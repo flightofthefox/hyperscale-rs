@@ -28,7 +28,7 @@ use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::network::gossip::beacon::BeaconBlockGossip;
 use hyperscale_types::network::request::GetBlockRequest;
-use hyperscale_types::test_utils::{TestCommittee, test_transaction};
+use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, test_transaction};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, CertifiedBeaconBlock,
     GenesisConfigHash, GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR,
@@ -132,6 +132,7 @@ impl Fixture {
         );
         let state = NodeStateMachine::new(
             me,
+            Arc::new(StubVmStatics),
             shard,
             &ShardConsensusConfig::default(),
             RecoveredState::default(),

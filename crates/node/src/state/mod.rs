@@ -36,8 +36,8 @@ use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
-    Block, BlockHeight, LocalTimestamp, ShardId, StateRoot, TopologySchedule, TopologySnapshot,
-    ValidatorId,
+    Block, BlockHeight, Derivation, LocalTimestamp, ShardId, StateRoot, TopologySchedule,
+    TopologySnapshot, ValidatorId,
 };
 use participation::ShardParticipation;
 use tracing::instrument;
@@ -94,6 +94,7 @@ impl NodeStateMachine {
     #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly
     pub fn new(
         me: ValidatorId,
+        derivation: Arc<dyn Derivation>,
         local_shard: ShardId,
         shard_config: &ShardConsensusConfig,
         recovered: RecoveredState,
@@ -112,6 +113,7 @@ impl NodeStateMachine {
             me,
             shard: Some(ShardParticipation::new(
                 verifier,
+                derivation,
                 me,
                 local_shard,
                 shard_config,

@@ -33,7 +33,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::network::gossip::beacon::RatifyVoteGossip;
-use hyperscale_types::test_utils::TestCommittee;
+use hyperscale_types::test_utils::{StubVmStatics, TestCommittee};
 use hyperscale_types::{
     BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig, CertifiedBeaconBlock, Epoch,
     GenesisConfigHash, GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR,
@@ -131,6 +131,7 @@ impl Fixture {
         let vnodes: Vec<(ValidatorId, Arc<dyn Signer>)> =
             vec![(self.committee.validator_id(idx), self.committee.signer(idx))];
         seat_vnode_group(SeatVnodeGroup {
+            derivation: Arc::new(StubVmStatics),
             verifier: Arc::new(BlsVerifier),
             beacon_storage: self.beacon_storage.as_ref(),
             beacon_network: NetworkDefinition::simulator(),

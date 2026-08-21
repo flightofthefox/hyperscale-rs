@@ -1154,7 +1154,7 @@ mod tests {
     use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
     use hyperscale_metrics_memory::MemoryRecorder;
     use hyperscale_types::test_utils::{
-        TestCommittee, certify, install_stub_vm_statics, make_finalization, make_live_block,
+        TestCommittee, certify, install_stub_protocol_statics, make_finalization, make_live_block,
         stub_transaction, test_prefix, test_principal, test_transaction,
         test_transaction_with_prefixes, test_validity_range,
     };
@@ -2444,7 +2444,7 @@ mod tests {
     /// A signed stub transaction whose derived owners are exactly
     /// `owners`, paying from `payer`.
     fn stub_vm(payer: PrincipalAddr, owners: &[Address]) -> Arc<Verified<Transaction>> {
-        install_stub_vm_statics();
+        install_stub_protocol_statics();
         Arc::new(verified(stub_transaction(
             payer,
             owners,

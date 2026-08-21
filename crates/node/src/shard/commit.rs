@@ -25,9 +25,9 @@ use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
 use hyperscale_storage::{ChainEntry, ParentAnchor, PendingChain, ShardStorage};
 use hyperscale_types::{
-    BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, EpochWindows,
-    Finalization, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SyncHint, Verifiable,
-    Verified, WeightedTimestamp, absorb_committed_cells, local_settled_tx_hashes,
+    BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, Derivation,
+    EpochWindows, Finalization, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SyncHint,
+    Verifiable, Verified, WeightedTimestamp, absorb_committed_cells, local_settled_tx_hashes,
 };
 use tracing::debug;
 
@@ -150,6 +150,7 @@ pub fn run_qc_only_prep<S>(
     pending_chain: &Arc<PendingChain<S>>,
     prepared_commits: &Arc<Mutex<PreparedCommitMap>>,
     pending: &QcOnlyPending,
+    derivation: &dyn Derivation,
 ) -> Result<(), Box<QcOnlyDivergence>>
 where
     S: ShardStorage,
@@ -206,7 +207,7 @@ where
         .iter()
         .flat_map(|fw| fw.consensus_receipts())
         .collect();
-    absorb_committed_cells(receipts.iter().map(AsRef::as_ref));
+    absorb_committed_cells(receipts.iter().map(AsRef::as_ref), derivation);
     let parent_block_hash = block.header().parent_block_hash();
     let settled_txs = local_settled_tx_hashes(finalizations.iter(), block.header().shard_id());
     let committed_txs = block.transactions().iter().map(|tx| tx.hash()).collect();

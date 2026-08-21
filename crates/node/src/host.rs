@@ -28,7 +28,7 @@ use hyperscale_engine::Executor;
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, PendingChain, ShardStorage, TickChain};
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, LocalTimestamp, NetworkDefinition, ShardId,
+    Block, BlockHeight, CertifiedBlock, Derivation, LocalTimestamp, NetworkDefinition, ShardId,
     TransactionStatus, TxHash, ValidatorId, Verified,
 };
 
@@ -501,6 +501,12 @@ where
     #[must_use]
     pub fn beacon_storage(&self) -> &Arc<dyn BeaconStorage> {
         &self.process.beacon_storage
+    }
+
+    /// This host's derivation, held by its engine.
+    #[must_use]
+    pub fn derivation(&self) -> Arc<dyn Derivation> {
+        self.process.derivation()
     }
 
     /// Look up the latest merged status for a transaction.

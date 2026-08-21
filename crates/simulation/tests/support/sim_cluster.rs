@@ -25,10 +25,10 @@ use hyperscale_scenarios::{
 use hyperscale_simulation::{EPOCH_MS, ExecutionMode, JoinKind, SimConfig, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_types::{
-    Address, BeaconChainConfig, BeaconState, BlockHeight, CertifiedBlock, ConsensusReceipt, Event,
-    LocalKey, PrincipalAddr, ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId, Verified,
-    WeightedTimestamp, WorkInFlight,
+    Address, BeaconChainConfig, BeaconState, BlockHeight, CertifiedBlock, ConsensusReceipt,
+    Derivation, Event, LocalKey, PrincipalAddr, ReshapeThresholds, ShardId, Signer, StateRoot,
+    SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
+    Verified, WeightedTimestamp, WorkInFlight,
 };
 
 /// The clock slice `run_until` advances per poll, matching the runner's own
@@ -357,6 +357,10 @@ impl SimCluster {
     /// selection is refined when cross-shard scenarios land.
     fn host_for_tx(&self, tx: &Transaction) -> Option<NodeIndex> {
         let topology_snapshot = self.runner.host_topology(0)?;
+        // Built by the harness rather than by a node, so nothing has
+        // derived it yet and routing is a derived fact.
+        tx.try_derived(self.runner.host_derivation(0)?.as_ref())
+            .ok()?;
         let shards: BTreeSet<ShardId> = topology_snapshot
             .all_shards_for_transaction(tx)
             .into_iter()
@@ -376,6 +380,12 @@ fn host_index(host: usize) -> NodeIndex {
 }
 
 impl Cluster for SimCluster {
+    fn derivation(&self) -> Arc<dyn Derivation> {
+        self.runner
+            .host_derivation(0)
+            .expect("a cluster runs at least one host")
+    }
+
     fn signer_from_seed(&self, seed: &[u8; 32]) -> Arc<dyn Signer> {
         self.runner.signer_from_seed(seed)
     }

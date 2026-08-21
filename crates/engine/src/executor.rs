@@ -29,10 +29,10 @@ use hyperscale_effects_bridge::{
 use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
 use hyperscale_types::{
-    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Event, EventExt, EventRoot,
-    ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, PrincipalAddr, ProvisionalHolds,
-    RevealChain, Stake, StakePoolSeat, StateWrites, SubstateEntry, Transaction, TxHash, Verified,
-    compute_merkle_root, install_derivation, install_protocol_statics,
+    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, Event, EventExt,
+    EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, PrincipalAddr,
+    ProvisionalHolds, RevealChain, Stake, StakePoolSeat, StateWrites, SubstateEntry, Transaction,
+    TxHash, Verified, compute_merkle_root, install_protocol_statics,
 };
 use hyperscale_vm_effects::{
     Declaration, InstanceRegistry, NodeCall, PackageHash, PrefixShardResolver, admit_tree,
@@ -259,12 +259,13 @@ pub struct Executor {
     pub(crate) world: World,
     pub(crate) backend: EngineBackend,
     pub(crate) mode: ExecutionMode,
+    derivation: Arc<BridgeStatics>,
 }
 
 impl Executor {
-    /// Build the engine and install the process-wide VM statics (first
-    /// installation wins, so co-hosted nodes sharing one genesis
-    /// coexist).
+    /// Build the engine, its derivation, and the process-wide protocol
+    /// answers (first installation wins, so co-hosted nodes sharing one
+    /// genesis coexist).
     ///
     /// # Panics
     ///
@@ -290,14 +291,16 @@ impl Executor {
     ) -> Self {
         let world = genesis_world_with_pools(pools, packages);
         let backend = EngineBackend::new(packages);
-        // Two installations, split on whether a node can answer
-        // differently: the derivation reads this node's caches, and the
-        // protocol answers read nothing a node accumulates.
-        install_derivation(Box::new(BridgeStatics {
+        // The two halves split on whether a node can answer differently.
+        // The derivation reads this engine's caches and is held here, so
+        // a process standing several nodes up gives each its own; the
+        // protocol answers read nothing a node accumulates, so they are
+        // installed once for the process.
+        let derivation = Arc::new(BridgeStatics {
             cache: world.cache.clone(),
             instances: world.instances.clone(),
             artifact_sink: Some(Arc::new(backend.absorber())),
-        }));
+        });
         install_protocol_statics(Box::new(BridgeStatics {
             cache: world.cache.clone(),
             instances: world.instances.clone(),
@@ -307,24 +310,33 @@ impl Executor {
             world,
             backend,
             mode,
+            derivation,
         }
+    }
+
+    /// This engine's derivation: what its node can resolve an envelope
+    /// against.
+    #[must_use]
+    pub fn derivation(&self) -> Arc<dyn Derivation> {
+        Arc::clone(&self.derivation) as Arc<dyn Derivation>
     }
 
     /// A second engine over this one's world: its own compiled code, the
     /// same published metadata.
     ///
-    /// Derivation reads metadata through the process-wide statics, so a
-    /// process has exactly one metadata cache however many engines it
-    /// builds — but compiled code is per engine, and that is the half a
-    /// node acquires for itself. A harness standing several nodes up in
-    /// one process uses this so each of them has to fetch the code a
-    /// publish put on the chain, the way separate processes would.
+    /// The peer shares this engine's derivation, so a process has
+    /// exactly one metadata cache however many engines it builds — but
+    /// compiled code is per engine, and that is the half a node acquires
+    /// for itself. A harness standing several nodes up in one process
+    /// uses this so each of them has to fetch the code a publish put on
+    /// the chain, the way separate processes would.
     #[must_use]
     pub fn peer(&self, mode: ExecutionMode) -> Self {
         Self {
             world: self.world.clone(),
             backend: EngineBackend::new(&GenesisPackages::protocol()),
             mode,
+            derivation: Arc::clone(&self.derivation),
         }
     }
 

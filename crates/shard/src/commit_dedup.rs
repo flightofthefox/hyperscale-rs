@@ -265,7 +265,8 @@ impl CommitDedupIndex {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::test_utils::{
-        install_stub_vm_statics, make_finalization, stub_transaction, test_prefix, test_principal,
+        install_stub_protocol_statics, make_finalization, stub_transaction, test_prefix,
+        test_principal,
     };
     use hyperscale_types::{
         BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions, RevealChain, ShardId,
@@ -276,7 +277,7 @@ mod tests {
 
     /// Build a test tx whose `validity_range.end_timestamp_exclusive == end_ms`.
     fn tx_with_end(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
-        install_stub_vm_statics();
+        install_stub_protocol_statics();
         let range = TimestampRange::new(
             WeightedTimestamp::ZERO,
             WeightedTimestamp::from_millis(end_ms),

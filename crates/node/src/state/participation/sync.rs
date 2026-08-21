@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 
 use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
 use hyperscale_shard::SettledTxSet;
-use hyperscale_types::{PredecessorTerminal, TerminalEvidence, TopologySchedule, TxHash};
+use hyperscale_types::{
+    PredecessorTerminal, TerminalEvidence, TopologySchedule, TxHash, derive_block_transactions,
+};
 
 use super::ShardParticipation;
 
@@ -23,6 +25,7 @@ impl ShardParticipation {
     ) -> Vec<Action> {
         match event {
             ProtocolEvent::BlockSyncReadyToApply { certified } => {
+                derive_block_transactions(certified.block(), self.derivation.as_ref());
                 self.shard_coordinator.on_sync_block_ready_to_apply(
                     topology_schedule,
                     std::sync::Arc::unwrap_or_clone(certified),
@@ -51,7 +54,7 @@ impl ShardParticipation {
                     .on_committed_state_restored(height, hash, qc);
                 actions.extend(
                     self.execution_coordinator
-                        .on_committed_state_restored(topology_schedule),
+                        .on_committed_state_restored(topology_schedule, self.derivation.as_ref()),
                 );
                 actions
             }

@@ -144,6 +144,8 @@ fn run_tick(
         tick_reveal: RevealChain::ZERO,
         holds: &ProvisionalHolds::new(),
     };
+    tx.try_derived(executor.derivation().as_ref())
+        .expect("a fixture transaction derives");
     let verified = Arc::new(Verified::<Transaction>::from_persisted(tx));
     let executed =
         executor.execute_batch(&ctx, &storage.snapshot(), std::slice::from_ref(&verified));

@@ -19,7 +19,7 @@ use hyperscale_storage::{
     PackageArtifactStore, ParentAnchor, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
     SubstateStore, Substates, VersionedStore,
 };
-use hyperscale_types::test_utils::{STUB_PACKAGE_MARKER, install_stub_vm_statics};
+use hyperscale_types::test_utils::{STUB_PACKAGE_MARKER, install_stub_protocol_statics};
 use hyperscale_types::{
     Address, AddressClass, AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block,
     BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
@@ -1648,7 +1648,7 @@ fn a_package_cell_lands_in_the_artifact_index_with_its_commit() {
     // The judgement of what a package cell is belongs to the installed
     // statics; the stub judges by local-key marker so the index write is
     // under test without the VM stack.
-    install_stub_vm_statics();
+    install_stub_protocol_statics();
 
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();

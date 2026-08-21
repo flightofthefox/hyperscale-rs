@@ -142,12 +142,12 @@ impl Verify<&ProvisionTxRootsContext<'_>> for ProvisionTxRootsMap {
 mod tests {
     use super::*;
     use crate::test_utils::{
-        TestCommittee, install_stub_vm_statics, stub_transaction, test_prefix, test_principal,
+        TestCommittee, install_stub_protocol_statics, stub_transaction, test_prefix, test_principal,
     };
     use crate::{PrincipalAddr, TimestampRange, WeightedTimestamp};
 
     fn cross_shard_tx(payer: PrincipalAddr) -> Arc<Verifiable<Transaction>> {
-        install_stub_vm_statics();
+        install_stub_protocol_statics();
         let validity = TimestampRange::new(
             WeightedTimestamp::ZERO,
             WeightedTimestamp::from_millis(100_000),

@@ -190,6 +190,8 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
         tick_reveal: RevealChain::ZERO,
         holds: &ProvisionalHolds::new(),
     };
+    tx.try_derived(executor.derivation().as_ref())
+        .expect("a fixture transaction derives");
     let verified = Arc::new(Verified::<Transaction>::from_persisted(tx));
     executor.execute_batch(&ctx, &store, std::slice::from_ref(&verified))
 }
@@ -217,14 +219,14 @@ fn seated(pools: &[StakePoolSeat], mode: ExecutionMode) -> Executor {
 
 /// Apply what a settled transaction wrote, so the next one reads it as
 /// committed state.
-fn absorb(store: &mut MapDb, executed: &ExecutedTx) {
+fn absorb(store: &mut MapDb, executed: &ExecutedTx, executor: &Executor) {
     let ConsensusReceipt::Succeeded { writes, .. } = &executed.consensus else {
         panic!("the transaction must settle: {:?}", executed.consensus);
     };
     // What the commit path does with a block's receipts: every committed
     // cell is offered to the caches, so a seal that settled is a
     // component the next transaction can name with nothing presented.
-    absorb_committed_cells([&executed.consensus]);
+    absorb_committed_cells([&executed.consensus], executor.derivation().as_ref());
     for (key, change) in &writes.cells {
         match change {
             Some(value) => store.cells.insert(*key, value.clone()),
@@ -310,11 +312,12 @@ fn a_founded_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
     // target the chain answers for, and it only does once the seal
     // ahead of it has committed.
     for build in [signed_instantiate, signed_found] {
-        let tx = Arc::new(Verified::<Transaction>::from_persisted(build(
-            OPERATOR, &unseated,
-        )));
+        let raw = build(OPERATOR, &unseated);
+        raw.try_derived(executor.derivation().as_ref())
+            .expect("a fixture transaction derives");
+        let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
         let executed = executor.execute_batch(&ctx, &store, std::slice::from_ref(&tx));
-        absorb(&mut store, &executed[0]);
+        absorb(&mut store, &executed[0], &executor);
     }
 
     let (genesis_cells, genesis_entries) = genesis_writes(
@@ -458,7 +461,10 @@ fn only_the_badge_holder_may_register_a_validator() {
     // call reaches it.
     let outsider = signed_registration(pool_at(POOL_ID), OUTSIDER);
     assert!(outsider.body().signature_is_valid());
-    assert!(outsider.try_derived().is_ok(), "the shape is well-formed");
+    assert!(
+        outsider.try_derived(executor.derivation().as_ref()).is_ok(),
+        "the shape is well-formed"
+    );
     let executed = execute(&executor, outsider);
     assert!(
         matches!(&executed[0].consensus, ConsensusReceipt::Failed),
@@ -480,6 +486,10 @@ fn only_the_badge_holder_may_register_a_validator() {
 /// in the funds it carries, so anyone may delegate to any seated pool.
 #[test]
 fn a_delegation_needs_no_operator() {
-    let _ = seated(&[seat(POOL_ID)], ExecutionMode::Serial);
-    assert!(signed_stake(pool_at(POOL_ID), 500).try_derived().is_ok());
+    let executor = seated(&[seat(POOL_ID)], ExecutionMode::Serial);
+    assert!(
+        signed_stake(pool_at(POOL_ID), 500)
+            .try_derived(executor.derivation().as_ref())
+            .is_ok()
+    );
 }

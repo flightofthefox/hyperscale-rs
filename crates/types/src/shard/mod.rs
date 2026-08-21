@@ -50,7 +50,7 @@ pub mod witness_sources;
 
 pub use block::{
     Block, SharedCertificates, SharedProvisions, SharedTransactions, TerminalRef,
-    VerifiedBlockAssembleError, shared_transactions_from_raw, work_over_certificates,
+    VerifiedBlockAssembleError, derive_block_transactions, work_over_certificates,
 };
 pub use witness_sources::{SharedWitnessSources, WitnessSources};
 
@@ -65,7 +65,8 @@ mod tests {
 
     use super::*;
     use crate::test_utils::{
-        install_stub_vm_statics, stub_transaction, test_prefix, test_principal, test_validity_range,
+        install_stub_protocol_statics, stub_transaction, test_prefix, test_principal,
+        test_validity_range,
     };
     use crate::{
         AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot,
@@ -119,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_compute_transaction_root_deterministic() {
-        install_stub_vm_statics();
+        install_stub_protocol_statics();
         let tx = Arc::new(Verifiable::from(stub_transaction(
             test_principal(1),
             &[test_prefix(2)],

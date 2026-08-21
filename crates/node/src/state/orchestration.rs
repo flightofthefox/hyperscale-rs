@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use hyperscale_core::Action;
-use hyperscale_types::{CertifiedBlock, CertifiedBlockHeader, Verified};
+use hyperscale_types::{CertifiedBlock, CertifiedBlockHeader, Verified, derive_block_transactions};
 
 use super::NodeStateMachine;
 
@@ -53,6 +53,7 @@ impl NodeStateMachine {
         };
         let mut actions = Vec::new();
         let block_hash = certified.block().hash();
+        derive_block_transactions(certified.block(), s.derivation.as_ref());
 
         s.shard_coordinator
             .on_block_committed_verification(block_hash);

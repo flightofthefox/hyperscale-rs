@@ -38,7 +38,7 @@ use hyperscale_storage::{
     RecoveredState, ReplayWindow, SubstateStore, Substates, TickChain, TickOutput, VersionedStore,
     merge_writes_from_receipts,
 };
-use hyperscale_types::test_utils::{TestCommittee, certify, make_live_block};
+use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, certify, make_live_block};
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, CertifiedBlock,
     ConsensusReceipt, DeclaredRange, EventRoot, ExecutionCertificate, ExecutionMetadata,
@@ -516,7 +516,9 @@ impl ExecutionSim {
         );
         self.chain = Arc::new(TickChain::new(Arc::clone(&self.base)));
         self.pending.clear();
-        let actions = self.coord.on_committed_state_restored(&self.topology);
+        let actions = self
+            .coord
+            .on_committed_state_restored(&self.topology, &StubVmStatics);
         self.absorb(actions);
         self.drain();
     }

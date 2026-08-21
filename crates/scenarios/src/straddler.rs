@@ -966,6 +966,8 @@ fn submit_straddler_reserving<C: Cluster>(
     to: PrincipalAddr,
 ) -> (TxHash, u64) {
     let tx = build_transfer_tx(key, from, to, STRADDLER_PAYMENT, validity_around(c.now()));
+    tx.try_derived(c.derivation().as_ref())
+        .expect("a scenario transfer derives");
     let (hash, work) = (tx.hash(), tx.work());
     c.submit(Arc::new(tx));
     (hash, work)

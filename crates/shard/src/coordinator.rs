@@ -6807,7 +6807,7 @@ mod tests {
     }
 
     fn precut_tx(seed: u8, opens_ms: u64) -> Arc<Transaction> {
-        test_utils::install_stub_vm_statics();
+        test_utils::install_stub_protocol_statics();
         Arc::new(test_utils::stub_transaction(
             test_utils::test_principal(seed),
             &[test_utils::test_prefix(seed)],
