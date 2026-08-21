@@ -162,7 +162,7 @@ impl Client {
         account::securify_uniform(
             &mut b,
             owner,
-            StoredRule::Require(Presented::Identity(holder.into())),
+            &StoredRule::Require(Presented::Identity(holder.into())),
             recovery_delay_ms,
         )?;
         b.build()
@@ -190,6 +190,7 @@ impl Client {
                 root_bindings: Vec::new(),
                 subintents: Vec::new(),
                 instances: Vec::new(),
+                resources: Vec::new(),
             },
             Vec::new(),
             payer,
@@ -308,7 +309,7 @@ mod tests {
                                 producer: 1,
                                 output: 0,
                             },
-                            constraints: vec![Constraint::ResourceIs((*XRD).into())],
+                            constraints: vec![Constraint::ResourceIs(*XRD)],
                         }],
                         evidence: BTreeSet::new(),
                     },

@@ -9,7 +9,7 @@
 
 use hyperscale_types::{ComponentAddr, ResourceAddr, StakePoolSeat};
 use hyperscale_vm_effects::{
-    Fungibility, Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash,
+    Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash, ResourceKind,
     ResourceRecord, Value, package_hash, resource_address,
 };
 use hyperscale_vm_fixtures::artifacts as fixture_artifacts;
@@ -154,10 +154,13 @@ pub fn genesis_world_with_pools(pools: &[StakePoolSeat], packages: &GenesisPacka
 /// A genesis-seated pool's creation-fixed record.
 ///
 /// Its configuration is the resource a delegation is denominated in and
-/// nothing else. The resource the pool *issues* and the owner badge its
-/// operator surface admits are both derived from the pool rather than
-/// configured, and the pool's own identity is its address — so none of
-/// them is named here.
+/// who may found it. The resource the pool *issues* and the owner badge
+/// its operator surface admits are both derived from the pool rather
+/// than configured, and the pool's own identity is its address — so
+/// neither is named here. The founder is the seat's operator: genesis
+/// seats the badge directly, so the founding call its configuration
+/// admits is already spent, and the field's whole work is keeping a
+/// genesis pool and a founded one one shape.
 ///
 /// The salt stands in for a creating transaction's fresh id, which
 /// genesis has none of: the pool's own beacon identifier separates two
@@ -166,7 +169,10 @@ pub fn genesis_world_with_pools(pools: &[StakePoolSeat], packages: &GenesisPacka
 pub fn pool_meta(staking_package: PackageHash, seat: &StakePoolSeat) -> InstanceMeta {
     InstanceMeta {
         package: staking_package,
-        config: vec![Value::Address(XRD.address())],
+        config: vec![
+            Value::Address(XRD.address()),
+            Value::Address(seat.operator.address()),
+        ],
         salt: ProtocolHasher.hash(DOMAIN_GENESIS_SALT, &[&seat.id.inner().to_le_bytes()]),
     }
 }
@@ -192,7 +198,12 @@ const DOMAIN_GENESIS_SALT: &[u8] = b"hyperscale/engine/genesis-instance";
 /// sight.
 #[must_use]
 pub fn stake_unit(pool: impl Into<Address>) -> ResourceAddr {
-    resource_address(&ProtocolHasher, pool, &[])
+    resource_address(
+        &ProtocolHasher,
+        pool,
+        ResourceKind::Fungible,
+        &[Value::Bytes(staking::STAKE_UNIT.to_vec()).canonical_bytes()],
+    )
 }
 
 /// The pool's owner badge: the identity its operator surface admits.
@@ -206,27 +217,27 @@ pub fn pool_owner_badge(pool: impl Into<Address>) -> ResourceAddr {
     resource_address(
         &ProtocolHasher,
         pool,
+        ResourceKind::NonFungible,
         &[Value::Bytes(staking::OWNER_BADGE.to_vec()).canonical_bytes()],
     )
 }
 
-/// The badge instance genesis seats: derived from the pool like the
-/// badge itself, so it is recomputable from the seat and stored nowhere.
-#[must_use]
-pub fn owner_badge_id(pool: impl Into<Address>) -> u64 {
-    let digest = ProtocolHasher.hash(DOMAIN_OWNER_BADGE_ID, &[&pool.into().to_bytes()]);
-    let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = digest.0;
-    u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7])
-}
-
-/// The domain separating a badge instance's id from every other
-/// derivation of a pool's address.
-const DOMAIN_OWNER_BADGE_ID: &[u8] = b"hyperscale/engine/owner-badge-id";
+/// The badge instance a pool's seating mints: id 0, in genesis and in a
+/// founding call alike.
+///
+/// A constant rather than a derivation, because the badge resource is
+/// already the pool's own — per-pool uniqueness lives in the address —
+/// and a founding call's `mint_nf` names the same literal. One value in
+/// two writers is what the cell-for-cell parity between a seated pool
+/// and a founded one rests on.
+pub const OWNER_BADGE_ID: u64 = 0;
 
 /// The owner badge's resource record: one non-fungible kind.
-pub const OWNER_BADGE_RECORD: ResourceRecord = ResourceRecord {
-    kind: Fungibility::NonFungible,
-};
+pub const OWNER_BADGE_RECORD: ResourceRecord = ResourceRecord::NonFungible;
+
+/// The fee resource's record: fungible, displayed at eighteen subunit
+/// digits. Display quantization only — nothing on-chain consults it.
+pub const XRD_RECORD: ResourceRecord = ResourceRecord::Fungible { divisibility: 18 };
 
 #[cfg(test)]
 mod tests {

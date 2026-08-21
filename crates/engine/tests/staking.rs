@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock};
 use hyperscale_effects_bridge::genesis::genesis_world_with_pools;
 use hyperscale_effects_bridge::{ProtocolHasher, account_address};
 use hyperscale_engine::genesis::{
-    GenesisPackages, owner_badge_id, pool_address, pool_owner_badge, staking_artifact,
+    GenesisPackages, OWNER_BADGE_ID, pool_address, pool_meta, pool_owner_badge, staking_artifact,
 };
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, TickBatchContext, XRD, genesis_writes,
@@ -25,7 +25,10 @@ use hyperscale_types::{
     StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction, Verified,
     WeightedTimestamp,
 };
-use hyperscale_vm_effects::package_hash;
+use hyperscale_vm_effects::{
+    holdings_collection, instance_data_key, package_hash, resource_record_key,
+};
+use hyperscale_vm_manifest_builder::EnvelopeBuilder;
 use hyperscale_vm_stdlib::{account, staking};
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -210,6 +213,81 @@ fn seated(pools: &[StakePoolSeat], mode: ExecutionMode) -> Executor {
     Executor::with_genesis(pools, &GenesisPackages::protocol(), mode)
 }
 
+/// One envelope that brings an unseated pool to life: it presents the
+/// pool's instance record, founds it as the configured founder, and
+/// files the badge in the founder's own account.
+fn signed_found(seed: u8, seat: &StakePoolSeat) -> Transaction {
+    let key = key_of(seed);
+    let from = account_address(&key.public_key().0);
+    let cache = client().cache();
+    let meta = pool_meta(package_hash(&ProtocolHasher, staking_artifact()), seat);
+    let mut instances = client().world().instances.clone();
+    let pool = instances.create(&ProtocolHasher, meta.clone());
+    let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
+    let founder = account::authorize(&mut root, from).expect("an account signs in");
+    let badge = staking::Staking::at(pool)
+        .found(&mut root, founder)
+        .expect("a pool answers a founding");
+    account::deposit_nf(&mut root, from, badge).expect("an account banks the badge");
+    env.instance(meta);
+    env.seal(root)
+        .expect("the root declares nothing to discharge");
+    let tree = env.build().expect("the intent declares no hole");
+    Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(1_000)))
+}
+
+/// A pool nobody seated founds itself in one transaction, and the cells
+/// it ends holding are the cells genesis writes for a seated one, byte
+/// for byte — two writers of one object, held to each other.
+#[test]
+fn a_founded_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
+    let unseated = seat(55);
+    let executor = seated(&[], ExecutionMode::Serial);
+    let store = MapDb::genesis(&[(account_of(OPERATOR), 10_000)], &[]);
+    let trie = ShardTrie::single();
+    let ctx = TickBatchContext {
+        local_shard: ShardId::ROOT,
+        shard_trie: &trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        tick_reveal: RevealChain::ZERO,
+        holds: &ProvisionalHolds::new(),
+    };
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_found(
+        OPERATOR, &unseated,
+    )));
+    let executed = executor.execute_batch(&ctx, &store, std::slice::from_ref(&tx));
+    let writes = executed[0]
+        .consensus
+        .writes()
+        .expect("the founding completes");
+
+    let (genesis_cells, genesis_entries) = genesis_writes(
+        &[],
+        std::slice::from_ref(&unseated),
+        &GenesisPackages::protocol(),
+    )
+    .into_parts();
+    let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated);
+    let badge = pool_owner_badge(pool);
+    for key in [
+        resource_record_key(&ProtocolHasher, pool, badge),
+        instance_data_key(&ProtocolHasher, pool, badge, OWNER_BADGE_ID),
+    ] {
+        assert!(genesis_cells.contains_key(&key), "genesis writes the cell");
+        assert_eq!(writes.cells.get(&key), genesis_cells.get(&key));
+    }
+    let entry = EntryKey {
+        owner: unseated.operator.address(),
+        collection: holdings_collection(&ProtocolHasher, unseated.operator, badge),
+        order: u128::from(OWNER_BADGE_ID),
+    };
+    assert!(
+        genesis_entries.contains_key(&entry),
+        "genesis writes the entry"
+    );
+    assert_eq!(writes.entries.get(&entry), genesis_entries.get(&entry));
+}
+
 #[test]
 fn a_delegation_to_a_seated_pool_reaches_the_witness_channel() {
     let executor = Executor::with_genesis(
@@ -274,7 +352,7 @@ fn signed_registration(pool: ComponentAddr, seed: u8) -> Transaction {
         &mut b,
         account_address(&key.public_key().0),
         pool_owner_badge(pool),
-        owner_badge_id(pool),
+        OWNER_BADGE_ID,
     )
     .expect("a presentation types");
     staking::Staking::at(pool)

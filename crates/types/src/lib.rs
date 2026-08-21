@@ -102,10 +102,10 @@ pub use hyperscale_hbor::HborSigned;
 pub use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, AccountSigner, Address, AddressClass, CallTarget, CollectionId,
     ComponentAddr, EntryKey, EntryLeaf, InvalidAddress, LEAF_KEY_BYTES, LocalKey,
-    MAX_CELL_VALUE_LEN, Mode, ModeKind, Movement, NativeAddr, NotAResource, NotCallable,
-    PackageAddr, Presence, PrincipalAddr, ResourceAddr, ResourceRef, SchemeId, SettledCells,
-    SettledEntries, SettledWrites, StateWrites, SubstateKey, TX_UNITS, amount_cell, compatible,
-    declared_work, encode_amount, entry_leaf_key, read_amount,
+    MAX_CELL_VALUE_LEN, Mode, ModeKind, Movement, NativeAddr, NotCallable, PackageAddr, Presence,
+    PrincipalAddr, ResourceAddr, SchemeId, SettledCells, SettledEntries, SettledWrites,
+    StateWrites, SubstateKey, TX_UNITS, amount_cell, compatible, declared_work, encode_amount,
+    entry_leaf_key, read_amount,
 };
 pub use network::{
     GossipMessage, MessageClass, NetworkMessage, Request, Signed, SignedContext, SignedVerifyError,

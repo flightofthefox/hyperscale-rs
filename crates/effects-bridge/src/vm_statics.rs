@@ -21,28 +21,29 @@ use hyperscale_types::{
     DeclaredKey, DeclaredRange, Derived, EnvelopeExt, Hash, MAX_STATE_ENTRIES_PER_TX, Routing,
     TransactionEnvelope, VmStatics, VmStaticsError, declared_work,
 };
-use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT, XRD as XRD_ROLE};
+use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
-    AuthCell, AuthRole, EnvelopeTree, InstanceRegistry, ManifestHash, MetadataCache, PackageHash,
+    AuthCell, EnvelopeTree, InstanceRegistry, ManifestHash, MetadataCache, PRIMARY, PackageHash,
     PackageMetadata, PrefixShardResolver, Presented, Routing as RoutedTransaction, Value,
-    admit_tree, child_key, footprint, native_address, package_hash,
-    package_key as canonical_package_key, principal_address, route_tree,
+    admit_tree, child_key, footprint, package_hash, package_key as canonical_package_key,
+    principal_address, route_tree, xrd,
 };
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
-    Address, EffectSet, EffectTarget, Mode, NativeAddr, Presence, PrincipalAddr, SchemeId,
-    SubstateKey,
+    Address, EffectSet, EffectTarget, Mode, PrincipalAddr, ResourceAddr, SchemeId, SubstateKey,
 };
 
 use crate::ProtocolHasher;
 use crate::artifact::admit_package;
 
-/// The native fee and transfer resource of the VM namespace.
+/// The protocol fee and transfer resource: the genesis publisher's
+/// primary issue.
 ///
-/// Derived from its protocol role rather than picked, so it sits where a
-/// hash puts it and no shard holds it by preference.
-pub static XRD: LazyLock<NativeAddr> = LazyLock::new(|| native_address(&ProtocolHasher, XRD_ROLE));
+/// A resource like any other, minted by an address no signer reaches —
+/// so supply moves only where the protocol writes state directly, and
+/// the address sits where a hash puts it, on no shard by preference.
+pub static XRD: LazyLock<ResourceAddr> = LazyLock::new(|| xrd(&ProtocolHasher));
 
 /// The vault cell for `resource` under `owner` — the same child key the
 /// stdlib account metadata's effect clauses compute.
@@ -189,7 +190,7 @@ fn classify_declared_access(routing: &RoutedTransaction) -> DeclaredAccess {
                 access.read_keys.insert(key);
                 access.provision_keys.insert(key);
             }
-            Mode::Write { .. } => {
+            Mode::Write => {
                 access.write_keys.insert(key);
                 access.provision_keys.insert(key);
             }
@@ -430,17 +431,7 @@ impl BridgeStatics {
                 write_prefixes: vec![publisher.address()],
                 provision_prefixes: Vec::new(),
                 read_keys: Vec::new(),
-                declared_modes: write_keys
-                    .iter()
-                    .map(|key| {
-                        (
-                            *key,
-                            Mode::Write {
-                                requires: Presence::Either,
-                            },
-                        )
-                    })
-                    .collect(),
+                declared_modes: write_keys.iter().map(|key| (*key, Mode::Write)).collect(),
                 write_keys,
                 provision_keys: Vec::new(),
             },
@@ -483,7 +474,7 @@ impl VmStatics for BridgeStatics {
         AuthCell::admits(
             auth_cell.unwrap_or_default(),
             payer.address(),
-            AuthRole::Primary,
+            PRIMARY,
             &[Presented::Identity(signer.into())],
             clock_ms,
         )
@@ -610,7 +601,7 @@ mod tests {
     use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
         AuthBase, Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Hasher, IntentDecl,
-        ManifestGraph, PackageHash, Presented, Proposal, RoleSet, StoredRule, Subintent,
+        ManifestGraph, PackageHash, Presented, Proposal, RoleTable, StoredRule, Subintent,
         SubintentHash, YieldBinding, YieldParam, child_key, nullifier_key,
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
@@ -688,7 +679,7 @@ mod tests {
                     producer,
                     output: 0,
                 },
-                constraints: vec![Constraint::ResourceIs(resource.into())],
+                constraints: vec![Constraint::ResourceIs(resource)],
             }],
             evidence: BTreeSet::new(),
         }
@@ -712,6 +703,7 @@ mod tests {
             root_bindings: Vec::new(),
             subintents: Vec::new(),
             instances: Vec::new(),
+            resources: Vec::new(),
         }
     }
 
@@ -728,7 +720,7 @@ mod tests {
                     ],
                 },
                 params: vec![YieldParam {
-                    resource: RES_Y.into(),
+                    resource: RES_Y,
                     constraints: vec![Constraint::MinAmount(10)],
                 }],
             },
@@ -749,7 +741,7 @@ mod tests {
                         ],
                     },
                     params: vec![YieldParam {
-                        resource: RES_X.into(),
+                        resource: RES_X,
                         constraints: vec![Constraint::MinAmount(100)],
                     }],
                 },
@@ -763,6 +755,7 @@ mod tests {
                 }],
             }],
             instances: Vec::new(),
+            resources: Vec::new(),
         }
     }
 
@@ -929,9 +922,11 @@ mod tests {
         assert!(!statics.rule_admits(None, composer_addr(), bob_addr(), 0));
 
         // Securified to Bob: the old identity is dead, the rule's lives.
-        let bob_rules =
-            || RoleSet::uniform(StoredRule::Require(Presented::Identity(bob_addr().into())));
-        let cell = AuthCell::new(AuthBase::new(1_000, &bob_rules()).unwrap())
+        let bob_rules = || {
+            RoleTable::uniform(&StoredRule::Require(Presented::Identity(bob_addr().into())))
+                .expect("a rule within the caps")
+        };
+        let cell = AuthCell::new(AuthBase::new(1_000, bob_rules()))
             .to_bytes()
             .unwrap();
         assert!(statics.rule_admits(Some(&cell), composer_addr(), bob_addr(), 0));
@@ -940,14 +935,15 @@ mod tests {
         // A pending proposal moves the payer binding at its instant and
         // not before: the retired primary stops paying the moment the
         // recovery matures, with nothing applying it.
-        let composer_rules = RoleSet::uniform(StoredRule::Require(Presented::Identity(
+        let composer_rules = RoleTable::uniform(&StoredRule::Require(Presented::Identity(
             composer_addr().into(),
-        )));
+        )))
+        .expect("a rule within the caps");
         let recovering = AuthCell {
-            base: AuthBase::new(1_000, &bob_rules()).unwrap(),
+            base: AuthBase::new(1_000, bob_rules()),
             proposal: Some(Proposal {
                 effective_at_ms: 5_000,
-                base: AuthBase::new(1_000, &composer_rules).unwrap(),
+                base: AuthBase::new(1_000, composer_rules),
             }),
         }
         .to_bytes()
@@ -956,6 +952,17 @@ mod tests {
         assert!(!statics.rule_admits(Some(&recovering), composer_addr(), composer_addr(), 4_999));
         assert!(statics.rule_admits(Some(&recovering), composer_addr(), composer_addr(), 5_000));
         assert!(!statics.rule_admits(Some(&recovering), composer_addr(), bob_addr(), 5_000));
+
+        // A frozen account binds no fees: the acting entry was removed,
+        // and an absent entry denies whoever asks — the recovery intent
+        // pays from somewhere else.
+        let mut frozen_roles = bob_rules();
+        frozen_roles.remove(PRIMARY);
+        let frozen = AuthCell::new(AuthBase::new(1_000, frozen_roles))
+            .to_bytes()
+            .unwrap();
+        assert!(!statics.rule_admits(Some(&frozen), composer_addr(), bob_addr(), 0));
+        assert!(!statics.rule_admits(Some(&frozen), composer_addr(), composer_addr(), 0));
 
         // Bytes no cell decodes from admit nobody — fail closed, like
         // the execution gate. Bare rule bytes are among them: the write
@@ -1080,9 +1087,12 @@ mod tests {
             method: "securify".into(),
             args: vec![
                 GraphArg::Literal(Value::Bytes(
-                    RoleSet::uniform(StoredRule::Require(Presented::Identity(bob_addr().into())))
-                        .to_bytes()
-                        .unwrap(),
+                    RoleTable::uniform(&StoredRule::Require(Presented::Identity(
+                        bob_addr().into(),
+                    )))
+                    .expect("a rule within the caps")
+                    .to_bytes()
+                    .unwrap(),
                 )),
                 GraphArg::Literal(Value::U64(86_400_000)),
             ],

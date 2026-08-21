@@ -45,8 +45,10 @@ mod tests {
                 "principal/ed25519/b = eef14e9e4037201e80c2cc20ce863c237f751c337d87224ae1d56d1e53363b01",
                 "component/salted = 6abb649cd46f582de44c4ec573818a3c678f643292307e48ac94e49d7fa7b702",
                 "package/content = 7e5f726fe1bb474718cfd6c20c04e2cd10de46768f830dabdc8845f0e2bc1e03",
-                "resource/minted = 3117557391fe54b15beb8399a4bcbbd03c9ea448ba00054d5a53937b7a1afb04",
-                "native/xrd = efc7fb8be541b753ed84483e50605ebf7035c082cde515e165c0590cb0c71c05",
+                "resource/minted = a9ae3894034d9f0ee3d489027b203a7b31fd5274533a88f7921557f5ed96fd04",
+                "resource/minted-nf = e8b5d6381fe5f53437b15db84aa15a59a7e93d417894ddc52ab513ee4ac65b04",
+                "native/genesis-publisher = 89ba159512ed286bc66436f6a009090f87af9a1c8b5f9fa3a7d633ef37b40105",
+                "resource/xrd = 9e69ffbc7d409d7a6475fdd4304a60a53f2c5f6495acb1f3c9c80b14efabe004",
             ]
         );
     }

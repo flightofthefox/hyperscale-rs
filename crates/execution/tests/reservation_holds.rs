@@ -24,7 +24,6 @@ use hyperscale_types::{
     TransactionEnvelope, TxHash, Verified, VmStatics, VmStaticsError, WeightedTimestamp,
     declared_work, install_vm_statics,
 };
-use hyperscale_vm_types::Presence;
 
 /// The two amount cells every fixture transaction declares a reservation
 /// on. Real derivation folds duplicate reservations per cell before the
@@ -72,12 +71,7 @@ impl VmStatics for ReservingStatics {
                 DeclaredKey::Cell(counterparty_vault()),
                 Mode::Reserve { amount: 25 },
             ),
-            (
-                written,
-                Mode::Write {
-                    requires: Presence::Either,
-                },
-            ),
+            (written, Mode::Write),
             (ranged, Mode::Delta),
         ];
         declared_modes.sort_unstable();

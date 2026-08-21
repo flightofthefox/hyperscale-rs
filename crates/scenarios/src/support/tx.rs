@@ -13,7 +13,7 @@ use hyperscale_effects_bridge::genesis::{GenesisPackages, genesis_world_with_poo
 use hyperscale_effects_bridge::vm_statics::principal_for;
 use hyperscale_effects_bridge::{ProtocolHasher, attach_metadata};
 use hyperscale_engine::genesis::{
-    owner_badge_id, pool_address, pool_owner_badge, stake_unit, staking_artifact,
+    OWNER_BADGE_ID, pool_address, pool_owner_badge, stake_unit, staking_artifact,
 };
 use hyperscale_engine::{XRD, account_address};
 use hyperscale_transactions::{Client, DEFAULT_GAS_LIMIT, Terms};
@@ -1100,7 +1100,7 @@ pub fn build_draw_tx(
     let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
     for address in addresses {
         lottery::Lottery::at(address)
-            .draw(&mut root)
+            .draw(&mut root, 64)
             .expect("a lottery answers a draw");
     }
     for meta in lotteries {
@@ -1182,6 +1182,7 @@ pub fn build_transfer_paid_by<S: AccountSigner>(
             root_bindings: Vec::new(),
             subintents: Vec::new(),
             instances: Vec::new(),
+            resources: Vec::new(),
         },
         Vec::new(),
         payer,
@@ -1399,8 +1400,7 @@ pub fn build_badge_sale_tx(
     let pool = pool_at(GENESIS_POOL_ID);
     let graph = graph(|b| {
         let proof = account::authorize(b, account_address(&seller.public_key().0))?;
-        let funds =
-            account::withdraw_nf(b, proof, pool_owner_badge(pool), &[owner_badge_id(pool)])?;
+        let funds = account::withdraw_nf(b, proof, pool_owner_badge(pool), &[OWNER_BADGE_ID])?;
         account::deposit_nf(b, buyer, funds)
     });
     Transaction::new(envelope(graph, seller, validity))
@@ -1546,6 +1546,7 @@ pub fn build_instance_deposit_tx(
         root_bindings: Vec::new(),
         subintents: Vec::new(),
         instances: vec![meta],
+        resources: Vec::new(),
     };
     Transaction::new(client().sign_tree(
         &tree,
@@ -1662,7 +1663,7 @@ pub fn build_deactivate_tx(
             b,
             account_address(&operator.public_key().0),
             pool_owner_badge(pool),
-            owner_badge_id(pool),
+            OWNER_BADGE_ID,
         )?;
         staking::Staking::at(pool).deactivate_validator(b, proof, validator.inner())
     });
@@ -1690,7 +1691,7 @@ pub fn build_register_tx(
             b,
             account_address(&operator.public_key().0),
             pool_owner_badge(pool),
-            owner_badge_id(pool),
+            OWNER_BADGE_ID,
         )?;
         staking::Staking::at(pool).register_validator(
             b,
@@ -1927,7 +1928,7 @@ pub fn build_reshape_threshold_vote_tx(
             b,
             account_address(&operator.public_key().0),
             pool_owner_badge(pool_at(GENESIS_POOL_ID)),
-            owner_badge_id(pool_at(GENESIS_POOL_ID)),
+            OWNER_BADGE_ID,
         )?;
         staking::Staking::at(pool_at(GENESIS_POOL_ID)).cast_param_vote(
             b,

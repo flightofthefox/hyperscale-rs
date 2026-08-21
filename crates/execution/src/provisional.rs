@@ -93,7 +93,7 @@ impl ProvisionalCells {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{AddressClass, DeclaredRange, LocalKey, Presence};
+    use hyperscale_types::{AddressClass, DeclaredRange, LocalKey};
 
     use super::*;
 
@@ -120,12 +120,7 @@ mod tests {
     fn nothing_is_blocked_by_an_empty_claim_set() {
         let claims = ProvisionalCells::default();
         assert!(claims.is_empty());
-        assert!(!claims.blocks(&[(
-            cell(1, 1),
-            Mode::Write {
-                requires: Presence::Either
-            }
-        )]));
+        assert!(!claims.blocks(&[(cell(1, 1), Mode::Write)]));
     }
 
     /// The reason the whole relation is here: payment traffic is delta
@@ -151,12 +146,7 @@ mod tests {
         let mut claims = ProvisionalCells::default();
         claims.claim(&[(cell(1, 1), Mode::Delta)]);
         assert!(claims.blocks(&[(cell(1, 1), Mode::Read)]));
-        assert!(claims.blocks(&[(
-            cell(1, 1),
-            Mode::Write {
-                requires: Presence::Either
-            }
-        )]));
+        assert!(claims.blocks(&[(cell(1, 1), Mode::Write)]));
     }
 
     /// An exclusive claim excludes everything, commutative included: it
@@ -164,20 +154,8 @@ mod tests {
     #[test]
     fn an_exclusive_claim_excludes_every_mode() {
         let mut claims = ProvisionalCells::default();
-        claims.claim(&[(
-            cell(1, 1),
-            Mode::Write {
-                requires: Presence::Either,
-            },
-        )]);
-        for mode in [
-            Mode::Delta,
-            RESERVE,
-            Mode::Read,
-            Mode::Write {
-                requires: Presence::Either,
-            },
-        ] {
+        claims.claim(&[(cell(1, 1), Mode::Write)]);
+        for mode in [Mode::Delta, RESERVE, Mode::Read, Mode::Write] {
             assert!(
                 claims.blocks(&[(cell(1, 1), mode)]),
                 "{mode:?} slipped past"
@@ -188,30 +166,9 @@ mod tests {
     #[test]
     fn a_claim_leaves_siblings_and_other_owners_alone() {
         let mut claims = ProvisionalCells::default();
-        claims.claim(&[(
-            cell(1, 1),
-            Mode::Write {
-                requires: Presence::Either,
-            },
-        )]);
-        assert!(
-            !claims.blocks(&[(
-                cell(1, 2),
-                Mode::Write {
-                    requires: Presence::Either
-                }
-            )]),
-            "sibling cell"
-        );
-        assert!(
-            !claims.blocks(&[(
-                cell(2, 1),
-                Mode::Write {
-                    requires: Presence::Either
-                }
-            )]),
-            "other owner"
-        );
+        claims.claim(&[(cell(1, 1), Mode::Write)]);
+        assert!(!claims.blocks(&[(cell(1, 2), Mode::Write)]), "sibling cell");
+        assert!(!claims.blocks(&[(cell(2, 1), Mode::Write)]), "other owner");
     }
 
     /// Two intervals of one collection contend by mode alone — the
@@ -221,33 +178,13 @@ mod tests {
     #[test]
     fn intervals_contend_by_collection_and_leave_points_alone() {
         let mut claims = ProvisionalCells::default();
-        claims.claim(&[(
-            interval(1, 0, 10),
-            Mode::Write {
-                requires: Presence::Either,
-            },
-        )]);
+        claims.claim(&[(interval(1, 0, 10), Mode::Write)]);
         assert!(claims.blocks(&[(interval(1, 20, 30), Mode::Read)]));
-        assert!(!claims.blocks(&[(
-            cell(1, 1),
-            Mode::Write {
-                requires: Presence::Either
-            }
-        )]));
+        assert!(!claims.blocks(&[(cell(1, 1), Mode::Write)]));
 
         let mut over_cell = ProvisionalCells::default();
-        over_cell.claim(&[(
-            cell(1, 1),
-            Mode::Write {
-                requires: Presence::Either,
-            },
-        )]);
-        assert!(!over_cell.blocks(&[(
-            interval(1, 0, 10),
-            Mode::Write {
-                requires: Presence::Either
-            }
-        )]));
+        over_cell.claim(&[(cell(1, 1), Mode::Write)]);
+        assert!(!over_cell.blocks(&[(interval(1, 0, 10), Mode::Write)]));
     }
 
     /// A locked read declares nothing anywhere, so it neither claims nor
@@ -255,12 +192,7 @@ mod tests {
     #[test]
     fn a_locked_read_contends_with_nothing() {
         let mut claims = ProvisionalCells::default();
-        claims.claim(&[(
-            cell(1, 1),
-            Mode::Write {
-                requires: Presence::Either,
-            },
-        )]);
+        claims.claim(&[(cell(1, 1), Mode::Write)]);
         assert!(!claims.blocks(&[(cell(1, 1), Mode::Locked)]));
     }
 }

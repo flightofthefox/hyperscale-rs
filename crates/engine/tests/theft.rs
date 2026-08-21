@@ -106,7 +106,7 @@ fn signed_transfer(from: PrincipalAddr, to: PrincipalAddr, amount: u128) -> Tran
     let graph = client()
         .transfer_graph(from, to, amount)
         .expect("an account answers a transfer");
-    Transaction::new(client().sign(graph, &key, terms(1_000)))
+    Transaction::new(client().sign(graph, &key, terms(2_000)))
 }
 
 fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
@@ -204,7 +204,7 @@ fn the_gated_node_is_the_one_that_moves_the_balance() {
         .expect("an executed receipt reports its cost")
         / Stake::ATTOS_PER_WHOLE;
     assert!(
-        charged > 0 && charged < 1_000,
+        charged > 0 && charged < 2_000,
         "the burn is real and inside the signed ceiling, so the balance equation below \
          is exact rather than capped: charged {charged}"
     );

@@ -505,7 +505,7 @@ mod tests {
     use hyperscale_hbor::{
         DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
-    use hyperscale_vm_types::{Address, AddressClass, Mode, Presence};
+    use hyperscale_vm_types::{Address, AddressClass, Mode};
 
     use super::*;
     use crate::test_utils::{test_prefix, test_validity_range};
@@ -551,9 +551,7 @@ mod tests {
                         ),
                         (
                             DeclaredKey::substate(test_prefix(0x22), [0x01; 16]),
-                            Mode::Write {
-                                requires: Presence::Either,
-                            },
+                            Mode::Write,
                         ),
                     ],
                 },

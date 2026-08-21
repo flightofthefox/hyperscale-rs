@@ -5,7 +5,7 @@ use std::sync::Arc;
 use hyperscale_crypto::{Signer, Verifier};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_vm_types::{
-    Address, AddressClass, LocalKey, Mode, Presence, PrincipalAddr, SchemeId, SubstateKey,
+    Address, AddressClass, LocalKey, Mode, PrincipalAddr, SchemeId, SubstateKey,
 };
 
 use crate::crypto::Ed25519PrivateKey;
@@ -940,14 +940,12 @@ impl VmStatics for StubVmStatics {
                     .iter()
                     .copied()
                     .map(|owner| (stub_cell(owner), Mode::Read))
-                    .chain(write_prefixes.iter().copied().map(|owner| {
-                        (
-                            stub_cell(owner),
-                            Mode::Write {
-                                requires: Presence::Either,
-                            },
-                        )
-                    }))
+                    .chain(
+                        write_prefixes
+                            .iter()
+                            .copied()
+                            .map(|owner| (stub_cell(owner), Mode::Write)),
+                    )
                     .collect(),
             },
             subintent_hashes: Vec::new(),

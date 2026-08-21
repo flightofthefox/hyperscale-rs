@@ -8,9 +8,9 @@
 //! kernel's own amount encoding.
 
 pub use hyperscale_effects_bridge::genesis::{
-    GenesisPackages, OWNER_BADGE_RECORD, World, account_artifact, genesis_publisher, genesis_world,
-    genesis_world_with_pools, owner_badge_id, pool_address, pool_meta, pool_owner_badge,
-    stake_unit, staking_artifact,
+    GenesisPackages, OWNER_BADGE_ID, OWNER_BADGE_RECORD, World, XRD_RECORD, account_artifact,
+    genesis_publisher, genesis_world, genesis_world_with_pools, pool_address, pool_meta,
+    pool_owner_badge, stake_unit, staking_artifact,
 };
 use hyperscale_effects_bridge::{ProtocolHasher, validator_key};
 pub use hyperscale_effects_bridge::{XRD, draw_key, vault_key};
@@ -100,7 +100,6 @@ pub fn genesis_writes(
         // stores a mapping, and selling the pool is an ordinary
         // holdings transfer from here on.
         let badge = pool_owner_badge(pool);
-        let id = owner_badge_id(pool);
         writes.cells.insert(
             resource_record_key(&ProtocolHasher, pool, badge),
             Some(
@@ -110,18 +109,31 @@ pub fn genesis_writes(
             ),
         );
         writes.cells.insert(
-            instance_data_key(&ProtocolHasher, pool, badge, id),
+            instance_data_key(&ProtocolHasher, pool, badge, OWNER_BADGE_ID),
             Some(vec![1]),
         );
+        // Empty content, as `deposit-nf` files an entry: presence is the
+        // whole of what a holdings entry says, and the two writers of
+        // this entry must agree byte for byte.
         writes.entries.insert(
             EntryKey {
                 owner: seat.operator.address(),
                 collection: holdings_collection(&ProtocolHasher, seat.operator, badge),
-                order: u128::from(id),
+                order: u128::from(OWNER_BADGE_ID),
             },
-            Some(vec![1]),
+            Some(Vec::new()),
         );
     }
+    // The fee resource's record, under its issuer: the one cell that says
+    // what XRD is, written where every resource's record lives.
+    writes.cells.insert(
+        resource_record_key(&ProtocolHasher, genesis_publisher(&ProtocolHasher), *XRD),
+        Some(
+            XRD_RECORD
+                .to_cell()
+                .expect("a record encodes within its wire depth"),
+        ),
+    );
     for (address, balance) in accounts {
         writes.cells.insert(
             vault_key(*address, *XRD),
@@ -164,9 +176,18 @@ mod tests {
             &[],
             &GenesisPackages::protocol(),
         );
-        // Two funded accounts' vault cells, plus the stdlib packages
-        // under the publisher no key derives.
-        assert_eq!(writes.cells().len(), 4);
+        // Two funded accounts' vault cells, the stdlib packages under
+        // the publisher no key derives, and the fee resource's record
+        // under the same publisher.
+        assert_eq!(writes.cells().len(), 5);
+        assert_eq!(
+            writes.cells().get(&resource_record_key(
+                &ProtocolHasher,
+                genesis_publisher(&ProtocolHasher),
+                *XRD
+            )),
+            Some(&Some(XRD_RECORD.to_cell().expect("a record encodes")))
+        );
         assert!(
             writes
                 .cells()

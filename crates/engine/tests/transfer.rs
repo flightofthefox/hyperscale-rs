@@ -307,7 +307,7 @@ fn signed_draw_with_fee(seed: u8, max_fee: u128) -> Transaction {
     let lottery_addr = instances.create(&ProtocolHasher, lottery_meta());
     let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
     lottery::Lottery::at(lottery_addr)
-        .draw(&mut root)
+        .draw(&mut root, 64)
         .expect("a lottery answers a draw");
     env.instance(lottery_meta());
     env.seal(root)
@@ -1230,8 +1230,9 @@ fn the_stdlib_artifact_carries_resolvable_bindings() {
     // reaches the declaration and never the body.
     assert_eq!(
         metadata.methods["withdraw"].abi,
-        vec![AbiParam::Handle(0)],
-        "the binding decoded is the binding authored"
+        vec![AbiParam::Handle(1)],
+        "the binding decoded is the binding authored: the gate's condition \
+         is the first clause, and the vault access it names is the second"
     );
     assert_eq!(
         metadata.methods["deposit"].abi,
@@ -1787,6 +1788,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
         root_bindings: Vec::new(),
         subintents: Vec::new(),
         instances: vec![meta],
+        resources: Vec::new(),
     };
 
     // The same call without its record has an unresolvable target and
@@ -1880,6 +1882,7 @@ fn a_locked_config_read_serves_from_the_presented_record() {
         root_bindings: Vec::new(),
         subintents: Vec::new(),
         instances: vec![meta],
+        resources: Vec::new(),
     };
     let call = Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(TRANSFER_FEE)));
     let executed = execute_on(

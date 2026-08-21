@@ -42,6 +42,7 @@ use hyperscale_vm_kernel::{
 };
 use hyperscale_vm_types::{
     Address, CallTarget, CollectionId, EffectSet, EffectTarget, EntryKey, Outcome, SubstateKey,
+    UnmetCondition,
 };
 
 use crate::backend::EngineBackend;
@@ -447,7 +448,7 @@ impl Executor {
                     .calls
                     .into_iter()
                     .map(|call| NodeCall {
-                        authority: None,
+                        requires: Vec::new(),
                         ..call
                     })
                     .collect(),
@@ -489,13 +490,15 @@ pub fn abort_reason(outcome: &Outcome) -> String {
             amount,
         } => format!("constraint unmet: node {node} parameter {param} carried {amount}"),
         Outcome::NullifierSpent { key } => format!("subintent already spent at {key:?}"),
-        Outcome::PresenceUnmet { target, required } => {
-            format!("leaf of {target:?} is not {required:?} as the write required")
-        }
         Outcome::Declined { node, code } => format!("node {node} declined with code {code}"),
-        Outcome::Unauthorized { node } => {
-            format!("node {node} presents no authority its target admits")
-        }
+        Outcome::ConditionUnmet { condition } => match condition {
+            UnmetCondition::Holds { target, required } => {
+                format!("leaf of {target:?} is not {required:?} as the condition required")
+            }
+            UnmetCondition::Satisfies { node } => {
+                format!("node {node} presents nothing that satisfies a required rule")
+            }
+        },
         Outcome::Completed { .. } => unreachable!("aborts only"),
     }
 }
@@ -609,8 +612,7 @@ pub const fn charge_for(outcome: &Outcome, payer: PayerFee) -> Option<u128> {
         Outcome::Infeasible { .. }
         | Outcome::ConstraintUnmet { .. }
         | Outcome::NullifierSpent { .. }
-        | Outcome::Unauthorized { .. }
-        | Outcome::PresenceUnmet { .. }
+        | Outcome::ConditionUnmet { .. }
         | Outcome::Declined { .. } => Some(payer.floor),
         // The kernel's own defect. `materialize_abort` refuses to price
         // it to the sender, and the burn agrees.
@@ -1357,23 +1359,28 @@ mod tests {
             owner: Address::new([2; 31], AddressClass::Component),
             local: LocalKey([9; 16]),
         });
-        for required in [Presence::Absent, Presence::Present] {
-            assert_eq!(
-                charge_for(
-                    &Outcome::PresenceUnmet {
-                        target: leaf,
-                        required
-                    },
-                    payer
-                ),
-                Some(payer.floor),
-                "{required:?}"
-            );
-        }
+        // A declared condition is the same precondition-on-committed-state
+        // class, in both of the shapes it is judged in.
         assert_eq!(
-            charge_for(&Outcome::Unauthorized { node: 0 }, payer),
+            charge_for(
+                &Outcome::ConditionUnmet {
+                    condition: UnmetCondition::Holds {
+                        target: leaf,
+                        required: Presence::Present,
+                    },
+                },
+                payer
+            ),
             Some(payer.floor),
-            "the class it is priced with"
+        );
+        assert_eq!(
+            charge_for(
+                &Outcome::ConditionUnmet {
+                    condition: UnmetCondition::Satisfies { node: 0 },
+                },
+                payer
+            ),
+            Some(payer.floor),
         );
     }
 }
