@@ -25,7 +25,7 @@ use hyperscale_types::{
     WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
-    InstanceRegistry, holdings_collection, instance_data_key, package_hash, resource_record_key,
+    Composed, holdings_collection, instance_data_key, package_hash, resource_record_key,
 };
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, TypedError};
 use hyperscale_vm_stdlib::{account, staking};
@@ -158,9 +158,8 @@ const fn terms(max_fee: u128) -> Terms {
 fn signed_stake(pool: ComponentAddr, amount: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[DELEGATOR; 32]).unwrap();
     let from = account_address(&key.public_key().0);
-    let cache = client().cache();
-    let instances = client().instances();
-    let mut b = client().builder(&cache, &instances);
+    let chain = client().records();
+    let mut b = client().builder(&chain);
     let sender = account::authorize(&mut b, from).expect("an account signs in");
     let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");
     let units = staking::Staking::at(pool)
@@ -244,11 +243,13 @@ fn absorb(store: &mut MapDb, executed: &ExecutedTx, executor: &Executor) {
 /// derivable component answers.
 fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
     let key = key_of(seed);
-    let cache = client().cache();
+    let chain = client().records();
     let meta = pool_meta(package_hash(&ProtocolHasher, staking_artifact()), seat);
-    let mut instances = InstanceRegistry::clone(&client().instances());
-    let pool = instances.create(&ProtocolHasher, meta.clone());
-    let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
+    // The composer types the call against a record the chain does not
+    // answer for yet: the seal is what makes it answer.
+    let composed = Composed::new(&chain, std::slice::from_ref(&meta), &ProtocolHasher);
+    let pool = meta.address(&ProtocolHasher);
+    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
     staking::Staking::at(pool)
         .instantiate(&mut root)
         .expect("a derivable pool answers its seal");
@@ -268,14 +269,15 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
 fn signed_found(seed: u8, seat: &StakePoolSeat) -> Transaction {
     let key = key_of(seed);
     let from = account_address(&key.public_key().0);
-    let cache = client().cache();
+    let _chain = client().records();
     // The composer knows the record and types the call against it; the
     // envelope carries nothing, because the chain answers for the
     // target itself once the seal has committed.
     let meta = pool_meta(package_hash(&ProtocolHasher, staking_artifact()), seat);
-    let mut instances = InstanceRegistry::clone(&client().instances());
-    let pool = instances.create(&ProtocolHasher, meta);
-    let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
+    let chain = client().records();
+    let composed = Composed::new(&chain, std::slice::from_ref(&meta), &ProtocolHasher);
+    let pool = meta.address(&ProtocolHasher);
+    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
     let founder = account::authorize(&mut root, from).expect("an account signs in");
     let badge = staking::Staking::at(pool)
         .found(&mut root, founder)
@@ -357,9 +359,8 @@ fn a_founded_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
 fn a_pool_nobody_instantiated_answers_nothing() {
     let unseated = seat(56);
     let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated);
-    let cache = client().cache();
-    let instances = client().instances();
-    let (_, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
+    let chain = client().records();
+    let (_, mut root) = EnvelopeBuilder::new(&chain, &ProtocolHasher);
     let founder = account::authorize(&mut root, account_of(OPERATOR)).expect("an account signs in");
     let refusal = staking::Staking::at(pool)
         .found(&mut root, founder)
@@ -428,9 +429,8 @@ fn an_ordinary_transfer_is_not_a_beacon_fact() {
 /// whether or not they hold it.
 fn signed_registration(pool: ComponentAddr, seed: u8) -> Transaction {
     let key = key_of(seed);
-    let cache = client().cache();
-    let instances = client().instances();
-    let mut b = client().builder(&cache, &instances);
+    let chain = client().records();
+    let mut b = client().builder(&chain);
     let proof = account::present_instance(
         &mut b,
         account_address(&key.public_key().0),

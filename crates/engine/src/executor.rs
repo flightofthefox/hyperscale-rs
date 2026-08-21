@@ -454,7 +454,6 @@ impl Executor {
         authority: TargetAuthority,
     ) -> Result<PreparedTx, String> {
         let vm = tx.body();
-        let packages = self.world.cache.load();
         let tree = decode_tree(
             vm.call_tree()
                 .ok_or_else(|| "publish body in a call sub-batch".to_string())?,
@@ -473,8 +472,7 @@ impl Executor {
             &tree,
             signer,
             envelope_identity(vm),
-            &packages,
-            &self.world.instances.load(),
+            &self.world.records(),
             &ProtocolHasher,
         )
         .map_err(|error| format!("admission: {error}"))?;
