@@ -23,10 +23,10 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
-    AuthCell, EnvelopeTree, InstanceRegistry, ManifestHash, MetadataCache, PRIMARY, PackageHash,
-    PackageMetadata, PrefixShardResolver, Presented, Routing as RoutedTransaction, Value,
-    admit_tree, child_key, footprint, package_hash, package_key as canonical_package_key,
-    principal_address, route_tree, xrd,
+    AuthCell, EnvelopeTree, Hasher, InstanceMeta, InstanceRegistry, ManifestHash, MetadataCache,
+    PRIMARY, PackageHash, PackageMetadata, PrefixShardResolver, Presented,
+    Routing as RoutedTransaction, Value, admit_tree, child_key, footprint, package_hash,
+    package_key as canonical_package_key, principal_address, route_tree, xrd,
 };
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
@@ -280,8 +280,8 @@ pub type ArtifactSink = Arc<dyn Fn(&[u8]) + Send + Sync>;
 pub struct BridgeStatics {
     /// Published package metadata, growing as blocks commit.
     pub cache: PackageCache,
-    /// Instance registrations, genesis-static.
-    pub instances: InstanceRegistry,
+    /// The instances the chain answers for, growing as blocks commit.
+    pub instances: InstanceCache,
     /// Where a committed package's artifact bytes are handed on, beside
     /// the metadata absorption.
     pub artifact_sink: Option<ArtifactSink>,
@@ -313,6 +313,76 @@ pub fn committed_package(owner: Address, local: [u8; 16], value: &[u8]) -> Optio
 
 /// The four bytes every wasm artifact opens with.
 const WASM_PREAMBLE: &[u8] = b"\0asm";
+
+/// The instance a committed cell seals, or `None` for every other cell.
+///
+/// A configuration leaf is self-identifying twice over: it sits at the
+/// one key its owner's `CONFIG` slot derives, and the record it holds
+/// derives that owner in turn. So a cell is this instance's seal exactly
+/// when both hold, and neither asks anything of whatever wrote it.
+///
+/// The key is tested first, because this runs over every cell of every
+/// commit and decoding a value to learn it was never a record is the one
+/// cost that scales with what the chain writes rather than with what it
+/// instantiates.
+#[must_use]
+pub fn committed_instance(owner: Address, local: [u8; 16], value: &[u8]) -> Option<InstanceMeta> {
+    if config_key(owner).local.0 != local {
+        return None;
+    }
+    let meta: InstanceMeta = hbor_from_slice(value).ok()?;
+    meta.derives(&ProtocolHasher, owner).then_some(meta)
+}
+
+/// The instance registry: what the chain answers a call target with,
+/// grown from committed state.
+///
+/// The same shape as [`PackageCache`] and for the same reasons — a
+/// record is immutable once sealed, so two readers hold the same thing
+/// and a reader never waits on the commit path.
+#[derive(Clone, Debug)]
+pub struct InstanceCache(Arc<ArcSwap<InstanceRegistry>>);
+
+impl InstanceCache {
+    /// A registry seeded with the instances a cold start already knows.
+    #[must_use]
+    pub fn new(seed: InstanceRegistry) -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(seed)))
+    }
+
+    /// The instances the chain currently answers for.
+    #[must_use]
+    pub fn load(&self) -> Arc<InstanceRegistry> {
+        self.0.load_full()
+    }
+
+    /// Register `meta` at the address it derives, unless it is already
+    /// there.
+    ///
+    /// First-write-wins, which costs nothing to be sure of: a record is
+    /// registered at the address its own contents derive, so a second
+    /// one at that address is the same record.
+    fn seat(&self, hasher: &dyn Hasher, meta: &InstanceMeta) {
+        if self.load().get(meta.address(hasher)).is_some() {
+            return;
+        }
+        self.0.rcu(|current| {
+            let mut next = InstanceRegistry::clone(current);
+            next.create(hasher, meta.clone());
+            next
+        });
+    }
+
+    /// Seat the instance a committed cell seals, and answer whether it
+    /// was one.
+    pub fn absorb_cell(&self, owner: impl Into<Address>, local: [u8; 16], value: &[u8]) -> bool {
+        let Some(meta) = committed_instance(owner.into(), local, value) else {
+            return false;
+        };
+        self.seat(&ProtocolHasher, &meta);
+        true
+    }
+}
 
 /// The published-package cache: content-addressed, shared process-wide,
 /// and grown from committed state.
@@ -455,6 +525,7 @@ impl VmStatics for BridgeStatics {
         {
             sink(value);
         }
+        self.instances.absorb_cell(owner, local, value);
     }
 
     fn package_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> Option<Hash> {
@@ -516,13 +587,11 @@ impl VmStatics for BridgeStatics {
             }
         }
         let packages = self.cache.load();
-        // The per-envelope registry: what genesis serves plus the tree's
-        // own presented instance records, each registered at exactly the
-        // address it derives — the whole of instantiation, composed
-        // identically on every node from the signed tree alone.
-        let instances = self
-            .instances
-            .with_instances(&tree.instances, &ProtocolHasher);
+        // What the chain answers a target with: genesis, grown by every
+        // seal that has committed since. Admission composes the tree's
+        // own records over these itself, holding each to standing for
+        // the seal of the component it derives.
+        let instances = self.instances.load();
         let admitted = admit_tree(
             &tree,
             signer,
@@ -639,7 +708,7 @@ mod tests {
         instances.serve_principals(package);
         BridgeStatics {
             cache: PackageCache::new(cache),
-            instances,
+            instances: InstanceCache::new(instances),
             artifact_sink: None,
         }
     }

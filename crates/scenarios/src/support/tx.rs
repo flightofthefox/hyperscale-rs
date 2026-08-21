@@ -25,8 +25,8 @@ use hyperscale_types::{
     WeightedTimestamp, ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
-    Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, ManifestGraph, Totality,
-    package_hash,
+    Constraint, EnvelopeTree, Hash32, InstanceMeta, InstanceRegistry, IntentDecl, ManifestGraph,
+    Totality, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::signing::{self, sign_subintent};
@@ -1083,7 +1083,7 @@ pub fn build_instantiate_tx(
 ) -> Transaction {
     let client = client();
     let cache = client.cache();
-    let mut instances = client.world().instances.clone();
+    let mut instances = InstanceRegistry::clone(&client.instances());
     let addresses: Vec<_> = lotteries
         .iter()
         .map(|meta| instances.create(&ProtocolHasher, meta.clone()))
@@ -1138,10 +1138,10 @@ pub fn build_draw_tx(
 ) -> Transaction {
     let client = client();
     let cache = client.cache();
-    // The builder resolves targets against the registry it is given, so
-    // the presented records are composed in first — exactly as admission
-    // composes them from the tree.
-    let mut instances = client.world().instances.clone();
+    // The composer knows each round's record and types the calls against
+    // them; the envelope carries none, because the seals have committed
+    // by the time this runs and the chain answers for the targets.
+    let mut instances = InstanceRegistry::clone(&client.instances());
     let addresses: Vec<_> = lotteries
         .iter()
         .map(|meta| instances.create(&ProtocolHasher, meta.clone()))
@@ -1151,9 +1151,6 @@ pub fn build_draw_tx(
         lottery::Lottery::at(address)
             .draw(&mut root, 64)
             .expect("a lottery answers a draw");
-    }
-    for meta in lotteries {
-        env.instance(meta.clone());
     }
     env.seal(root)
         .expect("the root declares nothing to discharge");
@@ -1850,8 +1847,8 @@ pub fn build_composed_tx(
 
     let client = client();
     let cache = client.cache();
-    let (mut env, mut root) =
-        EnvelopeBuilder::new(&cache, &client.world().instances, &ProtocolHasher);
+    let instances = client.instances();
+    let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
     let sender = account::authorize(&mut root, from).expect("an account signs in");
     let funds = account::withdraw(&mut root, sender, *XRD, amount)
         .expect("an account answers a withdrawal");
@@ -1916,7 +1913,8 @@ fn client() -> &'static Client {
 fn graph(write: impl FnOnce(&mut TypedBuilder<'_>) -> Result<(), TypedError>) -> ManifestGraph {
     let client = client();
     let cache = client.cache();
-    let mut b = client.builder(&cache);
+    let instances = client.instances();
+    let mut b = client.builder(&cache, &instances);
     write(&mut b).expect("every scenario call types against its signature");
     b.build().expect("every output is consumed")
 }
@@ -1930,7 +1928,8 @@ fn graph(write: impl FnOnce(&mut TypedBuilder<'_>) -> Result<(), TypedError>) ->
 fn declaration(write: impl FnOnce(&mut IntentBuilder<'_>) -> Result<(), TypedError>) -> IntentDecl {
     let client = client();
     let cache = client.cache();
-    let mut decl = IntentBuilder::declaration(&cache, &client.world().instances, &ProtocolHasher);
+    let instances = client.instances();
+    let mut decl = IntentBuilder::declaration(&cache, &instances, &ProtocolHasher);
     write(&mut decl).expect("every scenario call types against its signature");
     decl.into_decl()
         .expect("the declaration discharges its own holes")

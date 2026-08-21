@@ -24,12 +24,12 @@ use hyperscale_types::{
     BeaconWitnessEvent, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EntryKey, EnvelopeExt,
     NetworkId, PrincipalAddr, ProvisionalHolds, RevealChain, ShardId, ShardTrie, Stake,
     StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction, Verified,
-    WeightedTimestamp,
+    WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
-    holdings_collection, instance_data_key, package_hash, resource_record_key,
+    InstanceRegistry, holdings_collection, instance_data_key, package_hash, resource_record_key,
 };
-use hyperscale_vm_manifest_builder::EnvelopeBuilder;
+use hyperscale_vm_manifest_builder::{EnvelopeBuilder, TypedError};
 use hyperscale_vm_stdlib::{account, staking};
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -161,7 +161,8 @@ fn signed_stake(pool: ComponentAddr, amount: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[DELEGATOR; 32]).unwrap();
     let from = account_address(&key.public_key().0);
     let cache = client().cache();
-    let mut b = client().builder(&cache);
+    let instances = client().instances();
+    let mut b = client().builder(&cache, &instances);
     let sender = account::authorize(&mut b, from).expect("an account signs in");
     let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");
     let units = staking::Staking::at(pool)
@@ -220,6 +221,10 @@ fn absorb(store: &mut MapDb, executed: &ExecutedTx) {
     let ConsensusReceipt::Succeeded { writes, .. } = &executed.consensus else {
         panic!("the transaction must settle: {:?}", executed.consensus);
     };
+    // What the commit path does with a block's receipts: every committed
+    // cell is offered to the caches, so a seal that settled is a
+    // component the next transaction can name with nothing presented.
+    absorb_committed_cells([&executed.consensus]);
     for (key, change) in &writes.cells {
         match change {
             Some(value) => store.cells.insert(*key, value.clone()),
@@ -241,7 +246,7 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
     let key = key_of(seed);
     let cache = client().cache();
     let meta = pool_meta(package_hash(&ProtocolHasher, staking_artifact()), seat);
-    let mut instances = client().world().instances.clone();
+    let mut instances = InstanceRegistry::clone(&client().instances());
     let pool = instances.create(&ProtocolHasher, meta.clone());
     let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
     staking::Staking::at(pool)
@@ -254,23 +259,28 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
     Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(1_000)))
 }
 
-/// One envelope that founds an instantiated pool: it presents the pool's
-/// instance record, founds it as the configured founder, and files the
-/// badge in the founder's own account.
+/// One envelope that founds an instantiated pool: it founds it as the
+/// configured founder and files the badge in that account.
+///
+/// Carries no record. The pool's seal has committed by the time this
+/// runs, so the chain answers for the target and a record beside the
+/// call would be a second source for one fact.
 fn signed_found(seed: u8, seat: &StakePoolSeat) -> Transaction {
     let key = key_of(seed);
     let from = account_address(&key.public_key().0);
     let cache = client().cache();
+    // The composer knows the record and types the call against it; the
+    // envelope carries nothing, because the chain answers for the
+    // target itself once the seal has committed.
     let meta = pool_meta(package_hash(&ProtocolHasher, staking_artifact()), seat);
-    let mut instances = client().world().instances.clone();
-    let pool = instances.create(&ProtocolHasher, meta.clone());
+    let mut instances = InstanceRegistry::clone(&client().instances());
+    let pool = instances.create(&ProtocolHasher, meta);
     let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
     let founder = account::authorize(&mut root, from).expect("an account signs in");
     let badge = staking::Staking::at(pool)
         .found(&mut root, founder)
         .expect("a pool answers a founding");
     account::deposit_nf(&mut root, from, badge).expect("an account banks the badge");
-    env.instance(meta);
     env.seal(root)
         .expect("the root declares nothing to discharge");
     let tree = env.build().expect("the intent declares no hole");
@@ -296,11 +306,13 @@ fn a_founded_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
         tick_reveal: RevealChain::ZERO,
         holds: &ProvisionalHolds::new(),
     };
-    for tx in [
-        signed_instantiate(OPERATOR, &unseated),
-        signed_found(OPERATOR, &unseated),
-    ] {
-        let tx = Arc::new(Verified::<Transaction>::from_persisted(tx));
+    // Built one at a time rather than up front: the founding names a
+    // target the chain answers for, and it only does once the seal
+    // ahead of it has committed.
+    for build in [signed_instantiate, signed_found] {
+        let tx = Arc::new(Verified::<Transaction>::from_persisted(build(
+            OPERATOR, &unseated,
+        )));
         let executed = executor.execute_batch(&ctx, &store, std::slice::from_ref(&tx));
         absorb(&mut store, &executed[0]);
     }
@@ -333,39 +345,27 @@ fn a_founded_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
     assert_eq!(store.entries.get(&entry), genesis_entries[&entry].as_ref());
 }
 
-/// A pool nobody instantiated is derivable and not actual: its presented
-/// record resolves the call and the shard holding the leaf refuses it,
-/// before any body runs and whatever the founder presents.
+/// A pool nobody instantiated cannot be called at all.
+///
+/// Its address derives — anybody can compute it — but the chain answers
+/// for no such component, and a caller may not supply the answer: a
+/// record stands for the seal that makes a component actual and for no
+/// other call. So the composition fails where it is cheapest to fail,
+/// with nothing signed and nothing priced.
 #[test]
-fn a_call_on_an_unsealed_pool_is_refused_where_the_leaf_lives() {
+fn a_pool_nobody_instantiated_answers_nothing() {
     let unseated = seat(56);
-    let executor = seated(&[], ExecutionMode::Serial);
-    let store = MapDb::genesis(&[(account_of(OPERATOR), 10_000)], &[]);
-    let trie = ShardTrie::single();
-    let ctx = TickBatchContext {
-        local_shard: ShardId::ROOT,
-        shard_trie: &trie,
-        tick_ts: WeightedTimestamp::from_millis(1_000),
-        tick_reveal: RevealChain::ZERO,
-        holds: &ProvisionalHolds::new(),
-    };
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_found(
-        OPERATOR, &unseated,
-    )));
-    let executed = executor.execute_batch(&ctx, &store, std::slice::from_ref(&tx));
+    let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated);
+    let cache = client().cache();
+    let instances = client().instances();
+    let (_, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
+    let founder = account::authorize(&mut root, account_of(OPERATOR)).expect("an account signs in");
+    let refusal = staking::Staking::at(pool)
+        .found(&mut root, founder)
+        .expect_err("a pool nobody sealed resolves nothing");
     assert!(
-        matches!(executed[0].consensus, ConsensusReceipt::Failed),
-        "refused: {:?}",
-        executed[0].consensus
-    );
-    let message = executed[0]
-        .metadata
-        .error_message
-        .as_deref()
-        .unwrap_or_default();
-    assert!(
-        message.contains("Present"),
-        "refused as the leaf's unmet presence: {message}"
+        matches!(refusal, TypedError::UnknownInstance(address) if address == pool.address()),
+        "refused as an address the chain answers nothing for: {refusal:?}"
     );
 }
 
@@ -428,7 +428,8 @@ fn an_ordinary_transfer_is_not_a_beacon_fact() {
 fn signed_registration(pool: ComponentAddr, seed: u8) -> Transaction {
     let key = key_of(seed);
     let cache = client().cache();
-    let mut b = client().builder(&cache);
+    let instances = client().instances();
+    let mut b = client().builder(&cache, &instances);
     let proof = account::present_instance(
         &mut b,
         account_address(&key.public_key().0),
