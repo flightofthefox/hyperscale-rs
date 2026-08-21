@@ -25,8 +25,8 @@ use hyperscale_types::{
     WeightedTimestamp, ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
-    Composed, Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, ManifestGraph, Totality,
-    package_hash,
+    Composed, Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, ManifestGraph,
+    ResourceKind, Totality, Value, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::signing::{self, sign_subintent};
@@ -1542,10 +1542,17 @@ pub fn build_publish_tx(
 /// is registered anywhere — the envelope carries the record, and every
 /// node composes the same registry from it.
 #[must_use]
-pub fn published_instance(artifact: &[u8], salt: u8) -> InstanceMeta {
+pub fn published_instance(artifact: &[u8], salt: u8, founder: PrincipalAddr) -> InstanceMeta {
+    // The staking package's own configuration: what a delegation is
+    // denominated in, and who may bring the component up. The founder is
+    // folded into the address, so the caller that seals it is fixed
+    // before the transaction exists.
     InstanceMeta {
         package: package_hash(&ProtocolHasher, artifact),
-        config: Vec::new(),
+        config: vec![
+            Value::Address((*XRD).address()),
+            Value::Address(founder.address()),
+        ],
         salt: Hash32([salt; 32]),
     }
 }
@@ -1573,11 +1580,23 @@ pub fn build_instance_instantiate_tx(
     salt: u8,
     validity: TimestampRange,
 ) -> Transaction {
-    let meta = published_instance(artifact, salt);
+    let founder = account_address(&payer.public_key().0);
+    let meta = published_instance(artifact, salt, founder);
     let component = meta.address(&ProtocolHasher);
 
+    // Bringing up is one node: the founder its configuration names signs
+    // in, the seal mints the owner badge the component comes up holding,
+    // and that edge is filed in the founder's own account.
     let mut b = GraphBuilder::new();
-    let [] = b.call(component, "instantiate", ());
+    let [] = b.call_signed(founder, "authorize", ());
+    let [badge] = b.call_bearing(component, "instantiate", (), 0);
+    let owner_badge = issued_resource(
+        &ProtocolHasher,
+        component,
+        ResourceKind::NonFungible,
+        staking::OWNER_BADGE,
+    );
+    let [] = b.call(founder, "deposit-nf", (badge.resource_is(owner_badge),));
     let graph = b.build().expect("every output is consumed");
 
     let tree = EnvelopeTree {
