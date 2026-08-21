@@ -35,7 +35,7 @@ use hyperscale_types::{
     TxHash, Verified, compute_merkle_root, install_protocol_statics,
 };
 use hyperscale_vm_effects::{
-    Declaration, InstanceRegistry, NodeCall, PackageHash, PrefixShardResolver, admit_tree,
+    ChainRecords, Declaration, NodeCall, PackageHash, PrefixShardResolver, admit_tree,
     package_hash, route_tree,
 };
 use hyperscale_vm_kernel::{
@@ -448,7 +448,7 @@ impl Executor {
     #[must_use]
     pub fn instance_known(&self, instance: Address) -> bool {
         CallTarget::try_from(instance)
-            .is_ok_and(|target| self.world.instances.load().get(target).is_some())
+            .is_ok_and(|target| self.world.instances.record(target).is_some())
     }
 
     /// Derive one transaction's invocations, effect set, and nullifiers
@@ -857,7 +857,7 @@ struct BatchInputs<'a> {
     base: &'a TickBaseline,
     locality: &'a Locality,
     pools: &'a PoolRegistry,
-    instances: &'a InstanceRegistry,
+    instances: &'a dyn ChainRecords,
     staking_package: PackageHash,
 }
 
@@ -1158,7 +1158,7 @@ impl Executor {
                     base: &base,
                     locality: &locality,
                     pools: &self.world.pools,
-                    instances: &self.world.instances.load(),
+                    instances: &self.records(),
                     staking_package: self.world.staking_package,
                 },
                 &mut fold,
