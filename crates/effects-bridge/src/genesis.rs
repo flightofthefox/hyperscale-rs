@@ -114,7 +114,7 @@ impl World {
     pub fn fork(&self) -> Self {
         Self {
             cache: PackageCache::new((*self.cache.load()).clone()),
-            instances: InstanceCache::new((*self.instances.load()).clone()),
+            instances: self.instances.forked(),
             account_package: self.account_package,
             staking_package: self.staking_package,
             pools: self.pools.clone(),
@@ -323,7 +323,7 @@ mod tests {
         assert!(world.cache.load().get(world.account_package).is_some());
         for address in [test_principal(0x11), test_principal(0x22)] {
             assert_eq!(
-                world.instances.load().get(address).map(|m| m.package),
+                world.instances.record(address.into()).map(|m| m.package),
                 Some(world.account_package)
             );
         }

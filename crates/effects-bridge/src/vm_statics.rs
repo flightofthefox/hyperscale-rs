@@ -34,6 +34,7 @@ use hyperscale_vm_types::{
     Address, CallTarget, EffectSet, EffectTarget, Mode, PrincipalAddr, ResourceAddr, SchemeId,
     SubstateKey,
 };
+use im::{OrdMap, Vector};
 
 use crate::ProtocolHasher;
 use crate::artifact::admit_package;
@@ -395,7 +396,7 @@ pub trait LocalCells: Send + Sync {
 /// question of cost and not of meaning.
 pub struct NodeRecords {
     packages: Arc<MetadataCache>,
-    instances: Arc<InstanceRegistry>,
+    instances: Arc<Resident>,
     /// Where a cache miss is looked for, and where what it finds is put
     /// back so the next derivation reads it from memory.
     cells: Option<Arc<dyn LocalCells>>,
@@ -498,26 +499,121 @@ pub fn record_address(record: &[u8]) -> Option<Address> {
     Some(meta.address(&ProtocolHasher).address())
 }
 
-/// The instance registry: what the chain answers a call target with,
-/// grown from committed state.
+/// How many grown records a node holds before it starts letting the
+/// oldest go.
 ///
-/// The same shape as [`PackageCache`] and for the same reasons — a
-/// record is immutable once sealed, so two readers hold the same thing
-/// and a reader never waits on the commit path.
-#[derive(Clone, Debug)]
-pub struct InstanceCache(Arc<ArcSwap<InstanceRegistry>>);
+/// A bound rather than a horizon, because instances outnumber packages
+/// by orders of magnitude and a node that kept every record the chain
+/// ever created would hold a copy of a growing share of state in memory
+/// forever. What makes a bound safe is that nothing is lost by it: a
+/// record for a prefix this node serves is read back from the cell that
+/// sealed it, and one for a prefix it does not serve is fetched from the
+/// shard that does.
+pub const MAX_RESIDENT_INSTANCES: usize = 1 << 16;
 
-impl InstanceCache {
-    /// A registry seeded with the instances a cold start already knows.
+/// The records a node is holding, and the order it lets them go in.
+///
+/// Immutable, so seating one leaves every pinned reader's view intact —
+/// and shared structurally, so leaving it intact costs a handful of
+/// nodes rather than a copy of the map.
+#[derive(Clone, Debug)]
+pub struct Resident {
+    /// The blueprint serving every principal, and the instances genesis
+    /// seated. Never let go: a genesis pool on a shard this node does
+    /// not serve is answered by neither its state nor, usefully, a
+    /// fetch — and the set is small and identical on every node.
+    seeded: Arc<InstanceRegistry>,
+    /// What commits and fetches have added since.
+    grown: OrdMap<Address, Arc<InstanceMeta>>,
+    /// The order `grown` was filled in, oldest first.
+    ///
+    /// Insertion order rather than use: recording a use would mean
+    /// writing on the read path, which is every admission on the node.
+    /// A record that is still wanted after its turn comes up is read
+    /// back and seated afresh, so being busy keeps a record resident
+    /// without anything having to measure it.
+    order: Vector<Address>,
+    capacity: usize,
+}
+
+impl Resident {
+    /// The record serving a call target, if this node is holding one.
     #[must_use]
-    pub fn new(seed: InstanceRegistry) -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(seed)))
+    pub fn record(&self, target: CallTarget) -> Option<Arc<InstanceMeta>> {
+        if let Some(seeded) = self.seeded.record(target) {
+            return Some(seeded);
+        }
+        match target {
+            CallTarget::Principal(_) => None,
+            CallTarget::Component(address) => self.grown.get(&address.address()).cloned(),
+        }
     }
 
-    /// The instances the chain currently answers for.
+    /// This world with `meta` seated at `address`, and whatever the
+    /// bound leaves no room for let go.
+    fn seated(&self, address: Address, meta: InstanceMeta) -> Self {
+        let mut next = self.clone();
+        next.grown.insert(address, Arc::new(meta));
+        next.order.push_back(address);
+        while next.order.len() > next.capacity {
+            let Some(oldest) = next.order.pop_front() else {
+                break;
+            };
+            next.grown.remove(&oldest);
+        }
+        next
+    }
+}
+
+/// The instance registry: what the chain answers a call target with,
+/// grown from committed state and bounded.
+///
+/// The same shape as [`PackageCache`] — a record is immutable once
+/// sealed, so two readers hold the same thing and a reader never waits
+/// on the commit path — with a bound beneath it, because there are
+/// vastly more components than packages and no node needs every one of
+/// them in memory to serve the ones it is asked about.
+#[derive(Clone, Debug)]
+pub struct InstanceCache(Arc<ArcSwap<Resident>>);
+
+impl InstanceCache {
+    /// A registry seeded with the instances a cold start already knows,
+    /// at the default bound.
     #[must_use]
-    pub fn load(&self) -> Arc<InstanceRegistry> {
+    pub fn new(seed: InstanceRegistry) -> Self {
+        Self::bounded(seed, MAX_RESIDENT_INSTANCES)
+    }
+
+    /// [`Self::new`] holding at most `capacity` grown records.
+    #[must_use]
+    pub fn bounded(seed: InstanceRegistry, capacity: usize) -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(Resident {
+            seeded: Arc::new(seed),
+            grown: OrdMap::new(),
+            order: Vector::new(),
+            capacity,
+        })))
+    }
+
+    /// The instances this node currently answers for.
+    #[must_use]
+    pub fn load(&self) -> Arc<Resident> {
         self.0.load_full()
+    }
+
+    /// A second node's copy: the same records, in a cache that shares
+    /// nothing either side goes on to hold or let go.
+    #[must_use]
+    pub fn forked(&self) -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(Resident::clone(
+            &self.load(),
+        ))))
+    }
+
+    /// The record serving `target`, if this node is holding one.
+    #[must_use]
+    pub fn record(&self, target: CallTarget) -> Option<Arc<InstanceMeta>> {
+        self.load().record(target)
     }
 
     /// Register `meta` at the address it derives, unless it is already
@@ -527,14 +623,12 @@ impl InstanceCache {
     /// registered at the address its own contents derive, so a second
     /// one at that address is the same record.
     fn seat(&self, hasher: &dyn Hasher, meta: &InstanceMeta) {
-        if self.load().get(meta.address(hasher)).is_some() {
+        let address = meta.address(hasher);
+        if self.load().record(address.into()).is_some() {
             return;
         }
-        self.0.rcu(|current| {
-            let mut next = InstanceRegistry::clone(current);
-            next.create(hasher, meta.clone());
-            next
-        });
+        self.0
+            .rcu(|current| current.seated(address.address(), meta.clone()));
     }
 
     /// Seat a record verified elsewhere — read out of a committed cell
@@ -919,7 +1013,7 @@ mod tests {
         let instances = InstanceCache::new(InstanceRegistry::new());
         let packages = PackageCache::new(MetadataCache::new());
         assert!(
-            instances.load().get(address).is_none(),
+            instances.record(address.into()).is_none(),
             "the cache starts holding nothing"
         );
 
@@ -930,7 +1024,83 @@ mod tests {
         assert_eq!(*answered, meta);
 
         // Seated on the way past, so the read is paid once.
-        assert_eq!(instances.load().get(address), Some(&meta));
+        assert_eq!(instances.record(address.into()).as_deref(), Some(&meta));
+    }
+
+    /// A node past its bound lets the oldest record go, and answers for
+    /// it again from the cell that sealed it.
+    ///
+    /// The whole of what makes the bound safe: nothing a node drops is
+    /// lost, so the cache is sized for what it is asked about rather
+    /// than for everything the chain has ever created.
+    #[test]
+    fn a_record_past_the_bound_is_let_go_and_read_back() {
+        let record_at = |salt: u8| InstanceMeta {
+            package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
+            config: Vec::new(),
+            salt: Hash32([salt; 32]),
+        };
+        let oldest = record_at(1);
+        let address = oldest.address(&ProtocolHasher);
+
+        let instances = InstanceCache::bounded(InstanceRegistry::new(), 2);
+        for salt in 1..=3 {
+            instances.seat_record(&record_at(salt));
+        }
+        assert!(
+            instances.record(address.into()).is_none(),
+            "the third record past a bound of two lets the first go"
+        );
+        assert!(
+            instances
+                .record(record_at(3).address(&ProtocolHasher).into())
+                .is_some(),
+            "and the newest stays"
+        );
+
+        // The cell that sealed it still answers, so the node resolves
+        // the target it just stopped holding.
+        let key = config_key(address);
+        let cells = Arc::new(OneCell {
+            key,
+            value: hbor_to_vec(&oldest).expect("a record encodes"),
+        });
+        let packages = PackageCache::new(MetadataCache::new());
+        let chain = NodeRecords::pinned(&packages, &instances, Some(cells));
+        assert_eq!(
+            chain.instance(address.into()).as_deref(),
+            Some(&oldest),
+            "a record let go is read back from its own cell"
+        );
+    }
+
+    /// What genesis seated is never let go: a pool on a shard this node
+    /// does not serve is answered by neither its state nor a fetch it
+    /// has any reason to make.
+    #[test]
+    fn the_genesis_seed_outlives_the_bound() {
+        let seeded = InstanceMeta {
+            package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
+            config: vec![Value::U64(1)],
+            salt: Hash32([0xEE; 32]),
+        };
+        let address = seeded.address(&ProtocolHasher);
+        let mut seed = InstanceRegistry::new();
+        seed.create(&ProtocolHasher, seeded.clone());
+
+        let instances = InstanceCache::bounded(seed, 1);
+        for salt in 1..=4 {
+            instances.seat_record(&InstanceMeta {
+                package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
+                config: Vec::new(),
+                salt: Hash32([salt; 32]),
+            });
+        }
+        assert_eq!(
+            instances.record(address.into()).as_deref(),
+            Some(&seeded),
+            "the bound is over what a node grew, not over what it was born with"
+        );
     }
 
     /// Bytes at the leaf that derive some other address are not this
@@ -962,7 +1132,7 @@ mod tests {
             "a record derives the address it is admitted at, or none"
         );
         assert!(
-            instances.load().get(address).is_none(),
+            instances.record(address.into()).is_none(),
             "and nothing it refused is seated"
         );
     }
@@ -1595,8 +1765,7 @@ mod tests {
         assert!(cache.absorb_cell(address, config_key(address).local.0, &record));
         assert!(
             cache
-                .load()
-                .get(CallTarget::try_from(address).unwrap())
+                .record(CallTarget::try_from(address).unwrap())
                 .is_some()
         );
 
@@ -1612,8 +1781,7 @@ mod tests {
         assert!(!cache.absorb_cell(elsewhere, config_key(elsewhere).local.0, &record));
         assert!(
             cache
-                .load()
-                .get(CallTarget::try_from(elsewhere).unwrap())
+                .record(CallTarget::try_from(elsewhere).unwrap())
                 .is_none(),
             "a record deriving another address seats nothing"
         );

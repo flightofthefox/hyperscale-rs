@@ -43,7 +43,7 @@ use hyperscale_types::{
     BeaconWitnessEvent, ConsensusPublicKey, ConsensusSignature, Epoch, Event, NetworkParams,
     ParamProposal, ParamVote, ReshapeThresholds, Stake, StakePoolId, ValidatorId,
 };
-use hyperscale_vm_effects::{InstanceRegistry, PackageHash};
+use hyperscale_vm_effects::{ChainRecords, PackageHash};
 use hyperscale_vm_stdlib::staking as pool;
 use hyperscale_vm_types::{Address, ComponentAddr};
 
@@ -111,7 +111,7 @@ impl PoolRegistry {
 pub fn witness_from_event(
     event: &Event,
     pools: &PoolRegistry,
-    instances: &InstanceRegistry,
+    chain: &dyn ChainRecords,
     staking_package: PackageHash,
 ) -> Option<BeaconWitnessEvent> {
     let pool_id = pools.pool_of(event.emitter)?;
@@ -123,7 +123,7 @@ pub fn witness_from_event(
     // An emitter is whatever ran, so its class is checked here rather
     // than assumed: only a component emits a pool's events.
     let emitter = ComponentAddr::try_from(event.emitter).ok()?;
-    if instances.get(emitter)?.package != staking_package {
+    if chain.instance(emitter.into())?.package != staking_package {
         return None;
     }
     // Decoded through the emitting package's own event types, so what
@@ -213,7 +213,7 @@ const fn proposal_of(vote: &pool::ParamVote) -> ParamProposal {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::CONSENSUS_PUBLIC_KEY_BYTES;
-    use hyperscale_vm_effects::{Hash32, InstanceMeta};
+    use hyperscale_vm_effects::{Hash32, InstanceMeta, InstanceRegistry, Records};
     use hyperscale_vm_types::{Address, ComponentAddr};
 
     use super::*;
@@ -236,13 +236,13 @@ mod tests {
         )
     }
 
-    fn world() -> (PoolRegistry, InstanceRegistry, ComponentAddr, ComponentAddr) {
-        let mut instances = InstanceRegistry::new();
-        let pool = instance(&mut instances, 1);
-        let impostor = instance(&mut instances, 2);
+    fn world() -> (PoolRegistry, Records, ComponentAddr, ComponentAddr) {
+        let mut chain = Records::new();
+        let pool = instance(&mut chain.instances, 1);
+        let impostor = instance(&mut chain.instances, 2);
         let mut pools = PoolRegistry::new();
         pools.register(pool, StakePoolId::new(POOL_ID));
-        (pools, instances, pool, impostor)
+        (pools, chain, pool, impostor)
     }
 
     fn event(emitter: impl Into<Address>, event_type: u32, amount: u128) -> Event {

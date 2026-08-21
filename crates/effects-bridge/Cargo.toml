@@ -8,6 +8,10 @@ description = "The workspace's binding to the VM effect vocabulary: protocol has
 [dependencies]
 arc-swap.workspace = true
 blake3.workspace = true
+# Immutable maps with structural sharing: the instance cache is an
+# `ArcSwap` of a snapshot, so seating a record has to leave every pinned
+# reader's view intact without copying it.
+im.workspace = true
 hyperscale-types.workspace = true
 hyperscale-hbor.workspace = true
 hyperscale-vm-effects.workspace = true
