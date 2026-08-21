@@ -31,7 +31,7 @@ use hyperscale_vm_effects::{
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder};
-use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, STAKING_COMPONENT, account, staking};
+use hyperscale_vm_stdlib::{STAKING_COMPONENT, account, staking};
 use hyperscale_vm_types::{Address, CollectionId, amount_cell, encode_amount};
 
 /// The two accounts the transfer cases move funds between, as signing
@@ -1274,9 +1274,9 @@ fn a_committed_publish_grows_the_cache_that_routing_reads() {
     // A package the world has never seen: the stdlib artifact with its
     // metadata attached a second time under a different publisher would
     // be the same bytes, so vary the metadata to vary the address.
-    let mut metadata = published_account_metadata();
+    let mut metadata = published_metadata();
     metadata.events.push("republished".into());
-    let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
+    let artifact = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
 
     let cache = executor.packages();
@@ -1317,11 +1317,17 @@ fn a_committed_publish_grows_the_cache_that_routing_reads() {
 /// fixture drops the claim rather than the tests asserting a publish the
 /// gate does not allow.
 fn published_account_artifact() -> Vec<u8> {
-    attach_metadata(ACCOUNT_COMPONENT, &published_account_metadata()).expect("attaches")
+    attach_metadata(STAKING_COMPONENT, &published_metadata()).expect("attaches")
 }
 
-fn published_account_metadata() -> PackageMetadata {
-    let mut metadata = account::metadata();
+/// The metadata a publisher's artifact carries.
+///
+/// The staking package rather than the account's: a published package
+/// serves instances, and the gate holds one to declaring the seal its
+/// components come up through — which the account, serving principals,
+/// has no reason to carry.
+fn published_metadata() -> PackageMetadata {
+    let mut metadata = staking::metadata();
     for signature in metadata.methods.values_mut() {
         if signature.totality == Totality::Total {
             signature.totality = Totality::Infallible;
@@ -1346,9 +1352,9 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
     let payer = fee_payer(7);
     let executor = executor(ExecutionMode::Serial);
 
-    let mut metadata = published_account_metadata();
+    let mut metadata = published_metadata();
     metadata.events.push("compiled".into());
-    let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
+    let artifact = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
     assert!(
         !executor.package_code_settled(package),
@@ -1378,9 +1384,9 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
 fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
     let executor = executor(ExecutionMode::Serial);
 
-    let mut metadata = published_account_metadata();
+    let mut metadata = published_metadata();
     metadata.events.push("reseeded".into());
-    let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
+    let artifact = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
 
     // What a restarting host replays from its stores' package indices:
@@ -1402,7 +1408,7 @@ fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
     // whatever the store holds, so one unreadable entry must not be the
     // end of the reseed.
     metadata.events.push("after the refusal".into());
-    let next = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
+    let next = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
     executor.install_artifact(&next);
     await_code_settled(&executor, package_hash(&ProtocolHasher, &next));
 }
@@ -1416,9 +1422,9 @@ fn only_a_cell_that_addresses_its_own_contents_publishes() {
     let executor = executor(ExecutionMode::Serial);
     let cache = executor.packages();
 
-    let mut metadata = published_account_metadata();
+    let mut metadata = published_metadata();
     metadata.events.push("smuggled".into());
-    let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
+    let artifact = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
     let publisher = fee_payer(11);
 
