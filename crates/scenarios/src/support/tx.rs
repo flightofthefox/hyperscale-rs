@@ -1400,14 +1400,10 @@ pub fn build_securify_tx(
 
 /// Every stake pool any scenario in this crate seats.
 ///
-/// The VM statics are process-global and first-installed-wins, so a test
-/// binary sharing one process must install a world covering every
-/// scenario it will run — a pool is an instance the statics must
-/// resolve, so a binary whose first cluster seats none would leave every
-/// later delegation failing admission with `no instance`, which reads as
-/// a defect in whatever that scenario was testing. Accounts need no such
-/// list: a principal address is resolved by its class, so every scenario
-/// address is callable against any cluster's world. Seating a pool
+/// One list for the whole crate because the client that types every
+/// scenario's graphs is built once: a pool is an instance keyed by its
+/// configuration, so unlike an account — resolved by its address class —
+/// it has to be in the world a call is typed against. Seating a pool
 /// writes no genesis state and a pool nobody delegates to emits nothing,
 /// so recognising one everywhere costs a registry entry.
 #[must_use]

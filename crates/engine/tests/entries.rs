@@ -3,9 +3,8 @@
 //! ticks, and the custody gate reading possession from the materialized
 //! baseline.
 //!
-//! Its own binary because the VM statics install once per process: every
-//! executor here shares one world of funded, registered accounts, with
-//! one of them seeded holding instances at genesis.
+//! Every case here runs against one world of funded, registered
+//! accounts, with one of them seeded holding instances at genesis.
 
 use std::sync::{Arc, LazyLock};
 

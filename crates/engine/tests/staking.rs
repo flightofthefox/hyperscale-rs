@@ -1,10 +1,8 @@
 //! The beacon's control plane on the engine: a delegation to a seated
 //! stake pool arrives in the executing shard's `beacon_witness_events`.
 //!
-//! Its own binary rather than a case in `transfer`, because the VM statics
-//! install once per process and first-installed-wins: a world with a stake
-//! pool in it is a different world, and sharing a process would make
-//! whichever executor was built first decide what the other one can see.
+//! Every case here runs against a world with a stake pool seated in it,
+//! which is what makes the delegation's events beacon facts.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};

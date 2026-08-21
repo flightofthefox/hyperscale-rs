@@ -25,7 +25,6 @@ use hyperscale_production::{
     LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, StorageFactory,
 };
 use hyperscale_scenarios::query::chain_fate;
-use hyperscale_scenarios::tx::world_pools;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
@@ -538,11 +537,7 @@ fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
         temp_storage_dir(args.temp_dir),
     )
     .beacon_chain_config(args.beacon_chain_config)
-    .rpc_status(Arc::clone(&rpc_status))
-    // Unconditional, including for clusters that seat no pools at all:
-    // the statics install once per process and the first cluster built
-    // wins, and this binary runs every scenario serially in one.
-    .world_pools(world_pools());
+    .rpc_status(Arc::clone(&rpc_status));
     if let Some(cfg) = args.genesis_config {
         builder = builder.genesis_config(cfg);
     }

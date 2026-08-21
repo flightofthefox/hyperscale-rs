@@ -81,10 +81,10 @@ impl Simulator {
         let accounts =
             AccountPool::generate(u64::from(config.num_shards), config.accounts_per_shard)?;
 
-        // The world the process VM statics install has to name every
-        // account the workload will transact with: statics are installed
-        // once and first-writer-wins, so an account added afterwards
-        // would fail admission with no instance at its address.
+        // The world the cluster is born with has to name every account
+        // the workload will transact with: genesis fixes it, so an
+        // account added afterwards would fail admission with no instance
+        // at its address.
         let mut network_config = config.to_sim_config();
         network_config.accounts = accounts.all_genesis_balances(config.initial_balance);
         let runner = SimulationRunner::new(&network_config, config.seed);

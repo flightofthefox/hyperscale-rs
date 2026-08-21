@@ -13,8 +13,8 @@ use hyperscale_types::{Hash, SubstateKey, protocol_statics, protocol_statics_ins
 /// and another way at import is an index a turned-over committee cannot
 /// serve from.
 ///
-/// Without installed statics (bare storage tests) nothing is a package,
-/// matching the cache-absorption seam.
+/// Without the protocol answers installed (bare storage tests) nothing
+/// is a package, matching the cache-absorption seam.
 #[must_use]
 pub fn package_of_cell(key: SubstateKey, value: &[u8]) -> Option<Hash> {
     if !protocol_statics_installed() {

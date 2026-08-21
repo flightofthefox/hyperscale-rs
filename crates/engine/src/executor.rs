@@ -342,8 +342,8 @@ impl Executor {
 
     /// The published-package cache this engine routes against.
     ///
-    /// Shared with the installed statics rather than copied, so a package
-    /// a committed block publishes is visible to admission and to
+    /// Shared with this engine's derivation rather than copied, so a
+    /// package a committed block publishes is visible to admission and to
     /// execution at the same instant.
     #[must_use]
     pub const fn packages(&self) -> &PackageCache {

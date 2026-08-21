@@ -134,17 +134,6 @@ pub struct SimConfig {
     /// Stake pools the beacon folds facts for: the pool instance's owner
     /// prefix and the identifier it is folded under.
     pub pools: Vec<StakePoolSeat>,
-    /// Pool instances the process's VM statics must resolve, when that is
-    /// wider than what this cluster seats.
-    ///
-    /// The statics install once per process and the first installation
-    /// wins, so a test binary running several clusters has to register
-    /// every pool any of them will reach — otherwise the first cluster
-    /// fixes the instance registry and the rest fail admission. A pool is
-    /// a real instance keyed by its configuration, so unlike an account
-    /// it cannot be resolved by class alone. Empty means "the same pools
-    /// this cluster seats".
-    pub world_pools: Vec<StakePoolSeat>,
     /// The batch executor's group scheduling. Receipts are
     /// schedule-invariant, so this cannot change any outcome — the
     /// serial-vs-parallel A/B constructs one cluster per mode and
@@ -175,7 +164,6 @@ impl Default for SimConfig {
             crypto_scheme: CryptoScheme::default(),
             accounts: Vec::new(),
             pools: Vec::new(),
-            world_pools: Vec::new(),
             execution_mode: ExecutionMode::Serial,
             packages: GenesisPackages::protocol(),
         }
@@ -394,19 +382,13 @@ impl SimulationRunner {
         );
         let rng = ChaCha8Rng::seed_from_u64(seed);
 
-        // One engine per host, over one shared world. The process has a
-        // single metadata cache — derivation reads it through the VM
-        // statics, which install once — but compiled code is per host,
-        // so a host that did not commit a publish holds none of its code
-        // until its own fetch lands it. That is what puts the artifact
-        // acquisition path under test instead of around it.
-        let world_pools = if network_config.world_pools.is_empty() {
-            &network_config.pools
-        } else {
-            &network_config.world_pools
-        };
+        // One engine per host, over one shared world and one shared
+        // derivation — but compiled code is per host, so a host that did
+        // not commit a publish holds none of its code until its own fetch
+        // lands it. That is what puts the artifact acquisition path under
+        // test instead of around it.
         let engine = Arc::new(Executor::with_genesis(
-            world_pools,
+            &network_config.pools,
             &network_config.packages,
             network_config.execution_mode,
         ));
