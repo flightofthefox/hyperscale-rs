@@ -40,7 +40,7 @@ pub use executor::{Executor, artifact_package, instance_of_record};
 pub use genesis::{
     GenesisConfig, World, XRD, genesis_package_facts, genesis_world, genesis_writes,
 };
-pub use hyperscale_effects_bridge::account_address;
+pub use hyperscale_effects_bridge::{LocalCells, account_address};
 pub use hyperscale_vm_kernel::ExecutionMode;
 pub use output::ExecutedTx;
 pub use preview::{PreviewGrants, PreviewInputs, PreviewOutcome, PreviewReport, ResourceChange};

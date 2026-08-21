@@ -16,15 +16,15 @@
 //! transaction in a different block may abort differently.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use blake3::hash as blake3_hash;
 use hyperscale_effects_bridge::vm_statics::{
     PackageCache, config_key, package_key, principal_for, record_address,
 };
 use hyperscale_effects_bridge::{
-    BridgeStatics, NodeRecords, PoolRegistry, ProtocolHasher, admit_package, decode_tree,
-    envelope_identity, witness_from_event,
+    BridgeStatics, LocalCells, NodeRecords, PoolRegistry, ProtocolHasher, admit_package,
+    decode_tree, envelope_identity, witness_from_event,
 };
 use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
@@ -300,11 +300,13 @@ impl Executor {
             cache: world.cache.clone(),
             instances: world.instances.clone(),
             artifact_sink: Some(Arc::new(backend.absorber())),
+            cells: OnceLock::new(),
         });
         install_protocol_statics(Box::new(BridgeStatics {
             cache: world.cache.clone(),
             instances: world.instances.clone(),
             artifact_sink: None,
+            cells: OnceLock::new(),
         }));
         Self {
             world,
@@ -342,6 +344,7 @@ impl Executor {
             cache: world.cache.clone(),
             instances: world.instances.clone(),
             artifact_sink: Some(Arc::new(backend.absorber())),
+            cells: OnceLock::new(),
         });
         Self {
             world,
@@ -365,7 +368,14 @@ impl Executor {
     /// admission derives through.
     #[must_use]
     pub fn records(&self) -> NodeRecords {
-        self.world.records()
+        self.derivation.records()
+    }
+
+    /// Tell this engine where its node's committed state is, so a record
+    /// the cache does not hold is looked for there before it is given up
+    /// on. Installed by the host, which knows what it serves.
+    pub fn install_cells(&self, cells: Arc<dyn LocalCells>) {
+        self.derivation.install_cells(cells);
     }
 
     /// Seed one committed artifact from a store's package index: metadata
