@@ -31,7 +31,7 @@ use hyperscale_vm_effects::{
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder};
-use hyperscale_vm_stdlib::{STAKING_COMPONENT, account, staking};
+use hyperscale_vm_stdlib::{STAKING_COMPONENT, account, instantiate, staking};
 use hyperscale_vm_types::{Address, CollectionId, amount_cell, encode_amount};
 
 /// The two accounts the transfer cases move funds between, as signing
@@ -329,8 +329,7 @@ fn with_lottery(accounts: &[(PrincipalAddr, u128)], executor: &Executor) -> MapD
     let composed = Composed::new(&chain, &[lottery_meta()], &ProtocolHasher);
     let round = lottery_meta().address(&ProtocolHasher);
     let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
-    lottery::Lottery::at(round)
-        .instantiate(&mut root)
+    instantiate(&mut root, fee_payer(SEALER_SEED), round)
         .expect("a derivable round answers its seal");
     env.instance(lottery_meta());
     env.seal(root)

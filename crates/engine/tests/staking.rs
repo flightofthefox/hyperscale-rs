@@ -30,7 +30,7 @@ use hyperscale_vm_effects::{
     resource_record_key,
 };
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, TypedError};
-use hyperscale_vm_stdlib::{INSTANTIATE, account, instantiate, staking};
+use hyperscale_vm_stdlib::{account, instantiate, staking};
 use hyperscale_vm_types::{Address, CallTarget, CollectionId};
 
 /// The identifier the beacon folds the seated pool under.
@@ -427,13 +427,10 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
     let pool = meta.address(&ProtocolHasher);
     let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
     // The composition every bring-up writes: the seal, and the supply it
-    // yields filed where the founder keeps it. Which of those nodes
-    // exist is the package's own declaration to say.
-    let signature = staking::metadata()
-        .methods
-        .remove(INSTANTIATE)
-        .expect("an instance-serving package declares its seal");
-    instantiate(&mut root, from, pool, &signature).expect("a derivable pool answers its seal");
+    // yields filed where the founder keeps it. Which method seals and
+    // which of those nodes exist are the package's own declaration to
+    // say.
+    instantiate(&mut root, from, pool).expect("a derivable pool answers its seal");
     env.instance(meta);
     env.seal(root)
         .expect("the root declares nothing to discharge");
