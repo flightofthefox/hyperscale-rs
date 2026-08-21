@@ -105,7 +105,8 @@ fn storage() -> SimShardStorage {
 /// `from.withdraw-nf(NF, ids) -> to.deposit-nf(..)`, signed by `from`.
 fn signed_nf_transfer(from: u8, to: u8, ids: &[u64]) -> Transaction {
     let cache = client().cache();
-    let mut b = client().builder(&cache);
+    let instances = client().instances();
+    let mut b = client().builder(&cache, &instances);
     let proof = account::authorize(&mut b, principal(from)).expect("sign-in types");
     let funds = account::withdraw_nf(&mut b, proof, NF, ids).expect("withdraw-nf types");
     account::deposit_nf(&mut b, principal(to), funds).expect("deposit-nf types");
@@ -117,7 +118,8 @@ fn signed_nf_transfer(from: u8, to: u8, ids: &[u64]) -> Transaction {
 /// consumed by nothing — the gate's own verdict is the assertion.
 fn signed_present(who: u8, badge: ResourceAddr, id: u64) -> Transaction {
     let cache = client().cache();
-    let mut b = client().builder(&cache);
+    let instances = client().instances();
+    let mut b = client().builder(&cache, &instances);
     // The proof stays unpresented: nothing here needs its authority —
     // the gate's own verdict is what the test reads.
     let _ = account::present_instance(&mut b, principal(who), badge, id)

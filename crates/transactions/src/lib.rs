@@ -26,7 +26,7 @@ use hyperscale_types::{
     TransactionEnvelope,
 };
 use hyperscale_vm_effects::{
-    EnvelopeTree, IntentDecl, ManifestGraph, MetadataCache, Presented, StoredRule,
+    EnvelopeTree, InstanceRegistry, IntentDecl, ManifestGraph, MetadataCache, Presented, StoredRule,
 };
 use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
 use hyperscale_vm_stdlib::account;
@@ -104,11 +104,23 @@ impl Client {
 
     /// A typed builder over this client's world.
     ///
-    /// The cache is loaded by the caller because it is read behind an
-    /// `Arc` that has to outlive the builder borrowing it.
+    /// The cache and the registry are loaded by the caller because both
+    /// are read behind an `Arc` that has to outlive the builder
+    /// borrowing them.
     #[must_use]
-    pub fn builder<'a>(&'a self, cache: &'a MetadataCache) -> TypedBuilder<'a> {
-        TypedBuilder::new(cache, &self.world.instances, &ProtocolHasher)
+    pub fn builder<'a>(
+        &'a self,
+        cache: &'a MetadataCache,
+        instances: &'a InstanceRegistry,
+    ) -> TypedBuilder<'a> {
+        TypedBuilder::new(cache, instances, &ProtocolHasher)
+    }
+
+    /// The instances the chain answers for, for a caller opening its own
+    /// builder.
+    #[must_use]
+    pub fn instances(&self) -> Arc<InstanceRegistry> {
+        self.world.instances.load()
     }
 
     /// The published set, for a caller opening its own builder.
@@ -132,7 +144,8 @@ impl Client {
         amount: u128,
     ) -> Result<ManifestGraph, TypedError> {
         let cache = self.cache();
-        let mut b = self.builder(&cache);
+        let instances = self.instances();
+        let mut b = self.builder(&cache, &instances);
         let sender = account::authorize(&mut b, from)?;
         let funds = account::withdraw(&mut b, sender, *XRD, amount)?;
         account::deposit(&mut b, to, funds)?;
@@ -157,7 +170,8 @@ impl Client {
         recovery_delay_ms: u64,
     ) -> Result<ManifestGraph, TypedError> {
         let cache = self.cache();
-        let mut b = self.builder(&cache);
+        let instances = self.instances();
+        let mut b = self.builder(&cache, &instances);
         let owner = account::authorize(&mut b, account)?;
         account::securify_uniform(
             &mut b,
@@ -329,7 +343,7 @@ mod tests {
             &graph,
             test_principal(0x11),
             &cache,
-            &client.world().instances,
+            &client.instances(),
             &ProtocolHasher,
         )
         .expect("a built transfer admits");

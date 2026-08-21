@@ -26,8 +26,8 @@ use hyperscale_types::{
     absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
-    AbiParam, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, PackageHash, PackageMetadata,
-    Totality, Value, package_hash,
+    AbiParam, EnvelopeTree, Hash32, InstanceMeta, InstanceRegistry, IntentDecl, PackageHash,
+    PackageMetadata, Totality, Value, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder};
@@ -61,9 +61,6 @@ fn bob() -> PrincipalAddr {
 struct MapDb(BTreeMap<SubstateKey, Vec<u8>>);
 
 impl MapDb {
-    /// Genesis state, with the lottery this binary settles rounds on
-    /// seated beside it: its seal is committed state, as a seated pool's
-    /// is, so the fence on every draw finds the component actual.
     fn genesis(accounts: &[(PrincipalAddr, u128)]) -> Self {
         let writes = genesis_writes(accounts, &[], &packages());
         let mut map = BTreeMap::new();
@@ -71,12 +68,6 @@ impl MapDb {
             let value = change.clone().expect("genesis writes are Set-only");
             map.insert(*key, value);
         }
-        map.insert(
-            config_key(lottery_addr()),
-            lottery_meta()
-                .leaf_bytes()
-                .expect("the lottery's record encodes"),
-        );
         Self(map)
     }
 }
@@ -225,7 +216,8 @@ fn signed_transfer_under_bound(
 ) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let cache = client().cache();
-    let mut b = client().builder(&cache);
+    let instances = client().instances();
+    let mut b = client().builder(&cache, &instances);
     let sender = account::authorize(&mut b, from).expect("an account signs in");
     let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");
     account::deposit(&mut b, to, funds.min(min)).expect("an account deposits");
@@ -308,20 +300,58 @@ fn signed_draw(seed: u8) -> Transaction {
 fn signed_draw_with_fee(seed: u8, max_fee: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let cache = client().cache();
-    // The builder resolves targets against the registry it is given, so
-    // the presented record is composed in first — exactly as admission
-    // composes it from the tree.
-    let mut instances = client().world().instances.clone();
+    // The composer knows the round's record and types the call against
+    // it; the envelope carries nothing, because the chain seated the
+    // component and answers for it — see [`MapDb::genesis`].
+    let mut instances = InstanceRegistry::clone(&client().instances());
     let lottery_addr = instances.create(&ProtocolHasher, lottery_meta());
     let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
     lottery::Lottery::at(lottery_addr)
         .draw(&mut root, 64)
         .expect("a lottery answers a draw");
-    env.instance(lottery_meta());
     env.seal(root)
         .expect("the root declares nothing to discharge");
     let tree = env.build().expect("the intent declares no hole");
     Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(max_fee)))
+}
+
+/// Genesis state with the lottery this binary draws on made actual.
+///
+/// Sealed by a transaction rather than seeded, because that is the only
+/// way a component becomes actual: the seal commits, and the commit is
+/// what teaches the chain to answer for the round every draw below
+/// names without carrying anything.
+fn with_lottery(accounts: &[(PrincipalAddr, u128)], executor: &Executor) -> MapDb {
+    // Paid by a signer of its own, so the ledger a caller is asserting
+    // about carries nothing the setup spent.
+    const SEALER_SEED: u8 = 0x5E;
+    let mut funded = accounts.to_vec();
+    funded.push((fee_payer(SEALER_SEED), 1_000_000));
+    let mut store = MapDb::genesis(&funded);
+    let key = Ed25519PrivateKey::from_bytes(&[SEALER_SEED; 32]).unwrap();
+    let cache = client().cache();
+    let mut instances = InstanceRegistry::clone(&client().instances());
+    let round = instances.create(&ProtocolHasher, lottery_meta());
+    let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
+    lottery::Lottery::at(round)
+        .instantiate(&mut root)
+        .expect("a derivable round answers its seal");
+    env.instance(lottery_meta());
+    env.seal(root)
+        .expect("the root declares nothing to discharge");
+    let tree = env.build().expect("the intent declares no hole");
+    let seal = Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(1_000_000)));
+    let executed = execute_batch_on(
+        &store,
+        executor,
+        &[Arc::new(Verified::<Transaction>::from_persisted(seal))],
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
+        panic!("the seal must settle: {:?}", executed[0].consensus);
+    };
+    store.apply(writes);
+    absorb_committed_cells([&executed[0].consensus]);
+    store
 }
 
 /// Execute `transactions` as a single-shard batch anchored on `reveal`.
@@ -330,7 +360,7 @@ fn execute_anchored(
     reveal: RevealChain,
     transactions: &[Arc<Verified<Transaction>>],
 ) -> Vec<ExecutedTx> {
-    let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (bob(), 50)]);
+    let snapshot_store = with_lottery(&[(alice(), 1_000), (bob(), 50)], executor);
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
@@ -804,7 +834,8 @@ fn a_call_that_never_touches_its_payers_vault_still_pays() {
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
         signed_draw_with_fee(ALICE_SEED, 10),
     ));
-    let executed = execute(&executor, &[tx]);
+    let store = with_lottery(&[(alice(), 1_000), (bob(), 50)], &executor);
+    let executed = execute_batch_on(&store, &executor, &[tx]);
     let ConsensusReceipt::Succeeded {
         writes: database_updates,
         ..
@@ -884,7 +915,7 @@ fn shared_payer_burns_accumulate_across_a_batch() {
         .collect();
     txs.sort_by_key(|tx| tx.hash());
 
-    let mut store = MapDb::genesis(&[(alice(), 1_000), (bob(), 50)]);
+    let mut store = with_lottery(&[(alice(), 1_000), (bob(), 50)], &executor);
     let executed = execute_batch_on(&store, &executor, &txs);
     for tx in &executed {
         let ConsensusReceipt::Succeeded { writes, .. } = &tx.consensus else {
@@ -1112,7 +1143,8 @@ fn a_two_recipient_fan_out_executes() {
     let executor = executor(ExecutionMode::Serial);
     let key = Ed25519PrivateKey::from_bytes(&[ALICE_SEED; 32]).unwrap();
     let cache = client().cache();
-    let mut b = client().builder(&cache);
+    let instances = client().instances();
+    let mut b = client().builder(&cache, &instances);
     for (to, amount) in [(bob(), 5u128), (fee_payer(7), 6)] {
         let sender = account::authorize(&mut b, alice()).expect("an account signs in");
         let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");

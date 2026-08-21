@@ -17,7 +17,7 @@ pub use hyperscale_vm_stdlib::{account_artifact, genesis_publisher, staking_arti
 use hyperscale_vm_stdlib::{protocol_artifacts, staking};
 use hyperscale_vm_types::Address;
 
-use crate::vm_statics::PackageCache;
+use crate::vm_statics::{InstanceCache, PackageCache};
 use crate::{PoolRegistry, ProtocolHasher, XRD, admit_protocol_package};
 
 /// The packages a network is born running.
@@ -71,8 +71,8 @@ impl GenesisPackages {
 pub struct World {
     /// Published package metadata, growing as blocks commit.
     pub cache: PackageCache,
-    /// Instance registrations.
-    pub instances: InstanceRegistry,
+    /// The instances the chain answers for, growing as blocks commit.
+    pub instances: InstanceCache,
     /// The stdlib account package's content address.
     pub account_package: PackageHash,
     /// The stdlib stake pool package's content address — the code a
@@ -144,7 +144,7 @@ pub fn genesis_world_with_pools(pools: &[StakePoolSeat], packages: &GenesisPacka
     }
     World {
         cache,
-        instances,
+        instances: InstanceCache::new(instances),
         account_package,
         staking_package,
         pools: registry,
@@ -285,7 +285,7 @@ mod tests {
         assert!(world.cache.load().get(world.account_package).is_some());
         for address in [test_principal(0x11), test_principal(0x22)] {
             assert_eq!(
-                world.instances.get(address).map(|m| m.package),
+                world.instances.load().get(address).map(|m| m.package),
                 Some(world.account_package)
             );
         }
