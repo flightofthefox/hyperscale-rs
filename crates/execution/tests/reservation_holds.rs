@@ -18,11 +18,11 @@ use hyperscale_engine::ExecutedTx;
 use hyperscale_execution::action_handlers::accumulate_tick_output;
 use hyperscale_storage::TickOutput;
 use hyperscale_types::{
-    Address, AddressClass, CollectionId, ConsensusReceipt, DeclaredKey, DeclaredRange, Derived,
-    ExecutionMetadata, GlobalReceiptHash, Hash, LocalKey, Mode, NetworkId, PrincipalAddr,
+    Address, AddressClass, CollectionId, ConsensusReceipt, DeclaredKey, DeclaredRange, Derivation,
+    Derived, ExecutionMetadata, GlobalReceiptHash, Hash, LocalKey, Mode, NetworkId, PrincipalAddr,
     RevealChain, Routing, SchemeId, StateWrites, SubstateKey, Transaction, TransactionBody,
-    TransactionEnvelope, TxHash, Verified, VmStatics, VmStaticsError, WeightedTimestamp,
-    declared_work, install_vm_statics,
+    TransactionEnvelope, TxHash, Verified, VmStaticsError, WeightedTimestamp, declared_work,
+    install_derivation,
 };
 
 /// The two amount cells every fixture transaction declares a reservation
@@ -49,7 +49,7 @@ const fn counterparty_vault() -> SubstateKey {
 /// a reservation targets an amount cell, which no range is.
 struct ReservingStatics;
 
-impl VmStatics for ReservingStatics {
+impl Derivation for ReservingStatics {
     fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError> {
         let written = DeclaredKey::Cell(SubstateKey {
             owner: Address::new([0x33; 31], AddressClass::Component),
@@ -98,7 +98,7 @@ impl VmStatics for ReservingStatics {
 /// A transaction distinguished only by `seed`; its declaration is fixed
 /// by [`ReservingStatics`].
 fn reserving_transaction(seed: u8) -> Arc<Verified<Transaction>> {
-    install_vm_statics(Box::new(ReservingStatics));
+    install_derivation(Box::new(ReservingStatics));
     let vm = TransactionEnvelope {
         body: TransactionBody::Call(vec![seed]),
         subintent_sigs: Vec::new(),

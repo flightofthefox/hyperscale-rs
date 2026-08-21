@@ -12,14 +12,14 @@ use crate::crypto::Ed25519PrivateKey;
 use crate::{
     AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
     BlockVoteMessage, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommitProof,
-    ConsensusPublicKey, ConsensusSignature, DeclaredKey, Derived, EnvelopeExt,
+    ConsensusPublicKey, ConsensusSignature, DeclaredKey, Derivation, Derived, EnvelopeExt,
     ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
-    NetworkDefinition, NetworkId, ProposerTimestamp, QuorumCertificate, Round, Routing,
-    ShardForkProof, ShardId, SignerBitfield, TickHalf, TickId, TimestampRange, TopologySnapshot,
-    Transaction, TransactionBody, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome,
-    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, VmStatics, VmStaticsError,
-    WeightedTimestamp, WitnessSources, compute_global_receipt_root, declared_work,
-    install_vm_statics, signed_bytes, vm_statics_installed,
+    NetworkDefinition, NetworkId, ProposerTimestamp, ProtocolStatics, QuorumCertificate, Round,
+    Routing, ShardForkProof, ShardId, SignerBitfield, TickHalf, TickId, TimestampRange,
+    TopologySnapshot, Transaction, TransactionBody, TransactionDecision, TransactionEnvelope,
+    TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
+    VmStaticsError, WeightedTimestamp, WitnessSources, compute_global_receipt_root, declared_work,
+    install_derivation, install_protocol_statics, signed_bytes, vm_statics_installed,
 };
 
 /// Create a test transaction the [`StubVmStatics`] derivation routes to
@@ -872,7 +872,7 @@ const fn stub_cell(owner: Address) -> DeclaredKey {
     DeclaredKey::substate(owner, [0u8; 16])
 }
 
-/// A deterministic [`VmStatics`](crate::VmStatics) stub for consensus-crate
+/// A deterministic [`Derivation`](crate::Derivation) stub for consensus-crate
 /// tests.
 ///
 /// The envelope's tree is a leading read count followed by that many
@@ -883,7 +883,7 @@ const fn stub_cell(owner: Address) -> DeclaredKey {
 /// [`stub_transaction_running`], with no effects-bridge dependency.
 struct StubVmStatics;
 
-impl VmStatics for StubVmStatics {
+impl Derivation for StubVmStatics {
     fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError> {
         let tree = vm.call_tree().unwrap_or_default();
         let Some((&read_count, prefixes)) = tree.split_first() else {
@@ -967,7 +967,9 @@ impl VmStatics for StubVmStatics {
             ),
         })
     }
+}
 
+impl ProtocolStatics for StubVmStatics {
     fn package_cell(&self, _owner: [u8; 32], local: [u8; 16], value: &[u8]) -> Option<Hash> {
         (local[0] == STUB_PACKAGE_MARKER)
             .then(|| Hash::from_hash_bytes(&[*value.first().unwrap_or(&0); 32]))
@@ -983,7 +985,8 @@ pub const STUB_PACKAGE_MARKER: u8 = 0xAB;
 /// effects-bridge derivation, never both.
 pub fn install_stub_vm_statics() {
     if !vm_statics_installed() {
-        install_vm_statics(Box::new(StubVmStatics));
+        install_derivation(Box::new(StubVmStatics));
+        install_protocol_statics(Box::new(StubVmStatics));
     }
 }
 

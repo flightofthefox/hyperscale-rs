@@ -1,5 +1,5 @@
 //! The envelope's static derivation: the tree wire codec and the
-//! [`VmStatics`] implementation admission verifies through.
+//! [`Derivation`] implementation admission verifies through.
 //!
 //! The envelope tree travels as canonical HBOR of the mirror types
 //! below — the vocabulary crate deliberately has no wire encoding, so
@@ -18,8 +18,8 @@ use std::sync::{Arc, LazyLock};
 use arc_swap::ArcSwap;
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_types::{
-    DeclaredKey, DeclaredRange, Derived, EnvelopeExt, Hash, MAX_STATE_ENTRIES_PER_TX, Routing,
-    TransactionEnvelope, VmStatics, VmStaticsError, declared_work,
+    DeclaredKey, DeclaredRange, Derivation, Derived, EnvelopeExt, Hash, MAX_STATE_ENTRIES_PER_TX,
+    ProtocolStatics, Routing, TransactionEnvelope, VmStaticsError, declared_work,
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
@@ -275,7 +275,7 @@ pub fn envelope_identity(vm: &TransactionEnvelope) -> ManifestHash {
 /// moment its cell commits, not from its first call.
 pub type ArtifactSink = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
-/// The bridge's [`VmStatics`]: `decode → admit → route` over the
+/// The bridge's [`Derivation`]: `decode → admit → route` over the
 /// process's genesis-static metadata.
 pub struct BridgeStatics {
     /// Published package metadata, growing as blocks commit.
@@ -560,7 +560,7 @@ impl BridgeStatics {
     }
 }
 
-impl VmStatics for BridgeStatics {
+impl Derivation for BridgeStatics {
     fn absorb_committed_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) {
         let Ok(owner) = Address::from_bytes(owner) else {
             return;
@@ -571,30 +571,6 @@ impl VmStatics for BridgeStatics {
             sink(value);
         }
         self.instances.absorb_cell(owner, local, value);
-    }
-
-    fn package_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> Option<Hash> {
-        let owner = Address::from_bytes(owner).ok()?;
-        committed_package(owner, local, value).map(|package| Hash::from(package.0))
-    }
-
-    fn rule_admits(
-        &self,
-        auth_cell: Option<&[u8]>,
-        payer: PrincipalAddr,
-        signer: PrincipalAddr,
-        clock_ms: u64,
-    ) -> bool {
-        // The verdict is the kernel gate's own, judged over the envelope
-        // signer alone and the primary — paying is governed by whatever
-        // governs `authorize`.
-        AuthCell::admits(
-            auth_cell.unwrap_or_default(),
-            payer.address(),
-            PRIMARY,
-            &[Presented::Identity(signer.into())],
-            clock_ms,
-        )
     }
 
     fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError> {
@@ -713,6 +689,32 @@ impl VmStatics for BridgeStatics {
             auth_cell_local: auth_key(vm.fee_payer).local.0,
             packages,
         })
+    }
+}
+
+impl ProtocolStatics for BridgeStatics {
+    fn package_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> Option<Hash> {
+        let owner = Address::from_bytes(owner).ok()?;
+        committed_package(owner, local, value).map(|package| Hash::from(package.0))
+    }
+
+    fn rule_admits(
+        &self,
+        auth_cell: Option<&[u8]>,
+        payer: PrincipalAddr,
+        signer: PrincipalAddr,
+        clock_ms: u64,
+    ) -> bool {
+        // The verdict is the kernel gate's own, judged over the envelope
+        // signer alone and the primary — paying is governed by whatever
+        // governs `authorize`.
+        AuthCell::admits(
+            auth_cell.unwrap_or_default(),
+            payer.address(),
+            PRIMARY,
+            &[Presented::Identity(signer.into())],
+            clock_ms,
+        )
     }
 }
 

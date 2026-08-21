@@ -32,7 +32,7 @@ use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Event, EventExt, EventRoot,
     ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, PrincipalAddr, ProvisionalHolds,
     RevealChain, Stake, StakePoolSeat, StateWrites, SubstateEntry, Transaction, TxHash, Verified,
-    compute_merkle_root, install_vm_statics,
+    compute_merkle_root, install_derivation, install_protocol_statics,
 };
 use hyperscale_vm_effects::{
     Declaration, InstanceRegistry, NodeCall, PackageHash, PrefixShardResolver, admit_tree,
@@ -290,10 +290,18 @@ impl Executor {
     ) -> Self {
         let world = genesis_world_with_pools(pools, packages);
         let backend = EngineBackend::new(packages);
-        install_vm_statics(Box::new(BridgeStatics {
+        // Two installations, split on whether a node can answer
+        // differently: the derivation reads this node's caches, and the
+        // protocol answers read nothing a node accumulates.
+        install_derivation(Box::new(BridgeStatics {
             cache: world.cache.clone(),
             instances: world.instances.clone(),
             artifact_sink: Some(Arc::new(backend.absorber())),
+        }));
+        install_protocol_statics(Box::new(BridgeStatics {
+            cache: world.cache.clone(),
+            instances: world.instances.clone(),
+            artifact_sink: None,
         }));
         Self {
             world,
