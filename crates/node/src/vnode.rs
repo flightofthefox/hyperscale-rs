@@ -22,7 +22,7 @@ use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_types::{
-    BeaconState, GenesisConfigHash, LocalTimestamp, NetworkDefinition, ShardId, Signer,
+    BeaconState, Derivation, GenesisConfigHash, LocalTimestamp, NetworkDefinition, ShardId, Signer,
     ValidatorId, Verifier, WeightedTimestamp,
 };
 
@@ -60,6 +60,9 @@ impl VnodeInit {
 pub struct SeatVnodeGroup<'a> {
     /// Scheme verifier shared by every coordinator in the group.
     pub verifier: Arc<dyn Verifier>,
+    /// What this node derives envelopes through — its own caches, held
+    /// by its own engine.
+    pub derivation: Arc<dyn Derivation>,
     /// Host beacon storage; the group's coordinators resume from its
     /// committed tip.
     pub beacon_storage: &'a dyn BeaconStorage,
@@ -166,6 +169,7 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
             }
             let state = NodeStateMachine::new(
                 validator,
+                Arc::clone(&args.derivation),
                 args.shard,
                 args.shard_config,
                 args.recovered.clone(),

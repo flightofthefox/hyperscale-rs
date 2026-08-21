@@ -387,44 +387,29 @@ pub trait ProtocolStatics: Send + Sync {
     }
 }
 
-static DERIVATION: OnceLock<Box<dyn Derivation>> = OnceLock::new();
 static PROTOCOL_STATICS: OnceLock<Box<dyn ProtocolStatics>> = OnceLock::new();
 
-/// Install the process-wide derivation. The first installation wins; so
-/// tests and node boot can both install without coordination.
-pub fn install_derivation(statics: Box<dyn Derivation>) {
-    let _ = DERIVATION.set(statics);
-}
-
-/// Install the process-wide protocol answers, on the same terms.
+/// Install the process-wide protocol answers. The first installation
+/// wins, so tests and node boot can both install without coordination.
+///
+/// There is no counterpart for [`Derivation`]: a derivation is a node's
+/// own, and a process running several nodes holds one each.
 pub fn install_protocol_statics(statics: Box<dyn ProtocolStatics>) {
     let _ = PROTOCOL_STATICS.set(statics);
 }
 
-/// Whether a derivation is installed.
+/// Whether the protocol answers are installed.
 #[must_use]
-pub fn vm_statics_installed() -> bool {
-    DERIVATION.get().is_some()
-}
-
-/// The installed derivation.
-///
-/// # Panics
-///
-/// If none is installed — transactions cannot exist in a process that
-/// never wired the derivation seam.
-pub fn vm_statics() -> &'static dyn Derivation {
-    DERIVATION
-        .get()
-        .expect("VM statics not installed; node wiring installs the effects-bridge derivation")
-        .as_ref()
+pub fn protocol_statics_installed() -> bool {
+    PROTOCOL_STATICS.get().is_some()
 }
 
 /// The installed protocol answers.
 ///
 /// # Panics
 ///
-/// If none is installed, on the same terms as [`vm_statics`].
+/// If none are installed — transactions cannot exist in a process that
+/// never wired the VM seam.
 pub fn protocol_statics() -> &'static dyn ProtocolStatics {
     PROTOCOL_STATICS
         .get()

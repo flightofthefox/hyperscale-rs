@@ -17,12 +17,26 @@ use blake3::Hasher;
 use hyperscale_hbor::{Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use thiserror::Error;
 
-use crate::transaction::vm::{ProtocolVerifier, SchemeVerifier, vm_statics};
+use crate::transaction::vm::{Derivation, ProtocolVerifier, SchemeVerifier};
 use crate::{
     DeclaredKey, Derived, EnvelopeExt, Hash, LocalKey, MAX_TX_BYTES_LEN, NetworkId, PrincipalAddr,
     Routing, ShardTrie, SubstateKey, TimestampRange, TransactionEnvelope, TxHash, Verified, Verify,
     VmStaticsError, protocol_statics,
 };
+
+/// What a transaction is verified against: the network its envelope has
+/// to name, and the derivation this node answers with.
+///
+/// The derivation rides in the context because it is the node's, not the
+/// protocol's — two nodes hold different caches, so the same envelope can
+/// derive on one and want a record on the other.
+#[derive(Clone, Copy)]
+pub struct TransactionContext<'a> {
+    /// The network this node verifies for.
+    pub network: NetworkId,
+    /// This node's derivation.
+    pub derivation: &'a dyn Derivation,
+}
 
 /// A signed transaction as the network carries it.
 ///
@@ -246,14 +260,16 @@ impl Transaction {
 
     /// The derived routing identity.
     ///
-    /// Derives through the installed [`crate::Derivation`] on first access
-    /// and caches per transaction.
+    /// Reads the cache [`Self::try_derived`] fills; nothing derives here,
+    /// because deriving is a node's own answer and this accessor holds no
+    /// node.
     ///
     /// # Panics
     ///
-    /// Panics if derivation refuses the envelope — unreachable for
-    /// verified or committed transactions, whose envelopes already
-    /// derived cleanly at admission — or if no statics are installed.
+    /// Panics if the transaction was never derived — unreachable for
+    /// verified transactions, since verification derives, and for
+    /// committed ones, since a block whose transactions are not all
+    /// verified is not voted on.
     #[must_use]
     pub fn routing(&self) -> &Routing {
         &self.derived().routing
@@ -335,23 +351,28 @@ impl Transaction {
         protocol_statics().rule_admits(auth_cell, self.body().fee_payer, self.signer(), clock_ms)
     }
 
-    /// The cached derivation, or a panic naming the refusal.
+    /// The cached derivation, or a panic saying it was never derived.
     fn derived(&self) -> &Derived {
-        self.try_derived()
-            .unwrap_or_else(|error| panic!("derivation failed on an admitted transaction: {error}"))
+        self.derived.get().expect(
+            "derived facts read from a transaction that was never derived; \
+             verification derives, and consensus paths take only verified transactions",
+        )
     }
 
-    /// Derive (or fetch the cached) envelope derivation, fallibly — the
-    /// verification path.
+    /// Derive (or fetch the cached) envelope derivation under this
+    /// node's `derivation`.
+    ///
+    /// Only successes are cached, so a refusal for want of a record this
+    /// node has not seen re-derives once the record lands.
     ///
     /// # Errors
     ///
-    /// [`VmStaticsError`] from the installed derivation.
-    pub fn try_derived(&self) -> Result<&Derived, VmStaticsError> {
+    /// [`VmStaticsError`] from `derivation`.
+    pub fn try_derived(&self, derivation: &dyn Derivation) -> Result<&Derived, VmStaticsError> {
         if let Some(derived) = self.derived.get() {
             return Ok(derived);
         }
-        let derived = vm_statics().derive(self.body())?;
+        let derived = derivation.derive(self.body())?;
         Ok(self.derived.get_or_init(|| derived))
     }
 
@@ -422,7 +443,7 @@ pub enum TransactionVerifyError {
 
 /// Construction asserts: the body decodes, the envelope names this
 /// session's network, the composer's ed25519 signature covers the
-/// envelope content, the tree admits and routes under the installed
+/// envelope content, the tree admits and routes under the context's
 /// [`crate::Derivation`] (which caches the derived identity on the
 /// transaction and binds every subintent signer address to its public
 /// key), and every subintent signature covers its declaration hash.
@@ -441,15 +462,15 @@ pub enum TransactionVerifyError {
 ///   source (storage-recovery, where the value was validated before
 ///   persistence; equivalent-attestation paths). Every call site
 ///   carries a `// SAFETY:` comment naming the trust source.
-impl Verify<NetworkId> for Transaction {
+impl Verify<TransactionContext<'_>> for Transaction {
     type Error = TransactionVerifyError;
 
-    fn verify(&self, network: NetworkId) -> Result<Verified<Self>, Self::Error> {
+    fn verify(&self, ctx: TransactionContext<'_>) -> Result<Verified<Self>, Self::Error> {
         let vm = self.try_body()?;
-        if vm.network != network {
+        if vm.network != ctx.network {
             return Err(TransactionVerifyError::WrongNetwork {
                 signed: vm.network.0,
-                session: network.0,
+                session: ctx.network.0,
             });
         }
         if !vm.signature_is_valid() {
@@ -458,7 +479,7 @@ impl Verify<NetworkId> for Transaction {
         // Derivation checks the tree, the signature arity, and the
         // signer-address binding; the signatures themselves verify here,
         // over the derived declaration hashes.
-        let derived = self.try_derived()?;
+        let derived = self.try_derived(ctx.derivation)?;
         for (index, (sig, subintent)) in vm
             .subintent_sigs
             .iter()
@@ -511,7 +532,7 @@ mod tests {
     use crate::test_utils::{test_prefix, test_validity_range};
     use crate::{
         Derivation, Ed25519PrivateKey, MlDsa65PrivateKey, PrincipalAddr, SchemeId,
-        Secp256k1PrivateKey, SubintentSig, TransactionBody, declared_work, install_derivation,
+        Secp256k1PrivateKey, SubintentSig, TransactionBody, declared_work,
     };
 
     struct StubStatics;
@@ -588,8 +609,16 @@ mod tests {
     }
 
     fn fixture(tree: &[u8]) -> Transaction {
-        install_derivation(Box::new(StubStatics));
         Transaction::new(test_envelope(tree))
+    }
+
+    /// The verification context every test here judges against: this
+    /// module's stub derivation on the fixture network.
+    fn ctx(network: NetworkId) -> TransactionContext<'static> {
+        TransactionContext {
+            network,
+            derivation: &StubStatics,
+        }
     }
 
     #[test]
@@ -602,8 +631,9 @@ mod tests {
     }
 
     #[test]
-    fn admission_keys_derive_through_the_installed_statics() {
+    fn admission_keys_come_from_the_derivation() {
         let tx = fixture(b"graph bytes");
+        tx.try_derived(&StubStatics).expect("the stub routes it");
         assert_eq!(
             tx.admission_read_keys(),
             vec![DeclaredKey::substate(test_prefix(0x11), [0u8; 16])]
@@ -624,21 +654,21 @@ mod tests {
     #[test]
     fn verification_checks_signature_and_derivation() {
         let good = fixture(b"graph bytes");
-        assert!(good.verify(TEST_NETWORK).is_ok());
+        assert!(good.verify(ctx(TEST_NETWORK)).is_ok());
 
         // A tampered signature refuses.
         let mut vm = good.body().clone();
         vm.signature[0] ^= 1;
         let bad_signature = Transaction::new(vm);
         assert_eq!(
-            bad_signature.verify(TEST_NETWORK).unwrap_err(),
+            bad_signature.verify(ctx(TEST_NETWORK)).unwrap_err(),
             TransactionVerifyError::InvalidSignature
         );
 
         // A refused tree surfaces the derivation error.
         let inadmissible = fixture(b"inadmissible");
         assert!(matches!(
-            inadmissible.verify(TEST_NETWORK).unwrap_err(),
+            inadmissible.verify(ctx(TEST_NETWORK)).unwrap_err(),
             TransactionVerifyError::Derivation(_)
         ));
 
@@ -653,7 +683,7 @@ mod tests {
             cached_bytes: OnceLock::new(),
         };
         assert_eq!(
-            garbage.verify(TEST_NETWORK).unwrap_err(),
+            garbage.verify(ctx(TEST_NETWORK)).unwrap_err(),
             TransactionVerifyError::UndecodableBody
         );
     }
@@ -665,9 +695,9 @@ mod tests {
     #[test]
     fn verification_refuses_a_foreign_networks_transaction() {
         let tx = fixture(b"graph bytes");
-        assert!(tx.verify(TEST_NETWORK).is_ok());
+        assert!(tx.verify(ctx(TEST_NETWORK)).is_ok());
         assert_eq!(
-            tx.verify(NetworkId(7)).unwrap_err(),
+            tx.verify(ctx(NetworkId(7))).unwrap_err(),
             TransactionVerifyError::WrongNetwork {
                 signed: TEST_NETWORK.0,
                 session: 7,
@@ -678,7 +708,7 @@ mod tests {
         retargeted.network = NetworkId(7);
         assert_eq!(
             Transaction::new(retargeted)
-                .verify(NetworkId(7))
+                .verify(ctx(NetworkId(7)))
                 .unwrap_err(),
             TransactionVerifyError::InvalidSignature,
         );
@@ -689,7 +719,6 @@ mod tests {
     /// kilobytes rather than tens of bytes.
     #[test]
     fn an_envelope_signed_under_any_registered_scheme_round_trips() {
-        install_derivation(Box::new(StubStatics));
         let ed = unsigned_envelope(b"graph bytes")
             .sign(&Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap());
         let secp = unsigned_envelope(b"graph bytes")
@@ -705,7 +734,7 @@ mod tests {
             let bytes = hbor_to_vec(&Transaction::new(envelope)).unwrap();
             let carried: Transaction = hbor_from_slice(&bytes).unwrap();
             carried
-                .verify(TEST_NETWORK)
+                .verify(ctx(TEST_NETWORK))
                 .expect("what a registered scheme signed verifies under it");
         }
     }
@@ -716,7 +745,6 @@ mod tests {
     /// not a codec one.
     #[test]
     fn re_tagging_between_schemes_loses_the_signature() {
-        install_derivation(Box::new(StubStatics));
         let ed = unsigned_envelope(b"graph bytes")
             .sign(&Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap());
         let secp = unsigned_envelope(b"graph bytes")
@@ -737,7 +765,7 @@ mod tests {
                 .try_body()
                 .expect("a re-tagged envelope still decodes");
             assert_eq!(
-                carried.verify(TEST_NETWORK).unwrap_err(),
+                carried.verify(ctx(TEST_NETWORK)).unwrap_err(),
                 TransactionVerifyError::InvalidSignature,
             );
         }
@@ -745,8 +773,6 @@ mod tests {
 
     #[test]
     fn verification_checks_subintent_signatures() {
-        install_derivation(Box::new(StubStatics));
-
         // A subintent signature must cover the derived declaration hash.
         let subintent_key = Ed25519PrivateKey::from_bytes(&[9u8; 32]).unwrap();
         let composer_key = Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap();
@@ -759,7 +785,7 @@ mod tests {
         let composed = envelope.sign(&composer_key);
         assert!(
             Transaction::new(composed.clone())
-                .verify(TEST_NETWORK)
+                .verify(ctx(TEST_NETWORK))
                 .is_ok()
         );
 
@@ -767,7 +793,9 @@ mod tests {
         forged.subintent_sigs[0].signature[0] ^= 1;
         let forged = forged.sign(&composer_key);
         assert_eq!(
-            Transaction::new(forged).verify(TEST_NETWORK).unwrap_err(),
+            Transaction::new(forged)
+                .verify(ctx(TEST_NETWORK))
+                .unwrap_err(),
             TransactionVerifyError::InvalidSubintentSignature(0)
         );
     }

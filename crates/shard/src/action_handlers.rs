@@ -22,18 +22,18 @@ use hyperscale_types::{
     BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote, BlockVoteMessage,
     CertificateRoot, CertificateRootContext, CertifiedBlockHeader,
     CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError, ConsensusPublicKey,
-    ConsensusReceipt, Epoch, Finalization, Hash, LocalReceiptRoot, LocalReceiptRootContext,
-    NetworkDefinition, PreparedCommit, PrincipalAddr as AccountAddr, ProposerTimestamp,
-    ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
-    ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, RevealChain,
-    Round, ShardId, ShardLoad, SplitChildRoots, StateRoot, StateRootContext, Stopwatch,
-    StoredReceipt, SubstateKey, TerminalRoots, TerminalVerdict, TerminalVerdictRoot, Timeout,
-    TimeoutContext, TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash,
-    ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp,
-    WitnessSources, WorkInFlight, absorb_committed_cells, commit_witness_window, derive_leaves,
-    local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
-    protocol_statics, shard_reveal_sign, signed_bytes, vrf_output_from_proof,
-    work_over_certificates,
+    ConsensusReceipt, Derivation, Epoch, Finalization, Hash, LocalReceiptRoot,
+    LocalReceiptRootContext, NetworkDefinition, PreparedCommit, PrincipalAddr as AccountAddr,
+    ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
+    ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
+    ReshapeTrigger, RevealChain, Round, ShardId, ShardLoad, SplitChildRoots, StateRoot,
+    StateRootContext, Stopwatch, StoredReceipt, SubstateKey, TerminalRoots, TerminalVerdict,
+    TerminalVerdictRoot, Timeout, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
+    TransactionRootContext, TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
+    VrfProof, WeightedTimestamp, WitnessSources, WorkInFlight, absorb_committed_cells,
+    commit_witness_window, derive_leaves, local_settled_tx_hashes,
+    missed_proposals_since_prev_commit, next_reveal_chain, protocol_statics, shard_reveal_sign,
+    signed_bytes, vrf_output_from_proof, work_over_certificates,
 };
 
 /// Result of QC verification and assembly.
@@ -423,12 +423,12 @@ fn split_child_roots_for_header(
 
 /// A package published in this block is usable by transactions admitted
 /// after it commits, and this is where that becomes true.
-fn absorb_finalized_cells(ticks: &[Arc<Verifiable<Finalization>>]) {
+fn absorb_finalized_cells(ticks: &[Arc<Verifiable<Finalization>>], derivation: &dyn Derivation) {
     let receipts: Vec<Arc<ConsensusReceipt>> = ticks
         .iter()
         .flat_map(|fw| fw.consensus_receipts())
         .collect();
-    absorb_committed_cells(receipts.iter().map(AsRef::as_ref));
+    absorb_committed_cells(receipts.iter().map(AsRef::as_ref), derivation);
 }
 
 /// Handle the shard-owned delegated [`Action`] variants.
@@ -865,7 +865,7 @@ where
             record_signature_verification_latency("state_root", start.elapsed().as_secs_f64());
             let bytes_delta = jmt_snapshot.bytes_delta;
             if verify_result.is_ok() {
-                absorb_finalized_cells(&finalizations);
+                absorb_finalized_cells(&finalizations, ctx.executor.derivation().as_ref());
                 // SAFETY: `prepared` belongs to the same JMT replay that just
                 // produced the matching `computed_root` — only routed when
                 // verification succeeds.
@@ -1080,7 +1080,7 @@ where
             );
             let block_hash = result.block_hash;
             let bytes_delta = result.jmt_snapshot.bytes_delta;
-            absorb_finalized_cells(&finalizations);
+            absorb_finalized_cells(&finalizations, ctx.executor.derivation().as_ref());
             (ctx.commit_prepared)(PreparedBlock {
                 block_hash,
                 parent_block_hash,
@@ -1277,7 +1277,7 @@ mod tests {
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::test_utils::{
-        install_stub_vm_statics, stub_transaction, test_prefix, test_principal,
+        install_stub_protocol_statics, stub_transaction, test_prefix, test_principal,
     };
     use hyperscale_types::{
         CertificateRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Signer,
@@ -1751,7 +1751,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             WeightedTimestamp::from_millis(1_000),
         );
-        install_stub_vm_statics();
+        install_stub_protocol_statics();
         let tx = Arc::new(Verifiable::from(stub_transaction(
             test_principal(1),
             &[test_prefix(1)],
@@ -1798,7 +1798,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             anchor.plus(Duration::from_mins(10)),
         );
-        install_stub_vm_statics();
+        install_stub_protocol_statics();
         let tx = Arc::new(Verifiable::from(stub_transaction(
             test_principal(3),
             &[test_prefix(3)],

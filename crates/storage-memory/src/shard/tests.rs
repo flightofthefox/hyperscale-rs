@@ -11,8 +11,8 @@ use hyperscale_storage::{
     ShardChainWriter, SubstateStore, Substates, VersionedStore, test_helpers,
 };
 use hyperscale_types::test_utils::{
-    STUB_PACKAGE_MARKER, install_stub_vm_statics, stub_transaction, test_prefix, test_principal,
-    test_transaction,
+    STUB_PACKAGE_MARKER, install_stub_protocol_statics, stub_transaction, test_prefix,
+    test_principal, test_transaction,
 };
 use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
@@ -1128,7 +1128,7 @@ fn block_with_txs(
 /// A transaction whose signed window ends at `end_ms` — the deadline the
 /// fold has to recover for it.
 fn dedup_tx(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
-    install_stub_vm_statics();
+    install_stub_protocol_statics();
     let validity = TimestampRange::new(
         WeightedTimestamp::ZERO,
         WeightedTimestamp::from_millis(end_ms),
@@ -1302,7 +1302,7 @@ fn a_package_cell_lands_in_the_artifact_index_with_its_commit() {
     // The judgement of what a package cell is belongs to the installed
     // statics; the stub judges by local-key marker so the index write is
     // under test without the VM stack.
-    install_stub_vm_statics();
+    install_stub_protocol_statics();
     let storage = SimShardStorage::default();
 
     let artifact = vec![7u8; 64];

@@ -485,10 +485,18 @@ impl Session {
         let from = u8::try_from(self.nonce % u32::from(ACCOUNTS)).unwrap_or(0) + 1;
         let topology =
             (0..self.runner.num_hosts()).find_map(|host| self.runner.host_topology(host));
+        // Built outside any node, so nothing has derived it: routing is
+        // the deriving node's answer, and the question below is about a
+        // routed fact.
+        let derivation = self.runner.host_derivation(0);
         let crosses = |tx: &Transaction| {
-            topology
-                .as_ref()
-                .is_some_and(|t| t.is_cross_shard_transaction(tx))
+            let Some(derivation) = derivation.as_ref() else {
+                return false;
+            };
+            tx.try_derived(derivation.as_ref()).is_ok()
+                && topology
+                    .as_ref()
+                    .is_some_and(|t| t.is_cross_shard_transaction(tx))
         };
         // The next account in rotation is the fallback, so a topology where
         // nothing crosses still submits the pair it would have picked anyway.

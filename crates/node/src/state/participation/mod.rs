@@ -33,7 +33,9 @@ use hyperscale_provisions::{
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
-use hyperscale_types::{BlockHeight, ForkFence, LocalTimestamp, ShardId, ValidatorId, Verifier};
+use hyperscale_types::{
+    BlockHeight, Derivation, ForkFence, LocalTimestamp, ShardId, ValidatorId, Verifier,
+};
 
 /// The coordinators a vnode runs while seated on a shard.
 ///
@@ -43,6 +45,12 @@ use hyperscale_types::{BlockHeight, ForkFence, LocalTimestamp, ShardId, Validato
 pub(in crate::state) struct ShardParticipation {
     /// This vnode's home shard.
     pub(in crate::state) local_shard: ShardId,
+
+    /// What this node can resolve an envelope against. Blocks that
+    /// arrive already verified carry their derivation; the ones lifted
+    /// out of storage carry none, so the handlers that take them derive
+    /// through this before any coordinator reads a routed fact.
+    pub(in crate::state) derivation: Arc<dyn Derivation>,
 
     /// Shard consensus state (includes implicit round advancement).
     pub(in crate::state) shard_coordinator: ShardCoordinator,
@@ -107,6 +115,7 @@ impl ShardParticipation {
     #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly
     pub(in crate::state) fn new(
         verifier: Arc<dyn Verifier>,
+        derivation: Arc<dyn Derivation>,
         me: ValidatorId,
         local_shard: ShardId,
         shard_config: &ShardConsensusConfig,
@@ -133,6 +142,7 @@ impl ShardParticipation {
         );
         Self {
             local_shard,
+            derivation,
             shard_coordinator: ShardCoordinator::new(
                 verifier,
                 me,

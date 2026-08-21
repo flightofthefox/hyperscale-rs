@@ -6,7 +6,7 @@ use std::time::Duration;
 use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_types::{
-    Address, BeaconState, BlockHeight, Event, ShardId, Signer, StateRoot, Transaction,
+    Address, BeaconState, BlockHeight, Derivation, Event, ShardId, Signer, StateRoot, Transaction,
     TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, WorkInFlight,
 };
 
@@ -30,6 +30,14 @@ use super::Budget;
 pub trait Cluster {
     /// Submit a transaction, routed to whichever host serves its source shard.
     fn submit(&mut self, tx: Arc<Transaction>);
+
+    /// A derivation the cluster answers alike to — what a scenario reads
+    /// a routed fact off a transaction it built itself through.
+    ///
+    /// A transaction assembled in the scenario has been derived by
+    /// nobody: routing, work and the rest are a node's answer, and the
+    /// harness has to borrow one to ask.
+    fn derivation(&self) -> Arc<dyn Derivation>;
 
     /// Advance the cluster until `cond` holds or `budget` epochs elapse;
     /// return whether `cond` held.

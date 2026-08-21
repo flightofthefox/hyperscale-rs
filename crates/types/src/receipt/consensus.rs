@@ -19,7 +19,7 @@ use hyperscale_hbor::{
 };
 
 use crate::receipt::event::EventExt;
-use crate::transaction::vm::{vm_statics, vm_statics_installed};
+use crate::transaction::vm::Derivation;
 use crate::{
     BeaconWitnessEvent, BeaconWitnessRoot, Event, EventRoot, GlobalReceipt, GlobalReceiptHash,
     Hash, MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_EVENTS_PER_TX, StateWrites, WritesRoot,
@@ -85,26 +85,25 @@ pub enum ConsensusReceipt {
     Failed,
 }
 
-/// Offer every cell these committed receipts write to the installed
-/// VM statics, so the published-package cache grows with the chain.
+/// Offer every cell these committed receipts write to this node's
+/// `derivation`, so its caches grow with the chain.
 ///
 /// Called on both the live commit path and the sync path, which is the
 /// point: a block's receipts are block content, so a replica that
 /// replayed the block reaches the same cache as one that executed it.
 /// Receipts are also the only thing that moves state, so nothing a
 /// package cell could arrive through is missed here.
-pub fn absorb_committed_cells<'a>(receipts: impl IntoIterator<Item = &'a ConsensusReceipt>) {
-    if !vm_statics_installed() {
-        return;
-    }
-    let statics = vm_statics();
+pub fn absorb_committed_cells<'a>(
+    receipts: impl IntoIterator<Item = &'a ConsensusReceipt>,
+    derivation: &dyn Derivation,
+) {
     for receipt in receipts {
         let ConsensusReceipt::Succeeded { writes, .. } = receipt else {
             continue;
         };
         for (key, change) in &writes.cells {
             if let Some(value) = change {
-                statics.absorb_committed_cell(key.owner.to_bytes(), key.local.0, value);
+                derivation.absorb_committed_cell(key.owner.to_bytes(), key.local.0, value);
             }
         }
     }

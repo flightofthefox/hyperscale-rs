@@ -119,6 +119,8 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
         tick_reveal: RevealChain::ZERO,
         holds: &ProvisionalHolds::new(),
     };
+    tx.try_derived(executor.derivation().as_ref())
+        .expect("a fixture transaction derives");
     let verified = Arc::new(Verified::<Transaction>::from_persisted(tx));
     executor.execute_batch(&ctx, &store, std::slice::from_ref(&verified))
 }
@@ -157,7 +159,10 @@ fn draining_an_account_the_envelope_does_not_sign_for_is_refused() {
     let theft = signed_transfer(VICTIM, thief(), 5_000);
 
     assert!(theft.body().signature_is_valid());
-    assert!(theft.try_derived().is_ok(), "the shape is well-formed");
+    assert!(
+        theft.try_derived(executor.derivation().as_ref()).is_ok(),
+        "the shape is well-formed"
+    );
 
     let executed = execute(&executor, theft);
     let ConsensusReceipt::Failed = &executed[0].consensus else {

@@ -19,7 +19,7 @@ use crate::{
     TopologySnapshot, Transaction, TransactionBody, TransactionDecision, TransactionEnvelope,
     TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
     VmStaticsError, WeightedTimestamp, WitnessSources, compute_global_receipt_root, declared_work,
-    install_derivation, install_protocol_statics, signed_bytes, vm_statics_installed,
+    install_protocol_statics, protocol_statics_installed, signed_bytes,
 };
 
 /// Create a test transaction the [`StubVmStatics`] derivation routes to
@@ -881,7 +881,7 @@ const fn stub_cell(owner: Address) -> DeclaredKey {
 /// runs. Routing and package set are thus fully controlled per
 /// transaction by [`stub_transaction`] and
 /// [`stub_transaction_running`], with no effects-bridge dependency.
-struct StubVmStatics;
+pub struct StubVmStatics;
 
 impl Derivation for StubVmStatics {
     fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError> {
@@ -980,12 +980,16 @@ impl ProtocolStatics for StubVmStatics {
 /// of the content-address re-derivation the bridge statics perform.
 pub const STUB_PACKAGE_MARKER: u8 = 0xAB;
 
-/// Install [`StubVmStatics`] for this process. First-install-wins, like
-/// the production install — a test binary uses either the stub or the
-/// effects-bridge derivation, never both.
-pub fn install_stub_vm_statics() {
-    if !vm_statics_installed() {
-        install_derivation(Box::new(StubVmStatics));
+/// Install [`StubVmStatics`]'s protocol answers for this process.
+/// First-install-wins, like the production install — a test binary uses
+/// either the stub or the effects-bridge answers, never both.
+///
+/// The stub's derivation is not installed anywhere, because a derivation
+/// is a node's: the fixtures below derive their transactions through
+/// [`StubVmStatics`] as they build them, and a test that needs a
+/// derivation in hand names the stub directly.
+pub fn install_stub_protocol_statics() {
+    if !protocol_statics_installed() {
         install_protocol_statics(Box::new(StubVmStatics));
     }
 }
@@ -1051,7 +1055,7 @@ pub fn stub_transaction_running(
     max_fee: u128,
     validity: TimestampRange,
 ) -> Transaction {
-    install_stub_vm_statics();
+    install_stub_protocol_statics();
     let key = Ed25519PrivateKey::from_bytes(&[0x5A; 32]).expect("fixture key");
     let mut tree = vec![u8::try_from(read_prefixes.len()).expect("stub read set fits a byte")];
     for prefix in read_prefixes.iter().chain(write_prefixes) {
@@ -1076,7 +1080,10 @@ pub fn stub_transaction_running(
         signature: Vec::new(),
     }
     .sign(&key);
-    Transaction::new(vm)
+    let tx = Transaction::new(vm);
+    tx.try_derived(&StubVmStatics)
+        .expect("the fixture builds a tree the stub derivation routes");
+    tx
 }
 
 #[cfg(test)]

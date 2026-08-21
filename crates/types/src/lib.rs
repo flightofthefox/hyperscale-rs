@@ -189,7 +189,7 @@ pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::SafeVoteRegisters;
 pub use shard::{
     Block, SharedCertificates, SharedProvisions, SharedTransactions, SharedWitnessSources,
-    TerminalRef, VerifiedBlockAssembleError, WitnessSources, shared_transactions_from_raw,
+    TerminalRef, VerifiedBlockAssembleError, WitnessSources, derive_block_transactions,
     work_over_certificates,
 };
 pub use signing::{
@@ -234,10 +234,9 @@ pub use transaction::status::{
 pub use transaction::vm::{
     Derivation, Derived, EnvelopeExt, MAX_MESSAGE_LEN, MAX_SUBINTENTS, ProtocolStatics,
     ProtocolVerifier, Routing, SchemeVerifier, SubintentSig, TransactionBody, TransactionEnvelope,
-    VmStaticsError, install_derivation, install_protocol_statics, protocol_statics, vm_statics,
-    vm_statics_installed,
+    VmStaticsError, install_protocol_statics, protocol_statics, protocol_statics_installed,
 };
-pub use transaction::wire::{Transaction, TransactionVerifyError};
+pub use transaction::wire::{Transaction, TransactionContext, TransactionVerifyError};
 pub use verifiable::{Verifiable, Verified, Verify};
 
 #[cfg(any(test, feature = "test-utils"))]

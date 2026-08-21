@@ -545,6 +545,7 @@ impl ShardSupervisor {
     ) -> Vec<VnodeInit> {
         seat_vnode_group(SeatVnodeGroup {
             verifier: Arc::new(BlsVerifier),
+            derivation: self.process.derivation(),
             beacon_storage: self.process.beacon_storage().as_ref(),
             beacon_network: self.beacon_network.clone(),
             beacon_config_hash: self.beacon_config_hash,

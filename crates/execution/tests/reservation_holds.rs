@@ -22,7 +22,6 @@ use hyperscale_types::{
     Derived, ExecutionMetadata, GlobalReceiptHash, Hash, LocalKey, Mode, NetworkId, PrincipalAddr,
     RevealChain, Routing, SchemeId, StateWrites, SubstateKey, Transaction, TransactionBody,
     TransactionEnvelope, TxHash, Verified, VmStaticsError, WeightedTimestamp, declared_work,
-    install_derivation,
 };
 
 /// The two amount cells every fixture transaction declares a reservation
@@ -98,7 +97,6 @@ impl Derivation for ReservingStatics {
 /// A transaction distinguished only by `seed`; its declaration is fixed
 /// by [`ReservingStatics`].
 fn reserving_transaction(seed: u8) -> Arc<Verified<Transaction>> {
-    install_derivation(Box::new(ReservingStatics));
     let vm = TransactionEnvelope {
         body: TransactionBody::Call(vec![seed]),
         subintent_sigs: Vec::new(),
@@ -113,9 +111,10 @@ fn reserving_transaction(seed: u8) -> Arc<Verified<Transaction>> {
         signer: Vec::new(),
         signature: Vec::new(),
     };
-    Arc::new(Verified::<Transaction>::from_persisted(Transaction::new(
-        vm,
-    )))
+    let tx = Transaction::new(vm);
+    tx.try_derived(&ReservingStatics)
+        .expect("the fixture declaration is fixed");
+    Arc::new(Verified::<Transaction>::from_persisted(tx))
 }
 
 fn request_for(tx: &Arc<Verified<Transaction>>) -> CrossShardExecutionRequest {

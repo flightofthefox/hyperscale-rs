@@ -34,7 +34,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
-    BeaconChainConfig, ConsensusPublicKey, Epoch, GenesisConfigHash, GenesisValidators,
+    BeaconChainConfig, ConsensusPublicKey, Derivation, Epoch, GenesisConfigHash, GenesisValidators,
     LocalTimestamp, NetworkDefinition, PrincipalAddr, ShardId, Signer, StakePoolSeat,
     TopologySnapshot, TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet,
     Verifier, shard_prefix_path,
@@ -496,6 +496,15 @@ impl SimulationRunner {
             let beacon_storage: Arc<dyn BeaconStorage> = Arc::new(SimBeaconStorage::new());
             boot.commit_if_empty(beacon_storage.as_ref());
 
+            // The first host runs the engine the derivation is held by —
+            // the one the commit-time compile feeds — and every other
+            // host runs its own, holding only what it fetched.
+            let executor = if host_index == 0 {
+                Arc::clone(&engine)
+            } else {
+                Arc::new(engine.peer(network_config.execution_mode))
+            };
+
             // Seat each host's vnodes. Same-shard vnodes share one store
             // bundle, created inside `seat_vnode_group`; a dedicated pool
             // host's validators follow the beacon shard-less. Genesis boots a
@@ -514,6 +523,7 @@ impl SimulationRunner {
                     .collect();
                 vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
                     verifier: Arc::clone(&verifier),
+                    derivation: executor.derivation(),
                     beacon_storage: beacon_storage.as_ref(),
                     beacon_network: beacon_network.clone(),
                     beacon_config_hash,
@@ -541,15 +551,6 @@ impl SimulationRunner {
             let topology_arc_for_host = Arc::new(ArcSwap::from(Arc::clone(&shared_topology)));
 
             let (event_tx, event_rx) = unbounded();
-
-            // The first host runs the engine the statics were installed
-            // from — the one the commit-time compile feeds — and every
-            // other host runs its own, holding only what it fetched.
-            let executor = if host_index == 0 {
-                Arc::clone(&engine)
-            } else {
-                Arc::new(engine.peer(network_config.execution_mode))
-            };
 
             // One `SimShardStorage` per hosted shard on this host.
             let storages: HashMap<ShardId, SimShardStorage> = by_shard
@@ -845,6 +846,18 @@ impl SimulationRunner {
                 .topology_snapshot()
                 .load_full(),
         )
+    }
+
+    /// Host `host`'s derivation — what that node can resolve an envelope
+    /// against — or `None` if `host` is out of range.
+    ///
+    /// A harness building a transaction outside any node still has to
+    /// derive it through some node's caches before reading a routed fact
+    /// off it, the way an RPC submission derives through the node it
+    /// reaches.
+    #[must_use]
+    pub fn host_derivation(&self, host: NodeIndex) -> Option<Arc<dyn Derivation>> {
+        Some(self.hosts.get(host as usize)?.derivation())
     }
 
     /// The signing key of a registered validator, by id. Validator ids index

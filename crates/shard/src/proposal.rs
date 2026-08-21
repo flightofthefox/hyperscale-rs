@@ -609,8 +609,8 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_types::test_utils::{
-        install_stub_vm_statics, make_finalization, stub_transaction, test_prefix, test_principal,
-        test_transaction_running,
+        install_stub_protocol_statics, make_finalization, stub_transaction, test_prefix,
+        test_principal, test_transaction_running,
     };
     use hyperscale_types::{
         CommittedTxsRoot, Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
@@ -854,7 +854,7 @@ mod tests {
     }
 
     fn tx_with_range(seed: u8, range: TimestampRange) -> Arc<Verified<Transaction>> {
-        install_stub_vm_statics();
+        install_stub_protocol_statics();
         Arc::new(Verified::<Transaction>::from_persisted(stub_transaction(
             test_principal(seed),
             &[test_prefix(seed)],
@@ -886,7 +886,7 @@ mod tests {
     }
 
     fn tx_running(seed: u8, packages: &[Hash]) -> Arc<Verified<Transaction>> {
-        install_stub_vm_statics();
+        install_stub_protocol_statics();
         Arc::new(Verified::<Transaction>::from_persisted(
             test_transaction_running(seed, packages),
         ))

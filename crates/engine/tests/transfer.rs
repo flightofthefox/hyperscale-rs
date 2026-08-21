@@ -350,7 +350,7 @@ fn with_lottery(accounts: &[(PrincipalAddr, u128)], executor: &Executor) -> MapD
         panic!("the seal must settle: {:?}", executed[0].consensus);
     };
     store.apply(writes);
-    absorb_committed_cells([&executed[0].consensus]);
+    absorb_committed_cells([&executed[0].consensus], executor.derivation().as_ref());
     store
 }
 
@@ -369,6 +369,7 @@ fn execute_anchored(
         tick_reveal: reveal,
         holds: &ProvisionalHolds::new(),
     };
+    derived_through(executor, transactions);
     executor.execute_batch(&ctx, &snapshot_store, transactions)
 }
 
@@ -504,6 +505,15 @@ fn consecutive_payments_thread_through_the_tick_chain() {
     );
 }
 
+/// Derive every member the way admission would, so the engine reads the
+/// routed facts off the same caches it executes against.
+fn derived_through(executor: &Executor, transactions: &[Arc<Verified<Transaction>>]) {
+    for tx in transactions {
+        tx.try_derived(executor.derivation().as_ref())
+            .expect("a fixture transaction derives");
+    }
+}
+
 fn execute_on(
     accounts: &[(PrincipalAddr, u128)],
     executor: &Executor,
@@ -527,6 +537,7 @@ fn execute_batch_on(
         tick_reveal: RevealChain::ZERO,
         holds: &ProvisionalHolds::new(),
     };
+    derived_through(executor, transactions);
     executor.execute_batch(&ctx, snapshot_store, transactions)
 }
 
@@ -1033,6 +1044,7 @@ fn execute_on_shard(
         tick_reveal: RevealChain::ZERO,
         holds: &ProvisionalHolds::new(),
     };
+    derived_through(executor, transactions);
     executor.execute_batch(&ctx, &snapshot_store, transactions)
 }
 
@@ -1116,6 +1128,7 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
         tick_reveal: RevealChain::ZERO,
         holds: &holds,
     };
+    derived_through(&executor, std::slice::from_ref(&tx));
     let executed = executor.execute_batch(&ctx, &snapshot_store, std::slice::from_ref(&tx));
     assert!(
         matches!(executed[0].consensus, ConsensusReceipt::Failed),
@@ -1292,8 +1305,8 @@ fn the_stdlib_artifact_carries_resolvable_bindings() {
 /// the sender's fault.
 #[test]
 fn derivation_tells_a_gap_from_a_refusal() {
-    // Building the executor is what installs the derivation this reads.
-    let _installed = executor(ExecutionMode::Serial);
+    // The engine's own derivation is what these answers come from.
+    let engine = executor(ExecutionMode::Serial);
     let payer = fee_payer(7);
     let key = Ed25519PrivateKey::from_bytes(&[7; 32]).unwrap();
 
@@ -1323,7 +1336,9 @@ fn derivation_tells_a_gap_from_a_refusal() {
         &key,
         terms(TRANSFER_FEE),
     ));
-    let error = gap.try_derived().expect_err("nothing answers for it yet");
+    let error = gap
+        .try_derived(engine.derivation().as_ref())
+        .expect_err("nothing answers for it yet");
     assert_eq!(
         error.unresolved(),
         [unsealed.address()],
@@ -1351,7 +1366,9 @@ fn derivation_tells_a_gap_from_a_refusal() {
         &key,
         terms(TRANSFER_FEE),
     ));
-    let error = refused.try_derived().expect_err("a deposit takes a bucket");
+    let error = refused
+        .try_derived(engine.derivation().as_ref())
+        .expect_err("a deposit takes a bucket");
     assert!(
         error.unresolved().is_empty(),
         "a refusal names nothing to fetch: {error}"
@@ -1407,7 +1424,7 @@ fn a_committed_publish_grows_the_cache_that_routing_reads() {
         cache.load().get(package).is_none(),
         "execution alone does not publish"
     );
-    absorb_committed_cells([&executed[0].consensus]);
+    absorb_committed_cells([&executed[0].consensus], executor.derivation().as_ref());
     assert_eq!(
         cache.load().get(package),
         Some(&metadata),
@@ -1484,7 +1501,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
     // The same committed-cell walk that grows the metadata cache hands
     // the artifact to the compile worker: the code is on its way from
     // the commit, not from the first call that needs it.
-    absorb_committed_cells([&executed[0].consensus]);
+    absorb_committed_cells([&executed[0].consensus], executor.derivation().as_ref());
     await_code_settled(&executor, package);
 }
 
@@ -1857,7 +1874,7 @@ fn a_committed_cell_that_is_not_a_package_is_ignored() {
     )));
     let executed = execute(&executor, &[tx]);
     let bogus = package_hash(&ProtocolHasher, encode_amount(900).as_ref());
-    absorb_committed_cells([&executed[0].consensus]);
+    absorb_committed_cells([&executed[0].consensus], executor.derivation().as_ref());
     assert!(
         executor.packages().load().get(bogus).is_none(),
         "vault writes are not packages"
@@ -1897,7 +1914,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     let ConsensusReceipt::Succeeded { .. } = &executed[0].consensus else {
         panic!("the publish must succeed: {:?}", executed[0].consensus);
     };
-    absorb_committed_cells([&executed[0].consensus]);
+    absorb_committed_cells([&executed[0].consensus], executor.derivation().as_ref());
 
     // The instance is computed, not created: a package hash, a
     // configuration, and a salt derive the address, and the presented
@@ -1936,7 +1953,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     let bare =
         Transaction::new(client().sign_tree(&unpresented, Vec::new(), &key, terms(TRANSFER_FEE)));
     let refusal = bare
-        .try_derived()
+        .try_derived(executor.derivation().as_ref())
         .expect_err("an unresolved instance target does not derive");
     assert_eq!(
         refusal.unresolved(),

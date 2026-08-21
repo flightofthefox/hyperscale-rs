@@ -23,8 +23,8 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage};
 use hyperscale_types::{
-    Epoch, RatifyPhase, RatifyRound, RoutingCommittees, ShardId, SpcView, TopologySnapshot,
-    Transaction, ValidatorId, Verifier,
+    Derivation, Epoch, RatifyPhase, RatifyRound, RoutingCommittees, ShardId, SpcView,
+    TopologySnapshot, Transaction, ValidatorId, Verifier,
 };
 pub(crate) use network_handlers::register_shard_request_handlers;
 pub use tx_status::TxStatusCache;
@@ -349,6 +349,13 @@ where
         &self.beacon_storage
     }
 
+    /// This node's derivation, held by its engine — what a vnode seated
+    /// at runtime resolves envelopes against.
+    #[must_use]
+    pub fn derivation(&self) -> Arc<dyn Derivation> {
+        self.dispatch_handles.executor.derivation()
+    }
+
     /// Process-wide transaction status cache, shared with external RPC
     /// consumers.
     #[must_use]
@@ -420,7 +427,7 @@ where
         // envelope has to earn: asking an envelope that derives no
         // routing which shards it touches is asking for an answer it
         // does not have.
-        if let Err(error) = tx.try_derived() {
+        if let Err(error) = tx.try_derived(self.dispatch_handles.executor.derivation().as_ref()) {
             // Warn rather than debug: a refusal here can be this node's
             // own gap as easily as the envelope's fault, and the two read
             // identically from the submitter's side.

@@ -41,13 +41,13 @@ use hyperscale_metrics::{record_rebuilt_verdict_entry, record_unresolvable_tx};
 use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
-    CertifiedBlock, DeclaredKey, ExecutionCertificate, ExecutionCertificateVerifyError,
+    CertifiedBlock, DeclaredKey, Derivation, ExecutionCertificate, ExecutionCertificateVerifyError,
     ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
     Hash, MAX_FINALIZATION_DELAY, MAX_TERMINAL_VERDICTS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, Mode,
     Provisions, RETENTION_HORIZON, RevealChain, ScheduleLookup, SettledSetVerdict, SettledTxSet,
     ShardId, ShardTrie, TerminalVerdict, TickId, TopologySchedule, TopologySnapshot, Transaction,
     TransactionDecision, TxClaim, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, settled_set_verdict, tick_leader, tick_leader_at,
+    WeightedTimestamp, derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use tracing::instrument;
 
@@ -733,6 +733,7 @@ impl ExecutionCoordinator {
     pub fn on_committed_state_restored(
         &mut self,
         topology_schedule: &TopologySchedule,
+        derivation: &dyn Derivation,
     ) -> Vec<Action> {
         let blocks = std::mem::take(&mut self.replay_blocks);
         if blocks.is_empty() {
@@ -751,6 +752,9 @@ impl ExecutionCoordinator {
 
         let mut actions = Vec::new();
         for certified in &blocks {
+            // The replay window came off the store, so nothing derived
+            // these on the way in.
+            derive_block_transactions(certified.block(), derivation);
             actions.extend(self.on_block_committed(topology_schedule, certified));
         }
         actions
@@ -3515,8 +3519,8 @@ mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_storage::ReplayWindow;
     use hyperscale_types::test_utils::{
-        certify as test_certify, make_live_block as helpers_make_live_block, test_prefix,
-        test_transaction, test_transaction_running, test_transaction_with_prefixes,
+        StubVmStatics, certify as test_certify, make_live_block as helpers_make_live_block,
+        test_prefix, test_transaction, test_transaction_running, test_transaction_with_prefixes,
     };
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt,
@@ -6375,7 +6379,7 @@ mod tests {
             "construction has no topology to compose against, so it holds",
         );
 
-        let actions = restarted.on_committed_state_restored(&schedule);
+        let actions = restarted.on_committed_state_restored(&schedule, &StubVmStatics);
         assert_eq!(
             restarted.ticks.tick_assignment(held_hash),
             live.ticks.tick_assignment(held_hash),

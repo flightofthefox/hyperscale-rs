@@ -13,11 +13,11 @@ use thiserror::Error;
 
 use crate::{
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, CertificateRoot, ChainOrigin,
-    Finalization, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
-    MAX_TERMINAL_VERDICTS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, ProvisionTxRootsMap,
-    Provisions, ProvisionsRoot, QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots,
-    StateRoot, TerminalVerdict, Transaction, TransactionRoot, TxHash, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp, WitnessSources,
+    Derivation, Finalization, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TERMINAL_VERDICTS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ShardId,
+    SharedWitnessSources, SplitChildRoots, StateRoot, TerminalVerdict, Transaction,
+    TransactionRoot, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -31,27 +31,29 @@ use crate::{
 /// Same rationale as [`SharedCertificates`].
 pub type SharedTransactions = Arc<Vec<Arc<Verifiable<Transaction>>>>;
 
-/// Build a [`SharedTransactions`] from a list of raw `Arc<Transaction>`
-/// recovered from persistent storage.
+/// Derive every transaction of a committed `block` through this node's
+/// `derivation`, so the routed facts its handlers read are there to
+/// read.
 ///
-/// Each entry is lifted via
-/// [`Verified::<Transaction>::from_persisted`] — the BFT-transitive
-/// trust chain (persisted ⇒ committed block ⇒ voter-validated by ≥1 honest
-/// voter) justifies marking each as [`Verifiable::Verified`]. Callers
-/// outside that trust source must construct
-/// `Vec<Arc<Verifiable<Transaction>>>` directly.
+/// A block that arrived through verification carries its derivations
+/// already and this costs a cache hit apiece. One lifted out of storage
+/// carries none: its trust is BFT-transitive rather than local, so
+/// nothing derived it on the way in, and deriving is the node's own
+/// answer rather than something the block could carry.
 ///
-#[must_use]
-pub fn shared_transactions_from_raw(txs: Vec<Arc<Transaction>>) -> SharedTransactions {
-    let wrapped: Vec<Arc<Verifiable<Transaction>>> = txs
-        .into_iter()
-        .map(|tx| {
-            Arc::new(Verifiable::from(Verified::<Transaction>::from_persisted(
-                (*tx).clone(),
-            )))
-        })
-        .collect();
-    Arc::new(wrapped)
+/// A refusal is logged and left: the accessors panic where the fact is
+/// actually wanted, naming the transaction that was never derived.
+pub fn derive_block_transactions(block: &Block, derivation: &dyn Derivation) {
+    for tx in block.transactions().iter() {
+        if let Err(error) = tx.as_unverified().try_derived(derivation) {
+            tracing::error!(
+                tx_hash = ?tx.as_unverified().hash(),
+                height = block.height().inner(),
+                reason = %error,
+                "A committed transaction derives nothing on this node"
+            );
+        }
+    }
 }
 
 /// Shared certificate list — same rationale as [`SharedTransactions`].

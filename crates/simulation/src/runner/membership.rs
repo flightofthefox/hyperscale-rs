@@ -436,6 +436,7 @@ impl SimulationRunner {
                 as Arc<dyn Signer>;
         seat_vnode_group(SeatVnodeGroup {
             verifier: Arc::clone(&self.verifier),
+            derivation: host.derivation(),
             beacon_storage: host.beacon_storage().as_ref(),
             beacon_network: self.beacon_network.clone(),
             beacon_config_hash: self.beacon_config_hash,

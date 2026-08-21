@@ -21,7 +21,7 @@ use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::RecoveredState;
-use hyperscale_types::test_utils::TestCommittee;
+use hyperscale_types::test_utils::{StubVmStatics, TestCommittee};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, CertifiedBeaconBlock, GenesisPool, GenesisValidator,
     MIN_STAKE_FLOOR, NetworkDefinition, Randomness, ShardId, Stake, StakePoolId, ValidatorId,
@@ -72,6 +72,7 @@ impl TestNodeBuilder {
 
         let node = NodeStateMachine::new(
             me,
+            Arc::new(StubVmStatics),
             local_shard,
             &ShardConsensusConfig::default(),
             RecoveredState::default(),

@@ -465,11 +465,17 @@ where
         let prepared_commits = self.io.block_commit.prepared_commits_handle();
         let event_tx = self.event_sender().clone();
         let shard = self.shard;
+        let derivation = self.process.dispatch_handles.executor.derivation();
 
         self.process
             .dispatch
             .spawn(DispatchPool::Consensus, move || {
-                let result = run_qc_only_prep(&pending_chain, &prepared_commits, &pending);
+                let result = run_qc_only_prep(
+                    &pending_chain,
+                    &prepared_commits,
+                    &pending,
+                    derivation.as_ref(),
+                );
                 let QcOnlyPending {
                     certified,
                     source,

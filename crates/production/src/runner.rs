@@ -494,6 +494,35 @@ impl ProductionRunnerBuilder {
         }
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
+        // The bootstrap identity replicated into every fresh store the
+        // supervisor opens for a post-genesis join or observer duty —
+        // the same network + genesis config the startup genesis path
+        // installs, so the substate sides agree across stores.
+        let mut bootstrap_config = self.genesis_config.clone().unwrap_or_default();
+        // Each seated pool's founding members, read off the beacon's own
+        // folded genesis state: the contract's record of who a pool
+        // operates has to agree with the beacon's from the first block,
+        // and this is where both exist.
+        seed_founding_members(&boot.state, &mut bootstrap_config.pools);
+        let engine_bootstrap = EngineBootstrap {
+            config: bootstrap_config,
+        };
+        // The VM engine's world seats the same pools the startup genesis
+        // path installs, unless a wider set was given: construction
+        // installs the process protocol answers, which are
+        // first-writer-wins, so several clusters in one process must
+        // agree.
+        let world_pools = if self.world_pools.is_empty() {
+            &engine_bootstrap.config.pools
+        } else {
+            &self.world_pools
+        };
+        let executor: Arc<Executor> = Arc::new(Executor::with_genesis(
+            world_pools,
+            &engine_bootstrap.config.packages,
+            ExecutionMode::Serial,
+        ));
+
         // Seated validators boot from their own shard's recovered state;
         // pooled validators boot as shard-less beacon followers.
         let now = consensus_clock(chain_config.genesis_timestamp_ms);
@@ -502,6 +531,7 @@ impl ProductionRunnerBuilder {
             let recovered = storages[shard].load_recovered_state();
             vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
                 verifier: Arc::new(BlsVerifier),
+                derivation: executor.derivation(),
                 beacon_storage: self.beacon_storage.as_ref(),
                 beacon_network: beacon_network.clone(),
                 beacon_config_hash,
@@ -551,34 +581,6 @@ impl ProductionRunnerBuilder {
             topology_snapshot: topology_snapshot.clone(),
             verifier: Arc::new(BlsVerifier),
         })?;
-
-        // The bootstrap identity replicated into every fresh store the
-        // supervisor opens for a post-genesis join or observer duty —
-        // the same network + genesis config the startup genesis path
-        // installs, so the substate sides agree across stores.
-        let mut bootstrap_config = self.genesis_config.clone().unwrap_or_default();
-        // Each seated pool's founding members, read off the beacon's own
-        // folded genesis state: the contract's record of who a pool
-        // operates has to agree with the beacon's from the first block,
-        // and this is where both exist.
-        seed_founding_members(&boot.state, &mut bootstrap_config.pools);
-        let engine_bootstrap = EngineBootstrap {
-            config: bootstrap_config,
-        };
-        // The VM engine's world seats the same pools the startup genesis
-        // path installs, unless a wider set was given: construction
-        // installs the process VM statics, which are first-writer-wins,
-        // so several clusters in one process must agree.
-        let world_pools = if self.world_pools.is_empty() {
-            &engine_bootstrap.config.pools
-        } else {
-            &self.world_pools
-        };
-        let executor: Arc<Executor> = Arc::new(Executor::with_genesis(
-            world_pools,
-            &engine_bootstrap.config.packages,
-            ExecutionMode::Serial,
-        ));
 
         // Each shard's `shard_event_senders` entry points at that
         // shard's own pinned-thread callback channel — callbacks,

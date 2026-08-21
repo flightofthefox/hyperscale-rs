@@ -25,8 +25,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::{ShardStorage, SubstateStore};
 use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::{
-    Address, NetworkId, ShardId, TopologySnapshot, Transaction, TransactionVerifyError, TxHash,
-    Verified, Verify,
+    Address, NetworkId, ShardId, TopologySnapshot, Transaction, TransactionContext,
+    TransactionVerifyError, TxHash, Verified, Verify,
 };
 
 use super::TransactionBinding;
@@ -184,12 +184,17 @@ where
         let local_shard = self.shard;
         let par: Parallelism = self.process.dispatch.parallelism();
         let network = NetworkId::from(self.process.topology_snapshot.load().network());
+        let derivation = self.process.dispatch_handles.executor.derivation();
         self.process
             .dispatch
             .spawn(DispatchPool::Throughput, move || {
+                let ctx = TransactionContext {
+                    network,
+                    derivation: derivation.as_ref(),
+                };
                 let results: Vec<(TxHash, Option<Verified<Transaction>>)> = par.map(batch, |tx| {
                     let hash = tx.hash();
-                    (hash, tx.verify(network).ok())
+                    (hash, tx.verify(ctx).ok())
                 });
 
                 let mut valid: Vec<Arc<Verified<Transaction>>> = Vec::new();
@@ -314,10 +319,15 @@ where
             .load()
             .get(&self.shard)
             .map(|handles| Arc::clone(&handles.storage));
+        let derivation = self.process.dispatch_handles.executor.derivation();
         self.process
             .dispatch
             .spawn(DispatchPool::Throughput, move || {
                 type Outcome = (TxHash, Option<Verified<Transaction>>, Vec<Address>);
+                let ctx = TransactionContext {
+                    network: NetworkId::from(topology.network()),
+                    derivation: derivation.as_ref(),
+                };
                 let results: Vec<Outcome> = par.map(batch, |tx| {
                     let hash = tx.hash();
                     // What a refusal wanted but this node did not hold.
@@ -326,7 +336,7 @@ where
                     // so the addresses are what to ask for rather than
                     // grounds to drop it and forget.
                     let mut wanted = Vec::new();
-                    let verified = match tx.verify(NetworkId::from(topology.network())) {
+                    let verified = match tx.verify(ctx) {
                         Ok(v) => Some(v),
                         Err(TransactionVerifyError::Derivation(error)) => {
                             wanted = error.unresolved().to_vec();
