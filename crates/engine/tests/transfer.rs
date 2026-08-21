@@ -26,7 +26,7 @@ use hyperscale_types::{
     absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
-    AbiParam, EnvelopeTree, Hash32, InstanceMeta, InstanceRegistry, IntentDecl, PackageHash,
+    AbiParam, Composed, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, PackageHash,
     PackageMetadata, Totality, Value, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
@@ -215,9 +215,8 @@ fn signed_transfer_under_bound(
     max_fee: u128,
 ) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
-    let cache = client().cache();
-    let instances = client().instances();
-    let mut b = client().builder(&cache, &instances);
+    let chain = client().records();
+    let mut b = client().builder(&chain);
     let sender = account::authorize(&mut b, from).expect("an account signs in");
     let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");
     account::deposit(&mut b, to, funds.min(min)).expect("an account deposits");
@@ -299,13 +298,10 @@ fn signed_draw(seed: u8) -> Transaction {
 
 fn signed_draw_with_fee(seed: u8, max_fee: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
-    let cache = client().cache();
-    // The composer knows the round's record and types the call against
-    // it; the envelope carries nothing, because the chain seated the
-    // component and answers for it — see [`MapDb::genesis`].
-    let mut instances = InstanceRegistry::clone(&client().instances());
-    let lottery_addr = instances.create(&ProtocolHasher, lottery_meta());
-    let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
+    let chain = client().records();
+    let composed = Composed::new(&chain, &[lottery_meta()], &ProtocolHasher);
+    let lottery_addr = lottery_meta().address(&ProtocolHasher);
+    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
     lottery::Lottery::at(lottery_addr)
         .draw(&mut root, 64)
         .expect("a lottery answers a draw");
@@ -329,10 +325,10 @@ fn with_lottery(accounts: &[(PrincipalAddr, u128)], executor: &Executor) -> MapD
     funded.push((fee_payer(SEALER_SEED), 1_000_000));
     let mut store = MapDb::genesis(&funded);
     let key = Ed25519PrivateKey::from_bytes(&[SEALER_SEED; 32]).unwrap();
-    let cache = client().cache();
-    let mut instances = InstanceRegistry::clone(&client().instances());
-    let round = instances.create(&ProtocolHasher, lottery_meta());
-    let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
+    let chain = client().records();
+    let composed = Composed::new(&chain, &[lottery_meta()], &ProtocolHasher);
+    let round = lottery_meta().address(&ProtocolHasher);
+    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
     lottery::Lottery::at(round)
         .instantiate(&mut root)
         .expect("a derivable round answers its seal");
@@ -1155,9 +1151,8 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
 fn a_two_recipient_fan_out_executes() {
     let executor = executor(ExecutionMode::Serial);
     let key = Ed25519PrivateKey::from_bytes(&[ALICE_SEED; 32]).unwrap();
-    let cache = client().cache();
-    let instances = client().instances();
-    let mut b = client().builder(&cache, &instances);
+    let chain = client().records();
+    let mut b = client().builder(&chain);
     for (to, amount) in [(bob(), 5u128), (fee_payer(7), 6)] {
         let sender = account::authorize(&mut b, alice()).expect("an account signs in");
         let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");

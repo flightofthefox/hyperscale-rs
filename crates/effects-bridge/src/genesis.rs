@@ -17,7 +17,7 @@ pub use hyperscale_vm_stdlib::{account_artifact, genesis_publisher, staking_arti
 use hyperscale_vm_stdlib::{protocol_artifacts, staking};
 use hyperscale_vm_types::Address;
 
-use crate::vm_statics::{InstanceCache, PackageCache};
+use crate::vm_statics::{InstanceCache, NodeRecords, PackageCache};
 use crate::{PoolRegistry, ProtocolHasher, XRD, admit_protocol_package};
 
 /// The packages a network is born running.
@@ -85,6 +85,15 @@ pub struct World {
 }
 
 impl World {
+    /// This world's records, pinned for one derivation.
+    ///
+    /// Both caches are loaded once here, so a reader holds the world it
+    /// started in however many lookups it makes.
+    #[must_use]
+    pub fn records(&self) -> NodeRecords {
+        NodeRecords::pinned(&self.cache, &self.instances)
+    }
+
     /// A second node's copy of this world: the same packages and the
     /// same instances, in caches that share nothing either side goes on
     /// to absorb.

@@ -23,15 +23,16 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
-    AuthCell, EnvelopeTree, Hasher, InstanceMeta, InstanceRegistry, ManifestHash, MetadataCache,
-    PRIMARY, PackageHash, PackageMetadata, PrefixShardResolver, Presented,
+    AuthCell, ChainRecords, EnvelopeTree, Hasher, InstanceMeta, InstanceRegistry, ManifestHash,
+    MetadataCache, PRIMARY, PackageHash, PackageMetadata, PrefixShardResolver, Presented,
     Routing as RoutedTransaction, Value, admit_tree, child_key, footprint, package_hash,
     package_key as canonical_package_key, principal_address, route_tree, xrd,
 };
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
-    Address, EffectSet, EffectTarget, Mode, PrincipalAddr, ResourceAddr, SchemeId, SubstateKey,
+    Address, CallTarget, EffectSet, EffectTarget, Mode, PrincipalAddr, ResourceAddr, SchemeId,
+    SubstateKey,
 };
 
 use crate::ProtocolHasher;
@@ -334,6 +335,40 @@ pub fn committed_instance(owner: Address, local: [u8; 16], value: &[u8]) -> Opti
     meta.derives(&ProtocolHasher, owner).then_some(meta)
 }
 
+/// One node's answers for the length of one derivation.
+///
+/// Both caches are loaded once and held by refcount, which is the whole
+/// of what the [`ChainRecords`] stability contract asks for: a block
+/// committing partway through a derivation swaps the caches under a
+/// later reader, and this one keeps the world it started in. Two
+/// lookups in one derivation cannot disagree, so an envelope routes one
+/// way on a node rather than two.
+pub struct NodeRecords {
+    packages: Arc<MetadataCache>,
+    instances: Arc<InstanceRegistry>,
+}
+
+impl NodeRecords {
+    /// Load both caches once, fixing the world this view answers from.
+    #[must_use]
+    pub fn pinned(packages: &PackageCache, instances: &InstanceCache) -> Self {
+        Self {
+            packages: packages.load(),
+            instances: instances.load(),
+        }
+    }
+}
+
+impl ChainRecords for NodeRecords {
+    fn instance(&self, target: CallTarget) -> Option<Arc<InstanceMeta>> {
+        self.instances.record(target)
+    }
+
+    fn package(&self, hash: PackageHash) -> Option<Arc<PackageMetadata>> {
+        self.packages.record(hash)
+    }
+}
+
 /// The component targets `tree` names that neither committed state nor
 /// the tree's own records resolve.
 ///
@@ -341,7 +376,7 @@ pub fn committed_instance(owner: Address, local: [u8; 16], value: &[u8]) -> Opti
 /// holding each one's seal can answer for it. Collected whole, in the
 /// order the flattened manifest names them, so the answer is stable
 /// wherever it is computed.
-fn unresolved_targets(tree: &EnvelopeTree, instances: &InstanceRegistry) -> Vec<Address> {
+fn unresolved_targets(tree: &EnvelopeTree, chain: &dyn ChainRecords) -> Vec<Address> {
     let carried: BTreeSet<Address> = tree
         .instances
         .iter()
@@ -355,7 +390,7 @@ fn unresolved_targets(tree: &EnvelopeTree, instances: &InstanceRegistry) -> Vec<
     );
     for node in graphs.flat_map(|graph| &graph.nodes) {
         let address = node.target.address();
-        if instances.get(node.target).is_some() || carried.contains(&address) {
+        if chain.instance(node.target).is_some() || carried.contains(&address) {
             continue;
         }
         if !missing.contains(&address) {
@@ -609,17 +644,20 @@ impl Derivation for BridgeStatics {
                 )));
             }
         }
-        let packages = self.cache.load();
         // What the chain answers a target with: genesis, grown by every
-        // seal that has committed since. Admission composes the tree's
-        // own records over these itself, holding each to standing for
-        // the seal of the component it derives.
-        let instances = self.instances.load();
+        // seal that has committed since. Admission layers the tree's own
+        // records behind these itself, holding each to standing for the
+        // seal of the component it derives.
+        //
+        // One view for the whole derivation: both caches are read once
+        // here and held by refcount, so nothing a block commits partway
+        // through can make two lookups in one derivation disagree.
+        let chain = NodeRecords::pinned(&self.cache, &self.instances);
         // Every target this node holds no record for, named before
         // admission runs. Admission refuses at the first one it meets,
         // and a fetch wants the whole set: one round trip rather than
         // one per component the envelope calls.
-        let unresolved = unresolved_targets(&tree, &instances);
+        let unresolved = unresolved_targets(&tree, &chain);
         if !unresolved.is_empty() {
             return Err(VmStaticsError::Unresolved(unresolved));
         }
@@ -627,8 +665,7 @@ impl Derivation for BridgeStatics {
             &tree,
             signer,
             envelope_identity(vm),
-            &packages,
-            &instances,
+            &chain,
             &ProtocolHasher,
         )
         .map_err(|error| VmStaticsError::Refused(format!("admission: {error}")))?;

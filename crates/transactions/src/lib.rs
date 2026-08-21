@@ -16,18 +16,16 @@
 //! builders enforce, so a defect can cost a signer a refused transaction
 //! and can never produce one the chain would wrongly accept.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
-use hyperscale_effects_bridge::XRD;
 use hyperscale_effects_bridge::genesis::{World, genesis_world};
 use hyperscale_effects_bridge::vm_statics::principal_for;
+use hyperscale_effects_bridge::{NodeRecords, XRD};
 use hyperscale_types::{
     AccountSigner, NetworkId, ProtocolHasher, SubintentSig, TimestampRange, Transaction,
     TransactionEnvelope,
 };
-use hyperscale_vm_effects::{
-    EnvelopeTree, InstanceRegistry, IntentDecl, ManifestGraph, MetadataCache, Presented, StoredRule,
-};
+use hyperscale_vm_effects::{EnvelopeTree, IntentDecl, ManifestGraph, Presented, StoredRule};
 use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
 use hyperscale_vm_stdlib::account;
 use hyperscale_vm_types::PrincipalAddr;
@@ -104,29 +102,20 @@ impl Client {
 
     /// A typed builder over this client's world.
     ///
-    /// The cache and the registry are loaded by the caller because both
-    /// are read behind an `Arc` that has to outlive the builder
-    /// borrowing them.
+    /// The records are loaded by the caller because the view has to
+    /// outlive the builder borrowing it — and because one loaded view is
+    /// what keeps a graph typed against a single world however many
+    /// calls it names.
     #[must_use]
-    pub fn builder<'a>(
-        &'a self,
-        cache: &'a MetadataCache,
-        instances: &'a InstanceRegistry,
-    ) -> TypedBuilder<'a> {
-        TypedBuilder::new(cache, instances, &ProtocolHasher)
+    pub fn builder<'a>(&self, chain: &'a NodeRecords) -> TypedBuilder<'a> {
+        TypedBuilder::new(chain, &ProtocolHasher)
     }
 
-    /// The instances the chain answers for, for a caller opening its own
-    /// builder.
+    /// What this client's world answers for, pinned — for a caller
+    /// opening its own builder.
     #[must_use]
-    pub fn instances(&self) -> Arc<InstanceRegistry> {
-        self.world.instances.load()
-    }
-
-    /// The published set, for a caller opening its own builder.
-    #[must_use]
-    pub fn cache(&self) -> Arc<MetadataCache> {
-        self.world.cache.load()
+    pub fn records(&self) -> NodeRecords {
+        self.world.records()
     }
 
     /// The withdraw-then-deposit graph moving `amount` of the native
@@ -143,9 +132,8 @@ impl Client {
         to: PrincipalAddr,
         amount: u128,
     ) -> Result<ManifestGraph, TypedError> {
-        let cache = self.cache();
-        let instances = self.instances();
-        let mut b = self.builder(&cache, &instances);
+        let chain = self.records();
+        let mut b = self.builder(&chain);
         let sender = account::authorize(&mut b, from)?;
         let funds = account::withdraw(&mut b, sender, *XRD, amount)?;
         account::deposit(&mut b, to, funds)?;
@@ -169,9 +157,8 @@ impl Client {
         holder: PrincipalAddr,
         recovery_delay_ms: u64,
     ) -> Result<ManifestGraph, TypedError> {
-        let cache = self.cache();
-        let instances = self.instances();
-        let mut b = self.builder(&cache, &instances);
+        let chain = self.records();
+        let mut b = self.builder(&chain);
         let owner = account::authorize(&mut b, account)?;
         account::securify_uniform(
             &mut b,
@@ -338,12 +325,10 @@ mod tests {
         let graph = client
             .transfer_graph(test_principal(0x11), test_principal(0x22), 100)
             .unwrap();
-        let cache = client.cache();
         admit(
             &graph,
             test_principal(0x11),
-            &cache,
-            &client.instances(),
+            &client.records(),
             &ProtocolHasher,
         )
         .expect("a built transfer admits");
