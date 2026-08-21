@@ -723,9 +723,9 @@ mod tests {
     };
     use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
-        AuthBase, Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Hasher, IntentDecl,
-        ManifestGraph, PackageHash, Presented, Proposal, RoleTable, StoredRule, Subintent,
-        SubintentHash, YieldBinding, YieldParam, child_key, nullifier_key,
+        AuthBase, Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Hash32, Hasher,
+        IntentDecl, ManifestGraph, PackageHash, Presented, Proposal, RoleTable, StoredRule,
+        Subintent, SubintentHash, YieldBinding, YieldParam, child_key, nullifier_key,
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
     use hyperscale_vm_stdlib::account;
@@ -1350,5 +1350,73 @@ mod tests {
         ]
         .into();
         assert!(check_provision_weight(&cells_count).is_err());
+    }
+
+    /// A record is seated under the address its own contents derive, and
+    /// under no other.
+    ///
+    /// This is the whole of what makes a fetched record safe from any
+    /// peer: the address is the hash of the record, so a served record
+    /// either is the one asked for or derives somewhere else and seats
+    /// nothing. Nobody is trusted, and no consensus stands behind the
+    /// answer.
+    #[test]
+    fn a_record_is_seated_only_under_the_address_it_derives() {
+        let meta = InstanceMeta {
+            package: PackageHash(ProtocolHasher.hash(b"package", &[b"honest"])),
+            config: vec![Value::U64(7)],
+            salt: Hash32([3; 32]),
+        };
+        let address = meta.address(&ProtocolHasher).address();
+        let record = meta.leaf_bytes().expect("a record encodes");
+
+        // Its own address: the key derives, the contents derive, seated.
+        let cache = InstanceCache::new(InstanceRegistry::new());
+        assert!(cache.absorb_cell(address, config_key(address).local.0, &record));
+        assert!(
+            cache
+                .load()
+                .get(CallTarget::try_from(address).unwrap())
+                .is_some()
+        );
+
+        // Somebody else's: the same honest bytes, offered for a
+        // component they say nothing about.
+        let elsewhere = InstanceMeta {
+            salt: Hash32([9; 32]),
+            ..meta
+        }
+        .address(&ProtocolHasher)
+        .address();
+        let cache = InstanceCache::new(InstanceRegistry::new());
+        assert!(!cache.absorb_cell(elsewhere, config_key(elsewhere).local.0, &record));
+        assert!(
+            cache
+                .load()
+                .get(CallTarget::try_from(elsewhere).unwrap())
+                .is_none(),
+            "a record deriving another address seats nothing"
+        );
+
+        // And a cell that is not a configuration leaf is not a record,
+        // whatever it holds: the key is checked before the value is
+        // read, which is what keeps this cheap over every committed cell.
+        let cache = InstanceCache::new(InstanceRegistry::new());
+        assert!(!cache.absorb_cell(address, vault_key(address, *XRD).local.0, &record));
+    }
+
+    /// The address a served record derives, read off the bytes alone.
+    #[test]
+    fn a_records_address_is_read_from_the_record() {
+        let meta = InstanceMeta {
+            package: PackageHash(ProtocolHasher.hash(b"package", &[b"served"])),
+            config: Vec::new(),
+            salt: Hash32([5; 32]),
+        };
+        assert_eq!(
+            record_address(&meta.leaf_bytes().unwrap()),
+            Some(meta.address(&ProtocolHasher).address())
+        );
+        assert_eq!(record_address(b"not a record"), None);
     }
 }
