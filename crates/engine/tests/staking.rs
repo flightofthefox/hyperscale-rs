@@ -30,7 +30,7 @@ use hyperscale_vm_effects::{
     resource_record_key,
 };
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, TypedError};
-use hyperscale_vm_stdlib::{INSTANTIATE, account, found, staking};
+use hyperscale_vm_stdlib::{INSTANTIATE, account, instantiate, staking};
 use hyperscale_vm_types::{Address, CallTarget, CollectionId};
 
 /// The identifier the beacon folds the seated pool under.
@@ -433,7 +433,7 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
         .methods
         .remove(INSTANTIATE)
         .expect("an instance-serving package declares its seal");
-    found(&mut root, from, pool, &signature).expect("a derivable pool answers its seal");
+    instantiate(&mut root, from, pool, &signature).expect("a derivable pool answers its seal");
     env.instance(meta);
     env.seal(root)
         .expect("the root declares nothing to discharge");
@@ -445,7 +445,7 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
 /// are the cells genesis writes for a seated one, byte for byte — two
 /// writers of one object, held to each other.
 #[test]
-fn a_founded_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
+fn an_instantiated_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
     let unseated = seat(55);
     let executor = seated(&[], ExecutionMode::Serial);
     let mut store = MapDb::genesis(&[(account_of(OPERATOR), 10_000)], &[]);
@@ -473,7 +473,7 @@ fn a_founded_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
     let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated);
     let badge = pool_owner_badge(pool);
     // What a pool is, cell by cell: the seal, a record per mark it
-    // issues, and the badge instance its founding minted.
+    // issues, and the badge instance its instantiation minted.
     for key in [
         config_key(pool),
         resource_record_key(&ProtocolHasher, pool, badge),
