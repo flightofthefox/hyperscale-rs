@@ -612,6 +612,18 @@ impl InstanceCache {
         self.0.load_full()
     }
 
+    /// The records a cold start is born with: the blueprint serving
+    /// every principal, and whatever genesis seated.
+    ///
+    /// Held apart from what a node grew because these are the ones no
+    /// node acquires and none may let go — identical on every node, and
+    /// so the only records a reader may consult when its answer has to
+    /// be the same everywhere.
+    #[must_use]
+    pub fn seeded(&self) -> Arc<InstanceRegistry> {
+        Arc::clone(&self.load().seeded)
+    }
+
     /// A second node's copy: the same records, in a cache that shares
     /// nothing either side goes on to hold or let go.
     #[must_use]

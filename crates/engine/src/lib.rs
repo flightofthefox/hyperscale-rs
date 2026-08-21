@@ -29,6 +29,7 @@ mod executor;
 mod output;
 mod preview;
 mod receipt;
+mod records;
 
 /// Genesis seeding: the stdlib world and funded-account cells.
 pub mod genesis;

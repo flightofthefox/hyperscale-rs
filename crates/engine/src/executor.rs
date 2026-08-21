@@ -49,6 +49,7 @@ use hyperscale_vm_types::{
 
 use crate::backend::EngineBackend;
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
+use crate::records::BatchRecords;
 use crate::sharding::writes_root;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
 
@@ -455,8 +456,23 @@ impl Executor {
     /// — the same `decode → admit → route` admission ran; refusal here
     /// means the transaction bypassed admission and fails
     /// deterministically.
-    pub(crate) fn prepare(&self, tx: &Transaction) -> Result<PreparedTx, String> {
-        self.prepare_with_authority(tx, TargetAuthority::Required)
+    ///
+    /// Deterministically only as far as `chain` is: a refusal is this
+    /// member's contribution to a receipt root, so what answers a target
+    /// on the commit path has to answer the same on every member. That
+    /// is [`BatchRecords`], which reads the block and committed state
+    /// and nothing a node accumulated on its own.
+    ///
+    /// Nothing of the engine enters it, which is the same statement from
+    /// the other side: what an envelope declares is a function of the
+    /// envelope and the records, and of no node running it.
+    ///
+    /// [`BatchRecords`]: crate::records::BatchRecords
+    pub(crate) fn prepare(
+        tx: &Transaction,
+        chain: &dyn ChainRecords,
+    ) -> Result<PreparedTx, String> {
+        Self::prepare_with_authority(tx, chain, TargetAuthority::Required)
     }
 
     /// [`Self::prepare`] with the target-authority rule made optional.
@@ -466,8 +482,8 @@ impl Executor {
     /// signed. Nothing on the commit path reaches this with
     /// [`TargetAuthority::Assumed`].
     pub(crate) fn prepare_with_authority(
-        &self,
         tx: &Transaction,
+        chain: &dyn ChainRecords,
         authority: TargetAuthority,
     ) -> Result<PreparedTx, String> {
         let vm = tx.body();
@@ -482,17 +498,11 @@ impl Executor {
         // shard's verdict before the transaction committed.
         let signer = principal_for(vm.signer_scheme, &vm.signer)
             .ok_or_else(|| "the envelope's signer key derives no principal".to_string())?;
-        // The records the chain answers with. Admission composes the
+        // The records the caller answers with. Admission composes the
         // envelope's own over these itself, and holds each to standing
         // for the seal of the component it derives.
-        let admitted = admit_tree(
-            &tree,
-            signer,
-            envelope_identity(vm),
-            &self.world.records(),
-            &ProtocolHasher,
-        )
-        .map_err(|error| format!("admission: {error}"))?;
+        let admitted = admit_tree(&tree, signer, envelope_identity(vm), chain, &ProtocolHasher)
+            .map_err(|error| format!("admission: {error}"))?;
         let routing = route_tree(&admitted, &PrefixShardResolver { bits: 0 });
         // Both views of the declaration, straight from the fold: the
         // folded set that scheduling and judging read, and the clause
@@ -997,6 +1007,18 @@ impl Executor {
             })
             .collect();
 
+        // What this batch resolves its targets through: genesis, this
+        // shard's committed leaves, and the ones its counterparts
+        // provisioned. Every member of the shard builds the same three
+        // from the same block, which is what makes a refusal below a
+        // property of the transaction rather than of the node.
+        let records = BatchRecords::new(
+            self.world.cache.load(),
+            self.world.instances.seeded(),
+            provisions_by_tx,
+            snapshot,
+        );
+
         // Derive every transaction; refusals become deterministic
         // failures without touching the batch.
         let mut prepared: BTreeMap<TxHash, PreparedTx> = BTreeMap::new();
@@ -1006,7 +1028,7 @@ impl Executor {
             if publishes.contains_key(&vm_tx) {
                 continue;
             }
-            match self.prepare(tx) {
+            match Self::prepare(tx, &records) {
                 Ok(entry) => {
                     record_transaction_executed();
                     prepared.insert(vm_tx, entry);
@@ -1158,7 +1180,7 @@ impl Executor {
                     base: &base,
                     locality: &locality,
                     pools: &self.world.pools,
-                    instances: &self.records(),
+                    instances: &records,
                     staking_package: self.world.staking_package,
                 },
                 &mut fold,

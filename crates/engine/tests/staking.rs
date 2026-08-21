@@ -281,6 +281,80 @@ fn a_record_the_cache_answers_for_is_the_record_its_cell_holds() {
     );
 }
 
+/// A member holding no record for the target executes the call the same
+/// way as one that holds it.
+///
+/// What lets execution stop consulting anything a node accumulated. What
+/// a node holds for a component is its own: a record it never committed
+/// and never fetched is absent, and a bounded cache lets go of records
+/// on a schedule no two members share. If a target that would not
+/// resolve became a failed receipt, one member would hand up a receipt
+/// root of its own for a transaction every other member settled.
+///
+/// The two engines here are forked from one world and then differ in
+/// exactly one thing: the seal commits on one of them. The other holds
+/// no record for the pool at all and has to read the leaf out of the
+/// state it is executing against.
+#[test]
+fn a_member_holding_no_record_executes_the_call_alike() {
+    let unseated = seat(56);
+    let holder = seated(std::slice::from_ref(&seat(POOL_ID)), ExecutionMode::Serial);
+    // Forked before the seal, so what the holder goes on to absorb is
+    // the holder's alone — the way two processes would hold it.
+    let reader = holder.peer(ExecutionMode::Serial);
+    let mut store = MapDb::genesis(
+        &[(account_of(OPERATOR), 10_000)],
+        std::slice::from_ref(&seat(POOL_ID)),
+    );
+    let trie = ShardTrie::single();
+    let ctx = TickBatchContext {
+        local_shard: ShardId::ROOT,
+        shard_trie: &trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        tick_reveal: RevealChain::ZERO,
+        holds: &ProvisionalHolds::new(),
+    };
+
+    let raw = signed_instantiate(OPERATOR, &unseated);
+    raw.try_derived(holder.derivation().as_ref())
+        .expect("a fixture transaction derives");
+    let seal = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let sealed = holder.execute_batch(&ctx, &store, std::slice::from_ref(&seal));
+    absorb(&mut store, &sealed[0], &holder);
+
+    let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated);
+    assert!(
+        holder.instance_known(pool.address()),
+        "the sealing member absorbed the record its own commit wrote"
+    );
+    assert!(
+        !reader.instance_known(pool.address()),
+        "and the other holds none of it"
+    );
+
+    // Derived once, by the member that can resolve the pool from what it
+    // holds — the routed facts a block carries into execution are
+    // settled before it, and never re-asked.
+    let raw = signed_found(OPERATOR, &unseated);
+    raw.try_derived(holder.derivation().as_ref())
+        .expect("a fixture transaction derives");
+    let call = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let by_holder = holder.execute_batch(&ctx, &store, std::slice::from_ref(&call));
+    let by_reader = reader.execute_batch(&ctx, &store, std::slice::from_ref(&call));
+
+    // Stated before the comparison, so a pair of matching refusals
+    // cannot pass for agreement.
+    assert!(
+        matches!(by_reader[0].consensus, ConsensusReceipt::Succeeded { .. }),
+        "the member that read the leaf settled the call; receipt = {:?}",
+        by_reader[0].consensus
+    );
+    assert_eq!(
+        by_holder[0].consensus, by_reader[0].consensus,
+        "a member that holds the record and one that reads it produce one receipt"
+    );
+}
+
 /// An executor over a network seating `pools`, on the protocol's own
 /// packages — the staking surface reaches no fixture.
 fn seated(pools: &[StakePoolSeat], mode: ExecutionMode) -> Executor {
@@ -342,7 +416,6 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
 fn signed_found(seed: u8, seat: &StakePoolSeat) -> Transaction {
     let key = key_of(seed);
     let from = account_address(&key.public_key().0);
-    let _chain = client().records();
     // The composer knows the record and types the call against it; the
     // envelope carries nothing, because the chain answers for the
     // target itself once the seal has committed.
