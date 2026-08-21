@@ -21,7 +21,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use hyperscale_effects_bridge::vm_statics::{committed_instance, config_key};
+use hyperscale_effects_bridge::records::committed_instance;
+use hyperscale_effects_bridge::vm_statics::config_key;
 use hyperscale_types::{SubstateEntry, TxHash};
 use hyperscale_vm_effects::{
     ChainRecords, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash, PackageMetadata,

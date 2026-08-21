@@ -232,9 +232,9 @@ pub use transaction::status::{
     TransactionDecision, TransactionError, TransactionStatus, TransactionStatusParseError,
 };
 pub use transaction::vm::{
-    Derivation, Derived, EnvelopeExt, MAX_MESSAGE_LEN, MAX_SUBINTENTS, ProtocolStatics,
-    ProtocolVerifier, Routing, SchemeVerifier, SubintentSig, TransactionBody, TransactionEnvelope,
-    VmStaticsError, install_protocol_statics, protocol_statics, protocol_statics_installed,
+    Derivation, DerivationError, Derived, EnvelopeExt, MAX_MESSAGE_LEN, MAX_SUBINTENTS,
+    ProtocolStatics, ProtocolVerifier, Routing, SchemeVerifier, SubintentSig, TransactionBody,
+    TransactionEnvelope, install_protocol_statics, protocol_statics, protocol_statics_installed,
 };
 pub use transaction::wire::{Transaction, TransactionContext, TransactionVerifyError};
 pub use verifiable::{Verifiable, Verified, Verify};

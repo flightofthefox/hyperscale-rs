@@ -12,13 +12,13 @@ use crate::crypto::Ed25519PrivateKey;
 use crate::{
     AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
     BlockVoteMessage, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommitProof,
-    ConsensusPublicKey, ConsensusSignature, DeclaredKey, Derivation, Derived, EnvelopeExt,
-    ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
+    ConsensusPublicKey, ConsensusSignature, DeclaredKey, Derivation, DerivationError, Derived,
+    EnvelopeExt, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
     NetworkDefinition, NetworkId, ProposerTimestamp, ProtocolStatics, QuorumCertificate, Round,
     Routing, ShardForkProof, ShardId, SignerBitfield, TickHalf, TickId, TimestampRange,
     TopologySnapshot, Transaction, TransactionBody, TransactionDecision, TransactionEnvelope,
     TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
-    VmStaticsError, WeightedTimestamp, WitnessSources, compute_global_receipt_root, declared_work,
+    WeightedTimestamp, WitnessSources, compute_global_receipt_root, declared_work,
     install_protocol_statics, protocol_statics_installed, signed_bytes,
 };
 
@@ -884,24 +884,24 @@ const fn stub_cell(owner: Address) -> DeclaredKey {
 pub struct StubVmStatics;
 
 impl Derivation for StubVmStatics {
-    fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError> {
+    fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {
         let tree = vm.call_tree().unwrap_or_default();
         let Some((&read_count, prefixes)) = tree.split_first() else {
-            return Err(VmStaticsError::Refused("stub tree is empty".into()));
+            return Err(DerivationError::Refused("stub tree is empty".into()));
         };
         if !prefixes.len().is_multiple_of(32) || usize::from(read_count) * 32 > prefixes.len() {
-            return Err(VmStaticsError::Refused(
+            return Err(DerivationError::Refused(
                 "stub tree must be a read count then 32-byte owner prefixes".into(),
             ));
         }
-        let canonical = |chunks: &[u8]| -> Result<Vec<Address>, VmStaticsError> {
+        let canonical = |chunks: &[u8]| -> Result<Vec<Address>, DerivationError> {
             let mut prefixes: Vec<Address> = chunks
                 .as_chunks::<32>()
                 .0
                 .iter()
                 .map(|bytes| {
                     Address::from_bytes(*bytes)
-                        .map_err(|err| VmStaticsError::Refused(format!("stub prefix: {err}")))
+                        .map_err(|err| DerivationError::Refused(format!("stub prefix: {err}")))
                 })
                 .collect::<Result<_, _>>()?;
             prefixes.sort_unstable();
@@ -912,7 +912,7 @@ impl Derivation for StubVmStatics {
         let read_prefixes = canonical(reads)?;
         let write_prefixes = canonical(writes)?;
         if !vm.message.len().is_multiple_of(32) {
-            return Err(VmStaticsError::Refused(
+            return Err(DerivationError::Refused(
                 "stub message must be 32-byte package addresses".into(),
             ));
         }
