@@ -18,17 +18,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
-use hyperscale_dispatch::{Dispatch, DispatchPool};
+use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::instance_of_record;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
     GetInstanceRecordsRequest, MAX_INSTANCE_RECORDS_PER_REQUEST,
 };
-use hyperscale_types::{Address, MessageClass, ShardId, ValidatorId};
+use hyperscale_types::{Address, LocalTimestamp, MessageClass, ShardId, TxHash, ValidatorId};
 
 use crate::config::NodeConfig;
 use crate::fetch::{Fetch, FetchBinding, FetchInput, partition_solicited};
+use crate::shard::mempool::{DeferredOrigin, DeferredTransaction};
 use crate::shard::{HostEvent, ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
 
 /// Per-component record fetch, keyed by the address the record derives.
@@ -144,12 +145,44 @@ where
     N: Network,
     D: Dispatch,
 {
+    /// Hold `wanted` back and ask the shard owning each component's
+    /// prefix for the records they are waiting on.
+    ///
+    /// The envelopes wait rather than being dropped because the gap is
+    /// this node's, not theirs: every node that could propose one has
+    /// the same gap, so dropping them all would leave the arriving
+    /// record with nothing to admit.
+    pub(crate) fn defer_for_instance_records(&mut self, wanted: Vec<DeferredTransaction>) {
+        let mut evicted: Vec<TxHash> = Vec::new();
+        let mut instances: Vec<Address> = Vec::new();
+        for deferred in wanted {
+            for instance in &deferred.instances {
+                if !instances.contains(instance) {
+                    instances.push(*instance);
+                }
+            }
+            // Held under the same dedup guard a queued envelope is, so a
+            // gossip echo of one that is waiting does not enqueue a
+            // second copy behind it.
+            self.io
+                .mempool
+                .pending_validation
+                .insert(deferred.tx.hash());
+            evicted.extend(self.io.mempool.deferred_records.defer(deferred));
+        }
+        // An evicted envelope leaves the pipeline entirely: nothing will
+        // offer it again unless it is gossiped or fetched afresh, and
+        // that has to find the dedup guard clear.
+        self.handle_transaction_validations_failed(&evicted);
+        self.fetch_instance_records(instances);
+    }
+
     /// Ask the shard owning each component's prefix for its record.
     ///
-    /// Called with what a derivation could not resolve. Idempotent: a
-    /// record is immutable once sealed and self-verifying on arrival, so
-    /// asking twice costs a round trip and settles the same way.
-    pub(crate) fn fetch_instance_records(&mut self, instances: Vec<Address>) {
+    /// Idempotent: a record is immutable once sealed and self-verifying
+    /// on arrival, so asking twice costs a round trip and settles the
+    /// same way.
+    fn fetch_instance_records(&mut self, instances: Vec<Address>) {
         let executor = Arc::clone(&self.process.dispatch_handles.executor);
         let snapshot = self.process.topology_snapshot.load();
         let mut by_shard: BTreeMap<ShardId, Vec<Address>> = BTreeMap::new();
@@ -173,22 +206,44 @@ where
         }
     }
 
-    /// Seat verified fetched records in the registry derivation reads.
+    /// Seat verified fetched records in the registry derivation reads,
+    /// then offer the envelopes that were waiting on them again.
     ///
-    /// Off the shard loop, as the artifact install is: seating decodes a
-    /// record and re-derives its address, and nothing here is on the
-    /// path of a verdict — the bytes were verified against the address
-    /// asked for before this was posted.
+    /// Seating runs on the loop rather than off it, unlike the artifact
+    /// install beside it: a record is small, and what follows it here is
+    /// the re-admission that has to see the registry it grew.
     pub(crate) fn handle_instance_records_fetched(&mut self, records: Vec<(Address, Vec<u8>)>) {
+        let executor = Arc::clone(&self.process.dispatch_handles.executor);
         let ids: Vec<Address> = records.iter().map(|(address, _)| *address).collect();
-        let handles = Arc::clone(&self.process.dispatch_handles);
-        self.process
-            .dispatch
-            .spawn(DispatchPool::Throughput, move || {
-                for (instance, record) in records {
-                    handles.executor.install_instance(instance, &record);
+        for (instance, record) in records {
+            executor.install_instance(instance, &record);
+        }
+        self.drive_fetch::<InstanceRecordBinding>(FetchInput::Admitted { ids: ids.clone() });
+        for (tx, origin) in self.io.mempool.deferred_records.release(&ids) {
+            match origin {
+                DeferredOrigin::Validation => self.queue_validation(tx),
+                // Back through the fan-out it never got: its source
+                // shard, its passive co-hosts and its outbound gossip
+                // are all decisions the routing it can now derive makes.
+                DeferredOrigin::Submission => {
+                    self.io.mempool.pending_validation.remove(&tx.hash());
+                    self.process.submit_transaction(&tx);
                 }
-            });
-        self.drive_fetch::<InstanceRecordBinding>(FetchInput::Admitted { ids });
+            }
+        }
+    }
+
+    /// Drop the envelopes whose validity window has closed while they
+    /// waited, so a record that never arrives costs nothing standing.
+    pub(crate) fn sweep_deferred_records(&mut self, now: LocalTimestamp) {
+        if self.io.mempool.deferred_records.is_empty() {
+            return;
+        }
+        let expired = self
+            .io
+            .mempool
+            .deferred_records
+            .sweep_expired(now.as_millis());
+        self.handle_transaction_validations_failed(&expired);
     }
 }

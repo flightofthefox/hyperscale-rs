@@ -427,13 +427,15 @@ impl InstanceCache {
     }
 }
 
-/// The published-package cache: content-addressed, shared process-wide,
-/// and grown from committed state.
+/// The published-package cache: content-addressed, held by a node, and
+/// grown from committed state.
 ///
-/// One cache per process rather than one per shard, because a package is
+/// One cache per node rather than one per shard, because a package is
 /// immutable and named by the hash of its own bytes — two shards holding
 /// it hold the same thing, and a node running several vnodes has no
-/// reason to hold it twice.
+/// reason to hold it twice. Two *nodes* are a different matter: what a
+/// node has seen commit is its own, and a shard it does not serve
+/// publishes code it never absorbs.
 ///
 /// Reads are lock-free because every admission derivation takes one:
 /// swapping a whole new map in on the rare publish costs a clone that

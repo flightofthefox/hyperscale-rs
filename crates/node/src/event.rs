@@ -29,6 +29,7 @@ use hyperscale_types::{
 };
 
 use crate::shard::commit::QcOnlyDivergence;
+use crate::shard::mempool::DeferredTransaction;
 
 /// Priority levels for event ordering within the same timestamp.
 ///
@@ -164,11 +165,12 @@ pub enum ShardScopedInput {
         ids: Vec<Hash>,
     },
 
-    /// Component records a derivation wanted and this node did not
-    /// hold, named so the fetch can ask the shards owning them.
+    /// Envelopes a derivation could not resolve, each beside the
+    /// component records it wanted, so the fetch can ask the shards
+    /// owning them and the envelopes can wait for the answer.
     InstanceRecordsWanted {
-        /// The component addresses to resolve.
-        instances: Vec<Address>,
+        /// What is waiting, and what each is waiting for.
+        wanted: Vec<DeferredTransaction>,
     },
 
     /// Instance records delivered by the fetch protocol, already

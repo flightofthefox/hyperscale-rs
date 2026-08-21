@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::{Dispatch, DispatchPool, Parallelism};
 use hyperscale_network::Network;
@@ -29,18 +30,78 @@ use hyperscale_types::{
     TransactionVerifyError, TxHash, Verified, Verify,
 };
 
-use super::TransactionBinding;
+use super::{DeferredOrigin, DeferredTransaction, TransactionBinding};
 use crate::batch_accumulator::BatchAccumulator;
 use crate::fetch::FetchInput;
 use crate::host::NodeHost;
 use crate::process::SubmitFanout;
-use crate::shard::{ShardLoop, ShardScopedInput, push_protocol_event, push_shard_input};
+use crate::shard::{HostEvent, ShardLoop, ShardScopedInput, push_protocol_event, push_shard_input};
 
 /// Byte budget one outbound gossip batch accumulates before it flushes.
 /// Sized so a full batch — even one ending on a maximum-size envelope —
 /// encodes below the transport's frame cap, which would otherwise refuse
 /// the message and un-gossip the whole batch.
 const TX_GOSSIP_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+
+/// One envelope's verdict: the envelope itself, its verified form where
+/// it has one, and the records a derivation gap wanted.
+type ValidationOutcome = (
+    Arc<Transaction>,
+    Option<Verified<Transaction>>,
+    Vec<Address>,
+);
+
+/// Send back what a validation batch decided about the envelopes it
+/// could not admit: the ones held back for records this node has not
+/// seen, and the ones genuinely refused.
+///
+/// The two are different answers and the split is the whole point. A
+/// refusal is every node's; a gap is this one's, and the same envelope
+/// derives wherever the seals it names have landed — so it waits for the
+/// fetch instead of being forgotten, which is what keeps a transaction
+/// nobody can yet derive from being dropped by everyone who could
+/// propose it.
+fn report_validation_outcomes(
+    event_tx: &Sender<HostEvent>,
+    local_shard: ShardId,
+    outcomes: Vec<ValidationOutcome>,
+) {
+    let mut wanted: Vec<DeferredTransaction> = Vec::new();
+    let mut failed_hashes: Vec<TxHash> = Vec::new();
+    for (tx, verified, instances) in outcomes {
+        if let Some(v) = verified {
+            push_shard_input(
+                event_tx,
+                local_shard,
+                ShardScopedInput::TransactionValidated { tx: Arc::new(v) },
+            );
+        } else if instances.is_empty() {
+            failed_hashes.push(tx.hash());
+        } else {
+            wanted.push(DeferredTransaction {
+                tx,
+                instances,
+                origin: DeferredOrigin::Validation,
+            });
+        }
+    }
+    if !wanted.is_empty() {
+        push_shard_input(
+            event_tx,
+            local_shard,
+            ShardScopedInput::InstanceRecordsWanted { wanted },
+        );
+    }
+    if !failed_hashes.is_empty() {
+        push_shard_input(
+            event_tx,
+            local_shard,
+            ShardScopedInput::TransactionValidationsFailed {
+                hashes: failed_hashes,
+            },
+        );
+    }
+}
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -192,18 +253,25 @@ where
                     network,
                     derivation: derivation.as_ref(),
                 };
-                let results: Vec<(TxHash, Option<Verified<Transaction>>)> = par.map(batch, |tx| {
-                    let hash = tx.hash();
-                    (hash, tx.verify(ctx).ok())
+                let results: Vec<ValidationOutcome> = par.map(batch, |tx| {
+                    let mut wanted = Vec::new();
+                    let verified = match tx.verify(ctx) {
+                        Ok(v) => Some(v),
+                        Err(TransactionVerifyError::Derivation(error)) => {
+                            wanted = error.unresolved().to_vec();
+                            None
+                        }
+                        Err(_) => None,
+                    };
+                    (tx, verified, wanted)
                 });
 
                 let mut valid: Vec<Arc<Verified<Transaction>>> = Vec::new();
-                let mut failed_hashes = Vec::new();
-                for (hash, verified) in results {
-                    if let Some(v) = verified {
-                        valid.push(Arc::new(v));
-                    } else {
-                        failed_hashes.push(hash);
+                let mut undecided: Vec<ValidationOutcome> = Vec::new();
+                for (tx, verified, wanted) in results {
+                    match verified {
+                        Some(v) => valid.push(Arc::new(v)),
+                        None => undecided.push((tx, None, wanted)),
                     }
                 }
 
@@ -216,15 +284,7 @@ where
                         },
                     );
                 }
-                if !failed_hashes.is_empty() {
-                    push_shard_input(
-                        &event_tx,
-                        local_shard,
-                        ShardScopedInput::TransactionValidationsFailed {
-                            hashes: failed_hashes,
-                        },
-                    );
-                }
+                report_validation_outcomes(&event_tx, local_shard, undecided);
             });
     }
 
@@ -323,18 +383,16 @@ where
         self.process
             .dispatch
             .spawn(DispatchPool::Throughput, move || {
-                type Outcome = (TxHash, Option<Verified<Transaction>>, Vec<Address>);
                 let ctx = TransactionContext {
                     network: NetworkId::from(topology.network()),
                     derivation: derivation.as_ref(),
                 };
-                let results: Vec<Outcome> = par.map(batch, |tx| {
-                    let hash = tx.hash();
+                let results: Vec<ValidationOutcome> = par.map(batch, |tx| {
                     // What a refusal wanted but this node did not hold.
                     // A gap rather than a verdict: the same envelope
                     // derives wherever the seals it names have landed,
-                    // so the addresses are what to ask for rather than
-                    // grounds to drop it and forget.
+                    // so the addresses are what to ask for and the
+                    // envelope waits rather than being dropped.
                     let mut wanted = Vec::new();
                     let verified = match tx.verify(ctx) {
                         Ok(v) => Some(v),
@@ -353,48 +411,9 @@ where
                                 storage.as_deref(),
                             )
                     });
-                    (hash, verified, wanted)
+                    (tx, verified, wanted)
                 });
-
-                let mut unresolved: Vec<Address> = Vec::new();
-                for (_, _, wanted) in &results {
-                    for instance in wanted {
-                        if !unresolved.contains(instance) {
-                            unresolved.push(*instance);
-                        }
-                    }
-                }
-                if !unresolved.is_empty() {
-                    push_shard_input(
-                        &event_tx,
-                        local_shard,
-                        ShardScopedInput::InstanceRecordsWanted {
-                            instances: unresolved,
-                        },
-                    );
-                }
-
-                let mut failed_hashes = Vec::new();
-                for (hash, verified, _) in results {
-                    if let Some(v) = verified {
-                        push_shard_input(
-                            &event_tx,
-                            local_shard,
-                            ShardScopedInput::TransactionValidated { tx: Arc::new(v) },
-                        );
-                    } else {
-                        failed_hashes.push(hash);
-                    }
-                }
-                if !failed_hashes.is_empty() {
-                    push_shard_input(
-                        &event_tx,
-                        local_shard,
-                        ShardScopedInput::TransactionValidationsFailed {
-                            hashes: failed_hashes,
-                        },
-                    );
-                }
+                report_validation_outcomes(&event_tx, local_shard, results);
             });
     }
 }
@@ -444,6 +463,16 @@ where
                     .step(ShardScopedInput::GossipTransaction {
                         tx: Arc::clone(tx),
                         touched_shards,
+                    });
+            }
+            SubmitFanout::WantsRecords { host, instances } => {
+                self.shard_loop_mut(host)
+                    .step(ShardScopedInput::InstanceRecordsWanted {
+                        wanted: vec![DeferredTransaction {
+                            tx: Arc::clone(tx),
+                            instances,
+                            origin: DeferredOrigin::Submission,
+                        }],
                     });
             }
             SubmitFanout::NoHostedShard => {

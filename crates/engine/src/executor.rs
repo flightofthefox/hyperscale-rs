@@ -321,22 +321,33 @@ impl Executor {
         Arc::clone(&self.derivation) as Arc<dyn Derivation>
     }
 
-    /// A second engine over this one's world: its own compiled code, the
-    /// same published metadata.
+    /// A second engine beside this one: its own copy of the world, its
+    /// own derivation over that copy, and its own compiled code.
     ///
-    /// The peer shares this engine's derivation, so a process has
-    /// exactly one metadata cache however many engines it builds — but
-    /// compiled code is per engine, and that is the half a node acquires
-    /// for itself. A harness standing several nodes up in one process
-    /// uses this so each of them has to fetch the code a publish put on
-    /// the chain, the way separate processes would.
+    /// A harness standing several nodes up in one process uses this so
+    /// each of them holds only what it has itself seen — the code a
+    /// publish put on the chain and the record an instantiation sealed
+    /// alike — the way separate processes would. A node on a shard where
+    /// neither committed genuinely cannot answer for them until its own
+    /// fetch lands, which is what puts the acquisition paths under test
+    /// instead of around them.
+    ///
+    /// The backend starts at the protocol's own code rather than at this
+    /// engine's, so a genesis fixture package is acquired too.
     #[must_use]
     pub fn peer(&self, mode: ExecutionMode) -> Self {
+        let world = self.world.fork();
+        let backend = EngineBackend::new(&GenesisPackages::protocol());
+        let derivation = Arc::new(BridgeStatics {
+            cache: world.cache.clone(),
+            instances: world.instances.clone(),
+            artifact_sink: Some(Arc::new(backend.absorber())),
+        });
         Self {
-            world: self.world.clone(),
-            backend: EngineBackend::new(&GenesisPackages::protocol()),
+            world,
+            backend,
             mode,
-            derivation: Arc::clone(&self.derivation),
+            derivation,
         }
     }
 
