@@ -12,8 +12,8 @@
 //! nullifier creation writes ride the routed sets, so admission
 //! conflicts on them like any other exclusive key.
 
-use std::collections::BTreeSet;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
 use arc_swap::ArcSwap;
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
@@ -381,12 +381,9 @@ pub trait LocalCells: Send + Sync {
 
 /// One node's answers for the length of one derivation.
 ///
-/// Both caches are loaded once and held by refcount, which is the whole
-/// of what the [`ChainRecords`] stability contract asks for: a block
-/// committing partway through a derivation swaps the caches under a
-/// later reader, and this one keeps the world it started in. Two
-/// lookups in one derivation cannot disagree, so an envelope routes one
-/// way on a node rather than two.
+/// Both caches are loaded once and held by refcount, so a block
+/// committing partway through a derivation swaps them under a later
+/// reader and this one keeps the world it started in.
 ///
 /// A record the cache does not hold is looked for in this node's own
 /// committed state before it is given up on, so what the cache costs is
@@ -394,6 +391,14 @@ pub trait LocalCells: Send + Sync {
 /// created. The two sources answer alike — a record is the record its
 /// cell holds — which is what makes dropping one from the cache a
 /// question of cost and not of meaning.
+///
+/// That read is at the node's tip rather than at a pinned height, and
+/// what each one finds is held here for the rest of the derivation. Both
+/// halves matter for the [`ChainRecords`] stability the caller is owed:
+/// a leaf is written once and never rewritten, so the only way the tip's
+/// answer can move under a derivation is from absent to present — and
+/// holding what was found means a second lookup reads the first one's
+/// answer rather than the state again.
 pub struct NodeRecords {
     packages: Arc<MetadataCache>,
     instances: Arc<Resident>,
@@ -401,6 +406,12 @@ pub struct NodeRecords {
     /// back so the next derivation reads it from memory.
     cells: Option<Arc<dyn LocalCells>>,
     cache: InstanceCache,
+    /// What the state answered during this derivation. Successes only,
+    /// on the same terms the envelope derivation itself caches them: an
+    /// absence is a record this node has yet to see rather than a fact
+    /// about the chain, and nothing should have to be undone when it
+    /// arrives.
+    seen: Mutex<BTreeMap<Address, Arc<InstanceMeta>>>,
 }
 
 impl NodeRecords {
@@ -416,6 +427,7 @@ impl NodeRecords {
             instances: instances.load(),
             cells,
             cache: instances.clone(),
+            seen: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -425,6 +437,23 @@ impl NodeRecords {
     /// at the key its owner derives and holds a record deriving that
     /// owner, so bytes that say anything else are not this component's
     /// record and are dropped.
+    /// What the state already answered for `address` in this derivation.
+    fn seen(&self, address: Address) -> Option<Arc<InstanceMeta>> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&address)
+            .cloned()
+    }
+
+    /// Hold `record` for the rest of this derivation.
+    fn hold(&self, address: Address, record: &Arc<InstanceMeta>) {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(address, Arc::clone(record));
+    }
+
     fn read_from_state(&self, address: Address) -> Option<Arc<InstanceMeta>> {
         let key = config_key(address);
         let value = self.cells.as_ref()?.committed_cell(key)?;
@@ -447,7 +476,15 @@ impl ChainRecords for NodeRecords {
             // from a key, and the blueprint serving it is the
             // protocol's, held from genesis and never absent.
             CallTarget::Principal(_) => None,
-            CallTarget::Component(address) => self.read_from_state(address.address()),
+            CallTarget::Component(address) => {
+                let address = address.address();
+                if let Some(seen) = self.seen(address) {
+                    return Some(seen);
+                }
+                let record = self.read_from_state(address)?;
+                self.hold(address, &record);
+                Some(record)
+            }
         }
     }
 
@@ -972,6 +1009,8 @@ impl ProtocolStatics for BridgeStatics {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use hyperscale_types::{
         CallTarget, Ed25519PrivateKey, NetworkId, Secp256k1PrivateKey, TX_UNITS, TransactionBody,
     };
@@ -1012,6 +1051,59 @@ mod tests {
         fn committed_cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
             (key == self.key).then(|| self.value.clone())
         }
+    }
+
+    /// A cell answering once, counting how often it was asked.
+    struct CountedCell {
+        inner: OneCell,
+        reads: AtomicUsize,
+    }
+
+    impl LocalCells for CountedCell {
+        fn committed_cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.committed_cell(key)
+        }
+    }
+
+    /// One derivation reads a leaf once, however often it asks for the
+    /// record.
+    ///
+    /// The state read is at the node's own tip, which no view pins, so
+    /// what makes the answers one derivation gets a single world's is
+    /// that the first one is held: a manifest naming a component in ten
+    /// nodes reads its leaf once and reads that answer nine times.
+    #[test]
+    fn one_derivation_reads_a_leaf_once_however_often_it_asks() {
+        let meta = InstanceMeta {
+            package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
+            config: vec![Value::U64(4)],
+            salt: Hash32([0xA7; 32]),
+        };
+        let address = meta.address(&ProtocolHasher);
+        let cells = Arc::new(CountedCell {
+            inner: OneCell {
+                key: config_key(address),
+                value: hbor_to_vec(&meta).expect("a record encodes"),
+            },
+            reads: AtomicUsize::new(0),
+        });
+
+        let instances = InstanceCache::new(InstanceRegistry::new());
+        let packages = PackageCache::new(MetadataCache::new());
+        let chain = NodeRecords::pinned(&packages, &instances, Some(Arc::clone(&cells) as Arc<_>));
+        for _ in 0..3 {
+            assert_eq!(
+                chain.instance(address.into()).as_deref(),
+                Some(&meta),
+                "every lookup in one derivation answers alike"
+            );
+        }
+        assert_eq!(
+            cells.reads.load(Ordering::Relaxed),
+            1,
+            "the leaf is read once and held for the rest of the derivation"
+        );
     }
 
     /// A record the cache never absorbed is read out of the cell that
