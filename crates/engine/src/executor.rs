@@ -23,8 +23,8 @@ use hyperscale_effects_bridge::vm_statics::{
     PackageCache, config_key, package_key, principal_for, record_address,
 };
 use hyperscale_effects_bridge::{
-    BridgeStatics, PoolRegistry, ProtocolHasher, admit_package, decode_tree, envelope_identity,
-    witness_from_event,
+    BridgeStatics, NodeRecords, PoolRegistry, ProtocolHasher, admit_package, decode_tree,
+    envelope_identity, witness_from_event,
 };
 use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
@@ -359,6 +359,13 @@ impl Executor {
     #[must_use]
     pub const fn packages(&self) -> &PackageCache {
         &self.world.cache
+    }
+
+    /// What this engine's world answers for, pinned — the same view
+    /// admission derives through.
+    #[must_use]
+    pub fn records(&self) -> NodeRecords {
+        self.world.records()
     }
 
     /// Seed one committed artifact from a store's package index: metadata
