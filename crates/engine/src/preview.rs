@@ -347,7 +347,7 @@ fn preview_publish(
     grants: PreviewGrants,
 ) -> PreviewReport {
     if let Err(error) = admit_package(artifact) {
-        return PreviewReport::refused(error.0);
+        return PreviewReport::refused(error.to_string());
     }
     let work = publish_work(artifact);
     let mut base = TickBaseline::default();

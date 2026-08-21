@@ -887,10 +887,10 @@ impl VmStatics for StubVmStatics {
     fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError> {
         let tree = vm.call_tree().unwrap_or_default();
         let Some((&read_count, prefixes)) = tree.split_first() else {
-            return Err(VmStaticsError("stub tree is empty".into()));
+            return Err(VmStaticsError::Refused("stub tree is empty".into()));
         };
         if !prefixes.len().is_multiple_of(32) || usize::from(read_count) * 32 > prefixes.len() {
-            return Err(VmStaticsError(
+            return Err(VmStaticsError::Refused(
                 "stub tree must be a read count then 32-byte owner prefixes".into(),
             ));
         }
@@ -901,7 +901,7 @@ impl VmStatics for StubVmStatics {
                 .iter()
                 .map(|bytes| {
                     Address::from_bytes(*bytes)
-                        .map_err(|err| VmStaticsError(format!("stub prefix: {err}")))
+                        .map_err(|err| VmStaticsError::Refused(format!("stub prefix: {err}")))
                 })
                 .collect::<Result<_, _>>()?;
             prefixes.sort_unstable();
@@ -912,7 +912,7 @@ impl VmStatics for StubVmStatics {
         let read_prefixes = canonical(reads)?;
         let write_prefixes = canonical(writes)?;
         if !vm.message.len().is_multiple_of(32) {
-            return Err(VmStaticsError(
+            return Err(VmStaticsError::Refused(
                 "stub message must be 32-byte package addresses".into(),
             ));
         }

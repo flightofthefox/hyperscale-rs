@@ -150,7 +150,7 @@ pub fn encode_tree(tree: &EnvelopeTree) -> Vec<u8> {
 ///
 /// [`VmStaticsError`] on malformed or non-canonical bytes.
 pub fn decode_tree(bytes: &[u8]) -> Result<EnvelopeTree, VmStaticsError> {
-    hbor_from_slice(bytes).map_err(|error| VmStaticsError(format!("tree decode: {error}")))
+    hbor_from_slice(bytes).map_err(|error| VmStaticsError::Refused(format!("tree decode: {error}")))
 }
 
 /// How a routed declaration lands in the workspace's admission
@@ -222,7 +222,7 @@ fn check_provision_weight(provision_keys: &BTreeSet<DeclaredKey>) -> Result<(), 
         })
         .fold(0, usize::saturating_add);
     if weight > MAX_STATE_ENTRIES_PER_TX {
-        return Err(VmStaticsError(format!(
+        return Err(VmStaticsError::Refused(format!(
             "declared provisions could serve {weight} entries, past the \
              {MAX_STATE_ENTRIES_PER_TX} one bundle may carry"
         )));
@@ -332,6 +332,37 @@ pub fn committed_instance(owner: Address, local: [u8; 16], value: &[u8]) -> Opti
     }
     let meta: InstanceMeta = hbor_from_slice(value).ok()?;
     meta.derives(&ProtocolHasher, owner).then_some(meta)
+}
+
+/// The component targets `tree` names that neither committed state nor
+/// the tree's own records resolve.
+///
+/// A gap rather than a verdict: the addresses derive, and the shard
+/// holding each one's seal can answer for it. Collected whole, in the
+/// order the flattened manifest names them, so the answer is stable
+/// wherever it is computed.
+fn unresolved_targets(tree: &EnvelopeTree, instances: &InstanceRegistry) -> Vec<Address> {
+    let carried: BTreeSet<Address> = tree
+        .instances
+        .iter()
+        .map(|meta| meta.address(&ProtocolHasher).address())
+        .collect();
+    let mut missing = Vec::new();
+    let graphs = std::iter::once(&tree.root.graph).chain(
+        tree.subintents
+            .iter()
+            .map(|subintent| &subintent.decl.graph),
+    );
+    for node in graphs.flat_map(|graph| &graph.nodes) {
+        let address = node.target.address();
+        if instances.get(node.target).is_some() || carried.contains(&address) {
+            continue;
+        }
+        if !missing.contains(&address) {
+            missing.push(address);
+        }
+    }
+    missing
 }
 
 /// The instance registry: what the chain answers a call target with,
@@ -471,7 +502,9 @@ impl BridgeStatics {
         artifact: &[u8],
     ) -> Result<Derived, VmStaticsError> {
         if !vm.subintent_sigs.is_empty() {
-            return Err(VmStaticsError("a publish carries no subintents".into()));
+            return Err(VmStaticsError::Refused(
+                "a publish carries no subintents".into(),
+            ));
         }
         // The artifact has to describe itself before it is addressed:
         // what the address covers is code and signatures together, so an
@@ -560,7 +593,7 @@ impl VmStatics for BridgeStatics {
         // reservation engaging — so derivation records the identity and
         // never compares it against the payer field.
         let Some(signer) = principal_for(vm.signer_scheme, &vm.signer) else {
-            return Err(VmStaticsError(
+            return Err(VmStaticsError::Refused(
                 "the envelope's signer key derives no principal".into(),
             ));
         };
@@ -569,7 +602,7 @@ impl VmStatics for BridgeStatics {
         }
         let tree = decode_tree(vm.call_tree().unwrap_or_default())?;
         if vm.subintent_sigs.len() != tree.subintents.len() {
-            return Err(VmStaticsError(format!(
+            return Err(VmStaticsError::Refused(format!(
                 "envelope binds {} subintents but carries {} signatures",
                 tree.subintents.len(),
                 vm.subintent_sigs.len()
@@ -581,7 +614,7 @@ impl VmStatics for BridgeStatics {
         for (index, (sig, subintent)) in vm.subintent_sigs.iter().zip(&tree.subintents).enumerate()
         {
             if principal_for(sig.scheme, &sig.public_key) != Some(subintent.signer) {
-                return Err(VmStaticsError(format!(
+                return Err(VmStaticsError::Refused(format!(
                     "subintent {index} signer address does not match its public key"
                 )));
             }
@@ -592,6 +625,14 @@ impl VmStatics for BridgeStatics {
         // own records over these itself, holding each to standing for
         // the seal of the component it derives.
         let instances = self.instances.load();
+        // Every target this node holds no record for, named before
+        // admission runs. Admission refuses at the first one it meets,
+        // and a fetch wants the whole set: one round trip rather than
+        // one per component the envelope calls.
+        let unresolved = unresolved_targets(&tree, &instances);
+        if !unresolved.is_empty() {
+            return Err(VmStaticsError::Unresolved(unresolved));
+        }
         let admitted = admit_tree(
             &tree,
             signer,
@@ -600,7 +641,7 @@ impl VmStatics for BridgeStatics {
             &instances,
             &ProtocolHasher,
         )
-        .map_err(|error| VmStaticsError(format!("admission: {error}")))?;
+        .map_err(|error| VmStaticsError::Refused(format!("admission: {error}")))?;
         let routing = route_tree(&admitted, &PrefixShardResolver { bits: 0 });
 
         let DeclaredAccess {
@@ -1178,7 +1219,11 @@ mod tests {
                 &[],
             ))
             .expect_err("refuses");
-        assert!(refused.0.contains("evidence"), "{}", refused.0);
+        assert!(
+            refused.to_string().contains("evidence"),
+            "{}",
+            refused.to_string()
+        );
         // A signature proof is not this method's to read either: it signs
         // in, and the write takes what the sign-in minted.
         let refused = statics()
@@ -1187,7 +1232,11 @@ mod tests {
                 &[],
             ))
             .expect_err("refuses");
-        assert!(refused.0.contains("signature proof"), "{}", refused.0);
+        assert!(
+            refused.to_string().contains("signature proof"),
+            "{}",
+            refused.to_string()
+        );
         assert!(
             statics()
                 .derive(&envelope(

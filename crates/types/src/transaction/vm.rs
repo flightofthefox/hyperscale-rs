@@ -259,11 +259,39 @@ pub struct Derived {
     pub work: u64,
 }
 
-/// Why VM static derivation refused an envelope. Deterministic: every
-/// node reaches the identical verdict for the same bytes.
+/// Why VM static derivation did not answer.
+///
+/// Two different things, and a caller has to tell them apart. A refusal
+/// is a verdict every node reaches alike for the same bytes. A gap is
+/// this node's alone: derivation resolves a call target through the
+/// records it has seen commit, and one it has not seen resolves nothing
+/// here and resolves fine wherever the seal already landed. The first is
+/// the envelope's fault forever; the second closes when the record
+/// arrives.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
-#[error("vm static derivation failed: {0}")]
-pub struct VmStaticsError(pub String);
+pub enum VmStaticsError {
+    /// The envelope is inadmissible, on terms every node agrees on.
+    #[error("vm static derivation failed: {0}")]
+    Refused(String),
+    /// Component records this node holds none of, so it cannot say what
+    /// the envelope declares. Not a verdict: the addresses are what a
+    /// fetch asks its owning shard for, and derivation answers once they
+    /// are seated.
+    #[error("vm static derivation wants records this node has not seen: {0:?}")]
+    Unresolved(Vec<Address>),
+}
+
+impl VmStaticsError {
+    /// The records this node would need before derivation could answer,
+    /// empty for a refusal.
+    #[must_use]
+    pub fn unresolved(&self) -> &[Address] {
+        match self {
+            Self::Refused(_) => &[],
+            Self::Unresolved(addresses) => addresses,
+        }
+    }
+}
 
 /// The seam VM admission derives through.
 ///

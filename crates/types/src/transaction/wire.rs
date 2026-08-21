@@ -523,7 +523,7 @@ mod tests {
     impl VmStatics for StubStatics {
         fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError> {
             if vm.call_tree().unwrap_or_default() == b"inadmissible" {
-                return Err(VmStaticsError("stub refusal".into()));
+                return Err(VmStaticsError::Refused("stub refusal".into()));
             }
             let subintent_hashes = if vm.call_tree().unwrap_or_default() == b"with-subintent" {
                 vec![STUB_SUBINTENT_HASH]

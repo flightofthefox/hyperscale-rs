@@ -1282,6 +1282,82 @@ fn the_stdlib_artifact_carries_resolvable_bindings() {
     );
 }
 
+/// A gap and a refusal are different answers, and derivation says which.
+///
+/// Both stop a transaction here, but only one of them stops it
+/// everywhere. A malformed envelope is refused by every node that reads
+/// it; a target this node has not seen sealed resolves fine wherever the
+/// seal committed, and names what it would need so a fetch can close the
+/// gap. Collapsing the two would make a node's own cold start look like
+/// the sender's fault.
+#[test]
+fn derivation_tells_a_gap_from_a_refusal() {
+    // Building the executor is what installs the derivation this reads.
+    let _installed = executor(ExecutionMode::Serial);
+    let payer = fee_payer(7);
+    let key = Ed25519PrivateKey::from_bytes(&[7; 32]).unwrap();
+
+    // A component nobody sealed, named by an envelope that is otherwise
+    // well formed.
+    let meta = InstanceMeta {
+        package: lottery_package_hash(&ProtocolHasher),
+        config: Vec::new(),
+        salt: Hash32([0xA1; 32]),
+    };
+    let unsealed = meta.address(&ProtocolHasher);
+    let mut b = GraphBuilder::new();
+    let [] = b.call(unsealed, "draw", (64u64,));
+    let graph = b.build().expect("every output is consumed");
+    let gap = Transaction::new(client().sign_tree(
+        &EnvelopeTree {
+            root: IntentDecl {
+                graph,
+                params: Vec::new(),
+            },
+            root_bindings: Vec::new(),
+            subintents: Vec::new(),
+            instances: Vec::new(),
+            resources: Vec::new(),
+        },
+        Vec::new(),
+        &key,
+        terms(TRANSFER_FEE),
+    ));
+    let error = gap.try_derived().expect_err("nothing answers for it yet");
+    assert_eq!(
+        error.unresolved(),
+        [unsealed.address()],
+        "the record a fetch would ask for: {error}"
+    );
+
+    // A refusal, by contrast, names nothing to fetch: the account
+    // resolves, and no record would make a deposit taking no bucket
+    // admissible.
+    let mut b = GraphBuilder::new();
+    let [] = b.call(payer, "deposit", ());
+    let graph = b.build().expect("every output is consumed");
+    let refused = Transaction::new(client().sign_tree(
+        &EnvelopeTree {
+            root: IntentDecl {
+                graph,
+                params: Vec::new(),
+            },
+            root_bindings: Vec::new(),
+            subintents: Vec::new(),
+            instances: Vec::new(),
+            resources: Vec::new(),
+        },
+        Vec::new(),
+        &key,
+        terms(TRANSFER_FEE),
+    ));
+    let error = refused.try_derived().expect_err("a deposit takes a bucket");
+    assert!(
+        error.unresolved().is_empty(),
+        "a refusal names nothing to fetch: {error}"
+    );
+}
+
 #[test]
 fn a_publish_that_is_not_a_package_never_reaches_execution() {
     // The whole publish verdict is a function of the artifact's bytes,
@@ -1850,16 +1926,23 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
         resources: Vec::new(),
     };
 
-    // The same call without its record has an unresolvable target and
-    // never clears admission.
+    // The same call without its record: nothing committed answers for a
+    // component nobody sealed, so derivation names the address it would
+    // need rather than refusing the envelope. A gap, not a verdict —
+    // which is the difference between an envelope that is wrong and one
+    // this node cannot yet judge.
     let mut unpresented = tree.clone();
     unpresented.instances.clear();
     let bare =
         Transaction::new(client().sign_tree(&unpresented, Vec::new(), &key, terms(TRANSFER_FEE)));
     let refusal = bare
         .try_derived()
-        .expect_err("an unpresented instance target must refuse");
-    assert!(refusal.0.contains("no instance"), "reason = {}", refusal.0);
+        .expect_err("an unresolved instance target does not derive");
+    assert_eq!(
+        refusal.unresolved(),
+        [component.address()],
+        "the record this node would need, named: {refusal}"
+    );
 
     // Presented: the call admits, the invocation resolves the freshly
     // compiled package — waiting out the compile if it is still in
