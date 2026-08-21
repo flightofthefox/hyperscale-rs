@@ -27,11 +27,11 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     AbiParam, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, PackageHash, PackageMetadata,
-    Totality, package_hash,
+    Totality, Value, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder};
-use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account};
+use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, STAKING_COMPONENT, account, staking};
 use hyperscale_vm_types::{Address, CollectionId, amount_cell, encode_amount};
 
 /// The two accounts the transfer cases move funds between, as signing
@@ -1754,15 +1754,27 @@ fn a_committed_cell_that_is_not_a_package_is_ignored() {
 /// commits, its code compiles, and a presented instance of it — an
 /// address computed by a client, created nowhere — answers a call whose
 /// invocation runs the freshly compiled guest.
+///
+/// The call is the component's own seal, which is the first call any
+/// published package answers: nothing else can run until the leaf whose
+/// presence admission fences every component call on is there.
 #[test]
 fn a_presented_instance_of_a_published_package_answers_a_call() {
     let payer = fee_payer(7);
     let key = Ed25519PrivateKey::from_bytes(&[7; 32]).unwrap();
     let executor = executor(ExecutionMode::Serial);
 
-    let mut metadata = published_account_metadata();
+    // The staking package rather than the account's: a published package
+    // serves instances, so its components come up through the seal its
+    // own package declares.
+    let mut metadata = staking::metadata();
     metadata.events.push("instantiable".into());
-    let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
+    for signature in metadata.methods.values_mut() {
+        if signature.totality == Totality::Total {
+            signature.totality = Totality::Infallible;
+        }
+    }
+    let artifact = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
     let publish = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
         7, artifact,
@@ -1775,18 +1787,19 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
 
     // The instance is computed, not created: a package hash, a
     // configuration, and a salt derive the address, and the presented
-    // record carrying them is the whole of instantiation.
+    // record carrying them is what resolves the call.
     let meta = InstanceMeta {
         package,
-        config: Vec::new(),
+        config: vec![
+            Value::Address((*XRD).address()),
+            Value::Address(payer.address()),
+        ],
         salt: Hash32([7; 32]),
     };
     let component = meta.address(&ProtocolHasher);
 
     let mut b = GraphBuilder::new();
-    let [] = b.call_signed(payer, "authorize", ());
-    let [funds] = b.call_bearing(payer, "withdraw", (*XRD, 40u128), 0);
-    let [] = b.call(component, "deposit", (funds.resource_is(*XRD),));
+    let [] = b.call(component, "instantiate", ());
     let graph = b.build().expect("every output is consumed");
     let tree = EnvelopeTree {
         root: IntentDecl {
@@ -1795,7 +1808,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
         },
         root_bindings: Vec::new(),
         subintents: Vec::new(),
-        instances: vec![meta],
+        instances: vec![meta.clone()],
         resources: Vec::new(),
     };
 
@@ -1812,7 +1825,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
 
     // Presented: the call admits, the invocation resolves the freshly
     // compiled package — waiting out the compile if it is still in
-    // flight — and the instance's vault holds the deposit.
+    // flight — and the leaf holds the record the address derives from.
     let call = Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(TRANSFER_FEE)));
     let executed = execute_on(
         &[(payer, 1_000)],
@@ -1826,8 +1839,12 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
         );
     };
     assert_eq!(
-        vault_cell(&settled(writes, &[(payer, 1_000)]), component),
-        Some(encode_amount(40).to_vec()),
-        "the presented instance's vault holds the deposit"
+        settled(writes, &[(payer, 1_000)])
+            .cells()
+            .get(&config_key(component))
+            .cloned()
+            .flatten(),
+        Some(meta.leaf_bytes().expect("the record encodes")),
+        "the seal writes the record the component's address derives"
     );
 }
