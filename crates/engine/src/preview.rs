@@ -267,7 +267,12 @@ impl Executor {
         } else {
             TargetAuthority::Required
         };
-        let prepared = match self.prepare_with_authority(tx, authority) {
+        // A preview is advisory, so it answers from what this node
+        // holds rather than from what a block carries: it is not
+        // producing a receipt root, and a client asking what an envelope
+        // would do wants the answer for a component whose seal landed on
+        // some other shard.
+        let prepared = match Self::prepare_with_authority(tx, &self.records(), authority) {
             Ok(derived) => derived,
             Err(reason) => return PreviewReport::refused(reason),
         };

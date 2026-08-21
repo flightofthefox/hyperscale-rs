@@ -1137,7 +1137,6 @@ pub fn build_draw_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let client = client();
-    let _chain = client.records();
     // The composer knows each round's record and types the calls against
     // them; the envelope carries none, because the seals have committed
     // by the time this runs and the chain answers for the targets.
