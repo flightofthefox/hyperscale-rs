@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::genesis::genesis_world_with_pools;
+use hyperscale_effects_bridge::vm_statics::config_key;
 use hyperscale_effects_bridge::{ProtocolHasher, account_address};
 use hyperscale_engine::genesis::{
     GenesisPackages, OWNER_BADGE_ID, pool_address, pool_meta, pool_owner_badge, staking_artifact,
@@ -213,9 +214,49 @@ fn seated(pools: &[StakePoolSeat], mode: ExecutionMode) -> Executor {
     Executor::with_genesis(pools, &GenesisPackages::protocol(), mode)
 }
 
-/// One envelope that brings an unseated pool to life: it presents the
-/// pool's instance record, founds it as the configured founder, and
-/// files the badge in the founder's own account.
+/// Apply what a settled transaction wrote, so the next one reads it as
+/// committed state.
+fn absorb(store: &mut MapDb, executed: &ExecutedTx) {
+    let ConsensusReceipt::Succeeded { writes, .. } = &executed.consensus else {
+        panic!("the transaction must settle: {:?}", executed.consensus);
+    };
+    for (key, change) in &writes.cells {
+        match change {
+            Some(value) => store.cells.insert(*key, value.clone()),
+            None => store.cells.remove(key),
+        };
+    }
+    for (key, change) in &writes.entries {
+        match change {
+            Some(value) => store.entries.insert(*key, value.clone()),
+            None => store.entries.remove(key),
+        };
+    }
+}
+
+/// One envelope that makes an unseated pool actual: it presents the
+/// pool's instance record and seals it, which is the one call a
+/// derivable component answers.
+fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
+    let key = key_of(seed);
+    let cache = client().cache();
+    let meta = pool_meta(package_hash(&ProtocolHasher, staking_artifact()), seat);
+    let mut instances = client().world().instances.clone();
+    let pool = instances.create(&ProtocolHasher, meta.clone());
+    let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
+    staking::Staking::at(pool)
+        .instantiate(&mut root)
+        .expect("a derivable pool answers its seal");
+    env.instance(meta);
+    env.seal(root)
+        .expect("the root declares nothing to discharge");
+    let tree = env.build().expect("the intent declares no hole");
+    Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(1_000)))
+}
+
+/// One envelope that founds an instantiated pool: it presents the pool's
+/// instance record, founds it as the configured founder, and files the
+/// badge in the founder's own account.
 fn signed_found(seed: u8, seat: &StakePoolSeat) -> Transaction {
     let key = key_of(seed);
     let from = account_address(&key.public_key().0);
@@ -236,12 +277,68 @@ fn signed_found(seed: u8, seat: &StakePoolSeat) -> Transaction {
     Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(1_000)))
 }
 
-/// A pool nobody seated founds itself in one transaction, and the cells
-/// it ends holding are the cells genesis writes for a seated one, byte
-/// for byte — two writers of one object, held to each other.
+/// A pool nobody seated instantiates and founds itself, and the cells it
+/// ends holding are the cells genesis writes for a seated one, byte for
+/// byte — two writers of one object, held to each other. Two
+/// transactions, because a presence condition is judged against
+/// committed state: the seal has to be there before the founding's
+/// fence can see it.
 #[test]
 fn a_founded_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
     let unseated = seat(55);
+    let executor = seated(&[], ExecutionMode::Serial);
+    let mut store = MapDb::genesis(&[(account_of(OPERATOR), 10_000)], &[]);
+    let trie = ShardTrie::single();
+    let ctx = TickBatchContext {
+        local_shard: ShardId::ROOT,
+        shard_trie: &trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        tick_reveal: RevealChain::ZERO,
+        holds: &ProvisionalHolds::new(),
+    };
+    for tx in [
+        signed_instantiate(OPERATOR, &unseated),
+        signed_found(OPERATOR, &unseated),
+    ] {
+        let tx = Arc::new(Verified::<Transaction>::from_persisted(tx));
+        let executed = executor.execute_batch(&ctx, &store, std::slice::from_ref(&tx));
+        absorb(&mut store, &executed[0]);
+    }
+
+    let (genesis_cells, genesis_entries) = genesis_writes(
+        &[],
+        std::slice::from_ref(&unseated),
+        &GenesisPackages::protocol(),
+    )
+    .into_parts();
+    let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated);
+    let badge = pool_owner_badge(pool);
+    for key in [
+        config_key(pool),
+        resource_record_key(&ProtocolHasher, pool, badge),
+        instance_data_key(&ProtocolHasher, pool, badge, OWNER_BADGE_ID),
+    ] {
+        assert!(genesis_cells.contains_key(&key), "genesis writes the cell");
+        assert_eq!(store.cells.get(&key), genesis_cells[&key].as_ref());
+    }
+    let entry = EntryKey {
+        owner: unseated.operator.address(),
+        collection: holdings_collection(&ProtocolHasher, unseated.operator, badge),
+        order: u128::from(OWNER_BADGE_ID),
+    };
+    assert!(
+        genesis_entries.contains_key(&entry),
+        "genesis writes the entry"
+    );
+    assert_eq!(store.entries.get(&entry), genesis_entries[&entry].as_ref());
+}
+
+/// A pool nobody instantiated is derivable and not actual: its presented
+/// record resolves the call and the shard holding the leaf refuses it,
+/// before any body runs and whatever the founder presents.
+#[test]
+fn a_call_on_an_unsealed_pool_is_refused_where_the_leaf_lives() {
+    let unseated = seat(56);
     let executor = seated(&[], ExecutionMode::Serial);
     let store = MapDb::genesis(&[(account_of(OPERATOR), 10_000)], &[]);
     let trie = ShardTrie::single();
@@ -256,36 +353,20 @@ fn a_founded_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
         OPERATOR, &unseated,
     )));
     let executed = executor.execute_batch(&ctx, &store, std::slice::from_ref(&tx));
-    let writes = executed[0]
-        .consensus
-        .writes()
-        .expect("the founding completes");
-
-    let (genesis_cells, genesis_entries) = genesis_writes(
-        &[],
-        std::slice::from_ref(&unseated),
-        &GenesisPackages::protocol(),
-    )
-    .into_parts();
-    let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated);
-    let badge = pool_owner_badge(pool);
-    for key in [
-        resource_record_key(&ProtocolHasher, pool, badge),
-        instance_data_key(&ProtocolHasher, pool, badge, OWNER_BADGE_ID),
-    ] {
-        assert!(genesis_cells.contains_key(&key), "genesis writes the cell");
-        assert_eq!(writes.cells.get(&key), genesis_cells.get(&key));
-    }
-    let entry = EntryKey {
-        owner: unseated.operator.address(),
-        collection: holdings_collection(&ProtocolHasher, unseated.operator, badge),
-        order: u128::from(OWNER_BADGE_ID),
-    };
     assert!(
-        genesis_entries.contains_key(&entry),
-        "genesis writes the entry"
+        matches!(executed[0].consensus, ConsensusReceipt::Failed),
+        "refused: {:?}",
+        executed[0].consensus
     );
-    assert_eq!(writes.entries.get(&entry), genesis_entries.get(&entry));
+    let message = executed[0]
+        .metadata
+        .error_message
+        .as_deref()
+        .unwrap_or_default();
+    assert!(
+        message.contains("Present"),
+        "refused as the leaf's unmet presence: {message}"
+    );
 }
 
 #[test]

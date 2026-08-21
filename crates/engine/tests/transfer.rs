@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
-use hyperscale_effects_bridge::vm_statics::package_key;
+use hyperscale_effects_bridge::vm_statics::{config_key, package_key};
 use hyperscale_effects_bridge::{
     ProtocolHasher, account_address, admit_package, admit_protocol_package, attach_metadata,
 };
@@ -25,10 +25,9 @@ use hyperscale_types::{
     TimestampRange, Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
     absorb_committed_cells,
 };
-use hyperscale_vm_effects::vocabulary::CONFIG;
 use hyperscale_vm_effects::{
-    AbiParam, Clause, EnvelopeTree, Expr, Hash32, InstanceMeta, IntentDecl, ModeExpr, PackageHash,
-    PackageMetadata, TargetExpr, Totality, Value, package_hash,
+    AbiParam, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, PackageHash, PackageMetadata,
+    Totality, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder};
@@ -62,6 +61,9 @@ fn bob() -> PrincipalAddr {
 struct MapDb(BTreeMap<SubstateKey, Vec<u8>>);
 
 impl MapDb {
+    /// Genesis state, with the lottery this binary settles rounds on
+    /// seated beside it: its seal is committed state, as a seated pool's
+    /// is, so the fence on every draw finds the component actual.
     fn genesis(accounts: &[(PrincipalAddr, u128)]) -> Self {
         let writes = genesis_writes(accounts, &[], &packages());
         let mut map = BTreeMap::new();
@@ -69,6 +71,12 @@ impl MapDb {
             let value = change.clone().expect("genesis writes are Set-only");
             map.insert(*key, value);
         }
+        map.insert(
+            config_key(lottery_addr()),
+            lottery_meta()
+                .leaf_bytes()
+                .expect("the lottery's record encodes"),
+        );
         Self(map)
     }
 }
@@ -175,8 +183,8 @@ fn client() -> &'static Client {
 /// The lottery this binary settles rounds on.
 ///
 /// Computed rather than created: the envelope carries the record, and
-/// every node composes the same registry from it, so nothing had to be
-/// registered anywhere before the call.
+/// every node composes the same registry from it. What the store holds
+/// for it is the seal alone — see [`MapDb::genesis`].
 fn lottery_meta() -> InstanceMeta {
     InstanceMeta {
         package: lottery_package_hash(&ProtocolHasher),
@@ -1821,84 +1829,5 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
         vault_cell(&settled(writes, &[(payer, 1_000)]), component),
         Some(encode_amount(40).to_vec()),
         "the presented instance's vault holds the deposit"
-    );
-}
-
-/// A locked configuration read is served from the instance's own
-/// presented record: the value every shard derives locally, because a
-/// locked read makes no participant and no provision can carry it.
-///
-/// The published package appends a locked CONFIG clause to `deposit`, so
-/// materialization demands a locked cell no state anywhere holds — the
-/// deposit settles only because the baseline answers from the record.
-#[test]
-fn a_locked_config_read_serves_from_the_presented_record() {
-    let payer = fee_payer(7);
-    let key = Ed25519PrivateKey::from_bytes(&[7; 32]).unwrap();
-    let executor = executor(ExecutionMode::Serial);
-
-    let mut metadata = published_account_metadata();
-    metadata.events.push("locked-config".into());
-    metadata
-        .methods
-        .get_mut("deposit")
-        .expect("the account declares deposit")
-        .effects
-        .push(Clause::Effect {
-            guard: None,
-            target: TargetExpr::Point(Expr::ChildKey {
-                owner: Box::new(Expr::SelfAddr),
-                slot: CONFIG,
-                material: vec![],
-            }),
-            mode: ModeExpr::Locked,
-            denomination: None,
-        });
-    let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
-    let package = package_hash(&ProtocolHasher, &artifact);
-    let publish = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
-        7, artifact,
-    )));
-    let executed = execute_on(&[(payer, 1_000_000)], &executor, &[publish]);
-    absorb_committed_cells([&executed[0].consensus]);
-
-    let meta = InstanceMeta {
-        package,
-        config: vec![Value::U64(7)],
-        salt: Hash32([8; 32]),
-    };
-    let component = meta.address(&ProtocolHasher);
-
-    let mut b = GraphBuilder::new();
-    let [] = b.call_signed(payer, "authorize", ());
-    let [funds] = b.call_bearing(payer, "withdraw", (*XRD, 25u128), 0);
-    let [] = b.call(component, "deposit", (funds.resource_is(*XRD),));
-    let graph = b.build().expect("every output is consumed");
-    let tree = EnvelopeTree {
-        root: IntentDecl {
-            graph,
-            params: Vec::new(),
-        },
-        root_bindings: Vec::new(),
-        subintents: Vec::new(),
-        instances: vec![meta],
-        resources: Vec::new(),
-    };
-    let call = Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(TRANSFER_FEE)));
-    let executed = execute_on(
-        &[(payer, 1_000)],
-        &executor,
-        &[Arc::new(Verified::<Transaction>::from_persisted(call))],
-    );
-    let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
-        panic!(
-            "a deposit behind a locked config read must settle: {:?}",
-            executed[0].consensus
-        );
-    };
-    assert_eq!(
-        vault_cell(&settled(writes, &[(payer, 1_000)]), component),
-        Some(encode_amount(25).to_vec()),
-        "the instance's vault holds the deposit"
     );
 }

@@ -12,6 +12,7 @@ pub use hyperscale_effects_bridge::genesis::{
     genesis_publisher, genesis_world, genesis_world_with_pools, pool_address, pool_meta,
     pool_owner_badge, stake_unit, staking_artifact,
 };
+use hyperscale_effects_bridge::vm_statics::config_key;
 use hyperscale_effects_bridge::{ProtocolHasher, validator_key};
 pub use hyperscale_effects_bridge::{XRD, draw_key, vault_key};
 use hyperscale_hbor::to_vec;
@@ -93,11 +94,23 @@ pub fn genesis_writes(
                 .cells
                 .insert(validator_key(pool, validator.inner()), Some(held));
         }
+        // The seal: the pool's creation-fixed record in its configuration
+        // leaf, whose presence is what every method's fence reads. A
+        // seated pool has to be actual or the network's own validators
+        // could not reach it.
+        writes.cells.insert(
+            config_key(pool),
+            Some(
+                pool_meta(staking_package, seat)
+                    .leaf_bytes()
+                    .expect("a pool's record encodes"),
+            ),
+        );
         // Custody of the pool: the badge's record under the pool, the
         // instance's data cell, and the holdings entry in the seat's
         // operator account. The badge and its id both derive from the
-        // pool, so these three writes are the whole seating — nothing
-        // stores a mapping, and selling the pool is an ordinary
+        // pool, so these writes and the seal are the whole seating —
+        // nothing stores a mapping, and selling the pool is an ordinary
         // holdings transfer from here on.
         let badge = pool_owner_badge(pool);
         writes.cells.insert(

@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use blake3::hash as blake3_hash;
-use hyperscale_effects_bridge::vm_statics::{PackageCache, config_key, package_key, principal_for};
+use hyperscale_effects_bridge::vm_statics::{PackageCache, package_key, principal_for};
 use hyperscale_effects_bridge::{
     BridgeStatics, PoolRegistry, ProtocolHasher, admit_package, decode_tree, envelope_identity,
     witness_from_event,
@@ -41,8 +41,7 @@ use hyperscale_vm_kernel::{
     execute_batch,
 };
 use hyperscale_vm_types::{
-    Address, CallTarget, CollectionId, EffectSet, EffectTarget, EntryKey, Outcome, SubstateKey,
-    UnmetCondition,
+    Address, CollectionId, EffectSet, EffectTarget, EntryKey, Outcome, SubstateKey, UnmetCondition,
 };
 
 use crate::backend::EngineBackend;
@@ -81,12 +80,6 @@ pub struct PreparedTx {
     /// The envelope's signed execution ceiling, in fuel — one budget for
     /// the whole transaction, however many nodes its manifest walks.
     pub gas_limit: u64,
-    /// The locked configuration cells of the manifest's component
-    /// targets: `(cell, canonical config bytes)` per distinct target the
-    /// per-envelope registry resolves. A locked read makes no
-    /// participant, so every executing shard serves these from the
-    /// record rather than from state.
-    pub locked_configs: Vec<(SubstateKey, Vec<u8>)>,
 }
 
 /// The content address of a package artifact, as the workspace hash the
@@ -127,9 +120,11 @@ pub fn tx_randomness(anchor: RevealChain, tx: TxHash) -> [u8; 32] {
 /// the tick's JMT-backed snapshot at materialize time — point cells and
 /// the entries of declared collection intervals.
 ///
-/// Locks are absent from the current stdlib surface. Every kernel read
-/// flows through a capability for a declared effect, so pre-reading
-/// exactly the declared targets is complete.
+/// Every kernel read flows through a capability for a declared effect,
+/// so pre-reading exactly the declared targets is complete. An
+/// instance's configuration leaf is one of them: committed state the
+/// fence on every method reads, immutable by its one-way write door
+/// rather than by a lock, so nothing here is locked.
 #[derive(Debug, Default)]
 pub struct TickBaseline {
     pub cells: BTreeMap<SubstateKey, Vec<u8>>,
@@ -141,10 +136,6 @@ pub struct TickBaseline {
     /// a baseline with nothing in flight over it — a preview, or a shard
     /// with no cross-shard leg outstanding.
     pub holds: ProvisionalHolds,
-    /// The cells locked at this baseline: instance configuration leaves,
-    /// their values in `cells` beside them. Lockedness both admits the
-    /// locked-read capability and refuses mutation.
-    pub locked: BTreeSet<SubstateKey>,
 }
 
 impl Substates for TickBaseline {
@@ -182,8 +173,8 @@ impl Substates for TickBaseline {
 }
 
 impl Baseline for TickBaseline {
-    fn is_locked(&self, key: SubstateKey) -> bool {
-        self.locked.contains(&key)
+    fn is_locked(&self, _key: SubstateKey) -> bool {
+        false
     }
 
     fn holds(&self, key: SubstateKey) -> BTreeMap<TxHash, u128> {
@@ -418,24 +409,6 @@ impl Executor {
         // here would reach the same set but discard the order, which is
         // what a guest's positional handle parameters are indexed by.
         let declaration = routing.declaration().clone();
-        // Every distinct component target's configuration leaf, served
-        // locked from its own record on whichever shard executes.
-        let mut locked_configs = Vec::new();
-        let mut config_targets = BTreeSet::new();
-        for call in &routing.calls {
-            if !config_targets.insert(call.target) {
-                continue;
-            }
-            let Ok(target @ CallTarget::Component(_)) = CallTarget::try_from(call.target) else {
-                continue;
-            };
-            if let Some(meta) = instances.get(target) {
-                let bytes = meta
-                    .config_bytes()
-                    .map_err(|error| format!("config encode: {error}"))?;
-                locked_configs.push((config_key(call.target), bytes));
-            }
-        }
         Ok(PreparedTx {
             calls: match authority {
                 TargetAuthority::Required => routing.calls,
@@ -460,7 +433,6 @@ impl Executor {
                 .map(|record| record.nullifier)
                 .collect(),
             gas_limit: vm.gas_limit,
-            locked_configs,
         })
     }
 }
@@ -980,15 +952,6 @@ impl Executor {
         }
         for entry in prepared.values() {
             materialize_declared(snapshot, &entry.declaration.set, &locality, &mut base);
-        }
-        // Locked configuration leaves land last so the record's value
-        // stands whatever the snapshot held: the record is the
-        // authority, and every participant shard serves it locally.
-        for entry in prepared.values() {
-            for (key, value) in &entry.locked_configs {
-                base.cells.insert(*key, value.clone());
-                base.locked.insert(*key);
-            }
         }
         // A manifest needn't touch its payer's own vault — a publish
         // declares no effects at all, and a call can spend entirely from
