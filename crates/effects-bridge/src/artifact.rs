@@ -20,7 +20,7 @@ use hyperscale_vm_gate::{
 };
 
 fn chain(error: GateError) -> VmStaticsError {
-    VmStaticsError(error.0)
+    VmStaticsError::Refused(error.0)
 }
 
 /// Attach `metadata` to a component artifact as its metadata section.
@@ -99,6 +99,10 @@ mod tests {
         assert!(admit_protocol_package(artifact).is_ok());
 
         let refused = admit_package(artifact).expect_err("a publish cannot claim totality");
-        assert!(refused.0.contains("claims totality"), "{}", refused.0);
+        assert!(
+            refused.to_string().contains("claims totality"),
+            "{}",
+            refused.to_string()
+        );
     }
 }

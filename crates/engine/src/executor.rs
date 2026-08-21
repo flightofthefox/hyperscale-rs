@@ -334,7 +334,7 @@ impl Executor {
             }
             Err(error) => {
                 tracing::warn!(
-                    reason = error.0,
+                    reason = %error,
                     "indexed package artifact refused admission"
                 );
             }
@@ -686,7 +686,7 @@ fn assemble_published_tx(
     // Admission reached the whole verdict from these same bytes, so a
     // refusal here means the transaction bypassed admission — the same
     // condition `prepare` treats as a deterministic failure.
-    let refusal = admit_package(artifact).err().map(|error| error.0);
+    let refusal = admit_package(artifact).err().map(|error| error.to_string());
 
     let cached = refusal.as_ref().map_or_else(
         || {

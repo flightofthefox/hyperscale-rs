@@ -425,7 +425,7 @@ where
             // own gap as easily as the envelope's fault, and the two read
             // identically from the submitter's side.
             tracing::warn!(
-                reason = error.0,
+                reason = %error,
                 "Dropping locally-submitted transaction: it derives no routing"
             );
             return SubmitFanout::Underivable;
