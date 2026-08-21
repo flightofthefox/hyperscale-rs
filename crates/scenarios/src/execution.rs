@@ -27,7 +27,7 @@ use hyperscale_vm_effects::{InstanceMeta, package_hash};
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::faultable::FaultableCluster;
 use crate::support::tx::{
-    OVERDRAW_AMOUNT, build_composed_tx, build_draw_tx, build_instance_deposit_tx,
+    OVERDRAW_AMOUNT, build_composed_tx, build_draw_tx, build_instance_instantiate_tx,
     build_instantiate_tx, build_publish_tx, build_securify_tx, build_transfer_paid_by,
     build_transfer_tx, build_unbound_payer_tx, cross_shard_cast, cross_shard_keys, lottery_on,
     native_pq_cast, nullifier_race_cast, overdraw_cast, payment_request, recipient, securify_cast,
@@ -1584,8 +1584,12 @@ pub fn preview_reports_resource_changes(c: &mut impl Cluster) {
 /// Panics if the publish does not settle, if a call before the window
 /// closes reaches a decision, or if a call after it does not.
 pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
-    const SALT: u8 = 9;
-    const DEPOSIT: u128 = 40;
+    // One component per probe: a seal is a one-way door, so a probe that
+    // is held and later settles must not be the door the next one needs
+    // open.
+    const UNREGISTERED_SALT: u8 = 9;
+    const EARLY_SALT: u8 = 10;
+    const LATE_SALT: u8 = 11;
 
     let publishers = storm_publishers();
     let (key, publisher) = &publishers[0];
@@ -1618,7 +1622,7 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     // for the one reason every node can check alike: the registry does
     // not list it.
     let unregistered =
-        build_instance_deposit_tx(key, &artifact, SALT, DEPOSIT, validity_around(c.now()));
+        build_instance_instantiate_tx(key, &artifact, UNREGISTERED_SALT, validity_around(c.now()));
     let unregistered_hash = unregistered.hash();
     c.submit(Arc::new(unregistered));
     c.run_until(epochs(8), |c| {
@@ -1643,7 +1647,7 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     // it and every honest voter would refuse it, so it waits — which is
     // the whole of the guarantee, since a transaction committed here
     // could be handed to a node whose fetch had not landed.
-    let early = build_instance_deposit_tx(key, &artifact, SALT, DEPOSIT, validity_around(c.now()));
+    let early = build_instance_instantiate_tx(key, &artifact, EARLY_SALT, validity_around(c.now()));
     let early_hash = early.hash();
     c.submit(Arc::new(early));
     c.run_until(epochs(8), |c| {
@@ -1664,7 +1668,7 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     // Past the window. The same call settles now, and settling it means
     // the code reached the nodes that never committed the publish —
     // every shard the transaction touches runs the whole of it.
-    let late = build_instance_deposit_tx(key, &artifact, SALT, DEPOSIT, validity_around(c.now()));
+    let late = build_instance_instantiate_tx(key, &artifact, LATE_SALT, validity_around(c.now()));
     let late_hash = late.hash();
     c.submit(Arc::new(late));
     let status = await_tx_terminal(c, late_hash, epochs(24));

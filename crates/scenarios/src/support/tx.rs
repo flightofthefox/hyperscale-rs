@@ -33,7 +33,7 @@ use hyperscale_vm_manifest_builder::signing::{self, sign_subintent};
 use hyperscale_vm_manifest_builder::{
     EnvelopeBuilder, GraphBuilder, IntentBuilder, TypedBuilder, TypedError,
 };
-use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account, account_artifact, staking};
+use hyperscale_vm_stdlib::{STAKING_COMPONENT, account, account_artifact, staking};
 use hyperscale_vm_types::Address;
 
 /// A deterministic Ed25519 signer from a one-byte seed. A faucet transaction's
@@ -1498,17 +1498,20 @@ const PUBLISH_MAX_FEE: u128 = 1_000_000;
 /// the codec rather than a runtime condition.
 #[must_use]
 pub fn storm_artifact(nonce: u16) -> Vec<u8> {
-    let mut metadata = account::metadata();
+    // The staking package rather than the account: a published package
+    // serves instances, and a component becomes actual through the seal
+    // its own package declares — which the account, serving principals,
+    // has no reason to carry.
+    let mut metadata = staking::metadata();
     metadata.events.push(format!("storm-{nonce}"));
-    // The account declares a total method and this artifact publishes
-    // through the ordinary path, which grants the mark to nothing: it is
-    // the protocol's, and the protocol seeds its own code at genesis.
+    // The mark is granted to protocol code seeded at genesis, and this
+    // artifact publishes through the ordinary path.
     for signature in metadata.methods.values_mut() {
         if signature.totality == Totality::Total {
             signature.totality = Totality::Infallible;
         }
     }
-    attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("storm metadata attaches")
+    attach_metadata(STAKING_COMPONENT, &metadata).expect("storm metadata attaches")
 }
 
 /// Build a signed publish of `artifact`, paid for by `payer` from their
@@ -1554,37 +1557,34 @@ pub fn published_instance(artifact: &[u8], salt: u8) -> InstanceMeta {
     }
 }
 
-/// Build a deposit into an instance of a runtime-published package.
+/// Build the seal of an instance of a runtime-published package.
 ///
 /// Untyped, because the signature this types against lives in metadata
 /// the scenario's own client learns only from the chain it is driving;
 /// the graph is the same shape the typed builder would emit.
 ///
-/// This is the probe the artifact fetch has to answer. The code runs on
-/// every shard the transaction touches, and only the publisher's own
-/// committee held it at commit — so unless the rest of the network
-/// fetched it, this transaction has no code to run.
+/// This is the probe the artifact fetch has to answer, and instantiation
+/// is the first call anyone makes on a published package: the code runs
+/// on the shard holding the component, which is not in general the
+/// publisher's own, so unless the artifact reached that committee the
+/// call cannot run at all.
 ///
 /// # Panics
 ///
-/// Panics if the graph leaves an output unconsumed, which would be a
-/// defect in this builder rather than a runtime condition.
+/// If the graph does not build, which would be a defect here rather than
+/// in the chain.
 #[must_use]
-pub fn build_instance_deposit_tx(
+pub fn build_instance_instantiate_tx(
     payer: &Ed25519PrivateKey,
     artifact: &[u8],
     salt: u8,
-    amount: u128,
     validity: TimestampRange,
 ) -> Transaction {
     let meta = published_instance(artifact, salt);
     let component = meta.address(&ProtocolHasher);
-    let account = account_address(&payer.public_key().0);
 
     let mut b = GraphBuilder::new();
-    let [] = b.call_signed(account, "authorize", ());
-    let [funds] = b.call_bearing(account, "withdraw", (*XRD, amount), 0);
-    let [] = b.call(component, "deposit", (funds.resource_is(*XRD),));
+    let [] = b.call(component, "instantiate", ());
     let graph = b.build().expect("every output is consumed");
 
     let tree = EnvelopeTree {
