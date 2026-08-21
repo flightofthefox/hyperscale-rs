@@ -205,9 +205,6 @@ pub struct ProductionRunnerBuilder {
     publishers: RpcPublishers,
     /// Optional genesis configuration for initial state.
     genesis_config: Option<GenesisConfig>,
-    /// Pool instances the process-wide statics seat, when that set must be
-    /// wider than this cluster's own genesis seating.
-    world_pools: Vec<StakePoolSeat>,
     /// Network definition for transaction validation.
     /// Defaults to simulator network if not set.
     network_definition: Option<NetworkDefinition>,
@@ -253,7 +250,6 @@ impl ProductionRunnerBuilder {
             channel_capacity: 10_000,
             publishers: RpcPublishers::default(),
             genesis_config: None,
-            world_pools: Vec::new(),
             network_definition: None,
             // Harness default: the routing overlay runs in production
             // tests; the validator binary always overrides this from its
@@ -336,20 +332,6 @@ impl ProductionRunnerBuilder {
     #[must_use]
     pub fn genesis_config(mut self, config: GenesisConfig) -> Self {
         self.genesis_config = Some(config);
-        self
-    }
-
-    /// Seat `pools` in the process VM statics instead of this cluster's
-    /// own genesis seating.
-    ///
-    /// The statics install once per process and the first installer wins,
-    /// so several clusters in one process must agree on one world or the
-    /// later ones fail admission against a registry that never heard of
-    /// their pools. A pool nobody delegates to emits nothing, so
-    /// recognising one everywhere costs a registry entry.
-    #[must_use]
-    pub fn world_pools(mut self, pools: Vec<StakePoolSeat>) -> Self {
-        self.world_pools = pools;
         self
     }
 
@@ -508,17 +490,10 @@ impl ProductionRunnerBuilder {
             config: bootstrap_config,
         };
         // The VM engine's world seats the same pools the startup genesis
-        // path installs, unless a wider set was given: construction
-        // installs the process protocol answers, which are
-        // first-writer-wins, so several clusters in one process must
-        // agree.
-        let world_pools = if self.world_pools.is_empty() {
-            &engine_bootstrap.config.pools
-        } else {
-            &self.world_pools
-        };
+        // path installs, and holds the derivation this node's vnodes
+        // resolve envelopes through.
         let executor: Arc<Executor> = Arc::new(Executor::with_genesis(
-            world_pools,
+            &engine_bootstrap.config.pools,
             &engine_bootstrap.config.packages,
             ExecutionMode::Serial,
         ));

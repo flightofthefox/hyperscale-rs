@@ -173,7 +173,6 @@ impl SimCluster {
             execution_mode: args.execution_mode,
             packages: args.packages.clone(),
             pools: world_pools(),
-            world_pools: world_pools(),
             ..SimConfig::default()
         };
         let mut runner = SimulationRunner::new(&sim_config, args.seed);

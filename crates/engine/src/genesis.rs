@@ -35,9 +35,9 @@ pub struct GenesisConfig {
 
     /// Stake pools the beacon folds facts for: the pool instance's owner
     /// prefix and the identifier it is folded under. Seated as stake pool
-    /// package instances in the process's VM statics, which is what makes
-    /// their emitted events beacon facts — running the package never
-    /// does, because anyone may run the package.
+    /// package instances in the engine's world, which is what makes their
+    /// emitted events beacon facts — running the package never does,
+    /// because anyone may run the package.
     pub pools: Vec<StakePoolSeat>,
 
     /// The packages this network is born running. The protocol's own by

@@ -2,15 +2,11 @@
 //! else's signature, run through the whole real path — derivation, the
 //! verification gate, and the batch executor.
 //!
-//! Its own binary because the assertion is about what a signature reaches,
-//! and the VM statics install once per process: the victim has to be a
-//! funded, registered account in the world every executor here shares.
-//!
 //! The refusal is asserted at the admission gate rather than at execution.
 //! A verdict reachable from signed content alone belongs where the sender
 //! pays nothing for it, and nothing downstream re-derives its own opinion:
-//! routing runs through the same statics, so an envelope the gate refused
-//! cannot reach a block at all.
+//! routing runs through the same derivation, so an envelope the gate
+//! refused cannot reach a block at all.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
