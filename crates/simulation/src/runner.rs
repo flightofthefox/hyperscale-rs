@@ -382,11 +382,12 @@ impl SimulationRunner {
         );
         let rng = ChaCha8Rng::seed_from_u64(seed);
 
-        // One engine per host, over one shared world and one shared
-        // derivation — but compiled code is per host, so a host that did
-        // not commit a publish holds none of its code until its own fetch
-        // lands it. That is what puts the artifact acquisition path under
-        // test instead of around it.
+        // The engine the first host runs, and the one every other host's
+        // is forked from below. Each holds its own world, its own
+        // derivation and its own compiled code, so a host that committed
+        // neither a publish nor a seal answers for neither until its own
+        // fetch lands — which is what puts the acquisition paths under
+        // test instead of around them.
         let engine = Arc::new(Executor::with_genesis(
             &network_config.pools,
             &network_config.packages,
