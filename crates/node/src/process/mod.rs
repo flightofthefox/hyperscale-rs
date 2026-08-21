@@ -23,7 +23,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage};
 use hyperscale_types::{
-    Derivation, Epoch, RatifyPhase, RatifyRound, RoutingCommittees, ShardId, SpcView,
+    Address, Derivation, Epoch, RatifyPhase, RatifyRound, RoutingCommittees, ShardId, SpcView,
     TopologySnapshot, Transaction, ValidatorId, Verifier,
 };
 pub(crate) use network_handlers::register_shard_request_handlers;
@@ -31,6 +31,7 @@ pub use tx_status::TxStatusCache;
 
 use crate::beacon::BeaconCommitCoordinator;
 use crate::event::{HostEvent, ShardScopedInput};
+use crate::shard::mempool::{DeferredOrigin, DeferredTransaction};
 use crate::shard::{DispatchHandles, SharedTopologySnapshot};
 
 /// Lock-free per-shard event-sender map.
@@ -428,9 +429,17 @@ where
         // routing which shards it touches is asking for an answer it
         // does not have.
         if let Err(error) = tx.try_derived(self.dispatch_handles.executor.derivation().as_ref()) {
-            // Warn rather than debug: a refusal here can be this node's
-            // own gap as easily as the envelope's fault, and the two read
-            // identically from the submitter's side.
+            // A gap and a refusal read identically from the submitter's
+            // side and are not the same thing. A gap names records this
+            // node has not seen, and the same envelope derives wherever
+            // they landed, so it waits on a hosted shard while the fetch
+            // runs instead of being dropped at the door.
+            let instances = error.unresolved().to_vec();
+            if !instances.is_empty()
+                && let Some(host) = self.shard_event_senders.load().keys().copied().next()
+            {
+                return SubmitFanout::WantsRecords { host, instances };
+            }
             tracing::warn!(
                 reason = %error,
                 "Dropping locally-submitted transaction: it derives no routing"
@@ -527,6 +536,21 @@ where
                 tracing::warn!("Dropping locally-submitted transaction: host carries no shard");
                 ok = false;
             }
+            SubmitFanout::WantsRecords { host, instances } => {
+                let env = HostEvent::shard(
+                    host,
+                    ShardScopedInput::InstanceRecordsWanted {
+                        wanted: vec![DeferredTransaction {
+                            tx: Arc::clone(tx),
+                            instances,
+                            origin: DeferredOrigin::Submission,
+                        }],
+                    },
+                );
+                if self.shard_sender(host).send(env).is_err() {
+                    ok = false;
+                }
+            }
             SubmitFanout::Underivable => ok = false,
         }
         ok
@@ -617,6 +641,18 @@ pub enum SubmitFanout {
     /// It runs no shard pipeline to admit or gossip through, so a
     /// locally-submitted tx is dropped.
     NoHostedShard,
+    /// The envelope names components this node has not seen sealed, so
+    /// it derives no routing yet and there is nothing to fan out to.
+    ///
+    /// A gap rather than a verdict: the seals committed on the shards
+    /// owning their prefixes, and the envelope derives on any node that
+    /// has them. It waits on `host` while that shard fetches the records.
+    WantsRecords {
+        /// A hosted shard to hold the envelope and run the fetch.
+        host: ShardId,
+        /// The component addresses its derivation could not resolve.
+        instances: Vec<Address>,
+    },
     /// The envelope's derivation refuses, so it names no shards to fan
     /// out to and there is nothing to gossip it on.
     ///

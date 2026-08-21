@@ -11,6 +11,7 @@
 //! [`SharedCaches`](crate::shard::caches::SharedCaches) — it is a
 //! request-serving cache, cross-cutting and read-only.
 
+mod deferred;
 mod fetch;
 mod serve;
 mod validation;
@@ -19,6 +20,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use deferred::{DeferredForRecords, DeferredOrigin, DeferredTransaction};
 pub use fetch::{TransactionBinding, TransactionFetch};
 use hyperscale_types::{ShardId, Transaction, TxHash};
 pub use serve::serve_transaction_request;
@@ -58,6 +60,12 @@ pub struct MempoolState {
     /// declared-shard verification on the `tx_validation` pool.
     pub validation_batch: BatchAccumulator<Arc<Transaction>>,
 
+    /// Envelopes this node cannot derive yet, waiting on the component
+    /// records a fetch is out for. Entries stay in
+    /// `pending_validation` while they wait, so a re-gossip does not
+    /// enqueue a second copy.
+    pub deferred_records: DeferredForRecords,
+
     /// Per-destination-shard outbound `TransactionGossip` accumulators.
     /// This shard acts as the "source" — locally-submitted or validated
     /// transactions are appended here keyed by destination, each batch
@@ -83,6 +91,7 @@ impl MempoolState {
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
+            deferred_records: DeferredForRecords::new(),
             outbound_gossip_batches: BTreeMap::new(),
             tx_gossip_max: b.tx_gossip_max,
             tx_gossip_window: b.tx_gossip_window,

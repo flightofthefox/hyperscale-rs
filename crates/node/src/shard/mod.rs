@@ -482,8 +482,8 @@ where
             ShardScopedInput::PackageArtifactsFetched { artifacts } => {
                 self.handle_package_artifacts_fetched(artifacts);
             }
-            ShardScopedInput::InstanceRecordsWanted { instances } => {
-                self.fetch_instance_records(instances);
+            ShardScopedInput::InstanceRecordsWanted { wanted } => {
+                self.defer_for_instance_records(wanted);
             }
             ShardScopedInput::InstanceRecordsFetched { records } => {
                 self.handle_instance_records_fetched(records);
@@ -731,6 +731,7 @@ where
         if self.io.mempool.validation_batch.is_expired(now) {
             self.flush_validation_batch();
         }
+        self.sweep_deferred_records(now);
         if self.io.consensus.certified_header_batch.is_expired(now) {
             self.flush_certified_header_verifications();
         }

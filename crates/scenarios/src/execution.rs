@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_effects_bridge::ProtocolHasher;
-use hyperscale_effects_bridge::vm_statics::package_key;
+use hyperscale_effects_bridge::vm_statics::{config_key, package_key};
 use hyperscale_engine::genesis::{draw_key, vault_key};
 use hyperscale_engine::{
     PreviewGrants, PreviewOutcome, PreviewReport, ResourceChange, XRD, account_address,
@@ -789,6 +789,13 @@ fn recorded_bytes<C: Cluster>(c: &C, shard: ShardId) -> Option<u64> {
 /// read-set-provisioned shape in both directions: each shard executes on
 /// the other's shipped prior.
 ///
+/// It is also the cross-shard record fetch's coverage, which is why the
+/// split seating is asserted rather than assumed: a component's seal
+/// commits only where its own prefix lives, so neither shard can derive
+/// the draw off what it committed. Every node has to ask the other side
+/// for the record it is missing, and without that the draw never derives
+/// anywhere and no proposer can carry it.
+///
 /// # Panics
 ///
 /// Panics if the draw misses its budget, does not accept, either shard's
@@ -815,6 +822,23 @@ pub fn randomness_draw_agrees_across_shards<C: Cluster>(c: &mut C) {
             Some(TransactionStatus::Completed(TransactionDecision::Accept))
         ),
         "the lotteries were never sealed; status = {status:?}"
+    );
+
+    // Each seal landed only where its own prefix lives. That is what
+    // makes the draw below a fetch: what a node can resolve is what it
+    // committed, and neither shard committed both.
+    let holds_leaf = |c: &C, shard: ShardId, lottery: &InstanceMeta| -> bool {
+        let key = config_key(lottery.address(&ProtocolHasher));
+        c.substate(shard, key.owner, key.local.0).is_some()
+    };
+    assert!(
+        c.run_until(epochs(4), |c| holds_leaf(c, ShardId::leaf(1, 0), &left)
+            && holds_leaf(c, ShardId::leaf(1, 1), &right)),
+        "each lottery's seal must have committed on its own shard"
+    );
+    assert!(
+        !holds_leaf(c, ShardId::leaf(1, 0), &right) && !holds_leaf(c, ShardId::leaf(1, 1), &left),
+        "neither shard may hold the other's seal, or the draw derives with no fetch"
     );
 
     let tx = build_draw_tx(

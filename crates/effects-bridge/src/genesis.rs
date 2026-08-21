@@ -84,6 +84,30 @@ pub struct World {
     pub pools: PoolRegistry,
 }
 
+impl World {
+    /// A second node's copy of this world: the same packages and the
+    /// same instances, in caches that share nothing either side goes on
+    /// to absorb.
+    ///
+    /// Copied rather than rebuilt from genesis because the copy is what
+    /// a node booting alongside this one would hold, and rebuilding
+    /// would re-admit every artifact for an answer already computed.
+    /// What a node accumulates after this is its own: a package it never
+    /// committed and a component whose seal landed on a shard it does
+    /// not serve are both absent from it, which is the whole point of
+    /// holding one each.
+    #[must_use]
+    pub fn fork(&self) -> Self {
+        Self {
+            cache: PackageCache::new((*self.cache.load()).clone()),
+            instances: InstanceCache::new((*self.instances.load()).clone()),
+            account_package: self.account_package,
+            staking_package: self.staking_package,
+            pools: self.pools.clone(),
+        }
+    }
+}
+
 /// Build the world: the stdlib packages published under their artifact
 /// hashes, and the account package bound as the one serving every
 /// principal.
