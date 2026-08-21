@@ -89,9 +89,14 @@ impl World {
     ///
     /// Both caches are loaded once here, so a reader holds the world it
     /// started in however many lookups it makes.
+    ///
+    /// No committed state behind it: a world on its own is what a
+    /// composer or a test holds, and it answers from its caches alone. A
+    /// node reads its own state too, through
+    /// [`BridgeStatics::records`](crate::BridgeStatics::records).
     #[must_use]
     pub fn records(&self) -> NodeRecords {
-        NodeRecords::pinned(&self.cache, &self.instances)
+        NodeRecords::pinned(&self.cache, &self.instances, None)
     }
 
     /// A second node's copy of this world: the same packages and the

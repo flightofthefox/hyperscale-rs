@@ -13,7 +13,7 @@
 //! conflicts on them like any other exclusive key.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use arc_swap::ArcSwap;
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
@@ -286,6 +286,28 @@ pub struct BridgeStatics {
     /// Where a committed package's artifact bytes are handed on, beside
     /// the metadata absorption.
     pub artifact_sink: Option<ArtifactSink>,
+    /// This node's own committed state, once it has one.
+    ///
+    /// Installed by the host, which is the only thing that knows which
+    /// shards it serves. Empty on an engine with no node behind it — a
+    /// composer, a test, a genesis tool — which answers from its caches
+    /// alone and has no state to fall back on.
+    pub cells: OnceLock<Arc<dyn LocalCells>>,
+}
+
+impl BridgeStatics {
+    /// What this node answers for, pinned for one derivation: its caches
+    /// and, behind them, its own committed state.
+    #[must_use]
+    pub fn records(&self) -> NodeRecords {
+        NodeRecords::pinned(&self.cache, &self.instances, self.cells.get().cloned())
+    }
+
+    /// Tell this node where its own committed state is. The first
+    /// installation stands; a node has one state.
+    pub fn install_cells(&self, cells: Arc<dyn LocalCells>) {
+        let _ = self.cells.set(cells);
+    }
 }
 
 /// The package a committed cell publishes, or `None` for every other
@@ -335,6 +357,27 @@ pub fn committed_instance(owner: Address, local: [u8; 16], value: &[u8]) -> Opti
     meta.derives(&ProtocolHasher, owner).then_some(meta)
 }
 
+/// The committed cells this node can read for itself.
+///
+/// A component's record is a cell — the `CONFIG` leaf its instantiation
+/// sealed — so the shard owning its prefix already holds it, and a node
+/// serving that shard needs neither a cached copy to answer for it nor a
+/// fetch to recover one it dropped. What a node cannot read this way is
+/// exactly what belongs to some other shard, which is what the fetch is
+/// for.
+///
+/// Implemented by the host over the stores it has open, so this crate
+/// stays below the node and learns nothing about how a shard is served.
+pub trait LocalCells: Send + Sync {
+    /// The value committed at `key` at this node's own tip, or `None`
+    /// where the cell is absent or no shard it serves owns the prefix.
+    ///
+    /// Read at the committed tip and never at a pending one: what the
+    /// caches hold is what commits put there, and a pending block two
+    /// nodes disagree about would make them derive an envelope two ways.
+    fn committed_cell(&self, key: SubstateKey) -> Option<Vec<u8>>;
+}
+
 /// One node's answers for the length of one derivation.
 ///
 /// Both caches are loaded once and held by refcount, which is the whole
@@ -343,25 +386,68 @@ pub fn committed_instance(owner: Address, local: [u8; 16], value: &[u8]) -> Opti
 /// later reader, and this one keeps the world it started in. Two
 /// lookups in one derivation cannot disagree, so an envelope routes one
 /// way on a node rather than two.
+///
+/// A record the cache does not hold is looked for in this node's own
+/// committed state before it is given up on, so what the cache costs is
+/// bounded by what a node calls rather than by what the chain has ever
+/// created. The two sources answer alike — a record is the record its
+/// cell holds — which is what makes dropping one from the cache a
+/// question of cost and not of meaning.
 pub struct NodeRecords {
     packages: Arc<MetadataCache>,
     instances: Arc<InstanceRegistry>,
+    /// Where a cache miss is looked for, and where what it finds is put
+    /// back so the next derivation reads it from memory.
+    cells: Option<Arc<dyn LocalCells>>,
+    cache: InstanceCache,
 }
 
 impl NodeRecords {
     /// Load both caches once, fixing the world this view answers from.
     #[must_use]
-    pub fn pinned(packages: &PackageCache, instances: &InstanceCache) -> Self {
+    pub fn pinned(
+        packages: &PackageCache,
+        instances: &InstanceCache,
+        cells: Option<Arc<dyn LocalCells>>,
+    ) -> Self {
         Self {
             packages: packages.load(),
             instances: instances.load(),
+            cells,
+            cache: instances.clone(),
         }
+    }
+
+    /// The record `address` sealed, read out of this node's own state.
+    ///
+    /// Verified on the way in exactly as a fetched one is: the leaf sits
+    /// at the key its owner derives and holds a record deriving that
+    /// owner, so bytes that say anything else are not this component's
+    /// record and are dropped.
+    fn read_from_state(&self, address: Address) -> Option<Arc<InstanceMeta>> {
+        let key = config_key(address);
+        let value = self.cells.as_ref()?.committed_cell(key)?;
+        let meta = committed_instance(address, key.local.0, &value)?;
+        // Seated for the next derivation rather than this one: the view
+        // this one answers from is already fixed, and re-reading a cell
+        // is cheaper than letting a pinned snapshot go stale.
+        self.cache.seat_record(&meta);
+        Some(Arc::new(meta))
     }
 }
 
 impl ChainRecords for NodeRecords {
     fn instance(&self, target: CallTarget) -> Option<Arc<InstanceMeta>> {
-        self.instances.record(target)
+        if let Some(record) = self.instances.record(target) {
+            return Some(record);
+        }
+        match target {
+            // A principal has no record to read: its address derives
+            // from a key, and the blueprint serving it is the
+            // protocol's, held from genesis and never absent.
+            CallTarget::Principal(_) => None,
+            CallTarget::Component(address) => self.read_from_state(address.address()),
+        }
     }
 
     fn package(&self, hash: PackageHash) -> Option<Arc<PackageMetadata>> {
@@ -449,6 +535,13 @@ impl InstanceCache {
             next.create(hasher, meta.clone());
             next
         });
+    }
+
+    /// Seat a record verified elsewhere — read out of a committed cell
+    /// or delivered by the fetch, both of which check it derives the
+    /// address it is claimed for.
+    pub fn seat_record(&self, meta: &InstanceMeta) {
+        self.seat(&ProtocolHasher, meta);
     }
 
     /// Seat the instance a committed cell seals, and answer whether it
@@ -652,7 +745,7 @@ impl Derivation for BridgeStatics {
         // One view for the whole derivation: both caches are read once
         // here and held by refcount, so nothing a block commits partway
         // through can make two lookups in one derivation disagree.
-        let chain = NodeRecords::pinned(&self.cache, &self.instances);
+        let chain = self.records();
         // Every target this node holds no record for, named before
         // admission runs. Admission refuses at the first one it meets,
         // and a fetch wants the whole set: one round trip rather than
@@ -789,6 +882,91 @@ mod tests {
         account_address(&key(9).public_key().0)
     }
 
+    /// One cell, for a node whose state holds exactly one record.
+    struct OneCell {
+        key: SubstateKey,
+        value: Vec<u8>,
+    }
+
+    impl LocalCells for OneCell {
+        fn committed_cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+            (key == self.key).then(|| self.value.clone())
+        }
+    }
+
+    /// A record the cache never absorbed is read out of the cell that
+    /// sealed it — and seated, so the next derivation reads it from
+    /// memory.
+    ///
+    /// What makes a bound on the cache a question of cost rather than of
+    /// meaning: on the shard owning a component's prefix the record is
+    /// already on disk, so dropping it costs a state read and never an
+    /// answer.
+    #[test]
+    fn a_record_absent_from_the_cache_is_read_from_committed_state() {
+        let meta = InstanceMeta {
+            package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
+            config: vec![Value::U64(7)],
+            salt: Hash32([3; 32]),
+        };
+        let address = meta.address(&ProtocolHasher);
+        let key = config_key(address);
+        let cells = Arc::new(OneCell {
+            key,
+            value: hbor_to_vec(&meta).expect("a record encodes"),
+        });
+
+        let instances = InstanceCache::new(InstanceRegistry::new());
+        let packages = PackageCache::new(MetadataCache::new());
+        assert!(
+            instances.load().get(address).is_none(),
+            "the cache starts holding nothing"
+        );
+
+        let chain = NodeRecords::pinned(&packages, &instances, Some(cells));
+        let answered = chain
+            .instance(address.into())
+            .expect("the sealing cell answers for it");
+        assert_eq!(*answered, meta);
+
+        // Seated on the way past, so the read is paid once.
+        assert_eq!(instances.load().get(address), Some(&meta));
+    }
+
+    /// Bytes at the leaf that derive some other address are not this
+    /// component's record, and are refused where a fetched one would be.
+    #[test]
+    fn a_cell_holding_another_components_record_answers_for_neither() {
+        let meta = InstanceMeta {
+            package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
+            config: vec![Value::U64(7)],
+            salt: Hash32([3; 32]),
+        };
+        let elsewhere = InstanceMeta {
+            salt: Hash32([9; 32]),
+            ..meta.clone()
+        };
+        let address = meta.address(&ProtocolHasher);
+        // The honest record of a different component, sitting at this
+        // one's leaf.
+        let cells = Arc::new(OneCell {
+            key: config_key(address),
+            value: hbor_to_vec(&elsewhere).expect("a record encodes"),
+        });
+
+        let instances = InstanceCache::new(InstanceRegistry::new());
+        let packages = PackageCache::new(MetadataCache::new());
+        let chain = NodeRecords::pinned(&packages, &instances, Some(cells));
+        assert!(
+            chain.instance(address.into()).is_none(),
+            "a record derives the address it is admitted at, or none"
+        );
+        assert!(
+            instances.load().get(address).is_none(),
+            "and nothing it refused is seated"
+        );
+    }
+
     fn statics() -> BridgeStatics {
         let package = PackageHash(ProtocolHasher.hash(b"package", &[b"account"]));
         let mut cache = MetadataCache::new();
@@ -804,6 +982,7 @@ mod tests {
             cache: PackageCache::new(cache),
             instances: InstanceCache::new(instances),
             artifact_sink: None,
+            cells: OnceLock::new(),
         }
     }
 

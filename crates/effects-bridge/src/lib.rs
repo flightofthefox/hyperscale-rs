@@ -20,8 +20,8 @@ pub use hyperscale_types::ProtocolHasher;
 pub use staking::{PoolRegistry, witness_from_event};
 pub use vm_metadata::{MAX_PACKAGE_METADATA_BYTES, decode_metadata, encode_metadata};
 pub use vm_statics::{
-    BridgeStatics, NodeRecords, XRD, account_address, decode_tree, draw_key, encode_tree,
-    envelope_identity, validator_key, vault_key,
+    BridgeStatics, LocalCells, NodeRecords, XRD, account_address, decode_tree, draw_key,
+    encode_tree, envelope_identity, validator_key, vault_key,
 };
 
 #[cfg(test)]

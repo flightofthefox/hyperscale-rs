@@ -52,12 +52,12 @@ use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
 use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::Executor;
+use hyperscale_engine::{Executor, LocalCells};
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain};
 use hyperscale_types::{
-    Block, CertifiedBlock, LocalTimestamp, ShardId, TopologySnapshot, TransactionStatus, TxHash,
-    Verified,
+    Block, CertifiedBlock, LocalTimestamp, ShardId, SubstateKey, TopologySnapshot,
+    TransactionStatus, TxHash, Verified,
 };
 pub use io::ShardIo;
 pub use metrics::{MetricsSnapshot, ShardMetrics, VnodeMetrics, record_metrics};
@@ -113,7 +113,43 @@ pub(crate) struct DispatchHandles<S: ShardStorage, N> {
     /// Process-level beacon store, threaded to the ratify-vote sign
     /// handler as its durable-register seam.
     pub(crate) beacon_storage: Arc<dyn BeaconStorage>,
-    pub(crate) per_shard: ArcSwap<HashMap<ShardId, ShardDispatchHandles<S>>>,
+    /// Behind its own `Arc` so the stores can be shared with the engine
+    /// without the engine holding the handles that hold the engine.
+    pub(crate) per_shard: Arc<ArcSwap<HashMap<ShardId, ShardDispatchHandles<S>>>>,
+}
+
+/// The committed cells this node serves, across every shard it hosts.
+///
+/// A component's record lives in a cell under the component's own
+/// prefix, so at most one hosted store can hold any given key and asking
+/// each in turn answers without a topology lookup — and answers nothing
+/// where the prefix belongs to a shard this node does not serve, which
+/// is exactly the case the fetch covers.
+pub(crate) struct HostedCells<S: ShardStorage> {
+    per_shard: Arc<ArcSwap<HashMap<ShardId, ShardDispatchHandles<S>>>>,
+}
+
+impl<S: ShardStorage> HostedCells<S> {
+    pub(crate) const fn new(
+        per_shard: Arc<ArcSwap<HashMap<ShardId, ShardDispatchHandles<S>>>>,
+    ) -> Self {
+        Self { per_shard }
+    }
+}
+
+impl<S: ShardStorage> LocalCells for HostedCells<S> {
+    fn committed_cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+        self.per_shard.load().values().find_map(|handles| {
+            let storage = &handles.storage;
+            // The committed tip, never a pending one: the caches this
+            // stands behind are grown by commits, and a pending block
+            // two nodes disagree about would derive an envelope two
+            // ways.
+            storage
+                .get_substate_at_height(key, storage.jmt_height())
+                .flatten()
+        })
+    }
 }
 
 impl<S: ShardStorage, N> DispatchHandles<S, N> {
