@@ -27,12 +27,12 @@ use hyperscale_vm_effects::{InstanceMeta, package_hash};
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::faultable::FaultableCluster;
 use crate::support::tx::{
-    OVERDRAW_AMOUNT, build_composed_tx, build_draw_tx, build_instance_deposit_tx, build_publish_tx,
-    build_securify_tx, build_transfer_paid_by, build_transfer_tx, build_unbound_payer_tx,
-    cross_shard_cast, cross_shard_keys, lottery_on, native_pq_cast, nullifier_race_cast,
-    overdraw_cast, payment_request, recipient, securify_cast, sender, shared_recipient_cast,
-    storm_artifact, storm_publishers, unbound_payer_cast, unbound_remote_payer_cast,
-    validity_around,
+    OVERDRAW_AMOUNT, build_composed_tx, build_draw_tx, build_instance_deposit_tx,
+    build_instantiate_tx, build_publish_tx, build_securify_tx, build_transfer_paid_by,
+    build_transfer_tx, build_unbound_payer_tx, cross_shard_cast, cross_shard_keys, lottery_on,
+    native_pq_cast, nullifier_race_cast, overdraw_cast, payment_request, recipient, securify_cast,
+    sender, shared_recipient_cast, storm_artifact, storm_publishers, unbound_payer_cast,
+    unbound_remote_payer_cast, validity_around,
 };
 use crate::support::wait::{await_height, await_tx_terminal};
 use crate::support::{Cluster, epochs};
@@ -798,6 +798,25 @@ pub fn randomness_draw_agrees_across_shards<C: Cluster>(c: &mut C) {
     let (payer, ..) = cross_shard_keys();
     let left = lottery_on(ShardId::leaf(1, 0));
     let right = lottery_on(ShardId::leaf(1, 1));
+    // Both components are sealed first, in their own transaction: a
+    // draw's fence reads a committed leaf, and nothing is committed
+    // inside the transaction that writes it.
+    let seal = build_instantiate_tx(
+        &payer,
+        &[left.clone(), right.clone()],
+        validity_around(c.now()),
+    );
+    let sealed = seal.hash();
+    c.submit(Arc::new(seal));
+    let status = await_tx_terminal(c, sealed, epochs(16));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the lotteries were never sealed; status = {status:?}"
+    );
+
     let tx = build_draw_tx(
         &payer,
         &[left.clone(), right.clone()],

@@ -89,11 +89,12 @@ pub fn draw_key(lottery: impl Into<Address>) -> SubstateKey {
     child_key(&ProtocolHasher, lottery, lottery::OUTCOME, &[])
 }
 
-/// An instance's configuration cell: the locked leaf its creation fixed.
+/// An instance's configuration leaf: the seal its instantiation writes.
 ///
-/// Its value re-derives from the instance's own presented record, which
-/// is what serves it — a locked read makes no participant, so no shard
-/// reads another's state for it.
+/// Holds the whole creation-fixed record, and its presence is what makes
+/// the component actual — every method the package declares reads it
+/// under a presence condition, and the one write the slot admits is
+/// refused where the leaf is already there.
 #[must_use]
 pub fn config_key(owner: impl Into<Address>) -> SubstateKey {
     child_key(&ProtocolHasher, owner, CONFIG, &[])

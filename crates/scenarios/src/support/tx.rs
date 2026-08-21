@@ -1064,6 +1064,55 @@ pub fn lottery_on(shard: ShardId) -> InstanceMeta {
     panic!("no lottery salt lands on {shard:?}");
 }
 
+/// Seal the lotteries: one node per instance, each writing its own
+/// creation-fixed record into its configuration leaf.
+///
+/// What makes a derivable component actual, and a transaction of its own
+/// because a presence condition is judged against committed state — the
+/// leaf has to be there before any call's fence can find it.
+///
+/// # Panics
+///
+/// If the scenario world does not answer the seal, which would be a
+/// defect in the world rather than in the seal.
+#[must_use]
+pub fn build_instantiate_tx(
+    payer: &Ed25519PrivateKey,
+    lotteries: &[InstanceMeta],
+    validity: TimestampRange,
+) -> Transaction {
+    let client = client();
+    let cache = client.cache();
+    let mut instances = client.world().instances.clone();
+    let addresses: Vec<_> = lotteries
+        .iter()
+        .map(|meta| instances.create(&ProtocolHasher, meta.clone()))
+        .collect();
+    let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
+    for address in addresses {
+        lottery::Lottery::at(address)
+            .instantiate(&mut root)
+            .expect("a derivable lottery answers its seal");
+    }
+    for meta in lotteries {
+        env.instance(meta.clone());
+    }
+    env.seal(root)
+        .expect("the root declares nothing to discharge");
+    let tree = env.build().expect("the intent declares no hole");
+
+    Transaction::new(client.sign_tree(
+        &tree,
+        Vec::new(),
+        payer,
+        Terms {
+            max_fee: MAX_FEE,
+            validity,
+            message: Vec::new(),
+        },
+    ))
+}
+
 /// Build a cross-shard draw: two lottery instances, one per shard,
 /// settling their rounds in one transaction — so the two recorded draws
 /// are equal exactly when the two committees executed under one value.

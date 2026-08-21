@@ -282,10 +282,6 @@ impl Executor {
             &Locality::All,
             &mut base,
         );
-        for (key, value) in &prepared.locked_configs {
-            base.cells.insert(*key, value.clone());
-            base.locked.insert(*key);
-        }
         // The fee vault is not a declared effect, and the report needs
         // its committed amount to say what the charge would leave.
         if let Some(value) = snapshot.cell(payer.vault) {
