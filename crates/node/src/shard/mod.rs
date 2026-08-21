@@ -26,6 +26,7 @@ pub(crate) mod caches;
 pub(crate) mod commit;
 pub(crate) mod consensus;
 pub(crate) mod cross_shard;
+pub(crate) mod instances;
 pub(crate) mod io;
 pub(crate) mod mempool;
 pub(crate) mod packages;
@@ -76,6 +77,7 @@ use crate::shard::cross_shard::{
     CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
     ProvisionBinding,
 };
+use crate::shard::instances::InstanceRecordBinding;
 use crate::shard::mempool::TransactionBinding;
 use crate::shard::packages::PackageArtifactBinding;
 use crate::vnode::Vnode;
@@ -479,6 +481,15 @@ where
             }
             ShardScopedInput::PackageArtifactsFetched { artifacts } => {
                 self.handle_package_artifacts_fetched(artifacts);
+            }
+            ShardScopedInput::InstanceRecordsWanted { instances } => {
+                self.fetch_instance_records(instances);
+            }
+            ShardScopedInput::InstanceRecordsFetched { records } => {
+                self.handle_instance_records_fetched(records);
+            }
+            ShardScopedInput::InstanceRecordsFetchFailed { ids } => {
+                self.drive_fetch::<InstanceRecordBinding>(FetchInput::Failed { ids });
             }
             ShardScopedInput::PackageArtifactsFetchFailed { ids } => {
                 self.drive_fetch::<PackageArtifactBinding>(FetchInput::Failed { ids });

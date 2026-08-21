@@ -19,6 +19,7 @@ use crate::shard::cross_shard::{
     CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
     ProvisionBinding,
 };
+use crate::shard::instances::InstanceRecordBinding;
 use crate::shard::mempool::TransactionBinding;
 use crate::shard::packages::PackageArtifactBinding;
 
@@ -47,5 +48,6 @@ where
         self.drive_fetch::<ExecCertBinding>(FetchInput::Tick);
         self.drive_fetch::<CommittedTxBinding>(FetchInput::Tick);
         self.drive_fetch::<PackageArtifactBinding>(FetchInput::Tick);
+        self.drive_fetch::<InstanceRecordBinding>(FetchInput::Tick);
     }
 }

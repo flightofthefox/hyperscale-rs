@@ -25,7 +25,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::{ShardStorage, SubstateStore};
 use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::{
-    NetworkId, ShardId, TopologySnapshot, Transaction, TxHash, Verified, Verify,
+    Address, NetworkId, ShardId, TopologySnapshot, Transaction, TransactionVerifyError, TxHash,
+    Verified, Verify,
 };
 
 use super::TransactionBinding;
@@ -316,30 +317,55 @@ where
         self.process
             .dispatch
             .spawn(DispatchPool::Throughput, move || {
-                let results: Vec<(TxHash, Option<Verified<Transaction>>)> = par.map(batch, |tx| {
+                type Outcome = (TxHash, Option<Verified<Transaction>>, Vec<Address>);
+                let results: Vec<Outcome> = par.map(batch, |tx| {
                     let hash = tx.hash();
-                    let verified =
-                        tx.verify(NetworkId::from(topology.network()))
-                            .ok()
-                            .filter(|v| {
-                                payer_binding_holds(
-                                    v,
-                                    &topology,
-                                    local_shard,
-                                    storage.as_deref(),
-                                    clock_ms,
-                                ) && payer_covers_fee_ceiling(
-                                    v,
-                                    &topology,
-                                    local_shard,
-                                    storage.as_deref(),
-                                )
-                            });
-                    (hash, verified)
+                    // What a refusal wanted but this node did not hold.
+                    // A gap rather than a verdict: the same envelope
+                    // derives wherever the seals it names have landed,
+                    // so the addresses are what to ask for rather than
+                    // grounds to drop it and forget.
+                    let mut wanted = Vec::new();
+                    let verified = match tx.verify(NetworkId::from(topology.network())) {
+                        Ok(v) => Some(v),
+                        Err(TransactionVerifyError::Derivation(error)) => {
+                            wanted = error.unresolved().to_vec();
+                            None
+                        }
+                        Err(_) => None,
+                    };
+                    let verified = verified.filter(|v| {
+                        payer_binding_holds(v, &topology, local_shard, storage.as_deref(), clock_ms)
+                            && payer_covers_fee_ceiling(
+                                v,
+                                &topology,
+                                local_shard,
+                                storage.as_deref(),
+                            )
+                    });
+                    (hash, verified, wanted)
                 });
 
+                let mut unresolved: Vec<Address> = Vec::new();
+                for (_, _, wanted) in &results {
+                    for instance in wanted {
+                        if !unresolved.contains(instance) {
+                            unresolved.push(*instance);
+                        }
+                    }
+                }
+                if !unresolved.is_empty() {
+                    push_shard_input(
+                        &event_tx,
+                        local_shard,
+                        ShardScopedInput::InstanceRecordsWanted {
+                            instances: unresolved,
+                        },
+                    );
+                }
+
                 let mut failed_hashes = Vec::new();
-                for (hash, verified) in results {
+                for (hash, verified, _) in results {
                     if let Some(v) = verified {
                         push_shard_input(
                             &event_tx,

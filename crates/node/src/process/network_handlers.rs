@@ -787,12 +787,16 @@ pub fn register_shard_request_handlers<S, N, D>(
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use hyperscale_engine::Executor;
     use hyperscale_types::network::request::{
-        GetBlockRequest, GetCommittedTxsRequest, GetPackageArtifactsRequest, GetProvisionsRequest,
-        GetRemoteHeadersRequest, GetSettledTxsRequest, GetStateRangeRequest,
-        GetTransactionsRequest, GetWitnessHistoryRequest,
+        GetBlockRequest, GetCommittedTxsRequest, GetInstanceRecordsRequest,
+        GetPackageArtifactsRequest, GetProvisionsRequest, GetRemoteHeadersRequest,
+        GetSettledTxsRequest, GetStateRangeRequest, GetTransactionsRequest,
+        GetWitnessHistoryRequest,
     };
-    use hyperscale_types::network::response::GetPackageArtifactsResponse;
+    use hyperscale_types::network::response::{
+        GetInstanceRecordsResponse, GetPackageArtifactsResponse,
+    };
 
     use crate::beacon::serve::serve_beacon_block_request;
     use crate::beacon::witness_serve::serve_shard_witnesses_request;
@@ -910,6 +914,38 @@ pub fn register_shard_request_handlers<S, N, D>(
                     .collect();
                 record_fetch_response_sent("package_artifact", artifacts.len());
                 GetPackageArtifactsResponse::new(artifacts)
+            },
+        );
+
+    // ── instance_record.request → cross-shard component resolution ─
+
+    // No index behind this, unlike the artifact serve beside it: a
+    // component's configuration leaf sits at a key its own address
+    // derives, so the request names where to look. Read at the store's
+    // own committed height, which is what a record being immutable once
+    // sealed makes safe — any height at or after the seal answers the
+    // same bytes.
+    let storage = Arc::clone(&io.storage);
+    process
+        .network
+        .register_request_handler::<GetInstanceRecordsRequest>(
+            shard,
+            move |req: GetInstanceRecordsRequest| {
+                let height = storage.jmt_height();
+                let records: Vec<Vec<u8>> = req
+                    .instances
+                    .iter()
+                    .filter_map(|instance| {
+                        storage
+                            .get_substate_at_height(
+                                Executor::instance_record_key(*instance),
+                                height,
+                            )
+                            .flatten()
+                    })
+                    .collect();
+                record_fetch_response_sent("instance_record", records.len());
+                GetInstanceRecordsResponse::new(records)
             },
         );
 
