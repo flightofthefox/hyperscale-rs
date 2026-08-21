@@ -32,7 +32,8 @@ use hyperscale_types::{
     ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp,
     WitnessSources, WorkInFlight, absorb_committed_cells, commit_witness_window, derive_leaves,
     local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
-    shard_reveal_sign, signed_bytes, vm_statics, vrf_output_from_proof, work_over_certificates,
+    protocol_statics, shard_reveal_sign, signed_bytes, vrf_output_from_proof,
+    work_over_certificates,
 };
 
 /// Result of QC verification and assembly.
@@ -636,7 +637,7 @@ where
                     break;
                 };
                 for signer in &demand.signers {
-                    if !vm_statics().rule_admits(
+                    if !protocol_statics().rule_admits(
                         auth_cell.as_deref(),
                         payer,
                         *signer,

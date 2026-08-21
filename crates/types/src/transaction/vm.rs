@@ -6,7 +6,7 @@
 //! there through the derived preimage. What binds here is what the leaf
 //! crate deliberately does not know: the protocol hash and the signature
 //! arithmetic behind [`EnvelopeExt`], the clock behind the validity
-//! window, and the workspace's admission vocabulary behind [`VmStatics`].
+//! window, and the workspace's admission vocabulary behind [`Derivation`].
 
 use std::sync::OnceLock;
 
@@ -293,12 +293,18 @@ impl VmStaticsError {
     }
 }
 
-/// The seam VM admission derives through.
+/// The seam VM admission derives through: what one node can answer.
 ///
 /// Decode the envelope tree, admit it, and route its effect sets into
 /// the workspace vocabulary. The effects bridge implements it over the
-/// genesis-static metadata; node wiring installs it at boot.
-pub trait VmStatics: Send + Sync {
+/// records and packages that node has seen commit.
+///
+/// Split from [`ProtocolStatics`] on the only line that matters, which
+/// is whether two nodes can answer differently. Everything here reads a
+/// cache the chain fills, so a node that has not seen a seal commit
+/// resolves nothing a node that has resolves fine — a real difference,
+/// and one a single shared installation would erase.
+pub trait Derivation: Send + Sync {
     /// Derive the envelope's routing identity and subintent claims, or
     /// refuse it.
     ///
@@ -309,6 +315,35 @@ pub trait VmStatics: Send + Sync {
     /// bound signer address the matching public key does not derive.
     fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError>;
 
+    /// Offer one committed cell to the published-package cache.
+    ///
+    /// Called for every cell a block commits, on the commit path and
+    /// on the sync path alike, because both derive their state from the
+    /// same block content. What makes a cell a package is a property of
+    /// its own bytes, so the implementation decides — this seam carries
+    /// no VM vocabulary and no notion of what a package is.
+    ///
+    /// Feeding the cache from committed state rather than from execution
+    /// is what keeps routing identical across replicas: a package is
+    /// usable by transactions admitted after its block commits, and a
+    /// validator whose cache lagged would refuse what its peers admit.
+    fn absorb_committed_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) {
+        let _ = (owner, local, value);
+    }
+}
+
+/// The seam the VM answers protocol questions through: what every node
+/// answers alike.
+///
+/// A verdict over bytes a caller supplies, or a classification of bytes
+/// a block committed. Neither reads anything a node accumulates, so two
+/// nodes cannot disagree and nothing is gained by holding one of these
+/// per node.
+///
+/// A trait rather than free functions because the dependency runs from
+/// the effects bridge to this crate: consensus cannot call into the VM,
+/// so the VM installs its answers here.
+pub trait ProtocolStatics: Send + Sync {
     /// Whether `payer`'s rule admits `signer`, given the payer's
     /// stored-authority cell as read at the caller's own anchored
     /// height — `None` or empty meaning absent — and the weighted-time
@@ -338,22 +373,6 @@ pub trait VmStatics: Send + Sync {
         }
     }
 
-    /// Offer one committed cell to the published-package cache.
-    ///
-    /// Called for every cell a block commits, on the commit path and
-    /// on the sync path alike, because both derive their state from the
-    /// same block content. What makes a cell a package is a property of
-    /// its own bytes, so the implementation decides — this seam carries
-    /// no VM vocabulary and no notion of what a package is.
-    ///
-    /// Feeding the cache from committed state rather than from execution
-    /// is what keeps routing identical across replicas: a package is
-    /// usable by transactions admitted after its block commits, and a
-    /// validator whose cache lagged would refuse what its peers admit.
-    fn absorb_committed_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) {
-        let _ = (owner, local, value);
-    }
-
     /// The content address of the package this committed cell publishes,
     /// or `None` for every other cell.
     ///
@@ -368,31 +387,48 @@ pub trait VmStatics: Send + Sync {
     }
 }
 
-static VM_STATICS: OnceLock<Box<dyn VmStatics>> = OnceLock::new();
+static DERIVATION: OnceLock<Box<dyn Derivation>> = OnceLock::new();
+static PROTOCOL_STATICS: OnceLock<Box<dyn ProtocolStatics>> = OnceLock::new();
 
-/// Install the process-wide VM statics implementation. The first
-/// installation wins; later calls are ignored, so tests and node boot can
-/// both install without coordination.
-pub fn install_vm_statics(statics: Box<dyn VmStatics>) {
-    let _ = VM_STATICS.set(statics);
+/// Install the process-wide derivation. The first installation wins; so
+/// tests and node boot can both install without coordination.
+pub fn install_derivation(statics: Box<dyn Derivation>) {
+    let _ = DERIVATION.set(statics);
 }
 
-/// Whether a VM statics implementation is installed.
+/// Install the process-wide protocol answers, on the same terms.
+pub fn install_protocol_statics(statics: Box<dyn ProtocolStatics>) {
+    let _ = PROTOCOL_STATICS.set(statics);
+}
+
+/// Whether a derivation is installed.
 #[must_use]
 pub fn vm_statics_installed() -> bool {
-    VM_STATICS.get().is_some()
+    DERIVATION.get().is_some()
 }
 
-/// The installed statics.
+/// The installed derivation.
 ///
 /// # Panics
 ///
 /// If none is installed — transactions cannot exist in a process that
 /// never wired the derivation seam.
-pub fn vm_statics() -> &'static dyn VmStatics {
-    VM_STATICS
+pub fn vm_statics() -> &'static dyn Derivation {
+    DERIVATION
         .get()
         .expect("VM statics not installed; node wiring installs the effects-bridge derivation")
+        .as_ref()
+}
+
+/// The installed protocol answers.
+///
+/// # Panics
+///
+/// If none is installed, on the same terms as [`vm_statics`].
+pub fn protocol_statics() -> &'static dyn ProtocolStatics {
+    PROTOCOL_STATICS
+        .get()
+        .expect("protocol statics not installed; node wiring installs the effects-bridge answers")
         .as_ref()
 }
 

@@ -1,6 +1,6 @@
 //! The committed-package artifact index a backend keeps beside its state.
 
-use hyperscale_types::{Hash, SubstateKey, vm_statics, vm_statics_installed};
+use hyperscale_types::{Hash, SubstateKey, protocol_statics, vm_statics_installed};
 
 /// The content address a committed cell publishes, or `None` for a cell
 /// that publishes nothing.
@@ -20,7 +20,7 @@ pub fn package_of_cell(key: SubstateKey, value: &[u8]) -> Option<Hash> {
     if !vm_statics_installed() {
         return None;
     }
-    vm_statics().package_cell(key.owner.to_bytes(), key.local.0, value)
+    protocol_statics().package_cell(key.owner.to_bytes(), key.local.0, value)
 }
 
 /// Read access to the package artifacts this store's committed state

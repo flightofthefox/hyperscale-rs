@@ -21,7 +21,7 @@ use crate::transaction::vm::{ProtocolVerifier, SchemeVerifier, vm_statics};
 use crate::{
     DeclaredKey, Derived, EnvelopeExt, Hash, LocalKey, MAX_TX_BYTES_LEN, NetworkId, PrincipalAddr,
     Routing, ShardTrie, SubstateKey, TimestampRange, TransactionEnvelope, TxHash, Verified, Verify,
-    VmStaticsError,
+    VmStaticsError, protocol_statics,
 };
 
 /// A signed transaction as the network carries it.
@@ -246,7 +246,7 @@ impl Transaction {
 
     /// The derived routing identity.
     ///
-    /// Derives through the installed [`crate::VmStatics`] on first access
+    /// Derives through the installed [`crate::Derivation`] on first access
     /// and caches per transaction.
     ///
     /// # Panics
@@ -332,7 +332,7 @@ impl Transaction {
     /// Panics under the same conditions as [`Self::routing`].
     #[must_use]
     pub fn payer_admits_signer(&self, auth_cell: Option<&[u8]>, clock_ms: u64) -> bool {
-        vm_statics().rule_admits(auth_cell, self.body().fee_payer, self.signer(), clock_ms)
+        protocol_statics().rule_admits(auth_cell, self.body().fee_payer, self.signer(), clock_ms)
     }
 
     /// The cached derivation, or a panic naming the refusal.
@@ -423,7 +423,7 @@ pub enum TransactionVerifyError {
 /// Construction asserts: the body decodes, the envelope names this
 /// session's network, the composer's ed25519 signature covers the
 /// envelope content, the tree admits and routes under the installed
-/// [`crate::VmStatics`] (which caches the derived identity on the
+/// [`crate::Derivation`] (which caches the derived identity on the
 /// transaction and binds every subintent signer address to its public
 /// key), and every subintent signature covers its declaration hash.
 ///
@@ -510,8 +510,8 @@ mod tests {
     use super::*;
     use crate::test_utils::{test_prefix, test_validity_range};
     use crate::{
-        Ed25519PrivateKey, MlDsa65PrivateKey, PrincipalAddr, SchemeId, Secp256k1PrivateKey,
-        SubintentSig, TransactionBody, VmStatics, declared_work, install_vm_statics,
+        Derivation, Ed25519PrivateKey, MlDsa65PrivateKey, PrincipalAddr, SchemeId,
+        Secp256k1PrivateKey, SubintentSig, TransactionBody, declared_work, install_derivation,
     };
 
     struct StubStatics;
@@ -520,7 +520,7 @@ mod tests {
     /// trees; the fixture's subintent signature covers it.
     const STUB_SUBINTENT_HASH: [u8; 32] = [0x5A; 32];
 
-    impl VmStatics for StubStatics {
+    impl Derivation for StubStatics {
         fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError> {
             if vm.call_tree().unwrap_or_default() == b"inadmissible" {
                 return Err(VmStaticsError::Refused("stub refusal".into()));
@@ -588,7 +588,7 @@ mod tests {
     }
 
     fn fixture(tree: &[u8]) -> Transaction {
-        install_vm_statics(Box::new(StubStatics));
+        install_derivation(Box::new(StubStatics));
         Transaction::new(test_envelope(tree))
     }
 
@@ -689,7 +689,7 @@ mod tests {
     /// kilobytes rather than tens of bytes.
     #[test]
     fn an_envelope_signed_under_any_registered_scheme_round_trips() {
-        install_vm_statics(Box::new(StubStatics));
+        install_derivation(Box::new(StubStatics));
         let ed = unsigned_envelope(b"graph bytes")
             .sign(&Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap());
         let secp = unsigned_envelope(b"graph bytes")
@@ -716,7 +716,7 @@ mod tests {
     /// not a codec one.
     #[test]
     fn re_tagging_between_schemes_loses_the_signature() {
-        install_vm_statics(Box::new(StubStatics));
+        install_derivation(Box::new(StubStatics));
         let ed = unsigned_envelope(b"graph bytes")
             .sign(&Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap());
         let secp = unsigned_envelope(b"graph bytes")
@@ -745,7 +745,7 @@ mod tests {
 
     #[test]
     fn verification_checks_subintent_signatures() {
-        install_vm_statics(Box::new(StubStatics));
+        install_derivation(Box::new(StubStatics));
 
         // A subintent signature must cover the derived declaration hash.
         let subintent_key = Ed25519PrivateKey::from_bytes(&[9u8; 32]).unwrap();
