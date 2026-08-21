@@ -11,7 +11,8 @@ use hyperscale_effects_bridge::genesis::genesis_world_with_pools;
 use hyperscale_effects_bridge::vm_statics::{committed_instance, config_key};
 use hyperscale_effects_bridge::{ProtocolHasher, account_address};
 use hyperscale_engine::genesis::{
-    GenesisPackages, OWNER_BADGE_ID, pool_address, pool_meta, pool_owner_badge, staking_artifact,
+    GenesisPackages, OWNER_BADGE_ID, pool_address, pool_meta, pool_owner_badge, stake_unit,
+    staking_artifact,
 };
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, TickBatchContext, XRD, genesis_writes,
@@ -474,14 +475,41 @@ fn a_founded_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
     .into_parts();
     let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated);
     let badge = pool_owner_badge(pool);
+    // What a pool is, cell by cell: the seal, a record per mark it
+    // issues, and the badge instance its founding minted.
     for key in [
         config_key(pool),
         resource_record_key(&ProtocolHasher, pool, badge),
+        resource_record_key(&ProtocolHasher, pool, stake_unit(pool)),
         instance_data_key(&ProtocolHasher, pool, badge, OWNER_BADGE_ID),
     ] {
         assert!(genesis_cells.contains_key(&key), "genesis writes the cell");
         assert_eq!(store.cells.get(&key), genesis_cells[&key].as_ref());
     }
+    // And nothing beside them, either way. The list above says what the
+    // two writers agree on; this says neither writes a cell the other
+    // does not — which is the half a named list cannot check, and the
+    // half that catches a drift when one side grows a cell.
+    let under_pool = |cells: &BTreeMap<SubstateKey, Option<Vec<u8>>>| {
+        cells
+            .iter()
+            .filter(|(key, _)| key.owner == pool.address())
+            .map(|(key, value)| (*key, value.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let seeded = under_pool(&genesis_cells);
+    let executed: BTreeMap<_, _> = store
+        .cells
+        .iter()
+        .filter(|(key, _)| key.owner == pool.address())
+        .map(|(key, value)| (*key, Some(value.clone())))
+        .collect();
+    assert_eq!(
+        seeded.keys().collect::<Vec<_>>(),
+        executed.keys().collect::<Vec<_>>(),
+        "a seated pool and an instantiated one hold the same cells",
+    );
+    assert_eq!(seeded, executed, "and the same bytes in each");
     let entry = EntryKey {
         owner: unseated.operator.address(),
         collection: holdings_collection(&ProtocolHasher, unseated.operator, badge),

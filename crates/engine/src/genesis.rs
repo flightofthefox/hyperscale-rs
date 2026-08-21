@@ -8,9 +8,9 @@
 //! kernel's own amount encoding.
 
 pub use hyperscale_effects_bridge::genesis::{
-    GenesisPackages, OWNER_BADGE_ID, OWNER_BADGE_RECORD, World, XRD_RECORD, account_artifact,
-    genesis_publisher, genesis_world, genesis_world_with_pools, pool_address, pool_meta,
-    pool_owner_badge, stake_unit, staking_artifact,
+    GenesisPackages, OWNER_BADGE_ID, OWNER_BADGE_RECORD, STAKE_UNIT_RECORD, World, XRD_RECORD,
+    account_artifact, genesis_publisher, genesis_world, genesis_world_with_pools, pool_address,
+    pool_meta, pool_owner_badge, stake_unit, staking_artifact,
 };
 use hyperscale_effects_bridge::vm_statics::config_key;
 use hyperscale_effects_bridge::{ProtocolHasher, validator_key};
@@ -124,6 +124,17 @@ pub fn genesis_writes(
         writes.cells.insert(
             instance_data_key(&ProtocolHasher, pool, badge, OWNER_BADGE_ID),
             Some(vec![1]),
+        );
+        // The stake unit's record beside the badge's: instantiation
+        // writes one cell per declared mark, whether or not anything has
+        // been issued yet, so a seated pool carries the same set.
+        writes.cells.insert(
+            resource_record_key(&ProtocolHasher, pool, stake_unit(pool)),
+            Some(
+                STAKE_UNIT_RECORD
+                    .to_cell()
+                    .expect("a record encodes within its wire depth"),
+            ),
         );
         // Empty content, as `deposit-nf` files an entry: presence is the
         // whole of what a holdings entry says, and the two writers of
