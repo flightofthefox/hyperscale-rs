@@ -41,19 +41,28 @@ pub struct TickEnvironment {
     /// writes records. Derived rather than carried, because the clock
     /// already travels with the transaction and the epoch is a function
     /// of it.
+    ///
+    /// The schedule's rather than the snapshot's, and not for want of a
+    /// place to put it: the grid is the genesis-fixed window length a
+    /// schedule *is* indexed by, so a snapshot carrying a second copy
+    /// would be a second answer to a question one object already
+    /// settles. It is also the half of this that cannot skew — a seed
+    /// ring is what each window retained, where the grid is the same
+    /// under every window there has ever been.
     pub windows: EpochWindows,
 }
 
 impl TickEnvironment {
-    /// The environment `snapshot` governs.
+    /// The environment the block governed by `snapshot` executes under,
+    /// on the grid `windows` lays down.
     ///
-    /// Only the reveal-folded epochs cross into the window. A ceremony
-    /// roll is a seed a beacon member could have withheld from, and a
-    /// draw settled on one is settled on a value somebody had a lever
-    /// over — so a seal maturing into such an epoch answers `Expired`
-    /// and the round closes again.
+    /// Only the reveal-folded epochs cross into the seed window. A
+    /// ceremony roll is a seed a beacon member could have withheld from,
+    /// and a draw settled on one is settled on a value somebody had a
+    /// lever over — so a seal maturing into such an epoch answers
+    /// `Expired` and the round closes again.
     #[must_use]
-    pub fn governing(snapshot: &TopologySnapshot) -> Self {
+    pub fn governing(snapshot: &TopologySnapshot, windows: EpochWindows) -> Self {
         let ring = snapshot.seeds();
         Self {
             seeds: SeedWindow::new(
@@ -62,7 +71,7 @@ impl TickEnvironment {
                     .collect(),
                 ring.newest().map(Epoch::inner),
             ),
-            windows: snapshot.epoch_windows(),
+            windows,
         }
     }
 

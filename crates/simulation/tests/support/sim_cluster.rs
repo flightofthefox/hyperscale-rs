@@ -479,12 +479,13 @@ impl Cluster for SimCluster {
         let tip = store.get_certified_header(store.committed_height())?;
         let snapshot = store.snapshot();
         let topology = self.runner.host_topology(0)?;
+        let windows = self.beacon_state()?.chain_config.epoch_windows();
         Some(self.runner.engine().preview(
             &snapshot,
             tx,
             &PreviewInputs {
                 clock: tip.qc().weighted_timestamp(),
-                env: TickEnvironment::governing(&topology),
+                env: TickEnvironment::governing(&topology, windows),
                 grants,
             },
         ))

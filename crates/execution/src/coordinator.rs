@@ -896,6 +896,7 @@ impl ExecutionCoordinator {
         // the beacon rather than on what the block committed.
         let env = TickEnvironment::governing(
             self.classification_committee(topology_schedule, self.committed_committee_anchor_wt),
+            topology_schedule.windows(),
         );
         let pending = (!requests.is_empty()).then(|| PendingTick {
             tick: block.height,
@@ -3527,10 +3528,11 @@ mod tests {
     };
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt,
-        ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed, ExecutionOutcome, GlobalReceiptHash,
-        Hash, MAX_FINALIZATION_DELAY, NetworkDefinition, QuorumCertificate, Randomness,
-        RecoveryCause, SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer, SignerBitfield,
-        StateRoot, StoredReceipt, TickHalf, UnsettledTx, ValidatorInfo, ValidatorSet,
+        ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, ExecutionOutcome,
+        GlobalReceiptHash, Hash, MAX_FINALIZATION_DELAY, NetworkDefinition, QuorumCertificate,
+        Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer,
+        SignerBitfield, StateRoot, StoredReceipt, TickHalf, UnsettledTx, ValidatorInfo,
+        ValidatorSet,
     };
     use hyperscale_vm_types::Seeded;
 
@@ -5993,6 +5995,8 @@ mod tests {
     /// terms as the clock beside it.
     #[test]
     fn a_tick_executes_under_its_blocks_seed_window_not_the_head() {
+        const ED: u64 = 1_000;
+
         let mut state = make_test_state();
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let validators: Vec<ValidatorInfo> = keys
@@ -6023,12 +6027,12 @@ mod tests {
         };
         // One window, two snapshots of it: what the block's committee
         // carried, and what a node further along the fold holds.
-        let mut sched = TopologySchedule::single(seeded(0xA1));
+        let mut sched = TopologySchedule::new(ED, Epoch::GENESIS, seeded(0xA1));
         sched.set_head(seeded(0xB2));
 
         let block = make_live_block(
             BlockHeight::new(1),
-            1_000,
+            500,
             ValidatorId::new(0),
             vec![Arc::new(test_transaction(1))],
         );
@@ -6045,6 +6049,14 @@ mod tests {
             env.seeds.at(Epoch::GENESIS.inner()),
             Seeded::Ready([0xA1; 32]),
             "the tick reads the seed its block's committee carried",
+        );
+        // And the grid is the schedule's own window length, which is
+        // what the schedule is indexed by — not a default a snapshot
+        // that nobody projected would have answered with.
+        assert_eq!(
+            env.windows,
+            EpochWindows::new(ED),
+            "the tick resolves its clock on the chain's epoch grid",
         );
     }
 

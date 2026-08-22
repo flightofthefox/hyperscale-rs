@@ -1808,7 +1808,6 @@ impl BeaconState {
         .with_completed_recoveries(self.completed_recoveries.clone())
         .with_usable_packages(usable_packages)
         .with_seeds(seeds)
-        .with_epoch_windows(self.chain_config.epoch_windows())
     }
 
     /// The packages a block governed by `epoch` may name: registered and
