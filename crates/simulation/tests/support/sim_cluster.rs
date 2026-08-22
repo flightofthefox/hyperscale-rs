@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::genesis::GenesisPackages;
-use hyperscale_engine::{PreviewGrants, PreviewInputs, PreviewReport, draw_seeds};
+use hyperscale_engine::{PreviewGrants, PreviewInputs, PreviewReport, TickEnvironment};
 use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network::fault::{HostId, RuleHandle};
@@ -472,27 +472,22 @@ impl Cluster for SimCluster {
             .into_iter()
             .find_map(|host| self.runner.hosts_shard(host, shard))?;
         // The chain's own freshest attested values stand in for the
-        // environment a committing block would fix. The epoch is one
-        // sample, not a prediction: which block will commit the
-        // transaction, and so which epoch a seal it writes records, is
-        // not yet decided.
+        // environment a committing block would fix. The epoch the grid
+        // resolves is one sample, not a prediction: which block will
+        // commit the transaction, and so which epoch a seal it writes
+        // records, is not yet decided.
         let tip = store.get_certified_header(store.committed_height())?;
         let snapshot = store.snapshot();
         let topology = self.runner.host_topology(0)?;
-        Some(
-            self.runner.engine().preview(
-                &snapshot,
-                tx,
-                &PreviewInputs {
-                    clock: tip.qc().weighted_timestamp(),
-                    epoch: topology
-                        .epoch_windows()
-                        .epoch_for(tip.qc().weighted_timestamp()),
-                    seeds: draw_seeds(&topology),
-                    grants,
-                },
-            ),
-        )
+        Some(self.runner.engine().preview(
+            &snapshot,
+            tx,
+            &PreviewInputs {
+                clock: tip.qc().weighted_timestamp(),
+                env: TickEnvironment::governing(&topology),
+                grants,
+            },
+        ))
     }
 
     fn events(&self, shard: ShardId, tx: TxHash) -> Option<Vec<Event>> {

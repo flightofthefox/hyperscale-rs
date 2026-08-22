@@ -14,16 +14,16 @@ use hyperscale_engine::genesis::{
 };
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PreviewGrants, PreviewInputs, PreviewOutcome,
-    PreviewReport, ResourceChange, TickBatchContext, XRD, genesis_writes,
+    PreviewReport, ResourceChange, TickBatchContext, TickEnvironment, XRD, genesis_writes,
 };
 use hyperscale_storage::{SubstateStore, Substates, TickChain, TickOutput, VersionedStore};
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     BeaconWitnessEvent, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
-    Ed25519PrivateKey, EnvelopeExt, Epoch, EpochWindows, Hash, NetworkId, PrincipalAddr,
-    ProvisionalHolds, SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites,
-    SubstateKey, TimestampRange, Transaction, TransactionBody, TransactionEnvelope, Verified,
-    WeightedTimestamp, absorb_committed_cells,
+    Ed25519PrivateKey, EnvelopeExt, EpochWindows, Hash, NetworkId, PrincipalAddr, ProvisionalHolds,
+    SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey,
+    TimestampRange, Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
+    absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
     AbiParam, Composed, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, PackageHash,
@@ -385,14 +385,17 @@ fn closing_tree(salt: u8) -> EnvelopeTree {
     env.build().expect("the intent declares no hole")
 }
 
-/// The seeds a round sealed in this file's epoch grid opens onto. The
-/// grid folds every timestamp to genesis, so a seal records epoch zero
-/// and matures two past it.
-fn seeds(byte: u8) -> SeedWindow {
-    SeedWindow::new(
-        BTreeMap::from([(SEAL_MATURITY_EPOCHS, [byte; 32])]),
-        Some(SEAL_MATURITY_EPOCHS),
-    )
+/// The environment a round sealed in this file's epoch grid opens
+/// under. The grid folds every timestamp to genesis, so a seal records
+/// epoch zero and matures two past it.
+fn sealed_env(byte: u8) -> TickEnvironment {
+    TickEnvironment {
+        seeds: SeedWindow::new(
+            BTreeMap::from([(SEAL_MATURITY_EPOCHS, [byte; 32])]),
+            Some(SEAL_MATURITY_EPOCHS),
+        ),
+        windows: EpochWindows::new(0),
+    }
 }
 
 /// Execute `transactions` as a single-shard batch over `store`, under a
@@ -400,7 +403,7 @@ fn seeds(byte: u8) -> SeedWindow {
 fn execute_seeded(
     executor: &Executor,
     store: &MapDb,
-    seeds: SeedWindow,
+    env: TickEnvironment,
     transactions: &[Arc<Verified<Transaction>>],
 ) -> Vec<ExecutedTx> {
     let trie = ShardTrie::single();
@@ -408,8 +411,7 @@ fn execute_seeded(
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        seeds,
-        windows: EpochWindows::new(0),
+        env,
         holds: &ProvisionalHolds::new(),
     };
     derived_through(executor, transactions);
@@ -449,7 +451,12 @@ fn a_round_settles_on_what_its_seal_fixed() {
     let second = settle(21);
     assert_ne!(first.hash(), second.hash(), "two attempts, two hashes");
 
-    let one = execute_seeded(&executor, &store, seeds(0x5E), std::slice::from_ref(&first));
+    let one = execute_seeded(
+        &executor,
+        &store,
+        sealed_env(0x5E),
+        std::slice::from_ref(&first),
+    );
     let settled = draw_cell(&one[0]).expect("the settlement wrote the round");
     // Nobody entered, so the round holds the draw and no winner: the
     // draw's thirty-two bytes at the width the record states, and one
@@ -459,7 +466,7 @@ fn a_round_settles_on_what_its_seal_fixed() {
     let other = execute_seeded(
         &executor,
         &store,
-        seeds(0x5E),
+        sealed_env(0x5E),
         std::slice::from_ref(&second),
     );
     assert_eq!(
@@ -470,7 +477,12 @@ fn a_round_settles_on_what_its_seal_fixed() {
 
     // And the seed is what the seal committed to, so a chain that rolled
     // a different one settles the round differently.
-    let elsewhere = execute_seeded(&executor, &store, seeds(0x77), std::slice::from_ref(&first));
+    let elsewhere = execute_seeded(
+        &executor,
+        &store,
+        sealed_env(0x77),
+        std::slice::from_ref(&first),
+    );
     assert_ne!(
         draw_cell(&elsewhere[0]),
         Some(settled),
@@ -594,8 +606,7 @@ fn execute_batch_on(
         // A round sealed under this grid records genesis, so the window
         // holds the epoch such a seal matures into — every settlement
         // here opens rather than waiting.
-        seeds: seeds(0x5E),
-        windows: EpochWindows::new(0),
+        env: sealed_env(0x5E),
         holds: &ProvisionalHolds::new(),
     };
     derived_through(executor, transactions);
@@ -1106,8 +1117,7 @@ fn execute_on_shard(
         local_shard,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        seeds: SeedWindow::unfolded(),
-        windows: EpochWindows::new(0),
+        env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
     };
     derived_through(executor, transactions);
@@ -1191,8 +1201,7 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
         local_shard: near_shard,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        seeds: SeedWindow::unfolded(),
-        windows: EpochWindows::new(0),
+        env: TickEnvironment::unfolded(),
         holds: &holds,
     };
     derived_through(&executor, std::slice::from_ref(&tx));
@@ -1648,8 +1657,7 @@ fn preview_on(
         tx,
         &PreviewInputs {
             clock: WeightedTimestamp::from_millis(1_000),
-            epoch: Epoch::GENESIS,
-            seeds: SeedWindow::unfolded(),
+            env: TickEnvironment::unfolded(),
             grants,
         },
     )

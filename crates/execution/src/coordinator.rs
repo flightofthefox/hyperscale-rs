@@ -37,6 +37,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
+use hyperscale_engine::TickEnvironment;
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_unresolvable_tx};
 use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::{
@@ -105,6 +106,7 @@ struct TickedBatch {
 struct PendingTick {
     tick: BlockHeight,
     tick_ts: WeightedTimestamp,
+    env: TickEnvironment,
     requests: Vec<CrossShardExecutionRequest>,
 }
 
@@ -887,9 +889,18 @@ impl ExecutionCoordinator {
             }
         }
 
+        // Off the block's anchored committee, on the same terms the
+        // classification above reads it: what a seal opens onto is
+        // execution output, and a window taken from this node's head
+        // would make the answer depend on how far this node has folded
+        // the beacon rather than on what the block committed.
+        let env = TickEnvironment::governing(
+            self.classification_committee(topology_schedule, self.committed_committee_anchor_wt),
+        );
         let pending = (!requests.is_empty()).then(|| PendingTick {
             tick: block.height,
             tick_ts: block.ts,
+            env,
             requests,
         });
         (pending, votes_to_replay, members)
@@ -2652,6 +2663,7 @@ impl ExecutionCoordinator {
         vec![Action::ExecuteTransactions {
             tick: tick.tick,
             tick_ts: tick.tick_ts,
+            env: tick.env,
             requests: tick.requests,
         }]
     }
@@ -3516,11 +3528,12 @@ mod tests {
     };
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt,
-        ConsensusSignature, EPOCH_DURATION, Epoch, ExecutionOutcome, GlobalReceiptHash, Hash,
-        MAX_FINALIZATION_DELAY, NetworkDefinition, QuorumCertificate, RecoveryCause, ShardAnchor,
-        ShardRecovery, Signer, SignerBitfield, StateRoot, StoredReceipt, TickHalf, UnsettledTx,
-        ValidatorInfo, ValidatorSet,
+        ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed, ExecutionOutcome, GlobalReceiptHash,
+        Hash, MAX_FINALIZATION_DELAY, NetworkDefinition, QuorumCertificate, Randomness,
+        RecoveryCause, SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer, SignerBitfield,
+        StateRoot, StoredReceipt, TickHalf, UnsettledTx, ValidatorInfo, ValidatorSet,
     };
+    use hyperscale_vm_types::Seeded;
 
     use super::*;
 
@@ -5968,6 +5981,71 @@ mod tests {
             anchored.num_shards(),
             1,
             "classification anchors at the block's window (ROOT, one shard), not the two-shard head",
+        );
+    }
+
+    /// The seed window a tick executes under is the one its block's
+    /// committee carried, not the one this node's head has folded to.
+    ///
+    /// A head advances as a node folds the beacon and every node folds
+    /// at its own pace, so a window read off the head would answer
+    /// `Pending` on a laggard where it answers `Ready` on a leader —
+    /// one tick, two receipt roots. The block fixes it, on the same
+    /// terms as the clock beside it.
+    #[test]
+    fn a_tick_executes_under_its_blocks_seed_window_not_the_head() {
+        let mut state = make_test_state();
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId::new(i as u64),
+                public_key: k.public_key(),
+            })
+            .collect();
+        let seeded = |byte: u8| {
+            let mut ring = SeedRing::default();
+            ring.record(
+                Epoch::GENESIS,
+                EpochSeed {
+                    randomness: Randomness::new([byte; 32]),
+                    source: SeedSource::Reveals,
+                },
+            );
+            Arc::new(
+                TopologySnapshot::new(
+                    NetworkDefinition::simulator(),
+                    1,
+                    ValidatorSet::new(validators.clone()),
+                )
+                .with_seeds(ring),
+            )
+        };
+        // One window, two snapshots of it: what the block's committee
+        // carried, and what a node further along the fold holds.
+        let mut sched = TopologySchedule::single(seeded(0xA1));
+        sched.set_head(seeded(0xB2));
+
+        let block = make_live_block(
+            BlockHeight::new(1),
+            1_000,
+            ValidatorId::new(0),
+            vec![Arc::new(test_transaction(1))],
+        );
+        let actions = state.on_block_committed(&sched, &certify(block));
+        let env = actions
+            .iter()
+            .find_map(|action| match action {
+                Action::ExecuteTransactions { env, .. } => Some(env),
+                _ => None,
+            })
+            .expect("the commit dispatches its tick");
+
+        assert_eq!(
+            env.seeds.at(Epoch::GENESIS.inner()),
+            Seeded::Ready([0xA1; 32]),
+            "the tick reads the seed its block's committee carried",
         );
     }
 

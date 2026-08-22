@@ -23,12 +23,13 @@ use std::sync::Arc;
 
 use hyperscale_effects_bridge::admit_package;
 use hyperscale_storage::Substates;
-use hyperscale_types::{Epoch, Event, Transaction, WeightedTimestamp};
+use hyperscale_types::{Event, Transaction, WeightedTimestamp};
 use hyperscale_vm_kernel::{
     Baseline, BatchTx, EnvInputs, Locality, ManifestWalk, Receipt, decode_amount, execute_batch,
 };
-use hyperscale_vm_types::{Outcome, SeedWindow, SubstateKey};
+use hyperscale_vm_types::{Outcome, SubstateKey};
 
+use crate::batch::TickEnvironment;
 use crate::executor::{
     PayerFee, TargetAuthority, TickBaseline, abort_reason, charge_for, materialize_declared,
     protocol_hash, publish_work,
@@ -64,17 +65,15 @@ pub struct PreviewInputs {
     /// block's parent-QC weighted timestamp; while the transaction is a
     /// candidate, the caller's own tip is the nearest thing that exists.
     pub clock: WeightedTimestamp,
-    /// The epoch a seal written by this run would record, and the seeds
-    /// a matured one may be opened against.
+    /// The seeds a matured seal resolves against, and the grid that
+    /// says which epoch a seal written by this run would record.
     ///
     /// A preview of a settlement is a preview of a *committed* seal: the
     /// word is already fixed by the epoch that seal named, so what runs
     /// here is what would run on chain. A preview of a *closing* is not
     /// — which epoch the seal ends up recording is decided by the block
     /// that commits it.
-    pub epoch: Epoch,
-    /// The window a matured seal resolves against.
-    pub seeds: SeedWindow,
+    pub env: TickEnvironment,
     /// What this run is granted.
     pub grants: PreviewGrants,
 }
@@ -306,8 +305,8 @@ impl Executor {
             prepared.declaration,
             EnvInputs {
                 clock_ms: inputs.clock.as_millis(),
-                epoch: inputs.epoch.inner(),
-                seeds: inputs.seeds.clone(),
+                epoch: inputs.env.windows.epoch_for(inputs.clock).inner(),
+                seeds: inputs.env.seeds.clone(),
             },
         )
         .with_calls(prepared.calls)

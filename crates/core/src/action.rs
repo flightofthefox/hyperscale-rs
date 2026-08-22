@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_dispatch::DispatchPool;
+use hyperscale_engine::TickEnvironment;
 use hyperscale_storage::TickResolution;
 use hyperscale_types::{
     BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
@@ -1010,6 +1011,13 @@ pub enum Action {
         tick: BlockHeight,
         /// The committing block's parent-QC weighted timestamp.
         tick_ts: WeightedTimestamp,
+        /// What the block fixed about the environment: the seeds a
+        /// sealed draw may settle on and the epoch grid a clock resolves
+        /// against. Resolved by the coordinator off the block's anchored
+        /// committee, not the `ArcSwap` head, so every replica executes
+        /// the tick over one window however far each has folded the
+        /// beacon.
+        env: TickEnvironment,
         /// Tick-attributed members of the batch. Results fan back to each
         /// tick by `tick_id`.
         /// The members, each with its provisions and environment.

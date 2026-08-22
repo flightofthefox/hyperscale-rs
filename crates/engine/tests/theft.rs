@@ -14,16 +14,16 @@ use std::sync::{Arc, LazyLock};
 use hyperscale_effects_bridge::account_address;
 use hyperscale_engine::genesis::{GenesisPackages, vault_key};
 use hyperscale_engine::{
-    ExecutedTx, ExecutionMode, Executor, TickBatchContext, XRD, genesis_writes,
+    ExecutedTx, ExecutionMode, Executor, TickBatchContext, TickEnvironment, XRD, genesis_writes,
 };
 use hyperscale_storage::Substates;
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
-    ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, EpochWindows, NetworkId, PrincipalAddr,
-    ProvisionalHolds, SettledWrites, ShardId, ShardTrie, Stake, StateWrites, SubstateKey,
-    TimestampRange, Transaction, Verified, WeightedTimestamp,
+    ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, NetworkId, PrincipalAddr, ProvisionalHolds,
+    SettledWrites, ShardId, ShardTrie, Stake, StateWrites, SubstateKey, TimestampRange,
+    Transaction, Verified, WeightedTimestamp,
 };
-use hyperscale_vm_types::{Address, CollectionId, SeedWindow, amount_cell, encode_amount};
+use hyperscale_vm_types::{Address, CollectionId, amount_cell, encode_amount};
 
 /// A funded account whose key nothing in this binary holds — the address
 /// is all an attacker has, and the address is public.
@@ -112,8 +112,7 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        seeds: SeedWindow::unfolded(),
-        windows: EpochWindows::new(0),
+        env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
     };
     tx.try_derived(executor.derivation().as_ref())

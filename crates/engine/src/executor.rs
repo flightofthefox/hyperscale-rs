@@ -28,11 +28,10 @@ use hyperscale_effects_bridge::{
 use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
 use hyperscale_types::{
-    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, Epoch, Event, EventExt,
+    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, Event, EventExt,
     EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, PrincipalAddr,
-    ProvisionalHolds, Stake, StakePoolSeat, StateWrites, SubstateEntry, TopologySnapshot,
-    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
-    install_protocol_statics,
+    ProvisionalHolds, Stake, StakePoolSeat, StateWrites, SubstateEntry, Transaction, TxHash,
+    Verified, WeightedTimestamp, compute_merkle_root, install_protocol_statics,
 };
 use hyperscale_vm_effects::{
     ChainRecords, Declaration, NodeCall, PackageHash, PrefixShardResolver, admit_tree,
@@ -43,8 +42,8 @@ use hyperscale_vm_kernel::{
     execute_batch,
 };
 use hyperscale_vm_types::{
-    Address, CallTarget, CollectionId, EffectSet, EffectTarget, EntryKey, Outcome, SeedWindow,
-    SubstateKey, UnmetCondition,
+    Address, CallTarget, CollectionId, EffectSet, EffectTarget, EntryKey, Outcome, SubstateKey,
+    UnmetCondition,
 };
 
 use crate::backend::EngineBackend;
@@ -110,23 +109,6 @@ pub fn protocol_hash(data: &[u8]) -> [u8; 32] {
     *blake3_hash(data).as_bytes()
 }
 
-/// The seeds a sealed draw may settle on, as the VM resolves them.
-///
-/// Only the reveal-folded epochs cross. A ceremony roll is a seed a
-/// beacon member could have withheld from, and a draw settled on one is
-/// settled on a value somebody had a lever over — so a seal maturing
-/// into such an epoch answers `Expired` and the round closes again.
-#[must_use]
-pub fn draw_seeds(snapshot: &TopologySnapshot) -> SeedWindow {
-    let ring = snapshot.seeds();
-    SeedWindow::new(
-        ring.folded()
-            .map(|(epoch, seed)| (epoch.inner(), *seed.as_bytes()))
-            .collect(),
-        ring.newest().map(Epoch::inner),
-    )
-}
-
 /// The environment a member executes under: its own clock, the epoch
 /// that clock falls in, and the seeds a seal written in that epoch can
 /// later be opened against.
@@ -138,8 +120,8 @@ pub fn draw_seeds(snapshot: &TopologySnapshot) -> SeedWindow {
 fn env_at(ctx: &TickBatchContext<'_>, clock: WeightedTimestamp) -> EnvInputs {
     EnvInputs {
         clock_ms: clock.as_millis(),
-        epoch: ctx.windows.epoch_for(clock).inner(),
-        seeds: ctx.seeds.clone(),
+        epoch: ctx.env.windows.epoch_for(clock).inner(),
+        seeds: ctx.env.seeds.clone(),
     }
 }
 

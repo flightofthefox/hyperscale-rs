@@ -10,19 +10,21 @@ use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::account_address;
 use hyperscale_engine::genesis::GenesisPackages;
-use hyperscale_engine::{ExecutedTx, ExecutionMode, Executor, TickBatchContext, genesis_writes};
+use hyperscale_engine::{
+    ExecutedTx, ExecutionMode, Executor, TickBatchContext, TickEnvironment, genesis_writes,
+};
 use hyperscale_hbor::{from_slice, to_vec};
 use hyperscale_storage::{BoundaryStore, GenesisCommit, SubstateStore, Substates};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
-    BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EntryKey, EpochWindows, NetworkId,
-    PrincipalAddr, ProtocolHasher, ProvisionalHolds, ResourceAddr, SettledWrites, ShardId,
-    ShardTrie, StoredReceipt, TimestampRange, Transaction, Verified, WeightedTimestamp,
+    BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EntryKey, NetworkId, PrincipalAddr,
+    ProtocolHasher, ProvisionalHolds, ResourceAddr, SettledWrites, ShardId, ShardTrie,
+    StoredReceipt, TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::holdings_collection;
 use hyperscale_vm_stdlib::account;
-use hyperscale_vm_types::{CollectionId, SeedWindow};
+use hyperscale_vm_types::CollectionId;
 
 /// The two signing seeds this world funds.
 const ALICE: u8 = 1;
@@ -138,8 +140,7 @@ fn run_tick(
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        seeds: SeedWindow::unfolded(),
-        windows: EpochWindows::new(0),
+        env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
     };
     tx.try_derived(executor.derivation().as_ref())
