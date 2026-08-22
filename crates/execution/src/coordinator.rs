@@ -44,8 +44,8 @@ use hyperscale_types::{
     CertifiedBlock, DeclaredKey, Derivation, ExecutionCertificate, ExecutionCertificateVerifyError,
     ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
     Hash, MAX_FINALIZATION_DELAY, MAX_TERMINAL_VERDICTS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, Mode,
-    Provisions, RETENTION_HORIZON, RevealChain, ScheduleLookup, SettledSetVerdict, SettledTxSet,
-    ShardId, ShardTrie, TerminalVerdict, TickId, TopologySchedule, TopologySnapshot, Transaction,
+    Provisions, RETENTION_HORIZON, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
+    ShardTrie, TerminalVerdict, TickId, TopologySchedule, TopologySnapshot, Transaction,
     TransactionDecision, TxClaim, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
     WeightedTimestamp, derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
 };
@@ -81,8 +81,6 @@ struct CommittingBlock {
     height: BlockHeight,
     /// The block's parent-QC weighted timestamp.
     ts: WeightedTimestamp,
-    /// The block's reveal chain.
-    reveal: RevealChain,
 }
 
 /// A tick with entries on the tick chain and no committed fate yet.
@@ -107,7 +105,6 @@ struct TickedBatch {
 struct PendingTick {
     tick: BlockHeight,
     tick_ts: WeightedTimestamp,
-    tick_reveal: RevealChain,
     requests: Vec<CrossShardExecutionRequest>,
 }
 
@@ -654,7 +651,7 @@ impl ExecutionCoordinator {
     /// owes an outcome for, the provisions and engagement echoes its
     /// cross-shard members wait on, and the candidate itself.
     ///
-    /// `ts` and `reveal` are the committing block's, which is what a
+    /// `ts` is the committing block's, which is what a
     /// member executes under however many ticks later it runs — so a
     /// replay of the chain passes the anchors each transaction's own
     /// block carried rather than the tip's.
@@ -665,7 +662,6 @@ impl ExecutionCoordinator {
         &mut self,
         classification: &TopologySnapshot,
         ts: WeightedTimestamp,
-        reveal: RevealChain,
         transactions: &[Arc<Verifiable<Transaction>>],
     ) {
         let local_shard = self.local_shard;
@@ -697,8 +693,7 @@ impl ExecutionCoordinator {
                 Ok(v) => Arc::new(v),
                 Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
             };
-            self.candidates
-                .register(verified, participating, ts, reveal);
+            self.candidates.register(verified, participating, ts);
         }
 
         for (tx_hash, counterparts, validity_end) in engagement_waits {
@@ -895,7 +890,6 @@ impl ExecutionCoordinator {
         let pending = (!requests.is_empty()).then(|| PendingTick {
             tick: block.height,
             tick_ts: block.ts,
-            tick_reveal: block.reveal,
             requests,
         });
         (pending, votes_to_replay, members)
@@ -2272,14 +2266,13 @@ impl ExecutionCoordinator {
             hash: block_hash,
             height,
             ts: self.committed_ts,
-            reveal: header.reveal_chain(),
         };
 
         // Everything this commit puts in flight or unblocks, before
         // anything is composed from it: the block's own transactions, and
         // the provisions and engagement echoes its batches carry.
         if !transactions.is_empty() {
-            self.register_committed_txs(anchored, block.ts, block.reveal, transactions);
+            self.register_committed_txs(anchored, block.ts, transactions);
         }
         if !provisions.is_empty() {
             self.apply_committed_provisions(provisions);
@@ -2659,7 +2652,6 @@ impl ExecutionCoordinator {
         vec![Action::ExecuteTransactions {
             tick: tick.tick,
             tick_ts: tick.tick_ts,
-            tick_reveal: tick.tick_reveal,
             requests: tick.requests,
         }]
     }

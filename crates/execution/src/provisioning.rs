@@ -19,19 +19,21 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Provisions, RETENTION_HORIZON, RevealChain, ShardId, SubstateEntry, TxHash, Verified,
-    WeightedTimestamp,
+    Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, TxHash, Verified, WeightedTimestamp,
 };
 
 /// The environment a source block's bundle carries for the transactions
-/// that block committed: the clock and the randomness anchor, both
-/// checked against the commit-proven source header at verification.
+/// that block committed: the clock, checked against the commit-proven
+/// source header at verification.
+///
+/// One field, and it stays a record because what a bundle carries about
+/// the environment is a set rather than a value — a seed is the
+/// beacon's, so it needs no carrying, and what else might is answered
+/// here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceAnchor {
     /// The source block's parent-QC weighted timestamp.
     pub clock: WeightedTimestamp,
-    /// The source block's reveal chain.
-    pub randomness: RevealChain,
 }
 
 pub struct ProvisioningTracker {
@@ -176,7 +178,6 @@ impl ProvisioningTracker {
         let source_shard = provisions.source_shard();
         let anchor = SourceAnchor {
             clock: provisions.source_block_ts(),
-            randomness: provisions.source_block_reveal(),
         };
         for tx_entry in provisions.transactions() {
             let tx_hash = tx_entry.tx_hash;
@@ -285,7 +286,7 @@ mod tests {
             ShardId::leaf(2, 0),
             block_height,
             anchor.clock,
-            anchor.randomness,
+            RevealChain::ZERO,
             MerkleInclusionProof::dummy(),
             transactions,
         ))
@@ -296,13 +297,12 @@ mod tests {
         block_height: BlockHeight,
         tx_hashes: Vec<TxHash>,
     ) -> Verified<Provisions> {
-        make_provisions_at(source, block_height, anchor(0, 0), tx_hashes)
+        make_provisions_at(source, block_height, anchor(0), tx_hashes)
     }
 
-    fn anchor(clock_ms: u64, reveal: u8) -> SourceAnchor {
+    fn anchor(clock_ms: u64) -> SourceAnchor {
         SourceAnchor {
             clock: WeightedTimestamp::from_millis(clock_ms),
-            randomness: RevealChain::from_raw(Hash::from_bytes(&[reveal; 32])),
         }
     }
 
@@ -425,7 +425,7 @@ mod tests {
         t.absorb_provisions(&make_provisions_at(
             shard(1),
             BlockHeight::new(5),
-            anchor(7_000, 0x11),
+            anchor(7_000),
             vec![tx],
         ));
         assert_eq!(t.payer_anchor(tx), None);
@@ -436,10 +436,10 @@ mod tests {
         t.absorb_provisions(&make_provisions_at(
             shard(2),
             BlockHeight::new(9),
-            anchor(9_500, 0x22),
+            anchor(9_500),
             vec![tx],
         ));
-        assert_eq!(t.payer_anchor(tx), Some(anchor(9_500, 0x22)));
+        assert_eq!(t.payer_anchor(tx), Some(anchor(9_500)));
 
         t.remove_tx(tx);
         assert_eq!(t.payer_anchor(tx), None);

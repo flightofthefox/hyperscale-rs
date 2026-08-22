@@ -12,9 +12,9 @@ use hyperscale_hbor::Hbor;
 
 use crate::{
     Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, ConsensusPublicKey,
-    DeclaredKey, Epoch, Hash, NetworkDefinition, NetworkParams, ReshapeThresholds, Round,
-    SeedLookup, SeedRing, ShardId, ShardRecovery, ShardTrie, StateRoot, TerminalRoots, Transaction,
-    ValidatorId, ValidatorSet, VoteCount, WeightedTimestamp,
+    DeclaredKey, Epoch, EpochWindows, Hash, NetworkDefinition, NetworkParams, ReshapeThresholds,
+    Round, SeedLookup, SeedRing, ShardId, ShardRecovery, ShardTrie, StateRoot, TerminalRoots,
+    Transaction, ValidatorId, ValidatorSet, VoteCount, WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -197,6 +197,10 @@ pub struct TopologySnapshot {
     /// epoch would otherwise pin that epoch's whole committee to answer
     /// a question thirty-two bytes settle.
     seeds: SeedRing,
+    /// The epoch grid, projected from the beacon's genesis-fixed chain
+    /// config: what turns a transaction's clock into the epoch a seal
+    /// written by it records.
+    epoch_windows: EpochWindows,
     /// The packages a block governed by this window may name, projected
     /// from `BeaconState.packages`: registered and past their maturity
     /// window, plus the genesis packages the registry is seeded with. A
@@ -254,6 +258,7 @@ impl TopologySnapshot {
             params: NetworkParams::default(),
             usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
+            epoch_windows: EpochWindows::new(0),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -303,6 +308,7 @@ impl TopologySnapshot {
             params: NetworkParams::default(),
             usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
+            epoch_windows: EpochWindows::new(0),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -361,6 +367,7 @@ impl TopologySnapshot {
             params: NetworkParams::default(),
             usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
+            epoch_windows: EpochWindows::new(0),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
@@ -455,6 +462,7 @@ impl TopologySnapshot {
             params: NetworkParams::default(),
             usable_packages: BTreeSet::new(),
             seeds: SeedRing::default(),
+            epoch_windows: EpochWindows::new(0),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
@@ -482,6 +490,22 @@ impl TopologySnapshot {
         self
     }
 
+    /// Set the epoch grid — genesis-fixed, so a snapshot carries it as
+    /// a fact rather than as a governable parameter. Defaults to the
+    /// single-window grid, under which every timestamp is genesis.
+    #[must_use]
+    pub const fn with_epoch_windows(mut self, windows: EpochWindows) -> Self {
+        self.epoch_windows = windows;
+        self
+    }
+
+    /// The grid that turns a weighted timestamp into the epoch a seal
+    /// written under it records.
+    #[must_use]
+    pub const fn epoch_windows(&self) -> EpochWindows {
+        self.epoch_windows
+    }
+
     /// Set the retained seed window. Defaults empty, under which every
     /// epoch reads as not yet committed — the answer a snapshot nobody
     /// projected from a beacon state should give.
@@ -489,6 +513,13 @@ impl TopologySnapshot {
     pub fn with_seeds(mut self, seeds: SeedRing) -> Self {
         self.seeds = seeds;
         self
+    }
+
+    /// The retained seed window itself, for a consumer projecting it
+    /// into another vocabulary.
+    #[must_use]
+    pub const fn seeds(&self) -> &SeedRing {
+        &self.seeds
     }
 
     /// The seed `epoch` was rolled with, or which side of the retained

@@ -23,15 +23,15 @@ use std::sync::Arc;
 
 use hyperscale_effects_bridge::admit_package;
 use hyperscale_storage::Substates;
-use hyperscale_types::{Event, RevealChain, Transaction, WeightedTimestamp};
+use hyperscale_types::{Epoch, Event, Transaction, WeightedTimestamp};
 use hyperscale_vm_kernel::{
     Baseline, BatchTx, EnvInputs, Locality, ManifestWalk, Receipt, decode_amount, execute_batch,
 };
-use hyperscale_vm_types::{Outcome, SubstateKey};
+use hyperscale_vm_types::{Outcome, SeedWindow, SubstateKey};
 
 use crate::executor::{
     PayerFee, TargetAuthority, TickBaseline, abort_reason, charge_for, materialize_declared,
-    protocol_hash, publish_work, tx_randomness,
+    protocol_hash, publish_work,
 };
 use crate::genesis::vault_key;
 use crate::{Executor, XRD};
@@ -58,17 +58,23 @@ pub struct PreviewGrants {
 
 /// The transaction environment a preview reads, supplied by the caller
 /// because a candidate has no committing block to take it from.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PreviewInputs {
     /// The transaction clock. A committed execution reads the payer
     /// block's parent-QC weighted timestamp; while the transaction is a
     /// candidate, the caller's own tip is the nearest thing that exists.
     pub clock: WeightedTimestamp,
-    /// The randomness anchor. A committed execution draws from the payer
-    /// block's reveal chain, and which block that will be is not yet
-    /// decided — so a randomness-reading envelope previews one sample of
-    /// its draw, never a prediction of it.
-    pub randomness: RevealChain,
+    /// The epoch a seal written by this run would record, and the seeds
+    /// a matured one may be opened against.
+    ///
+    /// A preview of a settlement is a preview of a *committed* seal: the
+    /// word is already fixed by the epoch that seal named, so what runs
+    /// here is what would run on chain. A preview of a *closing* is not
+    /// — which epoch the seal ends up recording is decided by the block
+    /// that commits it.
+    pub epoch: Epoch,
+    /// The window a matured seal resolves against.
+    pub seeds: SeedWindow,
     /// What this run is granted.
     pub grants: PreviewGrants,
 }
@@ -243,7 +249,7 @@ impl Executor {
         &self,
         snapshot: &(dyn Substates + Sync),
         tx: &Transaction,
-        inputs: PreviewInputs,
+        inputs: &PreviewInputs,
     ) -> PreviewReport {
         let vm = tx.body();
         let payer = PayerFee {
@@ -300,7 +306,8 @@ impl Executor {
             prepared.declaration,
             EnvInputs {
                 clock_ms: inputs.clock.as_millis(),
-                randomness: tx_randomness(inputs.randomness, tx.hash()),
+                epoch: inputs.epoch.inner(),
+                seeds: inputs.seeds.clone(),
             },
         )
         .with_calls(prepared.calls)

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, ActionContext, CrossShardExecutionRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::{ExecutedTx, TickBatchContext, TickTxInput};
+use hyperscale_engine::{ExecutedTx, TickBatchContext, TickTxInput, draw_seeds};
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{ProvisionalTx, ShardStorage, TickOutput, fold_state_writes};
@@ -261,7 +261,6 @@ where
         Action::ExecuteTransactions {
             tick,
             tick_ts,
-            tick_reveal,
             requests,
         } => {
             let start = Stopwatch::start();
@@ -280,7 +279,11 @@ where
                 local_shard: ctx.shard,
                 shard_trie,
                 tick_ts,
-                tick_reveal,
+                // The seeds are the beacon's, so every shard resolves the
+                // same value for the same epoch and a member's own
+                // snapshot answers for all of them.
+                seeds: draw_seeds(ctx.topology_snapshot),
+                windows: ctx.topology_snapshot.epoch_windows(),
                 holds: &holds,
             };
             let inputs: Vec<TickTxInput<'_>> = requests
@@ -289,7 +292,6 @@ where
                     transaction: &r.transaction,
                     provisions: &r.provisions,
                     clock: r.clock,
-                    randomness: r.randomness,
                     abortable: r.reaches_beyond,
                 })
                 .collect();

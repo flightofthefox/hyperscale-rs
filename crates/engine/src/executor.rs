@@ -28,10 +28,11 @@ use hyperscale_effects_bridge::{
 use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
 use hyperscale_types::{
-    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, Event, EventExt,
+    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, Epoch, Event, EventExt,
     EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, PrincipalAddr,
-    ProvisionalHolds, RevealChain, Stake, StakePoolSeat, StateWrites, SubstateEntry, Transaction,
-    TxHash, Verified, compute_merkle_root, install_protocol_statics,
+    ProvisionalHolds, Stake, StakePoolSeat, StateWrites, SubstateEntry, TopologySnapshot,
+    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
+    install_protocol_statics,
 };
 use hyperscale_vm_effects::{
     ChainRecords, Declaration, NodeCall, PackageHash, PrefixShardResolver, admit_tree,
@@ -42,8 +43,8 @@ use hyperscale_vm_kernel::{
     execute_batch,
 };
 use hyperscale_vm_types::{
-    Address, CallTarget, CollectionId, EffectSet, EffectTarget, EntryKey, Outcome, SubstateKey,
-    UnmetCondition,
+    Address, CallTarget, CollectionId, EffectSet, EffectTarget, EntryKey, Outcome, SeedWindow,
+    SubstateKey, UnmetCondition,
 };
 
 use crate::backend::EngineBackend;
@@ -109,25 +110,37 @@ pub fn protocol_hash(data: &[u8]) -> [u8; 32] {
     *blake3_hash(data).as_bytes()
 }
 
-/// Domain tag for the per-transaction randomness draw.
-const DOMAIN_TX_RANDOMNESS: &[u8] = b"hyperscale/engine/tx-randomness";
-
-/// The transaction's randomness draw: the payer block's reveal chain —
-/// its proposer's VRF reveal, attested by the committee that committed
-/// the transaction — domain-separated by the transaction hash.
+/// The seeds a sealed draw may settle on, as the VM resolves them.
 ///
-/// Anchoring on the payer block is what makes the draw a property of the
-/// transaction rather than of whichever block a participant executes it
-/// in, so every participant of a cross-shard transaction derives one
-/// receipt. Mixing the hash keeps two transactions in one payer block
-/// from sharing a draw.
-pub fn tx_randomness(anchor: RevealChain, tx: TxHash) -> [u8; 32] {
-    *Hash::from_parts(&[
-        DOMAIN_TX_RANDOMNESS,
-        anchor.as_raw().as_bytes(),
-        tx.as_bytes(),
-    ])
-    .as_bytes()
+/// Only the reveal-folded epochs cross. A ceremony roll is a seed a
+/// beacon member could have withheld from, and a draw settled on one is
+/// settled on a value somebody had a lever over — so a seal maturing
+/// into such an epoch answers `Expired` and the round closes again.
+#[must_use]
+pub fn draw_seeds(snapshot: &TopologySnapshot) -> SeedWindow {
+    let ring = snapshot.seeds();
+    SeedWindow::new(
+        ring.folded()
+            .map(|(epoch, seed)| (epoch.inner(), *seed.as_bytes()))
+            .collect(),
+        ring.newest().map(Epoch::inner),
+    )
+}
+
+/// The environment a member executes under: its own clock, the epoch
+/// that clock falls in, and the seeds a seal written in that epoch can
+/// later be opened against.
+///
+/// Every input is a fact about the transaction or about the beacon, and
+/// none is a fact about the block executing it — which is what lets the
+/// shards of a cross-shard transaction derive one receipt, and what
+/// leaves nothing for an attempt to grind.
+fn env_at(ctx: &TickBatchContext<'_>, clock: WeightedTimestamp) -> EnvInputs {
+    EnvInputs {
+        clock_ms: clock.as_millis(),
+        epoch: ctx.windows.epoch_for(clock).inner(),
+        seeds: ctx.seeds.clone(),
+    }
 }
 
 /// The batch's committed baseline: the declared content pre-read from
@@ -1104,7 +1117,7 @@ impl Executor {
                 // a subset of those.
                 let env = env_by_tx
                     .get(vm_tx)
-                    .copied()
+                    .cloned()
                     .expect("every prepared transaction has an environment");
                 BatchTx::new(*vm_tx, entry.declaration.clone(), env)
                     .with_calls(entry.calls.clone())
@@ -1265,19 +1278,11 @@ impl Executor {
         snapshot: &(dyn Substates + Sync),
         transactions: &[Arc<Verified<Transaction>>],
     ) -> Vec<ExecutedTx> {
-        // Every member reads the context's own clock and randomness:
-        // one block committed them all.
+        // Every member reads the context's own clock: one block
+        // committed them all, so one epoch seals them all.
         let env_by_tx: BTreeMap<TxHash, EnvInputs> = transactions
             .iter()
-            .map(|tx| {
-                (
-                    tx.hash(),
-                    EnvInputs {
-                        clock_ms: ctx.tick_ts.as_millis(),
-                        randomness: tx_randomness(ctx.tick_reveal, tx.hash()),
-                    },
-                )
-            })
+            .map(|tx| (tx.hash(), env_at(ctx, ctx.tick_ts)))
             .collect();
         self.run_batch(
             ctx,
@@ -1312,15 +1317,7 @@ impl Executor {
             .collect();
         let env_by_tx: BTreeMap<TxHash, EnvInputs> = inputs
             .iter()
-            .map(|i| {
-                (
-                    i.transaction.hash(),
-                    EnvInputs {
-                        clock_ms: i.clock.as_millis(),
-                        randomness: tx_randomness(i.randomness, i.transaction.hash()),
-                    },
-                )
-            })
+            .map(|i| (i.transaction.hash(), env_at(ctx, i.clock)))
             .collect();
         let abortable: BTreeSet<TxHash> = inputs
             .iter()
@@ -1344,34 +1341,6 @@ mod tests {
     use hyperscale_vm_types::AbortReason;
 
     use super::*;
-
-    fn reveal(seed: &[u8]) -> RevealChain {
-        RevealChain::from_raw(Hash::from_bytes(seed))
-    }
-
-    fn tx(seed: &[u8]) -> TxHash {
-        TxHash::from(Hash::from_bytes(seed))
-    }
-
-    /// The draw is a pure function of the payer block's reveal chain and
-    /// the transaction hash: participants agreeing on the anchor derive
-    /// one draw, and two transactions under one anchor derive two.
-    #[test]
-    fn a_draw_is_fixed_by_its_anchor_and_transaction() {
-        let anchor = reveal(b"payer block");
-        assert_eq!(
-            tx_randomness(anchor, tx(b"a")),
-            tx_randomness(anchor, tx(b"a"))
-        );
-        assert_ne!(
-            tx_randomness(anchor, tx(b"a")),
-            tx_randomness(anchor, tx(b"b"))
-        );
-        assert_ne!(
-            tx_randomness(anchor, tx(b"a")),
-            tx_randomness(reveal(b"another block"), tx(b"a"))
-        );
-    }
 
     /// A declared refusal is priced as the lost race it is, not as the
     /// defect it is not.

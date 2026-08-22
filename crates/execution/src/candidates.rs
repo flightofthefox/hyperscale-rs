@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
-use hyperscale_types::{RevealChain, ShardId, Transaction, TxHash, Verified, WeightedTimestamp};
+use hyperscale_types::{ShardId, Transaction, TxHash, Verified, WeightedTimestamp};
 
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
@@ -33,9 +33,6 @@ struct Candidate {
     /// committing block's however many ticks later the member runs: the
     /// transaction was admitted against that clock.
     committed_ts: WeightedTimestamp,
-    /// The committing block's reveal chain, the randomness anchor under
-    /// the same rule.
-    committed_reveal: RevealChain,
     /// Counterpart shards whose engagement echo this shard, as the fee
     /// payer, still waits for. Empty for every other transaction.
     engagement_pending: BTreeSet<ShardId>,
@@ -104,13 +101,11 @@ impl TickCandidates {
         tx: Arc<Verified<Transaction>>,
         participating: BTreeSet<ShardId>,
         committed_ts: WeightedTimestamp,
-        committed_reveal: RevealChain,
     ) {
         self.candidates.entry(tx.hash()).or_insert(Candidate {
             tx,
             participating,
             committed_ts,
-            committed_reveal,
             engagement_pending: BTreeSet::new(),
             engagement_deadline: None,
         });
@@ -212,7 +207,6 @@ impl TickCandidates {
                         Vec::new()
                     },
                     clock: anchor.map_or(candidate.committed_ts, |a| a.clock),
-                    randomness: anchor.map_or(candidate.committed_reveal, |a| a.randomness),
                     reaches_beyond,
                 },
                 participating: candidate.participating.clone(),
@@ -287,7 +281,7 @@ mod tests {
 
     fn local_only(candidates: &mut TickCandidates, tx: Arc<Verified<Transaction>>) -> TxHash {
         let hash = tx.hash();
-        candidates.register(tx, BTreeSet::from([LOCAL]), ms(1_000), RevealChain::ZERO);
+        candidates.register(tx, BTreeSet::from([LOCAL]), ms(1_000));
         hash
     }
 
@@ -317,12 +311,7 @@ mod tests {
         let remote = ShardId::leaf(1, 1);
         let tx = tx(2);
         let hash = tx.hash();
-        candidates.register(
-            tx,
-            BTreeSet::from([LOCAL, remote]),
-            ms(1_000),
-            RevealChain::ZERO,
-        );
+        candidates.register(tx, BTreeSet::from([LOCAL, remote]), ms(1_000));
 
         let mut provisioning = ProvisioningTracker::new();
         assert!(
@@ -349,12 +338,7 @@ mod tests {
         let remote = ShardId::leaf(1, 1);
         let tx = tx(3);
         let hash = tx.hash();
-        candidates.register(
-            tx,
-            BTreeSet::from([LOCAL, remote]),
-            ms(1_000),
-            RevealChain::ZERO,
-        );
+        candidates.register(tx, BTreeSet::from([LOCAL, remote]), ms(1_000));
         candidates.record_engagement_wait(hash, BTreeSet::from([remote]), ms(60_000));
 
         let mut provisioning = ProvisioningTracker::new();
@@ -377,12 +361,7 @@ mod tests {
         let remote = ShardId::leaf(1, 1);
         let tx = tx(4);
         let hash = tx.hash();
-        candidates.register(
-            tx,
-            BTreeSet::from([LOCAL, remote]),
-            ms(1_000),
-            RevealChain::ZERO,
-        );
+        candidates.register(tx, BTreeSet::from([LOCAL, remote]), ms(1_000));
         candidates.record_engagement_wait(hash, BTreeSet::from([remote]), ms(60_000));
 
         let mut provisioning = ProvisioningTracker::new();

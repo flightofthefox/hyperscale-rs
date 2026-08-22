@@ -22,7 +22,7 @@ use hyperscale_storage::Substates;
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     BeaconWitnessEvent, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EntryKey, EnvelopeExt,
-    NetworkId, PrincipalAddr, ProvisionalHolds, RevealChain, ShardId, ShardTrie, Stake,
+    EpochWindows, NetworkId, PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, Stake,
     StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction, Verified,
     WeightedTimestamp, absorb_committed_cells,
 };
@@ -32,7 +32,7 @@ use hyperscale_vm_effects::{
 };
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, TypedError};
 use hyperscale_vm_stdlib::{account, instantiate, staking};
-use hyperscale_vm_types::{Address, CallTarget, CollectionId};
+use hyperscale_vm_types::{Address, CallTarget, CollectionId, SeedWindow};
 
 /// The identifier the beacon folds the seated pool under.
 const POOL_ID: u32 = 7;
@@ -210,7 +210,8 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        tick_reveal: RevealChain::ZERO,
+        seeds: SeedWindow::unfolded(),
+        windows: EpochWindows::new(0),
         holds: &ProvisionalHolds::new(),
     };
     tx.try_derived(executor.derivation().as_ref())
@@ -262,7 +263,8 @@ fn a_record_the_cache_answers_for_is_the_record_its_cell_holds() {
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        tick_reveal: RevealChain::ZERO,
+        seeds: SeedWindow::unfolded(),
+        windows: EpochWindows::new(0),
         holds: &ProvisionalHolds::new(),
     };
     // The second pool becomes actual the way the chain makes one actual:
@@ -336,7 +338,8 @@ fn a_member_holding_no_record_executes_the_call_alike() {
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        tick_reveal: RevealChain::ZERO,
+        seeds: SeedWindow::unfolded(),
+        windows: EpochWindows::new(0),
         holds: &ProvisionalHolds::new(),
     };
 
@@ -452,7 +455,8 @@ fn an_instantiated_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        tick_reveal: RevealChain::ZERO,
+        seeds: SeedWindow::unfolded(),
+        windows: EpochWindows::new(0),
         holds: &ProvisionalHolds::new(),
     };
     let raw = signed_instantiate(OPERATOR, &unseated);

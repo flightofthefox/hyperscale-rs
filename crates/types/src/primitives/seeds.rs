@@ -90,6 +90,16 @@ impl SeedRing {
         }
     }
 
+    /// The epochs whose seeds came from the reveal fold, which are the
+    /// ones a draw may settle on — the ceremony's are left out, since
+    /// they are seeds a beacon member could have withheld from.
+    pub fn folded(&self) -> impl Iterator<Item = (Epoch, Randomness)> + '_ {
+        self.0
+            .iter()
+            .filter(|(_, seed)| matches!(seed.source, SeedSource::Reveals))
+            .map(|(epoch, seed)| (*epoch, seed.randomness))
+    }
+
     /// The newest epoch the ring holds, if it holds any.
     #[must_use]
     pub fn newest(&self) -> Option<Epoch> {

@@ -41,10 +41,6 @@ pub struct CrossShardExecutionRequest {
     /// bundle carried, so every participant executes the transaction
     /// under one clock.
     pub clock: WeightedTimestamp,
-    /// The randomness anchor: the same payer block's reveal chain,
-    /// resolved the same way, so every participant draws the
-    /// transaction's randomness from one attested value.
-    pub randomness: RevealChain,
     /// Whether this transaction reaches beyond the executing shard.
     ///
     /// A batch is not homogeneous in this: it carries whatever the tick
@@ -1014,8 +1010,6 @@ pub enum Action {
         tick: BlockHeight,
         /// The committing block's parent-QC weighted timestamp.
         tick_ts: WeightedTimestamp,
-        /// The committing block's reveal chain.
-        tick_reveal: RevealChain,
         /// Tick-attributed members of the batch. Results fan back to each
         /// tick by `tick_id`.
         /// The members, each with its provisions and environment.

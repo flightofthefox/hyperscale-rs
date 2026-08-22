@@ -20,9 +20,8 @@ use hyperscale_storage::TickOutput;
 use hyperscale_types::{
     Address, AddressClass, CollectionId, ConsensusReceipt, DeclaredKey, DeclaredRange, Derivation,
     DerivationError, Derived, ExecutionMetadata, GlobalReceiptHash, Hash, LocalKey, Mode,
-    NetworkId, PrincipalAddr, RevealChain, Routing, SchemeId, StateWrites, SubstateKey,
-    Transaction, TransactionBody, TransactionEnvelope, TxHash, Verified, WeightedTimestamp,
-    declared_work,
+    NetworkId, PrincipalAddr, Routing, SchemeId, StateWrites, SubstateKey, Transaction,
+    TransactionBody, TransactionEnvelope, TxHash, Verified, WeightedTimestamp, declared_work,
 };
 
 /// The two amount cells every fixture transaction declares a reservation
@@ -124,7 +123,6 @@ fn request_for(tx: &Arc<Verified<Transaction>>) -> CrossShardExecutionRequest {
         transaction: Arc::clone(tx),
         provisions: Vec::new(),
         clock: WeightedTimestamp::from_millis(1_000),
-        randomness: RevealChain::ZERO,
         reaches_beyond: true,
     }
 }

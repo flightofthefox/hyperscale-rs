@@ -20,10 +20,10 @@ use hyperscale_storage::{SubstateStore, Substates, TickChain, TickOutput, Versio
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     BeaconWitnessEvent, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
-    Ed25519PrivateKey, EnvelopeExt, Hash, NetworkId, PrincipalAddr, ProvisionalHolds, RevealChain,
-    SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey,
-    TimestampRange, Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
-    absorb_committed_cells,
+    Ed25519PrivateKey, EnvelopeExt, Epoch, EpochWindows, Hash, NetworkId, PrincipalAddr,
+    ProvisionalHolds, SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites,
+    SubstateKey, TimestampRange, Transaction, TransactionBody, TransactionEnvelope, Verified,
+    WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
     AbiParam, Composed, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, PackageHash,
@@ -32,7 +32,9 @@ use hyperscale_vm_effects::{
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder};
 use hyperscale_vm_stdlib::{STAKING_COMPONENT, account, instantiate, staking};
-use hyperscale_vm_types::{Address, CollectionId, amount_cell, encode_amount};
+use hyperscale_vm_types::{
+    Address, CollectionId, SEAL_MATURITY_EPOCHS, SeedWindow, amount_cell, encode_amount,
+};
 
 /// The two accounts the transfer cases move funds between, as signing
 /// seeds rather than as literal addresses: a withdrawing node admits only
@@ -290,26 +292,15 @@ fn execute(executor: &Executor, transactions: &[Arc<Verified<Transaction>>]) -> 
     execute_on(&[(alice(), 1_000), (bob(), 50)], executor, transactions)
 }
 
-/// A signed single-node draw: the lottery settles its round on the
-/// transaction's randomness.
-///
-/// Public, so the round needs no signature of its own — what the payer
-/// signs is the fee. That is the package's point rather than a
-/// convenience: the draw is nobody's to choose, so there is nothing an
-/// operator would be trusted with.
-fn signed_draw(seed: u8) -> Transaction {
-    signed_draw_with_fee(seed, 1_000_000, ROUND)
-}
-
-fn signed_draw_with_fee(seed: u8, max_fee: u128, salt: u8) -> Transaction {
+fn signed_settle_with_fee(seed: u8, max_fee: u128, salt: u8) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let chain = client().records();
     let composed = Composed::new(&chain, &[lottery_meta(salt)], &ProtocolHasher);
     let lottery_addr = lottery_meta(salt).address(&ProtocolHasher);
     let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
     lottery::Lottery::at(lottery_addr)
-        .draw(&mut root, 64)
-        .expect("a lottery answers a draw");
+        .settle(&mut root, 64)
+        .expect("a lottery answers a settlement");
     env.seal(root)
         .expect("the root declares nothing to discharge");
     let tree = env.build().expect("the intent declares no hole");
@@ -326,7 +317,11 @@ fn with_lottery(accounts: &[(PrincipalAddr, u128)], executor: &Executor) -> MapD
     with_rounds(accounts, executor, &[ROUND])
 }
 
-/// Genesis state with one round per salt made actual.
+/// Genesis state with one round per salt made actual and closed.
+///
+/// Closed in the setup because these cases are about what a settlement
+/// costs its payer, not about when a round ends — and a settlement needs
+/// a seal to open.
 fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &[u8]) -> MapDb {
     // Paid by a signer of its own, so the ledger a caller is asserting
     // about carries nothing the setup spent.
@@ -357,27 +352,68 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
         };
         store.apply(writes);
         absorb_committed_cells([&executed[0].consensus], executor.derivation().as_ref());
+
+        let close = Transaction::new(client().sign_tree(
+            &closing_tree(*salt),
+            Vec::new(),
+            &key,
+            terms(1_000_000),
+        ));
+        let executed = execute_batch_on(
+            &store,
+            executor,
+            &[Arc::new(Verified::<Transaction>::from_persisted(close))],
+        );
+        let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
+            panic!("the close must settle: {:?}", executed[0].consensus);
+        };
+        store.apply(writes);
     }
     store
 }
 
-/// Execute `transactions` as a single-shard batch anchored on `reveal`.
-fn execute_anchored(
+/// The intent that closes the round at `salt`.
+fn closing_tree(salt: u8) -> EnvelopeTree {
+    let chain = client().records();
+    let composed = Composed::new(&chain, &[lottery_meta(salt)], &ProtocolHasher);
+    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
+    lottery::Lottery::at(lottery_meta(salt).address(&ProtocolHasher))
+        .close(&mut root)
+        .expect("a lottery answers a close");
+    env.seal(root)
+        .expect("the root declares nothing to discharge");
+    env.build().expect("the intent declares no hole")
+}
+
+/// The seeds a round sealed in this file's epoch grid opens onto. The
+/// grid folds every timestamp to genesis, so a seal records epoch zero
+/// and matures two past it.
+fn seeds(byte: u8) -> SeedWindow {
+    SeedWindow::new(
+        BTreeMap::from([(SEAL_MATURITY_EPOCHS, [byte; 32])]),
+        Some(SEAL_MATURITY_EPOCHS),
+    )
+}
+
+/// Execute `transactions` as a single-shard batch over `store`, under a
+/// seed window the caller states.
+fn execute_seeded(
     executor: &Executor,
-    reveal: RevealChain,
+    store: &MapDb,
+    seeds: SeedWindow,
     transactions: &[Arc<Verified<Transaction>>],
 ) -> Vec<ExecutedTx> {
-    let snapshot_store = with_lottery(&[(alice(), 1_000), (bob(), 50)], executor);
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        tick_reveal: reveal,
+        seeds,
+        windows: EpochWindows::new(0),
         holds: &ProvisionalHolds::new(),
     };
     derived_through(executor, transactions);
-    executor.execute_batch(&ctx, &snapshot_store, transactions)
+    executor.execute_batch(&ctx, store, transactions)
 }
 
 /// The settled round a draw wrote, if any.
@@ -390,41 +426,55 @@ fn draw_cell(executed: &ExecutedTx) -> Option<Vec<u8>> {
         .flatten()
 }
 
-/// The round settles on a draw fixed by the anchor: the same anchor
-/// gives the same 32 bytes, a different anchor gives different ones —
-/// which is what makes the payer block, and not the executing block,
-/// decide a randomness-reading guest's receipt.
+/// A round settles on what its seal fixed, and on nothing about the
+/// attempt that settles it: two transactions, two hashes, two fees —
+/// one word.
+///
+/// This is the whole property. A draw that moved between attempts is a
+/// draw a loser can try again for, and every attempt at a settlement is
+/// its own transaction.
 #[test]
-fn a_draw_settles_on_what_its_anchor_fixes() {
+fn a_round_settles_on_what_its_seal_fixed() {
     let executor = executor(ExecutionMode::Serial);
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_draw(
-        ALICE_SEED,
-    )));
-    let anchor = RevealChain::from_raw(Hash::from_bytes(b"payer block"));
+    // The round arrives closed: what varies here is which attempt
+    // settles it, never when it ended.
+    let store = with_lottery(&[(alice(), 1_000), (bob(), 50)], &executor);
 
-    let executed = execute_anchored(&executor, anchor, std::slice::from_ref(&tx));
-    let settled = draw_cell(&executed[0]).expect("the draw settled the round");
+    let settle = |fee: u128| {
+        Arc::new(Verified::<Transaction>::from_persisted(
+            signed_settle_with_fee(ALICE_SEED, fee, ROUND),
+        ))
+    };
+    let first = settle(20);
+    let second = settle(21);
+    assert_ne!(first.hash(), second.hash(), "two attempts, two hashes");
+
+    let one = execute_seeded(&executor, &store, seeds(0x5E), std::slice::from_ref(&first));
+    let settled = draw_cell(&one[0]).expect("the settlement wrote the round");
     // Nobody entered, so the round holds the draw and no winner: the
     // draw's thirty-two bytes at the width the record states, and one
     // byte saying there is no winner.
     assert_eq!(settled.len(), 33);
 
-    let again = execute_anchored(&executor, anchor, std::slice::from_ref(&tx));
+    let other = execute_seeded(
+        &executor,
+        &store,
+        seeds(0x5E),
+        std::slice::from_ref(&second),
+    );
     assert_eq!(
-        draw_cell(&again[0]),
+        draw_cell(&other[0]),
         Some(settled.clone()),
-        "one anchor, one draw"
+        "one seal, one word — whichever attempt asks"
     );
 
-    let elsewhere = execute_anchored(
-        &executor,
-        RevealChain::from_raw(Hash::from_bytes(b"another block")),
-        std::slice::from_ref(&tx),
-    );
+    // And the seed is what the seal committed to, so a chain that rolled
+    // a different one settles the round differently.
+    let elsewhere = execute_seeded(&executor, &store, seeds(0x77), std::slice::from_ref(&first));
     assert_ne!(
         draw_cell(&elsewhere[0]),
         Some(settled),
-        "a different anchor is a different draw"
+        "a different seed is a different draw"
     );
 }
 
@@ -541,7 +591,11 @@ fn execute_batch_on(
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        tick_reveal: RevealChain::ZERO,
+        // A round sealed under this grid records genesis, so the window
+        // holds the epoch such a seal matures into — every settlement
+        // here opens rather than waiting.
+        seeds: seeds(0x5E),
+        windows: EpochWindows::new(0),
         holds: &ProvisionalHolds::new(),
     };
     derived_through(executor, transactions);
@@ -850,7 +904,7 @@ fn a_call_that_never_touches_its_payers_vault_still_pays() {
     // A draw's fuel far exceeds the tiny ceiling, so the burn is
     // exactly `max_fee`.
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_draw_with_fee(ALICE_SEED, 10, ROUND),
+        signed_settle_with_fee(ALICE_SEED, 10, ROUND),
     ));
     let store = with_lottery(&[(alice(), 1_000), (bob(), 50)], &executor);
     let executed = execute_batch_on(&store, &executor, &[tx]);
@@ -931,7 +985,7 @@ fn shared_payer_burns_accumulate_across_a_batch() {
         .zip(ROUNDS)
         .map(|(fee, salt)| {
             Arc::new(Verified::<Transaction>::from_persisted(
-                signed_draw_with_fee(ALICE_SEED, fee, salt),
+                signed_settle_with_fee(ALICE_SEED, fee, salt),
             ))
         })
         .collect();
@@ -1052,7 +1106,8 @@ fn execute_on_shard(
         local_shard,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        tick_reveal: RevealChain::ZERO,
+        seeds: SeedWindow::unfolded(),
+        windows: EpochWindows::new(0),
         holds: &ProvisionalHolds::new(),
     };
     derived_through(executor, transactions);
@@ -1136,7 +1191,8 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
         local_shard: near_shard,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        tick_reveal: RevealChain::ZERO,
+        seeds: SeedWindow::unfolded(),
+        windows: EpochWindows::new(0),
         holds: &holds,
     };
     derived_through(&executor, std::slice::from_ref(&tx));
@@ -1590,9 +1646,10 @@ fn preview_on(
     executor.preview(
         &snapshot_store,
         tx,
-        PreviewInputs {
+        &PreviewInputs {
             clock: WeightedTimestamp::from_millis(1_000),
-            randomness: RevealChain::ZERO,
+            epoch: Epoch::GENESIS,
+            seeds: SeedWindow::unfolded(),
             grants,
         },
     )

@@ -16,13 +16,13 @@ use hyperscale_storage::{BoundaryStore, GenesisCommit, SubstateStore, Substates}
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
-    BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EntryKey, NetworkId, PrincipalAddr,
-    ProtocolHasher, ProvisionalHolds, ResourceAddr, RevealChain, SettledWrites, ShardId, ShardTrie,
-    StoredReceipt, TimestampRange, Transaction, Verified, WeightedTimestamp,
+    BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EntryKey, EpochWindows, NetworkId,
+    PrincipalAddr, ProtocolHasher, ProvisionalHolds, ResourceAddr, SettledWrites, ShardId,
+    ShardTrie, StoredReceipt, TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::holdings_collection;
 use hyperscale_vm_stdlib::account;
-use hyperscale_vm_types::CollectionId;
+use hyperscale_vm_types::{CollectionId, SeedWindow};
 
 /// The two signing seeds this world funds.
 const ALICE: u8 = 1;
@@ -138,7 +138,8 @@ fn run_tick(
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        tick_reveal: RevealChain::ZERO,
+        seeds: SeedWindow::unfolded(),
+        windows: EpochWindows::new(0),
         holds: &ProvisionalHolds::new(),
     };
     tx.try_derived(executor.derivation().as_ref())

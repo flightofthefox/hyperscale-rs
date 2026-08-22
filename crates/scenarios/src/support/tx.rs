@@ -1130,10 +1130,46 @@ pub fn build_instantiate_tx(
 /// If the scenario world does not answer a draw, which would be a defect
 /// in the world rather than in the draw.
 #[must_use]
+pub fn build_close_tx(
+    payer: &Ed25519PrivateKey,
+    lotteries: &[InstanceMeta],
+    validity: TimestampRange,
+) -> Transaction {
+    build_lottery_tx(payer, lotteries, validity, &|round, root| {
+        round.close(root).expect("a lottery answers a close");
+    })
+}
+
+/// A cross-shard settlement over every round named, each on its own
+/// shard.
+///
+/// # Panics
+///
+/// If the scenario world does not answer a settlement, which would be a
+/// defect in the world rather than in the settlement.
+#[must_use]
 pub fn build_draw_tx(
     payer: &Ed25519PrivateKey,
     lotteries: &[InstanceMeta],
     validity: TimestampRange,
+) -> Transaction {
+    build_lottery_tx(payer, lotteries, validity, &|round, root| {
+        round
+            .settle(root, 64)
+            .expect("a lottery answers a settlement");
+    })
+}
+
+/// One leg per round named, on whichever shard each lives.
+///
+/// # Panics
+///
+/// If the scenario world does not answer the leg.
+fn build_lottery_tx(
+    payer: &Ed25519PrivateKey,
+    lotteries: &[InstanceMeta],
+    validity: TimestampRange,
+    leg: &dyn Fn(&lottery::Lottery, &mut TypedBuilder<'_>),
 ) -> Transaction {
     let client = client();
     // The composer knows each round's record and types the calls against
@@ -1147,9 +1183,7 @@ pub fn build_draw_tx(
         .collect();
     let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
     for address in addresses {
-        lottery::Lottery::at(address)
-            .draw(&mut root, 64)
-            .expect("a lottery answers a draw");
+        leg(&lottery::Lottery::at(address), &mut root);
     }
     env.seal(root)
         .expect("the root declares nothing to discharge");

@@ -23,18 +23,20 @@ use hyperscale_types::{
     TransactionStatus, TxHash,
 };
 use hyperscale_vm_effects::{InstanceMeta, package_hash};
+use hyperscale_vm_types::SEAL_MATURITY_EPOCHS;
 
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::faultable::FaultableCluster;
+use crate::support::query::beacon_epoch;
 use crate::support::tx::{
-    OVERDRAW_AMOUNT, build_composed_tx, build_draw_tx, build_instance_instantiate_tx,
-    build_instantiate_tx, build_publish_tx, build_securify_tx, build_transfer_paid_by,
-    build_transfer_tx, build_unbound_payer_tx, cross_shard_cast, cross_shard_keys, lottery_on,
-    native_pq_cast, nullifier_race_cast, overdraw_cast, payment_request, recipient, securify_cast,
-    sender, shared_recipient_cast, storm_artifact, storm_publishers, unbound_payer_cast,
-    unbound_remote_payer_cast, validity_around,
+    OVERDRAW_AMOUNT, build_close_tx, build_composed_tx, build_draw_tx,
+    build_instance_instantiate_tx, build_instantiate_tx, build_publish_tx, build_securify_tx,
+    build_transfer_paid_by, build_transfer_tx, build_unbound_payer_tx, cross_shard_cast,
+    cross_shard_keys, lottery_on, native_pq_cast, nullifier_race_cast, overdraw_cast,
+    payment_request, recipient, securify_cast, sender, shared_recipient_cast, storm_artifact,
+    storm_publishers, unbound_payer_cast, unbound_remote_payer_cast, validity_around,
 };
-use crate::support::wait::{await_height, await_tx_terminal};
+use crate::support::wait::{await_beacon_epoch, await_height, await_tx_terminal};
 use crate::support::{Cluster, epochs};
 
 /// Per-payment amount of the contention scenarios.
@@ -777,15 +779,14 @@ fn recorded_bytes<C: Cluster>(c: &C, shard: ShardId) -> Option<u64> {
         .and_then(|state| state.boundaries.get(&shard).map(|b| b.substate_bytes))
 }
 
-/// A randomness-reading transaction derives one draw on both shards.
+/// A settlement of two sealed rounds derives one receipt on both shards.
 ///
-/// Two lottery instances, one per shard, settle their rounds in the same
-/// transaction, so the two recorded draws agree exactly when the two
-/// committees executed under one value. The draw is anchored on the
-/// payer block — the block that committed the transaction on the payer's
-/// shard, whose reveal chain rides the engagement bundle — so agreement
-/// holds by construction rather than by the two shards happening to
-/// commit in step. Each result is an exclusive write, so this is also the
+/// Two lottery instances, one per shard, close and then settle in the
+/// same transaction. The draws are the beacon's seed mixed with each
+/// round's own cell, so the two shards agree by construction rather than
+/// by committing in step — and a shard that disagreed would derive a
+/// different receipt, which is what the single terminal verdict below
+/// rules out. Each result is an exclusive write, so this is also the
 /// read-set-provisioned shape in both directions: each shard executes on
 /// the other's shipped prior.
 ///
@@ -841,6 +842,36 @@ pub fn randomness_draw_agrees_across_shards<C: Cluster>(c: &mut C) {
         "neither shard may hold the other's seal, or the draw derives with no fetch"
     );
 
+    // Both rounds close first, on their own shards, so each carries a
+    // seal the settlement below opens. A round nobody closed has no
+    // draw to agree about.
+    let close = build_close_tx(
+        &payer,
+        &[left.clone(), right.clone()],
+        validity_around(c.now()),
+    );
+    let closed = close.hash();
+    c.submit(Arc::new(close));
+    let status = await_tx_terminal(c, closed, epochs(16));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the rounds were never closed; status = {status:?}"
+    );
+
+    // A seal opens onto a seed rolled after it was written, so the
+    // settlement waits for the epoch it named to mature. That wait is
+    // the property, not an inconvenience: a draw readable in the
+    // transaction that closed the round would be a draw its sender could
+    // have seen before committing to it.
+    let sealed_at = beacon_epoch(c).expect("a committed beacon epoch").inner();
+    assert!(
+        await_beacon_epoch(c, sealed_at + SEAL_MATURITY_EPOCHS + 1, epochs(24)),
+        "the seed the rounds sealed against never rolled"
+    );
+
     let tx = build_draw_tx(
         &payer,
         &[left.clone(), right.clone()],
@@ -881,14 +912,20 @@ pub fn randomness_draw_agrees_across_shards<C: Cluster>(c: &mut C) {
     // Nobody entered either round, so each cell holds the draw and no
     // winner: thirty-two bytes at the width the record states, and one
     // byte saying there is no winner.
-    assert_eq!(
-        left.len(),
-        33,
-        "an unentered round is the draw and no winner"
-    );
-    assert_eq!(
+    for settled in [&left, &right] {
+        assert_eq!(
+            settled.len(),
+            33,
+            "an unentered round is the draw and no winner"
+        );
+    }
+    // Two rounds, one seed, two words: the cell each seal sits in is
+    // what separates them. A package holding two rounds therefore gets
+    // two draws rather than one repeated, and neither round's outcome
+    // says anything about the other's.
+    assert_ne!(
         left, right,
-        "the two shards executed the transaction under different draws"
+        "two rounds under one seed must not settle alike"
     );
 }
 

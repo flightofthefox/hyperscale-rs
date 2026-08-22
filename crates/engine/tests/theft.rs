@@ -19,11 +19,11 @@ use hyperscale_engine::{
 use hyperscale_storage::Substates;
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
-    ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, NetworkId, PrincipalAddr, ProvisionalHolds,
-    RevealChain, SettledWrites, ShardId, ShardTrie, Stake, StateWrites, SubstateKey,
+    ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, EpochWindows, NetworkId, PrincipalAddr,
+    ProvisionalHolds, SettledWrites, ShardId, ShardTrie, Stake, StateWrites, SubstateKey,
     TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
-use hyperscale_vm_types::{Address, CollectionId, amount_cell, encode_amount};
+use hyperscale_vm_types::{Address, CollectionId, SeedWindow, amount_cell, encode_amount};
 
 /// A funded account whose key nothing in this binary holds — the address
 /// is all an attacker has, and the address is public.
@@ -112,7 +112,8 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        tick_reveal: RevealChain::ZERO,
+        seeds: SeedWindow::unfolded(),
+        windows: EpochWindows::new(0),
         holds: &ProvisionalHolds::new(),
     };
     tx.try_derived(executor.derivation().as_ref())
