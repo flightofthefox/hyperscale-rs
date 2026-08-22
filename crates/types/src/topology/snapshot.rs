@@ -12,9 +12,9 @@ use hyperscale_hbor::Hbor;
 
 use crate::{
     Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, ConsensusPublicKey,
-    DeclaredKey, Epoch, Hash, NetworkDefinition, NetworkParams, ReshapeThresholds, Round, ShardId,
-    ShardRecovery, ShardTrie, StateRoot, TerminalRoots, Transaction, ValidatorId, ValidatorSet,
-    VoteCount, WeightedTimestamp,
+    DeclaredKey, Epoch, Hash, NetworkDefinition, NetworkParams, ReshapeThresholds, Round,
+    SeedLookup, SeedRing, ShardId, ShardRecovery, ShardTrie, StateRoot, TerminalRoots, Transaction,
+    ValidatorId, ValidatorSet, VoteCount, WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -188,6 +188,15 @@ pub struct TopologySnapshot {
     /// the same `reshape_thresholds` for a block off its weighted-time-bound
     /// snapshot rather than a live head value that skews across folds.
     params: NetworkParams,
+    /// The seeds of the epochs still inside the retained window, each
+    /// beside the roll that produced it — projected from `BeaconState`,
+    /// which is where they are folded.
+    ///
+    /// Carried on the snapshot rather than reached for through a
+    /// retained one, because a consumer that resolves against a past
+    /// epoch would otherwise pin that epoch's whole committee to answer
+    /// a question thirty-two bytes settle.
+    seeds: SeedRing,
     /// The packages a block governed by this window may name, projected
     /// from `BeaconState.packages`: registered and past their maturity
     /// window, plus the genesis packages the registry is seeded with. A
@@ -244,6 +253,7 @@ impl TopologySnapshot {
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             usable_packages: BTreeSet::new(),
+            seeds: SeedRing::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -292,6 +302,7 @@ impl TopologySnapshot {
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             usable_packages: BTreeSet::new(),
+            seeds: SeedRing::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -349,6 +360,7 @@ impl TopologySnapshot {
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             usable_packages: BTreeSet::new(),
+            seeds: SeedRing::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
@@ -442,6 +454,7 @@ impl TopologySnapshot {
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
             usable_packages: BTreeSet::new(),
+            seeds: SeedRing::default(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
@@ -467,6 +480,22 @@ impl TopologySnapshot {
     pub fn with_usable_packages(mut self, packages: BTreeSet<Hash>) -> Self {
         self.usable_packages = packages;
         self
+    }
+
+    /// Set the retained seed window. Defaults empty, under which every
+    /// epoch reads as not yet committed — the answer a snapshot nobody
+    /// projected from a beacon state should give.
+    #[must_use]
+    pub fn with_seeds(mut self, seeds: SeedRing) -> Self {
+        self.seeds = seeds;
+        self
+    }
+
+    /// The seed `epoch` was rolled with, or which side of the retained
+    /// window it fell outside.
+    #[must_use]
+    pub fn seed(&self, epoch: Epoch) -> SeedLookup {
+        self.seeds.at(epoch)
     }
 
     /// Set the live produced-past-genesis set (see [`Self::successors_live`]).

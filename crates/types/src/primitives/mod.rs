@@ -7,6 +7,7 @@
 //! - [`signer_bitfield`]: compact bitfield for tracking validator signatures.
 //! - [`positional_bundle`]: signer bitfield paired with per-signer payload, in set-bit order.
 //! - [`bloom`]: typed [`BloomFilter`] used for sync inventory negotiation.
+//! - [`seeds`]: the retained window of past epoch seeds.
 
 pub mod bloom;
 pub mod hash;
@@ -15,4 +16,5 @@ pub mod identifiers;
 pub mod merkle;
 pub mod positional_bundle;
 pub mod randomness;
+pub mod seeds;
 pub mod signer_bitfield;

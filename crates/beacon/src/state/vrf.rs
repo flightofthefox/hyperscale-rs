@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use hyperscale_types::{
-    BeaconProposal, BeaconState, Epoch, HALT_THRESHOLD_EPOCHS, JailReason, NetworkDefinition,
-    Randomness, RevealChain, ShardId, ValidatorId, ValidatorStatus, Verifier, VrfOutput,
-    beacon_reveal_verify, byzantine_threshold,
+    BeaconProposal, BeaconState, Epoch, EpochSeed, HALT_THRESHOLD_EPOCHS, JailReason,
+    NetworkDefinition, Randomness, RevealChain, SeedSource, ShardId, ValidatorId, ValidatorStatus,
+    Verifier, VrfOutput, beacon_reveal_verify, byzantine_threshold,
 };
 
 use crate::state::pool::exit_placement;
@@ -121,20 +121,33 @@ pub(super) fn filter_and_roll_randomness<'a>(
     // domain ‖ prior randomness ‖ each 32-byte value — differing only in
     // the domain tag and the source, so the fold lives in one place.
     let mut h = Hasher::new();
-    if reveals.is_empty() {
+    let source = if reveals.is_empty() {
         h.update(DOMAIN_BEACON_RANDOMNESS);
         h.update(state.randomness.as_bytes());
         for o in &accepted_outputs {
             h.update(o.as_bytes());
         }
+        SeedSource::Ceremony
     } else {
         h.update(DOMAIN_BEACON_RANDOMNESS_REVEALS);
         h.update(state.randomness.as_bytes());
         for chain in reveals.values() {
             h.update(chain.as_raw().as_bytes());
         }
-    }
+        SeedSource::Reveals
+    };
     state.randomness = Randomness::new(*h.finalize().as_bytes());
+    // The value keyed by the epoch it was rolled for, so a consumer
+    // resolving against a past epoch reads what stood then. Which roll
+    // produced it travels with it: the two are not interchangeable to
+    // anything that draws on one.
+    state.seeds.record(
+        epoch,
+        EpochSeed {
+            randomness: state.randomness,
+            source,
+        },
+    );
 
     // Cascade jail for rejected proposers currently `OnShard`.
     let mut jailed = Vec::new();
@@ -286,8 +299,9 @@ mod tests {
     use blake3::Hasher;
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::{
-        BeaconProposal, BeaconState, Epoch, Hash, JailReason, MIN_STAKE_FLOOR, Randomness,
-        RevealChain, ShardId, Stake, StakePoolId, ValidatorId, ValidatorStatus,
+        BeaconProposal, BeaconState, Epoch, EpochSeed, Hash, JailReason, MIN_STAKE_FLOOR,
+        Randomness, RevealChain, SeedLookup, SeedSource, ShardId, Stake, StakePoolId, ValidatorId,
+        ValidatorStatus,
     };
 
     use super::{DOMAIN_BEACON_RANDOMNESS, DOMAIN_BEACON_RANDOMNESS_REVEALS};
@@ -770,6 +784,47 @@ mod tests {
             h.update(reveal_chain(seed).as_raw().as_bytes());
         }
         assert_eq!(state.randomness, Randomness::new(*h.finalize().as_bytes()));
+    }
+
+    /// The roll files its value under the epoch it rolled for, so a
+    /// consumer resolving against a past epoch reads what stood then
+    /// rather than the head — which is the whole difference between a
+    /// value fixed by a commitment and a value fixed by when it is read.
+    #[test]
+    fn the_roll_files_its_epochs_seed() {
+        let mut state = single_pool_state(4);
+        let target = state.current_epoch.next();
+        let mut reveals = BTreeMap::new();
+        reveals.insert(ShardId::leaf(1, 0), reveal_chain(1));
+        roll(&mut state, &reveals);
+
+        assert_eq!(
+            state.seeds.at(target),
+            SeedLookup::Seed(EpochSeed {
+                randomness: state.randomness,
+                source: SeedSource::Reveals,
+            }),
+        );
+        assert_eq!(state.seeds.at(target.next()), SeedLookup::NotYetCommitted);
+    }
+
+    /// An epoch with no crossing falls back to the ceremony, and the
+    /// entry says so. A draw settled on one is settled on the path a
+    /// beacon member can withhold from, so the two must be tellable
+    /// apart by whoever reads the seed rather than by whoever wrote it.
+    #[test]
+    fn a_ceremony_roll_files_itself_as_one() {
+        let mut state = single_pool_state(4);
+        let target = state.current_epoch.next();
+        roll(&mut state, &BTreeMap::new());
+
+        assert_eq!(
+            state.seeds.at(target),
+            SeedLookup::Seed(EpochSeed {
+                randomness: state.randomness,
+                source: SeedSource::Ceremony,
+            }),
+        );
     }
 
     /// With reveals folding, the accepted ceremony outputs stay out of

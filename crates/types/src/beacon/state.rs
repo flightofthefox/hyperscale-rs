@@ -38,8 +38,8 @@ use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
     Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, Hash,
-    NetworkDefinition, RETENTION_HORIZON, Randomness, ShardId, Stake, StakePoolId, StateRoot,
-    TerminalRoots, ValidatorId, WeightedTimestamp,
+    NetworkDefinition, RETENTION_HORIZON, Randomness, SeedRing, ShardId, Stake, StakePoolId,
+    StateRoot, TerminalRoots, ValidatorId, WeightedTimestamp,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -732,6 +732,13 @@ pub struct BeaconState {
     /// the shard reveal chains folded this epoch; an epoch where no
     /// reveal folds mixes the accepted ceremony VRF outputs instead.
     pub randomness: Randomness,
+    /// The seeds of the epochs still inside [`SEED_WINDOW_EPOCHS`], each
+    /// beside the roll that produced it.
+    ///
+    /// `randomness` is the head of this: what a draw resolving against a
+    /// past epoch needs is the value as it stood then, and reading the
+    /// head instead would make the answer depend on when it was asked.
+    pub seeds: SeedRing,
     /// Beacon committee for the current epoch — the validators running
     /// the SPC instance producing this epoch's block.
     pub committee: Vec<ValidatorId>,
@@ -1136,6 +1143,10 @@ struct WindowProjection {
     params: NetworkParams,
     /// The packages a block governed by this window may name.
     usable_packages: BTreeSet<Hash>,
+    /// The retained seed window. Not frozen a window ahead like the
+    /// committee: a seed is a fact about an epoch that has already
+    /// closed, so the head and lookahead projections carry the same ring.
+    seeds: SeedRing,
 }
 
 impl BeaconState {
@@ -1157,6 +1168,7 @@ impl BeaconState {
             validators: BTreeMap::new(),
             pools: BTreeMap::new(),
             randomness: Randomness::ZERO,
+            seeds: SeedRing::default(),
             committee: Vec::new(),
             shard_committees: BTreeMap::new(),
             next_shard_committees: BTreeMap::new(),
@@ -1447,6 +1459,7 @@ impl BeaconState {
                 settled_window_floors: self.window.settled_window_floors.clone(),
                 params: self.params,
                 usable_packages: self.usable_packages(self.current_epoch),
+                seeds: self.seeds.clone(),
             },
             network,
         )
@@ -1475,6 +1488,7 @@ impl BeaconState {
                 settled_window_floors: live.settled_window_floors,
                 params: self.next_params,
                 usable_packages: self.usable_packages(self.current_epoch.next()),
+                seeds: self.seeds.clone(),
             },
             network,
         )
@@ -1722,6 +1736,7 @@ impl BeaconState {
             settled_window_floors,
             params,
             usable_packages,
+            seeds,
         } = projection;
         let validators: Vec<ValidatorInfo> = self
             .validators
@@ -1792,6 +1807,7 @@ impl BeaconState {
         .with_pending_recoveries(self.pending_recoveries.clone())
         .with_completed_recoveries(self.completed_recoveries.clone())
         .with_usable_packages(usable_packages)
+        .with_seeds(seeds)
     }
 
     /// The packages a block governed by `epoch` may name: registered and
@@ -1959,7 +1975,9 @@ mod tests {
     use hyperscale_crypto_bls::public_key_from_u64_seed;
 
     use super::*;
-    use crate::{Hash, JailReason, PrincipalAddr};
+    use crate::{
+        EpochSeed, Hash, JailReason, PrincipalAddr, SeedLookup, SeedSource, TopologySnapshot,
+    };
 
     fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> ValidatorRecord {
         ValidatorRecord {
@@ -1973,6 +1991,47 @@ mod tests {
 
     fn empty_state() -> BeaconState {
         BeaconState::empty(BeaconChainConfig::default())
+    }
+
+    /// Both projections carry the ring the fold built, so a consumer
+    /// resolving a past epoch reads it off whichever snapshot governs
+    /// the block it is in. A seed is a fact about an epoch that already
+    /// closed, so unlike the committee there is nothing to freeze a
+    /// window ahead — the head and the lookahead answer alike.
+    #[test]
+    fn both_projections_carry_the_seed_window() {
+        let mut state = empty_state();
+        let seed = EpochSeed {
+            randomness: Randomness::new([0x5A; 32]),
+            source: SeedSource::Reveals,
+        };
+        state.seeds.record(Epoch::new(4), seed);
+        state.current_epoch = Epoch::new(4);
+
+        for snapshot in [
+            state.derive_topology_snapshot(NetworkDefinition::simulator()),
+            state.derive_next_topology_snapshot(NetworkDefinition::simulator()),
+        ] {
+            assert_eq!(snapshot.seed(Epoch::new(4)), SeedLookup::Seed(seed));
+            assert_eq!(snapshot.seed(Epoch::new(5)), SeedLookup::NotYetCommitted);
+        }
+    }
+
+    /// A snapshot nobody projected from a beacon state answers nothing,
+    /// rather than answering zero: a caller that took a default seed for
+    /// a real one would be drawing on a value no fold produced.
+    #[test]
+    fn an_unprojected_snapshot_holds_no_seed() {
+        let snapshot = TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            ValidatorSet::new(Vec::new()),
+        );
+        assert_eq!(
+            snapshot.seed(Epoch::GENESIS),
+            SeedLookup::NotYetCommitted,
+            "an empty ring is ahead of every epoch"
+        );
     }
 
     /// Build a state with one shard, one pool, and `n_active` validators
