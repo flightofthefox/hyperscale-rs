@@ -13,16 +13,19 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_effects_bridge::ProtocolHasher;
-use hyperscale_effects_bridge::vm_statics::{config_key, package_key};
+use hyperscale_effects_bridge::vm_statics::{config_key, package_key, round_key};
 use hyperscale_engine::genesis::{draw_key, vault_key};
 use hyperscale_engine::{
-    PreviewGrants, PreviewOutcome, PreviewReport, ResourceChange, XRD, account_address,
+    DOMAIN_SEALED_DRAW, PreviewGrants, PreviewOutcome, PreviewReport, ResourceChange, XRD,
+    account_address, protocol_hash,
 };
+use hyperscale_hbor::from_slice;
 use hyperscale_types::{
-    AccountSigner, Address, BlockHeight, Hash, SchemeId, ShardId, TransactionDecision,
-    TransactionStatus, TxHash,
+    AccountSigner, Address, BlockHeight, Epoch, Hash, SchemeId, SeedLookup, ShardId,
+    TransactionDecision, TransactionStatus, TxHash,
 };
 use hyperscale_vm_effects::{InstanceMeta, package_hash};
+use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_types::SEAL_MATURITY_EPOCHS;
 
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
@@ -779,14 +782,76 @@ fn recorded_bytes<C: Cluster>(c: &C, shard: ShardId) -> Option<u64> {
         .and_then(|state| state.boundaries.get(&shard).map(|b| b.substate_bytes))
 }
 
+/// The word `shard`'s copy of `lottery` settled on, checked against the
+/// seed the round's own seal commits to.
+///
+/// The expected word is built from the beacon's state and the kernel's
+/// stated preimage rather than read back from what the guest wrote, so a
+/// host feeding the wrong epoch's seed fails here rather than agreeing
+/// with itself.
+///
+/// # Panics
+///
+/// Panics if the round is unsettled, holds no seal, matured into an
+/// epoch the beacon no longer retains, or settled on any other word.
+fn settled_on_its_seal<C: Cluster>(c: &C, shard: ShardId, lottery: &InstanceMeta) -> [u8; 32] {
+    let address = lottery.address(&ProtocolHasher);
+    let outcome = draw_key(address);
+    let settled: lottery::Outcome = from_slice(
+        &c.substate(shard, outcome.owner, outcome.local.0)
+            .expect("the round settled"),
+    )
+    .expect("the round's own type");
+
+    // The epoch the kernel stamped, read off the seal cell itself: eight
+    // bytes, little endian, and nothing a body chose.
+    let key = round_key(address);
+    let sealed = c
+        .substate(shard, key.owner, key.local.0)
+        .expect("the round holds its seal");
+    let sealed_in = u64::from_le_bytes(sealed.try_into().expect("a seal is eight bytes"));
+
+    let SeedLookup::Seed(seed) = c
+        .beacon_state()
+        .expect("a folded beacon")
+        .seeds
+        .at(Epoch::new(sealed_in + SEAL_MATURITY_EPOCHS))
+    else {
+        panic!("the seed the round matured into is not retained");
+    };
+    // The seal's own cell is what the kernel mixes: the handle names it,
+    // so nothing about the round's other leaves reaches the word.
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(DOMAIN_SEALED_DRAW);
+    preimage.extend_from_slice(seed.randomness.as_bytes());
+    preimage.extend_from_slice(&key.to_bytes());
+
+    assert_eq!(
+        settled.draw.as_bytes(),
+        &protocol_hash(&preimage),
+        "the round settled on a word its seal does not commit to"
+    );
+    assert_eq!(
+        settled.winner, None,
+        "nobody entered, so the round drew and named no winner"
+    );
+    *settled.draw.as_bytes()
+}
+
 /// A settlement of two sealed rounds derives one receipt on both shards.
 ///
 /// Two lottery instances, one per shard, close and then settle in the
-/// same transaction. The draws are the beacon's seed mixed with each
-/// round's own cell, so the two shards agree by construction rather than
-/// by committing in step — and a shard that disagreed would derive a
-/// different receipt, which is what the single terminal verdict below
-/// rules out. Each result is an exclusive write, so this is also the
+/// same transaction. Each round's word is asserted against the beacon's
+/// own seed for the epoch that round's seal records, mixed with the
+/// round's cell key and re-hashed here — so this pins the whole seam
+/// between the two repos: that the host hands the kernel the seed the
+/// beacon rolled, for the epoch the kernel stamped, and that both
+/// shards resolve it alike. A shard reading a different window would
+/// derive a different receipt, which is what the single terminal
+/// verdict rules out; a host feeding the wrong seed would agree with
+/// itself, which is what the recomputation rules out.
+///
+/// Each result is an exclusive write, so this is also the
 /// read-set-provisioned shape in both directions: each shard executes on
 /// the other's shipped prior.
 ///
@@ -799,10 +864,10 @@ fn recorded_bytes<C: Cluster>(c: &C, shard: ShardId) -> Option<u64> {
 ///
 /// # Panics
 ///
-/// Panics if the draw misses its budget, does not accept, either shard's
-/// chain never commits it, either round is unsettled, or the two rounds
-/// settled on different draws.
-pub fn randomness_draw_agrees_across_shards<C: Cluster>(c: &mut C) {
+/// Panics if the settlement misses its budget, does not accept, either
+/// shard's chain never commits it, either round is unsettled, or either
+/// round settled on a word that is not the one its seal commits to.
+pub fn sealed_rounds_settle_on_the_seed_they_committed_to<C: Cluster>(c: &mut C) {
     let (payer, ..) = cross_shard_keys();
     let left = lottery_on(ShardId::leaf(1, 0));
     let right = lottery_on(ShardId::leaf(1, 1));
@@ -907,24 +972,17 @@ pub fn randomness_draw_agrees_across_shards<C: Cluster>(c: &mut C) {
             && read(c, ShardId::leaf(1, 1), &right).is_some()),
         "both rounds must have settled"
     );
-    let left = read(c, ShardId::leaf(1, 0), &left).expect("settled");
-    let right = read(c, ShardId::leaf(1, 1), &right).expect("settled");
-    // Nobody entered either round, so each cell holds the draw and no
-    // winner: thirty-two bytes at the width the record states, and one
-    // byte saying there is no winner.
-    for settled in [&left, &right] {
-        assert_eq!(
-            settled.len(),
-            33,
-            "an unentered round is the draw and no winner"
-        );
-    }
+    let words = [
+        settled_on_its_seal(c, ShardId::leaf(1, 0), &left),
+        settled_on_its_seal(c, ShardId::leaf(1, 1), &right),
+    ];
+
     // Two rounds, one seed, two words: the cell each seal sits in is
     // what separates them. A package holding two rounds therefore gets
     // two draws rather than one repeated, and neither round's outcome
     // says anything about the other's.
     assert_ne!(
-        left, right,
+        words[0], words[1],
         "two rounds under one seed must not settle alike"
     );
 }

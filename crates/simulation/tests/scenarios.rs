@@ -45,9 +45,10 @@ use hyperscale_scenarios::{
     nullifier_race_admits_exactly_one, participant_count_sweep, partition_halts_and_heals,
     partition_heals_at_exact_quorum, pool_capacity_caps_registrations,
     pool_transfer_moves_operatorship, preview_reports_resource_changes,
-    randomness_draw_agrees_across_shards, re_registration_of_a_live_validator_is_a_no_op,
-    reads_the_committed_baseline, register_validator_pools_a_node,
-    register_without_capacity_is_rejected, registered_validator_activates_onto_a_shard,
+    re_registration_of_a_live_validator_is_a_no_op, reads_the_committed_baseline,
+    register_validator_pools_a_node, register_without_capacity_is_rejected,
+    registered_validator_activates_onto_a_shard,
+    sealed_rounds_settle_on_the_seed_they_committed_to,
     securify_retires_the_key_at_the_payer_shard, single_transfer,
     split_boundary_admits_an_uncommitted_precut_tx,
     split_boundary_hands_back_what_it_never_included, split_boundary_refuses_a_replay,
@@ -305,7 +306,7 @@ fn attested_load_reaches_the_beacon_sim() {
 }
 
 #[test]
-fn randomness_draw_agrees_across_shards_sim() {
+fn sealed_rounds_settle_on_the_seed_they_committed_to_sim() {
     // The one scenario that calls a fixture package, so the one network
     // born running it.
     let mut cluster = SimCluster::with_grown_packages(
@@ -314,7 +315,7 @@ fn randomness_draw_agrees_across_shards_sim() {
         &cross_shard_genesis_accounts(),
         GenesisPackages::with_fixtures(),
     );
-    randomness_draw_agrees_across_shards(&mut cluster);
+    sealed_rounds_settle_on_the_seed_they_committed_to(&mut cluster);
 }
 
 #[test]

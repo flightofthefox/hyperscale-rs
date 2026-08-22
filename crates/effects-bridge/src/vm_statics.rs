@@ -89,6 +89,13 @@ pub fn draw_key(lottery: impl Into<Address>) -> SubstateKey {
     child_key(&ProtocolHasher, lottery, lottery::OUTCOME, &[])
 }
 
+/// The lottery's round cell: the seal a close writes and a settlement
+/// opens. Eight bytes, the epoch the kernel stamped, little-endian.
+#[must_use]
+pub fn round_key(lottery: impl Into<Address>) -> SubstateKey {
+    child_key(&ProtocolHasher, lottery, lottery::ROUND, &[])
+}
+
 /// An instance's configuration leaf: the seal its instantiation writes.
 ///
 /// Holds the whole creation-fixed record, and its presence is what makes

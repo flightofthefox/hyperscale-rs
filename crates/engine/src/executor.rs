@@ -105,6 +105,7 @@ pub fn artifact_package(artifact: &[u8]) -> Hash {
 
 /// The protocol crypto hash behind the kernel's hashing host function
 /// and fresh-ID derivation.
+#[must_use]
 pub fn protocol_hash(data: &[u8]) -> [u8; 32] {
     *blake3_hash(data).as_bytes()
 }

@@ -35,10 +35,10 @@ pub use execution::{
     cross_shard_credit_survives_a_later_local_credit, cross_shard_transfer, deploy_storm_rides_out,
     events_land_on_their_emitters_home_shard, failure_charges_its_payer, hot_recipient,
     insolvent_payer_engages_nothing, nullifier_race_admits_exactly_one,
-    preview_reports_resource_changes, randomness_draw_agrees_across_shards,
-    reads_the_committed_baseline, securify_retires_the_key_at_the_payer_shard, single_transfer,
-    unbound_payer_engages_nothing, unbound_remote_payer_engages_nothing,
-    withdrawals_compose_over_one_vault, zipf_payments,
+    preview_reports_resource_changes, reads_the_committed_baseline,
+    sealed_rounds_settle_on_the_seed_they_committed_to,
+    securify_retires_the_key_at_the_payer_shard, single_transfer, unbound_payer_engages_nothing,
+    unbound_remote_payer_engages_nothing, withdrawals_compose_over_one_vault, zipf_payments,
 };
 pub use faults::{
     beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,

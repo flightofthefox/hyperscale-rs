@@ -37,12 +37,12 @@ pub mod genesis;
 pub mod sharding;
 
 pub use batch::{SeedWindow, TickBatchContext, TickEnvironment, TickTxInput};
-pub use executor::{Executor, artifact_package, instance_of_record};
+pub use executor::{Executor, artifact_package, instance_of_record, protocol_hash};
 pub use genesis::{
     GenesisConfig, World, XRD, genesis_package_facts, genesis_world, genesis_writes,
 };
 pub use hyperscale_effects_bridge::{LocalCells, account_address};
-pub use hyperscale_vm_kernel::ExecutionMode;
+pub use hyperscale_vm_kernel::{DOMAIN_SEALED_DRAW, ExecutionMode};
 pub use output::ExecutedTx;
 pub use preview::{PreviewGrants, PreviewInputs, PreviewOutcome, PreviewReport, ResourceChange};
 pub use receipt::{CachedOutput, project_to_shard};

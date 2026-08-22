@@ -2487,6 +2487,7 @@ dependencies = [
  "hyperscale-crypto-bls",
  "hyperscale-effects-bridge",
  "hyperscale-engine",
+ "hyperscale-hbor",
  "hyperscale-mempool",
  "hyperscale-storage",
  "hyperscale-transactions",
