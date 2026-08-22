@@ -17,8 +17,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::{ShardStorage, SubstateStore, SubstateView, VersionedStore};
 use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
-    BlockHeight, Provisions, ProvisionsContext, ProvisionsSenderMessage, RevealChain, ShardId,
-    Stopwatch, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, signed_bytes,
+    BlockHeight, Provisions, ProvisionsContext, ProvisionsSenderMessage, ShardId, Stopwatch,
+    ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, signed_bytes,
 };
 use tracing::warn;
 
@@ -40,7 +40,6 @@ pub fn fetch_and_broadcast_provision<S, H>(
     source_shard: ShardId,
     block_height: BlockHeight,
     source_block_ts: WeightedTimestamp,
-    source_block_reveal: RevealChain,
     requests: &[ProvisionsRequest],
     shard_recipients: &HashMap<ShardId, Vec<ValidatorId>, H>,
 ) -> Vec<ProvisionBatch>
@@ -59,7 +58,6 @@ where
             *target_shard,
             block_height,
             source_block_ts,
-            source_block_reveal,
             requests,
         ) else {
             continue;
@@ -120,7 +118,6 @@ where
             source_shard,
             block_height,
             source_block_ts,
-            source_block_reveal,
             shard_recipients,
         } => {
             let view = ctx.pending_chain.view_at(block_hash, block_height);
@@ -129,7 +126,6 @@ where
                 source_shard,
                 block_height,
                 source_block_ts,
-                source_block_reveal,
                 &requests,
                 &shard_recipients,
             );

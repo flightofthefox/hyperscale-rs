@@ -19,12 +19,12 @@ use hyperscale_types::{
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, Finalization,
     GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel, MerkleInclusionProof, PcQc2,
     PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp, ProtocolHasher, ProvisionEntry,
-    ProvisionHash, Provisions, QuorumCertificate, Randomness, RatifyCert, RatifyRound, RevealChain,
-    Round, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload,
-    SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt,
-    SubstateKey, SubstateLeaf, TerminalVerdict, TickHalf, TickId, Transaction, TransactionDecision,
-    TxHash, TxOutcome, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    WitnessSources, WorkInFlight, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
+    ProvisionHash, Provisions, QuorumCertificate, Randomness, RatifyCert, RatifyRound, Round,
+    SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield,
+    SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt, SubstateKey,
+    SubstateLeaf, TerminalVerdict, TickHalf, TickId, Transaction, TransactionDecision, TxHash,
+    TxOutcome, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    WorkInFlight, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
 };
 
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
@@ -1114,7 +1114,6 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
         ShardId::ROOT,
         BlockHeight::new(1),
         WeightedTimestamp::ZERO,
-        RevealChain::ZERO,
         MerkleInclusionProof::dummy(),
         vec![ProvisionEntry::new(tx_hash, vec![])],
     );

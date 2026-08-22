@@ -14,8 +14,8 @@ use thiserror::Error;
 use crate::state_key::jmt_value_hash;
 use crate::{
     BlockHeight, CertifiedBlockHeader, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof,
-    ProvisionEntry, ProvisionHash, RETENTION_HORIZON, RevealChain, ShardId, SubstateEntry, TxHash,
-    Verified, Verify, WeightedTimestamp,
+    ProvisionEntry, ProvisionHash, RETENTION_HORIZON, ShardId, SubstateEntry, TxHash, Verified,
+    Verify, WeightedTimestamp,
 };
 
 /// All provisions from a single source block, scoped to a single target shard.
@@ -44,13 +44,6 @@ pub struct Provisions {
     /// source block committed, available to receivers that no longer
     /// hold the header itself.
     source_block_ts: WeightedTimestamp,
-    /// The source block's reveal chain — its proposer's VRF reveal folded
-    /// into the epoch's running chain. Verification checks it against the
-    /// commit-proven source header for the same reason the timestamp is
-    /// checked: receivers draw the transaction randomness from it, so it
-    /// must be the value the source committee attested rather than one
-    /// the sender chose.
-    source_block_reveal: RevealChain,
     proof: MerkleInclusionProof,
     #[hbor(max = MAX_TXS_PER_BLOCK)]
     transactions: Vec<ProvisionEntry>,
@@ -84,7 +77,6 @@ impl Clone for Provisions {
             target_shard: self.target_shard,
             block_height: self.block_height,
             source_block_ts: self.source_block_ts,
-            source_block_reveal: self.source_block_reveal,
             proof: self.proof.clone(),
             transactions: self.transactions.clone(),
             hash: cloned_hash,
@@ -110,7 +102,6 @@ impl Provisions {
         target_shard: ShardId,
         block_height: BlockHeight,
         source_block_ts: WeightedTimestamp,
-        source_block_reveal: RevealChain,
         proof: MerkleInclusionProof,
         transactions: Vec<ProvisionEntry>,
     ) -> Self {
@@ -119,7 +110,6 @@ impl Provisions {
             target_shard,
             block_height,
             source_block_ts,
-            source_block_reveal,
             proof,
             transactions,
             hash: OnceLock::new(),
@@ -151,15 +141,6 @@ impl Provisions {
         self.source_block_ts
     }
 
-    /// The source block's reveal chain, as carried on the wire and checked
-    /// against the commit-proven header at verification. The transaction
-    /// randomness of every transaction that block committed is drawn from
-    /// it.
-    #[must_use]
-    pub const fn source_block_reveal(&self) -> RevealChain {
-        self.source_block_reveal
-    }
-
     /// Aggregated merkle multiproof covering all entries for this block.
     #[must_use]
     pub const fn proof(&self) -> &MerkleInclusionProof {
@@ -181,7 +162,6 @@ impl Provisions {
                 self.target_shard,
                 self.block_height,
                 self.source_block_ts,
-                self.source_block_reveal,
                 &self.proof,
                 &self.transactions,
             )
@@ -207,7 +187,6 @@ impl Provisions {
         target_shard: ShardId,
         block_height: BlockHeight,
         source_block_ts: WeightedTimestamp,
-        source_block_reveal: RevealChain,
         proof: &MerkleInclusionProof,
         transactions: &[ProvisionEntry],
     ) -> ProvisionHash {
@@ -225,10 +204,6 @@ impl Provisions {
         bytes.extend_from_slice(
             &hbor_to_vec(&source_block_ts)
                 .expect("WeightedTimestamp serialization should never fail"),
-        );
-        bytes.extend_from_slice(
-            &hbor_to_vec(&source_block_reveal)
-                .expect("RevealChain serialization should never fail"),
         );
         bytes.extend_from_slice(
             &hbor_to_vec(proof).expect("MerkleInclusionProof serialization should never fail"),
@@ -272,7 +247,6 @@ impl Provisions {
             target_shard,
             block_height,
             WeightedTimestamp::ZERO,
-            RevealChain::ZERO,
             MerkleInclusionProof::dummy(),
             vec![],
         )
@@ -307,10 +281,6 @@ pub enum ProvisionsVerifyError {
     /// commit-proven source header's parent-QC weighted timestamp.
     #[error("provisions source block timestamp does not match the committed header")]
     SourceBlockTsMismatch,
-    /// The bundle's claimed `source_block_reveal` does not equal the
-    /// commit-proven source header's reveal chain.
-    #[error("provisions source block reveal chain does not match the committed header")]
-    SourceBlockRevealMismatch,
 }
 
 /// Construction asserts: the aggregated merkle multiproof in
@@ -345,14 +315,6 @@ impl Verify<&ProvisionsContext<'_>> for Provisions {
                 .weighted_timestamp()
         {
             return Err(ProvisionsVerifyError::SourceBlockTsMismatch);
-        }
-
-        // Likewise the reveal chain: the transaction randomness is drawn
-        // from it, so a sender-chosen value would let one participant
-        // execute a randomness-reading guest under a draw no committee
-        // attested.
-        if self.source_block_reveal != ctx.certified_header.header().reveal_chain() {
-            return Err(ProvisionsVerifyError::SourceBlockRevealMismatch);
         }
 
         let entries = self.all_entries_deduped();
@@ -438,7 +400,6 @@ mod tests {
             ShardId::leaf(2, 2),
             BlockHeight::new(100),
             WeightedTimestamp::ZERO,
-            RevealChain::ZERO,
             MerkleInclusionProof::new(vec![]),
             vec![],
         );
@@ -456,7 +417,6 @@ mod tests {
             ShardId::leaf(2, 2),
             BlockHeight::new(42),
             WeightedTimestamp::ZERO,
-            RevealChain::ZERO,
             MerkleInclusionProof::new(vec![1, 2, 3]),
             vec![],
         );
@@ -474,7 +434,6 @@ mod tests {
             ShardId::leaf(1, 1),
             BlockHeight::new(10),
             WeightedTimestamp::ZERO,
-            RevealChain::ZERO,
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(
                 TxHash::from(Hash::from_bytes(b"tx1")),
@@ -495,7 +454,6 @@ mod tests {
             ShardId::leaf(1, 1),
             BlockHeight::new(10),
             WeightedTimestamp::ZERO,
-            RevealChain::ZERO,
             MerkleInclusionProof::dummy(),
             vec![
                 ProvisionEntry::new(TxHash::from(Hash::from_bytes(b"tx1")), vec![entry.clone()]),
@@ -582,7 +540,6 @@ mod tests {
                 ShardId::leaf(1, 0),
                 BlockHeight::new(1),
                 WeightedTimestamp::ZERO,
-                RevealChain::ZERO,
                 proof,
                 tx_entries,
             )
@@ -639,7 +596,6 @@ mod tests {
                 ShardId::leaf(1, 0),
                 BlockHeight::new(1),
                 WeightedTimestamp::ZERO,
-                RevealChain::ZERO,
                 MerkleInclusionProof::new(vec![]),
                 vec![],
             );
@@ -678,7 +634,6 @@ mod tests {
                 ShardId::leaf(1, 0),
                 BlockHeight::new(1),
                 WeightedTimestamp::from_millis(1),
-                RevealChain::ZERO,
                 proof,
                 vec![ProvisionEntry::new(
                     TxHash::from(Hash::from_bytes(b"tx")),
@@ -693,35 +648,6 @@ mod tests {
                 Err(ProvisionsVerifyError::SourceBlockTsMismatch)
             );
         }
-
-        #[test]
-        fn verify_rejects_a_mismatched_source_block_reveal() {
-            // The bundle claims a reveal chain the commit-proven header
-            // does not carry: receivers draw the transaction randomness
-            // from it, so verification refuses it outright.
-            let items = vec![entry(1)];
-            let (state_root, proof) = build_jmt(&items);
-            let verified_header = header_with_state_root(state_root);
-            let provisions = Provisions::new(
-                ShardId::leaf(1, 1),
-                ShardId::leaf(1, 0),
-                BlockHeight::new(1),
-                WeightedTimestamp::ZERO,
-                RevealChain::from_raw(Hash::from_bytes(b"another block's reveal")),
-                proof,
-                vec![ProvisionEntry::new(
-                    TxHash::from(Hash::from_bytes(b"tx")),
-                    vec![SubstateEntry::new(items[0].0, Some(items[0].1.clone()))],
-                )],
-            );
-            let ctx = ProvisionsContext {
-                certified_header: &verified_header,
-            };
-            assert_eq!(
-                provisions.verify(&ctx),
-                Err(ProvisionsVerifyError::SourceBlockRevealMismatch)
-            );
-        }
     }
 
     #[test]
@@ -732,7 +658,6 @@ mod tests {
             hbor_to_vec(&ShardId::leaf(2, 2)).unwrap(),
             hbor_to_vec(&BlockHeight::new(10)).unwrap(),
             hbor_to_vec(&WeightedTimestamp::ZERO).unwrap(),
-            hbor_to_vec(&RevealChain::ZERO).unwrap(),
             hbor_to_vec(&MerkleInclusionProof::dummy()).unwrap(),
         ] {
             buf.extend_from_slice(&part);

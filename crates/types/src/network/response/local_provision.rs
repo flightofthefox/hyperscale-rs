@@ -112,8 +112,7 @@ mod tests {
         use crate::{
             BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlockHeader,
             ChainOrigin, Hash, MerkleInclusionProof, ProposerTimestamp, ProvisionEntry,
-            QuorumCertificate, RevealChain, Round, ShardId, SignerBitfield, TxHash,
-            WeightedTimestamp,
+            QuorumCertificate, Round, ShardId, SignerBitfield, TxHash, WeightedTimestamp,
         };
 
         let source_shard = ShardId::leaf(1, 1);
@@ -124,7 +123,6 @@ mod tests {
             target_shard,
             source_height,
             WeightedTimestamp::ZERO,
-            RevealChain::ZERO,
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(
                 TxHash::from(Hash::from_bytes(b"tx")),

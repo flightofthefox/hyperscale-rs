@@ -1158,7 +1158,7 @@ mod tests {
         stub_transaction, test_prefix, test_principal, test_transaction,
         test_transaction_with_prefixes, test_validity_range,
     };
-    use hyperscale_types::{Address, PrincipalAddr, RevealChain, Verified, WitnessSources};
+    use hyperscale_types::{Address, PrincipalAddr, Verified, WitnessSources};
 
     /// Test-only convenience: wrap any `Transaction` in a
     /// `Verified` witness via the test-only gate.
@@ -1216,7 +1216,6 @@ mod tests {
             ShardId::ROOT,
             height,
             WeightedTimestamp::ZERO,
-            RevealChain::ZERO,
             MerkleInclusionProof::dummy(),
             transactions,
         );

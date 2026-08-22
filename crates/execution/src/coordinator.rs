@@ -2267,7 +2267,6 @@ impl ExecutionCoordinator {
                     source_shard: local_shard,
                     block_height: height,
                     source_block_ts: header.parent_qc().weighted_timestamp(),
-                    source_block_reveal: header.reveal_chain(),
                     shard_recipients,
                 });
             }

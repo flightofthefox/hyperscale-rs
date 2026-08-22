@@ -17,7 +17,7 @@ use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{SubstateStore, SubstateView, VersionedStore};
 use hyperscale_types::{
     BlockHeight, EntryKey, MerkleInclusionProof, ProtocolHasher, ProvisionEntry, Provisions,
-    RevealChain, ShardId, SubstateEntry, SubstateKey, TxHash, WeightedTimestamp, entry_leaf_key,
+    ShardId, SubstateEntry, SubstateKey, TxHash, WeightedTimestamp, entry_leaf_key,
 };
 use tracing::warn;
 
@@ -38,7 +38,6 @@ pub fn build_provisions<S>(
     target_shard: ShardId,
     source_block_height: BlockHeight,
     source_block_ts: WeightedTimestamp,
-    source_block_reveal: RevealChain,
     requests: &[ProvisionsRequest],
 ) -> Option<Arc<Provisions>>
 where
@@ -154,7 +153,6 @@ where
         target_shard,
         source_block_height,
         source_block_ts,
-        source_block_reveal,
         proof,
         transactions,
     )))

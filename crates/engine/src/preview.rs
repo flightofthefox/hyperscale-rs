@@ -241,8 +241,8 @@ impl Executor {
     /// it would cost, committing nothing.
     ///
     /// `tx` is the envelope in the wire form a wallet would submit, so
-    /// the preview's identity — which fresh-key derivation and the
-    /// randomness draw both root at — is the one the chain would use.
+    /// the preview's identity — which fresh-key derivation roots at — is
+    /// the one the chain would use.
     #[must_use]
     pub fn preview(
         &self,

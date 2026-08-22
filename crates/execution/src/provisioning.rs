@@ -263,7 +263,7 @@ impl ProvisioningTracker {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, RevealChain};
+    use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry};
 
     use super::*;
 
@@ -286,7 +286,6 @@ mod tests {
             ShardId::leaf(2, 0),
             block_height,
             anchor.clock,
-            RevealChain::ZERO,
             MerkleInclusionProof::dummy(),
             transactions,
         ))

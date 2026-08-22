@@ -688,10 +688,10 @@ mod tests {
     use hyperscale_types::{
         Address, AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin,
         Finalization, Hash, MerkleInclusionProof, NetworkDefinition, PrincipalAddr,
-        ProposerTimestamp, ProvisionEntry, Provisions, QuorumCertificate, RevealChain, Round,
-        ShardId, ShardLoad, Signer, SignerBitfield, TerminalVerdict, TerminalVerdictRoot,
-        TimestampRange, Transaction, TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo,
-        ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources, test_utils,
+        ProposerTimestamp, ProvisionEntry, Provisions, QuorumCertificate, Round, ShardId,
+        ShardLoad, Signer, SignerBitfield, TerminalVerdict, TerminalVerdictRoot, TimestampRange,
+        Transaction, TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet,
+        Verifiable, Verified, WeightedTimestamp, WitnessSources, test_utils,
     };
 
     use super::*;
@@ -1609,7 +1609,6 @@ mod tests {
             ShardId::leaf(1, 1),
             BlockHeight::new(u64::from(seed)),
             WeightedTimestamp::ZERO,
-            RevealChain::ZERO,
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(tx_hash, vec![])],
         ))
@@ -1893,7 +1892,6 @@ mod tests {
                 local,
                 BlockHeight::new(1),
                 WeightedTimestamp::ZERO,
-                RevealChain::ZERO,
                 MerkleInclusionProof::dummy(),
                 vec![ProvisionEntry::new(tx_hash, vec![])],
             ))
@@ -1917,7 +1915,6 @@ mod tests {
                 ShardId::leaf(1, 1),
                 BlockHeight::new(1),
                 WeightedTimestamp::ZERO,
-                RevealChain::ZERO,
                 MerkleInclusionProof::dummy(),
                 vec![ProvisionEntry::new(tx_hash, vec![])],
             ))

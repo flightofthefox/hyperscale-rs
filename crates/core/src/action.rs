@@ -337,10 +337,6 @@ pub enum Action {
         /// the bundle wire form and checked against the commit-proven
         /// header at verification.
         source_block_ts: WeightedTimestamp,
-        /// The source block's reveal chain, carried and checked the same
-        /// way: it is the anchor every participant draws this block's
-        /// transactions' randomness from.
-        source_block_reveal: RevealChain,
         /// Per-shard recipients for provision broadcasts (excluding self).
         shard_recipients: HashMap<ShardId, Vec<ValidatorId>>,
     },

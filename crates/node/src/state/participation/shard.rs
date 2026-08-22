@@ -483,9 +483,9 @@ mod tests {
     use hyperscale_types::{
         Block, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, CertifiedBlock,
         CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp, MerkleInclusionProof,
-        ProvisionEntry, ProvisionTxRoot, Provisions, QuorumCertificate, RETENTION_HORIZON,
-        RevealChain, Round, ShardForkProof, ShardId, TransactionStatus, TxHash, ValidatorId,
-        Verified, WeightedTimestamp, WitnessSources,
+        ProvisionEntry, ProvisionTxRoot, Provisions, QuorumCertificate, RETENTION_HORIZON, Round,
+        ShardForkProof, ShardId, TransactionStatus, TxHash, ValidatorId, Verified,
+        WeightedTimestamp, WitnessSources,
     };
 
     use crate::state::test_support::TestNode;
@@ -734,7 +734,6 @@ mod tests {
             ShardId::leaf(1, 1),
             BlockHeight::new(1),
             WeightedTimestamp::ZERO,
-            RevealChain::ZERO,
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(
                 TxHash::from(Hash::from_bytes(b"outbound-tx")),

@@ -955,7 +955,7 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Hash,
         MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry,
-        ProvisionTxRoot, QuorumCertificate, RevealChain, Round, ShardId, SignerBitfield, StateRoot,
+        ProvisionTxRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot,
         TopologySnapshot, TxHash, ValidatorId, ValidatorSet, Verifiable, WeightedTimestamp,
         WitnessSources, compute_merkle_root,
     };
@@ -1472,7 +1472,6 @@ mod tests {
             target_shard,
             height,
             WeightedTimestamp::ZERO,
-            RevealChain::ZERO,
             MerkleInclusionProof::dummy(),
             transactions,
         )

@@ -43,10 +43,10 @@ use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, CertifiedBlock,
     ConsensusReceipt, DeclaredRange, EventRoot, ExecutionCertificate, ExecutionMetadata,
     ExecutionOutcome, Finalization, GlobalReceipt, LocalKey, MerkleInclusionProof, Movement,
-    ProvisionEntry, Provisions, RevealChain, SettledWrites, ShardId, ShardTrie, SignerBitfield,
-    StateRoot, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TopologySchedule,
-    TopologySnapshot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, compute_global_receipt_root, read_amount,
+    ProvisionEntry, Provisions, SettledWrites, ShardId, ShardTrie, SignerBitfield, StateRoot,
+    StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TopologySchedule, TopologySnapshot,
+    Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    compute_global_receipt_root, read_amount,
 };
 use hyperscale_vm_types::CollectionId;
 
@@ -315,7 +315,6 @@ impl ExecutionSim {
             self.local_shard,
             self.height,
             WeightedTimestamp::from_millis(self.height.inner() * BLOCK_INTERVAL_MS),
-            RevealChain::ZERO,
             MerkleInclusionProof::dummy(),
             tx_hashes
                 .iter()
