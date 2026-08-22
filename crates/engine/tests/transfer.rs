@@ -176,16 +176,21 @@ fn client() -> &'static Client {
 /// Computed rather than created: the envelope carries the record, and
 /// every node composes the same registry from it. What the store holds
 /// for it is the seal alone — see [`MapDb::genesis`].
-fn lottery_meta() -> InstanceMeta {
+/// The salt every round that needs only one uses.
+const ROUND: u8 = 0x4C;
+
+/// A round of its own: a settled round is settled, so a case that
+/// settles more than once names a round per settlement.
+fn lottery_meta(salt: u8) -> InstanceMeta {
     InstanceMeta {
         package: lottery_package_hash(&ProtocolHasher),
         config: Vec::new(),
-        salt: Hash32([0x4C; 32]),
+        salt: Hash32([salt; 32]),
     }
 }
 
-fn lottery_addr() -> ComponentAddr {
-    lottery_meta().address(&ProtocolHasher)
+fn lottery_addr(salt: u8) -> ComponentAddr {
+    lottery_meta(salt).address(&ProtocolHasher)
 }
 
 /// The signing terms every transaction here shares: a window nothing
@@ -293,14 +298,14 @@ fn execute(executor: &Executor, transactions: &[Arc<Verified<Transaction>>]) -> 
 /// convenience: the draw is nobody's to choose, so there is nothing an
 /// operator would be trusted with.
 fn signed_draw(seed: u8) -> Transaction {
-    signed_draw_with_fee(seed, 1_000_000)
+    signed_draw_with_fee(seed, 1_000_000, ROUND)
 }
 
-fn signed_draw_with_fee(seed: u8, max_fee: u128) -> Transaction {
+fn signed_draw_with_fee(seed: u8, max_fee: u128, salt: u8) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let chain = client().records();
-    let composed = Composed::new(&chain, &[lottery_meta()], &ProtocolHasher);
-    let lottery_addr = lottery_meta().address(&ProtocolHasher);
+    let composed = Composed::new(&chain, &[lottery_meta(salt)], &ProtocolHasher);
+    let lottery_addr = lottery_meta(salt).address(&ProtocolHasher);
     let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
     lottery::Lottery::at(lottery_addr)
         .draw(&mut root, 64)
@@ -318,6 +323,11 @@ fn signed_draw_with_fee(seed: u8, max_fee: u128) -> Transaction {
 /// what teaches the chain to answer for the round every draw below
 /// names without carrying anything.
 fn with_lottery(accounts: &[(PrincipalAddr, u128)], executor: &Executor) -> MapDb {
+    with_rounds(accounts, executor, &[ROUND])
+}
+
+/// Genesis state with one round per salt made actual.
+fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &[u8]) -> MapDb {
     // Paid by a signer of its own, so the ledger a caller is asserting
     // about carries nothing the setup spent.
     const SEALER_SEED: u8 = 0x5E;
@@ -325,27 +335,29 @@ fn with_lottery(accounts: &[(PrincipalAddr, u128)], executor: &Executor) -> MapD
     funded.push((fee_payer(SEALER_SEED), 1_000_000));
     let mut store = MapDb::genesis(&funded);
     let key = Ed25519PrivateKey::from_bytes(&[SEALER_SEED; 32]).unwrap();
-    let chain = client().records();
-    let composed = Composed::new(&chain, &[lottery_meta()], &ProtocolHasher);
-    let round = lottery_meta().address(&ProtocolHasher);
-    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
-    instantiate(&mut root, fee_payer(SEALER_SEED), round)
-        .expect("a derivable round answers its seal");
-    env.instance(lottery_meta());
-    env.seal(root)
-        .expect("the root declares nothing to discharge");
-    let tree = env.build().expect("the intent declares no hole");
-    let seal = Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(1_000_000)));
-    let executed = execute_batch_on(
-        &store,
-        executor,
-        &[Arc::new(Verified::<Transaction>::from_persisted(seal))],
-    );
-    let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
-        panic!("the seal must settle: {:?}", executed[0].consensus);
-    };
-    store.apply(writes);
-    absorb_committed_cells([&executed[0].consensus], executor.derivation().as_ref());
+    for salt in salts {
+        let chain = client().records();
+        let composed = Composed::new(&chain, &[lottery_meta(*salt)], &ProtocolHasher);
+        let round = lottery_meta(*salt).address(&ProtocolHasher);
+        let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
+        instantiate(&mut root, fee_payer(SEALER_SEED), round)
+            .expect("a derivable round answers its seal");
+        env.instance(lottery_meta(*salt));
+        env.seal(root)
+            .expect("the root declares nothing to discharge");
+        let tree = env.build().expect("the intent declares no hole");
+        let seal = Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(1_000_000)));
+        let executed = execute_batch_on(
+            &store,
+            executor,
+            &[Arc::new(Verified::<Transaction>::from_persisted(seal))],
+        );
+        let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
+            panic!("the seal must settle: {:?}", executed[0].consensus);
+        };
+        store.apply(writes);
+        absorb_committed_cells([&executed[0].consensus], executor.derivation().as_ref());
+    }
     store
 }
 
@@ -373,7 +385,7 @@ fn draw_cell(executed: &ExecutedTx) -> Option<Vec<u8>> {
     let writes = executed.consensus.writes()?;
     writes
         .cells
-        .get(&draw_key(lottery_addr()))
+        .get(&draw_key(lottery_addr(ROUND)))
         .cloned()
         .flatten()
 }
@@ -838,7 +850,7 @@ fn a_call_that_never_touches_its_payers_vault_still_pays() {
     // A draw's fuel far exceeds the tiny ceiling, so the burn is
     // exactly `max_fee`.
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_draw_with_fee(ALICE_SEED, 10),
+        signed_draw_with_fee(ALICE_SEED, 10, ROUND),
     ));
     let store = with_lottery(&[(alice(), 1_000), (bob(), 50)], &executor);
     let executed = execute_batch_on(&store, &executor, &[tx]);
@@ -852,7 +864,7 @@ fn a_call_that_never_touches_its_payers_vault_still_pays() {
     assert!(
         database_updates
             .cells
-            .contains_key(&draw_key(lottery_addr())),
+            .contains_key(&draw_key(lottery_addr(ROUND))),
         "the draw settled its round"
     );
     assert_eq!(
@@ -908,20 +920,24 @@ fn a_receipt_carries_only_its_own_payers_burn() {
 /// hash-sorted — loses none of them.
 #[test]
 fn shared_payer_burns_accumulate_across_a_batch() {
-    let executor = executor(ExecutionMode::Serial);
     // Distinct ceilings make three distinct draws; a draw's fuel
-    // exceeds all of them, so each burns exactly its ceiling.
+    // exceeds all of them, so each burns exactly its ceiling. Each
+    // settles a round of its own, since a settled round is settled.
+    const ROUNDS: [u8; 3] = [0x4D, 0x4E, 0x4F];
+
+    let executor = executor(ExecutionMode::Serial);
     let mut txs: Vec<Arc<Verified<Transaction>>> = [10u128, 11, 12]
         .into_iter()
-        .map(|fee| {
+        .zip(ROUNDS)
+        .map(|(fee, salt)| {
             Arc::new(Verified::<Transaction>::from_persisted(
-                signed_draw_with_fee(ALICE_SEED, fee),
+                signed_draw_with_fee(ALICE_SEED, fee, salt),
             ))
         })
         .collect();
     txs.sort_by_key(|tx| tx.hash());
 
-    let mut store = with_lottery(&[(alice(), 1_000), (bob(), 50)], &executor);
+    let mut store = with_rounds(&[(alice(), 1_000), (bob(), 50)], &executor, &ROUNDS);
     let executed = execute_batch_on(&store, &executor, &txs);
     for tx in &executed {
         let ConsensusReceipt::Succeeded { writes, .. } = &tx.consensus else {
