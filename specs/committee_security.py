@@ -15,7 +15,7 @@ Table index (letter -> note section):
   A fresh draws (S1)         I beacon redraw (S1)       B/C trickle chain (S2)
   D1/D2 sizing (S3)          E/J/K adaptive (S4, S8)    F seats vs stake (S5)
   G operating point (S6)     H interval sweep (S6)      L concentration (S7)
-  V terminal boundary (S10.1)             W1-W4 window edge (S10.3)
+  V terminal boundary (S10.1)             W1-W5 window edge (S10.3)
   M/N fallback ceremony grind (S10.4)     R/T input-side stack (S10.5)
   S detect-and-rotate (S10.6)
 
@@ -864,6 +864,100 @@ def reveal_ceremony_p_event(beta, p, beacon_size=16):
     return 1.0 - (1.0 - p) ** (2 ** round(beta * beacon_size))
 
 
+def sealed_draw_edge_multiplier(beta, sight=1.0, edge_windows=2, p_ref=1e-6):
+    """How much holding a cut slot multiplies an adversary's own odds in a
+    sealed draw, where the target predicate is "the winner is mine".
+
+    The mechanism is `witness_edge_p_event` unchanged: it prices a grind
+    against any predicate with single-seed success `p`, and a lottery's is
+    the honest win probability. What is new is the *consumer*. A committee
+    march compounds a best-of-2 over months and is priced by how long it
+    takes; a settled round pays out once, immediately, so what matters is
+    the ratio in a single event.
+
+    In the small-`p` limit `1-(1-p)^c -> c*p`, so the ratio converges to
+    `E[cbar^j]` and stops depending on the predicate at all — the edge
+    multiplies your odds by a constant whatever the round's size. Larger
+    `p` sits strictly below that limit (best-of-c saturates), so the limit
+    is the worst case and the default `p_ref` takes it."""
+    return witness_edge_p_event(beta, p_ref, sight, edge_windows) / p_ref
+
+
+def sealed_draw_break_even_stake(beta, sight=1.0, edge_windows=2):
+    """The per-ticket stake at which exercising the edge pays for itself,
+    in units of one forfeited proposal.
+
+    An adversary holding one ticket of a fair round has honest expectation
+    equal to its stake; the edge lifts that to `mult * stake`, so the gain
+    is `(mult - 1) * stake` against a cost of at most one missed proposal.
+    The round's size cancels — a bigger round means a bigger pot and a
+    proportionally smaller win probability — so the bound is per ticket
+    and not per pot, which is the opposite of the intuitive statement."""
+    # The multiplier is a ratio taken near zero, so an absent edge lands
+    # within rounding of one rather than exactly on it. A gain at the float
+    # noise floor is no gain, and inverting one would report a break-even
+    # stake of ten billion proposals as though it meant something.
+    gain = sealed_draw_edge_multiplier(beta, sight, edge_windows) - 1.0
+    return float("inf") if gain <= 1e-9 else 1.0 / gain
+
+
+def check_sealed_draw_value() -> None:
+    """The value lens over the same edge: limits, invariance, monotonicity."""
+    # No slot, or no sight, is no edge: odds are the honest ones.
+    for m in (1, 2, 4):
+        if abs(sealed_draw_edge_multiplier(0.0, 1.0, m) - 1.0) > 1e-9:
+            raise AssertionError("sealed-draw multiplier at beta=0 != 1")
+        if abs(sealed_draw_edge_multiplier(0.10, 0.0, m) - 1.0) > 1e-9:
+            raise AssertionError("sealed-draw multiplier at sight=0 != 1")
+        if sealed_draw_break_even_stake(0.0, 1.0, m) != float("inf"):
+            raise AssertionError("a beta=0 edge must never pay for itself")
+    # The small-p limit is E[cbar^j] over j ~ Bin(m, beta*sight), which is
+    # the closed form the ratio converges to.
+    for beta in (0.05, 0.10, 0.15, 0.20):
+        for m in (1, 2, 4):
+            run = sum((beta ** k) * (1.0 - beta) * k for k in range(16))
+            run += (1.0 - sum((beta ** k) * (1.0 - beta) for k in range(16))) * 16
+            cbar = 2.0 + run
+            closed = sum(
+                comb(m, j) * (beta ** j) * ((1.0 - beta) ** (m - j)) * (cbar ** j)
+                for j in range(m + 1)
+            )
+            # A limit approached from below, so the tolerance is the
+            # convergence error at `p_ref` — O(p_ref * c^2) — and not a
+            # float-noise epsilon.
+            got = sealed_draw_edge_multiplier(beta, 1.0, m)
+            if not 0.0 <= closed - got <= 1e-4 * closed:
+                raise AssertionError("sealed-draw multiplier != E[cbar^j]")
+    # A round's size does not change the multiplier, and every finite size
+    # sits at or below the limit the bound is stated at.
+    limit = sealed_draw_edge_multiplier(0.10, 1.0, 2)
+    for entrants in (2, 10, 100, 10_000):
+        p = 1.0 / entrants
+        mult = witness_edge_p_event(0.10, p, 1.0, 2) / p
+        if mult > limit + 1e-9:
+            raise AssertionError("a finite round beats the small-p limit")
+        if entrants >= 100 and abs(mult - limit) > 5e-3:
+            raise AssertionError("multiplier drifts with round size")
+    # Monotone in beta and in the cut-racing window count.
+    grid = [0.02, 0.05, 0.10, 0.15, 0.20, 0.25]
+    for lo, hi in zip(grid, grid[1:]):
+        if sealed_draw_edge_multiplier(hi) < sealed_draw_edge_multiplier(lo):
+            raise AssertionError("sealed-draw multiplier not monotone in beta")
+        if sealed_draw_break_even_stake(hi) > sealed_draw_break_even_stake(lo):
+            raise AssertionError("break-even stake not falling in beta")
+    for m in (1, 2, 3):
+        if (sealed_draw_edge_multiplier(0.10, 1.0, m + 1)
+                < sealed_draw_edge_multiplier(0.10, 1.0, m)):
+            raise AssertionError("sealed-draw multiplier not monotone in m")
+    # The WT-cutoff variant caps the edge at a sight-independent best-of-2,
+    # so it must price strictly cheaper to attack than the boundary edge it
+    # would replace.
+    for beta in (0.05, 0.10, 0.15):
+        wt_mult = wt_edge_p_event(beta, 1e-6) / 1e-6
+        if wt_mult >= sealed_draw_edge_multiplier(beta, 1.0, 2):
+            raise AssertionError("WT variant not below the boundary edge")
+
+
 def witness_march_days(n, beta, sight=1.0, edge_windows=2,
                        interval=None):
     """Days to march one targeted shard from beta*n to f+1 under the
@@ -1051,6 +1145,7 @@ def main() -> None:
     check_grind_network()
     check_resample_boost()
     check_witness_edge()
+    check_sealed_draw_value()
 
     # A: per-draw failure probability (genesis, split cohorts, merge keepers)
     table(
@@ -1739,6 +1834,42 @@ def main() -> None:
           "cutoff in place of the")
     print("    anchor-epoch reset — a second fork-critical derivation on the "
           "header.)")
+
+    print(f"\nW5. What the edge is worth to a sealed draw (§10.3 priced for a "
+          f"different consumer)")
+    print("    Tables W1-W3 price the edge by how long a march takes, because "
+          "a committee is")
+    print("    steered over months. A settled round pays out once, so what "
+          "matters is the ratio")
+    print("    in a single event — the same `witness_edge_p_event`, read for "
+          "value instead of")
+    print("    for time. The predicate is \"the winner is mine\" and "
+          "single-seed success is the")
+    print("    honest win probability.")
+    print("    beta  | odds multiplier  m=1 / m=2 / m=4 | break-even stake per "
+          "ticket (missed proposals)")
+    print("  " + "-" * 88)
+    for beta in (0.05, 0.10, 0.13, 0.15, 0.20):
+        mults = [sealed_draw_edge_multiplier(beta, 1.0, m) for m in (1, 2, 4)]
+        evens = [sealed_draw_break_even_stake(beta, 1.0, m) for m in (1, 2, 4)]
+        print(f"    {beta:.2f}  | " + " / ".join(f"{x:.3f}" for x in mults)
+              + "          | " + " / ".join(f"{x:6.1f}" for x in evens))
+    print("   (The multiplier does not depend on the round's size: in the "
+          "small-p limit it is")
+    print("    E[cbar^j], so a ten-entrant round and a ten-thousand-entrant one "
+          "are lifted alike,")
+    print("    and every finite round sits at or below the figure shown. The "
+          "break-even therefore")
+    print("    cancels the size too — a bigger round is a bigger pot and a "
+          "proportionally smaller")
+    print("    win probability — which makes the bound PER TICKET rather than "
+          "per pot. At the")
+    print(f"    design point (beta=0.10, m=2) a round is worth biasing once one "
+          f"ticket's stake")
+    print(f"    exceeds ~{sealed_draw_break_even_stake(0.10, 1.0, 2):.1f} missed "
+          "proposals; the pot may be arbitrarily large below that.")
+    print("    W4's WT cutoff caps the multiplier sight-independently and so "
+          "raises this floor.)")
 
     print("   The seed in one line: the include/omit lever is removed "
           "structurally (chain fold),")

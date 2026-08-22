@@ -709,6 +709,31 @@ dilution credited, the scheme is complete on its own — no shard-count
 threshold and no separate header/aggregate blinder — and any real network's
 cross-shard closing race only dilutes the edge further.
 
+**The edge is priced by how long a march takes, and a second consumer
+prices it by what one event is worth.** Everything above measures the edge
+against committee steering, where the win is a β-gated best-of-≈2
+compounded over months — which is why a per-event ratio near 1.2 reads as
+harmless. A **sealed draw** is the other kind of consumer: a package
+commits to a future epoch's seed, and when that seed rolls the round pays
+out once, immediately. The mechanism is unchanged and the tables above
+still price it; what changes is the adversary's willingness to buy an edge
+event they would otherwise not bother with. Table W5 reads the same
+`witness_edge_p_event` for value, with the predicate "the winner is mine"
+and single-seed success the honest win probability.
+
+Two results, and the second is the one to carry. **The multiplier does not
+depend on the round's size** — in the small-`p` limit it converges to
+`E[c̄^j]`, so a ten-entrant round and a ten-thousand-entrant one are lifted
+by the same factor, and every finite round sits at or below it. **The
+break-even is therefore per ticket, not per pot**: a bigger round is a
+bigger pot *and* a proportionally smaller win probability, and the two
+cancel. At the design point (β = 0.10, m = 2) exercising the edge pays for
+itself once a single ticket's stake exceeds ≈ 4.3 missed proposals. A pot
+may be arbitrarily large below that; what matters is what one entrant put
+in. That is the bound a package should be read against, and it is the
+condition under which W4's tightening stops being optional — the WT cutoff
+caps the multiplier sight-independently, so it raises this floor.
+
 A variant tightens the edge (table W4). Anchoring the fold's upper cut to a
 *fixed schedule line* `T_cut = boundary − Δ` (`Δ ≥ MAX_TIMESTAMP_DELAY`),
 closing each epoch's chain at the last block whose aggregated weighted
@@ -1007,7 +1032,9 @@ above) and the window edge (whose FIFO equilibrium is interval-independent),
 so the interval trades chiefly against adaptive corruption — §6 Rider 1
 carries that trade.
 
-Residuals, priced above: the window-edge lever (§10.3); fallback-epoch bias
+Residuals, priced above: the window-edge lever (§10.3), whose *value* to
+an immediate-payoff consumer is table W5's per-ticket break-even rather
+than W1–W3's march rate; fallback-epoch bias
 exposure (one best-of-2^t draw per zero-crossing epoch); the
 beacon-committee compromise rate (liveness/bias only — pool ratification
 carries commits, and the seed's grind resistance no longer rides beacon
