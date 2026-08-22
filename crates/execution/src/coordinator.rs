@@ -889,19 +889,21 @@ impl ExecutionCoordinator {
             }
         }
 
-        // Off the block's anchored committee, on the same terms the
-        // classification above reads it: what a seal opens onto is
-        // execution output, and a window taken from this node's head
-        // would make the answer depend on how far this node has folded
-        // the beacon rather than on what the block committed.
-        let env = TickEnvironment::governing(
-            self.classification_committee(topology_schedule, self.committed_committee_anchor_wt),
-            topology_schedule.windows(),
-        );
         let pending = (!requests.is_empty()).then(|| PendingTick {
             tick: block.height,
             tick_ts: block.ts,
-            env,
+            // Off the block's anchored committee, on the same terms the
+            // classification above reads it: what a seal opens onto is
+            // execution output, and a window taken from this node's head
+            // would make the answer depend on how far this node has
+            // folded the beacon rather than on what the block committed.
+            env: TickEnvironment::governing(
+                self.classification_committee(
+                    topology_schedule,
+                    self.committed_committee_anchor_wt,
+                ),
+                topology_schedule.windows(),
+            ),
             requests,
         });
         (pending, votes_to_replay, members)

@@ -36,7 +36,7 @@ pub mod genesis;
 /// Shard assignment and write filtering for `StateWrites`.
 pub mod sharding;
 
-pub use batch::{SeedWindow, TickBatchContext, TickEnvironment, TickTxInput};
+pub use batch::{TickBatchContext, TickEnvironment, TickTxInput};
 pub use executor::{Executor, artifact_package, instance_of_record, protocol_hash};
 pub use genesis::{
     GenesisConfig, World, XRD, genesis_package_facts, genesis_world, genesis_writes,

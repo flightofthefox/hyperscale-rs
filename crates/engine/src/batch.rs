@@ -19,7 +19,7 @@ use hyperscale_types::{
     Epoch, EpochWindows, ProvisionalHolds, ShardId, ShardTrie, SubstateEntry, TopologySnapshot,
     Transaction, Verified, WeightedTimestamp,
 };
-pub use hyperscale_vm_types::SeedWindow;
+use hyperscale_vm_types::SeedWindow;
 
 /// What a block fixes about the environment its tick executes under.
 ///
@@ -38,17 +38,16 @@ pub struct TickEnvironment {
     /// nothing about which block executes a leg reaches the answer.
     pub seeds: SeedWindow,
     /// The grid that turns a member's clock into the epoch a seal it
-    /// writes records. Derived rather than carried, because the clock
-    /// already travels with the transaction and the epoch is a function
-    /// of it.
+    /// writes records — so the epoch rides the clock the transaction
+    /// already carries rather than travelling beside it.
     ///
-    /// The schedule's rather than the snapshot's, and not for want of a
-    /// place to put it: the grid is the genesis-fixed window length a
-    /// schedule *is* indexed by, so a snapshot carrying a second copy
-    /// would be a second answer to a question one object already
-    /// settles. It is also the half of this that cannot skew — a seed
-    /// ring is what each window retained, where the grid is the same
-    /// under every window there has ever been.
+    /// Taken from the schedule, which is the object indexed by it, and
+    /// not from the snapshot: a genesis-fixed window length carried on
+    /// something derived per window would be a second answer to a
+    /// question already settled, and a default on the copy would answer
+    /// it wrongly where nobody set one. It is also the half of this pair
+    /// that cannot skew — a seed ring is what one window retained, where
+    /// the grid is the same under every window there has been.
     pub windows: EpochWindows,
 }
 
