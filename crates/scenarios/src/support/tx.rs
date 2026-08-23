@@ -16,6 +16,7 @@ use hyperscale_engine::genesis::{
     OWNER_BADGE_ID, pool_address, pool_owner_badge, stake_unit, staking_artifact,
 };
 use hyperscale_engine::{XRD, account_address};
+use hyperscale_hbor::TypeShape;
 use hyperscale_transactions::{Client, DEFAULT_GAS_LIMIT, Terms};
 use hyperscale_types::{
     AccountSigner, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
@@ -1529,7 +1530,14 @@ pub fn storm_artifact(nonce: u16) -> Vec<u8> {
     // its own package declares — which the account, serving principals,
     // has no reason to carry.
     let mut metadata = staking::metadata();
-    metadata.events.push(format!("storm-{nonce}"));
+    // An event is a name and a shape, so the name that varies the address
+    // arrives with the empty one — what an event carrying nothing
+    // declares.
+    let named = format!("storm-{nonce}");
+    metadata
+        .types
+        .insert(named.clone(), TypeShape::Tuple(Vec::new()));
+    metadata.events.push(named);
     // The mark is granted to protocol code seeded at genesis, and this
     // artifact publishes through the ordinary path.
     for signature in metadata.methods.values_mut() {

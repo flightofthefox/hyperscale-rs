@@ -16,6 +16,7 @@ use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PreviewGrants, PreviewInputs, PreviewOutcome,
     PreviewReport, ResourceChange, TickBatchContext, TickEnvironment, XRD, genesis_writes,
 };
+use hyperscale_hbor::TypeShape;
 use hyperscale_storage::{SubstateStore, Substates, TickChain, TickOutput, VersionedStore};
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
@@ -1475,7 +1476,7 @@ fn a_committed_publish_grows_the_cache_that_routing_reads() {
     // metadata attached a second time under a different publisher would
     // be the same bytes, so vary the metadata to vary the address.
     let mut metadata = published_metadata();
-    metadata.events.push("republished".into());
+    naming(&mut metadata, "republished");
     let artifact = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
 
@@ -1526,6 +1527,20 @@ fn published_account_artifact() -> Vec<u8> {
 /// serves instances, and the gate holds one to declaring the seal its
 /// components come up through — which the account, serving principals,
 /// has no reason to carry.
+/// Vary `metadata`, and so the address of any artifact carrying it, by
+/// naming one more event.
+///
+/// A package is content-addressed, so republishing one is the same bytes
+/// at the same address; one more name is the smallest thing that moves
+/// it. An event is a name *and* a shape, so the name arrives with the
+/// empty one — what an event carrying nothing declares.
+fn naming(metadata: &mut PackageMetadata, event: &str) {
+    metadata.events.push(event.to_owned());
+    metadata
+        .types
+        .insert(event.to_owned(), TypeShape::Tuple(Vec::new()));
+}
+
 fn published_metadata() -> PackageMetadata {
     let mut metadata = staking::metadata();
     for signature in metadata.methods.values_mut() {
@@ -1553,7 +1568,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
     let executor = executor(ExecutionMode::Serial);
 
     let mut metadata = published_metadata();
-    metadata.events.push("compiled".into());
+    naming(&mut metadata, "compiled");
     let artifact = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
     assert!(
@@ -1585,7 +1600,7 @@ fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
     let executor = executor(ExecutionMode::Serial);
 
     let mut metadata = published_metadata();
-    metadata.events.push("reseeded".into());
+    naming(&mut metadata, "reseeded");
     let artifact = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
 
@@ -1607,7 +1622,7 @@ fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
     // the index still reaches the compile worker. A restart replays
     // whatever the store holds, so one unreadable entry must not be the
     // end of the reseed.
-    metadata.events.push("after the refusal".into());
+    naming(&mut metadata, "after the refusal");
     let next = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
     executor.install_artifact(&next);
     await_code_settled(&executor, package_hash(&ProtocolHasher, &next));
@@ -1623,7 +1638,7 @@ fn only_a_cell_that_addresses_its_own_contents_publishes() {
     let cache = executor.packages();
 
     let mut metadata = published_metadata();
-    metadata.events.push("smuggled".into());
+    naming(&mut metadata, "smuggled");
     let artifact = attach_metadata(STAKING_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
     let publisher = fee_payer(11);
@@ -1974,7 +1989,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     // serves instances, so its components come up through the seal its
     // own package declares.
     let mut metadata = staking::metadata();
-    metadata.events.push("instantiable".into());
+    naming(&mut metadata, "instantiable");
     for signature in metadata.methods.values_mut() {
         if signature.totality == Totality::Total {
             signature.totality = Totality::Infallible;
