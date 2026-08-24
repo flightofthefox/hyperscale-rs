@@ -21,8 +21,8 @@ use hyperscale_vm_types::{Address, CollectionId};
 
 use crate::lock_recover::{lock_or_recover, read_or_recover, write_or_recover};
 use crate::{
-    BlockForSync, JmtSnapshot, ShardChainReader, SubstateStore, Substates, VersionedStore,
-    entry_overlay_range, merge_entry_overlay, merge_entry_overlay_with,
+    Anchored, BlockForSync, JmtSnapshot, ShardChainReader, SubstateStore, Substates,
+    VersionedStore, entry_overlay_range, merge_entry_overlay, merge_entry_overlay_with,
 };
 
 /// Cached base-storage reads observed through a [`SubstateView`].
@@ -974,6 +974,8 @@ impl<Snap: Substates> Substates for ViewSnapshot<Snap> {
         )
     }
 }
+
+impl<Snap: Substates> Anchored for ViewSnapshot<Snap> {}
 
 impl<S: SubstateStore + VersionedStore> SubstateStore for SubstateView<S> {
     type Snapshot<'a>

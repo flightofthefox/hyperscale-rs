@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-use hyperscale_storage::Substates;
+use hyperscale_storage::{Anchored, Substates};
 use hyperscale_types::{EntryKey, SubstateKey};
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -97,6 +97,8 @@ pub fn entries_in_range_at(
     }
     merged.into_iter().take(limit).collect()
 }
+
+impl Anchored for SimSnapshot {}
 
 impl Substates for SimSnapshot {
     fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {

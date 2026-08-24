@@ -513,7 +513,7 @@ fn test_prepare_then_commit_fast_path() {
         ParentAnchor {
             state_root: parent_root,
             height: BlockHeight::GENESIS,
-            state: &*s_prepared,
+            state: &s_prepared.snapshot(),
             pending: &[],
             base_reads: None,
         },
@@ -541,7 +541,7 @@ fn test_prepare_commit_state_root_matches() {
         ParentAnchor {
             state_root: parent_root,
             height: BlockHeight::GENESIS,
-            state: &*storage,
+            state: &storage.snapshot(),
             pending: &[],
             base_reads: None,
         },

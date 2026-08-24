@@ -7,6 +7,18 @@ use hyperscale_types::{BlockHeight, DeclaredRange, StateRoot, SubstateKey};
 
 use crate::Substates;
 
+/// A reader whose version was fixed when it was made.
+///
+/// Every snapshot is one. A store is not, and neither is a
+/// [`crate::pending_chain::SubstateView`] read directly: both resolve
+/// against whatever has persisted by the time the read happens. The
+/// difference is invisible at a call site and decides the state root — a
+/// movement resolved against a baseline that moves with one validator's
+/// persistence progress forks against every replica that lagged
+/// differently. So the places that must not read live ask for this, and
+/// handing them a live reader stops compiling.
+pub trait Anchored: Substates {}
+
 /// Extension trait for substate storage with snapshots, historical reads,
 /// and JMT state roots.
 ///

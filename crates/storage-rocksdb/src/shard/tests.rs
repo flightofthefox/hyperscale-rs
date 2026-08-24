@@ -670,7 +670,7 @@ fn test_prepare_then_commit_matches_direct() {
         ParentAnchor {
             state_root: parent_root,
             height: BlockHeight::GENESIS,
-            state: &*s_prepared,
+            state: &s_prepared.snapshot(),
             pending: &[],
             base_reads: None,
         },
@@ -740,7 +740,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
         ParentAnchor {
             state_root: storage.state_root(),
             height: BlockHeight::GENESIS,
-            state: &*storage,
+            state: &storage.snapshot(),
             pending: &[],
             base_reads: None,
         },
@@ -765,7 +765,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
         ParentAnchor {
             state_root: root1,
             height: BlockHeight::new(1),
-            state: &*storage,
+            state: &storage.snapshot(),
             pending: &[],
             base_reads: None,
         },
@@ -776,7 +776,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
         ParentAnchor {
             state_root: root2,
             height: BlockHeight::new(2),
-            state: &*storage,
+            state: &storage.snapshot(),
             pending: std::slice::from_ref(&snap2),
             base_reads: None,
         },

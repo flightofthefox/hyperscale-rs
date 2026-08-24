@@ -12,7 +12,7 @@ use hyperscale_types::{
     Verifiable, Verified,
 };
 
-use crate::{BaseReadCache, JmtSnapshot, Substates};
+use crate::{Anchored, BaseReadCache, JmtSnapshot};
 
 /// The block a new one builds on: what it committed, and the state it
 /// left behind.
@@ -34,8 +34,9 @@ pub struct ParentAnchor<'a> {
     pub height: BlockHeight,
     /// The state as the parent left it — what this block's writes land
     /// on. Anchored at the parent, which is not always the committed
-    /// tip: a proposer builds on blocks that have not persisted yet.
-    pub state: &'a dyn Substates,
+    /// tip: a proposer builds on blocks that have not persisted yet, so
+    /// only a snapshot can answer for that height.
+    pub state: &'a dyn Anchored,
     /// The certified-but-unpersisted ancestors between the committed tip
     /// and the parent, as their verification snapshots. Their tree nodes
     /// overlay the base store for the JMT computation, and their settled
