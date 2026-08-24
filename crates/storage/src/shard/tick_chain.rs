@@ -715,6 +715,14 @@ mod tests {
     }
 
     struct StubSnapshot(HashMap<SubstateKey, Vec<u8>>);
+    use crate::Anchored;
+
+    impl Anchored for StubSnapshot {
+        fn anchor(&self) -> BlockHeight {
+            BlockHeight::GENESIS
+        }
+    }
+
     impl Substates for StubSnapshot {
         fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
             self.0.get(&key).cloned()

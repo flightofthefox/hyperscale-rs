@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 
 use hyperscale_storage::{Anchored, Substates};
-use hyperscale_types::{EntryKey, SubstateKey};
+use hyperscale_types::{BlockHeight, EntryKey, SubstateKey};
 use hyperscale_vm_types::{Address, CollectionId};
 
 /// Point-in-time snapshot of in-memory storage scoped to a specific
@@ -98,7 +98,11 @@ pub fn entries_in_range_at(
     merged.into_iter().take(limit).collect()
 }
 
-impl Anchored for SimSnapshot {}
+impl Anchored for SimSnapshot {
+    fn anchor(&self) -> BlockHeight {
+        BlockHeight::new(self.version)
+    }
+}
 
 impl Substates for SimSnapshot {
     fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {

@@ -79,7 +79,19 @@ impl ShardChainWriter for RocksDbShardStorage {
         // they commit the same values or they disagree about state. A
         // receipt says what it moved, and two receipts moving one cell
         // compose only once something has said what they moved from.
-        let settled = merge_writes_from_receipts(&settling, &mut |key| parent.state.cell(key));
+        let settled = merge_writes_from_receipts(&settling, &mut |key| {
+            // Reached only to resolve a movement, which is the one thing
+            // that needs the parent's own baseline. A snapshot of any
+            // other height is as wrong as a live read and looks the same
+            // from here, so what the type cannot say is checked where it
+            // matters.
+            assert_eq!(
+                parent.state.anchor(),
+                parent.height,
+                "a movement's baseline is anchored at the wrong height",
+            );
+            parent.state.cell(key)
+        });
 
         let (computed_root, collected) = if parent.pending.is_empty() {
             put_at_version(
