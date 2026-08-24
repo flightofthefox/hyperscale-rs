@@ -7,6 +7,8 @@
 //! is here is the state genesis writes, which is the half that needs the
 //! kernel's own amount encoding.
 
+use std::sync::Arc;
+
 pub use hyperscale_effects_bridge::genesis::{
     GenesisPackages, OWNER_BADGE_ID, OWNER_BADGE_RECORD, STAKE_UNIT_RECORD, World, XRD_RECORD,
     account_artifact, genesis_publisher, genesis_world, genesis_world_with_pools, pool_address,
@@ -15,15 +17,19 @@ pub use hyperscale_effects_bridge::genesis::{
 use hyperscale_effects_bridge::vm_statics::config_key;
 use hyperscale_effects_bridge::{ProtocolHasher, validator_key};
 pub use hyperscale_effects_bridge::{XRD, draw_key, vault_key};
-use hyperscale_hbor::to_vec;
+use hyperscale_hbor::{Hash32, to_vec};
 use hyperscale_types::{EntryKey, Hash, PrincipalAddr, SettledWrites, StakePoolSeat};
 use hyperscale_vm_effects::{
-    holdings_collection, instance_data_key, package_hash, resource_record_key,
+    Declaration, DeclaredAccess, ResourceKind, holdings_collection, instance_data_key,
+    package_hash, resource_record_key,
 };
+use hyperscale_vm_kernel::{EnvInputs, KernelSession, Locality, MemoryStore, OverlayStore};
 use hyperscale_vm_stdlib::{package_writes, staking};
-use hyperscale_vm_types::{Address, encode_amount};
+use hyperscale_vm_types::{
+    Address, Effect, EffectSet, EffectTarget, ISSUER_REP, Mode, Outcome, TxHash,
+};
 
-use crate::executor::artifact_package;
+use crate::executor::{artifact_package, protocol_hash};
 
 /// Configuration for genesis bootstrapping.
 #[derive(Debug, Clone, Default)]
@@ -158,13 +164,80 @@ pub fn genesis_writes(
                 .expect("a record encodes within its wire depth"),
         ),
     );
-    for (address, balance) in accounts {
-        writes.cells.insert(
-            vault_key(*address, *XRD),
-            Some(encode_amount(*balance).to_vec()),
-        );
-    }
+    let (minted, _) = minted_allocations(accounts).into_parts();
+    writes.cells.extend(minted);
     SettledWrites::from_parts(writes.cells, writes.entries)
+}
+
+/// The XRD each funded account is born holding, as the mint that made it.
+///
+/// Value enters the world through a mint and nowhere else, genesis
+/// included. Written straight into the cells it would be a stock no
+/// supply answers for, and the rule every later transaction meets would
+/// have one exception, at the one block nobody can inspect the history
+/// of. Run through the kernel it is a transaction like any other, and it
+/// meets the same fold — so a genesis that seeded more than it minted
+/// would not produce a receipt to seed from.
+///
+/// Only the value. Packages, validator records, pool configuration and
+/// badge custody are records rather than holdings, and stay the direct
+/// writes they are.
+fn minted_allocations(accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
+    /// What the opening mint is recorded under. Genesis has no signed
+    /// transaction behind it, so the hash names the occasion instead.
+    const GENESIS_TX: TxHash = TxHash(Hash32([0; 32]));
+
+    // One clause per allocation, in the order they are given, so a
+    // handle's index is the account it credits and nothing has to look
+    // one up.
+    let ordered: Vec<DeclaredAccess> = accounts
+        .iter()
+        .map(|(address, _)| DeclaredAccess {
+            effect: Effect {
+                target: EffectTarget::Point(vault_key(*address, *XRD)),
+                mode: Mode::Delta,
+            },
+            holds: Some(*XRD),
+        })
+        .collect();
+    let mut set = EffectSet::new();
+    for declared in &ordered {
+        set.insert(declared.effect)
+            .expect("a commutative credit conflicts with nothing");
+    }
+    let declaration = Declaration {
+        set,
+        ordered,
+        ..Declaration::default()
+    };
+    let mut session = KernelSession::materialize(
+        OverlayStore::new(Arc::new(MemoryStore::new())),
+        &declaration,
+        GENESIS_TX,
+        EnvInputs::unsealed(0),
+        protocol_hash,
+    )
+    .expect("every allocation names one unheld vault");
+
+    session.grant_issuance(*XRD, ResourceKind::Fungible);
+    for (rep, (_, balance)) in accounts.iter().enumerate() {
+        let rep = u32::try_from(rep).expect("one clause per funded account");
+        let minted = session.mint(ISSUER_REP, *balance).expect("the grant mints");
+        session
+            .delta_put(rep, minted)
+            .expect("into the vault it was minted for");
+    }
+    let (receipt, _) = session
+        .finish(Vec::new(), 0)
+        .expect("genesis declares every cell it credits");
+    assert!(
+        matches!(receipt.outcome, Outcome::Completed { .. }),
+        "genesis seeds only what it mints: {:?}",
+        receipt.outcome
+    );
+    // Resolved against nothing, which is what an opening balance lands
+    // on: every credit here is the first thing its cell ever held.
+    receipt.delta.project(&Locality::All).resolve(&mut |_| None)
 }
 
 /// The packages the chain is born running, as the beacon registry holds
@@ -188,8 +261,31 @@ pub fn genesis_package_facts(packages: &GenesisPackages) -> Vec<(Hash, Address)>
 #[cfg(test)]
 mod tests {
     use hyperscale_types::test_utils::test_principal;
+    use hyperscale_vm_types::encode_amount;
 
     use super::*;
+
+    /// The opening balances come from a mint, never from a write.
+    ///
+    /// A genesis seeding more than it minted would not get this far: the
+    /// session it runs through meets the same fold every later
+    /// transaction does, and the seeding is read off the receipt.
+    #[test]
+    fn funded_vaults_are_what_genesis_minted() {
+        let alice = test_principal(0x11);
+        let bob = test_principal(0x22);
+        let (cells, entries) = minted_allocations(&[(alice, 500), (bob, 700)]).into_parts();
+
+        assert!(entries.is_empty(), "a balance is a cell, not an entry");
+        assert_eq!(
+            cells,
+            std::collections::BTreeMap::from([
+                (vault_key(alice, *XRD), Some(encode_amount(500).to_vec())),
+                (vault_key(bob, *XRD), Some(encode_amount(700).to_vec())),
+            ]),
+            "the mint credits each funded vault and nothing besides"
+        );
+    }
 
     #[test]
     fn genesis_writes_are_identity_keyed_vault_cells() {
