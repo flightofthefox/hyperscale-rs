@@ -27,7 +27,7 @@ flat key:  owner(16) || local(16)
 leaf key:  [ owner | local ]
 ```
 
-The leaf is read straight off the key — no hashing, no ownership map — because the effect DSL computes placement when it derives the transaction's access, so the storage layer has nothing left to derive (INV-VM-4 holds structurally rather than by validation). Routing is the same prefix walk as everything else (`shard_for_prefix`), and every key-classifying path fails closed on a shape that is not exactly this one. Three consequences follow:
+The leaf is read straight off the key — no hashing, no ownership map — because the effect DSL computes placement when it derives the transaction's access, so the storage layer has nothing left to derive (INV-VM-OBJ-1 holds structurally rather than by validation). Routing is the same prefix walk as everything else (`shard_for_prefix`), and every key-classifying path fails closed on a shape that is not exactly this one. Three consequences follow:
 
 - An account and everything it owns live in **one** shard, always: an owned object's key is minted under its creator's prefix, so it is placed at creation rather than resolved afterward.
 - An object never changes owner, so keys are stable forever: nothing ever needs re-keying, including across splits and merges (INV-STATE-2).

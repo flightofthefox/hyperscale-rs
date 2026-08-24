@@ -24,6 +24,6 @@ Start with the overview; it tells the whole story in five pages and links down.
 
 ## Conventions
 
-- **Invariant IDs** (`INV-<AREA>-<n>`) are stable references. They appear inline in each doc where the property arises; the precise statements live once, in [08-invariants.md](08-invariants.md). Cite them rather than restating properties. The `INV-VM-*` family is the exception: the execution engine documents itself, and its register is [vm/docs/09-invariants.md](../vm/docs/09-invariants.md).
+- **Invariant IDs** (`INV-<AREA>-<n>`) are stable references. They appear inline in each doc where the property arises; the precise statements live once, in [08-invariants.md](08-invariants.md). Cite them rather than restating properties. The `INV-VM-*` families are the exception: the execution engine documents itself, and its register — which subdivides by area the same way, as `INV-VM-<AREA>-<n>` — is [vm/docs/09-invariants.md](../vm/docs/09-invariants.md).
 - **Code anchors** name crates and load-bearing types (for example `QuorumCertificate` in `crates/types`, `ReshapeOrchestrator` in `crates/node`). They are entry points for a code dive, not line-precise references.
 - The docs describe the system as designed and built on `main`; known interim gaps are flagged explicitly where they exist (the register's "known deliberate gaps" in [08-invariants.md](08-invariants.md)).

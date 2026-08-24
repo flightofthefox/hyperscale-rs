@@ -4,7 +4,7 @@ The consolidated register of the system's safety and liveness properties, with s
 
 **Classification.** *Safety* — never violated in any reachable state, regardless of timing. *Liveness* — eventually holds under eventual synchrony. *Assumption* — a premise the deployment must establish; other properties are conditional on it. *Determinism* — a functional property (same inputs ⇒ same outputs across replicas) that safety properties reduce to.
 
-**The VM family.** `INV-VM-*` IDs cited from these documents are stated in the VM's own register, [vm/docs/09-invariants.md](../vm/docs/09-invariants.md); this register owns every other family. The split follows the design boundary: the VM register covers execution semantics, the runtime, the object model, and the requirements the engine places on its host; this one covers the protocol that hosts it.
+**The VM families.** `INV-VM-<AREA>-<n>` IDs cited from these documents are stated in the VM's own register, [vm/docs/09-invariants.md](../vm/docs/09-invariants.md); this register owns every other family. The split follows the design boundary: the VM register covers execution semantics, the runtime, the object model, and the requirements the engine places on its host; this one covers the protocol that hosts it.
 
 **Suggested verification order** (dependency-first): INV-SEC-1 (the premise) → INV-SHARD-1..9 (single-chain safety) → INV-BEACON-1..12 (topology determinism) → INV-EXEC-1..10 (atomic commitment) → INV-RESHAPE-1..11 (atomicity under topology change) → INV-SEC-2..14 / INV-STATE / INV-ECON / INV-DET (the supporting mechanisms and reductions).
 

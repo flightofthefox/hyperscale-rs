@@ -2,11 +2,11 @@
 // payer-first commitment with the max_fee reservation as block validity,
 // commit-proof-gated counterpart engagement, engagement-echo-gated payer
 // voting with the validity-window deadline abort at the floor, and the
-// successor sweep under payer-shard termination. Checked for INV-VM-9
-// (no counterpart engages without an engaged reservation), INV-VM-10
+// successor sweep under payer-shard termination. Checked for INV-VM-HOST-1
+// (no counterpart engages without an engaged reservation), INV-VM-HOST-2
 // (every engaged reservation resolves exactly once, burn classes by
-// verdict, conservation), INV-VM-11 (the payer speaks once, on its own
-// chain content), and INV-VM-7's fee-side clause (a bond is posted only
+// verdict, conservation), INV-VM-HOST-3 (the payer speaks once, on its own
+// chain content), and INV-VM-OBJ-2's fee-side clause (a bond is posted only
 // against substates that committed, and a balance that cannot cover one
 // records debt rather than forgiving it).
 //
@@ -151,7 +151,7 @@ module vm_fee_assurance {
   // The storage bond a committed transaction's substates carry. Posted
   // out of the payer's balance at settlement, refundable to whoever
   // later deletes them — burned value and bonded value are different
-  // things, and INV-VM-7 conserves the second.
+  // things, and INV-VM-OBJ-2 conserves the second.
   const BOND: int
   // Broken twin: an abort posts a bond for substates it never wrote.
   const BOND_ON_ABORT: bool
@@ -218,11 +218,11 @@ module vm_fee_assurance {
   // P has reached its reshape terminal block; its chain is frozen.
   var pTerminal: bool
   // The payer's fee accounting: liquid balance, held reservation,
-  // cumulative burn. INV-VM-10's conserved quantities.
+  // cumulative burn. INV-VM-HOST-2's conserved quantities.
   var balance: int
   var held: int
   var burned: int
-  // INV-VM-7's quantities: bonds posted against committed substates, and
+  // INV-VM-OBJ-2's quantities: bonds posted against committed substates, and
   // the debt a payer whose balance could not cover one still owes.
   var bonded: int
   var debt: int
@@ -529,21 +529,21 @@ module vm_fee_assurance {
     pLocalTimerAbort, pTerminate,
   }
 
-  // INV-VM-9: engagement is evidence-gated. Q committed implies P
+  // INV-VM-HOST-1: engagement is evidence-gated. Q committed implies P
   // committed — under the healthy gate, Q moreover holds the proof.
   val invEngageGated =
     committedAt.get(Q) == NONE or committedAt.get(P) != NONE
 
-  // INV-VM-10: the conserved quantities. Fees never move cross-shard —
+  // INV-VM-HOST-2: the conserved quantities. Fees never move cross-shard —
   // Q has no fee state to conserve, structurally.
   val invConserve = balance + held + burned + bonded == BALANCE + debt
 
-  // INV-VM-7: a bond is posted only against substates that committed.
+  // INV-VM-OBJ-2: a bond is posted only against substates that committed.
   // An aborted transaction wrote none, so it carries no bond — the same
   // fact that makes the abort atomic, read on the storage side.
   val invNoBondOnAbort = terminal.get(P) != ABORT or bonded == 0
 
-  // INV-VM-7: what a payer's balance could not cover is recorded as
+  // INV-VM-OBJ-2: what a payer's balance could not cover is recorded as
   // debt, never silently forgiven — and debt exists only against a
   // posted bond.
   val invDebtBacked = debt >= 0 and debt <= bonded
