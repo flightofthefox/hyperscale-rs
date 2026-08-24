@@ -17,7 +17,9 @@ use hyperscale_engine::{
     PreviewReport, ResourceChange, TickBatchContext, TickEnvironment, XRD, genesis_writes,
 };
 use hyperscale_hbor::TypeShape;
-use hyperscale_storage::{SubstateStore, Substates, TickChain, TickOutput, VersionedStore};
+use hyperscale_storage::{
+    Anchored, SubstateStore, Substates, TickChain, TickOutput, VersionedStore,
+};
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     BeaconWitnessEvent, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
@@ -111,8 +113,15 @@ impl Substates for MapDb {
     }
 }
 
-/// The store surface a [`TickChain`] needs. The map is the whole world
-/// at one version, so every anchor reads the same.
+/// The map is the whole world at one version, so every anchor reads the
+/// same and the snapshot is a copy of it.
+impl Anchored for MapDb {
+    fn anchor(&self) -> BlockHeight {
+        BlockHeight::GENESIS
+    }
+}
+
+/// The store surface a [`TickChain`] needs.
 impl SubstateStore for MapDb {
     type Snapshot<'a> = Self;
     fn snapshot(&self) -> Self::Snapshot<'_> {

@@ -938,6 +938,8 @@ impl<S: Substates> Substates for SubstateView<S> {
 /// base storage's snapshot.
 pub struct ViewSnapshot<Snap> {
     base_snapshot: Snap,
+    /// The view's anchor, which is the height `base_snapshot` reads at.
+    anchor: BlockHeight,
     overlay: Arc<OverlayEntries>,
     overlay_entries: Arc<BTreeMap<EntryKey, Option<Vec<u8>>>>,
     /// Shared with the parent `SubstateView` so reads through this
@@ -975,7 +977,11 @@ impl<Snap: Substates> Substates for ViewSnapshot<Snap> {
     }
 }
 
-impl<Snap: Substates> Anchored for ViewSnapshot<Snap> {}
+impl<Snap: Substates> Anchored for ViewSnapshot<Snap> {
+    fn anchor(&self) -> BlockHeight {
+        self.anchor
+    }
+}
 
 impl<S: SubstateStore + VersionedStore> SubstateStore for SubstateView<S> {
     type Snapshot<'a>
@@ -992,6 +998,7 @@ impl<S: SubstateStore + VersionedStore> SubstateStore for SubstateView<S> {
         // for cross-validator state_root computation.
         ViewSnapshot {
             base_snapshot: (*self.base).snapshot_at(self.anchor_height),
+            anchor: self.anchor_height,
             // Clone the overlay into an Arc so the snapshot is `'static`
             // with respect to the view's overlay map.
             overlay: Arc::new(self.overlay.clone()),
@@ -1162,6 +1169,12 @@ mod tests {
 
     /// Empty snapshot for `StubStore` — returns no data.
     struct StubSnapshot;
+    impl Anchored for StubSnapshot {
+        fn anchor(&self) -> BlockHeight {
+            BlockHeight::GENESIS
+        }
+    }
+
     impl Substates for StubSnapshot {
         fn cell(&self, _key: SubstateKey) -> Option<Vec<u8>> {
             None

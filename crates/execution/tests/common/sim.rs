@@ -35,8 +35,8 @@ use hyperscale_execution::action_handlers::{
 };
 use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizationStore};
 use hyperscale_storage::{
-    RecoveredState, ReplayWindow, SubstateStore, Substates, TickChain, TickOutput, VersionedStore,
-    merge_writes_from_receipts,
+    Anchored, RecoveredState, ReplayWindow, SubstateStore, Substates, TickChain, TickOutput,
+    VersionedStore, merge_writes_from_receipts,
 };
 use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, certify, make_live_block};
 use hyperscale_types::{
@@ -121,6 +121,12 @@ impl StubBase {
 
 /// A snapshot of [`StubBase`] — cloned, so a fold cannot mutate through it.
 struct StubSnapshot(HashMap<SubstateKey, Vec<u8>>);
+
+impl Anchored for StubSnapshot {
+    fn anchor(&self) -> BlockHeight {
+        BlockHeight::GENESIS
+    }
+}
 
 impl Substates for StubSnapshot {
     fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {

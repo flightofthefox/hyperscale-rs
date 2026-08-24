@@ -17,7 +17,15 @@ use crate::Substates;
 /// persistence progress forks against every replica that lagged
 /// differently. So the places that must not read live ask for this, and
 /// handing them a live reader stops compiling.
-pub trait Anchored: Substates {}
+pub trait Anchored: Substates {
+    /// The height every read through this reader resolves at.
+    ///
+    /// Knowing a version was fixed is not enough for a caller that needs
+    /// a *particular* one — a snapshot of the wrong block is as wrong as
+    /// a live read, and looks the same at the call site. This is what
+    /// lets the caller check.
+    fn anchor(&self) -> BlockHeight;
+}
 
 /// Extension trait for substate storage with snapshots, historical reads,
 /// and JMT state roots.
@@ -43,7 +51,7 @@ pub trait SubstateStore: Substates + Send + Sync + 'static {
     /// chosen by the impl's [`Self::snapshot`] default (typically the
     /// current committed tip). For views, it is the view's bound
     /// anchor height.
-    type Snapshot<'a>: Substates + Send + Sync
+    type Snapshot<'a>: Anchored + Send + Sync
     where
         Self: 'a;
 

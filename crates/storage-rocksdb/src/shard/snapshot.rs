@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use hyperscale_storage::{Anchored, Substates};
-use hyperscale_types::SubstateKey;
+use hyperscale_types::{BlockHeight, SubstateKey};
 use hyperscale_vm_types::{Address, CollectionId};
 use rocksdb::{DB, ReadOptions, Snapshot};
 
@@ -44,7 +44,11 @@ impl RocksDbSnapshot<'_> {
     }
 }
 
-impl Anchored for RocksDbSnapshot<'_> {}
+impl Anchored for RocksDbSnapshot<'_> {
+    fn anchor(&self) -> BlockHeight {
+        BlockHeight::new(self.version)
+    }
+}
 
 impl Substates for RocksDbSnapshot<'_> {
     fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
