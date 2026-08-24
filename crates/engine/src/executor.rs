@@ -1404,4 +1404,53 @@ mod tests {
             Some(payer.floor),
         );
     }
+
+    /// A transaction that lost value costs its sender nothing.
+    ///
+    /// Every other abort here is priced, because charging nothing makes
+    /// failure the cheaper way to buy execution. This one is the
+    /// exception and has to be: the outcome names the kernel, not the
+    /// sender, so a sender charged for it would be paying for a defect.
+    /// What keeps the exception from being a free-execution lever is that
+    /// nothing a package can express reaches it — value moves only
+    /// through buckets, every bucket names what it carries, and a
+    /// declaration calling one cell two resources is refused before any
+    /// body runs.
+    #[test]
+    fn a_kernel_defect_is_priced_to_nobody() {
+        let payer = PayerFee {
+            vault: SubstateKey {
+                owner: Address::new([1; 31], AddressClass::Component),
+                local: LocalKey([0; 16]),
+            },
+            floor: 7,
+            max_fee: 1_000,
+            abortable: false,
+        };
+        assert_eq!(
+            charge_for(
+                &Outcome::ProtocolError {
+                    reason: AbortReason::ValueNotConserved
+                },
+                payer
+            ),
+            None,
+        );
+        // The sole exception: every abort a sender can reach is priced,
+        // whichever end of the schedule it lands on.
+        assert!(
+            charge_for(&Outcome::Declined { node: 0, code: 3 }, payer).is_some(),
+            "a declared refusal pays"
+        );
+        assert!(
+            charge_for(
+                &Outcome::UserError {
+                    reason: AbortReason::Unreachable
+                },
+                payer
+            )
+            .is_some(),
+            "and so does a trap"
+        );
+    }
 }
