@@ -287,7 +287,7 @@ impl ExecutionSim {
             // Movements resolve against the state they land on, which is
             // whatever the certificates before this one already settled.
             let resolved =
-                merge_writes_from_receipts(&fw.settling_receipts(), &mut |key| self.base.cell(key));
+                merge_writes_from_receipts(&fw.settling_receipts(), &self.base.snapshot());
             self.base.apply(self.height, &resolved);
         }
         let block = make_live_block(

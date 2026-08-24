@@ -11,6 +11,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_kernel::Substates;
 
+use crate::shard::store::Anchored;
 use crate::tree::JmtSnapshot;
 
 /// Extract and merge the writes from stored receipts, resolving what
@@ -31,10 +32,19 @@ use crate::tree::JmtSnapshot;
 /// `prior` reads the state being settled into. It is consulted only for
 /// cells something moved and nothing in this batch wrote, which is the
 /// one case where the starting value is not already here.
+///
+/// It is [`Anchored`] because a movement's baseline decides the state
+/// root. A live reader resolves against whatever the node it runs on has
+/// persisted, so two validators at different persistence depths would
+/// settle one block's movements onto two different values and attest two
+/// different roots. Knowing the version was fixed is what this asks; a
+/// caller that needs a *particular* height still checks `anchor()`,
+/// because a snapshot of the wrong block is as wrong as a live read and
+/// looks the same from here.
 #[must_use]
 pub fn merge_writes_from_receipts(
     receipts: &[StoredReceipt],
-    prior: &mut dyn FnMut(SubstateKey) -> Option<Vec<u8>>,
+    prior: &dyn Anchored,
 ) -> SettledWrites {
     let mut merged = StateWrites::default();
     for receipt in receipts {
@@ -42,7 +52,7 @@ pub fn merge_writes_from_receipts(
             fold_state_writes(&mut merged, writes);
         }
     }
-    merged.resolve(prior)
+    merged.resolve(&mut |key| prior.cell(key))
 }
 
 /// Fold `writes` onto `merged`, in that order.

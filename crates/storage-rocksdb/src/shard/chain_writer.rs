@@ -7,7 +7,7 @@ use hyperscale_storage::tree::{
     resolve_materialized_root,
 };
 use hyperscale_storage::{
-    JmtSnapshot, ParentAnchor, ShardChainWriter, Substates, merge_writes_from_receipts,
+    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, merge_writes_from_receipts,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, Finalization, PreparedCommit,
@@ -79,19 +79,15 @@ impl ShardChainWriter for RocksDbShardStorage {
         // they commit the same values or they disagree about state. A
         // receipt says what it moved, and two receipts moving one cell
         // compose only once something has said what they moved from.
-        let settled = merge_writes_from_receipts(&settling, &mut |key| {
-            // Reached only to resolve a movement, which is the one thing
-            // that needs the parent's own baseline. A snapshot of any
-            // other height is as wrong as a live read and looks the same
-            // from here, so what the type cannot say is checked where it
-            // matters.
-            assert_eq!(
-                parent.state.anchor(),
-                parent.height,
-                "a movement's baseline is anchored at the wrong height",
-            );
-            parent.state.cell(key)
-        });
+        // The type says the baseline was fixed when it was made; which
+        // block it was fixed at is this caller's to check, and a movement
+        // resolved against any other is as wrong as one resolved live.
+        assert_eq!(
+            parent.state.anchor(),
+            parent.height,
+            "a movement's baseline is anchored at the wrong height",
+        );
+        let settled = merge_writes_from_receipts(&settling, parent.state);
 
         let (computed_root, collected) = if parent.pending.is_empty() {
             put_at_version(
@@ -154,8 +150,13 @@ impl ShardChainWriter for RocksDbShardStorage {
             .iter()
             .flat_map(|fw| fw.settling_receipts())
             .collect();
-        let merged_writes = merge_writes_from_receipts(&settling, &mut |key| self.cell(key));
+        // Under the lock, and off a snapshot rather than the live store:
+        // the baseline a movement resolves against has to be the state
+        // this block is about to land on, and both a concurrent commit
+        // and this node's own persistence depth move a live read out
+        // from under it.
         let _commit_guard = self.commit_lock.lock().unwrap();
+        let merged_writes = merge_writes_from_receipts(&settling, &self.snapshot());
         self.commit_block_inner_locked(&merged_writes, block, qc, &receipts, witness)
     }
 }
@@ -238,7 +239,7 @@ fn build_prepared_commit(
                 .iter()
                 .flat_map(|fw| fw.settling_receipts())
                 .collect();
-            let merged_writes = merge_writes_from_receipts(&settling, &mut |key| storage.cell(key));
+            let merged_writes = merge_writes_from_receipts(&settling, &storage.snapshot());
             storage.commit_block_inner_locked(&merged_writes, block, qc, &receipts, witness)
         },
     )

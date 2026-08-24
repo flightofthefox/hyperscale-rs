@@ -12,8 +12,9 @@ use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
-    AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, Substates, WitnessSeed,
-    entry_from_leaf, filter_writes_to_prefix, merge_writes_from_receipts, package_of_cell,
+    AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, SubstateStore, Substates,
+    WitnessSeed, entry_from_leaf, filter_writes_to_prefix, merge_writes_from_receipts,
+    package_of_cell,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryKey, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf,
@@ -231,7 +232,12 @@ impl BoundaryStore for SimShardStorage {
         height: BlockHeight,
         receipts: &[StoredReceipt],
     ) -> Result<StateRoot, String> {
-        let merged = merge_writes_from_receipts(receipts, &mut |key| self.cell(key));
+        // Anchored at this store's own tip, which the check above holds
+        // only to being behind the followed block rather than one short
+        // of it. A follow that skips a height resolves its movements
+        // against a baseline missing what the gap left, and fails against
+        // the child roots rather than committing quietly.
+        let merged = merge_writes_from_receipts(receipts, &self.snapshot());
         let mut state = write_or_recover(&self.state);
         if height <= state.current_block_height {
             return Err(format!(
