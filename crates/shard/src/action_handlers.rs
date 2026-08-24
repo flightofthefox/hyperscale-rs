@@ -11,7 +11,7 @@ use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
     JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage, SubstateStore, SubstateView,
-    Substates, TerminalWindow,
+    TerminalWindow, VersionedStore,
 };
 use hyperscale_types::network::gossip::{CertifiedBlockHeaderGossip, ShardForkProofGossip};
 use hyperscale_types::network::notification::{
@@ -196,7 +196,7 @@ pub struct ProposalResult {
 /// 4. Return block, hash, prepared commit handle
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)] // one linear block-assembly pipeline
-pub fn build_proposal<S: ShardChainWriter + Substates>(
+pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore>(
     view: &Arc<SubstateView<S>>,
     proposer: ValidatorId,
     height: BlockHeight,
@@ -232,11 +232,16 @@ pub fn build_proposal<S: ShardChainWriter + Substates>(
     // this block's settling movements land on, the pending chain its
     // priors are judged against, and the reads execution accumulated.
     let base_reads = view.take_base_reads();
+    // Read through the view's snapshot, which resolves the base at the
+    // anchor height. Reading the view directly resolves at whatever this
+    // validator has persisted, and a movement baseline that moves with
+    // persistence progress forks the root against replicas that lag.
+    let anchored = view.snapshot();
     let (state_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
         ParentAnchor {
             state_root: parent_state_root,
             height: parent_block_height,
-            state: view.as_ref(),
+            state: &anchored,
             pending: view.pending_snapshots(),
             base_reads: Some(&base_reads),
         },
@@ -826,11 +831,12 @@ where
                 .view_at(parent_block_hash, parent_block_height);
             // The view is freshly anchored — nothing has read through
             // it, so there is no execution cache to carry.
+            let anchored = view.snapshot();
             let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
                 ParentAnchor {
                     state_root: parent_state_root,
                     height: parent_block_height,
-                    state: view.as_ref(),
+                    state: &anchored,
                     pending: view.pending_snapshots(),
                     base_reads: None,
                 },

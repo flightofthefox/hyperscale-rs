@@ -32,7 +32,7 @@ use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
     ChainEntry, ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore,
-    ShardChainWriter, TerminalWindow,
+    ShardChainWriter, SubstateStore, TerminalWindow,
 };
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::TestCommittee;
@@ -1814,7 +1814,7 @@ impl ShardCoordinatorSim {
                     ParentAnchor {
                         state_root: parent_state_root,
                         height: parent_block_height,
-                        state: view.as_ref(),
+                        state: &view.snapshot(),
                         pending: view.pending_snapshots(),
                         base_reads: None,
                     },

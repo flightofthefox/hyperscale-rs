@@ -23,7 +23,7 @@ use crossbeam::channel::Sender;
 use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
-use hyperscale_storage::{ChainEntry, ParentAnchor, PendingChain, ShardStorage};
+use hyperscale_storage::{ChainEntry, ParentAnchor, PendingChain, ShardStorage, SubstateStore};
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, Derivation,
     EpochWindows, Finalization, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SyncHint,
@@ -169,11 +169,12 @@ where
     let finalizations: Vec<Arc<Verifiable<Finalization>>> = block.certificates().to_vec();
     // The view is freshly anchored — nothing has read through it, so
     // there is no execution cache to carry.
+    let anchored = view.snapshot();
     let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
         ParentAnchor {
             state_root: pending.parent_state_root,
             height: pending.parent_block_height,
-            state: view.as_ref(),
+            state: &anchored,
             pending: view.pending_snapshots(),
             base_reads: None,
         },
