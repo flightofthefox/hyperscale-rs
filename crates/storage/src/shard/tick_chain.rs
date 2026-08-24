@@ -647,12 +647,15 @@ mod tests {
     use std::sync::Mutex;
 
     use hyperscale_types::{
-        Address, AddressClass, DeclaredRange, EntryKey, Hash, LocalKey, ShardId, StateRoot,
-        encode_amount,
+        Address, AddressClass, DeclaredRange, EntryKey, Hash, LocalKey, ResourceAddr, ShardId,
+        StateRoot, encode_amount,
     };
 
     use super::*;
     use crate::SubstateStore;
+
+    /// What every cell these fixtures move holds.
+    const RESOURCE: ResourceAddr = ResourceAddr::new([0xE1; 31]);
     use crate::lock_recover::lock_or_recover;
 
     /// A base built from settled write sets at heights, readable as of
@@ -804,6 +807,7 @@ mod tests {
         moved.movements.insert(
             cell,
             Movement {
+                resource: RESOURCE,
                 credit: 0,
                 debit: amount,
             },

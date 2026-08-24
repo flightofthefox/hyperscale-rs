@@ -22,7 +22,7 @@ use blake3::hash as blake3_hash;
 use hyperscale_effects_bridge::records::{PackageCache, record_address};
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key, principal_for};
 use hyperscale_effects_bridge::{
-    BridgeStatics, LocalCells, NodeRecords, PoolRegistry, ProtocolHasher, admit_package,
+    BridgeStatics, LocalCells, NodeRecords, PoolRegistry, ProtocolHasher, XRD, admit_package,
     decode_tree, envelope_identity, witness_from_event,
 };
 use hyperscale_metrics::record_transaction_executed;
@@ -596,11 +596,15 @@ fn apply_fee_burn(writes: &mut StateWrites, fee: Option<PayerFee>, fuel: u64) {
     if burn == 0 {
         return;
     }
-    let entry = writes.movements.entry(payer.vault).or_default();
-    *entry = entry.then(Movement {
-        credit: 0,
-        debit: burn,
-    });
+    // A fee is paid in the protocol's own resource, which is what the
+    // payer's vault is keyed by and what makes this movement nameable
+    // without reading the vault.
+    let burned = Movement::debit(*XRD, burn);
+    writes
+        .movements
+        .entry(payer.vault)
+        .and_modify(|standing| *standing = standing.then(burned))
+        .or_insert(burned);
 }
 
 /// What this shard, as a transaction's fee payer, charges it.
@@ -717,13 +721,7 @@ fn build_fee_receipt(
 ) -> ConsensusReceipt {
     let writes = StateWrites {
         cells: BTreeMap::new(),
-        movements: BTreeMap::from([(
-            vault,
-            Movement {
-                credit: 0,
-                debit: floor,
-            },
-        )]),
+        movements: BTreeMap::from([(vault, Movement::debit(*XRD, floor))]),
         entries: BTreeMap::new(),
     };
     let receipt_hash = GlobalReceipt::new(

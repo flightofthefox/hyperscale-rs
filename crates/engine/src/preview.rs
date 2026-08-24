@@ -196,7 +196,7 @@ fn resource_changes(
             let change = changes
                 .entry(key)
                 .or_insert_with(|| ResourceChange::at(key, amount_at(base, key)));
-            change.settled = change.settled.saturating_add(settled);
+            change.settled = change.settled.saturating_add(settled.debit);
         }
     }
     let charged_to = (fee > 0 && !grants.free_credit).then_some(payer);

@@ -43,12 +43,15 @@ use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, CertifiedBlock,
     ConsensusReceipt, DeclaredRange, EventRoot, ExecutionCertificate, ExecutionMetadata,
     ExecutionOutcome, Finalization, GlobalReceipt, LocalKey, MerkleInclusionProof, Movement,
-    ProvisionEntry, Provisions, SettledWrites, ShardId, ShardTrie, SignerBitfield, StateRoot,
-    StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TopologySchedule, TopologySnapshot,
-    Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    compute_global_receipt_root, read_amount,
+    ProvisionEntry, Provisions, ResourceAddr, SettledWrites, ShardId, ShardTrie, SignerBitfield,
+    StateRoot, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TopologySchedule,
+    TopologySnapshot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, compute_global_receipt_root, read_amount,
 };
 use hyperscale_vm_types::CollectionId;
+
+/// What every cell these fixtures move holds.
+const RESOURCE: ResourceAddr = ResourceAddr::new([0xE1; 31]);
 
 /// The shard a single-shard fixture runs on.
 pub const SHARD: ShardId = ShardId::ROOT;
@@ -665,11 +668,15 @@ fn stub_execute(
         let next = counter(snapshot.cell(cell)) + 1;
         cells.insert(cell, Some(next.to_le_bytes().to_vec()));
         charged.get_or_insert_with(|| key.owner());
-        let credit = movements.entry(vault_of(key.owner())).or_default();
-        *credit = credit.then(Movement {
+        let credited = Movement {
+            resource: RESOURCE,
             credit: CREDIT,
             debit: 0,
-        });
+        };
+        movements
+            .entry(vault_of(key.owner()))
+            .and_modify(|standing| *standing = standing.then(credited))
+            .or_insert(credited);
     }
     let writes = StateWrites {
         cells,
@@ -709,6 +716,7 @@ fn stub_charge(owner: Address) -> ConsensusReceipt {
     writes.movements.insert(
         charge_of(owner),
         Movement {
+            resource: RESOURCE,
             credit: FLOOR,
             debit: 0,
         },
