@@ -164,8 +164,13 @@ pub fn genesis_writes(
                 .expect("a record encodes within its wire depth"),
         ),
     );
-    let (minted, _) = minted_allocations(accounts).into_parts();
-    writes.cells.extend(minted);
+    // Both halves of what the mint produced, though a fungible seed
+    // yields only cells: what genesis seeds is read off a receipt, and a
+    // reader that takes half of one decides by omission what a later
+    // seed is allowed to be.
+    let (cells, entries) = minted_allocations(accounts).into_parts();
+    writes.cells.extend(cells);
+    writes.entries.extend(entries);
     SettledWrites::from_parts(writes.cells, writes.entries)
 }
 
