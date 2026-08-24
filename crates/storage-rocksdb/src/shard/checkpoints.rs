@@ -18,7 +18,7 @@ use std::sync::Arc;
 use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, Substates, WitnessSeed,
+    AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, SubstateStore, Substates, WitnessSeed,
     entry_from_leaf, filter_writes_to_prefix, merge_writes_from_receipts, package_of_cell,
 };
 use hyperscale_types::{
@@ -595,7 +595,12 @@ impl BoundaryStore for RocksDbShardStorage {
             ));
         }
 
-        let merged = merge_writes_from_receipts(receipts, &mut |key| self.cell(key));
+        // Anchored at this store's own tip, which the check above holds
+        // only to being behind the followed block rather than one short
+        // of it. A follow that skips a height resolves its movements
+        // against a baseline missing what the gap left, and fails against
+        // the child roots rather than committing quietly.
+        let merged = merge_writes_from_receipts(receipts, &self.snapshot());
         let filtered = filter_writes_to_prefix(&merged, &self.root_path);
         if filtered.is_empty() {
             return Ok(base_root);

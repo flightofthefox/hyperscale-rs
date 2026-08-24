@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use hyperscale_jmt::NibblePath;
 use hyperscale_storage::test_helpers::{
-    entry_key, make_settled_writes, make_test_block, make_test_block_with_anchor_wt,
-    make_test_certified, make_test_execution_certificate, make_test_finalization, make_test_qc,
-    make_test_receipt, state_key, test_committed_bundle_outlives_sealing,
-    test_ec_storage_batch as helpers_test_ec_storage_batch,
+    PendingBaseline, entry_key, make_settled_writes, make_test_block,
+    make_test_block_with_anchor_wt, make_test_certified, make_test_execution_certificate,
+    make_test_finalization, make_test_qc, make_test_receipt, state_key,
+    test_committed_bundle_outlives_sealing, test_ec_storage_batch as helpers_test_ec_storage_batch,
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
     test_entries_commit_serve_and_history, test_recovery_carries_the_tip_drain_total,
     test_registers_recover_their_justification, test_retained_bundle_drops_below_the_history_floor,
@@ -776,7 +776,15 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
         ParentAnchor {
             state_root: root2,
             height: BlockHeight::new(2),
-            state: &storage.snapshot(),
+            // Block 2 is certified and unpersisted, so the store's own
+            // snapshot answers for block 1. What the parent left is that
+            // plus what block 2 settled, which is what a view supplies
+            // here in production.
+            state: &PendingBaseline::new(
+                storage.snapshot(),
+                std::slice::from_ref(&snap2),
+                BlockHeight::new(2),
+            ),
             pending: std::slice::from_ref(&snap2),
             base_reads: None,
         },

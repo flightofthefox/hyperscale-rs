@@ -30,10 +30,70 @@ use hyperscale_types::{
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
-    BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, RecoveredState,
-    SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
-    VersionedStore, WitnessSeed,
+    Anchored, BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, JmtSnapshot,
+    RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore,
+    Substates, VersionedStore, WitnessSeed,
 };
+
+/// The state a parent left, where the parent is certified but not yet
+/// persisted: the store's own tip, overlaid with what the blocks between
+/// have settled, answering for the height they reach.
+///
+/// This is what a [`SubstateView`](crate::SubstateView) is in production,
+/// spelled small enough for a backend's own tests. It exists because
+/// `ParentAnchor::state` must answer for the parent's height and a store
+/// snapshot answers for the last block it wrote — the two differ exactly
+/// while a proposer is building on blocks its own disk has not caught up
+/// with, which is the case worth having a fixture for.
+pub struct PendingBaseline<Snap> {
+    base: Snap,
+    settled: BTreeMap<SubstateKey, Option<Vec<u8>>>,
+    anchor: BlockHeight,
+}
+
+impl<Snap: Substates> PendingBaseline<Snap> {
+    /// `base` overlaid with `pending`'s settled cells, anchored at
+    /// `height`.
+    #[must_use]
+    pub fn new(base: Snap, pending: &[Arc<JmtSnapshot>], height: BlockHeight) -> Self {
+        let mut settled = BTreeMap::new();
+        for snapshot in pending {
+            for (key, change) in snapshot.settled.cells() {
+                settled.insert(*key, change.clone());
+            }
+        }
+        Self {
+            base,
+            settled,
+            anchor: height,
+        }
+    }
+}
+
+impl<Snap: Substates> Anchored for PendingBaseline<Snap> {
+    fn anchor(&self) -> BlockHeight {
+        self.anchor
+    }
+}
+
+impl<Snap: Substates> Substates for PendingBaseline<Snap> {
+    fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+        self.settled
+            .get(&key)
+            .map_or_else(|| self.base.cell(key), Clone::clone)
+    }
+
+    fn entries_in_range(
+        &self,
+        owner: Address,
+        collection: CollectionId,
+        lo: u128,
+        hi: u128,
+        limit: usize,
+    ) -> Vec<(u128, Vec<u8>)> {
+        self.base.entries_in_range(owner, collection, lo, hi, limit)
+    }
+}
 
 /// A completed [`ImportProgress`] covering the whole key span as one
 /// exhausted sub-range — the record a one-shot staged import carries.
