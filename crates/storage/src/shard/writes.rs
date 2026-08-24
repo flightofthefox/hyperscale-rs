@@ -62,8 +62,11 @@ pub fn fold_state_writes(merged: &mut StateWrites, writes: &StateWrites) {
         merged.movements.remove(key);
     }
     for (key, movement) in &writes.movements {
-        let entry = merged.movements.entry(*key).or_default();
-        *entry = entry.then(*movement);
+        merged
+            .movements
+            .entry(*key)
+            .and_modify(|standing| *standing = standing.then(*movement))
+            .or_insert(*movement);
     }
     for (key, change) in &writes.entries {
         merged.entries.insert(*key, change.clone());
