@@ -329,8 +329,9 @@ impl Transaction {
     /// Whether the fee payer's rule admits the envelope signer, given
     /// the payer's stored-authority cell as read at the caller's own
     /// anchored height — `None` or empty meaning absent, the virtual
-    /// rule — judged at `clock_ms`, the caller's weighted-time instant,
-    /// so a matured recovery proposal governs paying too.
+    /// rule. `clock_ms` reaches [`ProtocolStatics::rule_admits`], which
+    /// does not read it: the cell holds one rule, and replacing one is a
+    /// write.
     ///
     /// Every fee rule debits the account the envelope's `fee_payer`
     /// names — the reservation the payer shard enforces as block
@@ -526,7 +527,7 @@ mod tests {
     use hyperscale_hbor::{
         DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
-    use hyperscale_vm_types::{Address, AddressClass, Mode};
+    use hyperscale_vm_types::{Address, AddressClass, Mode, Moves};
 
     use super::*;
     use crate::test_utils::{test_prefix, test_validity_range};
@@ -572,7 +573,7 @@ mod tests {
                         ),
                         (
                             DeclaredKey::substate(test_prefix(0x22), [0x01; 16]),
-                            Mode::Write,
+                            Mode::Write { moves: Moves::Both },
                         ),
                     ],
                 },

@@ -23,6 +23,7 @@ use hyperscale_types::{
     NetworkId, PrincipalAddr, Routing, SchemeId, StateWrites, SubstateKey, Transaction,
     TransactionBody, TransactionEnvelope, TxHash, Verified, WeightedTimestamp, declared_work,
 };
+use hyperscale_vm_types::Moves;
 
 /// The two amount cells every fixture transaction declares a reservation
 /// on. Real derivation folds duplicate reservations per cell before the
@@ -70,8 +71,8 @@ impl Derivation for ReservingStatics {
                 DeclaredKey::Cell(counterparty_vault()),
                 Mode::Reserve { amount: 25 },
             ),
-            (written, Mode::Write),
-            (ranged, Mode::Delta),
+            (written, Mode::Write { moves: Moves::Both }),
+            (ranged, Mode::Delta { moves: Moves::Both }),
         ];
         declared_modes.sort_unstable();
         Ok(Derived {

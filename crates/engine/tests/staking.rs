@@ -162,7 +162,7 @@ fn signed_stake(pool: ComponentAddr, amount: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[DELEGATOR; 32]).unwrap();
     let from = account_address(&key.public_key().0);
     let chain = client().records();
-    let mut b = client().builder(&chain);
+    let mut b = client().builder(&chain, from);
     let sender = account::authorize(&mut b, from).expect("an account signs in");
     let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");
     let units = staking::Staking::at(pool)
@@ -184,14 +184,17 @@ fn signed_stake_composed(seat: &StakePoolSeat, amount: u128) -> Transaction {
     let pool = meta.address(&ProtocolHasher);
     let chain = client().records();
     let composed = Composed::new(&chain, std::slice::from_ref(&meta), &ProtocolHasher);
-    let (mut env, mut b) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
+    let (mut env, mut b) = EnvelopeBuilder::new(&composed, &ProtocolHasher, from);
     let sender = account::authorize(&mut b, from).expect("an account signs in");
     let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");
     let units = staking::Staking::at(pool)
         .stake(&mut b, funds)
         .expect("a pool takes a delegation");
     account::deposit(&mut b, from, units).expect("an account banks its position");
-    env.seal(b).expect("the root declares nothing to discharge");
+    env.seal(b)
+        .expect("the root declares nothing to discharge")
+        .none()
+        .expect("the root declares no socket");
     let tree = env.build().expect("the intent declares no hole");
     Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(1_000)))
 }
@@ -426,7 +429,7 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
     // answer for yet: the seal is what makes it answer.
     let composed = Composed::new(&chain, std::slice::from_ref(&meta), &ProtocolHasher);
     let pool = meta.address(&ProtocolHasher);
-    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
+    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher, from);
     // The composition every bring-up writes: the seal, and the supply it
     // yields filed where the founder keeps it. Which method seals and
     // which of those nodes exist are the package's own declaration to
@@ -434,7 +437,9 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
     instantiate(&mut root, from, pool).expect("a derivable pool answers its seal");
     env.instance(meta);
     env.seal(root)
-        .expect("the root declares nothing to discharge");
+        .expect("the root declares nothing to discharge")
+        .none()
+        .expect("the root declares no socket");
     let tree = env.build().expect("the intent declares no hole");
     Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(1_000)))
 }
@@ -529,7 +534,7 @@ fn a_pool_nobody_instantiated_answers_nothing() {
     let unseated = seat(56);
     let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated);
     let chain = client().records();
-    let (_, mut root) = EnvelopeBuilder::new(&chain, &ProtocolHasher);
+    let (_, mut root) = EnvelopeBuilder::new(&chain, &ProtocolHasher, delegator());
     let sender = account::authorize(&mut root, delegator()).expect("an account signs in");
     let funds = account::withdraw(&mut root, sender, *XRD, 500).expect("an account withdraws");
     let refusal = staking::Staking::at(pool)
@@ -599,15 +604,11 @@ fn an_ordinary_transfer_is_not_a_beacon_fact() {
 /// whether or not they hold it.
 fn signed_registration(pool: ComponentAddr, seed: u8) -> Transaction {
     let key = key_of(seed);
+    let signer = account_address(&key.public_key().0);
     let chain = client().records();
-    let mut b = client().builder(&chain);
-    let proof = account::present_instance(
-        &mut b,
-        account_address(&key.public_key().0),
-        pool_owner_badge(pool),
-        OWNER_BADGE_ID,
-    )
-    .expect("a presentation types");
+    let mut b = client().builder(&chain, signer);
+    let proof = account::present_instance(&mut b, signer, pool_owner_badge(pool), OWNER_BADGE_ID)
+        .expect("a presentation types");
     staking::Staking::at(pool)
         .register_validator(&mut b, proof, 11, vec![0xC1; 48], vec![0xC2; 96])
         .expect("a pool answers a registration");

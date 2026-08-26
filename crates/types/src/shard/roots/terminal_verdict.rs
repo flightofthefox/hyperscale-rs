@@ -90,13 +90,23 @@ impl Verify<&TerminalVerdictRootContext<'_>> for TerminalVerdictRoot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ShardId, TxHash, UnsettledTx, WeightedTimestamp};
+    use crate::{
+        AbortCharge, Address, AddressClass, LocalKey, ShardId, SubstateKey, TxHash, UnsettledTx,
+        WeightedTimestamp,
+    };
 
     fn tx(seed: u8) -> UnsettledTx {
         UnsettledTx {
             tx_hash: TxHash::from(Hash::from_bytes(&[seed; 32])),
             deadline: WeightedTimestamp::from_millis(500),
             declared_work: 7,
+            charge: AbortCharge {
+                vault: SubstateKey {
+                    owner: Address::new([seed; 31], AddressClass::Component),
+                    local: LocalKey([seed; 16]),
+                },
+                floor: 11,
+            },
         }
     }
 

@@ -5,12 +5,12 @@ use std::sync::Arc;
 use hyperscale_crypto::{Signer, Verifier};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_vm_types::{
-    Address, AddressClass, LocalKey, Mode, PrincipalAddr, SchemeId, SubstateKey,
+    Address, AddressClass, LocalKey, Mode, Moves, PrincipalAddr, SchemeId, SubstateKey,
 };
 
 use crate::crypto::Ed25519PrivateKey;
 use crate::{
-    AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
+    AbortCharge, AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
     BlockVoteMessage, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommitProof,
     ConsensusPublicKey, ConsensusSignature, DeclaredKey, Derivation, DerivationError, Derived,
     EnvelopeExt, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
@@ -872,6 +872,23 @@ const fn stub_cell(owner: Address) -> DeclaredKey {
     DeclaredKey::substate(owner, [0u8; 16])
 }
 
+/// A stub charge for a record fixture: a vault under `seed`'s own
+/// prefix, at a nominal floor.
+///
+/// The consensus fixtures that carry one are about what a record names
+/// and how it validates, never about what the burn comes to — so the
+/// figures need only be a function of the seed.
+#[must_use]
+pub const fn stub_abort_charge(seed: u8) -> AbortCharge {
+    AbortCharge {
+        vault: SubstateKey {
+            owner: Address::new([seed; 31], AddressClass::Component),
+            local: LocalKey([seed; 16]),
+        },
+        floor: 13,
+    }
+}
+
 /// A deterministic [`Derivation`](crate::Derivation) stub for consensus-crate
 /// tests.
 ///
@@ -944,7 +961,7 @@ impl Derivation for StubVmStatics {
                         write_prefixes
                             .iter()
                             .copied()
-                            .map(|owner| (stub_cell(owner), Mode::Write)),
+                            .map(|owner| (stub_cell(owner), Mode::Write { moves: Moves::Both })),
                     )
                     .collect(),
             },

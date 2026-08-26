@@ -30,8 +30,9 @@ use hyperscale_storage::entry_from_leaf;
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, Event, EventExt,
     EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, PrincipalAddr,
-    ProvisionalHolds, Stake, StakePoolSeat, StateWrites, SubstateEntry, Transaction, TxHash,
-    Verified, WeightedTimestamp, compute_merkle_root, install_protocol_statics,
+    ProvisionalHolds, ShardId, ShardTrie, Stake, StakePoolSeat, StateWrites, SubstateEntry,
+    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
+    install_protocol_statics,
 };
 use hyperscale_vm_effects::{
     ChainRecords, Declaration, NodeCall, PackageHash, PrefixShardResolver, admit_tree,
@@ -556,12 +557,25 @@ pub fn abort_reason(outcome: &Outcome) -> String {
         Outcome::NullifierSpent { key } => format!("subintent already spent at {key:?}"),
         Outcome::Declined { node, code } => format!("node {node} declined with code {code}"),
         Outcome::ConditionUnmet { condition } => match condition {
-            UnmetCondition::Holds { target, required } => {
-                format!("leaf of {target:?} is not {required:?} as the condition required")
-            }
+            UnmetCondition::Holds {
+                target,
+                required,
+                node,
+            } => node.map_or_else(
+                || format!("leaf of {target:?} is not {required:?} as the condition required"),
+                |node| {
+                    format!(
+                        "node {node} required leaf of {target:?} to be {required:?}, and it is not"
+                    )
+                },
+            ),
             UnmetCondition::Satisfies { node } => {
                 format!("node {node} presents nothing that satisfies a required rule")
             }
+            UnmetCondition::Unanswerable { node } => node.map_or_else(
+                || "a condition the judge it reached could not answer".to_owned(),
+                |node| format!("node {node} declared a condition its judge could not answer"),
+            ),
         },
         Outcome::Completed { .. } => unreachable!("aborts only"),
     }
@@ -713,8 +727,15 @@ struct FoldState {
 /// siblings left — which is what a movement means and what an absolute
 /// computed here could not have expressed without re-deriving their
 /// burns.
-fn build_fee_receipt(
-    ctx: &TickBatchContext<'_>,
+///
+/// Shared with the abandonment path, which settles the same floor for a
+/// transaction that never reached the engine: both are the same charge
+/// on the same vault, and two builders would be two receipt hashes for
+/// one verdict.
+#[must_use]
+pub fn build_fee_receipt(
+    local_shard: ShardId,
+    shard_trie: &ShardTrie,
     tx_hash: TxHash,
     vault: SubstateKey,
     floor: u128,
@@ -744,7 +765,7 @@ fn build_fee_receipt(
         Vec::new(),
         Vec::new(),
     );
-    project_to_shard(&cached, tx_hash, ctx.local_shard, ctx.shard_trie).consensus
+    project_to_shard(&cached, tx_hash, local_shard, shard_trie).consensus
 }
 
 /// What judging and storing one artifact costs, whatever the verdict:
@@ -828,7 +849,13 @@ fn assemble_published_tx(
     // publish — so it pays the ceiling, exactly as a trap does. Charging
     // less would leave a rejected publish cheaper than an accepted one.
     let fee_receipt = match (&refusal, fee) {
-        (Some(_), Some(payer)) => Some(build_fee_receipt(ctx, tx_hash, payer.vault, payer.max_fee)),
+        (Some(_), Some(payer)) => Some(build_fee_receipt(
+            ctx.local_shard,
+            ctx.shard_trie,
+            tx_hash,
+            payer.vault,
+            payer.max_fee,
+        )),
         _ => None,
     };
 
@@ -876,7 +903,13 @@ fn assemble_executed_tx(
     let tx_hash = vm_tx;
     let fee_receipt = fee.and_then(|payer| {
         let amount = charge_for(&receipt.outcome, payer)?;
-        Some(build_fee_receipt(ctx, tx_hash, payer.vault, amount))
+        Some(build_fee_receipt(
+            ctx.local_shard,
+            ctx.shard_trie,
+            tx_hash,
+            payer.vault,
+            amount,
+        ))
     });
     let cached = if matches!(receipt.outcome, Outcome::Completed { .. }) {
         // What the receipt carries: exclusive writes as absolutes,
@@ -1388,6 +1421,7 @@ mod tests {
                     condition: UnmetCondition::Holds {
                         target: leaf,
                         required: Presence::Present,
+                        node: None,
                     },
                 },
                 payer

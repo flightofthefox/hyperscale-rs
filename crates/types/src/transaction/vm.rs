@@ -346,19 +346,20 @@ pub trait Derivation: Send + Sync {
 pub trait ProtocolStatics: Send + Sync {
     /// Whether `payer`'s rule admits `signer`, given the payer's
     /// stored-authority cell as read at the caller's own anchored
-    /// height — `None` or empty meaning absent — and the weighted-time
-    /// instant the verdict is judged at, in milliseconds.
+    /// height — `None` or empty meaning absent.
     ///
     /// The rule's encoding is the VM's fact, so consensus hands the
     /// bytes across this seam and stays blind to them. Absent means the
     /// account is virtual and the rule is the identity its address
     /// derives; stored bytes that do not decode admit nobody, the same
-    /// fail-closed verdict the execution gate gives them. The clock is
-    /// what lets a matured recovery proposal govern here with nothing
-    /// applying it: voters pass the judged block's own parent-QC
-    /// weighted timestamp — the same instant its transactions execute
-    /// under if it commits them — the proposal builder the parent QC it
-    /// builds on, and mempool admission its local advisory instant.
+    /// fail-closed verdict the execution gate gives them.
+    ///
+    /// The cell holds one rule and the verdict is that rule's, so what
+    /// replaces one is a write to the cell: a replacement an account has
+    /// waiting sits in that package's own cells and governs here only
+    /// once a call enacts it. `clock_ms` is passed and not read — no
+    /// implementation consults it, and two nodes reading one cell reach
+    /// one verdict whatever instant each judges at.
     fn rule_admits(
         &self,
         auth_cell: Option<&[u8]>,

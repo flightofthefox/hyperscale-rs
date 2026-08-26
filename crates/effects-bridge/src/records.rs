@@ -17,10 +17,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arc_swap::ArcSwap;
 use hyperscale_hbor::from_slice as hbor_from_slice;
 use hyperscale_vm_effects::{
-    ChainRecords, Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash,
-    PackageMetadata, package_hash,
+    ChainRecords, Hasher, InstanceMeta, InstanceRegistry, Issuance, MetadataCache, PackageHash,
+    PackageMetadata, ResourceMeta, Value, package_hash,
 };
-use hyperscale_vm_types::{Address, CallTarget, ComponentAddr, SubstateKey};
+use hyperscale_vm_types::{Address, CallTarget, ComponentAddr, ResourceAddr, SubstateKey};
 use im::{OrdMap, Vector};
 
 use crate::ProtocolHasher;
@@ -207,6 +207,73 @@ impl ChainRecords for NodeRecords {
     fn package(&self, hash: PackageHash) -> Option<Arc<PackageMetadata>> {
         self.packages.record(hash)
     }
+
+    /// Derived from the records this node is holding: every resident
+    /// instance's package declares which resources it issues, and each
+    /// of those addresses re-derives against the instance issuing it.
+    ///
+    /// Bounded by residency rather than by the chain, which is the same
+    /// bound every other answer here carries — a record evicted from
+    /// the cache is read back by [`Self::instance`] before it is given
+    /// up on, and one this node never held is one no call of its own
+    /// named.
+    fn resource(&self, resource: ResourceAddr, hasher: &dyn Hasher) -> Option<ResourceMeta> {
+        resource_issued_by(
+            self.instances.components(),
+            self.packages.as_ref(),
+            resource,
+            hasher,
+        )
+    }
+}
+
+/// Find the record `resource` derives among everything `instances`
+/// issue, or `None` where none of them could have issued it.
+///
+/// A scan rather than an index, because what it scans is bounded by the
+/// caller's own world — and an index would be one more thing to keep
+/// agreeing with the collections beside it.
+pub fn resource_issued_by<'a>(
+    instances: impl Iterator<Item = (Address, &'a InstanceMeta)>,
+    packages: &MetadataCache,
+    resource: ResourceAddr,
+    hasher: &dyn Hasher,
+) -> Option<ResourceMeta> {
+    instances
+        .filter_map(|(issuer, meta)| Some((issuer, meta, packages.record(meta.package)?)))
+        .flat_map(|(issuer, meta, package)| {
+            package
+                .methods
+                .values()
+                .flat_map(|signature| &signature.issues)
+                .filter_map(|issuance| issued_record(hasher, issuer, meta, issuance))
+                .collect::<Vec<_>>()
+        })
+        .find(|record| record.address(hasher) == resource)
+}
+
+/// The record one declared issuance commits, resolved against the
+/// instance issuing it.
+///
+/// `None` where the grant tree names something the instance's own
+/// configuration does not resolve — a resource that instance could
+/// never issue, and so one no address of this world's names.
+///
+/// Shared rather than repeated: an address folds the rules it grants,
+/// so two sites deriving it differently would answer for two different
+/// resources under one name.
+pub fn issued_record(
+    hasher: &dyn Hasher,
+    issuer: Address,
+    meta: &InstanceMeta,
+    issuance: &Issuance,
+) -> Option<ResourceMeta> {
+    Some(ResourceMeta {
+        namespace: issuer,
+        kind: issuance.kind,
+        material: vec![Value::Bytes(issuance.mark.clone()).canonical_bytes()],
+        rules: issuance.grants.resolve(hasher, issuer, &meta.config).ok()?,
+    })
 }
 
 /// The component address a record's own contents derive, or `None` for
@@ -269,6 +336,19 @@ impl Resident {
             CallTarget::Principal(_) => None,
             CallTarget::Component(address) => self.grown.get(&address.address()).cloned(),
         }
+    }
+
+    /// Every component record this node is currently holding, seeded
+    /// and grown alike.
+    ///
+    /// Seeded first, so a genesis record answers ahead of a grown one
+    /// claiming its address — the same order [`Self::record`] reads in.
+    pub fn components(&self) -> impl Iterator<Item = (Address, &InstanceMeta)> {
+        self.seeded.components().chain(
+            self.grown
+                .iter()
+                .map(|(address, meta)| (*address, meta.as_ref())),
+        )
     }
 
     /// This world with `meta` seated at `address`, and whatever the

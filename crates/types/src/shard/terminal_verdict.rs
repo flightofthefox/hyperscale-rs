@@ -20,16 +20,31 @@
 //! stays owed and unabandonable either way — while the absence of a
 //! settlement is what licenses a verdict.
 //!
-//! Each name carries the two figures composing the abort takes: the
-//! deadline it opens at and the reservation it returns. Both are functions
-//! of the transaction body, so a proposer restates them and a voter
-//! holding the transaction checks the restatement — and a replica whose
-//! rebuild never reached the transaction's own block still holds enough to
-//! compose the same verdict as its peers.
+//! Each name carries the figures composing the abort takes: the deadline
+//! it opens at, the reservation it returns, and the charge it settles.
+//! All are functions of the transaction body, so a proposer restates them
+//! and a voter holding the transaction checks the restatement — and a
+//! replica whose rebuild never reached the transaction's own block still
+//! holds enough to compose the same verdict as its peers.
 
 use hyperscale_hbor::Hbor;
 
-use crate::{MAX_UNSETTLED_PER_BLOCK, ShardId, TxHash, WeightedTimestamp};
+use crate::{MAX_UNSETTLED_PER_BLOCK, ShardId, SubstateKey, TxHash, WeightedTimestamp};
+
+/// What an abort of one transaction burns, and out of whose vault.
+///
+/// Both are functions of signed content — the vault the fee payer's
+/// address derives, the floor its declared class fixes — so the receipt
+/// settling an abort is the same receipt on every replica whether or not
+/// the transaction ever reached an engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
+pub struct AbortCharge {
+    /// The fee payer's vault, which the burn debits.
+    pub vault: SubstateKey,
+    /// The class floor: what an attempt owes when nothing it did was its
+    /// sender's fault.
+    pub floor: u128,
+}
 
 /// One transaction a departed shard left unsettled, with what abandoning
 /// it takes.
@@ -43,6 +58,9 @@ pub struct UnsettledTx {
     /// The reservation its committing block took against the drain, which
     /// the abandonment returns exactly.
     pub declared_work: u64,
+    /// What the abandonment burns, settled by the shard holding the
+    /// vault and by no other.
+    pub charge: AbortCharge,
 }
 
 /// One departed shard's unsettled remainder, as this chain sees it.
@@ -127,13 +145,20 @@ impl TerminalVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Hash;
+    use crate::{Address, AddressClass, Hash, LocalKey};
 
     fn tx(seed: u8) -> UnsettledTx {
         UnsettledTx {
             tx_hash: TxHash::from(Hash::from_bytes(&[seed; 32])),
             deadline: WeightedTimestamp::from_millis(u64::from(seed) * 100),
             declared_work: u64::from(seed) * 7,
+            charge: AbortCharge {
+                vault: SubstateKey {
+                    owner: Address::new([seed; 31], AddressClass::Component),
+                    local: LocalKey([seed; 16]),
+                },
+                floor: u128::from(seed) * 3,
+            },
         }
     }
 

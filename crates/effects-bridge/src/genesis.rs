@@ -234,14 +234,22 @@ const DOMAIN_GENESIS_SALT: &[u8] = b"hyperscale/engine/genesis-instance";
 /// never be seated on one stake-unit resource, a holder's units always
 /// name the pool that owes them, and the address says both facts on
 /// sight.
+///
+/// # Panics
+///
+/// If `pool` is not a component address. A pool is one by construction,
+/// so a caller passing anything else has already lost the thing it
+/// meant to name.
 #[must_use]
 pub fn stake_unit(pool: impl Into<Address>) -> ResourceAddr {
-    resource_address(
-        &ProtocolHasher,
-        pool,
-        ResourceKind::Fungible,
-        &[Value::Bytes(staking::STAKE_UNIT.to_vec()).canonical_bytes()],
-    )
+    // Through the package's own helper rather than a restatement of it:
+    // a resource's address folds the rules its declaration grants, and
+    // the stake unit grants its issuer the right to mint and retire it.
+    // Deriving it any other way names a vacant sibling — an address
+    // nothing is ever minted at, where a read finds an empty vault and
+    // nothing fails.
+    staking::Staking::at(ComponentAddr::try_from(pool.into()).expect("a pool is a component"))
+        .issued_stake_unit(&ProtocolHasher)
 }
 
 /// The pool's owner badge: the identity its operator surface admits.

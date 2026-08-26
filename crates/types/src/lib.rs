@@ -184,7 +184,7 @@ pub use shard::roots::{
     ready_leaf_payload, settled_txs_root_from_hashes, terminal_verdict_root_from_records,
 };
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
-pub use shard::terminal_verdict::{TerminalVerdict, UnsettledTx};
+pub use shard::terminal_verdict::{AbortCharge, TerminalVerdict, UnsettledTx};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::SafeVoteRegisters;

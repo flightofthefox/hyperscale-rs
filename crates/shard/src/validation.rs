@@ -684,7 +684,9 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::BlsSigner;
-    use hyperscale_types::test_utils::{TestCommittee, make_finalization, test_principal};
+    use hyperscale_types::test_utils::{
+        TestCommittee, make_finalization, stub_abort_charge, test_principal,
+    };
     use hyperscale_types::{
         Address, AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin,
         Finalization, Hash, MerkleInclusionProof, NetworkDefinition, PrincipalAddr,
@@ -1185,6 +1187,7 @@ mod tests {
             tx_hash,
             deadline: WeightedTimestamp::from_millis(900),
             declared_work: 11,
+            charge: stub_abort_charge(11),
         }
     }
 

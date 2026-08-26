@@ -609,8 +609,8 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_types::test_utils::{
-        install_stub_protocol_statics, make_finalization, stub_transaction, test_prefix,
-        test_principal, test_transaction_running,
+        install_stub_protocol_statics, make_finalization, stub_abort_charge, stub_transaction,
+        test_prefix, test_principal, test_transaction_running,
     };
     use hyperscale_types::{
         CommittedTxsRoot, Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
@@ -675,6 +675,7 @@ mod tests {
                 tx_hash: TxHash::from(Hash::from_bytes(b"stranded")),
                 deadline: WeightedTimestamp::from_millis(5_000),
                 declared_work: 3,
+                charge: stub_abort_charge(3),
             }],
         );
         let offered = |sched: &TopologySchedule, anchor: WeightedTimestamp| {

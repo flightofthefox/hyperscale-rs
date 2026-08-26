@@ -22,9 +22,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Address, Finalization, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, ShardId, ShardTrie,
-    TerminalVerdict, Transaction, TxHash, UnsettledTx, Verifiable, WeightedTimestamp,
+    AbortCharge, Address, Finalization, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, ShardId,
+    ShardTrie, TerminalVerdict, Transaction, TxHash, UnsettledTx, Verifiable, WeightedTimestamp,
 };
+
+/// One transaction the ledger will let a tick abandon, with everything
+/// that abandonment states: it releases the reservation its committing
+/// block took and settles the charge its class fixes, and neither is
+/// readable from an execution it never had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Abandonable {
+    /// The transaction.
+    pub tx_hash: TxHash,
+    /// The reservation to return.
+    pub declared_work: u64,
+    /// The burn to settle, on the shard holding the vault it names.
+    pub charge: AbortCharge,
+}
 
 /// One committed transaction's outstanding account.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +51,10 @@ struct Owed {
     /// here because an abandonment has no execution to read it from and
     /// must release exactly what was taken.
     declared_work: u64,
+    /// What an abort of it burns, held here for the same reason: an
+    /// abandonment never reaches an engine, so the charge its verdict
+    /// settles has to be readable without one.
+    charge: AbortCharge,
     /// The frontier its committing block anchored at, which dates the
     /// question below: a shard that left before this never held the
     /// transaction, whatever its keyspace covers now.
@@ -151,6 +169,10 @@ impl UnresolvedTxs {
                     .end_timestamp_exclusive
                     .plus(MAX_FINALIZATION_DELAY),
                 declared_work: tx.work(),
+                charge: AbortCharge {
+                    vault: tx.fee_vault(),
+                    floor: tx.body().abort_floor(),
+                },
                 remote_prefixes: tx
                     .routing()
                     .all_prefixes()
@@ -220,6 +242,7 @@ impl UnresolvedTxs {
                     Owed {
                         deadline: entry.deadline,
                         declared_work: entry.declared_work,
+                        charge: entry.charge,
                         // The record dates it no later than the cut, which
                         // is the one bound on its commit the record itself
                         // establishes.
@@ -259,6 +282,7 @@ impl UnresolvedTxs {
                 tx_hash: *tx_hash,
                 deadline: owed.deadline,
                 declared_work: owed.declared_work,
+                charge: owed.charge,
             })
             .collect()
     }
@@ -384,14 +408,18 @@ impl UnresolvedTxs {
     /// so every replica at the same frontier names the same set, which is
     /// what lets a committee sign the abort it composes.
     #[must_use]
-    pub fn past_deadline(&self, now: WeightedTimestamp) -> Vec<(TxHash, u64)> {
+    pub fn past_deadline(&self, now: WeightedTimestamp) -> Vec<Abandonable> {
         self.owed
             .iter()
             .filter(|(_, owed)| {
                 now >= owed.deadline
                     && (owed.unsettled_by.is_some() || now < owed.deadline.plus(MAX_VALIDITY_RANGE))
             })
-            .map(|(tx_hash, owed)| (*tx_hash, owed.declared_work))
+            .map(|(tx_hash, owed)| Abandonable {
+                tx_hash: *tx_hash,
+                declared_work: owed.declared_work,
+                charge: owed.charge,
+            })
             .collect()
     }
 
@@ -560,6 +588,24 @@ mod tests {
                 .end_timestamp_exclusive
                 .plus(MAX_FINALIZATION_DELAY),
             declared_work: tx.work(),
+            charge: charge(tx),
+        }
+    }
+
+    /// What abandoning `tx` states: its reservation and its floor.
+    fn abandons(tx: &Arc<Verifiable<Transaction>>) -> Abandonable {
+        Abandonable {
+            tx_hash: tx.hash(),
+            declared_work: tx.work(),
+            charge: charge(tx),
+        }
+    }
+
+    /// The burn an abort of `tx` settles.
+    fn charge(tx: &Arc<Verifiable<Transaction>>) -> AbortCharge {
+        AbortCharge {
+            vault: tx.fee_vault(),
+            floor: tx.body().abort_floor(),
         }
     }
 
@@ -611,7 +657,7 @@ mod tests {
                 .is_empty(),
             "and the deadline is still the one it was admitted under",
         );
-        assert_eq!(ledger.past_deadline(deadline), vec![(tx.hash(), tx.work())]);
+        assert_eq!(ledger.past_deadline(deadline), vec![abandons(&tx)]);
     }
 
     /// A transaction becomes abandonable at its own deadline and not
@@ -631,7 +677,7 @@ mod tests {
         );
         assert_eq!(
             ledger.past_deadline(deadline),
-            vec![(tx.hash(), tx.work())],
+            vec![abandons(&tx)],
             "at the deadline, named with what it reserved",
         );
     }
@@ -690,7 +736,7 @@ mod tests {
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         assert_eq!(
             ledger.past_deadline(deadline),
-            vec![(tx.hash(), tx.work())],
+            vec![abandons(&tx)],
             "at its deadline it is the shard's to speak for",
         );
         assert_eq!(
@@ -699,7 +745,7 @@ mod tests {
                     .plus(MAX_VALIDITY_RANGE)
                     .minus(Duration::from_millis(1))
             ),
-            vec![(tx.hash(), tx.work())],
+            vec![abandons(&tx)],
             "and stays so for the room to get that committed",
         );
 
@@ -818,9 +864,9 @@ mod tests {
             .plus(MAX_FINALIZATION_DELAY)
             .plus(MAX_VALIDITY_RANGE);
         let mut offered = ledger.past_deadline(past);
-        offered.sort_unstable();
-        let mut expected = vec![(one.hash(), one.work()), (two.hash(), two.work())];
-        expected.sort_unstable();
+        offered.sort_unstable_by_key(|entry| entry.tx_hash);
+        let mut expected = vec![abandons(&one), abandons(&two)];
+        expected.sort_unstable_by_key(|entry| entry.tx_hash);
         assert_eq!(offered, expected);
     }
 
@@ -876,7 +922,7 @@ mod tests {
         )]);
         assert_eq!(
             ledger.past_deadline(past),
-            vec![(tx.hash(), tx.work())],
+            vec![abandons(&tx)],
             "the record says nothing can settle it, so the shard may",
         );
         assert!(ledger.is_unsettled_by_departed(tx.hash()));

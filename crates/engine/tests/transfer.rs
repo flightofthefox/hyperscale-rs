@@ -233,7 +233,7 @@ fn signed_transfer_under_bound(
 ) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let chain = client().records();
-    let mut b = client().builder(&chain);
+    let mut b = client().builder(&chain, from);
     let sender = account::authorize(&mut b, from).expect("an account signs in");
     let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");
     account::deposit(&mut b, to, funds.min(min)).expect("an account deposits");
@@ -307,12 +307,14 @@ fn signed_settle_with_fee(seed: u8, max_fee: u128, salt: u8) -> Transaction {
     let chain = client().records();
     let composed = Composed::new(&chain, &[lottery_meta(salt)], &ProtocolHasher);
     let lottery_addr = lottery_meta(salt).address(&ProtocolHasher);
-    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
+    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher, fee_payer(seed));
     lottery::Lottery::at(lottery_addr)
         .settle(&mut root, 64)
         .expect("a lottery answers a settlement");
     env.seal(root)
-        .expect("the root declares nothing to discharge");
+        .expect("the root declares nothing to discharge")
+        .none()
+        .expect("the root declares no socket");
     let tree = env.build().expect("the intent declares no hole");
     Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(max_fee)))
 }
@@ -344,12 +346,15 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
         let chain = client().records();
         let composed = Composed::new(&chain, &[lottery_meta(*salt)], &ProtocolHasher);
         let round = lottery_meta(*salt).address(&ProtocolHasher);
-        let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
+        let (mut env, mut root) =
+            EnvelopeBuilder::new(&composed, &ProtocolHasher, fee_payer(SEALER_SEED));
         instantiate(&mut root, fee_payer(SEALER_SEED), round)
             .expect("a derivable round answers its seal");
         env.instance(lottery_meta(*salt));
         env.seal(root)
-            .expect("the root declares nothing to discharge");
+            .expect("the root declares nothing to discharge")
+            .none()
+            .expect("the root declares no socket");
         let tree = env.build().expect("the intent declares no hole");
         let seal = Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(1_000_000)));
         let executed = execute_batch_on(
@@ -364,7 +369,7 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
         absorb_committed_cells([&executed[0].consensus], executor.derivation().as_ref());
 
         let close = Transaction::new(client().sign_tree(
-            &closing_tree(*salt),
+            &closing_tree(*salt, fee_payer(SEALER_SEED)),
             Vec::new(),
             &key,
             terms(1_000_000),
@@ -382,16 +387,18 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
     store
 }
 
-/// The intent that closes the round at `salt`.
-fn closing_tree(salt: u8) -> EnvelopeTree {
+/// The intent that closes the round at `salt`, for `signer` to sign.
+fn closing_tree(salt: u8, signer: PrincipalAddr) -> EnvelopeTree {
     let chain = client().records();
     let composed = Composed::new(&chain, &[lottery_meta(salt)], &ProtocolHasher);
-    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
+    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher, signer);
     lottery::Lottery::at(lottery_meta(salt).address(&ProtocolHasher))
         .close(&mut root)
         .expect("a lottery answers a close");
     env.seal(root)
-        .expect("the root declares nothing to discharge");
+        .expect("the root declares nothing to discharge")
+        .none()
+        .expect("the root declares no socket");
     env.build().expect("the intent declares no hole")
 }
 
@@ -1242,7 +1249,7 @@ fn a_two_recipient_fan_out_executes() {
     let executor = executor(ExecutionMode::Serial);
     let key = Ed25519PrivateKey::from_bytes(&[ALICE_SEED; 32]).unwrap();
     let chain = client().records();
-    let mut b = client().builder(&chain);
+    let mut b = client().builder(&chain, alice());
     for (to, amount) in [(bob(), 5u128), (fee_payer(7), 6)] {
         let sender = account::authorize(&mut b, alice()).expect("an account signs in");
         let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");
@@ -1368,15 +1375,21 @@ fn the_stdlib_artifact_carries_resolvable_bindings() {
     // reaches the declaration and never the body.
     assert_eq!(
         metadata.methods["withdraw"].abi,
-        vec![AbiParam::Handle(1)],
+        vec![AbiParam::Handle { clause: 1, site: 0 }],
         "the binding decoded is the binding authored: the gate's condition \
          is the first clause, and the vault access it names is the second"
     );
     assert_eq!(
         metadata.methods["deposit"].abi,
-        vec![AbiParam::Handle(1), AbiParam::Bucket(0)],
-        "the handle names a clause rather than a position, and the vault is \
-         the second one the account declares"
+        vec![
+            AbiParam::Handle { clause: 0, site: 0 },
+            AbiParam::Handle { clause: 1, site: 0 },
+            AbiParam::Handle { clause: 2, site: 0 },
+            AbiParam::Bucket(0),
+        ],
+        "one handle per cell the deposit may reach — the flag it reads, the \
+         vault, and the quarantine beside it — each naming the clause that \
+         declared it rather than a position"
     );
 }
 
@@ -1410,7 +1423,7 @@ fn derivation_tells_a_gap_from_a_refusal() {
         &EnvelopeTree {
             root: IntentDecl {
                 graph,
-                params: Vec::new(),
+                sockets: Vec::new(),
             },
             root_bindings: Vec::new(),
             subintents: Vec::new(),
@@ -1440,7 +1453,7 @@ fn derivation_tells_a_gap_from_a_refusal() {
         &EnvelopeTree {
             root: IntentDecl {
                 graph,
-                params: Vec::new(),
+                sockets: Vec::new(),
             },
             root_bindings: Vec::new(),
             subintents: Vec::new(),
@@ -2047,7 +2060,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     let tree = EnvelopeTree {
         root: IntentDecl {
             graph,
-            params: Vec::new(),
+            sockets: Vec::new(),
         },
         root_bindings: Vec::new(),
         subintents: Vec::new(),
@@ -2073,7 +2086,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
         "the record this node would need, named: {refusal}"
     );
 
-    // Presented: the call admits, the invocation resolves the freshly
+    // Claim: the call admits, the invocation resolves the freshly
     // compiled package — waiting out the compile if it is still in
     // flight — and the leaf holds the record the address derives from.
     let call = Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(TRANSFER_FEE)));

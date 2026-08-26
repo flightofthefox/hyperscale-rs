@@ -23,14 +23,15 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
-    AuthCell, ChainRecords, EnvelopeTree, ManifestHash, PRIMARY, PackageHash, PrefixShardResolver,
-    Presented, Routing as RoutedTransaction, Value, admit_tree, child_key, footprint, package_hash,
+    ChainRecords, Claim, EnvelopeTree, ManifestHash, PackageHash, PrefixShardResolver,
+    Routing as RoutedTransaction, RuleBytes, Value, admit_tree, child_key, footprint, package_hash,
     package_key as canonical_package_key, principal_address, route_tree, xrd,
 };
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
-    Address, EffectSet, EffectTarget, Mode, PrincipalAddr, ResourceAddr, SchemeId, SubstateKey,
+    Address, EffectSet, EffectTarget, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId,
+    SubstateKey,
 };
 
 use crate::ProtocolHasher;
@@ -199,11 +200,11 @@ fn classify_declared_access(routing: &RoutedTransaction) -> DeclaredAccess {
                 access.read_keys.insert(key);
                 access.provision_keys.insert(key);
             }
-            Mode::Write => {
+            Mode::Write { .. } => {
                 access.write_keys.insert(key);
                 access.provision_keys.insert(key);
             }
-            Mode::Delta | Mode::Reserve { .. } => {
+            Mode::Delta { .. } | Mode::Reserve { .. } => {
                 access.write_keys.insert(key);
             }
         }
@@ -396,7 +397,10 @@ impl BridgeStatics {
                 write_prefixes: vec![publisher.address()],
                 provision_prefixes: Vec::new(),
                 read_keys: Vec::new(),
-                declared_modes: write_keys.iter().map(|key| (*key, Mode::Write)).collect(),
+                declared_modes: write_keys
+                    .iter()
+                    .map(|key| (*key, Mode::Write { moves: Moves::Both }))
+                    .collect(),
                 write_keys,
                 provision_keys: Vec::new(),
             },
@@ -557,15 +561,22 @@ impl ProtocolStatics for BridgeStatics {
         clock_ms: u64,
     ) -> bool {
         // The verdict is the kernel gate's own, judged over the envelope
-        // signer alone and the primary — paying is governed by whatever
-        // governs `authorize`.
-        AuthCell::admits(
-            auth_cell.unwrap_or_default(),
-            payer.address(),
-            PRIMARY,
-            &[Presented::Identity(signer.into())],
-            clock_ms,
-        )
+        // signer alone — paying is governed by whatever governs
+        // `authorize`, which is the one rule the cell holds.
+        let _ = clock_ms;
+        match auth_cell {
+            // An address with nothing stored governs itself, which is the
+            // rule's own second branch rather than anything supplied here.
+            None | Some([]) => payer == signer,
+            // Bytes that are not a rule admit nobody, the same fail-closed
+            // verdict the execution gate gives them — as does a rule
+            // asking about a holding, which this judge holds nothing to
+            // answer with.
+            Some(bytes) => RuleBytes::rule_in_cell(bytes)
+                .ok()
+                .and_then(|rule| rule.claims_only())
+                .is_some_and(|claims| claims.satisfied_by(&[Claim::of_subject(signer)])),
+        }
     }
 }
 
@@ -576,10 +587,10 @@ mod tests {
     };
     use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
-        AuthBase, Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Hash32, Hasher,
+        Binding, Claim, Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Hash32, Hasher,
         InstanceMeta, InstanceRegistry, IntentDecl, ManifestGraph, MetadataCache, PackageHash,
-        Presented, Proposal, RoleTable, StoredRule, Subintent, SubintentHash, YieldBinding,
-        YieldParam, child_key, nullifier_key,
+        Socket, StoredRule, Subintent, SubintentHash, child_key, never, nullifier_key,
+        package_slot,
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
     use hyperscale_vm_stdlib::account;
@@ -664,11 +675,11 @@ mod tests {
         }
     }
 
-    fn deposit_param(target: impl Into<CallTarget>, param: u32) -> GraphNode {
+    fn deposit_socket(target: impl Into<CallTarget>, socket: u32) -> GraphNode {
         GraphNode {
             target: target.into(),
             method: "deposit".into(),
-            args: vec![GraphArg::Param(param)],
+            args: vec![GraphArg::Socket(socket)],
             evidence: BTreeSet::new(),
         }
     }
@@ -677,7 +688,7 @@ mod tests {
         EnvelopeTree {
             root: IntentDecl {
                 graph: ManifestGraph { nodes },
-                params: Vec::new(),
+                sockets: Vec::new(),
             },
             root_bindings: Vec::new(),
             subintents: Vec::new(),
@@ -695,15 +706,15 @@ mod tests {
                     nodes: vec![
                         sign_in(composer_addr()),
                         withdraw(composer_addr(), RES_X, 100),
-                        deposit_param(composer_addr(), 0),
+                        deposit_socket(composer_addr(), 0),
                     ],
                 },
-                params: vec![YieldParam {
+                sockets: vec![Socket::Value {
                     resource: RES_Y,
                     constraints: vec![Constraint::MinAmount(10)],
                 }],
             },
-            root_bindings: vec![YieldBinding {
+            root_bindings: vec![Binding::Value {
                 intent: 1,
                 edge: EdgeRef {
                     producer: 1,
@@ -716,16 +727,16 @@ mod tests {
                         nodes: vec![
                             sign_in(bob_addr()),
                             withdraw(bob_addr(), RES_Y, 10),
-                            deposit_param(bob_addr(), 0),
+                            deposit_socket(bob_addr(), 0),
                         ],
                     },
-                    params: vec![YieldParam {
+                    sockets: vec![Socket::Value {
                         resource: RES_X,
                         constraints: vec![Constraint::MinAmount(100)],
                     }],
                 },
                 signer: bob_addr(),
-                bindings: vec![YieldBinding {
+                bindings: vec![Binding::Value {
                     intent: 0,
                     edge: EdgeRef {
                         producer: 1,
@@ -859,9 +870,11 @@ mod tests {
 
         // Reserve at the sender's vault and deltas at the recipient's:
         // all exclusive-class, substate-granular, under the two owners.
-        // The sign-in reads the sender's rule cell, which is the one
-        // shared key and the one provision — its absence is what the
-        // read carries to every participant.
+        // One read a side and both of them provisions: the sign-in reads
+        // the sender's rule cell, whose absence is what the read carries
+        // to every participant, and the deposit reads the recipient's
+        // own flag to pick between the vault and the quarantine beside
+        // it. Neither is a balance, so the movement stays commutative.
         let sender_vault = child_key(
             &ProtocolHasher,
             composer_addr(),
@@ -874,25 +887,45 @@ mod tests {
         )));
         let rule_cell =
             DeclaredKey::substate(composer_addr().address(), auth_key(composer_addr()).local.0);
-        assert_eq!(derived.routing.read_keys, vec![rule_cell]);
-        assert_eq!(derived.routing.provision_keys, vec![rule_cell]);
-        assert_eq!(
-            derived.routing.provision_prefixes,
-            vec![composer_addr().address()]
+        let refused = child_key(
+            &ProtocolHasher,
+            bob_addr(),
+            package_slot(0),
+            &[Value::Address(RES_X.address()).canonical_bytes()],
         );
+        let landing = DeclaredKey::substate(bob_addr().address(), refused.local.0);
+        let mut reads = vec![rule_cell, landing];
+        reads.sort_unstable();
+        assert_eq!(derived.routing.read_keys, reads);
+        assert_eq!(derived.routing.provision_keys, reads);
+        let mut provisioning = vec![composer_addr().address(), bob_addr().address()];
+        provisioning.sort_unstable();
+        assert_eq!(derived.routing.provision_prefixes, provisioning);
         assert!(derived.subintent_hashes.is_empty());
         let mut owners = vec![composer_addr(), bob_addr()];
         owners.sort_unstable();
         assert_eq!(derived.routing.write_prefixes, owners);
     }
 
+    /// One identity, as the bytes a rule parameter carries.
+    fn bob_rule() -> Vec<u8> {
+        RuleBytes::try_from(&StoredRule::claim(Claim::of_subject(bob_addr())))
+            .expect("a rule within the vocabulary caps")
+            .bytes()
+            .to_vec()
+    }
+
     /// The payer shard's binding verdict across the securify boundary:
-    /// absent means the virtual rule, stored bytes mean the governing
-    /// primary and nothing else, and bytes that decode as no cell admit
-    /// nobody.
+    /// absent means the address governs itself, stored bytes mean the one
+    /// rule the cell holds, and bytes that are no rule admit nobody.
     #[test]
     fn the_stored_rule_governs_the_payer_binding() {
         let statics = statics();
+        let stored = |rule: &StoredRule| {
+            RuleBytes::try_from(rule)
+                .expect("a rule within the vocabulary caps")
+                .in_cell()
+        };
 
         // Virtual: the payer's own identity and no other, whatever the
         // clock says.
@@ -901,45 +934,23 @@ mod tests {
         assert!(!statics.rule_admits(None, composer_addr(), bob_addr(), 0));
 
         // Securified to Bob: the old identity is dead, the rule's lives.
-        let bob_rules = || {
-            RoleTable::uniform(&StoredRule::Require(Presented::Identity(bob_addr().into())))
-                .expect("a rule within the caps")
-        };
-        let cell = AuthCell::new(AuthBase::new(1_000, bob_rules()))
-            .to_bytes()
-            .unwrap();
+        let cell = stored(&StoredRule::claim(Claim::of_subject(bob_addr())));
         assert!(statics.rule_admits(Some(&cell), composer_addr(), bob_addr(), 0));
         assert!(!statics.rule_admits(Some(&cell), composer_addr(), composer_addr(), 0));
 
-        // A pending proposal moves the payer binding at its instant and
-        // not before: the retired primary stops paying the moment the
-        // recovery matures, with nothing applying it.
-        let composer_rules = RoleTable::uniform(&StoredRule::Require(Presented::Identity(
-            composer_addr().into(),
-        )))
-        .expect("a rule within the caps");
-        let recovering = AuthCell {
-            base: AuthBase::new(1_000, bob_rules()),
-            proposal: Some(Proposal {
-                effective_at_ms: 5_000,
-                base: AuthBase::new(1_000, composer_rules),
-            }),
+        // And the cell is the whole of it. A replacement an account has
+        // waiting sits in that package's own cells and moves this binding
+        // only once it is enacted here — so no instant a verdict is
+        // judged at can part two nodes reading one cell.
+        for clock in [0, 4_999, 5_000, u64::MAX] {
+            assert!(statics.rule_admits(Some(&cell), composer_addr(), bob_addr(), clock));
+            assert!(!statics.rule_admits(Some(&cell), composer_addr(), composer_addr(), clock));
         }
-        .to_bytes()
-        .unwrap();
-        assert!(statics.rule_admits(Some(&recovering), composer_addr(), bob_addr(), 4_999));
-        assert!(!statics.rule_admits(Some(&recovering), composer_addr(), composer_addr(), 4_999));
-        assert!(statics.rule_admits(Some(&recovering), composer_addr(), composer_addr(), 5_000));
-        assert!(!statics.rule_admits(Some(&recovering), composer_addr(), bob_addr(), 5_000));
 
-        // A frozen account binds no fees: the acting entry was removed,
-        // and an absent entry denies whoever asks — the recovery intent
-        // pays from somewhere else.
-        let mut frozen_roles = bob_rules();
-        frozen_roles.remove(PRIMARY);
-        let frozen = AuthCell::new(AuthBase::new(1_000, frozen_roles))
-            .to_bytes()
-            .unwrap();
+        // A frozen account binds no fees: the rule nobody satisfies is
+        // written rather than removed, because an unwritten cell is what
+        // the address's own key still governs.
+        let frozen = stored(&never());
         assert!(!statics.rule_admits(Some(&frozen), composer_addr(), bob_addr(), 0));
         assert!(!statics.rule_admits(Some(&frozen), composer_addr(), composer_addr(), 0));
 
@@ -947,7 +958,7 @@ mod tests {
         // the execution gate. Bare rule bytes are among them: the write
         // path stores frames.
         assert!(!statics.rule_admits(Some(&[0xFF, 0xFF]), composer_addr(), composer_addr(), 0));
-        let bare = StoredRule::Require(Presented::Identity(bob_addr().into()))
+        let bare = StoredRule::claim(Claim::of_subject(bob_addr()))
             .to_bytes()
             .unwrap();
         assert!(!statics.rule_admits(Some(&bare), composer_addr(), bob_addr(), 0));
@@ -1030,19 +1041,18 @@ mod tests {
     }
 
     /// A withdrawal from an account the envelope carries no signature for
-    /// is well-formed and derives: the composer's own badge is presented,
-    /// and what admission asks of a guarded call is that it present
-    /// something. Whether Bob's account admits that badge is Bob's
-    /// account's answer, and the engine's theft test is where it is
-    /// asserted.
+    /// is refused where it is cheapest to refuse it: the composer's own
+    /// badge is what the node presents, an unsecurified account admits a
+    /// claim on its own key alone, and both are signed content — so
+    /// nothing has to be read to know the answer.
     #[test]
-    fn a_withdrawal_from_an_unsigned_account_derives_and_defers() {
+    fn a_withdrawal_from_an_unsigned_account_is_refused() {
         let tree = single_intent_tree(vec![
             sign_in(composer_addr()),
             withdraw(bob_addr(), RES_X, 100),
             deposit_edge(composer_addr(), 1, RES_X),
         ]);
-        assert!(statics().derive(&envelope(&tree, &[])).is_ok());
+        assert!(statics().derive(&envelope(&tree, &[])).is_err());
 
         // Reversed, it is the ordinary transfer: the composer withdraws
         // from their own account and Bob is credited without being asked.
@@ -1065,14 +1075,9 @@ mod tests {
             target: composer_addr().into(),
             method: "securify".into(),
             args: vec![
-                GraphArg::Literal(Value::Bytes(
-                    RoleTable::uniform(&StoredRule::Require(Presented::Identity(
-                        bob_addr().into(),
-                    )))
-                    .expect("a rule within the caps")
-                    .to_bytes()
-                    .unwrap(),
-                )),
+                GraphArg::Literal(Value::Bytes(bob_rule())),
+                GraphArg::Literal(Value::Bytes(bob_rule())),
+                GraphArg::Literal(Value::Bytes(bob_rule())),
                 GraphArg::Literal(Value::U64(86_400_000)),
             ],
             evidence,
@@ -1134,12 +1139,14 @@ mod tests {
         assert!(!derived.routing.write_keys.is_empty());
 
         // The same envelope with Bob's withdrawal moved into the
-        // composer's intent still derives — its proof now carries the
-        // composer, which Bob's account does not admit, and the verdict
-        // on that is the account's to give at execution.
+        // composer's intent is refused: the node draws its own intent's
+        // signer, so the proof it presents carries the composer, and
+        // Bob's account admits a claim on Bob's key alone. Both halves
+        // of that are signed content, so the answer is admission's to
+        // give rather than execution's.
         let mut stolen = composed_tree();
         stolen.root.graph.nodes[1] = withdraw(bob_addr(), RES_X, 100);
-        assert!(statics().derive(&envelope(&stolen, &[&bob])).is_ok());
+        assert!(statics().derive(&envelope(&stolen, &[&bob])).is_err());
     }
 
     #[test]

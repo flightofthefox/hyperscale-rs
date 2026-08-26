@@ -866,8 +866,7 @@ pub enum Action {
         read_height: BlockHeight,
         /// The judged block's own parent-QC weighted timestamp — the
         /// transaction clock its members execute under if it commits
-        /// them, and so the instant the payer binding's maturity
-        /// comparison is judged at.
+        /// them.
         clock: WeightedTimestamp,
     },
 

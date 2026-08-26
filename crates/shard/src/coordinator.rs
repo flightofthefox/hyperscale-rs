@@ -6697,7 +6697,7 @@ mod tests {
 
     use hyperscale_core::Action;
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-    use hyperscale_types::test_utils::make_live_block;
+    use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeaderParts,
         CommittedTxsRoot, ConsensusSignature, Epoch, Hash, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
@@ -11147,6 +11147,7 @@ mod tests {
                 tx_hash: TxHash::from(Hash::from_bytes(tx)),
                 deadline: WeightedTimestamp::from_millis(1_200),
                 declared_work: 5,
+                charge: stub_abort_charge(5),
             }],
         )
     }

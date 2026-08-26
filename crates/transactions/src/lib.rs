@@ -25,7 +25,7 @@ use hyperscale_types::{
     AccountSigner, NetworkId, ProtocolHasher, SubintentSig, TimestampRange, Transaction,
     TransactionEnvelope,
 };
-use hyperscale_vm_effects::{EnvelopeTree, IntentDecl, ManifestGraph, Presented, StoredRule};
+use hyperscale_vm_effects::{Claim, EnvelopeTree, IntentDecl, ManifestGraph, StoredRule};
 use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
 use hyperscale_vm_stdlib::account;
 use hyperscale_vm_types::PrincipalAddr;
@@ -100,15 +100,16 @@ impl Client {
         self.network
     }
 
-    /// A typed builder over this client's world.
+    /// A typed builder over this client's world, for an intent `signer`
+    /// will sign.
     ///
     /// The records are loaded by the caller because the view has to
     /// outlive the builder borrowing it — and because one loaded view is
     /// what keeps a graph typed against a single world however many
     /// calls it names.
     #[must_use]
-    pub fn builder<'a>(&self, chain: &'a NodeRecords) -> TypedBuilder<'a> {
-        TypedBuilder::new(chain, &ProtocolHasher)
+    pub fn builder<'a>(&self, chain: &'a NodeRecords, signer: PrincipalAddr) -> TypedBuilder<'a> {
+        TypedBuilder::new(chain, &ProtocolHasher, signer)
     }
 
     /// What this client's world answers for, pinned — for a caller
@@ -133,7 +134,7 @@ impl Client {
         amount: u128,
     ) -> Result<ManifestGraph, TypedError> {
         let chain = self.records();
-        let mut b = self.builder(&chain);
+        let mut b = self.builder(&chain, from);
         let sender = account::authorize(&mut b, from)?;
         let funds = account::withdraw(&mut b, sender, *XRD, amount)?;
         account::deposit(&mut b, to, funds)?;
@@ -158,12 +159,12 @@ impl Client {
         recovery_delay_ms: u64,
     ) -> Result<ManifestGraph, TypedError> {
         let chain = self.records();
-        let mut b = self.builder(&chain);
+        let mut b = self.builder(&chain, account);
         let owner = account::authorize(&mut b, account)?;
         account::securify_uniform(
             &mut b,
             owner,
-            &StoredRule::Require(Presented::Identity(holder.into())),
+            &StoredRule::claim(Claim::of_subject(holder)),
             recovery_delay_ms,
         )?;
         b.build()
@@ -186,7 +187,7 @@ impl Client {
             &EnvelopeTree {
                 root: IntentDecl {
                     graph,
-                    params: Vec::new(),
+                    sockets: Vec::new(),
                 },
                 root_bindings: Vec::new(),
                 subintents: Vec::new(),

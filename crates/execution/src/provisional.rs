@@ -94,6 +94,7 @@ impl ProvisionalCells {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{AddressClass, DeclaredRange, LocalKey};
+    use hyperscale_vm_types::Moves;
 
     use super::*;
 
@@ -115,12 +116,13 @@ mod tests {
     }
 
     const RESERVE: Mode = Mode::Reserve { amount: 5 };
+    const WRITE: Mode = Mode::Write { moves: Moves::Both };
 
     #[test]
     fn nothing_is_blocked_by_an_empty_claim_set() {
         let claims = ProvisionalCells::default();
         assert!(claims.is_empty());
-        assert!(!claims.blocks(&[(cell(1, 1), Mode::Write)]));
+        assert!(!claims.blocks(&[(cell(1, 1), WRITE)]));
     }
 
     /// The reason the whole relation is here: payment traffic is delta
@@ -129,13 +131,13 @@ mod tests {
     #[test]
     fn commutative_access_does_not_wait_on_commutative_access() {
         let mut claims = ProvisionalCells::default();
-        claims.claim(&[(cell(1, 1), Mode::Delta)]);
-        assert!(!claims.blocks(&[(cell(1, 1), Mode::Delta)]));
+        claims.claim(&[(cell(1, 1), Mode::Delta { moves: Moves::Both })]);
+        assert!(!claims.blocks(&[(cell(1, 1), Mode::Delta { moves: Moves::Both })]));
         assert!(!claims.blocks(&[(cell(1, 1), RESERVE)]));
 
         let mut reserved = ProvisionalCells::default();
         reserved.claim(&[(cell(1, 1), RESERVE)]);
-        assert!(!reserved.blocks(&[(cell(1, 1), Mode::Delta)]));
+        assert!(!reserved.blocks(&[(cell(1, 1), Mode::Delta { moves: Moves::Both })]));
         assert!(!reserved.blocks(&[(cell(1, 1), RESERVE)]));
     }
 
@@ -144,9 +146,9 @@ mod tests {
     #[test]
     fn a_read_or_an_exclusive_write_still_waits() {
         let mut claims = ProvisionalCells::default();
-        claims.claim(&[(cell(1, 1), Mode::Delta)]);
+        claims.claim(&[(cell(1, 1), Mode::Delta { moves: Moves::Both })]);
         assert!(claims.blocks(&[(cell(1, 1), Mode::Read)]));
-        assert!(claims.blocks(&[(cell(1, 1), Mode::Write)]));
+        assert!(claims.blocks(&[(cell(1, 1), WRITE)]));
     }
 
     /// An exclusive claim excludes everything, commutative included: it
@@ -154,8 +156,13 @@ mod tests {
     #[test]
     fn an_exclusive_claim_excludes_every_mode() {
         let mut claims = ProvisionalCells::default();
-        claims.claim(&[(cell(1, 1), Mode::Write)]);
-        for mode in [Mode::Delta, RESERVE, Mode::Read, Mode::Write] {
+        claims.claim(&[(cell(1, 1), WRITE)]);
+        for mode in [
+            Mode::Delta { moves: Moves::Both },
+            RESERVE,
+            Mode::Read,
+            WRITE,
+        ] {
             assert!(
                 claims.blocks(&[(cell(1, 1), mode)]),
                 "{mode:?} slipped past"
@@ -166,9 +173,9 @@ mod tests {
     #[test]
     fn a_claim_leaves_siblings_and_other_owners_alone() {
         let mut claims = ProvisionalCells::default();
-        claims.claim(&[(cell(1, 1), Mode::Write)]);
-        assert!(!claims.blocks(&[(cell(1, 2), Mode::Write)]), "sibling cell");
-        assert!(!claims.blocks(&[(cell(2, 1), Mode::Write)]), "other owner");
+        claims.claim(&[(cell(1, 1), WRITE)]);
+        assert!(!claims.blocks(&[(cell(1, 2), WRITE)]), "sibling cell");
+        assert!(!claims.blocks(&[(cell(2, 1), WRITE)]), "other owner");
     }
 
     /// Two intervals of one collection contend by mode alone — the
@@ -178,12 +185,12 @@ mod tests {
     #[test]
     fn intervals_contend_by_collection_and_leave_points_alone() {
         let mut claims = ProvisionalCells::default();
-        claims.claim(&[(interval(1, 0, 10), Mode::Write)]);
+        claims.claim(&[(interval(1, 0, 10), WRITE)]);
         assert!(claims.blocks(&[(interval(1, 20, 30), Mode::Read)]));
-        assert!(!claims.blocks(&[(cell(1, 1), Mode::Write)]));
+        assert!(!claims.blocks(&[(cell(1, 1), WRITE)]));
 
         let mut over_cell = ProvisionalCells::default();
-        over_cell.claim(&[(cell(1, 1), Mode::Write)]);
-        assert!(!over_cell.blocks(&[(interval(1, 0, 10), Mode::Write)]));
+        over_cell.claim(&[(cell(1, 1), WRITE)]);
+        assert!(!over_cell.blocks(&[(interval(1, 0, 10), WRITE)]));
     }
 }

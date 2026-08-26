@@ -21,14 +21,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use hyperscale_effects_bridge::records::committed_instance;
+use hyperscale_effects_bridge::records::{committed_instance, resource_issued_by};
 use hyperscale_effects_bridge::vm_statics::config_key;
 use hyperscale_types::{SubstateEntry, TxHash};
 use hyperscale_vm_effects::{
-    ChainRecords, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash, PackageMetadata,
+    ChainRecords, Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash,
+    PackageMetadata, ResourceMeta,
 };
 use hyperscale_vm_kernel::Substates;
-use hyperscale_vm_types::{CallTarget, SubstateKey};
+use hyperscale_vm_types::{CallTarget, ResourceAddr, SubstateKey};
 
 /// The records one batch answers a call target with.
 ///
@@ -110,6 +111,23 @@ impl ChainRecords for BatchRecords<'_> {
 
     fn package(&self, hash: PackageHash) -> Option<Arc<PackageMetadata>> {
         self.packages.record(hash)
+    }
+
+    /// Derived over the seeded records alone, which is the only
+    /// instance set this batch can scan without leaving the block and
+    /// the chain: `provisioned` and `committed` answer an address that
+    /// is asked for, and nothing enumerates the issuers among them.
+    ///
+    /// Deterministic for that reason rather than in spite of it — the
+    /// seeded set is genesis's and identical on every node, so two
+    /// members of a shard resolve a resource alike or neither does.
+    fn resource(&self, resource: ResourceAddr, hasher: &dyn Hasher) -> Option<ResourceMeta> {
+        resource_issued_by(
+            self.seeded.components(),
+            self.packages.as_ref(),
+            resource,
+            hasher,
+        )
     }
 }
 

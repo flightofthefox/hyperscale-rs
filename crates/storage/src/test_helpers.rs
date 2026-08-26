@@ -12,19 +12,20 @@ use hyperscale_hbor::from_slice;
 use hyperscale_jmt::{KEY_BYTES, TreeReader};
 use hyperscale_types::test_utils::{make_finalization, test_transaction};
 use hyperscale_types::{
-    Address, AddressClass, AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconCert,
-    BeaconChainConfig, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
-    Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBeaconBlock,
-    CertifiedBlock, ChainOrigin, CollectionId, ConsensusReceipt, EntryKey, EntryLeaf, Epoch, Event,
-    ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, Finalization,
-    GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel, MerkleInclusionProof, PcQc2,
-    PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp, ProtocolHasher, ProvisionEntry,
-    ProvisionHash, Provisions, QuorumCertificate, Randomness, RatifyCert, RatifyRound, Round,
-    SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield,
-    SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt, SubstateKey,
-    SubstateLeaf, TerminalVerdict, TickHalf, TickId, Transaction, TransactionDecision, TxHash,
-    TxOutcome, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
-    WorkInFlight, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
+    AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock, BeaconBlockHash,
+    BeaconCert, BeaconChainConfig, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount,
+    BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
+    CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId, ConsensusReceipt, EntryKey,
+    EntryLeaf, Epoch, Event, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary,
+    Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel,
+    MerkleInclusionProof, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp,
+    ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, Randomness,
+    RatifyCert, RatifyRound, Round, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId,
+    ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
+    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, TerminalVerdict, TickHalf, TickId,
+    Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp, WitnessSources, WorkInFlight, compute_global_receipt_root,
+    compute_merkle_root, entry_leaf_key,
 };
 
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
@@ -1540,6 +1541,10 @@ pub fn test_undischarged_record_holds_the_floor(
             tx_hash: stranded.hash(),
             deadline: WeightedTimestamp::from_millis(500),
             declared_work: stranded.work(),
+            charge: AbortCharge {
+                vault: stranded.fee_vault(),
+                floor: stranded.body().abort_floor(),
+            },
         }],
     );
 

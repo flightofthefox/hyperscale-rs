@@ -443,7 +443,7 @@ fn validate_synced_block(
 mod tests {
     use std::sync::Arc;
 
-    use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_types::test_utils::{stub_abort_charge, test_transaction};
     use hyperscale_types::{
         AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, CertificateRoot,
         ChainOrigin, ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, Finalization,
@@ -673,6 +673,7 @@ mod tests {
                 tx_hash: TxHash::from(Hash::from_bytes(b"stranded")),
                 deadline: WeightedTimestamp::from_millis(1_500),
                 declared_work: 7,
+                charge: stub_abort_charge(7),
             }],
         )
     }

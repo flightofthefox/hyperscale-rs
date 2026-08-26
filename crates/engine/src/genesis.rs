@@ -20,14 +20,12 @@ pub use hyperscale_effects_bridge::{XRD, draw_key, vault_key};
 use hyperscale_hbor::{Hash32, to_vec};
 use hyperscale_types::{EntryKey, Hash, PrincipalAddr, SettledWrites, StakePoolSeat};
 use hyperscale_vm_effects::{
-    Declaration, DeclaredAccess, ResourceKind, holdings_collection, instance_data_key,
-    package_hash, resource_record_key,
+    Declaration, DeclaredAccess, IssuanceGrant, Issued, ResourceKind, holdings_collection,
+    instance_data_key, package_hash, resource_record_key,
 };
 use hyperscale_vm_kernel::{EnvInputs, KernelSession, Locality, MemoryStore, OverlayStore};
 use hyperscale_vm_stdlib::{package_writes, staking};
-use hyperscale_vm_types::{
-    Address, Effect, EffectSet, EffectTarget, ISSUER_REP, Mode, Outcome, TxHash,
-};
+use hyperscale_vm_types::{Address, Effect, EffectSet, EffectTarget, Mode, Moves, Outcome, TxHash};
 
 use crate::executor::{artifact_package, protocol_hash};
 
@@ -200,9 +198,13 @@ fn minted_allocations(accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
         .map(|(address, _)| DeclaredAccess {
             effect: Effect {
                 target: EffectTarget::Point(vault_key(*address, *XRD)),
-                mode: Mode::Delta,
+                mode: Mode::Delta { moves: Moves::Both },
             },
             holds: Some(*XRD),
+            // Genesis credits the accounts it is naming, so every one of
+            // these is under the prefix it belongs to and none reaches a
+            // stranger's.
+            reach: None,
         })
         .collect();
     let mut set = EffectSet::new();
@@ -224,12 +226,23 @@ fn minted_allocations(accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
     )
     .expect("every allocation names one unheld vault");
 
-    session.grant_issuance(*XRD, ResourceKind::Fungible);
-    for (rep, (_, balance)) in accounts.iter().enumerate() {
-        let rep = u32::try_from(rep).expect("one clause per funded account");
-        let minted = session.mint(ISSUER_REP, *balance).expect("the grant mints");
+    // The one issuance genesis holds, so every mint below names index
+    // zero. Founding rather than minting under a rule: the fee resource
+    // grants no `Mint` entry, and what a body may do here is the
+    // occasion's rather than any caller's.
+    session.grant_issuance(vec![IssuanceGrant {
+        resource: *XRD,
+        kind: ResourceKind::Fungible,
+        direction: Issued::Minted,
+    }]);
+    // A session seeds one site per capability, in table order, so the
+    // clause a vault was declared under is reached at the same position
+    // with no walk having bound anything first.
+    for (site, (_, balance)) in accounts.iter().enumerate() {
+        let site = u32::try_from(site).expect("one clause per funded account");
+        let minted = session.mint(0, *balance).expect("the grant mints");
         session
-            .delta_put(rep, minted)
+            .cell_put(site, 0, minted)
             .expect("into the vault it was minted for");
     }
     let (receipt, _) = session

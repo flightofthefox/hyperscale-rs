@@ -37,7 +37,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::TickEnvironment;
+use hyperscale_engine::{TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_unresolvable_tx};
 use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::{
@@ -46,9 +46,10 @@ use hyperscale_types::{
     ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
     Hash, MAX_FINALIZATION_DELAY, MAX_TERMINAL_VERDICTS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, Mode,
     Provisions, RETENTION_HORIZON, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
-    ShardTrie, TerminalVerdict, TickId, TopologySchedule, TopologySnapshot, Transaction,
-    TransactionDecision, TxClaim, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
+    ShardTrie, StoredReceipt, TerminalVerdict, TickId, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp, derive_block_transactions, settled_set_verdict, tick_leader,
+    tick_leader_at,
 };
 use tracing::instrument;
 
@@ -66,7 +67,7 @@ use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
 use crate::tick_state::{Admission, Divergence, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
-use crate::unresolved::{Unanswerable, UnresolvedTxs};
+use crate::unresolved::{Abandonable, Unanswerable, UnresolvedTxs};
 use crate::vote_tracker::VoteTracker;
 
 /// One payer-side engagement wait: the transaction, the counterpart
@@ -767,6 +768,65 @@ impl ExecutionCoordinator {
     ///
     /// Returns the tick, if the commit composed one, and any early votes
     /// its leader can now replay.
+    /// Admit into the tick being composed everything this commit
+    /// abandons: past its deadline, with no shard left that could settle
+    /// it.
+    ///
+    /// Read after composition's own assignments, so a member that just
+    /// joined this tick is not taken from it — the tick that holds a
+    /// transaction is the one that speaks for it.
+    ///
+    /// Each joins undispatched, on the shards its committing block
+    /// named. Those are what routes this tick's certificate to the
+    /// counterparts still waiting on a verdict for it — the abort is
+    /// dominant, so their coverage closes on it — and what the fence
+    /// asks its question about.
+    fn admit_abandoned(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        tick_id: TickId,
+        state: &mut TickState,
+    ) {
+        let local_shard = self.local_shard;
+        let trie = self.counterpart_trie(topology_schedule);
+        for entry in self.abandonable(tick_id) {
+            let Abandonable {
+                tx_hash,
+                declared_work,
+                charge,
+            } = entry;
+            // A tick that held the member can never speak for it — its
+            // coverage will not close — and its other legs would wait on
+            // that coverage forever. It goes with the member; the rest of
+            // its members reach their own deadlines instead.
+            if let Some(held_by) = self.ticks.tick_assignment(tx_hash) {
+                self.discard_tick(held_by);
+            }
+            let mut participating = self.unresolved.counterparts(tx_hash, trie);
+            participating.insert(local_shard);
+            state.admit(tx_hash, participating, declared_work, Admission::Aborted);
+            // An abandonment reaches no engine, so the charge its verdict
+            // settles is built here rather than read off a result. The
+            // floor is owed whether or not the transaction ever ran: the
+            // reservation engaged when its block committed it, and an
+            // abort that released it without burning would price an
+            // attempt nobody could execute below the success it was
+            // competing with.
+            //
+            // Fees never move cross-shard, so only the shard holding the
+            // vault settles it — the same question the engine asks of the
+            // payers it prices.
+            if trie.shard_for_prefix(charge.vault.owner) == local_shard {
+                let fee = build_fee_receipt(local_shard, trie, tx_hash, charge.vault, charge.floor);
+                state.record_fee_receipt(StoredReceipt::synced(tx_hash, Arc::new(fee)));
+            }
+            self.candidates.remove(tx_hash);
+            self.provisioning.remove_tx(tx_hash);
+            self.ticks.assign_tx(tx_hash, tick_id);
+            self.unresolved.certify(tx_hash);
+        }
+    }
+
     fn compose_tick(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -804,33 +864,7 @@ impl ExecutionCoordinator {
             requests.push(member.request);
         }
 
-        // Read after the assignments above, so a member that just joined
-        // this tick is not taken from it: the tick that holds a
-        // transaction is the one that speaks for it.
-        //
-        // Each joins undispatched, on the shards its committing block
-        // named. Those are what routes this tick's certificate to the
-        // counterparts still waiting on a verdict for it — the abort is
-        // dominant, so their coverage closes on it — and what the fence
-        // asks its question about.
-        for (tx_hash, declared_work) in self.abandonable(tick_id) {
-            // A tick that held the member can never speak for it — its
-            // coverage will not close — and its other legs would wait on
-            // that coverage forever. It goes with the member; the rest of
-            // its members reach their own deadlines instead.
-            if let Some(held_by) = self.ticks.tick_assignment(tx_hash) {
-                self.discard_tick(held_by);
-            }
-            let mut participating = self
-                .unresolved
-                .counterparts(tx_hash, self.counterpart_trie(topology_schedule));
-            participating.insert(local_shard);
-            state.admit(tx_hash, participating, declared_work, Admission::Aborted);
-            self.candidates.remove(tx_hash);
-            self.provisioning.remove_tx(tx_hash);
-            self.ticks.assign_tx(tx_hash, tick_id);
-            self.unresolved.certify(tx_hash);
-        }
+        self.admit_abandoned(topology_schedule, tick_id, &mut state);
 
         if state.is_empty() {
             return (None, Vec::new(), Vec::new());
@@ -2403,11 +2437,11 @@ impl ExecutionCoordinator {
     /// transaction a terminating counterpart may have settled is the
     /// fence's question, which [`Self::fence_pairs`] is what lets the
     /// fence ask about an abandonment at all.
-    fn abandonable(&self, composing: TickId) -> Vec<(TxHash, u64)> {
+    fn abandonable(&self, composing: TickId) -> Vec<Abandonable> {
         self.unresolved
             .past_deadline(self.committed_ts)
             .into_iter()
-            .filter(|(tx_hash, _)| self.beyond_every_shard(composing, *tx_hash))
+            .filter(|entry| self.beyond_every_shard(composing, entry.tx_hash))
             .collect()
     }
 
@@ -3529,12 +3563,12 @@ mod tests {
         test_prefix, test_transaction, test_transaction_running, test_transaction_with_prefixes,
     };
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt,
-        ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, ExecutionOutcome,
-        GlobalReceiptHash, Hash, MAX_FINALIZATION_DELAY, NetworkDefinition, QuorumCertificate,
-        Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer,
-        SignerBitfield, StateRoot, StoredReceipt, TickHalf, UnsettledTx, ValidatorInfo,
-        ValidatorSet,
+        AbortCharge, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
+        ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed,
+        EpochWindows, ExecutionOutcome, GlobalReceiptHash, Hash, LocalKey, MAX_FINALIZATION_DELAY,
+        NetworkDefinition, QuorumCertificate, Randomness, RecoveryCause, SeedRing, SeedSource,
+        ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateRoot, StoredReceipt, SubstateKey,
+        TickHalf, UnsettledTx, ValidatorInfo, ValidatorSet,
     };
     use hyperscale_vm_types::Seeded;
 
@@ -6394,6 +6428,112 @@ mod tests {
         );
     }
 
+    /// The floor is burned by the abandonment too, which is what stops a
+    /// transaction nobody could execute from aborting for free.
+    ///
+    /// An abandoned member never reaches an engine, so the charge its
+    /// verdict settles is composed rather than executed — but the
+    /// reservation engaged when its block committed it, and releasing
+    /// that without a burn would price an unexecutable attempt below the
+    /// success it was competing with.
+    #[test]
+    fn an_abandoned_transaction_still_settles_its_floor() {
+        let schedule = make_test_topology();
+        let mut state = make_test_state();
+        let tx = test_transaction(1);
+        let expected = build_fee_receipt(
+            ShardId::ROOT,
+            state.counterpart_trie(&schedule),
+            tx.hash(),
+            tx.fee_vault(),
+            tx.body().abort_floor(),
+        );
+        let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
+
+        state.on_block_committed(
+            &schedule,
+            &test_certify(
+                make_live_block(
+                    BlockHeight::new(1),
+                    1_000,
+                    ValidatorId::new(0),
+                    vec![Arc::new(tx)],
+                ),
+                1_000,
+            ),
+        );
+        state
+            .ticks
+            .remove_tick(&TickId::new(ShardId::ROOT, BlockHeight::new(1)));
+
+        let outcomes = abandonment_vote(&mut state, &schedule, 2, deadline_ms);
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].is_aborted());
+        assert_eq!(
+            outcomes[0].fee_receipt(),
+            Some(expected.receipt_hash()),
+            "the abandonment settles the same floor an attested abort would",
+        );
+    }
+
+    /// And it is settled by the payer's own shard alone: fees never move
+    /// cross-shard, so a participant abandoning a leg of somebody else's
+    /// transaction charges nothing.
+    #[test]
+    fn an_abandonment_charges_nothing_where_the_vault_is_not() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        // A payer whose prefix the other half of the split owns.
+        let tx = test_transaction(0x81);
+        assert_eq!(
+            state
+                .counterpart_trie(&schedule)
+                .shard_for_prefix(tx.fee_vault().owner),
+            PEER,
+            "the fixture is only a test of this if the vault is elsewhere",
+        );
+        let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
+
+        state.on_block_committed(
+            &schedule,
+            &test_certify(
+                make_live_block_on_shard(
+                    HOME,
+                    BlockHeight::new(1),
+                    1_000,
+                    ValidatorId::new(0),
+                    vec![Arc::new(tx)],
+                ),
+                1_000,
+            ),
+        );
+        state
+            .ticks
+            .remove_tick(&TickId::new(HOME, BlockHeight::new(1)));
+
+        let block = make_live_block_on_shard(
+            HOME,
+            BlockHeight::new(2),
+            deadline_ms,
+            ValidatorId::new(0),
+            vec![],
+        );
+        state.on_block_committed(&schedule, &test_certify(block, deadline_ms));
+        let outcomes: Vec<TxOutcome> = state
+            .scan_votable_ticks(&schedule)
+            .into_iter()
+            .flat_map(|completion| completion.tx_outcomes)
+            .collect();
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].is_aborted());
+        assert_eq!(
+            outcomes[0].fee_receipt(),
+            None,
+            "the vault is not here, so neither is the burn",
+        );
+    }
+
     /// A block a replay feeds back in, as storage hands it over.
     fn replayable(block: Block, now_ms: u64) -> Verified<CertifiedBlock> {
         Verified::<CertifiedBlock>::from_persisted(test_certify(block, now_ms))
@@ -6836,6 +6976,13 @@ mod tests {
                     tx_hash,
                     deadline: WeightedTimestamp::from_millis(30_000),
                     declared_work: 1,
+                    charge: AbortCharge {
+                        vault: SubstateKey {
+                            owner: Address::new([9; 31], AddressClass::Component),
+                            local: LocalKey([9; 16]),
+                        },
+                        floor: 5,
+                    },
                 }],
             )]);
     }
@@ -6949,7 +7096,7 @@ mod tests {
             state
                 .abandonable(TickId::new(HOME, BlockHeight::new(9)))
                 .iter()
-                .map(|(hash, _)| *hash)
+                .map(|entry| entry.tx_hash)
                 .collect::<Vec<_>>(),
             vec![tx_hash],
             "and the record is what makes the abort this shard's to compose",

@@ -49,8 +49,8 @@ mod tests {
                 "package/content = 7e5f726fe1bb474718cfd6c20c04e2cd10de46768f830dabdc8845f0e2bc1e03",
                 "resource/minted = e7ade2f9f5f36c4a571c1f0f003b6a5e3a788d18362634e11b9d82df673bd404",
                 "resource/minted-nf = ac913fc5425c3f6b4712e91099ef2754b4d739998d3bdee9eff308794405b904",
-                "native/genesis-publisher = 89ba159512ed286bc66436f6a009090f87af9a1c8b5f9fa3a7d633ef37b40105",
-                "resource/xrd = b9c3798c9eeebca9e772f4f0d256872e193ab5864e9e557bba8a1c413c255704",
+                "native/genesis-publisher = a8d17f712889af8c3657c416f393543e4c7c2871c0e361decaedefda4fc9c705",
+                "resource/xrd = f0762f0fd514e13031e6b12df742a5901b263aec476126ca1bc0b130bc0d3d04",
             ]
         );
     }

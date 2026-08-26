@@ -19,8 +19,8 @@ use hyperscale_vm_gate::{
     attach_metadata as attach, extract_metadata as extract,
 };
 
-fn chain(error: GateError) -> DerivationError {
-    DerivationError::Refused(error.0)
+fn chain<T>(verdict: Result<T, GateError>) -> Result<T, DerivationError> {
+    verdict.map_err(|error| DerivationError::Refused(error.to_string()))
 }
 
 /// Attach `metadata` to a component artifact as its metadata section.
@@ -38,7 +38,7 @@ pub fn attach_metadata(
     artifact: &[u8],
     metadata: &PackageMetadata,
 ) -> Result<Vec<u8>, DerivationError> {
-    attach(artifact, metadata).map_err(chain)
+    chain(attach(artifact, metadata))
 }
 
 /// The effect metadata a component artifact declares, if it declares any.
@@ -49,7 +49,7 @@ pub fn attach_metadata(
 /// it declares the metadata section more than once, or if the section's
 /// payload is oversized or not canonical metadata.
 pub fn extract_metadata(artifact: &[u8]) -> Result<Option<PackageMetadata>, DerivationError> {
-    extract(artifact).map_err(chain)
+    chain(extract(artifact))
 }
 
 /// The metadata a publish admits from an artifact, or why it does not.
@@ -64,7 +64,7 @@ pub fn extract_metadata(artifact: &[u8]) -> Result<Option<PackageMetadata>, Deri
 /// not export, an ABI binding the export's type cannot honour, or a
 /// claim to totality, which only [`admit_protocol_package`] grants.
 pub fn admit_package(artifact: &[u8]) -> Result<PackageMetadata, DerivationError> {
-    admit(artifact).map_err(chain)
+    chain(admit(artifact))
 }
 
 /// Admit an artifact the protocol supplies rather than a publisher.
@@ -81,7 +81,7 @@ pub fn admit_package(artifact: &[u8]) -> Result<PackageMetadata, DerivationError
 /// against the artifact instead of refused, and fails admission when the
 /// code does not support it.
 pub fn admit_protocol_package(artifact: &[u8]) -> Result<PackageMetadata, DerivationError> {
-    admit_protocol(artifact).map_err(chain)
+    chain(admit_protocol(artifact))
 }
 
 #[cfg(test)]
