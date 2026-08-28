@@ -675,7 +675,11 @@ fn stub_execute(
         };
         movements
             .entry(vault_of(key.owner()))
-            .and_modify(|standing| *standing = standing.then(credited))
+            .and_modify(|standing| {
+                *standing = standing
+                    .then(credited)
+                    .expect("a fixture's constant credits compose inside u128");
+            })
             .or_insert(credited);
     }
     let writes = StateWrites {

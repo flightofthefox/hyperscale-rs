@@ -2704,6 +2704,7 @@ dependencies = [
 name = "hyperscale-vm-fixtures"
 version = "0.1.0"
 dependencies = [
+ "hyperscale-hbor",
  "hyperscale-vm-effects",
  "hyperscale-vm-manifest-builder",
  "hyperscale-vm-sdk",

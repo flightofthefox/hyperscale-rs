@@ -107,7 +107,14 @@ pub trait EnvelopeExt: Sized {
 
 impl EnvelopeExt for TransactionEnvelope {
     fn signing_hash(&self) -> Hash {
-        Hash::from_hash_bytes(&self.signing_digest(&ProtocolHasher))
+        // The digest refuses only an envelope past the wire caps, and
+        // nothing here holds one: a decoded envelope stays inside the
+        // bounds its decoder enforced, and a composed one was refused at
+        // signing before it reached an identity.
+        let digest = self
+            .signing_digest(&ProtocolHasher)
+            .expect("an envelope within its caps digests");
+        Hash::from_hash_bytes(&digest)
     }
 
     fn sign<S: AccountSigner>(mut self, key: &S) -> Self {
@@ -117,7 +124,9 @@ impl EnvelopeExt for TransactionEnvelope {
         // its own hasher — this is the protocol hash's spelling of it,
         // for the fixtures and call sites that already hold a key.
         self.signer_scheme = key.scheme();
-        let digest = self.signing_digest(&ProtocolHasher);
+        let digest = self
+            .signing_digest(&ProtocolHasher)
+            .expect("a fixture envelope stays within the wire caps");
         self.signer = key.public_key_bytes();
         self.signature = key.sign_digest(&digest);
         self

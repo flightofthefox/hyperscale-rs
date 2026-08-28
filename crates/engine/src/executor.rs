@@ -555,6 +555,9 @@ pub fn abort_reason(outcome: &Outcome) -> String {
             amount,
         } => format!("constraint unmet: node {node} parameter {param} carried {amount}"),
         Outcome::NullifierSpent { key } => format!("subintent already spent at {key:?}"),
+        Outcome::BaselineDiscarded { flipped } => {
+            format!("baseline discarded: group-mate {flipped:?} flipped at apply")
+        }
         Outcome::Declined { node, code } => format!("node {node} declined with code {code}"),
         Outcome::ConditionUnmet { condition } => match condition {
             UnmetCondition::Holds {
@@ -613,11 +616,20 @@ fn apply_fee_burn(writes: &mut StateWrites, fee: Option<PayerFee>, fuel: u64) {
     // A fee is paid in the protocol's own resource, which is what the
     // payer's vault is keyed by and what makes this movement nameable
     // without reading the vault.
+    //
+    // This composition lands in the receipt `writes_root` commits over,
+    // so it stays exact gross — and it can: the standing debit is
+    // bounded by the XRD that exists, the burn by the `u64` fuel reads
+    // in, and the two together sit far inside `u128`.
     let burned = Movement::debit(*XRD, burn);
     writes
         .movements
         .entry(payer.vault)
-        .and_modify(|standing| *standing = standing.then(burned))
+        .and_modify(|standing| {
+            *standing = standing
+                .then(burned)
+                .expect("a vault's debits and a u64 fee compose inside u128");
+        })
         .or_insert(burned);
 }
 
@@ -691,10 +703,14 @@ pub const fn charge_for(outcome: &Outcome, payer: PayerFee) -> Option<u128> {
         // floor, and the discount a package could engineer by burning
         // its budget before declining is bounded by that transaction's
         // own gas.
+        // A discarded baseline is the same lost race one step removed:
+        // a group-mate flipped at apply and this execution read writes
+        // that never committed. Nothing the sender signed caused it.
         Outcome::Infeasible { .. }
         | Outcome::ConstraintUnmet { .. }
         | Outcome::NullifierSpent { .. }
         | Outcome::ConditionUnmet { .. }
+        | Outcome::BaselineDiscarded { .. }
         | Outcome::Declined { .. } => Some(payer.floor),
         // The kernel's own defect. `materialize_abort` refuses to price
         // it to the sender, and the burn agrees.
@@ -916,7 +932,10 @@ fn assemble_executed_tx(
         // everything commutative as the movement it was. Unresolved,
         // because the state this lands on is not the state it ran
         // against — that is settlement's question.
-        let mut writes = receipt.delta.project(locality);
+        let mut writes = receipt
+            .delta
+            .project(locality)
+            .expect("kernel-produced movements compose");
         // The batch's own fold is the one reader whose baseline really is
         // this one: a later transaction in this tick must see what an
         // earlier one left. It mirrors the kernel's store, so it takes

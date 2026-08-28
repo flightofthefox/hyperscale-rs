@@ -6,8 +6,8 @@ use std::sync::Arc;
 use hyperscale_hbor::{from_slice, to_vec};
 use hyperscale_jmt::{Key as JmtKey, NibblePath};
 use hyperscale_types::{
-    Address, CollectionId, EntryKey, EntryLeaf, ProtocolHasher, SettledEntries, SettledWrites,
-    StateWrites, StoredReceipt, SubstateKey, entry_leaf_key,
+    Address, CollectionId, EntryKey, EntryLeaf, Movement, ProtocolHasher, SettledEntries,
+    SettledWrites, StateWrites, StoredReceipt, SubstateKey, entry_leaf_key,
 };
 use hyperscale_vm_kernel::Substates;
 
@@ -75,11 +75,57 @@ pub fn fold_state_writes(merged: &mut StateWrites, writes: &StateWrites) {
         merged
             .movements
             .entry(*key)
-            .and_modify(|standing| *standing = standing.then(*movement))
+            .and_modify(|standing| *standing = compose_movements(*standing, *movement))
             .or_insert(*movement);
     }
     for (key, change) in &writes.entries {
         merged.entries.insert(*key, change.clone());
+    }
+}
+
+/// One cell's movement followed by another, at the merge layer's own
+/// altitude: exact gross totals while they fit, and the net the pair
+/// stands for where they do not.
+///
+/// A receipt's own movement is consensus content and stays gross — the
+/// kernel refuses a composition past `u128` there, because no execution
+/// produced one. A merged movement is not: everything it feeds —
+/// settlement's `resolve`, the tick view's readable fold — applies the
+/// net against a prior value, and gross totals past `u128` across many
+/// valid receipts are legal, since a large-supply resource moving
+/// through one cell repeatedly grows them without bound while the net
+/// stays a difference of two balances. The net is therefore what such a
+/// composition means, and it fits `u128` on whichever side it falls.
+///
+/// The saturation on the same-signed arm is [`StateWrites::resolve`]'s
+/// own posture: a net past `u128` is no difference of balances this
+/// chain held, and settlement saturates rather than raising an error no
+/// caller could act on.
+pub(crate) fn compose_movements(standing: Movement, next: Movement) -> Movement {
+    standing.then(next).unwrap_or_else(|| {
+        let (standing_gains, standing_net) = net(standing);
+        let (next_gains, next_net) = net(next);
+        let (gains, magnitude) = if standing_gains == next_gains {
+            (standing_gains, standing_net.saturating_add(next_net))
+        } else if standing_net >= next_net {
+            (standing_gains, standing_net - next_net)
+        } else {
+            (next_gains, next_net - standing_net)
+        };
+        Movement {
+            resource: standing.resource,
+            credit: if gains { magnitude } else { 0 },
+            debit: if gains { 0 } else { magnitude },
+        }
+    })
+}
+
+/// A movement as the direction and magnitude it nets to.
+const fn net(movement: Movement) -> (bool, u128) {
+    if movement.credit >= movement.debit {
+        (true, movement.credit - movement.debit)
+    } else {
+        (false, movement.debit - movement.credit)
     }
 }
 
@@ -319,7 +365,7 @@ mod tests {
 
     use hyperscale_jmt::NibblePath;
     use hyperscale_types::test_utils::test_prefix;
-    use hyperscale_types::{Address, LocalKey, SubstateKey};
+    use hyperscale_types::{Address, LocalKey, ResourceAddr, SubstateKey};
 
     use super::*;
 
@@ -351,6 +397,54 @@ mod tests {
             merge_state_writes(&[&relative(test_prefix(1), 1), &relative(test_prefix(1), 2)]);
         assert_eq!(merged.cells.len(), 1);
         assert_eq!(merged.cells.values().next().unwrap(), &Some(vec![2]));
+    }
+
+    /// Gross totals past `u128` are legal at the merge layer — many
+    /// valid receipts moving one large-supply resource through one cell
+    /// grow them without bound — and what such a composition means is
+    /// the net, which is what everything downstream applies.
+    #[test]
+    fn a_composition_past_u128_keeps_its_net() {
+        let resource = ResourceAddr::new([7; 31]);
+        let paid_in = Movement {
+            resource,
+            credit: u128::MAX,
+            debit: 0,
+        };
+        let cycled = Movement {
+            resource,
+            credit: 5,
+            debit: u128::MAX,
+        };
+        // Exact while it fits: nothing about a small pair is reduced.
+        let small = Movement {
+            resource,
+            credit: 3,
+            debit: 1,
+        };
+        assert_eq!(compose_movements(small, small).credit, 6);
+        assert_eq!(compose_movements(small, small).debit, 2);
+        // Past the width, the net survives: everything paid in came
+        // back out but five, and the composed movement says exactly
+        // that on the crediting side.
+        let folded = compose_movements(paid_in, cycled);
+        assert_eq!((folded.credit, folded.debit), (5, 0));
+        // The other way round nets to a debit.
+        let folded = compose_movements(cycled, paid_in);
+        assert_eq!((folded.credit, folded.debit), (5, 0));
+        let drained = compose_movements(
+            Movement {
+                resource,
+                credit: 0,
+                debit: u128::MAX,
+            },
+            Movement {
+                resource,
+                credit: u128::MAX,
+                debit: 3,
+            },
+        );
+        assert_eq!((drained.credit, drained.debit), (0, 3));
     }
 
     #[test]

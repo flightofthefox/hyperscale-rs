@@ -1282,7 +1282,10 @@ pub fn build_transfer_paid_by<S: AccountSigner>(
             message: Vec::new(),
         },
     );
-    Transaction::new(signing::sign(envelope, signer, &ProtocolHasher))
+    Transaction::new(
+        signing::sign(envelope, signer, &ProtocolHasher)
+            .expect("a composed envelope stays within the wire caps"),
+    )
 }
 
 /// Build a transfer whose fee payer is somebody else's account, which

@@ -46,7 +46,9 @@ use hyperscale_types::{
 use hyperscale_vm_types::{Address, CollectionId};
 
 use crate::lock_recover::{read_or_recover, write_or_recover};
-use crate::shard::writes::{entry_overlay_range, fold_state_writes, merge_entry_overlay};
+use crate::shard::writes::{
+    compose_movements, entry_overlay_range, fold_state_writes, merge_entry_overlay,
+};
 use crate::{Substates, VersionedStore};
 
 /// One cross-shard transaction's provisional contribution to a tick.
@@ -586,7 +588,7 @@ impl<Snap: Substates> Substates for TickViewSnapshot<Snap> {
         let mut written: Option<&Option<Vec<u8>>> = None;
         for overlay in self.overlays.iter().rev() {
             if let Some(movement) = overlay.movements.get(&key) {
-                moved = Some(moved.map_or(*movement, |above| movement.then(above)));
+                moved = Some(moved.map_or(*movement, |above| compose_movements(*movement, above)));
             }
             if let Some(change) = overlay.cells.get(&key) {
                 written = Some(change);

@@ -212,7 +212,9 @@ impl Client {
     /// # Panics
     ///
     /// If `payer` produces a key its own scheme does not admit, which is
-    /// a defect in the signer rather than in what it was asked to sign.
+    /// a defect in the signer rather than in what it was asked to sign —
+    /// or if the composed envelope outgrows the wire caps, which nothing
+    /// this client composes does.
     #[must_use]
     pub fn sign_tree<S: AccountSigner>(
         &self,
@@ -237,6 +239,7 @@ impl Client {
             },
         );
         signing::sign(envelope, payer, &ProtocolHasher)
+            .expect("a composed envelope stays within the wire caps")
     }
 
     /// A signed native-resource transfer from `from` to `to`.

@@ -256,7 +256,11 @@ fn minted_allocations(accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
     );
     // Resolved against nothing, which is what an opening balance lands
     // on: every credit here is the first thing its cell ever held.
-    receipt.delta.project(&Locality::All).resolve(&mut |_| None)
+    receipt
+        .delta
+        .project(&Locality::All)
+        .expect("kernel-produced movements compose")
+        .resolve(&mut |_| None)
 }
 
 /// The packages the chain is born running, as the beacon registry holds
