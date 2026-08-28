@@ -595,10 +595,9 @@ pub fn build_fan_out_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = graph(account_address(&payer.public_key().0), |b| {
-        let sender = account::authorize(b, from)?;
         for (index, to) in recipients.iter().enumerate() {
             let leg = amount + index as u128;
-            let funds = account::withdraw(b, sender, *XRD, leg)?;
+            let funds = account::withdraw(b, from, *XRD, leg)?;
             account::deposit(b, *to, funds)?;
         }
         Ok(())
@@ -1095,7 +1094,7 @@ pub fn build_instantiate_tx(
         instantiate(&mut root, founder, address).expect("a derivable lottery answers its seal");
     }
     for meta in lotteries {
-        env.instance(meta.clone());
+        env.register_instance(meta.clone());
     }
     env.seal(root)
         .expect("the root declares nothing to discharge")
@@ -1483,8 +1482,8 @@ pub fn build_badge_sale_tx(
 ) -> Transaction {
     let pool = pool_at(GENESIS_POOL_ID);
     let graph = graph(account_address(&seller.public_key().0), |b| {
-        let proof = account::authorize(b, account_address(&seller.public_key().0))?;
-        let funds = account::withdraw_nf(b, proof, pool_owner_badge(pool), &[OWNER_BADGE_ID])?;
+        let seller = account_address(&seller.public_key().0);
+        let funds = account::withdraw_nf(b, seller, pool_owner_badge(pool), &[OWNER_BADGE_ID])?;
         account::deposit_nf(b, buyer, funds)
     });
     Transaction::new(envelope(graph, seller, validity))
@@ -1775,7 +1774,9 @@ pub fn build_deactivate_tx(
             pool_owner_badge(pool),
             OWNER_BADGE_ID,
         )?;
-        staking::Staking::at(pool).deactivate_validator(b, proof, validator.inner())
+        b.presenting(proof, |b| {
+            staking::Staking::at(pool).deactivate_validator(b, validator.inner())
+        })
     });
     Transaction::new(envelope(graph, operator, validity))
 }
@@ -1803,13 +1804,14 @@ pub fn build_register_tx(
             pool_owner_badge(pool),
             OWNER_BADGE_ID,
         )?;
-        staking::Staking::at(pool).register_validator(
-            b,
-            proof,
-            validator.inner(),
-            pubkey.as_bytes().to_vec(),
-            possession_proof.as_bytes().to_vec(),
-        )
+        b.presenting(proof, |b| {
+            staking::Staking::at(pool).register_validator(
+                b,
+                validator.inner(),
+                *pubkey.as_bytes(),
+                *possession_proof.as_bytes(),
+            )
+        })
     });
     Transaction::new(envelope(graph, operator, validity))
 }
@@ -1829,8 +1831,7 @@ pub fn build_unstake_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = graph(account_address(&delegator.public_key().0), |b| {
-        let delegator = account::authorize(b, from)?;
-        let units = account::withdraw(b, delegator, stake_unit(pool), amount)?;
+        let units = account::withdraw(b, from, stake_unit(pool), amount)?;
         staking::Staking::at(pool).unstake(b, units)
     });
     Transaction::new(envelope(graph, delegator, validity))
@@ -1860,8 +1861,7 @@ pub fn build_stake_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = graph(account_address(&delegator.public_key().0), |b| {
-        let delegator = account::authorize(b, from)?;
-        let funds = account::withdraw(b, delegator, *XRD, amount)?;
+        let funds = account::withdraw(b, from, *XRD, amount)?;
         let units = staking::Staking::at(pool).stake(b, funds)?;
         account::deposit(b, from, units)
     });
@@ -1916,12 +1916,11 @@ pub fn build_composed_tx(
         &ProtocolHasher,
         account_address(&composer.public_key().0),
     );
-    let sender = account::authorize(&mut root, from).expect("an account signs in");
-    let funds = account::withdraw(&mut root, sender, *XRD, amount)
-        .expect("an account answers a withdrawal");
+    let funds =
+        account::withdraw(&mut root, from, *XRD, amount).expect("an account answers a withdrawal");
     let paid = root.export(funds);
     let wants = env
-        .present(account_address(&signer_key.public_key().0), request.clone())
+        .adopt(account_address(&signer_key.public_key().0), request.clone())
         .expect("the request discharges its own hole")
         .one()
         .expect("the request declares one parameter");
@@ -2053,13 +2052,14 @@ pub fn build_reshape_threshold_vote_tx(
             pool_owner_badge(pool_at(GENESIS_POOL_ID)),
             OWNER_BADGE_ID,
         )?;
-        staking::Staking::at(pool_at(GENESIS_POOL_ID)).cast_param_vote(
-            b,
-            proof,
-            split_bytes,
-            NetworkParams::default().impound_epochs,
-            activate_at.inner(),
-        )
+        b.presenting(proof, |b| {
+            staking::Staking::at(pool_at(GENESIS_POOL_ID)).cast_param_vote(
+                b,
+                split_bytes,
+                NetworkParams::default().impound_epochs,
+                activate_at.inner(),
+            )
+        })
     });
     Transaction::new(envelope(graph, operator, validity))
 }

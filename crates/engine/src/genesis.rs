@@ -205,6 +205,7 @@ fn minted_allocations(accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
             // these is under the prefix it belongs to and none reaches a
             // stranger's.
             reach: None,
+            clause: None,
         })
         .collect();
     let mut set = EffectSet::new();

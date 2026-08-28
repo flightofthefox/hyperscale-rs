@@ -234,8 +234,7 @@ fn signed_transfer_under_bound(
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let chain = client().records();
     let mut b = client().builder(&chain, from);
-    let sender = account::authorize(&mut b, from).expect("an account signs in");
-    let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");
+    let funds = account::withdraw(&mut b, from, *XRD, amount).expect("an account withdraws");
     account::deposit(&mut b, to, funds.min(min)).expect("an account deposits");
     let graph = b.build().expect("every output is consumed");
     Transaction::new(client().sign(graph, &key, terms(max_fee)))
@@ -350,7 +349,7 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
             EnvelopeBuilder::new(&composed, &ProtocolHasher, fee_payer(SEALER_SEED));
         instantiate(&mut root, fee_payer(SEALER_SEED), round)
             .expect("a derivable round answers its seal");
-        env.instance(lottery_meta(*salt));
+        env.register_instance(lottery_meta(*salt));
         env.seal(root)
             .expect("the root declares nothing to discharge")
             .none()
@@ -1251,8 +1250,7 @@ fn a_two_recipient_fan_out_executes() {
     let chain = client().records();
     let mut b = client().builder(&chain, alice());
     for (to, amount) in [(bob(), 5u128), (fee_payer(7), 6)] {
-        let sender = account::authorize(&mut b, alice()).expect("an account signs in");
-        let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");
+        let funds = account::withdraw(&mut b, alice(), *XRD, amount).expect("an account withdraws");
         account::deposit(&mut b, to, funds).expect("an account deposits");
     }
     let graph = b.build().expect("every output is consumed");

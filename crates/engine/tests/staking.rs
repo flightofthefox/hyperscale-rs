@@ -163,8 +163,7 @@ fn signed_stake(pool: ComponentAddr, amount: u128) -> Transaction {
     let from = account_address(&key.public_key().0);
     let chain = client().records();
     let mut b = client().builder(&chain, from);
-    let sender = account::authorize(&mut b, from).expect("an account signs in");
-    let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");
+    let funds = account::withdraw(&mut b, from, *XRD, amount).expect("an account withdraws");
     let units = staking::Staking::at(pool)
         .stake(&mut b, funds)
         .expect("a pool takes a delegation");
@@ -185,8 +184,7 @@ fn signed_stake_composed(seat: &StakePoolSeat, amount: u128) -> Transaction {
     let chain = client().records();
     let composed = Composed::new(&chain, std::slice::from_ref(&meta), &ProtocolHasher);
     let (mut env, mut b) = EnvelopeBuilder::new(&composed, &ProtocolHasher, from);
-    let sender = account::authorize(&mut b, from).expect("an account signs in");
-    let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");
+    let funds = account::withdraw(&mut b, from, *XRD, amount).expect("an account withdraws");
     let units = staking::Staking::at(pool)
         .stake(&mut b, funds)
         .expect("a pool takes a delegation");
@@ -435,7 +433,7 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
     // which of those nodes exist are the package's own declaration to
     // say.
     instantiate(&mut root, from, pool).expect("a derivable pool answers its seal");
-    env.instance(meta);
+    env.register_instance(meta);
     env.seal(root)
         .expect("the root declares nothing to discharge")
         .none()
@@ -535,8 +533,7 @@ fn a_pool_nobody_instantiated_answers_nothing() {
     let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated);
     let chain = client().records();
     let (_, mut root) = EnvelopeBuilder::new(&chain, &ProtocolHasher, delegator());
-    let sender = account::authorize(&mut root, delegator()).expect("an account signs in");
-    let funds = account::withdraw(&mut root, sender, *XRD, 500).expect("an account withdraws");
+    let funds = account::withdraw(&mut root, delegator(), *XRD, 500).expect("an account withdraws");
     let refusal = staking::Staking::at(pool)
         .stake(&mut root, funds)
         .expect_err("a pool nobody sealed resolves nothing");
@@ -609,9 +606,10 @@ fn signed_registration(pool: ComponentAddr, seed: u8) -> Transaction {
     let mut b = client().builder(&chain, signer);
     let proof = account::present_instance(&mut b, signer, pool_owner_badge(pool), OWNER_BADGE_ID)
         .expect("a presentation types");
-    staking::Staking::at(pool)
-        .register_validator(&mut b, proof, 11, vec![0xC1; 48], vec![0xC2; 96])
-        .expect("a pool answers a registration");
+    b.presenting(proof, |b| {
+        staking::Staking::at(pool).register_validator(b, 11, [0xC1; 48], [0xC2; 96])
+    })
+    .expect("a pool answers a registration");
     let graph = b.build().expect("a registration produces nothing");
     Transaction::new(client().sign(graph, &key, terms(1_000)))
 }

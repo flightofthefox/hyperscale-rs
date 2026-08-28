@@ -803,13 +803,19 @@ fn settled_on_its_seal<C: Cluster>(c: &C, shard: ShardId, lottery: &InstanceMeta
     )
     .expect("the round's own type");
 
-    // The epoch the kernel stamped, read off the seal cell itself: eight
-    // bytes, little endian, and nothing a body chose.
+    // The epoch the kernel stamped, read off the seal cell itself: the
+    // kernel's tag, then eight bytes little endian, and nothing a body
+    // chose. The tag is spelled here rather than imported, so a change
+    // to what a seal holds fails here instead of agreeing with itself.
     let key = round_key(address);
     let sealed = c
         .substate(shard, key.owner, key.local.0)
         .expect("the round holds its seal");
-    let sealed_in = u64::from_le_bytes(sealed.try_into().expect("a seal is eight bytes"));
+    let [0x5E, epoch @ ..] = sealed.as_slice() else {
+        panic!("the cell does not open with the kernel's seal tag");
+    };
+    let sealed_in =
+        u64::from_le_bytes(epoch.try_into().expect("a seal is its tag and eight bytes"));
 
     let SeedLookup::Seed(seed) = c
         .beacon_state()

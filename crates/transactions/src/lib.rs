@@ -135,8 +135,7 @@ impl Client {
     ) -> Result<ManifestGraph, TypedError> {
         let chain = self.records();
         let mut b = self.builder(&chain, from);
-        let sender = account::authorize(&mut b, from)?;
-        let funds = account::withdraw(&mut b, sender, *XRD, amount)?;
+        let funds = account::withdraw(&mut b, from, *XRD, amount)?;
         account::deposit(&mut b, to, funds)?;
         b.build()
     }
@@ -160,10 +159,9 @@ impl Client {
     ) -> Result<ManifestGraph, TypedError> {
         let chain = self.records();
         let mut b = self.builder(&chain, account);
-        let owner = account::authorize(&mut b, account)?;
         account::securify_uniform(
             &mut b,
-            owner,
+            account,
             &StoredRule::claim(Claim::of_subject(holder)),
             recovery_delay_ms,
         )?;

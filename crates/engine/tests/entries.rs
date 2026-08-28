@@ -107,8 +107,7 @@ fn storage() -> SimShardStorage {
 fn signed_nf_transfer(from: u8, to: u8, ids: &[u64]) -> Transaction {
     let chain = client().records();
     let mut b = client().builder(&chain, principal(from));
-    let proof = account::authorize(&mut b, principal(from)).expect("sign-in types");
-    let funds = account::withdraw_nf(&mut b, proof, NF, ids).expect("withdraw-nf types");
+    let funds = account::withdraw_nf(&mut b, principal(from), NF, ids).expect("withdraw-nf types");
     account::deposit_nf(&mut b, principal(to), funds).expect("deposit-nf types");
     let graph = b.build().expect("every output is consumed");
     Transaction::new(client().sign(graph, &key_of(from), terms()))
