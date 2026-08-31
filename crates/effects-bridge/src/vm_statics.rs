@@ -1,9 +1,9 @@
-//! The envelope's static derivation: the tree wire codec and the
+//! The envelope's static derivation: the tree's decode seam and the
 //! [`Derivation`] implementation admission verifies through.
 //!
-//! The envelope tree travels as canonical HBOR of the mirror types
-//! below — the vocabulary crate deliberately has no wire encoding, so
-//! this module owns it. Derivation is `decode → admit → route` over
+//! The tree travels as canonical HBOR of the vocabulary's own types, so
+//! what this module owns is the call and the refusal a malformed tree
+//! maps to, not an encoding. Derivation is `decode → admit → route` over
 //! whatever the node holds — [`records`](crate::records) is where that
 //! lives, and this module only asks it — rooted at the envelope's
 //! signing hash, projected into the workspace's admission vocabulary:
