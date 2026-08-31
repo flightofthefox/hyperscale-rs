@@ -19,13 +19,15 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_types::{
     DeclaredKey, DeclaredRange, Derivation, DerivationError, Derived, EnvelopeExt, Hash,
-    MAX_STATE_ENTRIES_PER_TX, ProtocolStatics, Routing, TransactionEnvelope, declared_work,
+    MAX_STATE_ENTRIES_PER_TX, MAX_SUBINTENT_VALIDITY_RANGE, ProtocolStatics, Routing,
+    TimestampRange, TransactionEnvelope, WeightedTimestamp, declared_work,
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
-    ChainRecords, Claim, EnvelopeTree, ManifestHash, PackageHash, PrefixShardResolver,
-    Routing as RoutedTransaction, RuleBytes, Value, admit_tree, child_key, footprint, package_hash,
-    package_key as canonical_package_key, principal_address, route_tree, xrd,
+    ChainRecords, Claim, EnvelopeTree, IntentHeader, ManifestHash, PackageHash,
+    PrefixShardResolver, Routing as RoutedTransaction, RuleBytes, Value, admit_tree, child_key,
+    footprint, package_hash, package_key as canonical_package_key, principal_address, route_tree,
+    xrd,
 };
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
@@ -162,6 +164,77 @@ pub fn decode_tree(bytes: &[u8]) -> Result<EnvelopeTree, DerivationError> {
         .map_err(|error| DerivationError::Refused(format!("tree decode: {error}")))
 }
 
+/// The window the transaction is admissible in, and the header rules
+/// that decide it.
+///
+/// Every intent names the network and window its own signer declared it
+/// for. The network must match the envelope's exactly — an intent binds
+/// only into a composition for the network it was signed for — while a
+/// window only ever narrows: the answer is the intersection of the
+/// envelope's with every intent's, and an empty one is a composition no
+/// signer agreed to.
+///
+/// The root is no special case. Its window folds in like any other, so a
+/// composer who states a tighter one on their own intent than on the
+/// envelope gets the tighter one, and a wider one buys nothing. That is
+/// what a narrowing rule gives for free, where an equality rule would
+/// have made a signed field mean one thing in the root and another
+/// everywhere else.
+///
+/// Checked against the envelope rather than against the session's
+/// network, and against no clock at all, because a derivation that read
+/// either would stop being a pure function of the envelope. The
+/// session's own check on the envelope covers the tree transitively, and
+/// the anchor check runs once, on the window returned here.
+fn effective_window(
+    vm: &TransactionEnvelope,
+    tree: &EnvelopeTree,
+) -> Result<TimestampRange, DerivationError> {
+    let mut window = vm.validity_window();
+    let headers = std::iter::once(&tree.root.header).chain(
+        tree.subintents
+            .iter()
+            .map(|subintent| &subintent.decl.header),
+    );
+    for (index, header) in headers.enumerate() {
+        let named = || {
+            if index == 0 {
+                "the root intent".to_string()
+            } else {
+                format!("subintent {}", index - 1)
+            }
+        };
+        if header.network != vm.network {
+            return Err(DerivationError::Refused(format!(
+                "{} names a different network than the envelope",
+                named()
+            )));
+        }
+        let offered = window_of(header);
+        if !offered.is_well_formed_length(MAX_SUBINTENT_VALIDITY_RANGE) {
+            return Err(DerivationError::Refused(format!(
+                "{} stands for longer than an intent may",
+                named()
+            )));
+        }
+        window = window.intersect(offered).ok_or_else(|| {
+            DerivationError::Refused(format!(
+                "{} shares no window with the transaction binding it",
+                named()
+            ))
+        })?;
+    }
+    Ok(window)
+}
+
+/// A header's window in the workspace's clock vocabulary. The VM crate
+/// holds the milliseconds its signer signed; what they mean is here.
+const fn window_of(header: &IntentHeader) -> TimestampRange {
+    TimestampRange::new(
+        WeightedTimestamp::from_millis(header.validity_start_ms),
+        WeightedTimestamp::from_millis(header.validity_end_ms),
+    )
+}
 /// How a routed declaration lands in the workspace's admission
 /// vocabulary: the three key classes, and the mode behind each key.
 struct DeclaredAccess {
@@ -390,6 +463,9 @@ impl BridgeStatics {
         let work = declared_work(footprint, vm.gas_limit, vm.signature_work());
 
         Ok(Derived {
+            // A publish carries no tree, so nothing narrows the window
+            // its composer signed.
+            effective_window: vm.validity_window(),
             work,
             signer,
             routing: Routing {
@@ -442,26 +518,7 @@ impl Derivation for BridgeStatics {
             return Self::derive_publish(vm, signer, artifact);
         }
         let tree = decode_tree(vm.call_tree().unwrap_or_default())?;
-        // Every intent names the network its own signer declared it for,
-        // and the envelope names the composer's. They have to agree, so
-        // a subintent binds only into a composition for the network it
-        // was signed for — and the session's own check against the
-        // envelope then covers the whole tree transitively. Checked
-        // against the envelope rather than against the session, because
-        // a derivation that read the node's network would stop being a
-        // pure function of the envelope.
-        if tree.root.network != vm.network {
-            return Err(DerivationError::Refused(
-                "the root intent names a different network than the envelope".into(),
-            ));
-        }
-        for (index, subintent) in tree.subintents.iter().enumerate() {
-            if subintent.decl.network != vm.network {
-                return Err(DerivationError::Refused(format!(
-                    "subintent {index} names a different network than the envelope"
-                )));
-            }
-        }
+        let effective_window = effective_window(vm, &tree)?;
         if vm.subintent_sigs.len() != tree.subintents.len() {
             return Err(DerivationError::Refused(format!(
                 "envelope binds {} subintents but carries {} signatures",
@@ -544,6 +601,7 @@ impl Derivation for BridgeStatics {
             vm.signature_work(),
         );
         Ok(Derived {
+            effective_window,
             work,
             signer,
             routing: Routing {
@@ -707,10 +765,19 @@ mod tests {
     /// The network every envelope in these tests is signed for.
     const NETWORK: NetworkId = NetworkId(242);
 
+    /// The terms every intent in these tests is declared under: the same
+    /// window the envelope helper signs, so nothing narrows and the
+    /// intersection is the envelope's own.
+    const HEADER: IntentHeader = IntentHeader {
+        network: NETWORK,
+        validity_start_ms: 0,
+        validity_end_ms: 1_000_000,
+    };
+
     fn single_intent_tree(nodes: Vec<GraphNode>) -> EnvelopeTree {
         EnvelopeTree {
             root: IntentDecl {
-                network: NETWORK,
+                header: HEADER,
                 graph: ManifestGraph { nodes },
                 sockets: Vec::new(),
             },
@@ -726,7 +793,7 @@ mod tests {
     fn composed_tree() -> EnvelopeTree {
         EnvelopeTree {
             root: IntentDecl {
-                network: NETWORK,
+                header: HEADER,
                 graph: ManifestGraph {
                     nodes: vec![
                         sign_in(composer_addr()),
@@ -748,7 +815,7 @@ mod tests {
             }],
             subintents: vec![Subintent {
                 decl: IntentDecl {
-                    network: NETWORK,
+                    header: HEADER,
                     graph: ManifestGraph {
                         nodes: vec![
                             sign_in(bob_addr()),
@@ -1197,7 +1264,7 @@ mod tests {
         // that makes the subintent once-only lives on the network they
         // did name.
         let mut foreign = composed_tree();
-        foreign.subintents[0].decl.network = NetworkId(1);
+        foreign.subintents[0].decl.header.network = NetworkId(1);
         assert!(statics().derive(&envelope(&foreign, &[&key(9)])).is_err());
 
         // The composer's own intent answers the same rule: an envelope
@@ -1208,8 +1275,62 @@ mod tests {
             withdraw(composer_addr(), RES_X, 100),
             deposit_edge(bob_addr(), 1, RES_X),
         ]);
-        root_foreign.root.network = NetworkId(1);
+        root_foreign.root.header.network = NetworkId(1);
         assert!(statics().derive(&envelope(&root_foreign, &[])).is_err());
+    }
+
+    #[test]
+    fn a_bound_window_narrows_the_transaction_and_never_widens_it() {
+        // An offer standing inside the composition's window hands the
+        // transaction its own tighter edges: a composer cannot bind a
+        // signer past what that signer offered.
+        let mut tight = composed_tree();
+        tight.subintents[0].decl.header.validity_start_ms = 10;
+        tight.subintents[0].decl.header.validity_end_ms = 900;
+        let derived = statics()
+            .derive(&envelope(&tight, &[&key(9)]))
+            .expect("an offer inside the window composes");
+        assert_eq!(
+            derived
+                .effective_window
+                .start_timestamp_inclusive
+                .as_millis(),
+            10
+        );
+        assert_eq!(
+            derived.effective_window.end_timestamp_exclusive.as_millis(),
+            900
+        );
+
+        // The other direction buys nothing. An offer standing wider than
+        // the envelope leaves the transaction exactly as wide as its
+        // composer signed for.
+        let mut wide = composed_tree();
+        wide.subintents[0].decl.header.validity_end_ms = 5_000_000;
+        let derived = statics()
+            .derive(&envelope(&wide, &[&key(9)]))
+            .expect("a wider offer composes");
+        assert_eq!(
+            derived.effective_window.end_timestamp_exclusive.as_millis(),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn an_offer_sharing_no_window_with_its_composition_is_refused() {
+        // The offer closed before the transaction opens. There is no
+        // instant both signers agreed to, so there is no transaction.
+        let mut lapsed = composed_tree();
+        lapsed.subintents[0].decl.header.validity_start_ms = 2_000_000;
+        lapsed.subintents[0].decl.header.validity_end_ms = 2_000_001;
+        assert!(statics().derive(&envelope(&lapsed, &[&key(9)])).is_err());
+    }
+
+    #[test]
+    fn an_intent_standing_longer_than_the_cap_is_refused() {
+        let mut forever = composed_tree();
+        forever.subintents[0].decl.header.validity_end_ms = u64::MAX;
+        assert!(statics().derive(&envelope(&forever, &[&key(9)])).is_err());
     }
 
     #[test]

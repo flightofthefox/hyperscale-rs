@@ -22,12 +22,12 @@ use hyperscale_storage::Substates;
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     BeaconWitnessEvent, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EntryKey, EnvelopeExt,
-    NetworkId, PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, Stake, StakePoolId,
-    StakePoolSeat, SubstateKey, TimestampRange, Transaction, Verified, WeightedTimestamp,
-    absorb_committed_cells,
+    MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie,
+    Stake, StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction, Verified,
+    WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
-    ChainRecords, Composed, holdings_collection, instance_data_key, package_hash,
+    ChainRecords, Composed, IntentHeader, holdings_collection, instance_data_key, package_hash,
     resource_record_key,
 };
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, TypedError};
@@ -36,6 +36,18 @@ use hyperscale_vm_types::{Address, CallTarget, CollectionId};
 
 /// The network every envelope in these tests is signed for.
 const NETWORK: NetworkId = NetworkId(242);
+
+/// The widest window an intent may stand for, which these fixtures use
+/// wherever they mean "does not expire during the test".
+const OFFER_MS: u64 = MAX_SUBINTENT_VALIDITY_RANGE.as_secs() * 1_000;
+
+/// The terms every intent in these tests is sealed under. The window is
+/// the widest an intent may name, so nothing here narrows a transaction.
+const HEADER: IntentHeader = IntentHeader {
+    network: NETWORK,
+    validity_start_ms: 0,
+    validity_end_ms: OFFER_MS,
+};
 
 /// The identifier the beacon folds the seated pool under.
 const POOL_ID: u32 = 7;
@@ -154,7 +166,7 @@ const fn terms(max_fee: u128) -> Terms {
         max_fee,
         validity: TimestampRange::new(
             WeightedTimestamp::from_millis(0),
-            WeightedTimestamp::from_millis(u64::MAX),
+            WeightedTimestamp::from_millis(OFFER_MS),
         ),
         message: Vec::new(),
     }
@@ -186,7 +198,7 @@ fn signed_stake_composed(seat: &StakePoolSeat, amount: u128) -> Transaction {
     let pool = meta.address(&ProtocolHasher);
     let chain = client().records();
     let composed = Composed::new(&chain, std::slice::from_ref(&meta), &ProtocolHasher);
-    let (mut env, mut b) = EnvelopeBuilder::new(&composed, &ProtocolHasher, from, NETWORK);
+    let (mut env, mut b) = EnvelopeBuilder::new(&composed, &ProtocolHasher, from, HEADER);
     let funds = account::withdraw(&mut b, from, *XRD, amount).expect("an account withdraws");
     let units = staking::Staking::at(pool)
         .stake(&mut b, funds)
@@ -430,7 +442,7 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
     // answer for yet: the seal is what makes it answer.
     let composed = Composed::new(&chain, std::slice::from_ref(&meta), &ProtocolHasher);
     let pool = meta.address(&ProtocolHasher);
-    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher, from, NETWORK);
+    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher, from, HEADER);
     // The composition every bring-up writes: the seal, and the supply it
     // yields filed where the founder keeps it. Which method seals and
     // which of those nodes exist are the package's own declaration to
@@ -535,7 +547,7 @@ fn a_pool_nobody_instantiated_answers_nothing() {
     let unseated = seat(56);
     let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated);
     let chain = client().records();
-    let (_, mut root) = EnvelopeBuilder::new(&chain, &ProtocolHasher, delegator(), NETWORK);
+    let (_, mut root) = EnvelopeBuilder::new(&chain, &ProtocolHasher, delegator(), HEADER);
     let funds = account::withdraw(&mut root, delegator(), *XRD, 500).expect("an account withdraws");
     let refusal = staking::Staking::at(pool)
         .stake(&mut root, funds)

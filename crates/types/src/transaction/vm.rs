@@ -252,6 +252,16 @@ pub struct Derived {
     /// deduplicated. What the execution gate holds a candidate to: a
     /// shard dispatches the transaction only once it holds all of them.
     pub packages: Vec<Hash>,
+    /// The window the transaction is actually admissible in: the
+    /// envelope's, narrowed by every subintent it binds.
+    ///
+    /// A subintent signs the window its own signer offered it for, and a
+    /// composition cannot widen it — so the answer is the intersection,
+    /// and an empty one is refused at derivation rather than admitted
+    /// into a window no signer agreed to. Every consumer reads this
+    /// rather than the envelope's raw fields, which are the composer's
+    /// claim alone.
+    pub effective_window: TimestampRange,
     /// What including this transaction costs a block, in work units.
     ///
     /// A fixed admit-and-track charge, the declared footprint, and the

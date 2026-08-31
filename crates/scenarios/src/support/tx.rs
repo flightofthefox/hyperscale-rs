@@ -20,14 +20,14 @@ use hyperscale_hbor::TypeShape;
 use hyperscale_transactions::{Client, DEFAULT_GAS_LIMIT, Terms};
 use hyperscale_types::{
     AccountSigner, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
-    EnvelopeExt, Epoch, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR, MlDsa65PrivateKey, NetworkId,
-    NetworkParams, PrincipalAddr, SchemeId, ShardId, ShardTrie, StakePoolId, StakePoolSeat,
-    TimestampRange, Transaction, TransactionBody, TransactionEnvelope, ValidatorId,
-    WeightedTimestamp, ed25519_keypair_from_seed,
+    EnvelopeExt, Epoch, MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR,
+    MlDsa65PrivateKey, NetworkId, NetworkParams, PrincipalAddr, SchemeId, ShardId, ShardTrie,
+    StakePoolId, StakePoolSeat, TimestampRange, Transaction, TransactionBody, TransactionEnvelope,
+    ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
-    Composed, Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, ManifestGraph,
-    ResourceKind, Totality, Value, issued_resource, package_hash,
+    Composed, Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader,
+    ManifestGraph, ResourceKind, Totality, Value, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::signing::{self, sign_subintent};
@@ -485,6 +485,36 @@ pub fn merge_straddler_setup() -> MergeStraddlerSetup {
 
 /// A validity window bracketing `now`.
 ///
+/// The terms an intent is sealed under: the scenario network, and the
+/// same window the envelope carrying it is signed for. An intent's
+/// window narrows the transaction, so mirroring the envelope's is what
+/// leaves the transaction exactly as wide as its composer asked.
+#[must_use]
+pub const fn scenario_header(validity: TimestampRange) -> IntentHeader {
+    IntentHeader {
+        network: SCENARIO_NETWORK,
+        validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
+        validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
+    }
+}
+
+/// The terms a standing offer is signed under.
+///
+/// The scenario network, and a window far wider than any transaction's —
+/// which is the point of an offer: its signer is not composing it now
+/// and does not know when a composer will. The composition's own window
+/// is what narrows it.
+#[must_use]
+pub const fn offer_header() -> IntentHeader {
+    IntentHeader {
+        network: SCENARIO_NETWORK,
+        validity_start_ms: 0,
+        // The cap in milliseconds, which a `u64` holds with room: the
+        // constant is days and the type counts to half a billion years.
+        validity_end_ms: MAX_SUBINTENT_VALIDITY_RANGE.as_secs() * 1_000,
+    }
+}
+
 /// Opens [`VALIDITY_BACK`] before `now` to absorb the chain's anchor
 /// trailing the cluster clock, and runs [`VALIDITY_FORWARD`] past it.
 #[must_use]
@@ -1089,8 +1119,12 @@ pub fn build_instantiate_tx(
         .map(|meta| meta.address(&ProtocolHasher))
         .collect();
     let founder = account_address(&payer.public_key().0);
-    let (mut env, mut root) =
-        EnvelopeBuilder::new(&composed, &ProtocolHasher, founder, SCENARIO_NETWORK);
+    let (mut env, mut root) = EnvelopeBuilder::new(
+        &composed,
+        &ProtocolHasher,
+        founder,
+        scenario_header(validity),
+    );
     for address in addresses {
         instantiate(&mut root, founder, address).expect("a derivable lottery answers its seal");
     }
@@ -1188,7 +1222,7 @@ fn build_lottery_tx(
         &composed,
         &ProtocolHasher,
         account_address(&payer.public_key().0),
-        SCENARIO_NETWORK,
+        scenario_header(validity),
     );
     for address in addresses {
         leg(&lottery::Lottery::at(address), &mut root);
@@ -1265,7 +1299,7 @@ pub fn build_transfer_paid_by<S: AccountSigner>(
     let envelope = signing::wrap(
         &EnvelopeTree {
             root: IntentDecl {
-                network: SCENARIO_NETWORK,
+                header: scenario_header(validity),
                 graph,
                 sockets: Vec::new(),
             },
@@ -1655,7 +1689,7 @@ pub fn build_instance_instantiate_tx(
 
     let tree = EnvelopeTree {
         root: IntentDecl {
-            network: SCENARIO_NETWORK,
+            header: scenario_header(validity),
             graph,
             sockets: Vec::new(),
         },
@@ -1922,7 +1956,7 @@ pub fn build_composed_tx(
         &chain,
         &ProtocolHasher,
         account_address(&composer.public_key().0),
-        SCENARIO_NETWORK,
+        scenario_header(validity),
     );
     let funds =
         account::withdraw(&mut root, from, *XRD, amount).expect("an account answers a withdrawal");
@@ -2011,7 +2045,7 @@ fn declaration(
 ) -> IntentDecl {
     let client = client();
     let chain = client.records();
-    let mut decl = IntentBuilder::declaration(&chain, &ProtocolHasher, signer, SCENARIO_NETWORK);
+    let mut decl = IntentBuilder::declaration(&chain, &ProtocolHasher, signer, offer_header());
     write(&mut decl).expect("every scenario call types against its signature");
     decl.into_decl()
         .expect("the declaration discharges its own holes")

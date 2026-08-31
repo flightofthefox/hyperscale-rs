@@ -47,6 +47,32 @@ use crate::WeightedTimestamp;
 /// [`SKIP_TIMEOUT`]: crate::SKIP_TIMEOUT
 pub const MAX_VALIDITY_RANGE: Duration = Duration::from_secs(120);
 
+/// Hard upper bound on how long a subintent may stand open.
+///
+/// A standing offer wants to outlive a transaction, and it may: the
+/// bounds above are the *transaction* window's, and neither reaches
+/// here. The reshape argument bounds artifacts a successor must read
+/// from a predecessor's chain, and a subintent's window governs no such
+/// artifact — it governs a nullifier cell, which is state, and state
+/// migrates with its owner's prefix at every split and merge. Each
+/// transaction binding an offer still carries its own
+/// [`MAX_VALIDITY_RANGE`] window, so an offer signed a month ago and
+/// bound today yields a transaction whose window opened today.
+///
+/// What a long offer does cost is a resident nullifier per unspent one,
+/// for its window plus [`RETENTION_HORIZON`]. That is a state-growth
+/// question rather than a correctness one.
+///
+/// Nothing tx-derived may be sized from this. [`RETENTION_HORIZON`] and
+/// the fold window built on it retain chain artifacts — provisions,
+/// execution certificates, tombstones, conflict entries — and every one
+/// of them answers to [`MAX_VALIDITY_RANGE`]. Size a retention window
+/// from this constant instead and a month-old offer extends the life of
+/// every artifact on the chain.
+///
+/// [`RETENTION_HORIZON`]: crate::RETENTION_HORIZON
+pub const MAX_SUBINTENT_VALIDITY_RANGE: Duration = Duration::from_hours(24 * 30);
+
 /// Half-open `[start, end)` range of [`WeightedTimestamp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Hbor)]
 pub struct TimestampRange {
@@ -83,6 +109,34 @@ impl TimestampRange {
     pub const fn length(&self) -> Duration {
         self.end_timestamp_exclusive
             .elapsed_since(self.start_timestamp_inclusive)
+    }
+
+    /// Whether the range is ordered and no longer than `cap`.
+    ///
+    /// The clock-free half of well-formedness: a subintent's window is
+    /// held to this at derivation, where there is no anchor to check a
+    /// forward edge against and none is wanted — an offer's forward edge
+    /// is bounded by the transaction that binds it, whose own window
+    /// [`Self::is_well_formed`] holds to the anchor.
+    #[must_use]
+    pub fn is_well_formed_length(&self, cap: Duration) -> bool {
+        self.start_timestamp_inclusive < self.end_timestamp_exclusive && self.length() <= cap
+    }
+
+    /// The overlap of two ranges, or `None` if they share no instant.
+    ///
+    /// What a transaction's window becomes when it binds an offer: the
+    /// tighter start, the tighter end, and a refusal when the two do not
+    /// meet.
+    #[must_use]
+    pub fn intersect(&self, other: Self) -> Option<Self> {
+        let start = self
+            .start_timestamp_inclusive
+            .max(other.start_timestamp_inclusive);
+        let end = self
+            .end_timestamp_exclusive
+            .min(other.end_timestamp_exclusive);
+        (start < end).then(|| Self::new(start, end))
     }
 
     /// Validate the range against a block's anchoring weighted timestamp:

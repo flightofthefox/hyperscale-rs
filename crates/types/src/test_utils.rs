@@ -941,6 +941,9 @@ impl Derivation for StubVmStatics {
             .map(|bytes| Hash::from_hash_bytes(bytes))
             .collect();
         Ok(Derived {
+            // A stub derives no tree, so the envelope's own window is
+            // the whole of it.
+            effective_window: vm.validity_window(),
             routing: Routing {
                 read_keys: read_prefixes.iter().copied().map(stub_cell).collect(),
                 write_keys: write_prefixes.iter().copied().map(stub_cell).collect(),

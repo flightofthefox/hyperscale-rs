@@ -206,7 +206,7 @@ pub use signing::{
 pub use state_holds::ProvisionalHolds;
 pub use time::epoch_windows::EpochWindows;
 pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
-pub use time::range::{MAX_VALIDITY_RANGE, TimestampRange};
+pub use time::range::{MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, TimestampRange};
 pub use time::stopwatch::Stopwatch;
 pub use time::timeouts::{
     EPOCH_DURATION, MAX_FINALIZATION_DELAY, MAX_PROGRESS_WAIT, RATIFY_ROUND_TIMEOUT,
