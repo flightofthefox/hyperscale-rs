@@ -12,6 +12,7 @@
 //! dot-prefixed temporary name and a rename, so a crash mid-create
 //! leaves only a `.tmp-*` directory, swept on the next creation.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -20,18 +21,19 @@ use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_ve
 use hyperscale_storage::{
     AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, SubstateStore, Substates, WitnessSeed,
     entry_from_leaf, filter_writes_to_prefix, merge_writes_from_receipts, package_of_cell,
+    sweepable_expiry,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf,
 };
-use hyperscale_vm_types::{Address, CollectionId};
+use hyperscale_vm_types::{Address, CollectionId, SweepBucket};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{ColumnFamily, DB, Options, WriteBatch};
 use tracing::warn;
 
 use super::column_families::{
     ALL_COLUMN_FAMILIES, BeaconWitnessesCf, CfHandles, EntriesCf, ImportStagingCf, JmtNodesCf,
-    PackageArtifactsCf, StateCf, SubstateBytesCf,
+    PackageArtifactsCf, StateCf, SubstateBytesCf, SweepIndexCf,
 };
 use super::core::RocksDbShardStorage;
 use super::entry_key::scan_entries;
@@ -41,8 +43,68 @@ use super::metadata::{read_jmt_metadata, write_jmt_metadata};
 use crate::StorageError;
 use crate::typed_cf::{
     ImportProgressEntry, TypedCf, batch_delete, batch_put, get, iter_all, meta_delete, meta_read,
-    meta_write,
+    meta_write, multi_get,
 };
+
+/// Write one import batch's leaves and re-derive every index that hangs
+/// off them, returning the sweep rows for the caller to fold.
+///
+/// Each index is derived state, and rebuilding it from the leaves is the
+/// assertion that it equals them: a row exists exactly where a leaf
+/// re-derives it. That is what a successor needs — it holds the prefix
+/// and no history, so the state it just imported is the only honest
+/// source for what it owes.
+fn index_imported_leaves(
+    batch: &mut WriteBatch,
+    cf: &CfHandles<'_>,
+    leaves: &[SubstateLeaf],
+) -> BTreeMap<(SweepBucket, Address), u32> {
+    let state_cf = StateCf::handle(cf);
+    let entries_cf = EntriesCf::handle(cf);
+    let artifacts_cf = PackageArtifactsCf::handle(cf);
+    let mut sweep_rows: BTreeMap<(SweepBucket, Address), u32> = BTreeMap::new();
+    for leaf in leaves {
+        batch_put::<StateCf>(batch, state_cf, &leaf.key, &leaf.value);
+        if let Some((entry_key, value)) = entry_from_leaf(leaf.key, &leaf.value) {
+            batch_put::<EntriesCf>(batch, entries_cf, &entry_key, &value);
+        }
+        // The package index earns its rebuild for a sharper reason: an
+        // imported store whose committee turns over is the only place a
+        // foreign shard can still fetch this artifact from.
+        if let Some(package) = package_of_cell(leaf.key, &leaf.value) {
+            batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, &leaf.value);
+        }
+        if let Some(expiry) = sweepable_expiry(leaf.key, &leaf.value) {
+            *sweep_rows
+                .entry((SweepBucket::of(expiry), leaf.key.owner))
+                .or_default() += 1;
+        }
+    }
+    sweep_rows
+}
+
+/// Add an import batch's sweepable-leaf counts to the sweep index.
+///
+/// Rows survive across batches — one owner's bucket can span several —
+/// so each fold reads what earlier batches left. Every batch is written
+/// before the next is built, so the read sees them.
+fn fold_sweep_rows(
+    db: &DB,
+    batch: &mut WriteBatch,
+    cf: &CfHandles<'_>,
+    rows: &BTreeMap<(SweepBucket, Address), u32>,
+) {
+    if rows.is_empty() {
+        return;
+    }
+    let sweep_cf = SweepIndexCf::handle(cf);
+    let keys: Vec<(SweepBucket, Address)> = rows.keys().copied().collect();
+    let held: Vec<Option<u32>> = multi_get::<SweepIndexCf>(db, sweep_cf, &keys);
+    for ((row, added), current) in rows.iter().zip(held) {
+        let count = current.unwrap_or(0).saturating_add(*added);
+        batch_put::<SweepIndexCf>(batch, sweep_cf, row, &count);
+    }
+}
 
 /// Queue the staging CF's full range and the progress record for
 /// deletion in `batch`. Staged keys are exactly [`KEY_BYTES`] long, so a
@@ -259,31 +321,8 @@ impl RocksDbShardStorage {
                     &StoredNodeKey::from_jmt(&stale.node_key),
                 );
             }
-            let state_cf = StateCf::handle(&cf);
-            let entries_cf = EntriesCf::handle(&cf);
-            let artifacts_cf = PackageArtifactsCf::handle(&cf);
-            for leaf in &batch_leaves {
-                batch_put::<StateCf>(&mut batch, state_cf, &leaf.key, &leaf.value);
-                // The ordered entry index is derived state: rebuild it
-                // from the leaves themselves, which is also the assertion
-                // that it equals them — the row exists exactly where the
-                // leaf re-derives.
-                if let Some((entry_key, value)) = entry_from_leaf(leaf.key, &leaf.value) {
-                    batch_put::<EntriesCf>(&mut batch, entries_cf, &entry_key, &value);
-                }
-                // So is the package index, and for a sharper reason: an
-                // imported store whose committee turns over is the only
-                // place a foreign shard can still fetch this artifact
-                // from.
-                if let Some(package) = package_of_cell(leaf.key, &leaf.value) {
-                    batch_put::<PackageArtifactsCf>(
-                        &mut batch,
-                        artifacts_cf,
-                        &package,
-                        &leaf.value,
-                    );
-                }
-            }
+            let sweep_rows = index_imported_leaves(&mut batch, &cf, &batch_leaves);
+            fold_sweep_rows(&self.db, &mut batch, &cf, &sweep_rows);
             bytes_total += result.batch.bytes_delta;
 
             if is_final {
@@ -939,8 +978,7 @@ mod tests {
             state ^= state << 17;
             state
         };
-        let mut by_key: std::collections::BTreeMap<[u8; KEY_BYTES], SubstateLeaf> =
-            std::collections::BTreeMap::new();
+        let mut by_key: BTreeMap<[u8; KEY_BYTES], SubstateLeaf> = BTreeMap::new();
         while by_key.len() < n {
             let mut key = [0u8; KEY_BYTES];
             for chunk in key.chunks_mut(8) {

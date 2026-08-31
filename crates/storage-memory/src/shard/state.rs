@@ -6,12 +6,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use hyperscale_storage::tree::{carry_noop_root, jmt_parent_height, put_at_version};
-use hyperscale_storage::{JmtSnapshot, entry_leaf_rows, package_of_cell};
+use hyperscale_storage::{JmtSnapshot, entry_leaf_rows, package_of_cell, sweepable_expiry};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, EntryKey,
-    ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash,
-    Provisions, QuorumCertificate, SafeVoteRegisters, SettledWrites, ShardWitnessPayload,
-    StateRoot, StoredReceipt, SubstateKey, TickId, Transaction, TxHash, ValidatorId,
+    Address, Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt,
+    EntryKey, ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash,
+    ProvisionHash, Provisions, QuorumCertificate, SafeVoteRegisters, SettledWrites,
+    ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, SweepBucket, TickId, Transaction,
+    TxHash, ValidatorId,
 };
 
 use super::tree_store::SimTreeStore;
@@ -54,6 +55,12 @@ pub struct SharedState {
     /// cell that self-identifies as a package lands its bytes here in
     /// the same application that lands the cell.
     pub package_artifacts: BTreeMap<Hash, Vec<u8>>,
+    /// How many live sweepable cells each owner holds in each expiry
+    /// bucket — the mirror of the `RocksDB` backend's sweep index, fed
+    /// from the same judgement so both backends enumerate the same
+    /// candidates. Bucket-major, because a sweep walks by expiry and
+    /// `current_state` is owner-major.
+    pub sweep_index: BTreeMap<(SweepBucket, Address), u32>,
 }
 
 impl SharedState {
@@ -72,6 +79,7 @@ impl SharedState {
             entries_history: BTreeMap::new(),
             substate_bytes: BTreeMap::new(),
             package_artifacts: BTreeMap::new(),
+            sweep_index: BTreeMap::new(),
         }
     }
 
@@ -306,6 +314,36 @@ pub fn apply_writes(
     let leaf_rows = entry_leaf_rows(writes.entries());
     for (key, change) in writes.cells().iter().chain(&leaf_rows) {
         let prior = state.current_state.get(key).cloned();
+        // The sweep index counts live sweepable cells per owner and
+        // bucket, moved by whatever the write changes the cell into.
+        let was = prior
+            .as_deref()
+            .and_then(|bytes| sweepable_expiry(*key, bytes));
+        let now = change
+            .as_deref()
+            .and_then(|bytes| sweepable_expiry(*key, bytes));
+        if was != now {
+            if let Some(expiry) = was {
+                let row = (SweepBucket::of(expiry), key.owner);
+                let count = state
+                    .sweep_index
+                    .get(&row)
+                    .copied()
+                    .expect("a sweepable cell was counted when it was written")
+                    - 1;
+                if count == 0 {
+                    state.sweep_index.remove(&row);
+                } else {
+                    state.sweep_index.insert(row, count);
+                }
+            }
+            if let Some(expiry) = now {
+                *state
+                    .sweep_index
+                    .entry((SweepBucket::of(expiry), key.owner))
+                    .or_default() += 1;
+            }
+        }
         if write_history {
             state.state_history.insert((*key, version), prior);
         }

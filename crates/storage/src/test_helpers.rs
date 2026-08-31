@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use hyperscale_hbor::from_slice;
 use hyperscale_jmt::{KEY_BYTES, TreeReader};
-use hyperscale_types::test_utils::{make_finalization, test_transaction};
+use hyperscale_types::test_utils::{
+    install_stub_protocol_statics, make_finalization, stub_sweepable_cell, test_transaction,
+};
 use hyperscale_types::{
     AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock, BeaconBlockHash,
     BeaconCert, BeaconChainConfig, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount,
@@ -20,12 +22,12 @@ use hyperscale_types::{
     Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel,
     MerkleInclusionProof, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp,
     ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, Randomness,
-    RatifyCert, RatifyRound, Round, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId,
-    ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
-    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, TerminalVerdict, TickHalf, TickId,
-    Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp, WitnessSources, WorkInFlight, compute_global_receipt_root,
-    compute_merkle_root, entry_leaf_key,
+    RatifyCert, RatifyRound, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor,
+    ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
+    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier,
+    TerminalVerdict, TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome,
+    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    WorkInFlight, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
 };
 
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
@@ -33,7 +35,7 @@ use crate::tree::Jmt;
 use crate::{
     Anchored, BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, JmtSnapshot,
     RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore,
-    Substates, VersionedStore, WitnessSeed,
+    Substates, SweepIndex, VersionedStore, WitnessSeed,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -936,6 +938,86 @@ pub fn test_entries_commit_serve_and_history<S: VersionedStore>(
         storage
             .entries_in_range(state_key(9, 0).owner, key.collection, 0, u128::MAX, 10)
             .is_empty()
+    );
+}
+
+/// Shared sweep-index conformance: the index tracks what the leaves say,
+/// and the walk that reads it visits cells in sweep order.
+///
+/// Runs against [`StubVmStatics`](hyperscale_types::test_utils::StubVmStatics)'s
+/// sweepable family, so a backend's index is tested without a VM: what
+/// the backend owes is that it indexes whatever the judgement calls
+/// sweepable, which is a property of the backend and not of the family.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_sweep_index_tracks_the_leaves<S>(storage: &S, commit: impl Fn(&SettledWrites))
+where
+    S: SubstateStore + SweepIndex,
+{
+    install_stub_protocol_statics();
+    let bucket_ms = SWEEP_BUCKET_MS;
+    // Three cells across two buckets under two owners, so the walk has
+    // to order by bucket before owner — the property a leaf-key walk
+    // does not have.
+    let cells: Vec<(SubstateKey, u64)> = [
+        (0xF0u8, 3 * bucket_ms, 0x11u8),
+        (0x10, 3 * bucket_ms + 5, 0x22),
+        (0x10, 5 * bucket_ms, 0x33),
+    ]
+    .into_iter()
+    .map(|(owner, expiry, body)| {
+        let (local, value) = stub_sweepable_cell(expiry, body);
+        let key = SubstateKey {
+            owner: Address::new([owner; 31], AddressClass::Component),
+            local,
+        };
+        commit(&SettledWrites::from_absolutes(BTreeMap::from([(
+            key,
+            Some(value),
+        )])));
+        (key, expiry)
+    })
+    .collect();
+    // And one ordinary cell, which the index must not see.
+    commit(&make_settled_writes(0x10, 7, vec![9, 9, 9]));
+
+    // Sweep order is bucket, then owner, then local — so the late
+    // bucket goes last even though its owner sorts first, which is the
+    // property a walk over leaf keys would not have.
+    let (low_owner, high_owner, late) = (cells[1], cells[0], cells[2]);
+    let expected = vec![low_owner, high_owner, late];
+
+    let all = SweepFrontier::start_of(SweepBucket(u32::MAX));
+    assert_eq!(
+        storage.sweep_candidates(SweepFrontier::ZERO, all, 10),
+        expected,
+        "bucket orders before owner, and the plain cell is not swept"
+    );
+
+    // The ceiling excludes the clock's own bucket and everything above.
+    let clock = WeightedTimestamp::from_millis(4 * bucket_ms);
+    assert_eq!(
+        storage.sweep_candidates(SweepFrontier::ZERO, SweepFrontier::ceiling_at(clock), 10),
+        vec![low_owner, high_owner],
+    );
+
+    // The cap stops the walk, and resuming from where it stopped picks
+    // up exactly the rest — no gap, no repeat.
+    let first = storage.sweep_candidates(SweepFrontier::ZERO, all, 2);
+    assert_eq!(first, vec![low_owner, high_owner]);
+    let resumed = SweepFrontier::of_leaf(first[1].0);
+    assert_eq!(storage.sweep_candidates(resumed, all, 10), vec![late]);
+
+    // Removing a cell takes it out of the index, and the row it emptied
+    // with it — the walk then stops one short.
+    commit(&SettledWrites::from_absolutes(BTreeMap::from([(
+        late.0, None,
+    )])));
+    assert_eq!(
+        storage.sweep_candidates(SweepFrontier::ZERO, all, 10),
+        vec![low_owner, high_owner]
     );
 }
 

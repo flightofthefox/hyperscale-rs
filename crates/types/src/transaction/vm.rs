@@ -405,6 +405,24 @@ pub trait ProtocolStatics: Send + Sync {
         let _ = (owner, local, value);
         None
     }
+
+    /// The instant this committed cell stops being needed, or `None` for
+    /// every cell a sweep does not reach.
+    ///
+    /// A sweepable cell answers for its own life: the value carries the
+    /// expiry and the key derives from it, so the implementation decides
+    /// from the bytes alone and this seam carries no VM vocabulary — the
+    /// shape [`Self::package_cell`] already has. Storage backends index
+    /// what this answers so a sweep can enumerate by expiry over a
+    /// keyspace that is owner-major and always will be.
+    ///
+    /// The expiry is milliseconds on the same clock a block's
+    /// `weighted_timestamp` reads, because that is the clock a removal
+    /// is judged against.
+    fn sweepable_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> Option<u64> {
+        let _ = (owner, local, value);
+        None
+    }
 }
 
 static PROTOCOL_STATICS: OnceLock<Box<dyn ProtocolStatics>> = OnceLock::new();

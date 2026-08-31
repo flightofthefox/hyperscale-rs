@@ -14,12 +14,12 @@ use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
     AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, SubstateStore, Substates,
     WitnessSeed, entry_from_leaf, filter_writes_to_prefix, merge_writes_from_receipts,
-    package_of_cell,
+    package_of_cell, sweepable_expiry,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryKey, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf,
 };
-use hyperscale_vm_types::{Address, CollectionId};
+use hyperscale_vm_types::{Address, CollectionId, SweepBucket};
 
 use super::core::SimShardStorage;
 use super::snapshot::{entries_in_range_at, value_at_version};
@@ -200,6 +200,15 @@ impl BoundaryStore for SimShardStorage {
             // a foreign shard can still fetch this artifact from.
             if let Some(package) = package_of_cell(leaf.key, &leaf.value) {
                 state.package_artifacts.insert(package, leaf.value.clone());
+            }
+            // And so is the sweep index. A successor holds the prefix
+            // and no history, so the leaves it just imported are the
+            // only honest source for what it owes a sweep.
+            if let Some(expiry) = sweepable_expiry(leaf.key, &leaf.value) {
+                *state
+                    .sweep_index
+                    .entry((SweepBucket::of(expiry), leaf.key.owner))
+                    .or_default() += 1;
             }
             state.current_state.insert(leaf.key, leaf.value);
         }

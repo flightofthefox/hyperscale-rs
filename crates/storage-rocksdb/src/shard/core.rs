@@ -13,7 +13,7 @@
 //! On each commit, the JMT is updated and a new state root hash is
 //! computed.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -23,14 +23,14 @@ use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeRea
 use hyperscale_metrics::record_storage_read;
 use hyperscale_storage::{
     BaseReadCache, GenesisCommit, JmtSnapshot, SubstateStore, Substates, entry_leaf_value,
-    package_of_cell, pending_write, tree,
+    package_of_cell, pending_write, sweepable_expiry, tree,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryLeaf, ProtocolHasher, QuorumCertificate,
     SafeVoteRegisters, SettledWrites, StateRoot, SubstateKey, ValidatorId, Verified,
     entry_leaf_key,
 };
-use hyperscale_vm_types::{Address, CollectionId};
+use hyperscale_vm_types::{Address, CollectionId, SweepBucket};
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, Options,
     SliceTransform, WriteBatch,
@@ -41,7 +41,7 @@ use tracing::{Level, Span, instrument};
 use super::column_families::{
     ALL_COLUMN_FAMILIES, CfHandles, EntriesCf, EntriesHistoryCf, HOT_WRITE_COLUMN_FAMILIES,
     JmtNodesCf, PackageArtifactsCf, STATE_HISTORY_CF, StaleEntriesHistoryCf, StaleJmtNodesCf,
-    StaleStateHistoryCf, StateCf, StateHistoryCf, SubstateBytesCf,
+    StaleStateHistoryCf, StateCf, StateHistoryCf, SubstateBytesCf, SweepIndexCf,
 };
 use super::entry_key::VersionedEntryKeyCodec;
 use super::jmt_snapshot_store::SnapshotTreeStore;
@@ -96,6 +96,36 @@ pub struct RocksDbShardStorage {
     /// and letting a write that raises nothing (e.g. a timeout
     /// retransmit) skip the fsync entirely.
     pub(crate) vote_registers: Mutex<HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>>,
+}
+
+/// Move one cell's write across the sweep index's rows.
+///
+/// The index counts live sweepable cells per owner and bucket, so what
+/// matters is whether the cell was sweepable before and whether it is
+/// after — both judged from bytes alone. A value equal to its prior is
+/// sweepable in exactly the same row, which is why the no-op writes the
+/// caller skips need no entry here either.
+fn record_sweep_delta(
+    deltas: &mut BTreeMap<(SweepBucket, Address), i64>,
+    key: SubstateKey,
+    prior: Option<&[u8]>,
+    change: Option<&[u8]>,
+) {
+    let was = prior.and_then(|bytes| sweepable_expiry(key, bytes));
+    let now = change.and_then(|bytes| sweepable_expiry(key, bytes));
+    if was == now {
+        return;
+    }
+    if let Some(expiry) = was {
+        *deltas
+            .entry((SweepBucket::of(expiry), key.owner))
+            .or_default() -= 1;
+    }
+    if let Some(expiry) = now {
+        *deltas
+            .entry((SweepBucket::of(expiry), key.owner))
+            .or_default() += 1;
+    }
 }
 
 impl RocksDbShardStorage {
@@ -533,9 +563,11 @@ impl RocksDbShardStorage {
         // stale-set entry for this version in one shot.
         let history_key_codec = VersionedSubstateKeyCodec;
         let mut stale_history_keys: Vec<Vec<u8>> = Vec::new();
+        let mut sweep_deltas: BTreeMap<(SweepBucket, Address), i64> = BTreeMap::new();
         for ((key, change), prior_slot) in writes.cells().iter().zip(priors) {
             let prior =
                 prior_slot.expect("every write must have a resolved prior (cache hit or fetched)");
+            record_sweep_delta(&mut sweep_deltas, *key, prior.as_deref(), change.as_deref());
             if let Some(new_value) = change {
                 // No-op short-circuit: setting a key to the value it
                 // already holds changes nothing. Skip both the history
@@ -588,6 +620,8 @@ impl RocksDbShardStorage {
             }
         }
 
+        self.append_sweep_rows_to_batch(batch, &cf, &sweep_deltas);
+
         // Index the history keys by version so GC can delete them without
         // scanning StateHistoryCf. Skipped when write_history is false
         // (genesis) — nothing was written.
@@ -598,6 +632,52 @@ impl RocksDbShardStorage {
                 &version,
                 &stale_history_keys,
             );
+        }
+    }
+
+    /// Fold this batch's sweep-index deltas into the rows they touch.
+    ///
+    /// One read-modify-write per touched `(bucket, owner)` pair, which
+    /// is at most one per distinct owner a block writes a sweepable cell
+    /// for — never one per cell. A row that reaches zero is deleted, so
+    /// the index holds exactly the pairs that have something in them and
+    /// a sweep's walk skips nothing and visits nothing empty.
+    ///
+    /// The read is against the persisted store rather than the pending
+    /// overlay because the rows are a total over what has *committed*,
+    /// and every batch that moved one has already been applied by the
+    /// time this one is built.
+    ///
+    /// # Panics
+    ///
+    /// If a row would go negative, which means the index disagrees with
+    /// the leaves it is derived from — the same class of fault as the
+    /// byte total's checked add, and caught here rather than allowed to
+    /// under-report a sweep's candidates.
+    fn append_sweep_rows_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        cf: &CfHandles<'_>,
+        deltas: &BTreeMap<(SweepBucket, Address), i64>,
+    ) {
+        if deltas.is_empty() {
+            return;
+        }
+        let sweep_cf = SweepIndexCf::handle(cf);
+        let rows: Vec<(SweepBucket, Address)> = deltas.keys().copied().collect();
+        let current: Vec<Option<u32>> = multi_get::<SweepIndexCf>(&*self.db, sweep_cf, &rows);
+        for ((row, delta), held) in deltas.iter().zip(current) {
+            let count = i64::from(held.unwrap_or(0))
+                .checked_add(*delta)
+                .expect("a sweep-index count stays inside i64");
+            let count = u32::try_from(count).unwrap_or_else(|_| {
+                panic!("sweep index for {row:?} went to {count}, so it disagrees with the leaves")
+            });
+            if count == 0 {
+                batch_delete::<SweepIndexCf>(batch, sweep_cf, row);
+            } else {
+                batch_put::<SweepIndexCf>(batch, sweep_cf, row, &count);
+            }
         }
     }
 

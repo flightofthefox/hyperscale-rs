@@ -42,6 +42,7 @@ pub mod quorum_certificate;
 pub mod reshape;
 pub mod roots;
 pub mod storage_commit;
+pub mod sweep;
 pub mod terminal_verdict;
 pub mod timeout;
 pub mod vote;

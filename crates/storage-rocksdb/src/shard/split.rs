@@ -9,20 +9,26 @@
 //! subtree ([`RocksDbShardStorage::adopt_split_child`]). The sibling's
 //! keys ride along as dead weight outside the child's prefix — never
 //! read, never served, never in its `state_root` — until reclaimed.
+//!
+//! That holds because every index over the cells is read owner-scoped,
+//! and a transaction on a child names only owners the child holds. The
+//! sweep index is the exception, since a sweep enumerates the whole
+//! shard rather than one owner, so adoption prunes its foreign rows.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
-use hyperscale_storage::AdoptSource;
 use hyperscale_storage::tree::Jmt;
+use hyperscale_storage::{AdoptSource, key_under_prefix};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified,
+    BeaconWitnessLeafCount, Block, CertifiedBlock, ChainOrigin, Hash, LocalKey, StateRoot,
+    SubstateKey, Verified,
 };
 use rocksdb::WriteBatch;
 use rocksdb::checkpoint::Checkpoint;
 
-use super::column_families::{CfHandles, JmtNodesCf, SubstateBytesCf};
+use super::column_families::{CfHandles, JmtNodesCf, SubstateBytesCf, SweepIndexCf};
 use super::core::RocksDbShardStorage;
 use super::jmt_stored::{StoredNodeKey, VersionedStoredNode};
 use super::metadata::{
@@ -30,7 +36,7 @@ use super::metadata::{
     write_committed_hash, write_committed_height, write_jmt_metadata,
 };
 use crate::StorageError;
-use crate::typed_cf::{TypedCf, batch_put};
+use crate::typed_cf::{TypedCf, batch_delete, batch_put, iter_all};
 
 impl RocksDbShardStorage {
     /// Hard-link a checkpoint of this store's entire database into the
@@ -174,6 +180,7 @@ impl RocksDbShardStorage {
         }
         if !matches!(source, AdoptSource::InPlace) {
             write_jmt_metadata(&mut batch, genesis_version, adopted);
+            self.drop_foreign_sweep_rows(&cf, &mut batch);
         }
         write_chain_origin(&mut batch, origin);
         self.append_genesis_tip_to_batch(&mut batch, genesis);
@@ -181,6 +188,44 @@ impl RocksDbShardStorage {
             .write(batch)
             .map_err(|e| StorageError::DatabaseError(format!("reshape adoption write: {e}")))?;
         Ok(adopted)
+    }
+
+    /// Drop the sweep-index rows this store no longer owns.
+    ///
+    /// Adoption re-roots the tree at a subtree but leaves the cell
+    /// column whole, so a child's `StateCf` is a superset of its own
+    /// leaves — the sibling's cells are still sitting in it. Every other
+    /// index survives that because every other index is read
+    /// owner-scoped, and a transaction on a child names only owners the
+    /// child holds. A sweep is the first walk that enumerates the whole
+    /// shard, so it is the first to meet them.
+    ///
+    /// Rows are keyed by owner, which makes the fix exact: a row whose
+    /// owner is outside this store's prefix belongs wholly to a sibling,
+    /// so dropping it drops the sibling's cells from the walk and leaves
+    /// the counts of what remains untouched. Nothing has to filter
+    /// afterwards — a surviving row's owner is one whose every cell is
+    /// this store's.
+    ///
+    /// A replica that snap-syncs the same child instead of cloning it
+    /// rebuilds the index from the leaves it imported and so holds these
+    /// rows and no others. That the two agree is what makes the removal
+    /// set a function of committed state rather than of how a node got
+    /// there.
+    fn drop_foreign_sweep_rows(&self, cf: &CfHandles, batch: &mut WriteBatch) {
+        if self.root_path.is_empty() {
+            return;
+        }
+        let sweep_cf = SweepIndexCf::handle(cf);
+        for ((bucket, owner), _) in iter_all::<SweepIndexCf>(&self.db, sweep_cf) {
+            let leaf = SubstateKey {
+                owner,
+                local: LocalKey([0; 16]),
+            };
+            if !key_under_prefix(&leaf.to_bytes(), &self.root_path) {
+                batch_delete::<SweepIndexCf>(batch, sweep_cf, &(bucket, owner));
+            }
+        }
     }
 
     /// This store's own prefix, which a split child's adoption re-roots at.
@@ -341,10 +386,11 @@ impl TreeReader for PreRootStore<'_> {
 mod tests {
     use hyperscale_jmt::{Blake3Hasher, Hasher, KEY_BYTES, Key, NibblePath};
     use hyperscale_storage::test_helpers::import_boundary_state;
-    use hyperscale_storage::{AdoptSource, BoundaryStore, WitnessSeed};
+    use hyperscale_storage::{AdoptSource, BoundaryStore, SweepIndex, WitnessSeed};
+    use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
     use hyperscale_types::{
-        AddressClass, BlockHash, BlockHeight, ShardId, SubstateKey, SubstateLeaf, ValidatorId,
-        WeightedTimestamp,
+        AddressClass, BlockHash, BlockHeight, SWEEP_BUCKET_MS, ShardId, SubstateKey, SubstateLeaf,
+        SweepBucket, SweepFrontier, ValidatorId, WeightedTimestamp,
     };
     use tempfile::TempDir;
 
@@ -436,6 +482,65 @@ mod tests {
             .map_or(StateRoot::ZERO, |slot| {
                 StateRoot::from_raw(Hash::from_hash_bytes(&slot.hash))
             })
+    }
+
+    /// A cloned child sweeps only its own cells.
+    ///
+    /// The clone carries the sibling's leaves in the cell column, so
+    /// without the adoption prune the child's walk would find them —
+    /// and a replica that snap-synced the same child would not, which
+    /// is a fork between two storage histories of one chain.
+    #[test]
+    fn a_cloned_child_does_not_sweep_its_siblings_cells() {
+        install_stub_protocol_statics();
+        let expiry = 3 * SWEEP_BUCKET_MS;
+        let (local, value) = stub_sweepable_cell(expiry, 0x77);
+        let sweepable = |side: u8| SubstateLeaf {
+            key: SubstateKey::from_bytes({
+                let mut key = k(if side == 0 { 0x00 } else { 0x80 });
+                key[32..].copy_from_slice(&local.0);
+                key
+            })
+            .expect("a stored leaf key names an address"),
+            value: value.clone(),
+        };
+
+        let parent_dir = TempDir::new().unwrap();
+        let parent = RocksDbShardStorage::open(parent_dir.path(), NibblePath::empty()).unwrap();
+        import_boundary_state(
+            &parent,
+            BlockHeight::new(9),
+            &[sweepable(0), sweepable(1)],
+            WitnessSeed::default(),
+        )
+        .unwrap();
+        let (parent_version, _) = parent.read_jmt_metadata();
+        let all = SweepFrontier::start_of(SweepBucket(u32::MAX));
+        assert_eq!(
+            parent.sweep_candidates(SweepFrontier::ZERO, all, 10).len(),
+            2,
+            "the parent holds both sides"
+        );
+
+        for side in [0u8, 1u8] {
+            let child_dir = TempDir::new().unwrap();
+            let target = child_dir.path().join("store");
+            parent.checkpoint_into(&target).unwrap();
+            let child = RocksDbShardStorage::open(&target, child_path(side)).unwrap();
+            let child_root = child_root_from_parent(&parent, parent_version, side);
+            child
+                .adopt_genesis(
+                    origin_at_10(),
+                    &genesis_at_10(child_of(side), child_root),
+                    AdoptSource::ParentSubtree,
+                )
+                .unwrap();
+            assert_eq!(
+                child.sweep_candidates(SweepFrontier::ZERO, all, 10),
+                vec![(sweepable(side).key, expiry)],
+                "child {side} sweeps its own cell and not its sibling's"
+            );
+        }
     }
 
     /// The full parent-half flow: checkpoint the parent, open the

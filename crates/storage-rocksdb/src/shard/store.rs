@@ -5,19 +5,24 @@ use std::time::Instant;
 use hex::encode as hex_encode;
 use hyperscale_metrics::{record_storage_operation, record_storage_write};
 use hyperscale_storage::tree::carry_noop_root;
-use hyperscale_storage::{JmtSnapshot, PackageArtifactStore, SubstateStore, VersionedStore};
+use hyperscale_storage::{
+    JmtSnapshot, PackageArtifactStore, SubstateStore, SweepIndex, VersionedStore, sweepable_expiry,
+};
 use hyperscale_types::{
-    Block, BlockHeight, DeclaredRange, Hash, QuorumCertificate, StateRoot, SubstateKey, Verified,
+    Block, BlockHeight, DeclaredRange, Hash, QuorumCertificate, StateRoot, SubstateKey,
+    SweepFrontier, Verified,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 
-use super::column_families::PackageArtifactsCf;
+use super::column_families::{PackageArtifactsCf, StateCf, SweepIndexCf};
 use super::core::RocksDbShardStorage;
 use super::execution_certs::append_block_certs_to_batch;
 use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::metadata::read_jmt_metadata;
 use super::snapshot::RocksDbSnapshot;
-use crate::typed_cf::{TypedCf, get, iter_all};
+use super::substate_key::SubstateKeyCodec;
+use super::sweep_key::{SweepRowCodec, leaf_bucket_bounds, row_seek};
+use crate::typed_cf::{DbCodec, TypedCf, get, iter_all};
 
 impl SubstateStore for RocksDbShardStorage {
     type Snapshot<'a> = RocksDbSnapshot<'a>;
@@ -239,6 +244,53 @@ impl RocksDbShardStorage {
         );
 
         true
+    }
+}
+
+impl SweepIndex for RocksDbShardStorage {
+    fn sweep_candidates(
+        &self,
+        frontier: SweepFrontier,
+        ceiling: SweepFrontier,
+        limit: usize,
+    ) -> Vec<(SubstateKey, u64)> {
+        if limit == 0 || frontier >= ceiling {
+            return Vec::new();
+        }
+        let cf = self.cf();
+        let state_cf = StateCf::handle(&cf);
+        let mut found = Vec::new();
+        // Index rows first, in (bucket, owner) order; then that pair's
+        // leaves, in local order. The two walks composed are already
+        // sweep order, so nothing sorts and the cap stops the walk.
+        let mut rows = self.db.raw_iterator_cf(SweepIndexCf::handle(&cf));
+        rows.seek(row_seek(frontier.bucket()));
+        while rows.valid() && found.len() < limit {
+            let Some(raw) = rows.key() else { break };
+            let (bucket, owner) = SweepRowCodec.decode(raw);
+            if bucket >= ceiling.bucket() {
+                break;
+            }
+            let (start, end) = leaf_bucket_bounds(owner, bucket);
+            let mut leaves = self.db.raw_iterator_cf(state_cf);
+            leaves.seek(&start);
+            while leaves.valid() && found.len() < limit {
+                let Some(raw_key) = leaves.key() else { break };
+                if raw_key >= end.as_slice() {
+                    break;
+                }
+                let key = SubstateKeyCodec.decode(raw_key);
+                let value = leaves.value().unwrap_or_default();
+                if SweepFrontier::of_leaf(key) > frontier
+                    && let Some(expiry) = sweepable_expiry(key, value)
+                {
+                    found.push((key, expiry));
+                }
+                leaves.next();
+            }
+            rows.next();
+        }
+        found
     }
 }
 
