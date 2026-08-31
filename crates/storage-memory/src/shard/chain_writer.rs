@@ -127,6 +127,7 @@ impl ShardChainWriter for SimShardStorage {
     fn commit_block(
         &self,
         certified: &Arc<Verified<CertifiedBlock>>,
+        removals: &[SubstateKey],
         witness: &BeaconWitnessCommit,
     ) -> StateRoot {
         let block = certified.block();
@@ -136,13 +137,16 @@ impl ShardChainWriter for SimShardStorage {
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
-        let merged_writes = merge_writes_from_receipts(
-            &block
-                .certificates()
-                .iter()
-                .flat_map(|fw| fw.settling_receipts())
-                .collect::<Vec<_>>(),
-            &self.snapshot(),
+        let merged_writes = with_removals(
+            merge_writes_from_receipts(
+                &block
+                    .certificates()
+                    .iter()
+                    .flat_map(|fw| fw.settling_receipts())
+                    .collect::<Vec<_>>(),
+                &self.snapshot(),
+            ),
+            removals,
         );
         self.append_beacon_witnesses(witness);
         self.commit_block_inner(&merged_writes, block, qc, &receipts)

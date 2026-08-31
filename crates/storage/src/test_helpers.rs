@@ -546,7 +546,7 @@ fn commit_empty_blocks_up_to(storage: &impl ShardChainWriter, target: BlockHeigh
     let witness = empty_witness();
     for h in 0..target.inner() {
         let certified = make_test_certified(make_test_block(BlockHeight::new(h)));
-        storage.commit_block(&certified, &witness);
+        storage.commit_block(&certified, &[], &witness);
     }
 }
 
@@ -580,7 +580,7 @@ pub fn commit_block_with_updates(
         .into(),
     );
     let block = push_certificate(make_test_block(height), finalized);
-    storage.commit_block(&make_test_certified(block), &empty_witness())
+    storage.commit_block(&make_test_certified(block), &[], &empty_witness())
 }
 
 const fn empty_witness() -> BeaconWitnessCommit {
@@ -626,7 +626,7 @@ pub fn commit_block_with_witnesses(
         leaf_count_at_block_end: count,
         prune_persisted_below: None,
     };
-    storage.commit_block(&make_test_certified(block), &witness);
+    storage.commit_block(&make_test_certified(block), &[], &witness);
     block_hash
 }
 
@@ -681,7 +681,7 @@ pub fn commit_block_with_witness_window(
         leaf_count_at_block_end: count,
         prune_persisted_below,
     };
-    storage.commit_block(&make_test_certified(block), &witness);
+    storage.commit_block(&make_test_certified(block), &[], &witness);
     block_hash
 }
 
@@ -787,7 +787,7 @@ pub fn test_ec_storage_roundtrip(storage: &(impl ShardChainReader + ShardChainWr
     commit_empty_blocks_up_to(storage, BlockHeight::new(10));
     let block = make_test_block_with_ecs(BlockHeight::new(10), vec![Arc::new(ec)]);
     let certified = make_test_certified(block);
-    storage.commit_block(&certified, &empty_witness());
+    storage.commit_block(&certified, &[], &empty_witness());
 
     let direct = storage
         .get_execution_certificate(&tick_id)
@@ -812,14 +812,14 @@ pub fn test_ec_storage_batch(storage: &(impl ShardChainReader + ShardChainWriter
         BlockHeight::new(10),
         vec![Arc::new(ec1.clone()), Arc::new(ec2.clone())],
     );
-    storage.commit_block(&make_test_certified(block10), &empty_witness());
+    storage.commit_block(&make_test_certified(block10), &[], &empty_witness());
 
     for h in 11..20 {
         let certified = make_test_certified(make_test_block(BlockHeight::new(h)));
-        storage.commit_block(&certified, &empty_witness());
+        storage.commit_block(&certified, &[], &empty_witness());
     }
     let block20 = make_test_block_with_ecs(BlockHeight::new(20), vec![Arc::new(ec3.clone())]);
-    storage.commit_block(&make_test_certified(block20), &empty_witness());
+    storage.commit_block(&make_test_certified(block20), &[], &empty_witness());
 
     let known = [*ec1.tick_id(), *ec2.tick_id(), *ec3.tick_id()];
     let batch = storage.get_execution_certificates_batch(&known);
@@ -1215,7 +1215,7 @@ pub fn test_widest_tick_copy_holds_the_slot(storage: &(impl ShardChainReader + S
     // One leg arrives, and answers for the transaction it carries.
     commit_empty_blocks_up_to(storage, BlockHeight::new(1));
     let first = make_test_block_with_ecs(BlockHeight::new(1), vec![Arc::new(leg(txs[0]))]);
-    storage.commit_block(&make_test_certified(first), &empty_witness());
+    storage.commit_block(&make_test_certified(first), &[], &empty_witness());
     let served = storage.get_execution_certificates_for_txs(&[txs[0]]);
     assert_eq!(served.len(), 1, "the transaction its copy carries");
     assert!(served[0].covers(&txs[0]));
@@ -1223,7 +1223,7 @@ pub fn test_widest_tick_copy_holds_the_slot(storage: &(impl ShardChainReader + S
     // A disjoint leg does not take the slot from it — the transaction
     // only that leg covered is served from its own shard instead.
     let second = make_test_block_with_ecs(BlockHeight::new(2), vec![Arc::new(leg(txs[1]))]);
-    storage.commit_block(&make_test_certified(second), &empty_witness());
+    storage.commit_block(&make_test_certified(second), &[], &empty_witness());
     assert!(
         storage.get_execution_certificates_for_txs(&[txs[0]])[0].covers(&txs[0]),
         "the copy already held keeps the slot",
@@ -1238,7 +1238,7 @@ pub fn test_widest_tick_copy_holds_the_slot(storage: &(impl ShardChainReader + S
     // The complete copy carries everything the slot held and more, so it
     // takes it, and the index reaches every transaction of the tick.
     let third = make_test_block_with_ecs(BlockHeight::new(3), vec![Arc::new(complete.clone())]);
-    storage.commit_block(&make_test_certified(third), &empty_witness());
+    storage.commit_block(&make_test_certified(third), &[], &empty_witness());
     for tx in &txs {
         let served = storage.get_execution_certificates_for_txs(from_ref(tx));
         assert_eq!(served.len(), 1);
@@ -1295,7 +1295,7 @@ pub fn test_tx_index_answers_with_the_local_shards_certificate(
         make_test_block(BlockHeight::new(1)),
         Arc::new(certificate.into()),
     );
-    storage.commit_block(&make_test_certified(block), &empty_witness());
+    storage.commit_block(&make_test_certified(block), &[], &empty_witness());
 
     let served = storage.get_execution_certificates_for_txs(from_ref(&tx));
     assert_eq!(served.len(), 1, "one certificate answers for the tx");
@@ -1375,7 +1375,7 @@ fn commit_block_with_provisions(storage: &impl ShardChainWriter, height: u64) ->
         .first()
         .expect("the block carries one")
         .hash();
-    storage.commit_block(&make_test_certified(block), &empty_witness());
+    storage.commit_block(&make_test_certified(block), &[], &empty_witness());
     hash
 }
 
@@ -1465,7 +1465,7 @@ pub fn test_recovery_carries_the_tip_drain_total(
         work_in_flight: in_flight,
         ..Default::default()
     });
-    storage.commit_block(&make_test_certified(block), &empty_witness());
+    storage.commit_block(&make_test_certified(block), &[], &empty_witness());
 
     assert_eq!(
         recovered().committed_tip.map(|tip| tip.work_in_flight),
@@ -1573,12 +1573,12 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + ShardChainWriter)
             Arc::new(Verifiable::from(open.clone())),
         ],
     );
-    storage.commit_block(&make_test_certified(committing), &empty_witness());
+    storage.commit_block(&make_test_certified(committing), &[], &empty_witness());
 
     // A counterpart's bundle for the one that stays open, so the sealed
     // block below is read against a height that actually carried one.
     let provisioning = with_provisions(make_test_block(BlockHeight::new(2)), source, open.hash());
-    storage.commit_block(&make_test_certified(provisioning), &empty_witness());
+    storage.commit_block(&make_test_certified(provisioning), &[], &empty_witness());
 
     // Only one of them gets an outcome. An abort resolves a transaction
     // exactly as a settlement does, and owes no receipt — which is what
@@ -1591,7 +1591,7 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + ShardChainWriter)
             TransactionDecision::Aborted,
         ))),
     );
-    storage.commit_block(&make_test_certified(resolving), &empty_witness());
+    storage.commit_block(&make_test_certified(resolving), &[], &empty_witness());
 
     // The floor is the height that committed the one still open. The
     // one resolved at height 3 committed there too, and does not hold
@@ -1693,9 +1693,10 @@ pub fn test_undischarged_record_holds_the_floor(
     // rebuild the record exists to repair.
     commit_empty_blocks_up_to(storage, BlockHeight::new(2));
     let naming = with_terminal_verdict(make_test_block(BlockHeight::new(2)), record);
-    storage.commit_block(&make_test_certified(naming), &empty_witness());
+    storage.commit_block(&make_test_certified(naming), &[], &empty_witness());
     storage.commit_block(
         &make_test_certified(make_test_block(BlockHeight::new(3))),
+        &[],
         &empty_witness(),
     );
 
@@ -1714,7 +1715,7 @@ pub fn test_undischarged_record_holds_the_floor(
             TransactionDecision::Aborted,
         ))),
     );
-    storage.commit_block(&make_test_certified(aborting), &empty_witness());
+    storage.commit_block(&make_test_certified(aborting), &[], &empty_witness());
 
     assert_eq!(
         unresolved_replay_floor(storage, BlockHeight::new(4), WeightedTimestamp::ZERO),

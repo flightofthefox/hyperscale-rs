@@ -233,7 +233,7 @@ mod tests {
         let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
             CertifiedBlock::new_unchecked(block, qc),
         ));
-        storage.commit_block(&certified, &witness);
+        storage.commit_block(&certified, &[], &witness);
         (block_hash, root, leaf_count_at_block_end)
     }
 

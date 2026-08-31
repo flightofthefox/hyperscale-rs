@@ -317,6 +317,7 @@ mod tests {
             terminal = block.hash();
             storage.commit_block(
                 &make_test_certified(block),
+                &[],
                 &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
             );
         }
