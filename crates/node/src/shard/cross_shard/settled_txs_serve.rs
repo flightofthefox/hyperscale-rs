@@ -194,6 +194,7 @@ mod tests {
         let hash = block.hash();
         storage.commit_block(
             &make_test_certified(block),
+            &[],
             &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
         );
         hash

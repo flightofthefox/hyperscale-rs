@@ -176,7 +176,7 @@ fn commit_with(
     let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
         CertifiedBlock::new_unchecked(block, <Verified<_>>::clone(qc)),
     ));
-    storage.commit_block(&certified, &no_witness())
+    storage.commit_block(&certified, &[], &no_witness())
 }
 
 /// Helper: commit a block with empty updates and no ECs/receipts.

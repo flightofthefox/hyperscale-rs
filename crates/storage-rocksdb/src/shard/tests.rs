@@ -91,7 +91,7 @@ fn commit_empty(storage: &RocksDbShardStorage, block: &Block, qc: &Verified<Quor
     let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
         CertifiedBlock::new_unchecked(block.clone(), <Verified<_>>::clone(qc)),
     ));
-    storage.commit_block(&certified, &no_witness());
+    storage.commit_block(&certified, &[], &no_witness());
 }
 
 /// Writes holding a single removal.
@@ -650,7 +650,7 @@ fn test_commit_block_applies_writes() {
     let mut block = make_test_block(BlockHeight::new(1));
     let receipts = updates_to_receipts(&updates);
     attach_receipts(&mut block, receipts);
-    let result = storage.commit_block(&make_test_certified(block), &no_witness());
+    let result = storage.commit_block(&make_test_certified(block), &[], &no_witness());
     assert_ne!(result, StateRoot::ZERO);
 }
 
@@ -665,7 +665,7 @@ fn test_commit_block_multiple_certs() {
     let mut block = make_test_block(BlockHeight::new(1));
     let receipts = updates_to_receipts(&merged);
     attach_receipts(&mut block, receipts);
-    let result = storage.commit_block(&make_test_certified(block), &no_witness());
+    let result = storage.commit_block(&make_test_certified(block), &[], &no_witness());
     assert_ne!(result, StateRoot::ZERO);
 }
 
@@ -675,7 +675,7 @@ fn test_commit_block_empty_certs() {
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
     let block = make_test_block(BlockHeight::new(1));
-    storage.commit_block(&make_test_certified(block), &no_witness());
+    storage.commit_block(&make_test_certified(block), &[], &no_witness());
     assert_eq!(storage.jmt_height(), BlockHeight::new(1));
 }
 
@@ -707,7 +707,7 @@ fn test_prepare_then_commit_matches_direct() {
     let temp_dir2 = TempDir::new().unwrap();
     let s_direct = RocksDbShardStorage::open(temp_dir2.path(), NibblePath::empty()).unwrap();
     let block2 = make_test_block(BlockHeight::new(1));
-    let result_direct = s_direct.commit_block(&make_test_certified(block2), &no_witness());
+    let result_direct = s_direct.commit_block(&make_test_certified(block2), &[], &no_witness());
 
     assert_eq!(result_prepared, result_direct);
     assert_eq!(spec_root, result_prepared);
@@ -887,7 +887,7 @@ fn test_commit_block_stores_certificates() {
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     };
-    let _ = storage.commit_block(&make_test_certified(block), &no_witness());
+    let _ = storage.commit_block(&make_test_certified(block), &[], &no_witness());
 
     assert!(storage.get_certificate(&cert_hash).is_some());
 }
@@ -1169,7 +1169,7 @@ fn test_ec_survives_reopen() {
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
         let block = make_test_block(BlockHeight::new(0));
-        storage.commit_block(&make_test_certified(block), &no_witness());
+        storage.commit_block(&make_test_certified(block), &[], &no_witness());
         let mut block = make_test_block(BlockHeight::new(1));
         push_finalization(
             &mut block,
@@ -1177,7 +1177,7 @@ fn test_ec_survives_reopen() {
                 Finalization::new(tick_id, TickHalf::Determined, vec![Arc::new(ec)], vec![]).into(),
             ),
         );
-        storage.commit_block(&make_test_certified(block), &no_witness());
+        storage.commit_block(&make_test_certified(block), &[], &no_witness());
     }
 
     {
@@ -1204,7 +1204,7 @@ fn test_ec_atomic_with_block_commit() {
         ),
     );
     // Commit block with EC atomically
-    storage.commit_block(&make_test_certified(block), &no_witness());
+    storage.commit_block(&make_test_certified(block), &[], &no_witness());
 
     let cert = storage
         .get_execution_certificate(&tick_id)
@@ -1260,7 +1260,7 @@ fn rocks_commit_with(
     let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
         CertifiedBlock::new_unchecked(block, <Verified<_>>::clone(qc)),
     ));
-    storage.commit_block(&certified, &no_witness());
+    storage.commit_block(&certified, &[], &no_witness());
 }
 
 /// State-history walkthrough: key K created at V1 with value A, deleted
@@ -1629,7 +1629,7 @@ fn a_committed_bundle_survives_a_reopen() {
             TxHash::ZERO,
         );
         let hash = block.provisions()[0].hash();
-        storage.commit_block(&make_test_certified(block), &no_witness());
+        storage.commit_block(&make_test_certified(block), &[], &no_witness());
         hash
     };
 

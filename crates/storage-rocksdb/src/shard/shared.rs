@@ -243,9 +243,10 @@ impl ShardChainWriter for SharedStorage {
     fn commit_block(
         &self,
         certified: &Arc<Verified<CertifiedBlock>>,
+        removals: &[SubstateKey],
         witness: &BeaconWitnessCommit,
     ) -> StateRoot {
-        self.0.commit_block(certified, witness)
+        self.0.commit_block(certified, removals, witness)
     }
 }
 
