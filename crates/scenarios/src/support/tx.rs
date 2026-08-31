@@ -1926,6 +1926,24 @@ pub fn payment_request(signer: PrincipalAddr, amount: u128) -> IntentDecl {
     })
 }
 
+/// [`payment_request`] standing only for `window`.
+///
+/// The nullifier a spend of it takes lives for that window plus
+/// [`NULLIFIER_GRACE_MS`](hyperscale_vm_types::NULLIFIER_GRACE_MS), so a
+/// request signed for a transaction-shaped window yields a nullifier a
+/// scenario's clock can outrun and watch the sweep retire.
+#[must_use]
+pub fn payment_request_for(
+    signer: PrincipalAddr,
+    amount: u128,
+    window: TimestampRange,
+) -> IntentDecl {
+    declaration_under(signer, scenario_header(window), |b| {
+        let incoming = b.declare(*XRD, [Constraint::MinAmount(amount)]);
+        account::deposit(b, signer, incoming)
+    })
+}
+
 /// Compose `request` — signed by `signer_key`, whose account is the
 /// request's target — into a transaction that fills it from `from`.
 ///
@@ -2045,9 +2063,23 @@ fn declaration(
     signer: PrincipalAddr,
     write: impl FnOnce(&mut IntentBuilder<'_>) -> Result<(), TypedError>,
 ) -> IntentDecl {
+    declaration_under(signer, offer_header(), write)
+}
+
+/// [`declaration`] for a signer who names its own terms.
+///
+/// A standing offer runs the whole cap, which is what
+/// [`offer_header`] gives and what most scenarios want. One that stands
+/// only as long as the composition binding it produces a nullifier whose
+/// life a scenario can outrun, which is what a sweep needs to observe.
+fn declaration_under(
+    signer: PrincipalAddr,
+    header: IntentHeader,
+    write: impl FnOnce(&mut IntentBuilder<'_>) -> Result<(), TypedError>,
+) -> IntentDecl {
     let client = client();
     let chain = client.records();
-    let mut decl = IntentBuilder::declaration(&chain, &ProtocolHasher, signer, offer_header());
+    let mut decl = IntentBuilder::declaration(&chain, &ProtocolHasher, signer, header);
     write(&mut decl).expect("every scenario call types against its signature");
     decl.into_decl()
         .expect("the declaration discharges its own holes")

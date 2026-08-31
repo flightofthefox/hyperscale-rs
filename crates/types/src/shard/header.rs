@@ -925,6 +925,7 @@ mod tests {
     use hyperscale_hbor::{
         DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
+    use hyperscale_vm_types::SweepBucket;
 
     use super::*;
 
@@ -959,6 +960,44 @@ mod tests {
         assert_eq!(a.parent_block_hash(), parent_terminal.hash());
         assert_eq!(a.state_root(), root);
         assert_eq!(a.split_child_roots(), None);
+    }
+
+    /// Every structural genesis starts its sweep at the bottom, whatever
+    /// its predecessors had reached.
+    ///
+    /// A frontier is only safe carried down. A merge adopting the higher
+    /// of its two predecessors' cursors would put every cell the other
+    /// one held between them below the successor's cursor — unswept and
+    /// unreachable, a leak nothing else catches, because INV-SWEEP-7
+    /// governs creation and this is inheritance. Starting at zero costs
+    /// a catch-up over an interval the walk finds empty and no more.
+    #[test]
+    fn a_structural_genesis_starts_its_sweep_at_the_bottom() {
+        let swept = BlockHeader::new(BlockHeaderParts {
+            sweep_frontier: SweepFrontier::start_of(SweepBucket(9)),
+            ..sample_header().into_parts()
+        });
+        assert_ne!(swept.sweep_frontier(), SweepFrontier::ZERO);
+
+        let child = BlockHeader::split_child_genesis(
+            ShardId::leaf(1, 0),
+            StateRoot::from_raw(Hash::from_bytes(b"child subtree")),
+            &swept,
+            WeightedTimestamp::from_millis(42_000),
+        );
+        assert_eq!(child.sweep_frontier(), SweepFrontier::ZERO);
+
+        let merged = BlockHeader::merge_parent_genesis(
+            ShardId::ROOT,
+            StateRoot::from_raw(Hash::from_bytes(b"merged subtree")),
+            (swept.hash(), BlockHeight::new(40)),
+            (swept.hash(), BlockHeight::new(42)),
+            WeightedTimestamp::from_millis(50_000),
+        );
+        assert_eq!(merged.sweep_frontier(), SweepFrontier::ZERO);
+
+        // And the chain's own genesis, which has no predecessor at all.
+        assert_eq!(sample_header().sweep_frontier(), SweepFrontier::ZERO);
     }
 
     /// A merged parent's genesis is a pure function of its two children's
