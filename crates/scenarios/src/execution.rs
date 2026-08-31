@@ -11,6 +11,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key, round_key};
@@ -21,12 +22,12 @@ use hyperscale_engine::{
 };
 use hyperscale_hbor::from_slice;
 use hyperscale_types::{
-    AccountSigner, Address, BlockHeight, Epoch, Hash, SchemeId, SeedLookup, ShardId,
-    TransactionDecision, TransactionStatus, TxHash,
+    AccountSigner, Address, BlockHeight, Epoch, Hash, SWEEP_BUCKET_MS, SchemeId, SeedLookup,
+    ShardId, TransactionDecision, TransactionStatus, TxHash,
 };
-use hyperscale_vm_effects::{InstanceMeta, package_hash};
+use hyperscale_vm_effects::{InstanceMeta, nullifier_key, package_hash};
 use hyperscale_vm_fixtures::lottery;
-use hyperscale_vm_types::SEAL_MATURITY_EPOCHS;
+use hyperscale_vm_types::{NULLIFIER_GRACE_MS, SEAL_MATURITY_EPOCHS};
 
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::faultable::FaultableCluster;
@@ -36,8 +37,9 @@ use crate::support::tx::{
     build_instance_instantiate_tx, build_instantiate_tx, build_publish_tx, build_securify_tx,
     build_transfer_paid_by, build_transfer_tx, build_unbound_payer_tx, cross_shard_cast,
     cross_shard_keys, lottery_on, native_pq_cast, nullifier_race_cast, overdraw_cast,
-    payment_request, recipient, securify_cast, sender, shared_recipient_cast, storm_artifact,
-    storm_publishers, unbound_payer_cast, unbound_remote_payer_cast, validity_around,
+    payment_request, payment_request_for, recipient, securify_cast, sender, shared_recipient_cast,
+    storm_artifact, storm_publishers, unbound_payer_cast, unbound_remote_payer_cast,
+    validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_height, await_tx_terminal};
 use crate::support::{Cluster, epochs};
@@ -1542,6 +1544,95 @@ fn vault_balance(c: &impl Cluster, shard: ShardId, owner: impl Into<Address>) ->
             let cell: [u8; 16] = bytes.as_slice().try_into().expect("an amount cell");
             u128::from_le_bytes(cell)
         })
+}
+
+/// A spent nullifier outlives every chain that could read it, and no
+/// longer: the sweep retires it once its own shard's committed clock has
+/// passed the life the subintent's window gave it.
+///
+/// The whole mechanism end to end on the family it was built for — the
+/// cell written by a real spend, indexed by the bucket its expiry falls
+/// in, and removed by a block whose header states the frontier it
+/// reached. Nothing here reads an index or a frontier; it reads the cell,
+/// which is the only thing a replay would have read.
+///
+/// The request stands only for the composition's own window rather than
+/// the offer cap, so its nullifier expires inside a scenario's reach. A
+/// month-long offer is the same cell with the same rule and a life no
+/// simulated clock will outrun.
+///
+/// # Panics
+///
+/// Panics if the composition does not commit, if the nullifier is absent
+/// while a spend could still be decided, or if it survives past the
+/// point no chain can reach it.
+pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
+    let shard = ShardId::ROOT;
+    let (composer_key, _, requester_key) = nullifier_race_cast();
+    let composer = account_address(&composer_key.public_key().0);
+    let requester = account_address(&requester_key.public_key().0);
+
+    // One window for both: the offer stands exactly as long as the
+    // transaction binding it, so the nullifier's life is that window
+    // plus the grace every transaction-derived artifact gets.
+    let window = validity_around(c.now());
+    let request = payment_request_for(requester, REQUEST, window);
+    let expiry_ms = window
+        .end_timestamp_exclusive
+        .as_millis()
+        .saturating_add(NULLIFIER_GRACE_MS);
+    let nullifier = nullifier_key(
+        &ProtocolHasher,
+        requester,
+        request.hash(&ProtocolHasher),
+        expiry_ms,
+    );
+
+    let tx = build_composed_tx(
+        &composer_key,
+        composer,
+        &requester_key,
+        &request,
+        REQUEST,
+        window,
+    );
+    let hash = tx.hash();
+    c.submit(Arc::new(tx));
+    assert!(
+        matches!(
+            await_tx_terminal(c, hash, epochs(4)),
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the composition fills the request"
+    );
+    assert!(
+        c.substate(shard, nullifier.owner, nullifier.local.0)
+            .is_some(),
+        "the spend writes its nullifier under the request's signer"
+    );
+
+    // Past the expiry the cell records, plus the buckets the frontier
+    // stops short of: a cell at the foot of its bucket needs the clock a
+    // whole bucket past it before the ceiling clears that bucket, and the
+    // chain's own committed clock trails the cluster's. Three buckets
+    // covers both. Everything here is the sweep's own terms — nothing
+    // waits on a block count or a proposer's choice.
+    let swept_by = Duration::from_millis(expiry_ms)
+        .saturating_add(Duration::from_millis(SWEEP_BUCKET_MS.saturating_mul(3)));
+    // Budgeted in epochs but waiting on a wall-clock life, so the budget
+    // is sized for the *short* epoch a default-feature run uses; under
+    // production epochs it is slack the run never spends, since
+    // `run_until` returns the moment the cell goes.
+    let gone = c.run_until(epochs(24), |c| {
+        c.now() > swept_by
+            && c.substate(shard, nullifier.owner, nullifier.local.0)
+                .is_none()
+    });
+    assert!(
+        gone,
+        "the nullifier outlived the last clock that could reach it at {:?}",
+        c.now()
+    );
 }
 
 /// The reported change to `owner`'s native vault.
