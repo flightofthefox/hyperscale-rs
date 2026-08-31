@@ -23,13 +23,13 @@ use hyperscale_storage::{
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     BeaconWitnessEvent, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
-    Ed25519PrivateKey, EnvelopeExt, EpochWindows, Hash, NetworkId, PrincipalAddr, ProvisionalHolds,
-    SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey,
-    TimestampRange, Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
-    absorb_committed_cells,
+    Ed25519PrivateKey, EnvelopeExt, EpochWindows, Hash, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId,
+    PrincipalAddr, ProvisionalHolds, SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot,
+    StateWrites, SubstateKey, TimestampRange, Transaction, TransactionBody, TransactionEnvelope,
+    Verified, WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
-    AbiParam, Composed, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, PackageHash,
+    AbiParam, Composed, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader, PackageHash,
     PackageMetadata, ResourceKind, Totality, Value, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
@@ -41,6 +41,18 @@ use hyperscale_vm_types::{
 
 /// The network every envelope in these tests is signed for.
 const NETWORK: NetworkId = NetworkId(242);
+
+/// The widest window an intent may stand for, which these fixtures use
+/// wherever they mean "does not expire during the test".
+const OFFER_MS: u64 = MAX_SUBINTENT_VALIDITY_RANGE.as_secs() * 1_000;
+
+/// The terms every intent in these tests is sealed under. The window is
+/// the widest an intent may name, so nothing here narrows a transaction.
+const HEADER: IntentHeader = IntentHeader {
+    network: NETWORK,
+    validity_start_ms: 0,
+    validity_end_ms: OFFER_MS,
+};
 
 /// The two accounts the transfer cases move funds between, as signing
 /// seeds rather than as literal addresses: a withdrawing node admits only
@@ -215,7 +227,7 @@ const fn terms(max_fee: u128) -> Terms {
         max_fee,
         validity: TimestampRange::new(
             WeightedTimestamp::from_millis(0),
-            WeightedTimestamp::from_millis(u64::MAX),
+            WeightedTimestamp::from_millis(OFFER_MS),
         ),
         message: Vec::new(),
     }
@@ -310,7 +322,7 @@ fn signed_settle_with_fee(seed: u8, max_fee: u128, salt: u8) -> Transaction {
     let composed = Composed::new(&chain, &[lottery_meta(salt)], &ProtocolHasher);
     let lottery_addr = lottery_meta(salt).address(&ProtocolHasher);
     let (mut env, mut root) =
-        EnvelopeBuilder::new(&composed, &ProtocolHasher, fee_payer(seed), NETWORK);
+        EnvelopeBuilder::new(&composed, &ProtocolHasher, fee_payer(seed), HEADER);
     lottery::Lottery::at(lottery_addr)
         .settle(&mut root, 64)
         .expect("a lottery answers a settlement");
@@ -350,7 +362,7 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
         let composed = Composed::new(&chain, &[lottery_meta(*salt)], &ProtocolHasher);
         let round = lottery_meta(*salt).address(&ProtocolHasher);
         let (mut env, mut root) =
-            EnvelopeBuilder::new(&composed, &ProtocolHasher, fee_payer(SEALER_SEED), NETWORK);
+            EnvelopeBuilder::new(&composed, &ProtocolHasher, fee_payer(SEALER_SEED), HEADER);
         instantiate(&mut root, fee_payer(SEALER_SEED), round)
             .expect("a derivable round answers its seal");
         env.register_instance(lottery_meta(*salt));
@@ -394,7 +406,7 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
 fn closing_tree(salt: u8, signer: PrincipalAddr) -> EnvelopeTree {
     let chain = client().records();
     let composed = Composed::new(&chain, &[lottery_meta(salt)], &ProtocolHasher);
-    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher, signer, NETWORK);
+    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher, signer, HEADER);
     lottery::Lottery::at(lottery_meta(salt).address(&ProtocolHasher))
         .close(&mut root)
         .expect("a lottery answers a close");
@@ -1293,7 +1305,7 @@ fn signed_publish(seed: u8, artifact: Vec<u8>) -> Transaction {
         max_fee: 1_000_000,
         gas_limit: 1_000_000,
         validity_start_ms: 0,
-        validity_end_ms: u64::MAX,
+        validity_end_ms: OFFER_MS,
         message: Vec::new(),
         network: NETWORK,
         signer_scheme: SchemeId::NONE,
@@ -1424,7 +1436,7 @@ fn derivation_tells_a_gap_from_a_refusal() {
     let gap = Transaction::new(client().sign_tree(
         &EnvelopeTree {
             root: IntentDecl {
-                network: NETWORK,
+                header: HEADER,
                 graph,
                 sockets: Vec::new(),
             },
@@ -1455,7 +1467,7 @@ fn derivation_tells_a_gap_from_a_refusal() {
     let refused = Transaction::new(client().sign_tree(
         &EnvelopeTree {
             root: IntentDecl {
-                network: NETWORK,
+                header: HEADER,
                 graph,
                 sockets: Vec::new(),
             },
@@ -2063,7 +2075,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     let graph = b.build().expect("every output is consumed");
     let tree = EnvelopeTree {
         root: IntentDecl {
-            network: NETWORK,
+            header: HEADER,
             graph,
             sockets: Vec::new(),
         },

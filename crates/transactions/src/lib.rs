@@ -25,7 +25,9 @@ use hyperscale_types::{
     AccountSigner, NetworkId, ProtocolHasher, SubintentSig, TimestampRange, Transaction,
     TransactionEnvelope,
 };
-use hyperscale_vm_effects::{Claim, EnvelopeTree, IntentDecl, ManifestGraph, StoredRule};
+use hyperscale_vm_effects::{
+    Claim, EnvelopeTree, IntentDecl, IntentHeader, ManifestGraph, StoredRule,
+};
 use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
 use hyperscale_vm_stdlib::account;
 use hyperscale_vm_types::PrincipalAddr;
@@ -184,7 +186,11 @@ impl Client {
         self.sign_tree(
             &EnvelopeTree {
                 root: IntentDecl {
-                    network: self.network,
+                    header: IntentHeader {
+                        network: self.network,
+                        validity_start_ms: terms.validity.start_timestamp_inclusive.as_millis(),
+                        validity_end_ms: terms.validity.end_timestamp_exclusive.as_millis(),
+                    },
                     graph,
                     sockets: Vec::new(),
                 },

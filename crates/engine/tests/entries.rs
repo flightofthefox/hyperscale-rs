@@ -18,13 +18,17 @@ use hyperscale_storage::{BoundaryStore, GenesisCommit, SubstateStore, Substates}
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
-    BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EntryKey, NetworkId, PrincipalAddr,
-    ProtocolHasher, ProvisionalHolds, ResourceAddr, SettledWrites, ShardId, ShardTrie,
-    StoredReceipt, TimestampRange, Transaction, Verified, WeightedTimestamp,
+    BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EntryKey, MAX_SUBINTENT_VALIDITY_RANGE,
+    NetworkId, PrincipalAddr, ProtocolHasher, ProvisionalHolds, ResourceAddr, SettledWrites,
+    ShardId, ShardTrie, StoredReceipt, TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::holdings_collection;
 use hyperscale_vm_stdlib::account;
 use hyperscale_vm_types::CollectionId;
+
+/// The widest window an intent may stand for, which these fixtures use
+/// wherever they mean "does not expire during the test".
+const OFFER_MS: u64 = MAX_SUBINTENT_VALIDITY_RANGE.as_secs() * 1_000;
 
 /// The two signing seeds this world funds.
 const ALICE: u8 = 1;
@@ -54,7 +58,7 @@ const fn terms() -> Terms {
         max_fee: 1_000,
         validity: TimestampRange::new(
             WeightedTimestamp::from_millis(0),
-            WeightedTimestamp::from_millis(u64::MAX),
+            WeightedTimestamp::from_millis(OFFER_MS),
         ),
         message: Vec::new(),
     }

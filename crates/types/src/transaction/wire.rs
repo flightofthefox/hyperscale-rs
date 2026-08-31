@@ -170,9 +170,18 @@ impl Transaction {
     /// Half-open `WeightedTimestamp` range during which this tx may be
     /// included in a block. Anchored on the parent QC's `weighted_timestamp`
     /// at every check site. Signer-chosen, chain-enforced.
+    ///
+    /// The *effective* window: the envelope's, narrowed by every
+    /// subintent it binds. Read from the derivation rather than from the
+    /// envelope, because the envelope's own fields are the composer's
+    /// claim and a bound signer's window may be tighter.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
     #[must_use]
     pub fn validity_range(&self) -> TimestampRange {
-        self.body().validity_window()
+        self.derived().effective_window
     }
 
     /// Create a transaction from a signed envelope.
@@ -553,6 +562,9 @@ mod tests {
                 Vec::new()
             };
             Ok(Derived {
+                // A stub derives no tree, so the envelope's own window
+                // is the whole of it.
+                effective_window: vm.validity_window(),
                 // The stub cannot derive an address from a key, so it
                 // binds the signer to the payer field — every stubbed
                 // transaction's payer admits its signer.
@@ -647,8 +659,13 @@ mod tests {
     }
 
     #[test]
-    fn the_validity_window_is_read_off_the_signed_envelope() {
+    fn the_validity_window_is_the_derived_one() {
+        // The envelope's window is the composer's claim; the window the
+        // transaction actually has is the derivation's, because a bound
+        // subintent may have offered a tighter one. With nothing bound
+        // they agree, and that agreement is what this pins.
         let tx = fixture(b"graph bytes");
+        tx.try_derived(&StubStatics).expect("the stub derives");
         assert_eq!(tx.validity_range(), test_validity_range());
     }
 

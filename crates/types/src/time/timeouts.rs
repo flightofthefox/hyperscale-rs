@@ -55,6 +55,12 @@ pub const REMOTE_HEADER_RETENTION: Duration = Duration::from_secs(30);
 /// elapse, the tx is provably terminal everywhere — no shard can still
 /// need its provision data, EC, or any other artefact. Safe to drop on
 /// every node simultaneously.
+///
+/// Sized from the transaction window and never from
+/// [`MAX_SUBINTENT_VALIDITY_RANGE`](crate::MAX_SUBINTENT_VALIDITY_RANGE),
+/// which is far wider: what is retained here is derived from a
+/// transaction, and a transaction binding a long-standing offer still
+/// runs inside its own window.
 pub const RETENTION_HORIZON: Duration =
     Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() + MAX_FINALIZATION_DELAY.as_secs());
 

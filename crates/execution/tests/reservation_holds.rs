@@ -19,8 +19,8 @@ use hyperscale_execution::action_handlers::accumulate_tick_output;
 use hyperscale_storage::TickOutput;
 use hyperscale_types::{
     Address, AddressClass, CollectionId, ConsensusReceipt, DeclaredKey, DeclaredRange, Derivation,
-    DerivationError, Derived, ExecutionMetadata, GlobalReceiptHash, Hash, LocalKey, Mode,
-    NetworkId, PrincipalAddr, Routing, SchemeId, StateWrites, SubstateKey, Transaction,
+    DerivationError, Derived, EnvelopeExt, ExecutionMetadata, GlobalReceiptHash, Hash, LocalKey,
+    Mode, NetworkId, PrincipalAddr, Routing, SchemeId, StateWrites, SubstateKey, Transaction,
     TransactionBody, TransactionEnvelope, TxHash, Verified, WeightedTimestamp, declared_work,
 };
 use hyperscale_vm_types::Moves;
@@ -76,6 +76,8 @@ impl Derivation for ReservingStatics {
         ];
         declared_modes.sort_unstable();
         Ok(Derived {
+            // This stub derives no tree; the envelope's window stands.
+            effective_window: vm.validity_window(),
             routing: Routing {
                 read_keys: Vec::new(),
                 write_keys: declared_modes.iter().map(|(key, _)| *key).collect(),

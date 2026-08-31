@@ -19,11 +19,15 @@ use hyperscale_engine::{
 use hyperscale_storage::Substates;
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
-    ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, NetworkId, PrincipalAddr, ProvisionalHolds,
-    SettledWrites, ShardId, ShardTrie, Stake, StateWrites, SubstateKey, TimestampRange,
-    Transaction, Verified, WeightedTimestamp,
+    ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId,
+    PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie, Stake, StateWrites,
+    SubstateKey, TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::{Address, CollectionId, amount_cell, encode_amount};
+
+/// The widest window an intent may stand for, which these fixtures use
+/// wherever they mean "does not expire during the test".
+const OFFER_MS: u64 = MAX_SUBINTENT_VALIDITY_RANGE.as_secs() * 1_000;
 
 /// A funded account whose key nothing in this binary holds — the address
 /// is all an attacker has, and the address is public.
@@ -89,7 +93,7 @@ const fn terms(max_fee: u128) -> Terms {
         max_fee,
         validity: TimestampRange::new(
             WeightedTimestamp::from_millis(0),
-            WeightedTimestamp::from_millis(u64::MAX),
+            WeightedTimestamp::from_millis(OFFER_MS),
         ),
         message: Vec::new(),
     }
