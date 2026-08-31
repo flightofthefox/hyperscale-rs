@@ -466,8 +466,9 @@ impl BridgeStatics {
 
         Ok(Derived {
             // A publish carries no tree, so nothing narrows the window
-            // its composer signed.
+            // its composer signed and nothing binds a subintent.
             effective_window: vm.validity_window(),
+            sweepable_writes: 0,
             work,
             signer,
             routing: Routing {
@@ -620,6 +621,10 @@ impl Derivation for BridgeStatics {
                 .iter()
                 .map(|record| record.subintent.0.0)
                 .collect(),
+            // One nullifier per bound subintent, and nothing else this
+            // derivation produces is a family a sweep retires.
+            sweepable_writes: u32::try_from(admitted.subintents.len())
+                .expect("bounded by MAX_SUBINTENTS"),
             fee_vault_local: vault_key(vm.fee_payer, *XRD).local.0,
             auth_cell_local: auth_key(vm.fee_payer).local.0,
             packages,

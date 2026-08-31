@@ -239,6 +239,17 @@ pub struct Derived {
     pub signer: PrincipalAddr,
     /// One declaration hash per bound subintent, in tree order.
     pub subintent_hashes: Vec<[u8; 32]>,
+    /// How many cells this transaction creates that a sweep will later
+    /// have to retire.
+    ///
+    /// Counted rather than inferred from the routed sets, because what
+    /// makes a write sweepable is the family it belongs to and only the
+    /// derivation knows that. A block sums this over its transactions
+    /// and is refused past
+    /// [`MAX_SWEEPABLE_CREATED_PER_BLOCK`](crate::MAX_SWEEPABLE_CREATED_PER_BLOCK),
+    /// which is what keeps the sweep's own cap a bound on the resident
+    /// population rather than only on a block's work.
+    pub sweepable_writes: u32,
     /// The local half of the fee payer's native-resource vault cell —
     /// the substate the payer shard's reservation check reads and the
     /// fee settlement debits. The owner half is the envelope's

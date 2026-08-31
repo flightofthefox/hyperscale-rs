@@ -167,6 +167,18 @@ impl Transaction {
         self.derived().work
     }
 
+    /// How many cells this transaction creates that a sweep will later
+    /// have to retire — what a block sums to stay under
+    /// [`MAX_SWEEPABLE_CREATED_PER_BLOCK`](crate::MAX_SWEEPABLE_CREATED_PER_BLOCK).
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn sweepable_writes(&self) -> u32 {
+        self.derived().sweepable_writes
+    }
+
     /// Half-open `WeightedTimestamp` range during which this tx may be
     /// included in a block. Anchored on the parent QC's `weighted_timestamp`
     /// at every check site. Signer-chosen, chain-enforced.
@@ -562,6 +574,7 @@ mod tests {
                 Vec::new()
             };
             Ok(Derived {
+                sweepable_writes: 0,
                 // A stub derives no tree, so the envelope's own window
                 // is the whole of it.
                 effective_window: vm.validity_window(),

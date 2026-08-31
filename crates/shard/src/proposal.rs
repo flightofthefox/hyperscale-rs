@@ -22,7 +22,7 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash, LocalTimestamp,
     ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round,
     ShardId, TerminalVerdict, TopologySchedule, TopologySnapshot, Transaction, TxHash, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp,
+    Verifiable, Verified, WeightedTimestamp, sweep_admits_block,
 };
 use tracing::debug;
 
@@ -163,6 +163,11 @@ impl ProposalTracker {
 ///    would defer on or refuse.
 /// 4. Txs naming a package this window cannot run — the same question
 ///    `validate_packages_usable` asks, for the same reason.
+/// 5. Txs that would carry the block past the cap on sweepable cells
+///    one block may create — the question `validate_sweepable_creation`
+///    asks. A transaction that does not fit is skipped rather than
+///    ending the selection, so a large composition never starves the
+///    small ones behind it.
 ///
 /// Logs the dedup and expiry counts when non-zero.
 pub fn select_transactions(
@@ -179,6 +184,8 @@ pub fn select_transactions(
     let mut expired = 0;
     let mut predates = 0;
     let mut unrunnable = 0;
+    let mut oversweeping = 0;
+    let mut sweepable = 0usize;
     let filtered: Vec<_> = ready_txs
         .iter()
         .filter(|tx| {
@@ -210,16 +217,23 @@ pub fn select_transactions(
                 unrunnable += 1;
                 return false;
             }
+            let with_this = sweepable.saturating_add(tx.sweepable_writes() as usize);
+            if !sweep_admits_block(with_this) {
+                oversweeping += 1;
+                return false;
+            }
+            sweepable = with_this;
             true
         })
         .cloned()
         .collect();
-    if deduped > 0 || expired > 0 || predates > 0 || unrunnable > 0 {
+    if deduped > 0 || expired > 0 || predates > 0 || unrunnable > 0 || oversweeping > 0 {
         debug!(
             deduped,
             expired,
             predates,
             unrunnable,
+            oversweeping,
             before,
             after = filtered.len(),
             "Filtered proposal candidates"
@@ -610,10 +624,11 @@ mod tests {
 
     use hyperscale_types::test_utils::{
         install_stub_protocol_statics, make_finalization, stub_abort_charge, stub_transaction,
-        test_prefix, test_principal, test_transaction_running,
+        stub_transaction_binding, test_prefix, test_principal, test_transaction_running,
     };
     use hyperscale_types::{
-        CommittedTxsRoot, Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
+        CommittedTxsRoot, Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_SUBINTENTS,
+        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
         PredecessorTerminal, TimestampRange, TransactionDecision, UnsettledTx, ValidatorSet,
     };
 
@@ -1028,6 +1043,47 @@ mod tests {
         );
 
         assert!(selected.is_empty(), "malformed range should be filtered");
+    }
+
+    #[test]
+    fn selection_skips_what_would_overrun_the_sweep_creation_cap() {
+        install_stub_protocol_statics();
+        let anchor = ts(1_000);
+        let range = TimestampRange::new(ts(500), anchor.plus(Duration::from_mins(1)));
+        let binding = |seed: u8, bound: usize| -> Arc<Verified<Transaction>> {
+            Arc::new(Verified::<Transaction>::from_persisted(
+                stub_transaction_binding(seed, bound, range),
+            ))
+        };
+        // Fill the cap exactly, then offer one that cannot fit followed
+        // by one that can. Skipping rather than stopping is what keeps a
+        // large composition from starving the small ones behind it.
+        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / MAX_SUBINTENTS;
+        let mut txs: Vec<Arc<Verified<Transaction>>> = (0..full)
+            .map(|i| binding(u8::try_from(i).expect("fewer than 256"), MAX_SUBINTENTS))
+            .collect();
+        let overflows = binding(u8::MAX, MAX_SUBINTENTS);
+        let fits = binding(u8::MAX - 1, 0);
+        txs.push(overflows.clone());
+        txs.push(fits.clone());
+
+        let selected = select_transactions(
+            &txs,
+            &HashSet::new(),
+            &empty_dedup_index(),
+            anchor,
+            WeightedTimestamp::ZERO,
+            &refuses_precut(),
+            &window_listing_no_packages(),
+        );
+
+        assert_eq!(
+            selected.len(),
+            full + 1,
+            "the one that cannot fit is skipped"
+        );
+        assert!(selected.iter().any(|tx| tx.hash() == fits.hash()));
+        assert!(!selected.iter().any(|tx| tx.hash() == overflows.hash()));
     }
 
     #[test]
