@@ -162,9 +162,9 @@ pub use shard::header::{
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
     MAX_COMMITTED_TX_QUERY, MAX_DRAIN_WORK, MAX_FINALIZED_TX_PER_BLOCK, MAX_GAS_LIMIT,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP,
-    MAX_TERMINAL_VERDICTS_PER_BLOCK, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    drain_admits_block,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_SWEEP_PER_BLOCK,
+    MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TERMINAL_VERDICTS_PER_BLOCK, MAX_TXS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, drain_admits_block, sweep_admits_block,
 };
 pub use shard::load::ShardLoad;
 pub use shard::manifest::{BlockManifest, BlockMetadata};

@@ -24,6 +24,57 @@ use crate::WorkInFlight;
 /// block.
 pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 
+/// Hard cap on the sweepable cells one block's transactions may create
+/// between them.
+///
+/// A sweepable cell is state the chain must carry until a sweep retires
+/// it, so what bounds the resident population is the pair of rates: how
+/// fast cells are created and how fast they are removed. Removal is
+/// capped by [`MAX_SWEEP_PER_BLOCK`], and a creation rate above that cap
+/// is a backlog that grows for as long as the load lasts. Capping only
+/// the removal side would leave a sweep that bounds ordinary operation
+/// and not the peak, which is not a bound.
+///
+/// Set at [`MAX_TXS_PER_BLOCK`] — an average of one per transaction,
+/// which a block may distribute unevenly. Nothing else in the block
+/// budget reaches this: a nullifier costs its transaction a footprint
+/// unit and a signature, so the work budget admits thirty-two of them
+/// per transaction and the creation ceiling would otherwise sit two
+/// orders of magnitude above any removal count a block can carry.
+pub const MAX_SWEEPABLE_CREATED_PER_BLOCK: usize = MAX_TXS_PER_BLOCK;
+
+/// Hard cap on the cells one block's sweep may remove.
+///
+/// A count and not a work term: removals earn no fee because they are
+/// not optional, and nothing is in flight for them — they resolve inside
+/// the block that states them, so they never enter
+/// [`MAX_DRAIN_WORK`]. That is the same trade the frontier's mandatory
+/// advance makes, and it is why a proposer cannot decline to sweep in
+/// order to keep block space for what does pay.
+///
+/// Twice the creation cap, so a backlog drains rather than holding
+/// station: a shard that fell behind under peak load catches up in
+/// bounded time once the load stops, and one running at the creation cap
+/// still removes what it creates with room to spare.
+pub const MAX_SWEEP_PER_BLOCK: usize = 2 * MAX_SWEEPABLE_CREATED_PER_BLOCK;
+
+/// The removal cap must outrun the creation cap, or the resident
+/// population is bounded by nothing.
+const _: () = assert!(
+    MAX_SWEEP_PER_BLOCK >= 2 * MAX_SWEEPABLE_CREATED_PER_BLOCK,
+    "a sweep must drain a backlog faster than a block can form one",
+);
+
+/// Whether a block whose transactions create `sweepable` cells between
+/// them is one a validator may vote for.
+///
+/// On the block's own content, like every other content limit here, so a
+/// validator reaches the verdict with no history behind it.
+#[must_use]
+pub const fn sweep_admits_block(sweepable: usize) -> bool {
+    sweepable <= MAX_SWEEPABLE_CREATED_PER_BLOCK
+}
+
 /// Hard cap on the transactions a block's
 /// [`TerminalVerdict`](crate::TerminalVerdict) records may name between
 /// them.
@@ -211,7 +262,10 @@ pub const MAX_ROUND_GAP: u64 = 100_000;
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_DRAIN_WORK, WorkInFlight, drain_admits_block};
+    use super::{
+        MAX_DRAIN_WORK, MAX_SWEEPABLE_CREATED_PER_BLOCK, WorkInFlight, drain_admits_block,
+        sweep_admits_block,
+    };
 
     /// The bound bites on the level a block leaves: one carrying
     /// transactions is refused the moment its own total clears the
@@ -229,5 +283,16 @@ mod tests {
     #[test]
     fn a_block_adding_nothing_is_admitted_at_any_total() {
         assert!(drain_admits_block(WorkInFlight::new(u64::MAX), 0));
+    }
+
+    /// The creation cap bites at the cell. That it is outrun by the
+    /// removal cap — the pair being what bounds the resident population,
+    /// where either alone bounds one side of it — is the const assert's
+    /// business rather than this one's.
+    #[test]
+    fn a_block_may_create_up_to_the_cap_and_no_more() {
+        assert!(sweep_admits_block(MAX_SWEEPABLE_CREATED_PER_BLOCK));
+        assert!(!sweep_admits_block(MAX_SWEEPABLE_CREATED_PER_BLOCK + 1));
+        assert!(sweep_admits_block(0));
     }
 }

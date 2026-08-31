@@ -16,10 +16,10 @@ use crate::{
     ConsensusPublicKey, ConsensusSignature, DeclaredKey, Derivation, DerivationError, Derived,
     EnvelopeExt, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
     NetworkDefinition, NetworkId, ProposerTimestamp, ProtocolStatics, QuorumCertificate, Round,
-    Routing, ShardForkProof, ShardId, SignerBitfield, TickHalf, TickId, TimestampRange,
-    TopologySnapshot, Transaction, TransactionBody, TransactionDecision, TransactionEnvelope,
-    TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
-    WeightedTimestamp, WitnessSources, compute_global_receipt_root, declared_work,
+    Routing, ShardForkProof, ShardId, SignerBitfield, SubintentSig, TickHalf, TickId,
+    TimestampRange, TopologySnapshot, Transaction, TransactionBody, TransactionDecision,
+    TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
+    Verified, WeightedTimestamp, WitnessSources, compute_global_receipt_root, declared_work,
     install_protocol_statics, protocol_statics_installed, signed_bytes,
 };
 
@@ -942,6 +942,12 @@ impl Derivation for StubVmStatics {
             .map(|bytes| Hash::from_hash_bytes(bytes))
             .collect();
         Ok(Derived {
+            // One per bound signature, which is what a real derivation
+            // counts: a subintent's signature and its nullifier come in
+            // a pair. Every fixture that binds none derives zero, so a
+            // test opts in by binding.
+            sweepable_writes: u32::try_from(vm.subintent_sigs.len())
+                .expect("a stub binds far fewer than u32 subintents"),
             // A stub derives no tree, so the envelope's own window is
             // the whole of it.
             effective_window: vm.validity_window(),
@@ -1041,6 +1047,47 @@ pub fn install_stub_protocol_statics() {
     if !protocol_statics_installed() {
         install_protocol_statics(Box::new(StubVmStatics));
     }
+}
+
+/// A transaction the [`StubVmStatics`] derivation reports as creating
+/// `bound` sweepable cells — the fixture for anything gated on how many
+/// a block may create.
+///
+/// The signatures are placeholders: nothing in the stub verifies them,
+/// and what they stand for here is the pairing a real derivation has
+/// between a bound subintent's signature and the nullifier it takes.
+///
+/// # Panics
+///
+/// Panics if the fixture signing key fails to construct.
+#[must_use]
+pub fn stub_transaction_binding(seed: u8, bound: usize, validity: TimestampRange) -> Transaction {
+    let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).expect("fixture key");
+    let vm = TransactionEnvelope {
+        body: TransactionBody::Call(vec![0]),
+        subintent_sigs: (0..bound)
+            .map(|_| SubintentSig {
+                scheme: SchemeId::ED25519,
+                public_key: vec![0x11; 32],
+                signature: vec![0x22; 64],
+            })
+            .collect(),
+        fee_payer: test_principal(seed),
+        max_fee: 1_000,
+        gas_limit: 1_000_000,
+        validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
+        validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
+        message: Vec::new(),
+        network: NetworkId::from(&NetworkDefinition::simulator()),
+        signer_scheme: SchemeId::NONE,
+        signer: Vec::new(),
+        signature: Vec::new(),
+    }
+    .sign(&key);
+    let tx = Transaction::new(vm);
+    tx.try_derived(&StubVmStatics)
+        .expect("the fixture builds a tree the stub derivation routes");
+    tx
 }
 
 /// Build a signed transaction the [`StubVmStatics`] derivation routes to

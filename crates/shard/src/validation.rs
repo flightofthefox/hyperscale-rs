@@ -17,9 +17,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, LocalTimestamp, MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY,
-    MAX_TIMESTAMP_RUSH, MAX_UNSETTLED_PER_BLOCK, ProvisionHash, QuorumCertificate, ShardId,
-    ShardLoad, TopologySnapshot, Transaction, TxHash, Verifiable, VoteCount,
+    Block, BlockHeader, BlockHeight, LocalTimestamp, MAX_ROUND_GAP,
+    MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
+    MAX_UNSETTLED_PER_BLOCK, ProvisionHash, QuorumCertificate, ShardId, ShardLoad,
+    TopologySnapshot, Transaction, TxHash, Verifiable, VoteCount, sweep_admits_block,
     terminal_verdict_root_from_records,
 };
 
@@ -491,6 +492,32 @@ pub fn validate_packages_usable(
     Ok(())
 }
 
+/// The cells a block's transactions create for a sweep to retire must
+/// fit the per-block creation cap.
+///
+/// The sweep's own cap bounds how fast a shard can retire these; this
+/// bounds how fast it can be made to owe them. Only the pair bounds the
+/// resident population — a creation rate above the removal cap is a
+/// backlog that grows for as long as the load lasts, and a sweep that
+/// bounds ordinary operation and not the peak is not a bound.
+///
+/// Counted off the derivations, which is where the answer is: what makes
+/// a write sweepable is the family it belongs to, and nothing about a
+/// routed key says which family it is. Deterministic over block content,
+/// since every replica derives the same transactions the same way.
+pub fn validate_sweepable_creation(block: &Block) -> Result<(), String> {
+    let created = block.transactions().iter().fold(0usize, |total, tx| {
+        total.saturating_add(tx.sweepable_writes() as usize)
+    });
+    if !sweep_admits_block(created) {
+        return Err(format!(
+            "block creates {created} sweepable cells, past the per-block cap of \
+             {MAX_SWEEPABLE_CREATED_PER_BLOCK}"
+        ));
+    }
+    Ok(())
+}
+
 /// The header's running work total must be its parent's advanced by the
 /// work the block's own certificates report.
 ///
@@ -552,6 +579,7 @@ pub fn validate_block_for_vote(
     validate_no_duplicate_provisions(block, qc_chain_provision_hashes, dedup_index)?;
     validate_provisions_not_fenced(topology_snapshot, block)?;
     validate_packages_usable(topology_snapshot, block)?;
+    validate_sweepable_creation(block)?;
     validate_engagement(topology_snapshot, local_shard, block, dedup_index)?;
     validate_terminal_verdicts_well_formed(block)?;
     Ok(())
@@ -689,7 +717,7 @@ mod tests {
     };
     use hyperscale_types::{
         Address, AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin,
-        Finalization, Hash, MerkleInclusionProof, NetworkDefinition, PrincipalAddr,
+        Finalization, Hash, MAX_SUBINTENTS, MerkleInclusionProof, NetworkDefinition, PrincipalAddr,
         ProposerTimestamp, ProvisionEntry, Provisions, QuorumCertificate, Round, ShardId,
         ShardLoad, Signer, SignerBitfield, TerminalVerdict, TerminalVerdictRoot, TimestampRange,
         Transaction, TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet,
@@ -1157,6 +1185,44 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             terminal_verdicts: Arc::new(Vec::new()),
         }
+    }
+
+    /// A block creating sweepable cells fits the cap right up to it, and
+    /// one cell past is refused.
+    ///
+    /// The count is summed off the derivations rather than off anything
+    /// the header claims, so a proposer cannot understate what its block
+    /// will make the chain carry.
+    ///
+    /// An envelope binds at most `MAX_SUBINTENTS`, so the cap is reached
+    /// by a block of fully composed transactions rather than by one
+    /// transaction — which is the shape it is sized for.
+    #[test]
+    fn a_block_may_create_sweepable_cells_up_to_the_cap() {
+        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / MAX_SUBINTENTS;
+        let mut txs: Vec<Arc<Verifiable<Transaction>>> = (0..full)
+            .map(|i| {
+                Arc::new(Verifiable::from(test_utils::stub_transaction_binding(
+                    u8::try_from(i).expect("fewer than 256 transactions"),
+                    MAX_SUBINTENTS,
+                    test_utils::test_validity_range(),
+                )))
+            })
+            .collect();
+        let at_cap = block_with_transactions(BlockHeight::new(3), txs.clone());
+        assert!(validate_sweepable_creation(&at_cap).is_ok());
+
+        txs.push(Arc::new(Verifiable::from(
+            test_utils::stub_transaction_binding(u8::MAX, 1, test_utils::test_validity_range()),
+        )));
+        let over = block_with_transactions(BlockHeight::new(3), txs);
+        let err = validate_sweepable_creation(&over).expect_err("one past the cap is refused");
+        assert!(err.contains("sweepable cells"), "{err}");
+
+        // A block that binds nothing creates nothing, whatever else it
+        // carries — the common case must not pay for this rule.
+        let plain = block_with_transactions(BlockHeight::new(3), vec![tx(1)]);
+        assert!(validate_sweepable_creation(&plain).is_ok());
     }
 
     /// A block carrying records, rooted the way the header claims.
