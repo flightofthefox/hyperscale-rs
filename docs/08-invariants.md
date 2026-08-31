@@ -103,6 +103,22 @@ The consolidated register of the system's safety and liveness properties, with s
 | **INV-STATE-5** | Safety | **One verifier.** Sync-path and consensus-path commits share one state-root verification path; a sync-path mismatch is unrecoverable divergence and halts the node rather than admitting corruption. |
 | **INV-STATE-6** | Safety | **Ancestry visibility.** Pending-chain reads traverse parent-hash links to the committed tip; orphaned forks are structurally unreachable. |
 
+## Substate sweep — [03](03-state-and-sync.md)
+
+Removing a committed cell moves the state root, so a sweep is a consensus operation and carries a consensus operation's obligations. The families it reaches are those whose cells carry their own expiry and key by it.
+
+| ID | Class | Property |
+|---|---|---|
+| **INV-SWEEP-1** | Determinism | **Derived removal set.** A block's removals are a function of its frontier pair and committed state, so two replicas at the same height remove the same cells. Nothing about which node proposed the block, or how a node came by its state, enters into it. |
+| **INV-SWEEP-2** | Safety | **Prefix sufficiency.** A successor reaches the answer its predecessor would have, from the prefix alone: the index a sweep enumerates by is derived from the leaves and rebuilt from the leaves it imports. |
+| **INV-SWEEP-3** | Safety | **No live removal.** A sweep removes no cell any admissible transaction could still read. |
+| **INV-SWEEP-4** | Liveness | **Bounded and recorded.** Sweep work per block is bounded, and a partial sweep is correct and says where it stopped, so a backlog drains across blocks rather than landing whole on one. |
+| **INV-SWEEP-5** | Safety | **Expiry in the identity.** A sweepable cell's expiry is part of its key, so no writer can claim an expiry its declaration does not name — a false one addresses a cell the declaration does not cover. |
+| **INV-SWEEP-6** | Liveness | **Mandatory advance.** A block that could sweep and does not is invalid. A removal earns no fee and costs block space, so a rule that permits omission is one honest proposers converge on omitting. |
+| **INV-SWEEP-7** | Safety | **Nothing born below the cursor.** A cell is written with an expiry ahead of the frontier the block writing it may advance to, so the frontier passes each position once and nothing appears behind it. |
+| **INV-SWEEP-8** | Safety | **Inherited frontier never rises.** A chain's frontier never starts above any predecessor's. A merge adopting the higher of two cursors would leave every cell the other predecessor held between them unswept and unreachable — a leak INV-SWEEP-7 does not catch, because nothing was created below the cursor. |
+| **INV-SWEEP-9** | Safety | **Removal and admission share a clock.** The chain that removes a cell is one any transaction reading it must also be admitted on, so the two are ordered by a single monotone committed clock rather than by two that can drift. It is a family test: a family whose cell is read from a chain that does not hold it cannot be swept on this ground and needs a pure-time rule instead. |
+
 ## Resource economics — [06](06-resource-economics.md)
 
 | ID | Class | Property |
