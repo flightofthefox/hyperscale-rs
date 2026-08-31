@@ -442,6 +442,26 @@ impl Derivation for BridgeStatics {
             return Self::derive_publish(vm, signer, artifact);
         }
         let tree = decode_tree(vm.call_tree().unwrap_or_default())?;
+        // Every intent names the network its own signer declared it for,
+        // and the envelope names the composer's. They have to agree, so
+        // a subintent binds only into a composition for the network it
+        // was signed for — and the session's own check against the
+        // envelope then covers the whole tree transitively. Checked
+        // against the envelope rather than against the session, because
+        // a derivation that read the node's network would stop being a
+        // pure function of the envelope.
+        if tree.root.network != vm.network {
+            return Err(DerivationError::Refused(
+                "the root intent names a different network than the envelope".into(),
+            ));
+        }
+        for (index, subintent) in tree.subintents.iter().enumerate() {
+            if subintent.decl.network != vm.network {
+                return Err(DerivationError::Refused(format!(
+                    "subintent {index} names a different network than the envelope"
+                )));
+            }
+        }
         if vm.subintent_sigs.len() != tree.subintents.len() {
             return Err(DerivationError::Refused(format!(
                 "envelope binds {} subintents but carries {} signatures",
@@ -684,9 +704,13 @@ mod tests {
         }
     }
 
+    /// The network every envelope in these tests is signed for.
+    const NETWORK: NetworkId = NetworkId(242);
+
     fn single_intent_tree(nodes: Vec<GraphNode>) -> EnvelopeTree {
         EnvelopeTree {
             root: IntentDecl {
+                network: NETWORK,
                 graph: ManifestGraph { nodes },
                 sockets: Vec::new(),
             },
@@ -702,6 +726,7 @@ mod tests {
     fn composed_tree() -> EnvelopeTree {
         EnvelopeTree {
             root: IntentDecl {
+                network: NETWORK,
                 graph: ManifestGraph {
                     nodes: vec![
                         sign_in(composer_addr()),
@@ -723,6 +748,7 @@ mod tests {
             }],
             subintents: vec![Subintent {
                 decl: IntentDecl {
+                    network: NETWORK,
                     graph: ManifestGraph {
                         nodes: vec![
                             sign_in(bob_addr()),
@@ -768,7 +794,7 @@ mod tests {
             validity_start_ms: 0,
             validity_end_ms: 1_000_000,
             message: Vec::new(),
-            network: NetworkId(242),
+            network: NETWORK,
             signer_scheme: SchemeId::NONE,
             signer: Vec::new(),
             signature: Vec::new(),
@@ -1161,6 +1187,29 @@ mod tests {
         let mut unsigned = envelope(&tree, &[&key(9)]);
         unsigned.subintent_sigs.clear();
         assert!(statics().derive(&unsigned).is_err());
+    }
+
+    #[test]
+    fn an_intent_naming_another_network_is_refused() {
+        // A subintent signed for one network, bound into a composition
+        // for another. Its signer covered the network, so the binding is
+        // a claim about content they never signed — and the nullifier
+        // that makes the subintent once-only lives on the network they
+        // did name.
+        let mut foreign = composed_tree();
+        foreign.subintents[0].decl.network = NetworkId(1);
+        assert!(statics().derive(&envelope(&foreign, &[&key(9)])).is_err());
+
+        // The composer's own intent answers the same rule: an envelope
+        // whose root disagrees with the network it names is refused
+        // before any signature is read.
+        let mut root_foreign = single_intent_tree(vec![
+            sign_in(composer_addr()),
+            withdraw(composer_addr(), RES_X, 100),
+            deposit_edge(bob_addr(), 1, RES_X),
+        ]);
+        root_foreign.root.network = NetworkId(1);
+        assert!(statics().derive(&envelope(&root_foreign, &[])).is_err());
     }
 
     #[test]
