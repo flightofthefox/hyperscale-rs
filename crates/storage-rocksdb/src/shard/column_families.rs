@@ -4,15 +4,17 @@
 //! what they store, and how their keys/values are encoded.
 
 use hyperscale_types::{
-    BlockHeight, BlockMetadata, ChainOrigin, ConsensusReceipt, EntryKey, ExecutionCertificate,
-    ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash, Provisions,
-    SafeVoteRegisters, ShardWitnessPayload, SubstateKey, TickId, Transaction, ValidatorId,
+    Address, BlockHeight, BlockMetadata, ChainOrigin, ConsensusReceipt, EntryKey,
+    ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash,
+    Provisions, SafeVoteRegisters, ShardWitnessPayload, SubstateKey, SweepBucket, TickId,
+    Transaction, ValidatorId,
 };
 use rocksdb::{ColumnFamily, DB};
 
 use super::entry_key::{EntryKeyCodec, VersionedEntryKeyCodec};
 use super::jmt_stored::{StaleTreePart, StoredNodeKey, VersionedStoredNode};
 use super::substate_key::SubstateKeyCodec;
+use super::sweep_key::SweepRowCodec;
 use super::versioned_key::VersionedSubstateKeyCodec;
 use crate::typed_cf::{
     BeU64Codec, ChainOriginCodec, DbCodec, DbEncode, HashCodec, HborCodec, JmtKeyCodec, RawCodec,
@@ -176,6 +178,22 @@ pub const PROVISIONS_CF: &str = "provisions";
 /// entry is writing the same bytes.
 pub const PACKAGE_ARTIFACTS_CF: &str = "package_artifacts";
 
+/// Column family indexing which owners hold sweepable cells in each
+/// expiry bucket.
+///
+/// Key: `bucket_BE ++ owner`; value: how many of that owner's cells fall
+/// in that bucket. Derived state on the same terms as [`ENTRIES_CF`]:
+/// maintained in the commit batch where priors are already resolved,
+/// rebuilt from the leaves at boundary import, and equal at every height
+/// to what the tree's sweepable leaves say.
+///
+/// Bucket-major because a sweep enumerates by expiry and the state
+/// keyspace is owner-major. What the index does *not* have to say is
+/// which cells: the bucket leads a sweepable cell's local half, so one
+/// owner's bucket is a contiguous leaf-key range and completeness within
+/// an owner is answerable from the state root alone.
+pub const SWEEP_INDEX_CF: &str = "sweep_index";
+
 // Default-CF metadata keys are defined as MetadataEntry types in typed_cf.rs.
 // See CommittedHeightEntry, CommittedHashEntry, CommittedQcEntry, JmtMetadataEntry.
 
@@ -207,6 +225,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     IMPORT_STAGING_CF,
     PROVISIONS_CF,
     PACKAGE_ARTIFACTS_CF,
+    SWEEP_INDEX_CF,
 ];
 
 // ─── CfHandles ───────────────────────────────────────────────────────────────
@@ -239,6 +258,7 @@ pub struct CfHandles<'a> {
     import_staging: &'a ColumnFamily,
     provisions: &'a ColumnFamily,
     package_artifacts: &'a ColumnFamily,
+    sweep_index: &'a ColumnFamily,
 }
 
 impl<'a> CfHandles<'a> {
@@ -272,6 +292,7 @@ impl<'a> CfHandles<'a> {
             safe_vote_registers: resolve(SAFE_VOTE_REGISTERS_CF),
             import_staging: resolve(IMPORT_STAGING_CF),
             package_artifacts: resolve(PACKAGE_ARTIFACTS_CF),
+            sweep_index: resolve(SWEEP_INDEX_CF),
             provisions: resolve(PROVISIONS_CF),
         }
     }
@@ -374,6 +395,21 @@ impl TypedCf for PackageArtifactsCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.package_artifacts
+    }
+}
+
+/// Sweep index — which owners hold sweepable cells in each expiry
+/// bucket, and how many. See [`SWEEP_INDEX_CF`].
+pub struct SweepIndexCf;
+impl TypedCf for SweepIndexCf {
+    const NAME: &'static str = SWEEP_INDEX_CF;
+    type Key = (SweepBucket, Address);
+    type Value = u32; // live sweepable cells of this owner in this bucket
+    type KeyCodec = SweepRowCodec;
+    type ValueCodec = HborCodec<u32>;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.sweep_index
     }
 }
 

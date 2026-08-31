@@ -103,9 +103,9 @@ pub use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, AccountSigner, Address, AddressClass, CallTarget, CollectionId,
     ComponentAddr, EntryKey, EntryLeaf, InvalidAddress, LEAF_KEY_BYTES, LocalKey,
     MAX_CELL_VALUE_LEN, Mode, ModeKind, Movement, NativeAddr, NotCallable, PackageAddr, Presence,
-    PrincipalAddr, ResourceAddr, SchemeId, SettledCells, SettledEntries, SettledWrites,
-    StateWrites, SubstateKey, TX_UNITS, amount_cell, compatible, declared_work, encode_amount,
-    entry_leaf_key, read_amount,
+    PrincipalAddr, ResourceAddr, SWEEP_BUCKET_BYTES, SWEEP_BUCKET_SHIFT, SchemeId, SettledCells,
+    SettledEntries, SettledWrites, StateWrites, SubstateKey, SweepBucket, TX_UNITS, amount_cell,
+    compatible, declared_work, encode_amount, entry_leaf_key, read_amount,
 };
 pub use network::{
     GossipMessage, MessageClass, NetworkMessage, Request, Signed, SignedContext, SignedVerifyError,
@@ -184,6 +184,7 @@ pub use shard::roots::{
     ready_leaf_payload, settled_txs_root_from_hashes, terminal_verdict_root_from_records,
 };
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
+pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};
 pub use shard::terminal_verdict::{AbortCharge, TerminalVerdict, UnsettledTx};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};

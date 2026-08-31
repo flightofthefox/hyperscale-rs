@@ -16,6 +16,7 @@ pub mod packages;
 pub mod pending_chain;
 pub mod recovered_state;
 pub mod store;
+pub mod sweep;
 pub mod tick_certs;
 pub mod tick_chain;
 pub mod unresolved;

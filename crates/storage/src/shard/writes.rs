@@ -352,7 +352,8 @@ pub fn merge_entry_overlay(
 
 /// Whether `key`'s leading bits equal `prefix` — the subtree-membership
 /// test shard prefixes partition the keyspace by.
-fn key_under_prefix(key: &JmtKey, prefix: &NibblePath) -> bool {
+#[must_use]
+pub fn key_under_prefix(key: &JmtKey, prefix: &NibblePath) -> bool {
     (0..prefix.len()).all(|i| {
         let key_bit = (key[usize::from(i / 8)] >> (7 - (i % 8))) & 1;
         prefix.bits_at(i, 1) == key_bit

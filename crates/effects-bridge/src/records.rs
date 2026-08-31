@@ -17,10 +17,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arc_swap::ArcSwap;
 use hyperscale_hbor::from_slice as hbor_from_slice;
 use hyperscale_vm_effects::{
-    ChainRecords, Hasher, InstanceMeta, InstanceRegistry, Issuance, MetadataCache, PackageHash,
-    PackageMetadata, ResourceMeta, Value, package_hash,
+    ChainRecords, Hasher, InstanceMeta, InstanceRegistry, Issuance, MetadataCache, NullifierCell,
+    PackageHash, PackageMetadata, ResourceMeta, Value, nullifier_key, package_hash,
 };
-use hyperscale_vm_types::{Address, CallTarget, ComponentAddr, ResourceAddr, SubstateKey};
+use hyperscale_vm_types::{
+    Address, CallTarget, ComponentAddr, LocalKey, ResourceAddr, SubstateKey, SweepBucket,
+};
 use im::{OrdMap, Vector};
 
 use crate::ProtocolHasher;
@@ -53,6 +55,33 @@ pub fn committed_package(owner: Address, local: [u8; 16], value: &[u8]) -> Optio
 
 /// The four bytes every wasm artifact opens with.
 const WASM_PREAMBLE: &[u8] = b"\0asm";
+
+/// When a committed cell stops being needed, or `None` for every cell a
+/// sweep does not reach.
+///
+/// A sweepable cell is self-identifying the way a package cell is: the
+/// value carries the expiry it is owed until, and the key re-derives
+/// from that expiry under the family's own domain. So a cell of any
+/// other kind cannot pass except by finding a collision, and a writer
+/// cannot claim a life its declaration does not name — the key a false
+/// expiry produces is not the key the declaration covers.
+///
+/// One family today. Each arm is its own derivation, so arms cannot
+/// overlap and the order they are tried in does not decide the answer.
+///
+/// Three tests, cheapest first, because this runs over every cell of
+/// every commit. The decode rejects on width alone; the bucket check
+/// costs nothing and is the statement that the two halves of the key
+/// agree; only then is a hash worth taking.
+#[must_use]
+pub fn sweepable_cell(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u64> {
+    let cell: NullifierCell = hbor_from_slice(value).ok()?;
+    if SweepBucket::claimed_by(LocalKey(local)) != SweepBucket::of(cell.expiry_ms) {
+        return None;
+    }
+    let key = nullifier_key(&ProtocolHasher, owner, cell.subintent, cell.expiry_ms);
+    (key.local.0 == local).then_some(cell.expiry_ms)
+}
 
 /// The instance a committed cell seals, or `None` for every other cell.
 ///

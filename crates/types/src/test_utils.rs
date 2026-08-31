@@ -5,7 +5,8 @@ use std::sync::Arc;
 use hyperscale_crypto::{Signer, Verifier};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_vm_types::{
-    Address, AddressClass, LocalKey, Mode, Moves, PrincipalAddr, SchemeId, SubstateKey,
+    Address, AddressClass, LocalKey, Mode, Moves, PrincipalAddr, SWEEP_BUCKET_BYTES, SchemeId,
+    SubstateKey, SweepBucket,
 };
 
 use crate::crypto::Ed25519PrivateKey;
@@ -994,11 +995,39 @@ impl ProtocolStatics for StubVmStatics {
         (local[0] == STUB_PACKAGE_MARKER)
             .then(|| Hash::from_hash_bytes(&[*value.first().unwrap_or(&0); 32]))
     }
+
+    fn sweepable_cell(&self, _owner: [u8; 32], local: [u8; 16], value: &[u8]) -> Option<u64> {
+        let expiry = u64::from_le_bytes(value.get(1..9)?.try_into().ok()?);
+        (value.first() == Some(&STUB_SWEEPABLE_MARKER)
+            && SweepBucket::claimed_by(LocalKey(local)) == SweepBucket::of(expiry))
+        .then_some(expiry)
+    }
 }
 
 /// The local-key first byte the stub judges a package cell by, in place
 /// of the content-address re-derivation the bridge statics perform.
 pub const STUB_PACKAGE_MARKER: u8 = 0xAB;
+
+/// The value's first byte the stub judges a sweepable cell by, in place
+/// of the whole-key re-derivation the bridge statics perform. The eight
+/// bytes after it are the expiry, little-endian.
+///
+/// The bucket check is not stubbed out: the layout rule a sweep walks by
+/// — the expiry in the value agrees with the bucket leading the key — is
+/// the half of the judgement a storage backend's index depends on, so a
+/// stub that skipped it would be testing nothing.
+pub const STUB_SWEEPABLE_MARKER: u8 = 0xCD;
+
+/// A stub sweepable cell's value and the local key it must sit at for
+/// [`StubVmStatics`] to judge it sweepable.
+#[must_use]
+pub fn stub_sweepable_cell(expiry_ms: u64, body: u8) -> (LocalKey, Vec<u8>) {
+    let mut local = [body; 16];
+    local[..SWEEP_BUCKET_BYTES].copy_from_slice(&SweepBucket::of(expiry_ms).to_bytes());
+    let mut value = vec![STUB_SWEEPABLE_MARKER];
+    value.extend_from_slice(&expiry_ms.to_le_bytes());
+    (LocalKey(local), value)
+}
 
 /// Install [`StubVmStatics`]'s protocol answers for this process.
 /// First-install-wins, like the production install — a test binary uses

@@ -10,7 +10,7 @@ use hyperscale_storage::test_helpers::{
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
     test_entries_commit_serve_and_history, test_recovery_carries_the_tip_drain_total,
     test_registers_recover_their_justification, test_retained_bundle_drops_below_the_history_floor,
-    test_tx_index_answers_with_the_local_shards_certificate,
+    test_sweep_index_tracks_the_leaves, test_tx_index_answers_with_the_local_shards_certificate,
     test_undischarged_record_holds_the_floor, test_unresolved_fold,
     test_widest_tick_copy_holds_the_slot,
     test_witness_payload_range_reads as helpers_test_witness_payload_range_reads, with_provisions,
@@ -101,6 +101,15 @@ fn make_state_delete(owner_seed: u8, local_seed: u8) -> SettledWrites {
 /// The full entry pipeline over `RocksDB`: commit moves the root, the
 /// index serves current and historical ranges, the leaf self-describes,
 /// and the history GC prunes superseded rows without touching the tip.
+#[test]
+fn the_sweep_index_tracks_the_leaves() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_sweep_index_tracks_the_leaves(&storage, |writes| {
+        storage.commit(writes).unwrap();
+    });
+}
+
 #[test]
 fn entries_commit_serve_ranges_and_gc_history() {
     let temp_dir = TempDir::new().unwrap();
