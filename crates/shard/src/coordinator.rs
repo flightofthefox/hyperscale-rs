@@ -5175,6 +5175,9 @@ impl ShardCoordinator {
         let state_root_verified = self.verification.is_state_root_verified(&block_hash);
         let parent_state_root = self.committed_state_root;
         let parent_block_height = self.committed_height;
+        let parent_sweep_frontier = self
+            .chain_view()
+            .parent_sweep_frontier(certified.block().header().parent_block_hash());
         // Anchor on the parent QC's `weighted_timestamp`: it's hash-pinned in
         // this block's header, so every validator reads the identical value —
         // unlike the block's own QC, whose timestamp rides outside the signed
@@ -5222,6 +5225,7 @@ impl ShardCoordinator {
                 certified: Arc::clone(certified),
                 parent_state_root,
                 parent_block_height,
+                parent_sweep_frontier,
                 source,
                 witness,
             }

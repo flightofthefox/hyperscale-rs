@@ -1491,57 +1491,9 @@ mod tests {
     /// fold reads off a boundary header. Rebuilt rather than mutated
     /// because the field is hash-covered and private.
     fn stamping_load(header: BlockHeader, load: ShardLoad) -> BlockHeader {
-        let (
-            shard_id,
-            height,
-            parent_block_hash,
-            parent_qc,
-            proposer,
-            timestamp,
-            round,
-            is_fallback,
-            state_root,
-            transaction_root,
-            certificate_root,
-            local_receipt_root,
-            provision_root,
-            provision_tx_roots,
-            terminal_verdict_root,
-            in_flight,
-            settled_tick_frontier,
-            beacon_witness_root,
-            beacon_witness_leaf_count,
-            beacon_witness_base,
-            reveal_chain,
-            split_child_roots,
-            terminal_roots,
-            _,
-        ) = header.into_parts();
         BlockHeader::new(BlockHeaderParts {
-            shard_id,
-            height,
-            parent_block_hash,
-            parent_qc,
-            proposer,
-            timestamp,
-            round,
-            is_fallback,
-            state_root,
-            transaction_root,
-            certificate_root,
-            local_receipt_root,
-            provision_root,
-            provision_tx_roots: provision_tx_roots.iter().map(|(k, v)| (*k, *v)).collect(),
-            terminal_verdict_root,
-            work_in_flight: in_flight,
-            settled_tick_frontier,
-            beacon_witness_root,
-            beacon_witness_leaf_count,
-            beacon_witness_base,
-            reveal_chain,
-            split_child_roots,
-            terminal_roots,
             load,
+            ..header.into_parts()
         })
     }
 

@@ -35,7 +35,7 @@ use crate::tree::Jmt;
 use crate::{
     Anchored, BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, JmtSnapshot,
     RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore,
-    Substates, SweepIndex, VersionedStore, WitnessSeed,
+    Substates, SweepIndex, VersionedStore, WitnessSeed, sweep_for_block,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -1019,6 +1019,64 @@ where
         storage.sweep_candidates(SweepFrontier::ZERO, all, 10),
         vec![low_owner, high_owner]
     );
+}
+
+/// Shared block-sweep conformance: where a block's frontier lands, and
+/// that resuming from it loses nothing.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_sweep_stops_at_the_ceiling_or_the_cap<S>(storage: &S, commit: impl Fn(&SettledWrites))
+where
+    S: SubstateStore + SweepIndex,
+{
+    install_stub_protocol_statics();
+    // Two cells a bucket apart, both long past a clock well above them.
+    let cells: Vec<(SubstateKey, u64)> = [(3u64, 0x11u8), (5, 0x22)]
+        .into_iter()
+        .map(|(bucket, body)| {
+            let expiry = bucket * SWEEP_BUCKET_MS;
+            let (local, value) = stub_sweepable_cell(expiry, body);
+            let key = SubstateKey {
+                owner: Address::new([0x40; 31], AddressClass::Component),
+                local,
+            };
+            commit(&SettledWrites::from_absolutes(BTreeMap::from([(
+                key,
+                Some(value),
+            )])));
+            (key, expiry)
+        })
+        .collect();
+    let clock = WeightedTimestamp::from_millis(20 * SWEEP_BUCKET_MS);
+
+    // Under the cap, the frontier takes the ceiling: nothing sweepable
+    // is left below the clock's own bucket, so the next block starts
+    // from there rather than from the last cell.
+    let (removals, frontier) = sweep_for_block(storage, SweepFrontier::ZERO, clock);
+    assert_eq!(removals, vec![cells[0].0, cells[1].0]);
+    assert_eq!(frontier, SweepFrontier::ceiling_at(clock));
+
+    // A block whose ceiling has not moved past its parent's frontier
+    // removes nothing and repeats the frontier it inherited. That is
+    // every block at sub-second times against a minute-wide bucket, so
+    // the frontier's rule is monotone rather than strictly advancing.
+    let (again, stood_still) = sweep_for_block(storage, frontier, clock);
+    assert!(again.is_empty());
+    assert_eq!(stood_still, frontier);
+
+    // A clock inside the first cell's own bucket reaches neither, since
+    // the ceiling excludes that bucket entirely.
+    let early = WeightedTimestamp::from_millis(3 * SWEEP_BUCKET_MS + 1);
+    let (none, early_frontier) = sweep_for_block(storage, SweepFrontier::ZERO, early);
+    assert!(none.is_empty());
+    assert_eq!(early_frontier, SweepFrontier::ceiling_at(early));
+
+    // And resuming from that frontier still reaches both, so a block
+    // that swept nothing has not skipped anything.
+    let (resumed, _) = sweep_for_block(storage, early_frontier, clock);
+    assert_eq!(resumed, vec![cells[0].0, cells[1].0]);
 }
 
 /// Shared serve → import round trip: leaves enumerated and resolved

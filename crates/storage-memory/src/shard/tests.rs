@@ -4,7 +4,7 @@ use std::sync::Arc;
 use hyperscale_storage::test_helpers::{
     make_settled_writes, make_test_block, make_test_block_with_anchor_wt, make_test_certified,
     make_test_qc, state_key, test_entries_commit_serve_and_history,
-    test_sweep_index_tracks_the_leaves,
+    test_sweep_index_tracks_the_leaves, test_sweep_stops_at_the_ceiling_or_the_cap,
 };
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
@@ -186,6 +186,12 @@ fn commit_empty(
     qc: &Verified<QuorumCertificate>,
 ) -> StateRoot {
     commit_with(storage, &SettledWrites::default(), block, qc)
+}
+
+#[test]
+fn a_blocks_sweep_stops_at_the_ceiling_or_the_cap() {
+    let storage = SimShardStorage::default();
+    test_sweep_stops_at_the_ceiling_or_the_cap(&storage, |writes| storage.commit_shared(writes));
 }
 
 #[test]
@@ -525,6 +531,7 @@ fn test_prepare_then_commit_fast_path() {
             base_reads: None,
         },
         &[],
+        &[],
         BlockHeight::new(1),
     );
     let certified = make_test_certified(block.clone());
@@ -552,6 +559,7 @@ fn test_prepare_commit_state_root_matches() {
             pending: &[],
             base_reads: None,
         },
+        &[],
         &[],
         BlockHeight::new(1),
     );

@@ -10,7 +10,8 @@ use hyperscale_storage::test_helpers::{
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
     test_entries_commit_serve_and_history, test_recovery_carries_the_tip_drain_total,
     test_registers_recover_their_justification, test_retained_bundle_drops_below_the_history_floor,
-    test_sweep_index_tracks_the_leaves, test_tx_index_answers_with_the_local_shards_certificate,
+    test_sweep_index_tracks_the_leaves, test_sweep_stops_at_the_ceiling_or_the_cap,
+    test_tx_index_answers_with_the_local_shards_certificate,
     test_undischarged_record_holds_the_floor, test_unresolved_fold,
     test_widest_tick_copy_holds_the_slot,
     test_witness_payload_range_reads as helpers_test_witness_payload_range_reads, with_provisions,
@@ -101,6 +102,15 @@ fn make_state_delete(owner_seed: u8, local_seed: u8) -> SettledWrites {
 /// The full entry pipeline over `RocksDB`: commit moves the root, the
 /// index serves current and historical ranges, the leaf self-describes,
 /// and the history GC prunes superseded rows without touching the tip.
+#[test]
+fn a_blocks_sweep_stops_at_the_ceiling_or_the_cap() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_sweep_stops_at_the_ceiling_or_the_cap(&storage, |writes| {
+        storage.commit(writes).unwrap();
+    });
+}
+
 #[test]
 fn the_sweep_index_tracks_the_leaves() {
     let temp_dir = TempDir::new().unwrap();
@@ -684,6 +694,7 @@ fn test_prepare_then_commit_matches_direct() {
             base_reads: None,
         },
         &[],
+        &[],
         BlockHeight::new(1),
     );
     let block = make_test_block(BlockHeight::new(1));
@@ -757,6 +768,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
             BlockHeight::new(1),
             writes.clone(),
         )],
+        &[],
         BlockHeight::new(1),
     );
     prepared1(
@@ -779,6 +791,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
             base_reads: None,
         },
         &[finalization_with_writes(BlockHeight::new(2), tombstones)],
+        &[],
         BlockHeight::new(2),
     );
     let (_root3, _snap3, prepared3) = storage.prepare_block_commit(
@@ -798,6 +811,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
             base_reads: None,
         },
         &[finalization_with_writes(BlockHeight::new(3), writes)],
+        &[],
         BlockHeight::new(3),
     );
     prepared2(

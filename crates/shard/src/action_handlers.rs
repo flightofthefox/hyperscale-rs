@@ -11,7 +11,7 @@ use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
     JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage, SubstateStore, SubstateView,
-    TerminalWindow, VersionedStore,
+    SweepIndex, TerminalWindow, VersionedStore, sweep_for_block,
 };
 use hyperscale_types::network::gossip::{CertifiedBlockHeaderGossip, ShardForkProofGossip};
 use hyperscale_types::network::notification::{
@@ -27,13 +27,14 @@ use hyperscale_types::{
     ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
     ReshapeTrigger, RevealChain, Round, ShardId, ShardLoad, SplitChildRoots, StateRoot,
-    StateRootContext, Stopwatch, StoredReceipt, SubstateKey, TerminalRoots, TerminalVerdict,
-    TerminalVerdictRoot, Timeout, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
-    TransactionRootContext, TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
-    VrfProof, WeightedTimestamp, WitnessSources, WorkInFlight, absorb_committed_cells,
-    commit_witness_window, derive_leaves, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, protocol_statics, shard_reveal_sign,
-    signed_bytes, vrf_output_from_proof, work_over_certificates,
+    StateRootContext, StateRootVerifyError, Stopwatch, StoredReceipt, SubstateKey, SweepFrontier,
+    TerminalRoots, TerminalVerdict, TerminalVerdictRoot, Timeout, TimeoutContext, TopologySnapshot,
+    Transaction, TransactionRoot, TransactionRootContext, TxHash, ValidatorId, Verifiable,
+    Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
+    WorkInFlight, absorb_committed_cells, commit_witness_window, derive_leaves,
+    local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
+    protocol_statics, shard_reveal_sign, signed_bytes, vrf_output_from_proof,
+    work_over_certificates,
 };
 
 /// Result of QC verification and assembly.
@@ -196,7 +197,7 @@ pub struct ProposalResult {
 /// 4. Return block, hash, prepared commit handle
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)] // one linear block-assembly pipeline
-pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore>(
+pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + SweepIndex>(
     view: &Arc<SubstateView<S>>,
     proposer: ValidatorId,
     height: BlockHeight,
@@ -215,6 +216,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore>(
     terminal_verdicts: Vec<TerminalVerdict>,
     parent_in_flight: WorkInFlight,
     parent_settled_frontier: BlockHeight,
+    parent_sweep_frontier: SweepFrontier,
     parent_load: Option<ShardLoad>,
     substate_bytes: Option<u64>,
     ready_signals: Vec<ReadySignal>,
@@ -237,6 +239,20 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore>(
     // validator has persisted, and a movement baseline that moves with
     // persistence progress forks the root against replicas that lag.
     let anchored = view.snapshot();
+    // The sweep, before the root it moves. Removals are ordinary writes,
+    // so they fold in with the block's settling receipts and land under
+    // `state_root` like anything else — and the frontier the walk stops
+    // at is what the header claims, since that is what a verifier
+    // recomputes.
+    //
+    // Walked through the view rather than the store: a cell a certified
+    // but unpersisted ancestor created or retired is one this block's
+    // removals must account for, and the store alone does not know it.
+    let (removals, sweep_frontier) = sweep_for_block(
+        view.as_ref(),
+        parent_sweep_frontier,
+        parent_qc.weighted_timestamp(),
+    );
     let (state_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
         ParentAnchor {
             state_root: parent_state_root,
@@ -246,6 +262,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore>(
             base_reads: Some(&base_reads),
         },
         &certificates,
+        &removals,
         height,
     );
 
@@ -375,6 +392,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore>(
         terminal_verdict_root,
         work_in_flight,
         settled_tick_frontier,
+        sweep_frontier,
         beacon_witness_root,
         beacon_witness_leaf_count,
         beacon_witness_base,
@@ -791,6 +809,8 @@ where
             claimed_terminal_roots,
             parent_weighted_timestamp,
             settled_txs_window_floor,
+            parent_sweep_frontier,
+            claimed_sweep_frontier,
         } => {
             // Pre-flight: hash the receipts and compare to the QC'd
             // `local_receipt_root`. If they diverge, JMT recomputation
@@ -832,6 +852,37 @@ where
             // The view is freshly anchored — nothing has read through
             // it, so there is no execution cache to carry.
             let anchored = view.snapshot();
+            // The block's sweep, recomputed. A walk from the parent's
+            // frontier under the cap lands on exactly one position, so
+            // the frontier the header claims either is the one this
+            // produces or the block is refused: a claim short of it is a
+            // sweep the proposer declined to finish, and one past it
+            // reaches cells the clock does not yet allow. The removal
+            // set needs no separate check — it is what this same walk
+            // returned.
+            let (removals, computed_sweep_frontier) = sweep_for_block(
+                view.as_ref(),
+                parent_sweep_frontier,
+                parent_weighted_timestamp,
+            );
+            if computed_sweep_frontier != claimed_sweep_frontier {
+                tracing::warn!(
+                    ?block_hash,
+                    height = block_height.inner(),
+                    ?claimed_sweep_frontier,
+                    ?computed_sweep_frontier,
+                    "Rejecting block whose sweep frontier is not the one its interval produces"
+                );
+                ctx.notify_protocol(ProtocolEvent::StateRootVerified {
+                    block_hash,
+                    result: Err(StateRootVerifyError::SweepFrontierMismatch {
+                        expected: claimed_sweep_frontier,
+                        computed: computed_sweep_frontier,
+                    }),
+                    bytes_delta: 0,
+                });
+                return;
+            }
             let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
                 ParentAnchor {
                     state_root: parent_state_root,
@@ -841,6 +892,7 @@ where
                     base_reads: None,
                 },
                 &finalizations,
+                &removals,
                 block_height,
             );
             // A terminating shard's boundary header carries what it leaves
@@ -919,6 +971,7 @@ where
             fee_read_height,
             parent_in_flight,
             parent_settled_frontier,
+            parent_sweep_frontier,
             parent_load,
             substate_bytes,
             ready_signals,
@@ -1071,6 +1124,7 @@ where
                 terminal_verdicts,
                 parent_in_flight,
                 parent_settled_frontier,
+                parent_sweep_frontier,
                 parent_load,
                 substate_bytes,
                 ready_signals,

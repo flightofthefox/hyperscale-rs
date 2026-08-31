@@ -531,6 +531,8 @@ impl StateMachine for NodeStateMachine {
                     claimed_terminal_roots: ready.claimed_terminal_roots,
                     parent_weighted_timestamp: ready.parent_weighted_timestamp,
                     settled_txs_window_floor: ready.settled_txs_window_floor,
+                    parent_sweep_frontier: ready.parent_sweep_frontier,
+                    claimed_sweep_frontier: ready.claimed_sweep_frontier,
                 });
             }
 

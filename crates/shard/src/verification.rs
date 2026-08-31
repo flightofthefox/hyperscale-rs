@@ -16,8 +16,8 @@ use hyperscale_types::{
     BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertificateRoot,
     CertifiedBlock, ChainOrigin, Finalization, LinkageError, LocalReceiptRoot, ProvisionTxRootsMap,
     ProvisionsRoot, QuorumCertificate, ReshapeThresholds, RevealChain, ShardId, SplitChildRoots,
-    StateRoot, TerminalRoots, TopologySchedule, TopologySnapshot, TransactionRoot, TxHash,
-    Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp, WorkInFlight,
+    StateRoot, SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot, TransactionRoot,
+    TxHash, Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp, WorkInFlight,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -131,6 +131,12 @@ pub struct ReadyStateRootVerification {
     /// The schedule's settled-window floor at the anchor — extends the
     /// window back to the reshape's admission.
     pub settled_txs_window_floor: Option<WeightedTimestamp>,
+    /// Where the parent's sweep stopped — the lower end of the interval
+    /// this block's removals fill.
+    pub parent_sweep_frontier: SweepFrontier,
+    /// The header's own `sweep_frontier` claim, recomputed beside the
+    /// state root.
+    pub claimed_sweep_frontier: SweepFrontier,
 }
 
 /// Classification of the in-flight check outcome for the vote path.
@@ -2168,6 +2174,8 @@ impl VerificationPipeline {
             claimed_terminal_roots: pending.claimed_terminal_roots,
             parent_weighted_timestamp: pending.parent_weighted_timestamp,
             settled_txs_window_floor: pending.settled_txs_window_floor,
+            parent_sweep_frontier: chain.parent_sweep_frontier(pending.parent_block_hash),
+            claimed_sweep_frontier: block.header().sweep_frontier(),
         })
     }
 

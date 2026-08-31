@@ -16,8 +16,8 @@ use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
     BeaconProposal, BeaconWitnessCommit, BlockHeight, CertifiedBlock, Epoch, PredecessorTerminal,
-    RoutingCommittees, StateRoot, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
-    Verified,
+    RoutingCommittees, StateRoot, SweepFrontier, TopologySnapshot, TransactionStatus, TxHash,
+    ValidatorId, Verified,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -217,6 +217,7 @@ where
                 certified,
                 parent_state_root,
                 parent_block_height,
+                parent_sweep_frontier,
                 source,
                 witness,
             } => {
@@ -224,6 +225,7 @@ where
                     certified,
                     parent_state_root,
                     parent_block_height,
+                    parent_sweep_frontier,
                     source,
                     witness,
                 );
@@ -392,6 +394,7 @@ where
         certified: Arc<Verified<CertifiedBlock>>,
         parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
+        parent_sweep_frontier: SweepFrontier,
         source: CommitSource,
         witness: BeaconWitnessCommit,
     ) {
@@ -415,6 +418,7 @@ where
             certified,
             parent_state_root,
             parent_block_height,
+            parent_sweep_frontier,
             source,
             kind,
             witness,

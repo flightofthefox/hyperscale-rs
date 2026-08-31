@@ -19,9 +19,10 @@ use hyperscale_types::{
     Round, RoutingCommittees, SafeVoteRegisters, ShardForkProof, ShardId, ShardLoad,
     ShardVoteEquivocation, SharedCertificates, SharedTransactions, SharedWitnessSources,
     SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
-    StateRoot, SubstateEntry, SubstateKey, TerminalEvidence, TerminalRoots, TerminalVerdict,
-    TickId, Timeout, TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash,
-    TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WeightedTimestamp, WorkInFlight,
+    StateRoot, SubstateEntry, SubstateKey, SweepFrontier, TerminalEvidence, TerminalRoots,
+    TerminalVerdict, TickId, Timeout, TopologySnapshot, Transaction, TransactionRoot,
+    TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount,
+    WeightedTimestamp, WorkInFlight,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -693,6 +694,20 @@ pub enum Action {
         /// settled-transaction window walk floors at (`anchor − RETENTION_HORIZON`),
         /// resolved identically by the proposer and every verifier.
         parent_weighted_timestamp: WeightedTimestamp,
+        /// Where the parent's sweep stopped — the lower end of the
+        /// interval this block's removals fill.
+        parent_sweep_frontier: SweepFrontier,
+        /// The header's own `sweep_frontier` claim, recomputed beside the
+        /// state root.
+        ///
+        /// The recomputation is the whole check: a walk from the parent's
+        /// frontier under the cap lands on exactly one position, so a
+        /// frontier that matches came from the same removal set, and one
+        /// that does not is either an incomplete sweep or an overreaching
+        /// one. It also carries the obligation to advance, since a
+        /// proposer that swept nothing while cells sat below the clock
+        /// lands short of where the walk does.
+        claimed_sweep_frontier: SweepFrontier,
         /// The schedule's settled-window floor for the shard at the block's
         /// anchor — extends the settled-transaction window back to the reshape's
         /// admission, covering every settlement a counterpart fence can
@@ -928,6 +943,9 @@ pub enum Action {
         /// it by the determined halves it carries, and may carry none
         /// below it.
         parent_settled_frontier: BlockHeight,
+        /// Where the parent's sweep stopped — the lower end of the
+        /// interval this block's removals fill.
+        parent_sweep_frontier: SweepFrontier,
         /// Attested load on the parent's header — the running gas total
         /// this block advances by the gas its own certificates report.
         parent_load: Option<ShardLoad>,
@@ -1074,6 +1092,9 @@ pub enum Action {
         parent_state_root: StateRoot,
         /// Parent block's height — JMT parent version.
         parent_block_height: BlockHeight,
+        /// Where the parent's sweep stopped — the lower end of the
+        /// interval this block's removals fill.
+        parent_sweep_frontier: SweepFrontier,
         /// How this node learned the certifying QC (aggregator vs header).
         source: CommitSource,
         /// Beacon-witness leaves to persist alongside the block in the

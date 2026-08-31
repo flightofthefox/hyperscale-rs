@@ -52,7 +52,9 @@ pub use shard::pending_chain::{
 };
 pub use shard::recovered_state::RecoveredState;
 pub use shard::store::{Anchored, SubstateStore, VersionedStore};
-pub use shard::sweep::{SweepIndex, sweepable_expiry};
+pub use shard::sweep::{
+    SweepIndex, merge_sweep_overlay, sweep_for_block, sweepable_expiry, with_removals,
+};
 pub use shard::tick_certs::{covers_strictly_more, widest_tick_copies};
 pub use shard::tick_chain::{
     ProvisionalTx, TickChain, TickOutput, TickResolution, TickView, TickViewSnapshot,
@@ -83,6 +85,7 @@ pub trait ShardStorage:
     + BoundaryStore
     + PackageArtifactStore
     + SafeVoteRegisterStore
+    + SweepIndex
     + Send
     + Sync
     + 'static
@@ -98,6 +101,7 @@ impl<S> ShardStorage for S where
         + BoundaryStore
         + PackageArtifactStore
         + SafeVoteRegisterStore
+        + SweepIndex
         + Send
         + Sync
         + 'static

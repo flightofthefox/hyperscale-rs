@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, StateRoot,
-    Verifiable, Verified,
+    SubstateKey, Verifiable, Verified,
 };
 
 use crate::{Anchored, BaseReadCache, JmtSnapshot};
@@ -91,6 +91,7 @@ pub trait ShardChainWriter: Send + Sync + 'static {
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
         finalizations: &[Arc<Verifiable<Finalization>>],
+        removals: &[SubstateKey],
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit);
 
