@@ -667,8 +667,8 @@ mod tests {
     use hyperscale_vm_effects::{
         Binding, Claim, Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Hash32, Hasher,
         InstanceMeta, InstanceRegistry, IntentDecl, ManifestGraph, MetadataCache, PackageHash,
-        Socket, StoredRule, Subintent, SubintentHash, child_key, never, nullifier_key,
-        package_slot,
+        Socket, StoredRule, Subintent, SubintentHash, child_key, never, nullifier_expiry_ms,
+        nullifier_key, package_slot,
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
     use hyperscale_vm_stdlib::account;
@@ -1068,7 +1068,12 @@ mod tests {
 
         let hash = tree.subintents[0].decl.hash(&ProtocolHasher);
         assert_eq!(derived.subintent_hashes, vec![hash.0.0]);
-        let nullifier = nullifier_key(&ProtocolHasher, bob_addr(), hash);
+        let nullifier = nullifier_key(
+            &ProtocolHasher,
+            bob_addr(),
+            hash,
+            nullifier_expiry_ms(&tree.subintents[0].decl.header),
+        );
         assert!(derived.routing.write_keys.contains(&DeclaredKey::substate(
             bob_addr().address(),
             nullifier.local.0
