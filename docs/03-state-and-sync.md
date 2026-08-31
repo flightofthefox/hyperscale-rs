@@ -90,6 +90,18 @@ Divergence recovery defends against one failure mode: a replica whose local exec
 - **Ingress validation.** `Finalization`s received from peers are validated receipt by receipt against their EC's attestation (existence, hash, outcome) before admission.
 - **Fail-fast on poison.** If a sync-path commit's recomputed root mismatches the QC-attested header root, the parent state itself has diverged from canon. A corrupted tree has no block-granular repair, so the node emits a full diagnostic (heights, hashes, expected and computed roots) and halts; an operator restores from a checkpoint or resyncs. Halting loudly is the design: a node with poisoned state must not keep voting.
 
-## 8. Properties
+## 8. Retiring state
 
-The state and synchronization invariants this document motivates — INV-STATE-1 through INV-STATE-6 — are stated precisely in [08-invariants.md](08-invariants.md).
+A committed cell can be written and overwritten; nothing retires one on a schedule. Some kernel state is owed only for a bounded time — a subintent nullifier stops being replay protection once no chain can still be deciding a spend of the subintent — and without a sweep that state is permanent.
+
+Removing a cell moves the state root, so a sweep is a consensus operation. Three things follow.
+
+- **The cell answers for its own life.** A sweepable cell carries its expiry in its value and keys by it (INV-SWEEP-5), so no side index and no transaction body is needed to decide whether it is still owed. That matters because the prefix is the only thing guaranteed to reach a reshape successor: a rule keyed off anything else would not survive a split.
+- **The block states a frontier, not a list.** Sweepable cells sort by an expiry bucket that leads the key's local half, so a chain's sweep is a cursor over that order. A block's removals are exactly the cells between its parent's frontier and its own (INV-SWEEP-1), the interval is capped, and the cursor says where a capped sweep stopped (INV-SWEEP-4). A validator recomputes the frontier the way it recomputes the state root.
+- **Advancing is obliged.** A removal earns no fee and costs a proposer block space, so a rule permitting omission is one honest proposers converge on omitting. A block that could sweep and did not lands short of where the walk lands, and is refused (INV-SWEEP-6).
+
+What keeps a sweep from retiring something still in use is not a skew bound but co-location (INV-SWEEP-9): the chain holding the cell is one any transaction reading it must also be admitted on, so removal and admission answer to a single monotone committed clock. How far that clock lags real time never matters, because a chain lagging far enough to admit a lapsed transaction has by that same lag not advanced its frontier either.
+
+## 9. Properties
+
+The state and synchronization invariants this document motivates — INV-STATE-1 through INV-STATE-6, and the sweep's INV-SWEEP-1 through INV-SWEEP-9 — are stated precisely in [08-invariants.md](08-invariants.md).
