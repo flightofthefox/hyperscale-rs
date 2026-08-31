@@ -34,6 +34,9 @@ use hyperscale_vm_manifest_builder::{EnvelopeBuilder, TypedError};
 use hyperscale_vm_stdlib::{account, instantiate, staking};
 use hyperscale_vm_types::{Address, CallTarget, CollectionId};
 
+/// The network every envelope in these tests is signed for.
+const NETWORK: NetworkId = NetworkId(242);
+
 /// The identifier the beacon folds the seated pool under.
 const POOL_ID: u32 = 7;
 /// The delegator's signing seed.
@@ -183,7 +186,7 @@ fn signed_stake_composed(seat: &StakePoolSeat, amount: u128) -> Transaction {
     let pool = meta.address(&ProtocolHasher);
     let chain = client().records();
     let composed = Composed::new(&chain, std::slice::from_ref(&meta), &ProtocolHasher);
-    let (mut env, mut b) = EnvelopeBuilder::new(&composed, &ProtocolHasher, from);
+    let (mut env, mut b) = EnvelopeBuilder::new(&composed, &ProtocolHasher, from, NETWORK);
     let funds = account::withdraw(&mut b, from, *XRD, amount).expect("an account withdraws");
     let units = staking::Staking::at(pool)
         .stake(&mut b, funds)
@@ -427,7 +430,7 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
     // answer for yet: the seal is what makes it answer.
     let composed = Composed::new(&chain, std::slice::from_ref(&meta), &ProtocolHasher);
     let pool = meta.address(&ProtocolHasher);
-    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher, from);
+    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher, from, NETWORK);
     // The composition every bring-up writes: the seal, and the supply it
     // yields filed where the founder keeps it. Which method seals and
     // which of those nodes exist are the package's own declaration to
@@ -532,7 +535,7 @@ fn a_pool_nobody_instantiated_answers_nothing() {
     let unseated = seat(56);
     let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated);
     let chain = client().records();
-    let (_, mut root) = EnvelopeBuilder::new(&chain, &ProtocolHasher, delegator());
+    let (_, mut root) = EnvelopeBuilder::new(&chain, &ProtocolHasher, delegator(), NETWORK);
     let funds = account::withdraw(&mut root, delegator(), *XRD, 500).expect("an account withdraws");
     let refusal = staking::Staking::at(pool)
         .stake(&mut root, funds)

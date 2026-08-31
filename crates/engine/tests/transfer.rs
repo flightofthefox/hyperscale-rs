@@ -39,6 +39,9 @@ use hyperscale_vm_types::{
     Address, CollectionId, SEAL_MATURITY_EPOCHS, SeedWindow, amount_cell, encode_amount,
 };
 
+/// The network every envelope in these tests is signed for.
+const NETWORK: NetworkId = NetworkId(242);
+
 /// The two accounts the transfer cases move funds between, as signing
 /// seeds rather than as literal addresses: a withdrawing node admits only
 /// the signature its target's address derives from, so an account that
@@ -179,7 +182,7 @@ fn executor(mode: ExecutionMode) -> Executor {
 /// network its envelopes name.
 fn client() -> &'static Client {
     static CLIENT: LazyLock<Client> =
-        LazyLock::new(|| Client::new(genesis_world_with_pools(&[], &packages()), NetworkId(242)));
+        LazyLock::new(|| Client::new(genesis_world_with_pools(&[], &packages()), NETWORK));
     &CLIENT
 }
 
@@ -306,7 +309,8 @@ fn signed_settle_with_fee(seed: u8, max_fee: u128, salt: u8) -> Transaction {
     let chain = client().records();
     let composed = Composed::new(&chain, &[lottery_meta(salt)], &ProtocolHasher);
     let lottery_addr = lottery_meta(salt).address(&ProtocolHasher);
-    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher, fee_payer(seed));
+    let (mut env, mut root) =
+        EnvelopeBuilder::new(&composed, &ProtocolHasher, fee_payer(seed), NETWORK);
     lottery::Lottery::at(lottery_addr)
         .settle(&mut root, 64)
         .expect("a lottery answers a settlement");
@@ -346,7 +350,7 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
         let composed = Composed::new(&chain, &[lottery_meta(*salt)], &ProtocolHasher);
         let round = lottery_meta(*salt).address(&ProtocolHasher);
         let (mut env, mut root) =
-            EnvelopeBuilder::new(&composed, &ProtocolHasher, fee_payer(SEALER_SEED));
+            EnvelopeBuilder::new(&composed, &ProtocolHasher, fee_payer(SEALER_SEED), NETWORK);
         instantiate(&mut root, fee_payer(SEALER_SEED), round)
             .expect("a derivable round answers its seal");
         env.register_instance(lottery_meta(*salt));
@@ -390,7 +394,7 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
 fn closing_tree(salt: u8, signer: PrincipalAddr) -> EnvelopeTree {
     let chain = client().records();
     let composed = Composed::new(&chain, &[lottery_meta(salt)], &ProtocolHasher);
-    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher, signer);
+    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher, signer, NETWORK);
     lottery::Lottery::at(lottery_meta(salt).address(&ProtocolHasher))
         .close(&mut root)
         .expect("a lottery answers a close");
@@ -1291,7 +1295,7 @@ fn signed_publish(seed: u8, artifact: Vec<u8>) -> Transaction {
         validity_start_ms: 0,
         validity_end_ms: u64::MAX,
         message: Vec::new(),
-        network: NetworkId(242),
+        network: NETWORK,
         signer_scheme: SchemeId::NONE,
         signer: Vec::new(),
         signature: Vec::new(),
@@ -1420,6 +1424,7 @@ fn derivation_tells_a_gap_from_a_refusal() {
     let gap = Transaction::new(client().sign_tree(
         &EnvelopeTree {
             root: IntentDecl {
+                network: NETWORK,
                 graph,
                 sockets: Vec::new(),
             },
@@ -1450,6 +1455,7 @@ fn derivation_tells_a_gap_from_a_refusal() {
     let refused = Transaction::new(client().sign_tree(
         &EnvelopeTree {
             root: IntentDecl {
+                network: NETWORK,
                 graph,
                 sockets: Vec::new(),
             },
@@ -2057,6 +2063,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     let graph = b.build().expect("every output is consumed");
     let tree = EnvelopeTree {
         root: IntentDecl {
+            network: NETWORK,
             graph,
             sockets: Vec::new(),
         },

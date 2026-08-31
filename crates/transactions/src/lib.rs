@@ -184,6 +184,7 @@ impl Client {
         self.sign_tree(
             &EnvelopeTree {
                 root: IntentDecl {
+                    network: self.network,
                     graph,
                     sockets: Vec::new(),
                 },

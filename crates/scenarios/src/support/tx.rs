@@ -1089,7 +1089,8 @@ pub fn build_instantiate_tx(
         .map(|meta| meta.address(&ProtocolHasher))
         .collect();
     let founder = account_address(&payer.public_key().0);
-    let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher, founder);
+    let (mut env, mut root) =
+        EnvelopeBuilder::new(&composed, &ProtocolHasher, founder, SCENARIO_NETWORK);
     for address in addresses {
         instantiate(&mut root, founder, address).expect("a derivable lottery answers its seal");
     }
@@ -1187,6 +1188,7 @@ fn build_lottery_tx(
         &composed,
         &ProtocolHasher,
         account_address(&payer.public_key().0),
+        SCENARIO_NETWORK,
     );
     for address in addresses {
         leg(&lottery::Lottery::at(address), &mut root);
@@ -1263,6 +1265,7 @@ pub fn build_transfer_paid_by<S: AccountSigner>(
     let envelope = signing::wrap(
         &EnvelopeTree {
             root: IntentDecl {
+                network: SCENARIO_NETWORK,
                 graph,
                 sockets: Vec::new(),
             },
@@ -1652,6 +1655,7 @@ pub fn build_instance_instantiate_tx(
 
     let tree = EnvelopeTree {
         root: IntentDecl {
+            network: SCENARIO_NETWORK,
             graph,
             sockets: Vec::new(),
         },
@@ -1918,6 +1922,7 @@ pub fn build_composed_tx(
         &chain,
         &ProtocolHasher,
         account_address(&composer.public_key().0),
+        SCENARIO_NETWORK,
     );
     let funds =
         account::withdraw(&mut root, from, *XRD, amount).expect("an account answers a withdrawal");
@@ -2006,7 +2011,7 @@ fn declaration(
 ) -> IntentDecl {
     let client = client();
     let chain = client.records();
-    let mut decl = IntentBuilder::declaration(&chain, &ProtocolHasher, signer);
+    let mut decl = IntentBuilder::declaration(&chain, &ProtocolHasher, signer, SCENARIO_NETWORK);
     write(&mut decl).expect("every scenario call types against its signature");
     decl.into_decl()
         .expect("the declaration discharges its own holes")
