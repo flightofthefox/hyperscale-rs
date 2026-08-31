@@ -772,6 +772,7 @@ mod tests {
         network: NETWORK,
         validity_start_ms: 0,
         validity_end_ms: 1_000_000,
+        discriminator: 0,
     };
 
     fn single_intent_tree(nodes: Vec<GraphNode>) -> EnvelopeTree {
@@ -1331,6 +1332,41 @@ mod tests {
         let mut forever = composed_tree();
         forever.subintents[0].decl.header.validity_end_ms = u64::MAX;
         assert!(statics().derive(&envelope(&forever, &[&key(9)])).is_err());
+    }
+
+    #[test]
+    fn the_same_offer_twice_takes_two_nullifiers() {
+        // One signer, one offer, made twice inside one window. Without
+        // something to tell them apart the second carries the first's
+        // nullifier and reads as already spent; with it they are two
+        // declarations that conflict on nothing.
+        let once = composed_tree();
+        let mut twice = composed_tree();
+        twice.subintents[0].decl.header.discriminator = 1;
+
+        let first = statics()
+            .derive(&envelope(&once, &[&key(9)]))
+            .expect("the offer composes");
+        let second = statics()
+            .derive(&envelope(&twice, &[&key(9)]))
+            .expect("the same offer, said twice, composes");
+        assert_ne!(first.subintent_hashes, second.subintent_hashes);
+
+        // The nullifier is derived from that identity, so the two spend
+        // different cells — which is the whole of what the field buys.
+        let nullifiers = |derived: &Derived| -> Vec<DeclaredKey> {
+            derived
+                .routing
+                .write_keys
+                .iter()
+                .filter(|key| {
+                    key.cell()
+                        .is_some_and(|cell| cell.owner == Address::from(bob_addr()))
+                })
+                .copied()
+                .collect()
+        };
+        assert_ne!(nullifiers(&first), nullifiers(&second));
     }
 
     #[test]
