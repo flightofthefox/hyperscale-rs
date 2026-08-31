@@ -35,8 +35,8 @@ use hyperscale_types::{
     install_protocol_statics,
 };
 use hyperscale_vm_effects::{
-    ChainRecords, Declaration, NodeCall, PackageHash, PrefixShardResolver, admit_tree,
-    package_hash, route_tree,
+    ChainRecords, Declaration, NodeCall, PackageHash, PrefixShardResolver, SubintentRecord,
+    admit_tree, package_hash, route_tree,
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchTx, EnvInputs, ExecutionMode, Locality, ManifestWalk, Receipt, Substates,
@@ -79,8 +79,9 @@ pub struct PreparedTx {
     /// reads, and the clause order the capability table is built in —
     /// which is what a lowered call's handle positions index.
     pub declaration: Declaration,
-    /// The subintent nullifier keys the batch entry enforces.
-    pub nullifiers: Vec<SubstateKey>,
+    /// One record per bound subintent: the nullifier the batch entry
+    /// enforces, and what the cell recording its spend says.
+    pub nullifiers: Vec<SubintentRecord>,
     /// The envelope's signed execution ceiling, in fuel — one budget for
     /// the whole transaction, however many nodes its manifest walks.
     pub gas_limit: u64,
@@ -520,11 +521,7 @@ impl Executor {
                     .collect(),
             },
             declaration,
-            nullifiers: admitted
-                .subintents
-                .iter()
-                .map(|record| record.nullifier)
-                .collect(),
+            nullifiers: admitted.subintents,
             gas_limit: vm.gas_limit,
         })
     }

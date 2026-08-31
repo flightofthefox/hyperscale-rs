@@ -18,6 +18,8 @@
 
 use std::time::Duration;
 
+use hyperscale_vm_types::NULLIFIER_GRACE_MS;
+
 use crate::MAX_VALIDITY_RANGE;
 
 /// The longest a cross-shard transaction may take to finalize, past the
@@ -63,6 +65,18 @@ pub const REMOTE_HEADER_RETENTION: Duration = Duration::from_secs(30);
 /// runs inside its own window.
 pub const RETENTION_HORIZON: Duration =
     Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() + MAX_FINALIZATION_DELAY.as_secs());
+
+/// A nullifier's life and every other tx-derived artifact's are the same
+/// bound, asserted rather than assumed: the VM keys and values a
+/// nullifier by an expiry it computes from its own constant, and this is
+/// where the two spellings are held together. If the horizon moves, that
+/// constant moves with it — a nullifier swept while some chain can still
+/// be deciding a spend of it is a replay, and one retained past it is
+/// state nobody can retire.
+const _: () = assert!(
+    RETENTION_HORIZON.as_secs() * 1_000 == NULLIFIER_GRACE_MS,
+    "a nullifier's grace is the protocol's retention horizon",
+);
 
 /// The horizon must not outlive the epoch that produced what it retains.
 ///
