@@ -10,11 +10,12 @@ use hyperscale_storage::tree::{
 };
 use hyperscale_storage::{
     JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, covers_strictly_more,
-    merge_writes_from_receipts, widest_tick_copies,
+    merge_writes_from_receipts, widest_tick_copies, with_removals,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, Finalization, PreparedCommit,
-    QuorumCertificate, SettledWrites, StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
+    QuorumCertificate, SettledWrites, StateRoot, StoredReceipt, SubstateKey, SyncHint, Verifiable,
+    Verified,
 };
 
 use super::core::SimShardStorage;
@@ -25,6 +26,7 @@ impl ShardChainWriter for SimShardStorage {
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
         finalizations: &[Arc<Verifiable<Finalization>>],
+        removals: &[SubstateKey],
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
         // Everything the ticks carried, for storage; only what they
@@ -38,10 +40,12 @@ impl ShardChainWriter for SimShardStorage {
             .flat_map(|fw| fw.settling_receipts())
             .collect();
 
-        // No receipts → no state changes → state root is unchanged.
-        // Build a no-op JmtSnapshot directly, avoiding put_at_version which
-        // would fail if the parent's tree nodes aren't in the store yet.
-        if receipts.is_empty() {
+        // Nothing to write → state root is unchanged. Build a no-op
+        // JmtSnapshot directly, avoiding put_at_version which would fail
+        // if the parent's tree nodes aren't in the store yet. A block's
+        // sweep is a write like any other, so a block that removes
+        // something is not one of these however few receipts it carries.
+        if receipts.is_empty() && removals.is_empty() {
             let s = read_or_recover(&self.state);
             let snapshot = Arc::new(noop_jmt_snapshot(
                 &s.tree_store,
@@ -86,7 +90,10 @@ impl ShardChainWriter for SimShardStorage {
             parent.height,
             "a movement's baseline is anchored at the wrong height",
         );
-        let settled = merge_writes_from_receipts(&settling, parent.state);
+        let settled = with_removals(
+            merge_writes_from_receipts(&settling, parent.state),
+            removals,
+        );
 
         let (result_root, collected) = if parent.pending.is_empty() {
             put_at_version(

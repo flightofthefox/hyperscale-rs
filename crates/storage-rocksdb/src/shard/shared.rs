@@ -15,14 +15,14 @@ use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeRea
 use hyperscale_storage::{
     AdoptSource, BlockForSync, BoundaryStore, GenesisCommit, ImportProgress, JmtSnapshot,
     PackageArtifactStore, ParentAnchor, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
-    SubstateStore, Substates, VersionedStore, WitnessSeed,
+    SubstateStore, Substates, SweepIndex, VersionedStore, WitnessSeed,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, DeclaredRange, ExecutionCertificate,
     Finalization, FinalizationHash, Hash, PreparedCommit, Provisions, QuorumCertificate,
     SafeVoteRegisters, SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey,
-    SubstateLeaf, TickId, Transaction, TxHash, ValidatorId, Verifiable, Verified,
+    SubstateLeaf, SweepFrontier, TickId, Transaction, TxHash, ValidatorId, Verifiable, Verified,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -60,6 +60,17 @@ impl std::ops::Deref for SharedStorage {
     type Target = RocksDbShardStorage;
     fn deref(&self) -> &RocksDbShardStorage {
         &self.0
+    }
+}
+
+impl SweepIndex for SharedStorage {
+    fn sweep_candidates(
+        &self,
+        frontier: SweepFrontier,
+        ceiling: SweepFrontier,
+        limit: usize,
+    ) -> Vec<(SubstateKey, u64)> {
+        self.0.sweep_candidates(frontier, ceiling, limit)
     }
 }
 
@@ -222,10 +233,11 @@ impl ShardChainWriter for SharedStorage {
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
         finalizations: &[Arc<Verifiable<Finalization>>],
+        removals: &[SubstateKey],
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
         self.0
-            .prepare_block_commit(parent, finalizations, block_height)
+            .prepare_block_commit(parent, finalizations, removals, block_height)
     }
 
     fn commit_block(

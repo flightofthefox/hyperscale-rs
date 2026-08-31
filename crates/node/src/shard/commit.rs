@@ -23,11 +23,14 @@ use crossbeam::channel::Sender;
 use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
-use hyperscale_storage::{ChainEntry, ParentAnchor, PendingChain, ShardStorage, SubstateStore};
+use hyperscale_storage::{
+    ChainEntry, ParentAnchor, PendingChain, ShardStorage, SubstateStore, sweep_for_block,
+};
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, Derivation,
-    EpochWindows, Finalization, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SyncHint,
-    Verifiable, Verified, WeightedTimestamp, absorb_committed_cells, local_settled_tx_hashes,
+    EpochWindows, Finalization, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SweepFrontier,
+    SyncHint, Verifiable, Verified, WeightedTimestamp, absorb_committed_cells,
+    local_settled_tx_hashes,
 };
 use tracing::debug;
 
@@ -75,6 +78,10 @@ pub struct QcOnlyPending {
     /// Parent's height (JMT parent version). Unused when
     /// `kind == AlreadyPrepared`.
     pub parent_block_height: BlockHeight,
+    /// Where the parent's sweep stopped — the lower end of the interval
+    /// this block's removals fill. Unused when
+    /// `kind == AlreadyPrepared`.
+    pub parent_sweep_frontier: SweepFrontier,
     /// How this node learned the certifying QC.
     pub source: CommitSource,
     /// Whether this entry needs the pool to run JMT prep or can
@@ -170,6 +177,15 @@ where
     // The view is freshly anchored — nothing has read through it, so
     // there is no execution cache to carry.
     let anchored = view.snapshot();
+    // The block's sweep, recomputed from the interval its header names.
+    // A frontier that is not the one this walk lands on produces a
+    // different removal set and so a different root, which the
+    // divergence check below is already the answer to.
+    let (removals, _) = sweep_for_block(
+        view.as_ref(),
+        pending.parent_sweep_frontier,
+        block.header().parent_qc().weighted_timestamp(),
+    );
     let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
         ParentAnchor {
             state_root: pending.parent_state_root,
@@ -179,6 +195,7 @@ where
             base_reads: None,
         },
         &finalizations,
+        &removals,
         height,
     );
 

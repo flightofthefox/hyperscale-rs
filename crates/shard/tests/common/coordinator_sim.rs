@@ -32,7 +32,7 @@ use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
     ChainEntry, ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore,
-    ShardChainWriter, SubstateStore, TerminalWindow,
+    ShardChainWriter, SubstateStore, TerminalWindow, sweep_for_block,
 };
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::TestCommittee;
@@ -46,7 +46,7 @@ use hyperscale_types::{
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
     QcVerifyError, QuorumCertificate, ReadySignal, Round, ShardId, ShardLoad,
     ShardVoteEquivocation, ShardWitnessPayload, Signer, StateRoot, StateRootContext,
-    StateRootVerifyError, StoredReceipt, Timeout, TimeoutContext, TopologySchedule,
+    StateRootVerifyError, StoredReceipt, SweepFrontier, Timeout, TimeoutContext, TopologySchedule,
     TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash,
     TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, VrfProof,
     WeightedTimestamp, WorkInFlight, local_settled_tx_hashes, shard_reveal_sign, signed_bytes,
@@ -100,6 +100,7 @@ struct StaleReparent {
     parent_block_height: BlockHeight,
     parent_in_flight: WorkInFlight,
     parent_settled_frontier: BlockHeight,
+    parent_sweep_frontier: SweepFrontier,
     parent_load: ShardLoad,
     height: BlockHeight,
 }
@@ -1103,6 +1104,8 @@ impl ShardCoordinatorSim {
                 claimed_terminal_roots: ready.claimed_terminal_roots,
                 parent_weighted_timestamp: ready.parent_weighted_timestamp,
                 settled_txs_window_floor: ready.settled_txs_window_floor,
+                parent_sweep_frontier: ready.parent_sweep_frontier,
+                claimed_sweep_frontier: ready.claimed_sweep_frontier,
             });
         }
         if self.coordinators[to_idx].take_ready_proposal() {
@@ -1430,6 +1433,7 @@ impl ShardCoordinatorSim {
                 fee_read_height: _,
                 parent_in_flight,
                 parent_settled_frontier,
+                parent_sweep_frontier,
                 parent_load,
                 substate_bytes,
                 ready_signals,
@@ -1462,6 +1466,7 @@ impl ShardCoordinatorSim {
                     parent_block_height,
                     parent_in_flight,
                     parent_settled_frontier,
+                    parent_sweep_frontier,
                     parent_load,
                     height,
                 ) = if let Some(reparent) = stale {
@@ -1474,6 +1479,7 @@ impl ShardCoordinatorSim {
                         reparent.parent_block_height,
                         reparent.parent_in_flight,
                         reparent.parent_settled_frontier,
+                        reparent.parent_sweep_frontier,
                         Some(reparent.parent_load),
                         reparent.height,
                     )
@@ -1485,6 +1491,7 @@ impl ShardCoordinatorSim {
                         parent_block_height,
                         parent_in_flight,
                         parent_settled_frontier,
+                        parent_sweep_frontier,
                         parent_load,
                         height,
                     )
@@ -1523,6 +1530,7 @@ impl ShardCoordinatorSim {
                     terminal_verdicts,
                     parent_in_flight,
                     parent_settled_frontier,
+                    parent_sweep_frontier,
                     parent_load,
                     substate_bytes,
                     ready_signals,
@@ -1773,6 +1781,8 @@ impl ShardCoordinatorSim {
                 claimed_terminal_roots,
                 parent_weighted_timestamp,
                 settled_txs_window_floor,
+                parent_sweep_frontier,
+                claimed_sweep_frontier,
             } => {
                 // Mirrors the production handler: receipt-root
                 // pre-flight first, then JMT prep on success.
@@ -1810,6 +1820,15 @@ impl ShardCoordinatorSim {
                 });
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
+                let (removals, computed_sweep_frontier) = sweep_for_block(
+                    view.as_ref(),
+                    parent_sweep_frontier,
+                    parent_weighted_timestamp,
+                );
+                assert_eq!(
+                    computed_sweep_frontier, claimed_sweep_frontier,
+                    "the sim's proposer and verifier walk the same interval",
+                );
                 let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
                     ParentAnchor {
                         state_root: parent_state_root,
@@ -1819,6 +1838,7 @@ impl ShardCoordinatorSim {
                         base_reads: None,
                     },
                     &finalizations,
+                    &removals,
                     block_height,
                 );
                 let verify_result = expected_root.verify(&StateRootContext {
@@ -1897,6 +1917,7 @@ impl ShardCoordinatorSim {
                 certified,
                 parent_state_root: _,
                 parent_block_height: _,
+                parent_sweep_frontier: _,
                 source: _,
                 witness,
             } => {
@@ -1964,6 +1985,7 @@ impl ShardCoordinatorSim {
             parent_block_height: ancestor.height(),
             parent_in_flight: ancestor.work_in_flight(),
             parent_settled_frontier: ancestor.settled_tick_frontier(),
+            parent_sweep_frontier: ancestor.sweep_frontier(),
             parent_load: ancestor.load(),
             height: ancestor.height().next(),
         })
@@ -1975,35 +1997,8 @@ impl ShardCoordinatorSim {
 /// other field stays identical so the receiver's per-root
 /// verifiers still pass.
 pub fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
-    let provision_tx_roots: BTreeMap<_, _> = h
-        .provision_tx_roots()
-        .iter()
-        .map(|(k, v)| (*k, *v))
-        .collect();
     BlockHeader::new(BlockHeaderParts {
-        shard_id: h.shard_id(),
-        height: h.height(),
-        parent_block_hash: h.parent_block_hash(),
-        parent_qc: h.parent_qc_verifiable().clone(),
-        proposer: h.proposer(),
         timestamp: ProposerTimestamp::from_millis(h.timestamp().as_millis().saturating_add(1)),
-        round: h.round(),
-        settled_tick_frontier: h.settled_tick_frontier(),
-        is_fallback: h.is_fallback(),
-        state_root: h.state_root(),
-        transaction_root: h.transaction_root(),
-        certificate_root: h.certificate_root(),
-        local_receipt_root: h.local_receipt_root(),
-        provision_root: h.provision_root(),
-        provision_tx_roots,
-        terminal_verdict_root: h.terminal_verdict_root(),
-        work_in_flight: h.work_in_flight(),
-        beacon_witness_root: h.beacon_witness_root(),
-        beacon_witness_leaf_count: h.beacon_witness_leaf_count(),
-        beacon_witness_base: h.beacon_witness_base(),
-        reveal_chain: h.reveal_chain(),
-        split_child_roots: h.split_child_roots(),
-        terminal_roots: h.terminal_roots(),
-        load: h.load(),
+        ..h.clone().into_parts()
     })
 }

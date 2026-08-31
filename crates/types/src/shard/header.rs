@@ -14,8 +14,8 @@ use crate::{
     ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot, MAX_PROVISION_TARGET_SHARDS,
     PredecessorTerminal, ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate,
     RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot,
-    TerminalRoots, TerminalVerdictRoot, TransactionRoot, ValidatorId, Verifiable, Verified, Verify,
-    WeightedTimestamp, WorkInFlight,
+    SweepFrontier, TerminalRoots, TerminalVerdictRoot, TransactionRoot, ValidatorId, Verifiable,
+    Verified, Verify, WeightedTimestamp, WorkInFlight,
 };
 
 /// The running values a block extending the committed tip is checked
@@ -33,6 +33,8 @@ pub struct CommittedTip {
     pub work_in_flight: WorkInFlight,
     /// Highest tick whose determined half has settled at or below the tip.
     pub settled_tick_frontier: BlockHeight,
+    /// How far the tip's sweep reached, which the next block advances.
+    pub sweep_frontier: SweepFrontier,
     /// Reveal chain the next block extends, or reseeds past in a later epoch.
     pub reveal_chain: RevealChain,
     /// Attested load through the tip: running gas total and the byte level.
@@ -46,6 +48,7 @@ impl CommittedTip {
     pub const GENESIS: Self = Self {
         work_in_flight: WorkInFlight::ZERO,
         settled_tick_frontier: BlockHeight::GENESIS,
+        sweep_frontier: SweepFrontier::ZERO,
         reveal_chain: RevealChain::ZERO,
         load: ShardLoad::ZERO,
     };
@@ -95,6 +98,22 @@ pub struct BlockHeader {
     /// a write later ticks have already read — and every replica would
     /// agree on the wrong state, leaving nothing to detect afterwards.
     settled_tick_frontier: BlockHeight,
+    /// How far this block's sweep reached: the position in expiry order
+    /// that its removals stop at.
+    ///
+    /// The block's removals are exactly the sweepable cells in
+    /// `(parent.sweep_frontier, this]`, so the pair — the parent's and
+    /// this one's — states the whole set without listing it, and a
+    /// validator checks completeness by walking the same interval. Read
+    /// off the block the way `settled_tick_frontier` is: a monotone
+    /// claim with no history behind it.
+    ///
+    /// Advancing is obliged rather than permitted. A removal earns no
+    /// fee and costs a proposer block space, so a rule that let one
+    /// decline is a rule honest proposers converge on declining, and the
+    /// bound would then hold only because the reference client happened
+    /// to sweep.
+    sweep_frontier: SweepFrontier,
     beacon_witness_root: BeaconWitnessRoot,
     beacon_witness_leaf_count: BeaconWitnessLeafCount,
     /// The beacon-witness window base of the window this block belongs
@@ -171,6 +190,7 @@ pub struct BlockHeaderParts {
     pub terminal_verdict_root: TerminalVerdictRoot,
     pub work_in_flight: WorkInFlight,
     pub settled_tick_frontier: BlockHeight,
+    pub sweep_frontier: SweepFrontier,
     pub beacon_witness_root: BeaconWitnessRoot,
     pub beacon_witness_leaf_count: BeaconWitnessLeafCount,
     pub beacon_witness_base: BeaconWitnessLeafCount,
@@ -201,6 +221,7 @@ impl Default for BlockHeaderParts {
             terminal_verdict_root: TerminalVerdictRoot::ZERO,
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
+            sweep_frontier: SweepFrontier::ZERO,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
@@ -239,6 +260,7 @@ impl BlockHeader {
             terminal_verdict_root,
             work_in_flight,
             settled_tick_frontier,
+            sweep_frontier,
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
@@ -265,6 +287,7 @@ impl BlockHeader {
             terminal_verdict_root,
             work_in_flight,
             settled_tick_frontier,
+            sweep_frontier,
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
@@ -310,6 +333,7 @@ impl BlockHeader {
             terminal_verdict_root: TerminalVerdictRoot::ZERO,
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
+            sweep_frontier: SweepFrontier::ZERO,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
@@ -363,6 +387,7 @@ impl BlockHeader {
             terminal_verdict_root: TerminalVerdictRoot::ZERO,
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
+            sweep_frontier: SweepFrontier::ZERO,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
@@ -430,6 +455,7 @@ impl BlockHeader {
             terminal_verdict_root: TerminalVerdictRoot::ZERO,
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
+            sweep_frontier: SweepFrontier::ZERO,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
@@ -601,6 +627,13 @@ impl BlockHeader {
         self.settled_tick_frontier
     }
 
+    /// How far this block's sweep reached. Its removals are exactly the
+    /// sweepable cells above its parent's frontier and at or below this.
+    #[must_use]
+    pub const fn sweep_frontier(&self) -> SweepFrontier {
+        self.sweep_frontier
+    }
+
     /// Root of this shard's monotonic beacon-witness accumulator at
     /// this block.
     ///
@@ -707,68 +740,47 @@ impl BlockHeader {
         CommittedTip {
             work_in_flight: self.work_in_flight,
             settled_tick_frontier: self.settled_tick_frontier,
+            sweep_frontier: self.sweep_frontier,
             reveal_chain: self.reveal_chain,
             load: self.load,
         }
     }
 
-    /// Decompose into the raw fields, in struct-declaration order.
-    #[allow(clippy::type_complexity)] // mirrors the 23 stored fields
+    /// Decompose into the parts [`Self::new`] builds one from.
+    ///
+    /// The inverse of the constructor rather than a positional tuple, so
+    /// a caller that rebuilds a header with one field changed names that
+    /// field and inherits the rest — and a header gaining a field does
+    /// not rewrite every such caller.
     #[must_use]
-    pub fn into_parts(
-        self,
-    ) -> (
-        ShardId,
-        BlockHeight,
-        BlockHash,
-        Verifiable<QuorumCertificate>,
-        ValidatorId,
-        ProposerTimestamp,
-        Round,
-        bool,
-        StateRoot,
-        TransactionRoot,
-        CertificateRoot,
-        LocalReceiptRoot,
-        ProvisionsRoot,
-        BTreeMap<ShardId, ProvisionTxRoot>,
-        TerminalVerdictRoot,
-        WorkInFlight,
-        BlockHeight,
-        BeaconWitnessRoot,
-        BeaconWitnessLeafCount,
-        BeaconWitnessLeafCount,
-        RevealChain,
-        Option<SplitChildRoots>,
-        Option<TerminalRoots>,
-        ShardLoad,
-    ) {
-        (
-            self.shard_id,
-            self.height,
-            self.parent_block_hash,
-            self.parent_qc,
-            self.proposer,
-            self.timestamp,
-            self.round,
-            self.is_fallback,
-            self.state_root,
-            self.transaction_root,
-            self.certificate_root,
-            self.local_receipt_root,
-            self.provision_root,
-            self.provision_tx_roots,
-            self.terminal_verdict_root,
-            self.work_in_flight,
-            self.settled_tick_frontier,
-            self.beacon_witness_root,
-            self.beacon_witness_leaf_count,
-            self.beacon_witness_base,
-            self.reveal_chain,
-            self.split_child_roots,
-            self.terminal_roots,
-            self.load,
-        )
+    pub fn into_parts(self) -> BlockHeaderParts {
+        BlockHeaderParts {
+            shard_id: self.shard_id,
+            height: self.height,
+            parent_block_hash: self.parent_block_hash,
+            parent_qc: self.parent_qc,
+            proposer: self.proposer,
+            timestamp: self.timestamp,
+            round: self.round,
+            is_fallback: self.is_fallback,
+            state_root: self.state_root,
+            transaction_root: self.transaction_root,
+            certificate_root: self.certificate_root,
+            local_receipt_root: self.local_receipt_root,
+            provision_root: self.provision_root,
+            provision_tx_roots: self.provision_tx_roots,
+            terminal_verdict_root: self.terminal_verdict_root,
+            work_in_flight: self.work_in_flight,
+            settled_tick_frontier: self.settled_tick_frontier,
+            sweep_frontier: self.sweep_frontier,
+            beacon_witness_root: self.beacon_witness_root,
+            beacon_witness_leaf_count: self.beacon_witness_leaf_count,
+            beacon_witness_base: self.beacon_witness_base,
+            reveal_chain: self.reveal_chain,
+            split_child_roots: self.split_child_roots,
+            terminal_roots: self.terminal_roots,
+            load: self.load,
+        }
     }
 
     /// Compute hash of this block header.
@@ -1001,56 +1013,10 @@ mod tests {
             left: StateRoot::from_raw(Hash::from_bytes(b"left")),
             right: StateRoot::from_raw(Hash::from_bytes(b"right")),
         };
-        let (
-            shard_id,
-            height,
-            parent_block_hash,
-            parent_qc,
-            proposer,
-            timestamp,
-            round,
-            is_fallback,
-            state_root,
-            transaction_root,
-            certificate_root,
-            local_receipt_root,
-            provision_root,
-            provision_tx_roots,
-            terminal_verdict_root,
-            in_flight,
-            settled_tick_frontier,
-            beacon_witness_root,
-            beacon_witness_leaf_count,
-            beacon_witness_base,
-            reveal_chain,
-            _,
-            _,
-            _,
-        ) = bare.clone().into_parts();
+        let bare_parts = bare.clone().into_parts();
         let carrying = BlockHeader::new(BlockHeaderParts {
-            shard_id,
-            height,
-            parent_block_hash,
-            parent_qc,
-            proposer,
-            timestamp,
-            round,
-            is_fallback,
-            state_root,
-            transaction_root,
-            certificate_root,
-            local_receipt_root,
-            provision_root,
-            provision_tx_roots: provision_tx_roots.iter().map(|(k, v)| (*k, *v)).collect(),
-            terminal_verdict_root,
-            work_in_flight: in_flight,
-            settled_tick_frontier,
-            beacon_witness_root,
-            beacon_witness_leaf_count,
-            beacon_witness_base,
-            reveal_chain,
             split_child_roots: Some(pair),
-            ..Default::default()
+            ..bare_parts
         });
 
         let decoded: BlockHeader = hbor_from_slice(&hbor_to_vec(&carrying).unwrap()).unwrap();

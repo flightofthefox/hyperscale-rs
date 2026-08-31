@@ -19,7 +19,7 @@ use hyperscale_hbor::Hbor;
 use hyperscale_jmt::{Blake3Hasher, Hasher};
 use thiserror::Error;
 
-use crate::{Hash, StateRoot, TerminalRoots, Verified, Verify};
+use crate::{Hash, StateRoot, SweepFrontier, TerminalRoots, Verified, Verify};
 
 /// The two child hashes of the JMT root node behind a header's
 /// `state_root` — `r_p0` / `r_p1` for a shard whose split executes at the
@@ -101,6 +101,21 @@ pub enum StateRootVerifyError {
         expected: StateRoot,
         /// Root produced by replaying receipts against the JMT.
         computed: StateRoot,
+    },
+
+    /// The header's sweep frontier is not the one the block's own
+    /// interval produces.
+    ///
+    /// Short of it is a sweep the proposer declined to finish, which is
+    /// the equilibrium the obligation exists to break — a removal earns
+    /// no fee and costs block space. Past it reaches cells the block's
+    /// clock does not yet allow.
+    #[error("computed sweep frontier {computed:?} ≠ claimed {expected:?}")]
+    SweepFrontierMismatch {
+        /// Header's claimed frontier.
+        expected: SweepFrontier,
+        /// Frontier the walk over the block's own interval lands on.
+        computed: SweepFrontier,
     },
 
     /// The block's window is the split-pending shard's final epoch, but

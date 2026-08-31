@@ -730,32 +730,8 @@ fn live_certify(
 /// so fixtures that want a committed block "at time T" must carry T there.
 fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) -> Block {
     let restamp = |header: BlockHeader| -> BlockHeader {
-        let (
-            shard_id,
-            height,
-            parent_block_hash,
-            parent_qc,
-            proposer,
-            timestamp,
-            round,
-            is_fallback,
-            state_root,
-            transaction_root,
-            certificate_root,
-            local_receipt_root,
-            provision_root,
-            provision_tx_roots,
-            terminal_verdict_root,
-            in_flight,
-            settled_tick_frontier,
-            beacon_witness_root,
-            beacon_witness_leaf_count,
-            beacon_witness_base,
-            reveal_chain,
-            split_child_roots,
-            terminal_roots,
-            load,
-        ) = header.into_parts();
+        let parts = header.into_parts();
+        let parent_qc = parts.parent_qc.clone();
         let pqc = parent_qc.as_unverified();
         let stamped = QuorumCertificate::new(
             pqc.block_hash(),
@@ -768,30 +744,8 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             WeightedTimestamp::from_millis(weighted_timestamp_ms),
         );
         BlockHeader::new(BlockHeaderParts {
-            shard_id,
-            height,
-            parent_block_hash,
             parent_qc: stamped.into(),
-            proposer,
-            timestamp,
-            round,
-            is_fallback,
-            state_root,
-            transaction_root,
-            certificate_root,
-            local_receipt_root,
-            provision_root,
-            provision_tx_roots,
-            terminal_verdict_root,
-            work_in_flight: in_flight,
-            settled_tick_frontier,
-            beacon_witness_root,
-            beacon_witness_leaf_count,
-            beacon_witness_base,
-            reveal_chain,
-            split_child_roots,
-            terminal_roots,
-            load,
+            ..parts
         })
     };
     match block {

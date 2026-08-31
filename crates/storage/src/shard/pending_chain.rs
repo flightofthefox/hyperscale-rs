@@ -13,16 +13,17 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
     ConsensusReceipt, DeclaredRange, EntryKey, ExecutionCertificate, Finalization,
     FinalizationHash, QuorumCertificate, RETENTION_HORIZON, ShardId, ShardWitnessPayload,
-    StateRoot, SubstateKey, TerminalRoots, TickId, Transaction, TxHash, Verifiable, Verified,
-    WeightedTimestamp, committed_txs_root_from_hashes, local_settled_tx_hashes,
+    StateRoot, SubstateKey, SweepFrontier, TerminalRoots, TickId, Transaction, TxHash, Verifiable,
+    Verified, WeightedTimestamp, committed_txs_root_from_hashes, local_settled_tx_hashes,
     settled_txs_root_from_hashes,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
 use crate::lock_recover::{lock_or_recover, read_or_recover, write_or_recover};
 use crate::{
-    Anchored, BlockForSync, JmtSnapshot, ShardChainReader, SubstateStore, Substates,
+    Anchored, BlockForSync, JmtSnapshot, ShardChainReader, SubstateStore, Substates, SweepIndex,
     VersionedStore, entry_overlay_range, merge_entry_overlay, merge_entry_overlay_with,
+    merge_sweep_overlay,
 };
 
 /// Cached base-storage reads observed through a [`SubstateView`].
@@ -980,6 +981,29 @@ impl<Snap: Substates> Substates for ViewSnapshot<Snap> {
 impl<Snap: Substates> Anchored for ViewSnapshot<Snap> {
     fn anchor(&self) -> BlockHeight {
         self.anchor
+    }
+}
+
+impl<S: SubstateStore + VersionedStore + SweepIndex> SweepIndex for SubstateView<S> {
+    fn sweep_candidates(
+        &self,
+        frontier: SweepFrontier,
+        ceiling: SweepFrontier,
+        limit: usize,
+    ) -> Vec<(SubstateKey, u64)> {
+        // Resolved through the overlay, never against the persisted
+        // store. Those differ, and both directions move the state root:
+        // a cell an unpersisted ancestor created reads as absent, so a
+        // removal the chain owes goes unmade; a cell one retired reads
+        // as live, so a removal is made twice and the second lands on a
+        // key the tree no longer holds.
+        merge_sweep_overlay(
+            |widened| self.base.sweep_candidates(frontier, ceiling, widened),
+            self.pending_snapshots(),
+            frontier,
+            ceiling,
+            limit,
+        )
     }
 }
 

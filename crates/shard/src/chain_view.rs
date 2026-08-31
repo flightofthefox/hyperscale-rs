@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin, CommittedTip, ProvisionHash,
-    QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot, TxHash, Verified, WorkInFlight,
+    QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot, SweepFrontier, TxHash, Verified,
+    WorkInFlight,
 };
 use tracing::warn;
 
@@ -149,6 +150,23 @@ impl<'a> ChainView<'a> {
     pub fn parent_settled_frontier(&self, parent_block_hash: BlockHash) -> BlockHeight {
         self.parent_settled_frontier_checked(parent_block_hash)
             .unwrap_or(BlockHeight::GENESIS)
+    }
+
+    /// Where the parent's sweep stopped, or the chain's start when the
+    /// parent is unresolvable.
+    ///
+    /// Falling back to the start is the safe direction on both sides: a
+    /// block built on it sweeps from the bottom rather than skipping an
+    /// interval, and a verifier reaching it computes a frontier the
+    /// proposer's cannot exceed. An unresolvable parent stops the block
+    /// on other grounds long before either matters.
+    #[must_use]
+    pub fn parent_sweep_frontier(&self, parent_block_hash: BlockHash) -> SweepFrontier {
+        if let Some(header) = self.get_header(parent_block_hash) {
+            return header.sweep_frontier();
+        }
+        self.tip_if(parent_block_hash)
+            .map_or(SweepFrontier::ZERO, |tip| tip.sweep_frontier)
     }
 
     /// Attested load on the parent header — the running gas total the next

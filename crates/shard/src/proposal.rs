@@ -480,6 +480,7 @@ pub fn assemble_build_action(
     let parent_state_root = chain.parent_state_root(parent_block_hash);
     let parent_in_flight = chain.parent_in_flight(parent_block_hash);
     let parent_settled_frontier = chain.parent_settled_frontier(parent_block_hash);
+    let parent_sweep_frontier = chain.parent_sweep_frontier(parent_block_hash);
     let parent_load = chain.parent_load_checked(parent_block_hash);
 
     let (
@@ -552,6 +553,7 @@ pub fn assemble_build_action(
         fee_read_height,
         parent_in_flight,
         parent_settled_frontier,
+        parent_sweep_frontier,
         parent_load,
         substate_bytes,
         ready_signals,
