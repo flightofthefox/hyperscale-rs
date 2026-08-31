@@ -495,6 +495,7 @@ pub const fn scenario_header(validity: TimestampRange) -> IntentHeader {
         network: SCENARIO_NETWORK,
         validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
         validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
+        discriminator: 0,
     }
 }
 
@@ -512,6 +513,7 @@ pub const fn offer_header() -> IntentHeader {
         // The cap in milliseconds, which a `u64` holds with room: the
         // constant is days and the type counts to half a billion years.
         validity_end_ms: MAX_SUBINTENT_VALIDITY_RANGE.as_secs() * 1_000,
+        discriminator: 0,
     }
 }
 

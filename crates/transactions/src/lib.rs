@@ -190,6 +190,12 @@ impl Client {
                         network: self.network,
                         validity_start_ms: terms.validity.start_timestamp_inclusive.as_millis(),
                         validity_end_ms: terms.validity.end_timestamp_exclusive.as_millis(),
+                        // Only a subintent's identity becomes a
+                        // nullifier, so a root has nothing to
+                        // distinguish itself from; what keeps two
+                        // identical submissions apart is the envelope,
+                        // through `Terms::message`.
+                        discriminator: 0,
                     },
                     graph,
                     sockets: Vec::new(),

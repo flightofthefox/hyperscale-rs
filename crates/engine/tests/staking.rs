@@ -47,6 +47,7 @@ const HEADER: IntentHeader = IntentHeader {
     network: NETWORK,
     validity_start_ms: 0,
     validity_end_ms: OFFER_MS,
+    discriminator: 0,
 };
 
 /// The identifier the beacon folds the seated pool under.
