@@ -18,7 +18,7 @@ use hyperscale_types::{
     LocalReceiptRootVerifyError, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
     PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
     Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate,
-    RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal, Round,
+    RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal, Refusal, Round,
     ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg,
     SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
     SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError, StoredReceipt, TickId,
@@ -788,6 +788,20 @@ pub enum ProtocolEvent {
         source_shard: ShardId,
         /// The parked source height.
         block_height: BlockHeight,
+    },
+
+    /// The execution coordinator mirrored a core shard's refusal of a
+    /// transaction a leg here issued for, off its verified certificate.
+    /// The shard coordinator records it for the vote fence, which checks
+    /// a `Refused` abandonment record against exactly this, and re-drives
+    /// the votes that deferred for want of it.
+    RefusalObserved {
+        /// The refusing core shard.
+        shard: ShardId,
+        /// The transaction it refused.
+        tx_hash: TxHash,
+        /// The refusal as mirrored.
+        refusal: Refusal,
     },
 
     /// The `io_loop`'s settled-set acquisition verified a past-terminal

@@ -166,6 +166,21 @@ impl Unsettleable {
     }
 }
 
+/// A core shard's refusal of a transaction a leg here issued for, as
+/// mirrored off its signature-verified certificate.
+///
+/// What a `Refused` record restates and what a voter checks it against:
+/// the anchor the refusing certificate carried, and the transaction's
+/// own deadline, which is the clock the mirror lives on — a refusal is
+/// held exactly as long as the leg entry it licenses a reclaim of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refusal {
+    /// The weighted timestamp of the refusing certificate's anchor.
+    pub refused_wt: WeightedTimestamp,
+    /// The refused transaction's deadline, as the leg's ledger holds it.
+    pub deadline: WeightedTimestamp,
+}
+
 /// One counterpart's unsettleable remainder, as this chain sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct AbandonmentRecord {
@@ -209,6 +224,16 @@ impl AbandonmentRecord {
         unsettled: impl IntoIterator<Item = UnsettledTx>,
     ) -> Self {
         Self::new(shard, Unsettleable::Departed { terminal_wt }, unsettled)
+    }
+
+    /// A record over what `shard`, a core, refused at `refused_wt`.
+    #[must_use]
+    pub fn refused(
+        shard: ShardId,
+        refused_wt: WeightedTimestamp,
+        unsettled: impl IntoIterator<Item = UnsettledTx>,
+    ) -> Self {
+        Self::new(shard, Unsettleable::Refused { refused_wt }, unsettled)
     }
 
     /// The counterpart shard.

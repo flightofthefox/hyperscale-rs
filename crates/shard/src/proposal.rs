@@ -22,7 +22,8 @@ use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash,
     LocalTimestamp, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger,
     RevealChain, Round, ShardId, TopologySchedule, TopologySnapshot, Transaction, TxHash,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp, sweep_admits_block,
+    Unsettleable, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    sweep_admits_block,
 };
 use tracing::debug;
 
@@ -340,14 +341,48 @@ pub fn select_finalizations(
 /// depth: without this the proposer offers a record every voter refuses,
 /// and because a chain that commits nothing never advances the frontier
 /// that would retire the set, the next proposal carries it again.
+///
+/// Only a departure is held to that window. A refusal names a live
+/// shard, which is never inside a terminal window: holding it to one
+/// would refuse every refusal record ever composed.
+///
+/// A record also loses every name a finalization selected for this
+/// block resolves, or one the chain already resolved — the same names
+/// the vote refuses a record for — and a record left with none is
+/// dropped. Without this the proposer offers a record every voter
+/// refuses, and offers it again next block.
 pub fn select_abandonment_records(
     verdicts: Vec<AbandonmentRecord>,
     topology_schedule: &TopologySchedule,
     anchor_wt: WeightedTimestamp,
+    finalizations: &[Arc<Verifiable<Finalization>>],
+    qc_chain_resolved_txs: &HashSet<TxHash>,
+    dedup_index: &CommitDedupIndex,
 ) -> Vec<AbandonmentRecord> {
+    let resolved_here: HashSet<TxHash> = finalizations
+        .iter()
+        .flat_map(|fw| fw.deciding_tx_hashes())
+        .collect();
     verdicts
         .into_iter()
-        .filter(|verdict| topology_schedule.terminal_evidence_readable(verdict.shard(), anchor_wt))
+        .filter(|verdict| {
+            !matches!(verdict.evidence(), Unsettleable::Departed { .. })
+                || topology_schedule.terminal_evidence_readable(verdict.shard(), anchor_wt)
+        })
+        .filter_map(|verdict| {
+            let kept: Vec<UnsettledTx> = verdict
+                .unsettled()
+                .iter()
+                .filter(|entry| {
+                    !resolved_here.contains(&entry.tx_hash)
+                        && !qc_chain_resolved_txs.contains(&entry.tx_hash)
+                        && !dedup_index.contains_resolved_tx(&entry.tx_hash)
+                })
+                .copied()
+                .collect();
+            (!kept.is_empty())
+                .then(|| AbandonmentRecord::new(verdict.shard(), verdict.evidence(), kept))
+        })
         .collect()
 }
 
@@ -638,6 +673,59 @@ mod tests {
 
     use super::*;
 
+    const DEPARTED: ShardId = ShardId::leaf(1, 0);
+    const SURVIVOR: ShardId = ShardId::leaf(1, 1);
+
+    /// A schedule in which `DEPARTED` left at a cut, with its handoff
+    /// stamped complete at `handoff_complete` or still open.
+    fn departed_schedule(handoff_complete: Option<Epoch>) -> TopologySchedule {
+        use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+        use hyperscale_types::{ShardAnchor, StateRoot};
+
+        let mut boundaries = HashMap::new();
+        boundaries.insert(
+            DEPARTED,
+            ShardAnchor {
+                state_root: StateRoot::ZERO,
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"terminal")),
+                height: BlockHeight::new(9),
+                weighted_timestamp: WeightedTimestamp::from_millis(2_000),
+                witness_base: BeaconWitnessLeafCount::ZERO,
+                terminal_roots: None,
+                handoff_complete,
+            },
+        );
+        let snapshot = Arc::new(TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &ValidatorSet::new(Vec::new()),
+            std::iter::once((SURVIVOR, Vec::new())).collect(),
+            HashMap::new(),
+            boundaries,
+            HashMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        ));
+        let mut sched = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&snapshot));
+        for epoch in 1..=20u64 {
+            sched.insert(Epoch::new(epoch), Arc::clone(&snapshot));
+        }
+        sched.set_head(snapshot);
+        sched
+    }
+
+    /// The one name the record fixtures carry.
+    fn stranded() -> UnsettledTx {
+        UnsettledTx {
+            tx_hash: TxHash::from(Hash::from_bytes(b"stranded")),
+            deadline: WeightedTimestamp::from_millis(5_000),
+            declared_work: 3,
+            charge: stub_abort_charge(3),
+        }
+    }
+
     /// A boundary record is offered only while the vote can still accept
     /// it. The vote reads the block's own anchor, which runs ahead of the
     /// committed frontier the composing side holds its evidence against,
@@ -645,64 +733,25 @@ mod tests {
     /// handoff-anchored evidence window the fence itself derives.
     #[test]
     fn select_abandonment_records_stops_at_the_evidence_expiry() {
-        use std::collections::{BTreeMap, BTreeSet, HashMap};
-
-        use hyperscale_types::{
-            NetworkDefinition, ShardAnchor, StateRoot, TopologySchedule, ValidatorSet,
-        };
-
-        let departed = ShardId::leaf(1, 0);
-        let survivor = ShardId::leaf(1, 1);
-        let schedule = |handoff_complete: Option<Epoch>| {
-            let mut boundaries = HashMap::new();
-            boundaries.insert(
-                departed,
-                ShardAnchor {
-                    state_root: StateRoot::ZERO,
-                    block_hash: BlockHash::from_raw(Hash::from_bytes(b"terminal")),
-                    height: BlockHeight::new(9),
-                    weighted_timestamp: WeightedTimestamp::from_millis(2_000),
-                    witness_base: BeaconWitnessLeafCount::ZERO,
-                    terminal_roots: None,
-                    handoff_complete,
-                },
-            );
-            let snapshot = Arc::new(TopologySnapshot::from_explicit_committees(
-                NetworkDefinition::simulator(),
-                &ValidatorSet::new(Vec::new()),
-                std::iter::once((survivor, Vec::new())).collect(),
-                HashMap::new(),
-                boundaries,
-                HashMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeSet::new(),
-            ));
-            let mut sched = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&snapshot));
-            for epoch in 1..=20u64 {
-                sched.insert(Epoch::new(epoch), Arc::clone(&snapshot));
-            }
-            sched.set_head(snapshot);
-            sched
-        };
-
         let record = AbandonmentRecord::departed(
-            departed,
+            DEPARTED,
             WeightedTimestamp::from_millis(2_000),
-            [UnsettledTx {
-                tx_hash: TxHash::from(Hash::from_bytes(b"stranded")),
-                deadline: WeightedTimestamp::from_millis(5_000),
-                declared_work: 3,
-                charge: stub_abort_charge(3),
-            }],
+            [stranded()],
         );
         let offered = |sched: &TopologySchedule, anchor: WeightedTimestamp| {
-            select_abandonment_records(vec![record.clone()], sched, anchor).len()
+            select_abandonment_records(
+                vec![record.clone()],
+                sched,
+                anchor,
+                &[],
+                &HashSet::new(),
+                &CommitDedupIndex::new(),
+            )
+            .len()
         };
 
         let handoff = Epoch::new(4);
-        let stamped = schedule(Some(handoff));
+        let stamped = departed_schedule(Some(handoff));
         let expiry = stamped.windows().handoff_evidence_expiry(handoff);
         assert_eq!(offered(&stamped, expiry), 1, "to the last instant of it");
         assert_eq!(
@@ -711,11 +760,60 @@ mod tests {
             "past it every voter refuses the claim, so it must not be offered",
         );
 
-        let open = schedule(None);
+        let open = departed_schedule(None);
         assert_eq!(
             offered(&open, expiry.plus(Duration::from_millis(1))),
             1,
             "an unstamped handoff holds the window open however late the anchor",
+        );
+    }
+
+    /// A refusal names a live shard and is held to no evidence window;
+    /// and any record loses the names a finalization in the same block
+    /// resolves, an emptied one being dropped rather than offered.
+    #[test]
+    fn a_refusal_is_offered_past_the_window_and_stripped_of_what_the_block_resolves() {
+        let handoff = Epoch::new(4);
+        let stamped = departed_schedule(Some(handoff));
+        let past = stamped
+            .windows()
+            .handoff_evidence_expiry(handoff)
+            .plus(Duration::from_millis(1));
+        let refused = AbandonmentRecord::refused(
+            DEPARTED,
+            WeightedTimestamp::from_millis(2_000),
+            [stranded()],
+        );
+        assert_eq!(
+            select_abandonment_records(
+                vec![refused.clone()],
+                &stamped,
+                past,
+                &[],
+                &HashSet::new(),
+                &CommitDedupIndex::new(),
+            )
+            .len(),
+            1,
+            "a refusal names a live shard and is held to no window",
+        );
+
+        let resolving = Arc::new(Verifiable::from(make_finalization(
+            BlockHeight::new(1),
+            stranded().tx_hash,
+            TransactionDecision::Accept,
+        )));
+        assert!(
+            select_abandonment_records(
+                vec![refused],
+                &stamped,
+                past,
+                &[resolving],
+                &HashSet::new(),
+                &CommitDedupIndex::new(),
+            )
+            .is_empty(),
+            "a name this block resolves is stripped, and an emptied record is dropped",
         );
     }
 

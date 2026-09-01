@@ -95,10 +95,10 @@ use hyperscale_types::{
     LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, MAX_VALIDITY_RANGE,
     PredecessorTerminal, ProvisionRootVerifyError, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext, QcVerifyError,
-    QuorumCertificate, RecoveryCause, Round, SafeVoteRegisters, StateRoot, StateRootVerifyError,
-    Timeout, TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TxHash,
-    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
-    derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
+    QuorumCertificate, RecoveryCause, Refusal, Round, SafeVoteRegisters, StateRoot,
+    StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, Transaction,
+    TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier,
+    Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -441,6 +441,12 @@ pub struct ShardCoordinator {
     /// settled the tick. Populated by the settled-transaction acquisition via
     /// [`Self::record_settled_txs`].
     settled_sets: HashMap<ShardId, SettledTxSet>,
+    /// Core shards' refusals of transactions legs here issued for, as
+    /// the execution coordinator mirrored them off verified
+    /// certificates. A `Refused` abandonment record is checked against
+    /// this and nothing else: equality on the anchor, and a voter holding
+    /// no mirror defers. Each lives to its transaction's horizon.
+    refusals: HashMap<(TxHash, ShardId), Refusal>,
 }
 
 impl std::fmt::Debug for ShardCoordinator {
@@ -584,6 +590,7 @@ impl ShardCoordinator {
             chain_origin: recovered.chain_origin,
             precut: Precut::succeeding(recovered.predecessors),
             settled_sets: HashMap::new(),
+            refusals: HashMap::new(),
         }
     }
 
@@ -858,6 +865,12 @@ impl ShardCoordinator {
         self.settled_sets.insert(shard, settled);
     }
 
+    /// Record a core shard's refusal for the vote fence. First-write-wins:
+    /// a core refuses a transaction once, under one certificate.
+    pub fn record_refusal(&mut self, shard: ShardId, tx_hash: TxHash, refusal: Refusal) {
+        self.refusals.entry((tx_hash, shard)).or_insert(refusal);
+    }
+
     /// Drop settled-transaction sets past their evidence window. Once the
     /// committed chain advances beyond it, the fence rejects any tick
     /// naming the shard regardless of the set, so retaining it only leaks
@@ -866,6 +879,11 @@ impl ShardCoordinator {
         let now = self.committed_block_anchor_wt;
         self.settled_sets
             .retain(|shard, _| topology_schedule.terminal_evidence_readable(*shard, now));
+        // A refusal lives as long as the leg entry it licenses a reclaim
+        // of: the transaction's deadline plus the room to commit the
+        // record, past which nothing is offered against it.
+        self.refusals
+            .retain(|_, refusal| now < refusal.deadline.plus(MAX_VALIDITY_RANGE));
     }
 
     /// The settled-transaction set this validator has acquired for a terminated
@@ -1020,6 +1038,89 @@ impl ShardCoordinator {
         }
     }
 
+    /// Whether one record's evidence stands for this validator, on the
+    /// arm it carries. A departure is checked against the schedule; a
+    /// refusal against this validator's own mirror of the core's
+    /// certificate, equality on the anchor; an absence against evidence
+    /// this fence does not hold. A voter that cannot check defers, which
+    /// is the same answer as a refusal here: not this vote.
+    fn record_evidence_stands(
+        &self,
+        topology_schedule: &TopologySchedule,
+        block_hash: BlockHash,
+        anchored_wt: WeightedTimestamp,
+        verdict: &AbandonmentRecord,
+    ) -> bool {
+        match verdict.evidence() {
+            // A departure is checked against the schedule here and
+            // the settled set below.
+            Unsettleable::Departed { terminal_wt } => {
+                let scheduled =
+                    topology_schedule.terminal_cut_for_shard(verdict.shard(), anchored_wt);
+                if scheduled != Some(terminal_wt) {
+                    warn!(
+                        validator = ?self.me,
+                        block_hash = ?block_hash,
+                        shard = ?verdict.shard(),
+                        claimed = ?terminal_wt,
+                        ?scheduled,
+                        "Abandonment record names a departure the schedule does not attest — \
+                         not voting"
+                    );
+                    return false;
+                }
+            }
+            // A refusal is checked against this validator's own mirror
+            // of the core's certificate: equality on the anchor. A
+            // voter holding no mirror cannot say and defers; one whose
+            // mirror disagrees refuses.
+            Unsettleable::Refused { refused_wt } => {
+                for entry in verdict.unsettled() {
+                    match self.refusals.get(&(entry.tx_hash, verdict.shard())) {
+                        Some(mirrored) if mirrored.refused_wt == refused_wt => {}
+                        Some(mirrored) => {
+                            warn!(
+                                validator = ?self.me,
+                                block_hash = ?block_hash,
+                                shard = ?verdict.shard(),
+                                tx_hash = ?entry.tx_hash,
+                                claimed = ?refused_wt,
+                                mirrored = ?mirrored.refused_wt,
+                                "Abandonment record restates a refusal at an anchor this \
+                                 validator did not see — not voting"
+                            );
+                            return false;
+                        }
+                        None => {
+                            trace!(
+                                validator = ?self.me,
+                                block_hash = ?block_hash,
+                                shard = ?verdict.shard(),
+                                tx_hash = ?entry.tx_hash,
+                                "Abandonment record restates a refusal this validator has not \
+                                 mirrored; deferring"
+                            );
+                            return false;
+                        }
+                    }
+                }
+            }
+            // An absence is checked against evidence this fence does
+            // not hold, and a voter that cannot check a record's
+            // evidence defers rather than accepting.
+            Unsettleable::Unclaimed { .. } => {
+                trace!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    shard = ?verdict.shard(),
+                    "Abandonment record carries evidence this fence cannot check; deferring"
+                );
+                return false;
+            }
+        }
+        true
+    }
+
     /// Whether the block's abandonment records are ones this voter
     /// can attest to, and so whether voting on it must be withheld.
     ///
@@ -1060,30 +1161,7 @@ impl ShardCoordinator {
         }
         let anchored_wt = block.header().parent_qc().weighted_timestamp();
         for verdict in block.abandonment_records() {
-            // A departure is checked against the schedule and the settled
-            // set below. A refusal or an absence is checked against
-            // evidence this fence does not hold, and a voter that cannot
-            // check a record's evidence defers rather than accepting.
-            let Unsettleable::Departed { terminal_wt } = verdict.evidence() else {
-                trace!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    shard = ?verdict.shard(),
-                    "Abandonment record carries evidence this fence cannot check; deferring"
-                );
-                return true;
-            };
-            let scheduled = topology_schedule.terminal_cut_for_shard(verdict.shard(), anchored_wt);
-            if scheduled != Some(terminal_wt) {
-                warn!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    shard = ?verdict.shard(),
-                    claimed = ?terminal_wt,
-                    ?scheduled,
-                    "Abandonment record names a departure the schedule does not attest — \
-                     not voting"
-                );
+            if !self.record_evidence_stands(topology_schedule, block_hash, anchored_wt, verdict) {
                 return true;
             }
         }
@@ -1120,11 +1198,18 @@ impl ShardCoordinator {
                 }
             }
         }
-        let claims = block.abandonment_records().iter().flat_map(|verdict| {
-            verdict
-                .tx_hashes()
-                .map(move |tx_hash| (verdict.shard(), tx_hash, TxClaim::Abandoned))
-        });
+        // Only a departure is a claim about a settled set; a refusal is a
+        // claim about a live shard, which is never inside a terminal
+        // window and has no set to check against.
+        let claims = block
+            .abandonment_records()
+            .iter()
+            .filter(|verdict| matches!(verdict.evidence(), Unsettleable::Departed { .. }))
+            .flat_map(|verdict| {
+                verdict
+                    .tx_hashes()
+                    .map(move |tx_hash| (verdict.shard(), tx_hash, TxClaim::Abandoned))
+            });
         match settled_set_verdict(
             &self.settled_sets,
             topology_schedule,
@@ -1871,6 +1956,39 @@ impl ShardCoordinator {
     // Proposer Logic
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /// What the block resolves: the finalizations it can carry, and the
+    /// abandonment records beside them — held to the same set of names
+    /// the chain already resolved, and to each other, so no record asks
+    /// for a second verdict on a name a finalization in the same block
+    /// settles.
+    fn select_resolutions(
+        &self,
+        topology_schedule: &TopologySchedule,
+        parent_block_hash: BlockHash,
+        validity_anchor: WeightedTimestamp,
+        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        abandonment_records: Vec<AbandonmentRecord>,
+    ) -> (Vec<Arc<Verifiable<Finalization>>>, Vec<AbandonmentRecord>) {
+        let qc_chain_resolved_txs = self.chain_view().ancestor_resolved_txs(parent_block_hash);
+        let (finalizations, _finalized_tx_count) = select_finalizations(
+            finalizations,
+            &qc_chain_resolved_txs,
+            &self.dedup_index,
+            self.chain_view().parent_settled_frontier(parent_block_hash),
+            MAX_FINALIZED_TX_PER_BLOCK,
+            self.chain_origin.anchor_wt,
+        );
+        let abandonment_records = select_abandonment_records(
+            abandonment_records,
+            topology_schedule,
+            validity_anchor,
+            &finalizations,
+            &qc_chain_resolved_txs,
+            &self.dedup_index,
+        );
+        (finalizations, abandonment_records)
+    }
+
     /// Try to build and broadcast a new block proposal.
     ///
     /// This is the unified proposal entry point, called from:
@@ -1980,7 +2098,6 @@ impl ShardCoordinator {
         // here to avoid repeating items across consecutive blocks.
         let (qc_chain_tx_hashes, qc_chain_provision_hashes) =
             self.collect_qc_chain_hashes(parent_block_hash);
-        let qc_chain_resolved_txs = self.chain_view().ancestor_resolved_txs(parent_block_hash);
 
         // Anchor validity-window filtering on the parent QC's weighted
         // timestamp — the deterministic clock voters will use to verify
@@ -1996,13 +2113,12 @@ impl ShardCoordinator {
             &self.precut,
             topology_schedule.head(),
         );
-        let (finalizations, _finalized_tx_count) = select_finalizations(
+        let (finalizations, abandonment_records) = self.select_resolutions(
+            topology_schedule,
+            parent_block_hash,
+            validity_anchor,
             finalizations,
-            &qc_chain_resolved_txs,
-            &self.dedup_index,
-            self.chain_view().parent_settled_frontier(parent_block_hash),
-            MAX_FINALIZED_TX_PER_BLOCK,
-            self.chain_origin.anchor_wt,
+            abandonment_records,
         );
         let provisions = select_provisions(
             provisions,
@@ -2010,8 +2126,6 @@ impl ShardCoordinator {
             &self.dedup_index,
             MAX_TXS_PER_BLOCK,
         );
-        let abandonment_records =
-            select_abandonment_records(abandonment_records, topology_schedule, validity_anchor);
         // Applied after provision selection: a cross-shard transaction
         // rides only beside (or after) its payer bundle, the engagement
         // evidence the voters' `validate_engagement` demands.
@@ -11356,24 +11470,67 @@ mod tests {
         ));
     }
 
-    /// The arms a departure check cannot answer for are deferred, not
-    /// accepted: a refusal record carries evidence this fence does not
-    /// hold.
+    /// A refusal record is checked against this validator's own mirror
+    /// of the core's certificate, and against nothing else: a matching
+    /// mirror passes it outside any terminal window, a mirror at another
+    /// anchor refuses it, and no mirror defers it.
+    #[test]
+    fn a_refusal_record_stands_or_falls_on_the_mirror() {
+        let sched = make_terminating_schedule(4);
+        let refused_wt = WeightedTimestamp::from_millis(5_000);
+        let refused = AbandonmentRecord::refused(ShardId::ROOT, refused_wt, [figures_of(b"tx")]);
+        let block = block_with_records(AFTER_CUT_MS, vec![refused]);
+        let tx_hash = figures_of(b"tx").tx_hash;
+        let mirror = |refused_wt: WeightedTimestamp| Refusal {
+            refused_wt,
+            deadline: figures_of(b"tx").deadline,
+        };
+
+        let mut matching = fence_coordinator();
+        matching.abandonment_figures.remember(figures_of(b"tx"));
+        matching.record_refusal(ShardId::ROOT, tx_hash, mirror(refused_wt));
+        assert!(
+            !matching.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
+            "a matching mirror passes it"
+        );
+
+        let mut mismatched = fence_coordinator();
+        mismatched.abandonment_figures.remember(figures_of(b"tx"));
+        mismatched.record_refusal(
+            ShardId::ROOT,
+            tx_hash,
+            mirror(WeightedTimestamp::from_millis(6_000)),
+        );
+        assert!(
+            mismatched.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
+            "a mirror at another anchor refuses it"
+        );
+
+        let mut absent = fence_coordinator();
+        absent.abandonment_figures.remember(figures_of(b"tx"));
+        assert!(
+            absent.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
+            "no mirror defers it"
+        );
+    }
+
+    /// The absence arm is checked against evidence this fence does not
+    /// hold, and is deferred rather than accepted.
     #[test]
     fn a_record_on_evidence_the_fence_cannot_check_is_deferred() {
         let mut coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         coord.abandonment_figures.remember(figures_of(b"tx"));
-        let refused = AbandonmentRecord::new(
+        let unclaimed = AbandonmentRecord::new(
             ShardId::ROOT,
-            Unsettleable::Refused {
-                refused_wt: WeightedTimestamp::from_millis(ROOT_CUT_MS),
+            Unsettleable::Unclaimed {
+                probed_wt: WeightedTimestamp::from_millis(ROOT_CUT_MS),
             },
             [figures_of(b"tx")],
         );
         assert!(coord.fence_abandonment_records(
             &sched,
-            &block_with_records(AFTER_CUT_MS, vec![refused]),
+            &block_with_records(AFTER_CUT_MS, vec![unclaimed]),
             BlockHash::ZERO,
         ));
     }

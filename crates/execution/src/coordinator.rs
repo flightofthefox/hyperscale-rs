@@ -44,13 +44,14 @@ use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::{
     AbandonmentRecord, Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight,
     BloomFilter, CertifiedBlock, DeclaredKey, Derivation, ExecutionCertificate,
-    ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationHash,
-    FinalizationVerifyError, GlobalReceiptRoot, Hash, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
-    MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, Mode, Provisions, RETENTION_HORIZON,
-    ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StoredReceipt, TickId,
-    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxHash,
-    TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp, derive_block_transactions,
-    settled_set_verdict, tick_leader, tick_leader_at,
+    ExecutionCertificateVerifyError, ExecutionOutcome, ExecutionVote, Finalization,
+    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash,
+    MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, Mode,
+    Provisions, RETENTION_HORIZON, Refusal, ScheduleLookup, SettledSetVerdict, SettledTxSet,
+    ShardId, ShardTrie, StoredReceipt, TickId, TopologySchedule, TopologySnapshot, Transaction,
+    TransactionDecision, TxClaim, TxHash, TxOutcome, UnsettledTx, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp, derive_block_transactions, settled_set_verdict, tick_leader,
+    tick_leader_at,
 };
 use tracing::instrument;
 
@@ -398,6 +399,13 @@ pub struct ExecutionCoordinator {
     /// keeps this verdict identical to the vote fence's.
     settled_sets: HashMap<ShardId, SettledTxSet>,
 
+    /// Core shards' refusals of transactions legs here issued for,
+    /// mirrored off their verified certificates as they arrive: what a
+    /// `Refused` abandonment record is offered from. Each is handed to
+    /// the vote fence the moment it is mirrored, so nothing here is
+    /// collected before it is drained. Each lives to its leg entry.
+    refusals: BTreeMap<(TxHash, ShardId), Refusal>,
+
     /// Finalizations built but withheld because a contained EC names a
     /// shard that is scheduled to terminate, or past-terminal with its
     /// settled set not yet known (the gate's `Defer`). Re-checked on every
@@ -509,6 +517,7 @@ impl ExecutionCoordinator {
             proven_remote: HashMap::new(),
             unproven_ecs: AwaitingTopologyBuffer::new(),
             settled_sets: HashMap::new(),
+            refusals: BTreeMap::new(),
             gated_finalized: BTreeMap::new(),
             me,
             local_shard,
@@ -773,7 +782,11 @@ impl ExecutionCoordinator {
             // with it outside the core set. Marked here, beside the
             // freeze, so a replay marks the same entries.
             if classified.decomposed().holds() && !classified.core().contains(&local_shard) {
-                self.unresolved.mark_leg(tx.hash(), Arc::clone(&verified));
+                self.unresolved.mark_leg(
+                    tx.hash(),
+                    Arc::clone(&verified),
+                    classified.core().clone(),
+                );
             }
             self.candidates
                 .register(verified, participating, ts, classified);
@@ -2319,6 +2332,7 @@ impl ExecutionCoordinator {
         }
         self.provisioning.advance_clock(self.committed_ts);
         self.gc_settled_sets(topology_schedule);
+        self.gc_refusals();
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
         // could still carry one is nobody's to resolve.
@@ -2683,7 +2697,10 @@ impl ExecutionCoordinator {
     #[must_use]
     pub fn pending_abandonment_records(&self) -> Vec<AbandonmentRecord> {
         let mut budget = MAX_UNSETTLED_PER_BLOCK;
-        let mut records: Vec<AbandonmentRecord> = Vec::new();
+        // One record per shard, ascending: departures first, since a
+        // departure covers everything the shard was party to, refusals
+        // then for the shards still running.
+        let mut records: BTreeMap<ShardId, AbandonmentRecord> = BTreeMap::new();
         // `settled_sets` is a hash map, so the shards are walked in sorted
         // order rather than its own: which departures the budget reaches
         // must not turn on a per-process iteration order.
@@ -2701,13 +2718,45 @@ impl ExecutionCoordinator {
                 continue;
             }
             budget -= unsettled.len();
-            records.push(AbandonmentRecord::departed(
+            records.insert(
                 shard,
-                settled.terminal_wt,
-                unsettled,
-            ));
+                AbandonmentRecord::departed(shard, settled.terminal_wt, unsettled),
+            );
         }
-        records
+        // Mirrored refusals, grouped by shard and then by the anchor the
+        // core refused at: one anchor per shard per block, earliest
+        // first, because a record spanning two anchors satisfies the
+        // fence's equality check for neither.
+        let mut refused: BTreeMap<ShardId, BTreeMap<WeightedTimestamp, Vec<UnsettledTx>>> =
+            BTreeMap::new();
+        for ((tx_hash, shard), refusal) in &self.refusals {
+            if let Some(figures) = self.unresolved.unsettled_leg_figures(*tx_hash) {
+                refused
+                    .entry(*shard)
+                    .or_default()
+                    .entry(refusal.refused_wt)
+                    .or_default()
+                    .push(figures);
+            }
+        }
+        for (shard, anchors) in refused {
+            if budget == 0 || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
+                break;
+            }
+            if records.contains_key(&shard) {
+                continue;
+            }
+            let Some((refused_wt, mut unsettled)) = anchors.into_iter().next() else {
+                continue;
+            };
+            unsettled.truncate(budget);
+            budget -= unsettled.len();
+            records.insert(
+                shard,
+                AbandonmentRecord::refused(shard, refused_wt, unsettled),
+            );
+        }
+        records.into_values().collect()
     }
 
     /// Let go of what this shard holds against transactions no shard can
@@ -2937,6 +2986,62 @@ impl ExecutionCoordinator {
     // Phase 5: Finalization
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /// Mirror what `ec` says a core refused of the transactions legs
+    /// here issued for, and hand each new refusal to the vote fence.
+    ///
+    /// Only a core's word counts: a leg elsewhere failing is its own
+    /// outcome, not the transaction's verdict, and the leg entry names
+    /// its core. First-write-wins, since a core refuses once under one
+    /// certificate. The hand-off is a continuation emitted here rather
+    /// than a map the fence reads later, so a refusal is never collected
+    /// before it is drained.
+    fn mirror_refusals(&mut self, ec: &Arc<Verified<ExecutionCertificate>>) -> Vec<Action> {
+        let shard = ec.shard_id();
+        if shard == self.local_shard {
+            return Vec::new();
+        }
+        let mut actions = Vec::new();
+        for outcome in ec.tx_outcomes() {
+            if matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }) {
+                continue;
+            }
+            let tx_hash = outcome.tx_hash();
+            if !self
+                .unresolved
+                .leg_core(tx_hash)
+                .is_some_and(|core| core.contains(&shard))
+            {
+                continue;
+            }
+            let Some(figures) = self.unresolved.unsettled_leg_figures(tx_hash) else {
+                continue;
+            };
+            let refusal = Refusal {
+                refused_wt: ec.vote_anchor_ts(),
+                deadline: figures.deadline,
+            };
+            if let std::collections::btree_map::Entry::Vacant(slot) =
+                self.refusals.entry((tx_hash, shard))
+            {
+                slot.insert(refusal);
+                actions.push(Action::Continuation(ProtocolEvent::RefusalObserved {
+                    shard,
+                    tx_hash,
+                    refusal,
+                }));
+            }
+        }
+        actions
+    }
+
+    /// Drop the mirrored refusals whose leg entries are gone — released
+    /// by the reclaim, or dropped at their horizon.
+    fn gc_refusals(&mut self) {
+        let unresolved = &self.unresolved;
+        self.refusals
+            .retain(|(tx_hash, _), _| unresolved.contains(*tx_hash));
+    }
+
     /// Handle a tick-level attestation (execution certificate) from any shard.
     ///
     /// A remote EC's `tick_id` reflects the remote shard's tick composition,
@@ -2953,20 +3058,25 @@ impl ExecutionCoordinator {
         topology_schedule: &TopologySchedule,
         ec: &Arc<Verified<ExecutionCertificate>>,
     ) -> Vec<Action> {
+        // What a core says of a transaction a leg here issued for is
+        // read before routing: the leg's tick settled long ago, so the
+        // certificate routes nowhere, and the refusal is the one thing
+        // in it this shard still has a use for.
+        let mut actions = self.mirror_refusals(ec);
+
         let routing = self.ticks.classify_attestation(ec);
 
         self.early.clear_routed(ec, &routing.routed_tx_hashes);
         self.early.buffer_ec(ec, &routing.unrouted_tx_hashes);
 
         if routing.affected_ticks.is_empty() {
-            return vec![];
+            return actions;
         }
 
         // Feed the EC to each affected local tick. Completion requires both
         // the local EC and all remote shards' coverage (aborted txs are
         // terminal-covered). Once `local_ec_emitted` is true, every tx
         // already has an outcome and a matching receipt in the cache.
-        let mut actions = Vec::new();
         for tick_id in &routing.affected_ticks {
             let Some(tick) = self.ticks.get_tick_mut(tick_id) else {
                 continue;
@@ -6951,6 +7061,7 @@ mod tests {
         state.unresolved.mark_leg(
             tx_hash,
             Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+            BTreeSet::from([PEER]),
         );
         state.unresolved.certify(tx_hash);
         state
@@ -6995,6 +7106,100 @@ mod tests {
             state.unresolved.reclaimable().is_empty(),
             "and the ledger has handed it to the tick"
         );
+    }
+
+    /// A core's refusal of a transaction a leg here issued for is
+    /// mirrored off its certificate and handed to the vote fence, and a
+    /// `Refused` record is offered from it under the certificate's own
+    /// anchor. A second copy adds nothing, and a success mirrors nothing.
+    #[test]
+    fn a_cores_refusal_of_a_leg_is_mirrored_and_offered() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        state.unresolved.register_committed(
+            HOME,
+            WeightedTimestamp::ZERO,
+            std::iter::once(&transaction),
+        );
+        state.unresolved.mark_leg(
+            tx_hash,
+            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+            BTreeSet::from([PEER]),
+        );
+        state.unresolved.certify(tx_hash);
+
+        let certificate = |outcome: ExecutionOutcome| {
+            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+                TickId::new(PEER, BlockHeight::new(3)),
+                WeightedTimestamp::from_millis(7_000),
+                GlobalReceiptRoot::ZERO,
+                vec![TxOutcome::new(tx_hash, outcome)],
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            )))
+        };
+        let actions = state.handle_attestation(&schedule, &certificate(ExecutionOutcome::Failed));
+        let observed = actions.iter().find_map(|action| match action {
+            Action::Continuation(ProtocolEvent::RefusalObserved {
+                shard,
+                tx_hash: observed,
+                refusal,
+            }) if *shard == PEER && *observed == tx_hash => Some(*refusal),
+            _ => None,
+        });
+        assert_eq!(
+            observed,
+            Some(Refusal {
+                refused_wt: WeightedTimestamp::from_millis(7_000),
+                deadline: UnsettledTx::for_transaction(&transaction).deadline,
+            }),
+            "the refusal reaches the vote fence"
+        );
+        assert_eq!(
+            state.pending_abandonment_records(),
+            vec![AbandonmentRecord::refused(
+                PEER,
+                WeightedTimestamp::from_millis(7_000),
+                [UnsettledTx::for_transaction(&transaction)],
+            )],
+            "and a record is offered under the certificate's anchor"
+        );
+        let again = state.handle_attestation(&schedule, &certificate(ExecutionOutcome::Failed));
+        assert!(
+            !again
+                .iter()
+                .any(|action| matches!(action, Action::Continuation(_))),
+            "a second copy adds nothing"
+        );
+
+        let mut accepting = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        accepting.unresolved.register_committed(
+            HOME,
+            WeightedTimestamp::ZERO,
+            std::iter::once(&transaction),
+        );
+        accepting.unresolved.mark_leg(
+            tx_hash,
+            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+            BTreeSet::from([PEER]),
+        );
+        let actions = accepting.handle_attestation(
+            &schedule,
+            &certificate(ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            }),
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::Continuation(_))),
+            "a success is not a refusal"
+        );
+        assert!(accepting.pending_abandonment_records().is_empty());
     }
 
     /// Before its deadline a transaction is merely slow, and nothing

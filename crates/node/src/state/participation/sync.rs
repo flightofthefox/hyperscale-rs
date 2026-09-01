@@ -87,6 +87,20 @@ impl ShardParticipation {
                 );
                 actions
             }
+            // A core shard refused a transaction a leg here issued for:
+            // the vote fence checks a refusal record against this mirror,
+            // so record it and re-drive the votes that deferred without
+            // it.
+            ProtocolEvent::RefusalObserved {
+                shard,
+                tx_hash,
+                refusal,
+            } => {
+                self.shard_coordinator
+                    .record_refusal(shard, tx_hash, refusal);
+                self.shard_coordinator
+                    .redrive_pending_votes(topology_schedule)
+            }
             // A predecessor answered which of the queried transactions it
             // committed. Record the answers, then re-drive the votes that
             // deferred for want of them and the proposal that was
