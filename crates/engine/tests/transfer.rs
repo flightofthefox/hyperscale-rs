@@ -2,7 +2,7 @@
 //! derivation, the batch executor, and the movement fold, against a
 //! genesis-seeded snapshot.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key};
@@ -11,6 +11,9 @@ use hyperscale_effects_bridge::{
 };
 use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
+};
+use hyperscale_engine::legs::{
+    Decomposed, Placement, PlanDefect, core_shards, crossings_of, decomposes, plan_for_shard,
 };
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
@@ -25,11 +28,11 @@ use hyperscale_storage::{
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt,
-    DeclaredRange, Ed25519PrivateKey, EnvelopeExt, EpochWindows, EventExt, EventRoot,
-    GlobalReceipt, Hash, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PrincipalAddr, ProvisionalHolds,
-    SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey,
-    TimestampRange, Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
-    absorb_committed_cells, compute_merkle_root,
+    DeclaredRange, Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt,
+    EventRoot, GlobalReceipt, Hash, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PrincipalAddr,
+    ProvisionalHolds, SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites,
+    SubstateKey, TimestampRange, Transaction, TransactionBody, TransactionEnvelope, Verified,
+    WeightedTimestamp, absorb_committed_cells, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
     AbiParam, Composed, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader, PackageHash,
@@ -1211,6 +1214,68 @@ fn an_event_lands_only_on_its_emitters_home_shard() {
     );
 }
 
+/// A real transfer divides as the classifier says: the sender's shard
+/// runs the sign-in and the withdraw and issues one crossing from the
+/// withdraw's reserved vault; the recipient's shard runs the deposit
+/// against that crossing's attested value, and cannot plan without it.
+#[test]
+fn a_transfer_plans_one_leg_each_side_of_the_trie() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let leaving = BTreeSet::new();
+    let divided = decomposes(tx.legs(), Placement::new(&trie, &leaving));
+    assert!(divided.holds(), "a transfer decomposes");
+    assert_eq!(core_shards(tx.legs(), &trie), BTreeSet::from([near_shard]));
+
+    let edges = crossings_of(tx.legs(), tx.crossings(), divided, &trie);
+    assert_eq!(edges.len(), 1, "one value edge crosses");
+    let edge = &edges[0];
+    assert_eq!(edge.from, near_shard);
+    assert_eq!(edge.to, BTreeSet::from([far_shard]));
+
+    let sender = plan_for_shard(tx.legs(), tx.crossings(), &[], divided, &trie, near_shard)
+        .expect("the sender's legs take no arrival");
+    assert!(!sender.legs.is_whole());
+    assert_eq!(
+        sender
+            .legs
+            .departing(edge.node, edge.output)
+            .map(|departure| departure.origin),
+        Some(vault_key(alice(), *XRD)),
+        "the withdraw departs from the sender's vault",
+    );
+    assert!(sender.scope.covers(alice()) && !sender.scope.covers(far()));
+
+    let arrived = EscrowedValue {
+        node: edge.node,
+        output: edge.output,
+        resource: *XRD,
+        amount: 100,
+    };
+    let recipient = plan_for_shard(
+        tx.legs(),
+        tx.crossings(),
+        std::slice::from_ref(&arrived),
+        divided,
+        &trie,
+        far_shard,
+    )
+    .expect("the recipient's leg has its arrival");
+    assert!(recipient.legs.arrival(edge.node, edge.output).is_some());
+    assert!(recipient.legs.departing(edge.node, edge.output).is_none());
+    assert!(recipient.scope.covers(far()) && !recipient.scope.covers(alice()));
+
+    assert!(matches!(
+        plan_for_shard(tx.legs(), tx.crossings(), &[], divided, &trie, far_shard),
+        Err(PlanDefect::MissingArrival { .. }),
+    ));
+}
+
 /// A divided batch attests only what it ran. Each side's event root
 /// covers the events its own emitters produced — what its receipt
 /// stores — so the hash a shard signs is recomputable from exactly what
@@ -1240,6 +1305,8 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
             abortable: true,
+            decomposed: Decomposed::WHOLE,
+            arrivals: &[],
         };
         executor
             .execute_tick_batch(&ctx, &snapshot_store, &[input])

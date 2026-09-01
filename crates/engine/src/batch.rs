@@ -16,10 +16,12 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Epoch, EpochWindows, ProvisionalHolds, ShardId, ShardTrie, SubstateEntry, TopologySnapshot,
-    Transaction, Verified, WeightedTimestamp,
+    Epoch, EpochWindows, EscrowedValue, ProvisionalHolds, ShardId, ShardTrie, SubstateEntry,
+    TopologySnapshot, Transaction, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::SeedWindow;
+
+use crate::legs::Decomposed;
 
 /// What a block fixes about the environment its tick executes under.
 ///
@@ -129,4 +131,13 @@ pub struct TickTxInput<'a> {
     /// after execution — true for a cross-shard leg. Decides both the
     /// reserve fee receipt and the batch's write locality.
     pub abortable: bool,
+    /// Whether the transaction's legs run where their state lives, as
+    /// frozen when its block committed. Carried, never re-derived: a
+    /// reshape landing between composition and execution would
+    /// otherwise leave one shard running a whole manifest while its
+    /// counterpart waits to be sent half of it.
+    pub decomposed: Decomposed,
+    /// What committed bundles attested for the edges this shard's legs
+    /// consume. Empty for a member that runs whole.
+    pub arrivals: &'a [EscrowedValue],
 }

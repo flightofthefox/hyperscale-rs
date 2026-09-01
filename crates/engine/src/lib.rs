@@ -33,6 +33,7 @@ mod records;
 
 /// Genesis seeding: the stdlib world and funded-account cells.
 pub mod genesis;
+pub mod legs;
 /// Shard assignment and write filtering for `StateWrites`.
 pub mod sharding;
 

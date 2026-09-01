@@ -2225,6 +2225,7 @@ dependencies = [
  "hyperscale-vm-stdlib",
  "hyperscale-vm-types",
  "indexmap",
+ "thiserror 2.0.19",
  "tracing",
  "wasmtime",
 ]

@@ -8,8 +8,28 @@
 //! filtered here first.
 
 use hyperscale_types::{Hash, SettledWrites, ShardId, ShardTrie, StateWrites, WritesRoot};
+use hyperscale_vm_effects::{ShardId as VmShardId, ShardResolver};
+use hyperscale_vm_types::Address;
 
 use crate::executor::protocol_hash;
+
+/// The routing layer's view of the trie, for the classifier.
+///
+/// Routing partitions a declaration by the same prefix walk that decides
+/// which shard commits a cell, so a leg's home and its writes' home
+/// cannot disagree. The two shard types are one number — a heap index —
+/// which is what lets the mapping be a cast rather than a table.
+#[derive(Clone, Copy, Debug)]
+pub struct TrieShardResolver<'a> {
+    /// The active partition.
+    pub trie: &'a ShardTrie,
+}
+
+impl ShardResolver for TrieShardResolver<'_> {
+    fn shard_of(&self, owner: Address) -> VmShardId {
+        VmShardId(self.trie.shard_for_prefix(owner).inner())
+    }
+}
 
 /// Filter genesis writes to the cells whose owner prefix routes to
 /// `local_shard`, for building that shard's prefix-rooted JMT.
@@ -85,6 +105,31 @@ pub fn writes_root(writes: &StateWrites) -> WritesRoot {
         return WritesRoot::ZERO;
     }
     WritesRoot::from_raw(Hash::from(writes.root(protocol_hash)))
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use hyperscale_types::AddressClass;
+
+    use super::*;
+
+    /// A shard named by the routing layer is the shard that commits the
+    /// cell, on both sides of a two-shard trie.
+    #[test]
+    fn the_resolver_names_the_shard_that_commits_the_cell() {
+        let trie = ShardTrie::uniform(1);
+        let resolver = TrieShardResolver { trie: &trie };
+        for (byte, path) in [(0x00u8, 0u64), (0x80, 1)] {
+            let owner = Address::new([byte; 31], AddressClass::Component);
+            let committed = trie.shard_for_prefix(owner);
+            assert_eq!(committed, ShardId::leaf(1, path));
+            assert_eq!(resolver.shard_of(owner), VmShardId(committed.inner()));
+            assert_eq!(
+                ShardId::from_heap_index(resolver.shard_of(owner).0),
+                committed
+            );
+        }
+    }
 }
 
 #[cfg(test)]

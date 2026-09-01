@@ -15,7 +15,7 @@
 //! memoized in the per-transaction `ProcessExecutionCache` — the same
 //! transaction in a different block may abort differently.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use blake3::hash as blake3_hash;
@@ -28,10 +28,10 @@ use hyperscale_effects_bridge::{
 use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
 use hyperscale_types::{
-    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, Event, EventExt,
-    EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, PrincipalAddr,
-    ProvisionalHolds, ShardId, ShardTrie, Stake, StakePoolSeat, StateWrites, SubstateEntry,
-    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
+    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EscrowedValue, Event,
+    EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement,
+    PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, Stake, StakePoolSeat, StateWrites,
+    SubstateEntry, Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
     install_protocol_statics,
 };
 use hyperscale_vm_effects::{
@@ -49,6 +49,7 @@ use hyperscale_vm_types::{
 
 use crate::backend::EngineBackend;
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
+use crate::legs::{Decomposed, ShardPlan, plan_for_shard};
 use crate::records::BatchRecords;
 use crate::sharding::writes_root;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
@@ -85,6 +86,18 @@ pub struct PreparedTx {
     /// The envelope's signed execution ceiling, in fuel — one budget for
     /// the whole transaction, however many nodes its manifest walks.
     pub gas_limit: u64,
+    /// What this shard runs of the transaction and the scope it judges
+    /// under — the one part of an entry that differs per participant.
+    pub plan: ShardPlan,
+}
+
+/// What kind of member a transaction is in its batch: whether a tick
+/// verdict can still discard it, whether its legs run where their state
+/// lives, and what arrived for the legs this shard runs.
+struct MemberShape {
+    abortable: bool,
+    decomposed: Decomposed,
+    arrivals: Vec<EscrowedValue>,
 }
 
 /// The component address a record's own contents derive, or `None` for
@@ -523,6 +536,9 @@ impl Executor {
             declaration,
             nullifiers: admitted.subintents,
             gas_limit: vm.gas_limit,
+            // Whole until the batch pipeline plans the member for its
+            // shard; a preview never divides.
+            plan: ShardPlan::whole(),
         })
     }
 }
@@ -1020,9 +1036,9 @@ fn assemble_executed_tx(
 impl Executor {
     /// The batch pipeline every dispatch arm shares: derive, pre-read the
     /// local baseline, layer provisioned remote cells, execute under the
-    /// shard's locality, fold local keys, and project. `abortable` names
-    /// the members a tick verdict can still discard — the cross-shard
-    /// legs; a batch without any executes under total locality.
+    /// shard's locality, fold local keys, and project. `shapes` says what
+    /// kind of member each transaction is; a batch with no abortable
+    /// member — no cross-shard leg — executes under total locality.
     #[allow(clippy::too_many_lines)] // one pipeline, stages in order
     fn run_batch(
         &self,
@@ -1031,7 +1047,7 @@ impl Executor {
         transactions: &[Arc<Verified<Transaction>>],
         provisions_by_tx: &BTreeMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
         env_by_tx: &BTreeMap<TxHash, EnvInputs>,
-        abortable: &BTreeSet<TxHash>,
+        shapes: &BTreeMap<TxHash, MemberShape>,
     ) -> Vec<ExecutedTx> {
         if transactions.is_empty() {
             return Vec::new();
@@ -1040,7 +1056,7 @@ impl Executor {
         // filtered to the local subtree; a batch of genuinely single-shard
         // members owns every key it declares and total locality is the
         // same filter without the trie walk.
-        let locality = if abortable.is_empty() {
+        let locality = if shapes.values().all(|shape| !shape.abortable) {
             Locality::All
         } else {
             let trie = ctx.shard_trie.clone();
@@ -1081,7 +1097,29 @@ impl Executor {
             if publishes.contains_key(&vm_tx) {
                 continue;
             }
-            match Self::prepare(tx, &records) {
+            // What this shard runs of the member: the whole shape unless
+            // the coordinator froze a division, and then the legs its
+            // placement gives it. A plan that cannot be built is a
+            // deterministic refusal like a derivation that cannot be —
+            // every replica reads the same legs and the same arrivals.
+            let (decomposed, arrivals) = shapes
+                .get(&vm_tx)
+                .map_or((Decomposed::WHOLE, &[][..]), |shape| {
+                    (shape.decomposed, shape.arrivals.as_slice())
+                });
+            let planned = Self::prepare(tx, &records).and_then(|mut entry| {
+                entry.plan = plan_for_shard(
+                    tx.legs(),
+                    tx.crossings(),
+                    arrivals,
+                    decomposed,
+                    ctx.shard_trie,
+                    ctx.local_shard,
+                )
+                .map_err(|defect| format!("no plan for this shard: {defect}"))?;
+                Ok(entry)
+            });
+            match planned {
                 Ok(entry) => {
                     record_transaction_executed();
                     prepared.insert(vm_tx, entry);
@@ -1168,6 +1206,8 @@ impl Executor {
                     .with_calls(entry.calls.clone())
                     .with_nullifiers(entry.nullifiers.clone())
                     .with_gas_limit(entry.gas_limit)
+                    .with_legs(entry.plan.legs.clone())
+                    .with_scope(entry.plan.scope.clone())
             })
             .collect();
         let walk = ManifestWalk {
@@ -1207,7 +1247,7 @@ impl Executor {
                         vault,
                         max_fee: vm.max_fee,
                         floor: vm.abort_floor(),
-                        abortable: abortable.contains(&tx.hash()),
+                        abortable: shapes.get(&tx.hash()).is_some_and(|shape| shape.abortable),
                     },
                 ))
             })
@@ -1335,7 +1375,7 @@ impl Executor {
             transactions,
             &BTreeMap::new(),
             &env_by_tx,
-            &BTreeSet::new(),
+            &BTreeMap::new(),
         )
     }
 
@@ -1364,10 +1404,18 @@ impl Executor {
             .iter()
             .map(|i| (i.transaction.hash(), env_at(ctx, i.clock)))
             .collect();
-        let abortable: BTreeSet<TxHash> = inputs
+        let shapes: BTreeMap<TxHash, MemberShape> = inputs
             .iter()
-            .filter(|i| i.abortable)
-            .map(|i| i.transaction.hash())
+            .map(|i| {
+                (
+                    i.transaction.hash(),
+                    MemberShape {
+                        abortable: i.abortable,
+                        decomposed: i.decomposed,
+                        arrivals: i.arrivals.to_vec(),
+                    },
+                )
+            })
             .collect();
         self.run_batch(
             ctx,
@@ -1375,7 +1423,7 @@ impl Executor {
             &transactions,
             &provisions_by_tx,
             &env_by_tx,
-            &abortable,
+            &shapes,
         )
     }
 }
