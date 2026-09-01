@@ -134,6 +134,7 @@ fn request_for(tx: &Arc<Verified<Transaction>>) -> CrossShardExecutionRequest {
         clock: WeightedTimestamp::from_millis(1_000),
         reaches_beyond: true,
         classified: Classified::whole(),
+        arrivals: Vec::new(),
     }
 }
 

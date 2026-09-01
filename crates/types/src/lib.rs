@@ -179,9 +179,10 @@ pub use shard::roots::{
     ProvisionsRootContext, REVEAL_CHAIN_DOMAIN_TAG, SplitChildRoots, StateRootContext,
     StateRootVerifyError, TerminalRoots, TransactionRootContext, TxRootVerifyError,
     abandonment_root_from_records, certificate_root_from_receipt_hashes, commit_witness_window,
-    committed_tx_leaf, committed_txs_root_from_hashes, derive_leaves, derive_reshape_trigger,
-    extend_reveal_chain, local_settled_tx_hashes, missed_proposals_since_prev_commit,
-    next_reveal_chain, prove_committed_tx_absent, ready_leaf_payload, settled_txs_root_from_hashes,
+    committed_crossings, committed_tx_leaf, committed_txs_root_from_hashes, derive_leaves,
+    derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
+    missed_proposals_since_prev_commit, next_reveal_chain, prove_committed_tx_absent,
+    ready_leaf_payload, settled_txs_root_from_hashes,
 };
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};

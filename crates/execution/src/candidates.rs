@@ -16,8 +16,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
-use hyperscale_engine::legs::Classified;
-use hyperscale_types::{ShardId, Transaction, TxHash, Verified, WeightedTimestamp};
+use hyperscale_engine::legs::{Classified, crossings_of};
+use hyperscale_types::{
+    EscrowedValue, ShardId, ShardTrie, SubstateKey, Transaction, TxHash, Verified,
+    WeightedTimestamp,
+};
+use hyperscale_vm_effects::CrossingCell;
 
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
@@ -61,6 +65,49 @@ impl Candidate {
                 .engagement_deadline
                 .is_some_and(|deadline| now >= deadline)
     }
+}
+
+/// What committed bundles attested for the edges `tx`'s legs on `local`
+/// consume: each crossing landing here, with the value its record cell
+/// says left.
+///
+/// A divided member only. The cell was proven against the source's
+/// committed root when the bundle was absorbed, and its bytes are the
+/// kernel's own record, so what it says left is what the consumer
+/// claims. An edge whose cell is missing or unreadable is left out, and
+/// the planner refuses the member for it rather than running short.
+fn arrivals_for(
+    tx: &Transaction,
+    classified: &Classified,
+    provisioning: &ProvisioningTracker,
+    trie: &ShardTrie,
+    local: ShardId,
+) -> Vec<EscrowedValue> {
+    if !classified.decomposed().holds() {
+        return Vec::new();
+    }
+    let edges = crossings_of(tx.legs(), tx.crossings(), classified.decomposed(), trie);
+    let cells: BTreeMap<SubstateKey, &[u8]> = provisioning
+        .provisions_for(tx.hash())
+        .into_iter()
+        .flatten()
+        .flat_map(|entries| entries.iter())
+        .filter_map(|entry| Some((entry.key, entry.value.as_deref()?)))
+        .collect();
+    edges
+        .into_iter()
+        .filter(|edge| edge.to.contains(&local))
+        .filter_map(|edge| {
+            let record = CrossingCell::from_bytes(cells.get(&edge.record)?)?;
+            Some(EscrowedValue {
+                node: edge.node,
+                output: edge.output,
+                resource: record.resource,
+                amount: record.amount,
+                record: edge.record,
+            })
+        })
+        .collect()
 }
 
 /// The committed transactions no tick has taken yet.
@@ -164,6 +211,7 @@ impl TickCandidates {
         provisioning: &ProvisioningTracker,
         held: &mut ProvisionalCells,
         now: WeightedTimestamp,
+        trie: &ShardTrie,
     ) -> Vec<Admitted> {
         let local = self.local_shard;
         let mut ordered: Vec<TxHash> = self.candidates.keys().copied().collect();
@@ -195,6 +243,16 @@ impl TickCandidates {
                 held.claim(declared);
             }
 
+            // What arrived for the edges this member's legs consume, read
+            // off the record cells the committed bundles proved. Every
+            // requirement is met, so every edge has its cell.
+            let arrivals = arrivals_for(
+                &candidate.tx,
+                &candidate.classified,
+                provisioning,
+                trie,
+                local,
+            );
             // A remote-payer leg executes under the anchor its payer
             // bundle carried; every other member under its own committing
             // block's.
@@ -214,6 +272,7 @@ impl TickCandidates {
                     clock: anchor.map_or(candidate.committed_ts, |a| a.clock),
                     reaches_beyond,
                     classified: candidate.classified.clone(),
+                    arrivals,
                 },
                 participating: candidate.participating.clone(),
                 admission: if candidate.engagement_pending.is_empty() {
@@ -302,6 +361,7 @@ mod tests {
             &ProvisioningTracker::new(),
             &mut ProvisionalCells::default(),
             ms(1_000),
+            &ShardTrie::single(),
         );
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].request.tx_hash, hash);
@@ -327,15 +387,24 @@ mod tests {
         let mut provisioning = ProvisioningTracker::new();
         assert!(
             candidates
-                .compose(&provisioning, &mut ProvisionalCells::default(), ms(1_000))
+                .compose(
+                    &provisioning,
+                    &mut ProvisionalCells::default(),
+                    ms(1_000),
+                    &ShardTrie::single()
+                )
                 .is_empty(),
             "nothing has arrived for it",
         );
         assert!(candidates.contains(hash), "so it is still waiting");
 
         provisioning.record_required(hash, BTreeSet::new());
-        let admitted =
-            candidates.compose(&provisioning, &mut ProvisionalCells::default(), ms(1_000));
+        let admitted = candidates.compose(
+            &provisioning,
+            &mut ProvisionalCells::default(),
+            ms(1_000),
+            &ShardTrie::single(),
+        );
         assert_eq!(admitted.len(), 1);
         assert!(admitted[0].request.reaches_beyond);
     }
@@ -362,7 +431,12 @@ mod tests {
 
         assert!(
             candidates
-                .compose(&provisioning, &mut ProvisionalCells::default(), ms(1_000))
+                .compose(
+                    &provisioning,
+                    &mut ProvisionalCells::default(),
+                    ms(1_000),
+                    &ShardTrie::single()
+                )
                 .is_empty(),
             "the payer holds while a counterpart has not engaged",
         );
@@ -388,8 +462,12 @@ mod tests {
         let mut provisioning = ProvisioningTracker::new();
         provisioning.record_required(hash, BTreeSet::new());
 
-        let admitted =
-            candidates.compose(&provisioning, &mut ProvisionalCells::default(), ms(60_000));
+        let admitted = candidates.compose(
+            &provisioning,
+            &mut ProvisionalCells::default(),
+            ms(60_000),
+            &ShardTrie::single(),
+        );
         assert_eq!(admitted.len(), 1);
         assert_eq!(
             admitted[0].admission,
@@ -411,7 +489,12 @@ mod tests {
 
         assert!(
             candidates
-                .compose(&ProvisioningTracker::new(), &mut held, ms(1_000))
+                .compose(
+                    &ProvisioningTracker::new(),
+                    &mut held,
+                    ms(1_000),
+                    &ShardTrie::single()
+                )
                 .is_empty(),
             "the cell is spoken for",
         );

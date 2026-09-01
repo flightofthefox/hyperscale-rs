@@ -291,10 +291,7 @@ where
                     clock: r.clock,
                     abortable: r.reaches_beyond,
                     decomposed: r.classified.decomposed(),
-                    // Nothing attests an arrival yet, so a divided member
-                    // consuming one cannot plan — and none is frozen
-                    // divided until the cut-over.
-                    arrivals: &[],
+                    arrivals: &r.arrivals,
                 })
                 .collect();
             let executed = ctx

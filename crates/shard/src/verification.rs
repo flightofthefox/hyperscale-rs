@@ -1283,6 +1283,7 @@ impl VerificationPipeline {
             block_hash,
             expected: block.header().provision_tx_roots().clone(),
             transactions: block.transactions().clone(),
+            certificates: block.certificates().clone(),
             topology_snapshot: topology_snapshot.clone(),
         }]
     }

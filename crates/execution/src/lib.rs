@@ -36,6 +36,6 @@ mod vote_tracker;
 pub use coordinator::{CompletionData, ExecutionCoordinator, ExecutionMemoryStats};
 pub use exec_cert_store::ExecCertStore;
 pub use finalizations::FinalizationStore;
-pub use lookups::provision_request;
+pub use lookups::{crossing_requests, provision_request};
 pub use tick_state::TickState;
 pub use vote_tracker::VoteTracker;

@@ -12,18 +12,18 @@ use hyperscale_types::{
     AbandonmentRecord, BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount,
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote,
     CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
-    CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, ExecutionCertificate,
-    ExecutionVote, Finalization, GlobalReceiptRoot, Hash, HeaderFetchCount, LocalReceiptRoot,
-    PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PrincipalAddr,
-    ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
-    QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadySignal, ReshapeThresholds,
-    ReshapeTrigger, ResolvedCommittee, RevealChain, Round, RoutingCommittees, SafeVoteRegisters,
-    ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation, SharedCertificates,
-    SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
-    SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry, SubstateKey,
-    SweepFrontier, TerminalEvidence, TerminalRoots, TickId, Timeout, TopologySnapshot, Transaction,
-    TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
-    VoteCount, WeightedTimestamp, WorkInFlight,
+    CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, EscrowedValue,
+    ExecutionCertificate, ExecutionVote, Finalization, GlobalReceiptRoot, Hash, HeaderFetchCount,
+    LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
+    PrincipalAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
+    ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadySignal,
+    ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round, RoutingCommittees,
+    SafeVoteRegisters, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation,
+    SharedCertificates, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
+    SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry,
+    SubstateKey, SweepFrontier, TerminalEvidence, TerminalRoots, TickId, Timeout, TopologySnapshot,
+    Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable,
+    Verified, VoteCount, WeightedTimestamp, WorkInFlight,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -57,6 +57,10 @@ pub struct CrossShardExecutionRequest {
     /// whether its legs run where their state lives, and where its core
     /// sits. Carried, never re-derived.
     pub classified: Classified,
+    /// What committed bundles attested for the edges this shard's legs
+    /// consume, read off the record cells they proved. Empty for a
+    /// member that runs the whole shape.
+    pub arrivals: Vec<EscrowedValue>,
 }
 
 /// A change to the local vnode's reshape-observer duty, carried on
@@ -863,6 +867,9 @@ pub enum Action {
         expected: ProvisionTxRootsMap,
         /// Transactions in the block.
         transactions: SharedTransactions,
+        /// Certificates in the block, whose committed outcomes promise
+        /// crossing bundles.
+        certificates: SharedCertificates,
         /// Topology snapshot used to route txs to target shards.
         topology_snapshot: TopologySnapshot,
     },

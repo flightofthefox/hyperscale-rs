@@ -912,17 +912,17 @@ impl ExecutionCoordinator {
     ) {
         let local_shard = self.local_shard;
         let tick_id = TickId::new(local_shard, block.height);
+        let trie = self
+            .classification_committee(topology_schedule, self.committed_committee_anchor_wt)
+            .shard_trie();
         let admitted = self
             .candidates
-            .compose(&self.provisioning, held, self.committed_ts);
+            .compose(&self.provisioning, held, self.committed_ts, trie);
 
         let mut state = TickState::new(tick_id, block.hash, block.ts);
         let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());
         let mut provisional_claims: Vec<(DeclaredKey, Mode)> = Vec::new();
         let mut legs: BTreeSet<TxHash> = BTreeSet::new();
-        let trie = self
-            .classification_committee(topology_schedule, self.committed_committee_anchor_wt)
-            .shard_trie();
         for member in admitted {
             state.admit(
                 member.request.tx_hash,
@@ -2340,6 +2340,7 @@ impl ExecutionCoordinator {
             Block::Live {
                 header,
                 transactions,
+                certificates,
                 provisions,
                 ..
             } => actions.extend(self.on_live_block_committed(
@@ -2347,6 +2348,7 @@ impl ExecutionCoordinator {
                 block.hash(),
                 header,
                 transactions,
+                certificates,
                 provisions,
             )),
             Block::Sealed {
@@ -2373,6 +2375,7 @@ impl ExecutionCoordinator {
         block_hash: BlockHash,
         header: &BlockHeader,
         transactions: &[Arc<Verifiable<Transaction>>],
+        certificates: &[Arc<Verifiable<Finalization>>],
         provisions: &[Arc<Verifiable<Provisions>>],
     ) -> Vec<Action> {
         let height = header.height();
@@ -2388,7 +2391,7 @@ impl ExecutionCoordinator {
         if self.me == header.proposer() {
             let local_shard = self.local_shard;
             if let Some((requests, shard_recipients)) =
-                build_provision_requests(anchored, transactions, self.me, local_shard)
+                build_provision_requests(anchored, transactions, certificates, self.me, local_shard)
             {
                 actions.push(Action::FetchAndBroadcastProvisions {
                     block_hash,
