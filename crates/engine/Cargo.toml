@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 description = "Engine integration: the tick-batch execution seam, the executor behind it, and genesis seeding"
 
+[features]
+# Run every transaction as the whole shape on every participant, whatever
+# the classifier says. The comparison build for the decomposition
+# scenarios: the suite must fail under it, or it is testing liveness
+# rather than the feature.
+whole-shape = []
+
 [dependencies]
 hyperscale-effects-bridge.workspace = true
 hyperscale-metrics.workspace = true

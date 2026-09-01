@@ -21,6 +21,22 @@ use hyperscale_vm_types::{Crossing, LegRole, LegShape, ProtocolHasher, SubstateK
 
 use crate::sharding::TrieShardResolver;
 
+/// Whether a transaction the classifier says decomposes is run leg by
+/// leg.
+///
+/// A build-time fact, not a strategy threaded through the pipeline:
+/// every replica of every shard answers alike, so the frozen
+/// classification is the same answer everywhere. Off until the
+/// cut-over, and off under the `whole-shape` feature — the comparison
+/// build the decomposition scenarios are held against.
+#[must_use]
+pub const fn decomposition_enabled() -> bool {
+    CUT_OVER && !cfg!(feature = "whole-shape")
+}
+
+/// The cut-over: whether a decomposing shape is divided at all.
+const CUT_OVER: bool = false;
+
 /// The trie and the departing set, read together.
 ///
 /// A caller taking one at this anchor and the other at another would
