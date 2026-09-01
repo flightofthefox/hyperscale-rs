@@ -343,7 +343,7 @@ impl ExecutionSim {
                 header,
                 transactions,
                 certificates,
-                terminal_verdicts,
+                abandonment_records,
                 witness_sources,
                 ..
             } => Block::Live {
@@ -351,7 +351,7 @@ impl ExecutionSim {
                 transactions,
                 certificates,
                 provisions: Arc::new(vec![Arc::new(Verifiable::from(bundle))]),
-                terminal_verdicts,
+                abandonment_records,
                 witness_sources,
             },
             sealed @ Block::Sealed { .. } => sealed,

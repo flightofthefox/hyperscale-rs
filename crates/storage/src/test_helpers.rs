@@ -14,20 +14,20 @@ use hyperscale_types::test_utils::{
     install_stub_protocol_statics, make_finalization, stub_sweepable_cell, test_transaction,
 };
 use hyperscale_types::{
-    AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock, BeaconBlockHash,
-    BeaconCert, BeaconChainConfig, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount,
-    BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
-    CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId, ConsensusReceipt, EntryKey,
-    EntryLeaf, Epoch, Event, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary,
-    Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel,
+    AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock,
+    BeaconBlockHash, BeaconCert, BeaconChainConfig, BeaconState, BeaconWitnessCommit,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts,
+    BlockHeight, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId, ConsensusReceipt,
+    EntryKey, EntryLeaf, Epoch, Event, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome,
+    FeeSummary, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel,
     MerkleInclusionProof, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp,
     ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, Randomness,
     RatifyCert, RatifyRound, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor,
     ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
-    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier,
-    TerminalVerdict, TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome,
-    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
-    WorkInFlight, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
+    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, TickHalf,
+    TickId, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx, ValidatorId,
+    Verifiable, Verified, WeightedTimestamp, WitnessSources, WorkInFlight,
+    compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
 };
 
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
@@ -241,7 +241,7 @@ pub fn make_test_block_with_anchor_wt(height: BlockHeight, anchor_wt_ms: u64) ->
         transactions: Arc::new(Vec::new()),
         certificates: Arc::new(Vec::new()),
         provisions: Arc::new(Vec::new()),
-        terminal_verdicts: Arc::new(Vec::new()),
+        abandonment_records: Arc::new(Vec::new()),
         witness_sources: Arc::new(WitnessSources::empty()),
     }
 }
@@ -469,7 +469,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
             transactions,
             certificates,
             provisions,
-            terminal_verdicts,
+            abandonment_records,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -479,7 +479,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
                 transactions,
                 certificates: Arc::new(certificates),
                 provisions,
-                terminal_verdicts,
+                abandonment_records,
                 witness_sources,
             }
         }
@@ -488,7 +488,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
             transactions,
             certificates,
             provision_hashes,
-            terminal_verdicts,
+            abandonment_records,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -498,7 +498,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
                 transactions,
                 certificates: Arc::new(certificates),
                 provision_hashes,
-                terminal_verdicts,
+                abandonment_records,
                 witness_sources,
             }
         }
@@ -506,7 +506,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
 }
 
 /// Put `record` on `block`, preserving the block variant.
-fn with_terminal_verdict(block: Block, record: TerminalVerdict) -> Block {
+fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
     match block {
         Block::Live {
             header,
@@ -520,7 +520,7 @@ fn with_terminal_verdict(block: Block, record: TerminalVerdict) -> Block {
             transactions,
             certificates,
             provisions,
-            terminal_verdicts: Arc::new(vec![record]),
+            abandonment_records: Arc::new(vec![record]),
             witness_sources,
         },
         Block::Sealed {
@@ -535,7 +535,7 @@ fn with_terminal_verdict(block: Block, record: TerminalVerdict) -> Block {
             transactions,
             certificates,
             provision_hashes,
-            terminal_verdicts: Arc::new(vec![record]),
+            abandonment_records: Arc::new(vec![record]),
             witness_sources,
         },
     }
@@ -616,7 +616,7 @@ pub fn commit_block_with_witnesses(
         transactions: Arc::new(Vec::new()),
         certificates: Arc::new(Vec::new()),
         provisions: Arc::new(Vec::new()),
-        terminal_verdicts: Arc::new(Vec::new()),
+        abandonment_records: Arc::new(Vec::new()),
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let block_hash = block.hash();
@@ -671,7 +671,7 @@ pub fn commit_block_with_witness_window(
         transactions: Arc::new(Vec::new()),
         certificates: Arc::new(Vec::new()),
         provisions: Arc::new(Vec::new()),
-        terminal_verdicts: Arc::new(Vec::new()),
+        abandonment_records: Arc::new(Vec::new()),
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let block_hash = block.hash();
@@ -1323,7 +1323,7 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
             header,
             transactions,
             certificates,
-            terminal_verdicts,
+            abandonment_records,
             witness_sources,
             ..
         } => Block::Live {
@@ -1331,7 +1331,7 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
             transactions,
             certificates,
             provisions: Arc::new(vec![Arc::new(Verifiable::from(bundle))]),
-            terminal_verdicts,
+            abandonment_records,
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,
@@ -1345,7 +1345,7 @@ fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Bl
             header,
             certificates,
             provisions,
-            terminal_verdicts,
+            abandonment_records,
             witness_sources,
             ..
         } => Block::Live {
@@ -1353,7 +1353,7 @@ fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Bl
             transactions: Arc::new(txs),
             certificates,
             provisions,
-            terminal_verdicts,
+            abandonment_records,
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,
@@ -1674,7 +1674,7 @@ pub fn test_undischarged_record_holds_the_floor(
     storage: &(impl ShardChainReader + ShardChainWriter),
 ) {
     let stranded = test_transaction(3);
-    let record = TerminalVerdict::new(
+    let record = AbandonmentRecord::departed(
         ShardId::leaf(1, 1),
         WeightedTimestamp::from_millis(1_000),
         [UnsettledTx {
@@ -1692,7 +1692,7 @@ pub fn test_undischarged_record_holds_the_floor(
     // that carried it is below anything this chain holds, which is the
     // rebuild the record exists to repair.
     commit_empty_blocks_up_to(storage, BlockHeight::new(2));
-    let naming = with_terminal_verdict(make_test_block(BlockHeight::new(2)), record);
+    let naming = with_abandonment(make_test_block(BlockHeight::new(2)), record);
     storage.commit_block(&make_test_certified(naming), &[], &empty_witness());
     storage.commit_block(
         &make_test_certified(make_test_block(BlockHeight::new(3))),

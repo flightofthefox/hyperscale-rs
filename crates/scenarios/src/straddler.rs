@@ -1050,7 +1050,7 @@ fn straddler_tally<C: Cluster>(
             (Some(_), Some(_)) => tally.mismatch += 1,
             (None, Some(TransactionDecision::Aborted)) => tally.doomed += 1, // correctly aborted
             (None, Some(_)) => tally.one_sided += 1,
-            (_, None) => {} // unresolved — the terminal-verdict gate caught it
+            (_, None) => {} // unresolved — the abandonment gate caught it
         }
     }
     let _ = write!(

@@ -8,21 +8,21 @@ use hyperscale_dispatch::DispatchPool;
 use hyperscale_engine::TickEnvironment;
 use hyperscale_storage::TickResolution;
 use hyperscale_types::{
-    BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
-    BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
-    CertificateRoot, CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader,
-    ConsensusPublicKey, DeclaredRange, Epoch, ExecutionCertificate, ExecutionVote, Finalization,
-    GlobalReceiptRoot, Hash, HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1,
-    PcVote2, PcVote3, PcVoteEquivocation, PrincipalAddr, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
-    RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain,
-    Round, RoutingCommittees, SafeVoteRegisters, ShardForkProof, ShardId, ShardLoad,
-    ShardVoteEquivocation, SharedCertificates, SharedTransactions, SharedWitnessSources,
-    SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
-    StateRoot, SubstateEntry, SubstateKey, SweepFrontier, TerminalEvidence, TerminalRoots,
-    TerminalVerdict, TickId, Timeout, TopologySnapshot, Transaction, TransactionRoot,
-    TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount,
-    WeightedTimestamp, WorkInFlight,
+    AbandonmentRecord, BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount,
+    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote,
+    CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
+    CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, ExecutionCertificate,
+    ExecutionVote, Finalization, GlobalReceiptRoot, Hash, HeaderFetchCount, LocalReceiptRoot,
+    PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PrincipalAddr,
+    ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
+    QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadySignal, ReshapeThresholds,
+    ReshapeTrigger, ResolvedCommittee, RevealChain, Round, RoutingCommittees, SafeVoteRegisters,
+    ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation, SharedCertificates,
+    SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
+    SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry, SubstateKey,
+    SweepFrontier, TerminalEvidence, TerminalRoots, TickId, Timeout, TopologySnapshot, Transaction,
+    TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+    VoteCount, WeightedTimestamp, WorkInFlight,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -924,7 +924,7 @@ pub enum Action {
         /// What departed shards left unresolved of this chain's business
         /// — written down here while the settled sets they were read
         /// from can still be checked against.
-        terminal_verdicts: Vec<TerminalVerdict>,
+        abandonment_records: Vec<AbandonmentRecord>,
         /// Prior fee-reservation demand per local payer among the
         /// candidate transactions — in-flight holds plus the uncommitted
         /// window, excluding the candidates themselves. The builder

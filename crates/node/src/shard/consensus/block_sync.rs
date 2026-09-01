@@ -28,9 +28,9 @@ use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{
-    BlockHeight, CertificateRoot, CertifiedBlock, ElidedCertifiedBlock, Hash, Inventory,
-    LocalReceiptRoot, ProvisionHash, ProvisionsRoot, RehydrateError, StoredReceipt,
-    TerminalVerdictRoot, TransactionRoot, Verifiable, Verified,
+    AbandonmentRoot, BlockHeight, CertificateRoot, CertifiedBlock, ElidedCertifiedBlock, Hash,
+    Inventory, LocalReceiptRoot, ProvisionHash, ProvisionsRoot, RehydrateError, StoredReceipt,
+    TransactionRoot, Verifiable, Verified,
 };
 
 use crate::event::classify_fetch_error;
@@ -325,7 +325,7 @@ where
 /// reject identically; force-full bypasses elision on the next attempt.
 /// Header / QC identity mismatches (`height_mismatch`, `qc_hash_mismatch`,
 /// `qc_height_mismatch`) inspect non-elidable fields and are excluded, as
-/// is `terminal_verdict_root_mismatch` — the records ride inline whatever
+/// is `abandonment_root_mismatch` — the records ride inline whatever
 /// inventory the requester offers, so refetching without elision would ask
 /// the same peer for the same bytes.
 fn cache_sensitive_validation_failure(reason: &str) -> bool {
@@ -361,7 +361,7 @@ fn cache_sensitive_validation_failure(reason: &str) -> bool {
 /// derives the `Live` list by hashing the same bodies the root is computed
 /// over. One expression therefore binds both variants.
 ///
-/// The terminal-verdict records are the one body list no hash in the
+/// The abandonment records are the one body list no hash in the
 /// manifest binds — they ride inline rather than by reference — so this is
 /// the only place a serving peer's copy is held to the header the committee
 /// actually signed.
@@ -385,10 +385,10 @@ fn validate_synced_block(
 
     let header = certified.block().header();
 
-    if Verified::<TerminalVerdictRoot>::compute(certified.block().terminal_verdicts()).into_inner()
-        != header.terminal_verdict_root()
+    if Verified::<AbandonmentRoot>::compute(certified.block().abandonment_records()).into_inner()
+        != header.abandonment_root()
     {
-        return Err("terminal_verdict_root_mismatch");
+        return Err("abandonment_root_mismatch");
     }
 
     if Verified::<TransactionRoot>::compute(certified.block().transactions()).into_inner()
@@ -445,12 +445,11 @@ mod tests {
 
     use hyperscale_types::test_utils::{stub_abort_charge, test_transaction};
     use hyperscale_types::{
-        AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, CertificateRoot,
-        ChainOrigin, ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, Finalization,
-        GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProposerTimestamp,
-        QuorumCertificate, Round, ShardId, SignerBitfield, TerminalVerdict, TickHalf, TickId,
-        TransactionRoot, TxHash, TxOutcome, UnsettledTx, Verifiable, WeightedTimestamp,
-        WitnessSources,
+        AbandonmentRecord, AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts,
+        CertificateRoot, ChainOrigin, ConsensusReceipt, ExecutionCertificate, ExecutionOutcome,
+        Finalization, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProposerTimestamp,
+        QuorumCertificate, Round, ShardId, SignerBitfield, TickHalf, TickId, TransactionRoot,
+        TxHash, TxOutcome, UnsettledTx, Verifiable, WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
@@ -575,7 +574,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -590,7 +589,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -609,7 +608,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(
@@ -632,7 +631,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(
@@ -652,21 +651,21 @@ mod tests {
         );
     }
 
-    /// [`header`] with `terminal_verdict_root` overridden.
-    fn header_committing(root: TerminalVerdictRoot) -> BlockHeader {
+    /// [`header`] with `abandonment_root` overridden.
+    fn header_committing(root: AbandonmentRoot) -> BlockHeader {
         BlockHeader::new(BlockHeaderParts {
             height: HEIGHT,
             parent_block_hash: BlockHash::ZERO,
             parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
             timestamp: ProposerTimestamp::from_millis(1_000),
             provision_tx_roots: std::collections::BTreeMap::new(),
-            terminal_verdict_root: root,
+            abandonment_root: root,
             ..Default::default()
         })
     }
 
-    fn boundary_record() -> TerminalVerdict {
-        TerminalVerdict::new(
+    fn boundary_record() -> AbandonmentRecord {
+        AbandonmentRecord::departed(
             ShardId::leaf(1, 0),
             WeightedTimestamp::from_millis(2_000),
             [UnsettledTx {
@@ -684,20 +683,20 @@ mod tests {
     /// to a header committing none is refused here — the vote path that
     /// would otherwise catch it never runs on a synced block.
     #[test]
-    fn validate_rejects_terminal_verdicts_the_header_does_not_commit() {
+    fn validate_rejects_abandonment_records_the_header_does_not_commit() {
         let block = Block::Live {
             header: header(),
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(vec![boundary_record()]),
+            abandonment_records: Arc::new(vec![boundary_record()]),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
         assert_eq!(
             validate_synced_block(HEIGHT, &certified).unwrap_err(),
-            "terminal_verdict_root_mismatch"
+            "abandonment_root_mismatch"
         );
     }
 
@@ -706,15 +705,15 @@ mod tests {
     /// header committing records is a mismatch rather than a lighter
     /// answer — which is why the check runs whatever the body carries.
     #[test]
-    fn validate_binds_terminal_verdicts_in_both_directions() {
+    fn validate_binds_abandonment_records_in_both_directions() {
         let records = vec![boundary_record()];
-        let root = Verified::<TerminalVerdictRoot>::compute(&records).into_inner();
-        let live = |terminal_verdicts: Vec<TerminalVerdict>| Block::Live {
+        let root = Verified::<AbandonmentRoot>::compute(&records).into_inner();
+        let live = |abandonment_records: Vec<AbandonmentRecord>| Block::Live {
             header: header_committing(root),
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(terminal_verdicts),
+            abandonment_records: Arc::new(abandonment_records),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -722,7 +721,7 @@ mod tests {
         let qc = qc_for(&dropped);
         assert_eq!(
             validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(dropped, qc)).unwrap_err(),
-            "terminal_verdict_root_mismatch"
+            "abandonment_root_mismatch"
         );
 
         let carried = live(records);
@@ -742,7 +741,7 @@ mod tests {
             transactions: Arc::new(vec![tx]),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -767,7 +766,7 @@ mod tests {
             transactions: Arc::new(vec![tx]),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -793,7 +792,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -815,7 +814,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -849,7 +848,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provision_hashes: Arc::new(provision_hashes),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -883,7 +882,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(vec![fw]),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -941,7 +940,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(vec![fw]),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -970,7 +969,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(vec![fw]),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1007,7 +1006,7 @@ mod tests {
             "height_mismatch",
             "qc_hash_mismatch",
             "qc_height_mismatch",
-            "terminal_verdict_root_mismatch",
+            "abandonment_root_mismatch",
         ] {
             assert!(
                 !cache_sensitive_validation_failure(reason),
@@ -1025,7 +1024,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(vec![fw]),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);

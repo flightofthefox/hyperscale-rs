@@ -20,8 +20,8 @@ use hyperscale_types::{
     Block, BlockHeader, BlockHeight, LocalTimestamp, MAX_ROUND_GAP,
     MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
     MAX_UNSETTLED_PER_BLOCK, ProvisionHash, QuorumCertificate, ShardId, ShardLoad,
-    TopologySnapshot, Transaction, TxHash, Verifiable, VoteCount, sweep_admits_block,
-    terminal_verdict_root_from_records,
+    TopologySnapshot, Transaction, TxHash, Verifiable, VoteCount, abandonment_root_from_records,
+    sweep_admits_block,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -324,11 +324,11 @@ pub fn validate_no_duplicate_resolutions(
             reject_if_resolved(tx_hash, qc_chain_resolved_txs, dedup_index)?;
         }
     }
-    for verdict in block.terminal_verdicts() {
+    for verdict in block.abandonment_records() {
         for tx_hash in verdict.tx_hashes() {
             if resolved_here.contains(&tx_hash) {
                 return Err(format!(
-                    "terminal-verdict record names {tx_hash}, which the same block resolves"
+                    "abandonment record names {tx_hash}, which the same block resolves"
                 ));
             }
             reject_if_resolved(tx_hash, qc_chain_resolved_txs, dedup_index)?;
@@ -581,11 +581,11 @@ pub fn validate_block_for_vote(
     validate_packages_usable(topology_snapshot, block)?;
     validate_sweepable_creation(block)?;
     validate_engagement(topology_snapshot, local_shard, block, dedup_index)?;
-    validate_terminal_verdicts_well_formed(block)?;
+    validate_abandonment_records_well_formed(block)?;
     Ok(())
 }
 
-/// Validate the block's terminal-verdict records against the header that
+/// Validate the block's abandonment records against the header that
 /// commits them, against the one form a record may take, and against the
 /// budget they share.
 ///
@@ -600,13 +600,13 @@ pub fn validate_block_for_vote(
 /// The budget checked is the sum across every record, because
 /// [`MAX_UNSETTLED_PER_BLOCK`] doubles as each record's own decode cap and
 /// that cap alone would let a block spend it once per record.
-pub fn validate_terminal_verdicts_well_formed(block: &Block) -> Result<(), String> {
-    let verdicts = block.terminal_verdicts();
-    let computed = terminal_verdict_root_from_records(verdicts);
-    let claimed = block.header().terminal_verdict_root();
+pub fn validate_abandonment_records_well_formed(block: &Block) -> Result<(), String> {
+    let verdicts = block.abandonment_records();
+    let computed = abandonment_root_from_records(verdicts);
+    let claimed = block.header().abandonment_root();
     if computed != claimed {
         return Err(format!(
-            "terminal-verdict root {claimed:?} does not commit the block's records {computed:?}"
+            "abandonment root {claimed:?} does not commit the block's records {computed:?}"
         ));
     }
 
@@ -615,7 +615,7 @@ pub fn validate_terminal_verdicts_well_formed(block: &Block) -> Result<(), Strin
     for verdict in verdicts {
         if !verdict.is_well_formed() {
             return Err(format!(
-                "terminal-verdict record for {:?} is empty, over its cap, or out of order",
+                "abandonment record for {:?} is empty, over its cap, or out of order",
                 verdict.shard(),
             ));
         }
@@ -625,7 +625,7 @@ pub fn validate_terminal_verdicts_well_formed(block: &Block) -> Result<(), Strin
         // form of the same block.
         if previous.is_some_and(|previous| previous >= verdict.shard()) {
             return Err(format!(
-                "terminal-verdict record for {:?} repeats or precedes the one before it",
+                "abandonment record for {:?} repeats or precedes the one before it",
                 verdict.shard(),
             ));
         }
@@ -634,7 +634,7 @@ pub fn validate_terminal_verdicts_well_formed(block: &Block) -> Result<(), Strin
     }
     if named > MAX_UNSETTLED_PER_BLOCK {
         return Err(format!(
-            "terminal-verdict records name {named} transactions, over the drain's own bound of \
+            "abandonment records name {named} transactions, over the drain's own bound of \
              {MAX_UNSETTLED_PER_BLOCK}",
         ));
     }
@@ -666,10 +666,10 @@ fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
             block.provisions().len()
         ));
     }
-    if !block.terminal_verdicts().is_empty() {
+    if !block.abandonment_records().is_empty() {
         return Err(format!(
-            "coast block past the terminal window carries {} terminal-verdict records",
-            block.terminal_verdicts().len()
+            "coast block past the terminal window carries {} abandonment records",
+            block.abandonment_records().len()
         ));
     }
     Ok(())
@@ -716,10 +716,10 @@ mod tests {
         TestCommittee, make_finalization, stub_abort_charge, test_principal,
     };
     use hyperscale_types::{
-        Address, AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin,
-        Finalization, Hash, MAX_SUBINTENTS, MerkleInclusionProof, NetworkDefinition, PrincipalAddr,
-        ProposerTimestamp, ProvisionEntry, Provisions, QuorumCertificate, Round, ShardId,
-        ShardLoad, Signer, SignerBitfield, TerminalVerdict, TerminalVerdictRoot, TimestampRange,
+        AbandonmentRecord, AbandonmentRoot, Address, AggregateSignature, BlockHash, BlockHeader,
+        BlockHeaderParts, ChainOrigin, Finalization, Hash, MAX_SUBINTENTS, MerkleInclusionProof,
+        NetworkDefinition, PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions,
+        QuorumCertificate, Round, ShardId, ShardLoad, Signer, SignerBitfield, TimestampRange,
         Transaction, TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet,
         Verifiable, Verified, WeightedTimestamp, WitnessSources, test_utils,
     };
@@ -1183,7 +1183,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
         }
     }
 
@@ -1226,7 +1226,7 @@ mod tests {
     }
 
     /// A block carrying records, rooted the way the header claims.
-    fn block_with_verdicts(verdicts: Vec<TerminalVerdict>, root: TerminalVerdictRoot) -> Block {
+    fn block_with_verdicts(verdicts: Vec<AbandonmentRecord>, root: AbandonmentRoot) -> Block {
         let base = header_at_height(BlockHeight::new(6), 100_000);
         Block::Live {
             header: BlockHeader::new(BlockHeaderParts {
@@ -1237,13 +1237,13 @@ mod tests {
                 timestamp: base.timestamp(),
                 round: base.round(),
                 provision_tx_roots: std::collections::BTreeMap::new(),
-                terminal_verdict_root: root,
+                abandonment_root: root,
                 ..Default::default()
             }),
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(verdicts),
+            abandonment_records: Arc::new(verdicts),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -1257,8 +1257,8 @@ mod tests {
         }
     }
 
-    fn verdict(shard: ShardId, seeds: &[u8]) -> TerminalVerdict {
-        TerminalVerdict::new(
+    fn verdict(shard: ShardId, seeds: &[u8]) -> AbandonmentRecord {
+        AbandonmentRecord::departed(
             shard,
             WeightedTimestamp::from_millis(1_000),
             seeds
@@ -1273,15 +1273,15 @@ mod tests {
     #[test]
     fn a_block_whose_root_does_not_commit_its_records_is_refused() {
         let records = vec![verdict(ShardId::ROOT, &[1, 2])];
-        let honest = terminal_verdict_root_from_records(&records);
+        let honest = abandonment_root_from_records(&records);
         assert!(
-            validate_terminal_verdicts_well_formed(&block_with_verdicts(records.clone(), honest))
+            validate_abandonment_records_well_formed(&block_with_verdicts(records.clone(), honest))
                 .is_ok()
         );
 
-        let err = validate_terminal_verdicts_well_formed(&block_with_verdicts(
+        let err = validate_abandonment_records_well_formed(&block_with_verdicts(
             records,
-            TerminalVerdictRoot::ZERO,
+            AbandonmentRoot::ZERO,
         ))
         .unwrap_err();
         assert!(err.contains("does not commit"), "{err}");
@@ -1293,10 +1293,10 @@ mod tests {
     #[test]
     fn a_record_out_of_its_canonical_form_is_refused() {
         let malformed =
-            TerminalVerdict::new(ShardId::ROOT, WeightedTimestamp::from_millis(1_000), []);
-        let root = terminal_verdict_root_from_records(std::slice::from_ref(&malformed));
+            AbandonmentRecord::departed(ShardId::ROOT, WeightedTimestamp::from_millis(1_000), []);
+        let root = abandonment_root_from_records(std::slice::from_ref(&malformed));
         let err =
-            validate_terminal_verdicts_well_formed(&block_with_verdicts(vec![malformed], root))
+            validate_abandonment_records_well_formed(&block_with_verdicts(vec![malformed], root))
                 .unwrap_err();
         assert!(
             err.contains("empty, over its cap, or out of order"),
@@ -1314,17 +1314,17 @@ mod tests {
         assert!(left < right, "the fixture relies on the child ordering");
 
         let ordered = vec![verdict(left, &[1]), verdict(right, &[2])];
-        let root = terminal_verdict_root_from_records(&ordered);
+        let root = abandonment_root_from_records(&ordered);
         assert!(
-            validate_terminal_verdicts_well_formed(&block_with_verdicts(ordered, root)).is_ok()
+            validate_abandonment_records_well_formed(&block_with_verdicts(ordered, root)).is_ok()
         );
 
         for records in [
             vec![verdict(right, &[2]), verdict(left, &[1])],
             vec![verdict(left, &[1]), verdict(left, &[2])],
         ] {
-            let root = terminal_verdict_root_from_records(&records);
-            let err = validate_terminal_verdicts_well_formed(&block_with_verdicts(records, root))
+            let root = abandonment_root_from_records(&records);
+            let err = validate_abandonment_records_well_formed(&block_with_verdicts(records, root))
                 .unwrap_err();
             assert!(err.contains("repeats or precedes"), "{err}");
         }
@@ -1341,7 +1341,7 @@ mod tests {
         let half = MAX_UNSETTLED_PER_BLOCK / 2 + 1;
         let (left, right) = ShardId::ROOT.children();
         let span = |shard: ShardId, from: usize| {
-            TerminalVerdict::new(
+            AbandonmentRecord::departed(
                 shard,
                 WeightedTimestamp::from_millis(1_000),
                 (from..from + half)
@@ -1353,8 +1353,8 @@ mod tests {
             assert!(record.is_well_formed(), "each record is within its own cap");
         }
 
-        let root = terminal_verdict_root_from_records(&records);
-        let err = validate_terminal_verdicts_well_formed(&block_with_verdicts(records, root))
+        let root = abandonment_root_from_records(&records);
+        let err = validate_abandonment_records_well_formed(&block_with_verdicts(records, root))
             .unwrap_err();
         assert!(err.contains("over the drain's own bound"), "{err}");
     }
@@ -1480,7 +1480,7 @@ mod tests {
             certificates: Arc::new(wrapped),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
         }
     }
 
@@ -1571,12 +1571,12 @@ mod tests {
         dedup_index.register_committed_certs(&[Arc::new((*settled).clone().into())]);
 
         let block = block_with_verdicts(
-            vec![TerminalVerdict::new(
+            vec![AbandonmentRecord::departed(
                 ShardId::ROOT,
                 WeightedTimestamp::from_millis(1_000),
                 [named(tx_hash)],
             )],
-            TerminalVerdictRoot::ZERO,
+            AbandonmentRoot::ZERO,
         );
         let err = no_resolutions(&block, &dedup_index).unwrap_err();
         assert!(
@@ -1600,7 +1600,7 @@ mod tests {
             certificates: Arc::new(vec![Arc::new((*settled).clone().into())]),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(vec![TerminalVerdict::new(
+            abandonment_records: Arc::new(vec![AbandonmentRecord::departed(
                 ShardId::ROOT,
                 WeightedTimestamp::from_millis(1_000),
                 [named(tx_hash)],
@@ -1667,7 +1667,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(wrapped),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
         }
     }
 
@@ -1872,10 +1872,8 @@ mod tests {
         // down, so the rule covers every body list rather than three of
         // four.
         let records = vec![verdict(ShardId::ROOT, &[1])];
-        let with_record = block_with_verdicts(
-            records.clone(),
-            terminal_verdict_root_from_records(&records),
-        );
+        let with_record =
+            block_with_verdicts(records.clone(), abandonment_root_from_records(&records));
         let err = validate_block_for_vote(
             &topo,
             local_shard(),
@@ -1888,7 +1886,7 @@ mod tests {
             Some(ShardLoad::ZERO),
         )
         .unwrap_err();
-        assert!(err.contains("terminal-verdict records"), "{err}");
+        assert!(err.contains("abandonment records"), "{err}");
 
         let empty = block_with_transactions(BlockHeight::new(1), Vec::new());
         assert!(
@@ -1934,7 +1932,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(provisions),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
         }
     }
 

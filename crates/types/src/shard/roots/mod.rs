@@ -19,6 +19,7 @@
 //! [`state`] is the one outlier: it carries the JMT-replay byproduct
 //! (`PreparedCommit`) in its `Verified<StateRoot, _>` augment slot.
 
+pub mod abandonment;
 pub mod beacon_witness;
 pub mod certificate;
 pub mod committed_txs;
@@ -29,9 +30,11 @@ pub mod reveal_chain;
 pub mod settled_txs;
 pub mod state;
 pub mod terminal;
-pub mod terminal_verdict;
 pub mod transaction;
 
+pub use abandonment::{
+    AbandonmentRootContext, AbandonmentRootVerifyError, abandonment_root_from_records,
+};
 pub use beacon_witness::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, commit_witness_window, derive_leaves,
     derive_reshape_trigger, missed_proposals_since_prev_commit, ready_leaf_payload,
@@ -50,7 +53,4 @@ pub use reveal_chain::{REVEAL_CHAIN_DOMAIN_TAG, extend_reveal_chain, next_reveal
 pub use settled_txs::{local_settled_tx_hashes, settled_txs_root_from_hashes};
 pub use state::{SplitChildRoots, StateRootContext, StateRootVerifyError};
 pub use terminal::TerminalRoots;
-pub use terminal_verdict::{
-    TerminalVerdictRootContext, TerminalVerdictRootVerifyError, terminal_verdict_root_from_records,
-};
 pub use transaction::{TransactionRootContext, TxRootVerifyError};

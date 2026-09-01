@@ -76,30 +76,35 @@ pub const fn sweep_admits_block(sweepable: usize) -> bool {
 }
 
 /// Hard cap on the transactions a block's
-/// [`TerminalVerdict`](crate::TerminalVerdict) records may name between
+/// [`AbandonmentRecord`](crate::AbandonmentRecord) records may name between
 /// them.
 ///
 /// A record answers for the transactions this chain still owes an outcome
-/// for that a departed shard did not settle, and how many that can be is
+/// for that a counterpart can never settle, and how many that can be is
 /// what [`MAX_DRAIN_WORK`] already bounds — a transaction is only owed
 /// while its reservation stands. So the ceiling is the drain's own count
-/// bound rather than a figure of its own, and a departure with more
+/// bound rather than a figure of its own, and a counterpart with more
 /// outstanding than one block will carry is answered over several, each
 /// record standing alone.
 ///
 /// The bound is on the block rather than on any one record, because the
-/// drain is one budget shared across every departure the block answers
+/// drain is one budget shared across every counterpart the block answers
 /// for. It doubles as each record's own decode cap, since a single
-/// departure can hold the whole of it — but that cap alone would let a
+/// counterpart can hold the whole of it — but that cap alone would let a
 /// block carry the budget once per record, which is why the sum is
 /// checked as well.
 pub const MAX_UNSETTLED_PER_BLOCK: usize = (MAX_DRAIN_WORK / TX_UNITS) as usize;
 
-/// Hard cap on the departed shards one block may answer for.
+/// Hard cap on the abandonment records one block may carry.
 ///
-/// A shard leaves at a reshape cut, so a block carrying more of these
-/// than the trie has leaves is describing a topology that never existed.
-pub const MAX_TERMINAL_VERDICTS_PER_BLOCK: usize = MAX_PROVISION_TARGET_SHARDS;
+/// A block's records are in strictly ascending shard order, so it carries
+/// at most one per counterpart shard, and a record may name a live shard
+/// — a refusing core — as readily as one that left. So the bound is the
+/// shard count itself: more records than the trie has leaves names a
+/// shard that does not exist. A shard with evidence at several anchors
+/// drains one anchor per block, which costs settlement rate rather than
+/// this bound.
+pub const MAX_ABANDONMENT_RECORDS_PER_BLOCK: usize = MAX_PROVISION_TARGET_SHARDS;
 
 /// Cap on the number of shards a block can name as provision targets, at
 /// decode time.

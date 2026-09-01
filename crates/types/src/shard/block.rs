@@ -12,12 +12,12 @@ use hyperscale_hbor::Hbor;
 use thiserror::Error;
 
 use crate::{
-    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, CertificateRoot, ChainOrigin,
-    Derivation, Finalization, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TERMINAL_VERDICTS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    AbandonmentRecord, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, CertificateRoot,
+    ChainOrigin, Derivation, Finalization, LocalReceiptRoot, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ShardId,
-    SharedWitnessSources, SplitChildRoots, StateRoot, TerminalVerdict, Transaction,
-    TransactionRoot, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    SharedWitnessSources, SplitChildRoots, StateRoot, Transaction, TransactionRoot, TxHash,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -117,9 +117,9 @@ pub enum Block {
         #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
         provisions: Arc<Vec<Arc<Verifiable<Provisions>>>>,
         /// What departed shards left unresolved of this chain's business.
-        /// Committed via the header's `terminal_verdict_root`.
-        #[hbor(max = MAX_TERMINAL_VERDICTS_PER_BLOCK)]
-        terminal_verdicts: Arc<Vec<TerminalVerdict>>,
+        /// Committed via the header's `abandonment_root`.
+        #[hbor(max = MAX_ABANDONMENT_RECORDS_PER_BLOCK)]
+        abandonment_records: Arc<Vec<AbandonmentRecord>>,
         /// Proposer-supplied beacon-witness inputs. Committed via the
         /// header's `beacon_witness_root`; carried on the body so
         /// commit-time leaf derivation is identical on every node. See
@@ -151,8 +151,8 @@ pub enum Block {
         /// Retained through sealing, unlike provisions: a verdict is
         /// composed on this evidence however long after the terminal it
         /// came from, which is the whole reason it is written down.
-        #[hbor(max = MAX_TERMINAL_VERDICTS_PER_BLOCK)]
-        terminal_verdicts: Arc<Vec<TerminalVerdict>>,
+        #[hbor(max = MAX_ABANDONMENT_RECORDS_PER_BLOCK)]
+        abandonment_records: Arc<Vec<AbandonmentRecord>>,
         /// Proposer-supplied beacon-witness inputs — retained through
         /// sealing (unlike provisions) because the beacon-witness fold
         /// consuming them can run well after the block sealed. See
@@ -225,7 +225,7 @@ impl Block {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -251,7 +251,7 @@ impl Block {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -280,7 +280,7 @@ impl Block {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -403,14 +403,16 @@ impl Block {
     /// regardless of variant — the evidence a verdict against a departed
     /// counterpart is composed on.
     #[must_use]
-    pub fn terminal_verdicts(&self) -> &[TerminalVerdict] {
+    pub fn abandonment_records(&self) -> &[AbandonmentRecord] {
         match self {
             Self::Live {
-                terminal_verdicts, ..
+                abandonment_records,
+                ..
             }
             | Self::Sealed {
-                terminal_verdicts, ..
-            } => terminal_verdicts,
+                abandonment_records,
+                ..
+            } => abandonment_records,
         }
     }
 
@@ -497,7 +499,7 @@ impl Block {
                 transactions,
                 certificates,
                 provisions,
-                terminal_verdicts,
+                abandonment_records,
                 witness_sources,
             } => {
                 let hashes: Vec<ProvisionHash> = provisions.iter().map(|p| p.hash()).collect();
@@ -506,7 +508,7 @@ impl Block {
                     transactions,
                     certificates,
                     provision_hashes: Arc::new(hashes),
-                    terminal_verdicts,
+                    abandonment_records,
                     witness_sources,
                 }
             }
@@ -529,7 +531,7 @@ impl Block {
                 header,
                 transactions,
                 certificates,
-                terminal_verdicts,
+                abandonment_records,
                 witness_sources,
                 ..
             } => Self::Live {
@@ -537,7 +539,7 @@ impl Block {
                 transactions,
                 certificates,
                 provisions,
-                terminal_verdicts,
+                abandonment_records,
                 witness_sources,
             },
             Self::Live { .. } => {

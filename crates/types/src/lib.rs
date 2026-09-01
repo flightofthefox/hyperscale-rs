@@ -114,10 +114,10 @@ pub use network::{
 pub use primitives::bloom::{BloomFilter, BloomKey, DEFAULT_FPR, MAX_BITS};
 pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
-    BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot, CommittedTxsRoot, EventRoot,
-    FinalizationHash, GenesisConfigHash, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
-    ProvisionHash, ProvisionTxRoot, ProvisionsRoot, RevealChain, SettledTxsRoot, StateRoot,
-    TerminalVerdictRoot, TransactionRoot, TxHash, WritesRoot,
+    AbandonmentRoot, BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot,
+    CommittedTxsRoot, EventRoot, FinalizationHash, GenesisConfigHash, GlobalReceiptHash,
+    GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot,
+    RevealChain, SettledTxsRoot, StateRoot, TransactionRoot, TxHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex, RatifyRound,
@@ -144,6 +144,7 @@ pub use receipt::event::{
 pub use receipt::global::GlobalReceipt;
 pub use receipt::metadata::{ExecutionMetadata, FeeSummary, LogLevel};
 pub use receipt::stored::StoredReceipt;
+pub use shard::abandonment::{AbandonmentRecord, AbortCharge, Unsettleable, UnsettledTx};
 pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch, LinkageError};
 pub use shard::certified_header::{CertifiedBlockHeader, CertifiedHeaderVerifyError};
 pub use shard::chain_origin::{ChainOrigin, PredecessorTerminal};
@@ -161,31 +162,29 @@ pub use shard::header::{
 };
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
-    MAX_COMMITTED_TX_QUERY, MAX_DRAIN_WORK, MAX_FINALIZED_TX_PER_BLOCK, MAX_GAS_LIMIT,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_SWEEP_PER_BLOCK,
-    MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TERMINAL_VERDICTS_PER_BLOCK, MAX_TXS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, drain_admits_block, sweep_admits_block,
+    MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_COMMITTED_TX_QUERY, MAX_DRAIN_WORK,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_GAS_LIMIT, MAX_PROVISION_TARGET_SHARDS,
+    MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_SWEEP_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, drain_admits_block, sweep_admits_block,
 };
 pub use shard::load::ShardLoad;
 pub use shard::manifest::{BlockManifest, BlockMetadata};
 pub use shard::quorum_certificate::{QcContext, QcVerifyError, QuorumCertificate};
 pub use shard::reshape::{ReshapeThresholds, ReshapeTrigger};
 pub use shard::roots::{
-    BeaconWitnessRootContext, BeaconWitnessRootVerifyError, CertRootVerifyError,
-    CertificateRootContext, CommittedTxAbsence, LocalReceiptRootContext,
-    LocalReceiptRootVerifyError, ProvisionRootVerifyError, ProvisionTxRootsContext,
-    ProvisionTxRootsMap, ProvisionTxRootsVerifyError, ProvisionsRootContext,
-    REVEAL_CHAIN_DOMAIN_TAG, SplitChildRoots, StateRootContext, StateRootVerifyError,
-    TerminalRoots, TerminalVerdictRootContext, TerminalVerdictRootVerifyError,
-    TransactionRootContext, TxRootVerifyError, certificate_root_from_receipt_hashes,
-    commit_witness_window, committed_tx_leaf, committed_txs_root_from_hashes, derive_leaves,
-    derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, prove_committed_tx_absent,
-    ready_leaf_payload, settled_txs_root_from_hashes, terminal_verdict_root_from_records,
+    AbandonmentRootContext, AbandonmentRootVerifyError, BeaconWitnessRootContext,
+    BeaconWitnessRootVerifyError, CertRootVerifyError, CertificateRootContext, CommittedTxAbsence,
+    LocalReceiptRootContext, LocalReceiptRootVerifyError, ProvisionRootVerifyError,
+    ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
+    ProvisionsRootContext, REVEAL_CHAIN_DOMAIN_TAG, SplitChildRoots, StateRootContext,
+    StateRootVerifyError, TerminalRoots, TransactionRootContext, TxRootVerifyError,
+    abandonment_root_from_records, certificate_root_from_receipt_hashes, commit_witness_window,
+    committed_tx_leaf, committed_txs_root_from_hashes, derive_leaves, derive_reshape_trigger,
+    extend_reveal_chain, local_settled_tx_hashes, missed_proposals_since_prev_commit,
+    next_reveal_chain, prove_committed_tx_absent, ready_leaf_payload, settled_txs_root_from_hashes,
 };
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};
-pub use shard::terminal_verdict::{AbortCharge, TerminalVerdict, UnsettledTx};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::SafeVoteRegisters;

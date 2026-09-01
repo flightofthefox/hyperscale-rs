@@ -123,7 +123,7 @@ pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
                     unresolved.insert(tx.hash(), height);
                 }
             }
-            for verdict in block.terminal_verdicts() {
+            for verdict in block.abandonment_records() {
                 for tx_hash in verdict.tx_hashes() {
                     undischarged.insert(tx_hash, height);
                 }

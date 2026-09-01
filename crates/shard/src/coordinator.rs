@@ -16,11 +16,11 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, FinalizationHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr,
-    ProposerTimestamp, ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger,
-    ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StoredReceipt,
-    SubstateKey, TerminalVerdict, TxClaim, TxOutcome, WeightedTimestamp, WorkInFlight,
+    AbandonmentRecord, BlockHash, FinalizationHash, Hash, LocalTimestamp,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK,
+    PrincipalAddr, ProposerTimestamp, ProvisionHash, ReadySignal, ReshapeThresholds,
+    ReshapeTrigger, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary,
+    StoredReceipt, SubstateKey, TxClaim, TxOutcome, Unsettleable, WeightedTimestamp, WorkInFlight,
     derive_reshape_trigger, ready_signal_window, settled_set_verdict,
 };
 
@@ -118,8 +118,8 @@ use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
 use crate::precut::{Precut, PrecutStatus, PrecutVerdict};
 use crate::proposal::{
     ProposalKind, ProposalTracker, TakeResult, assemble_build_action, dispatch_or_defer,
-    filter_engaged_transactions, select_finalizations, select_provisions, select_terminal_verdicts,
-    select_transactions,
+    filter_engaged_transactions, select_abandonment_records, select_finalizations,
+    select_provisions, select_transactions,
 };
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::timeout_keeper::TimeoutKeeper;
@@ -1014,7 +1014,7 @@ impl ShardCoordinator {
         }
     }
 
-    /// Whether the block's terminal-verdict records are ones this voter
+    /// Whether the block's abandonment records are ones this voter
     /// can attest to, and so whether voting on it must be withheld.
     ///
     /// A record makes two claims, and both have to be checked or neither
@@ -1043,32 +1043,45 @@ impl ShardCoordinator {
     /// the record is only proposable inside the window where the set can
     /// be read, so a voter inside it either has the set or is about to.
     /// After that window the record is history and nothing re-asks this.
-    fn fence_terminal_verdicts(
+    fn fence_abandonment_records(
         &self,
         topology_schedule: &TopologySchedule,
         block: &Block,
         block_hash: BlockHash,
     ) -> bool {
-        if block.terminal_verdicts().is_empty() {
+        if block.abandonment_records().is_empty() {
             return false;
         }
         let anchored_wt = block.header().parent_qc().weighted_timestamp();
-        for verdict in block.terminal_verdicts() {
+        for verdict in block.abandonment_records() {
+            // A departure is checked against the schedule and the settled
+            // set below. A refusal or an absence is checked against
+            // evidence this fence does not hold, and a voter that cannot
+            // check a record's evidence defers rather than accepting.
+            let Unsettleable::Departed { terminal_wt } = verdict.evidence() else {
+                trace!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    shard = ?verdict.shard(),
+                    "Abandonment record carries evidence this fence cannot check; deferring"
+                );
+                return true;
+            };
             let scheduled = topology_schedule.terminal_cut_for_shard(verdict.shard(), anchored_wt);
-            if scheduled != Some(verdict.terminal_wt()) {
+            if scheduled != Some(terminal_wt) {
                 warn!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
                     shard = ?verdict.shard(),
-                    claimed = ?verdict.terminal_wt(),
+                    claimed = ?terminal_wt,
                     ?scheduled,
-                    "Terminal-verdict record names a departure the schedule does not attest — \
+                    "Abandonment record names a departure the schedule does not attest — \
                      not voting"
                 );
                 return true;
             }
         }
-        let claims = block.terminal_verdicts().iter().flat_map(|verdict| {
+        let claims = block.abandonment_records().iter().flat_map(|verdict| {
             verdict
                 .tx_hashes()
                 .map(move |tx_hash| (verdict.shard(), tx_hash, TxClaim::Abandoned))
@@ -1085,7 +1098,7 @@ impl ShardCoordinator {
                 warn!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
-                    "Terminal-verdict record names a transaction its shard settled — not voting"
+                    "Abandonment record names a transaction its shard settled — not voting"
                 );
                 true
             }
@@ -1093,7 +1106,7 @@ impl ShardCoordinator {
                 trace!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
-                    "Settled set for a terminal-verdict record unknown at vote; deferring"
+                    "Settled set for a abandonment record unknown at vote; deferring"
                 );
                 true
             }
@@ -1838,7 +1851,7 @@ impl ShardCoordinator {
         ready_txs: &[Arc<Verified<Transaction>>],
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
-        terminal_verdicts: Vec<TerminalVerdict>,
+        abandonment_records: Vec<AbandonmentRecord>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // not the committed block — this lets the chain grow while the
@@ -1891,7 +1904,7 @@ impl ShardCoordinator {
                     transactions: Vec::new(),
                     finalizations: Vec::new(),
                     provisions: Vec::new(),
-                    terminal_verdicts: Vec::new(),
+                    abandonment_records: Vec::new(),
                 },
             );
         }
@@ -1916,7 +1929,7 @@ impl ShardCoordinator {
                     transactions: Vec::new(),
                     finalizations: Vec::new(),
                     provisions: Vec::new(),
-                    terminal_verdicts: Vec::new(),
+                    abandonment_records: Vec::new(),
                 },
             );
         }
@@ -1958,8 +1971,8 @@ impl ShardCoordinator {
             &self.dedup_index,
             MAX_TXS_PER_BLOCK,
         );
-        let terminal_verdicts =
-            select_terminal_verdicts(terminal_verdicts, topology_schedule, validity_anchor);
+        let abandonment_records =
+            select_abandonment_records(abandonment_records, topology_schedule, validity_anchor);
         // Applied after provision selection: a cross-shard transaction
         // rides only beside (or after) its payer bundle, the engagement
         // evidence the voters' `validate_engagement` demands.
@@ -1979,7 +1992,7 @@ impl ShardCoordinator {
                 transactions,
                 finalizations,
                 provisions,
-                terminal_verdicts,
+                abandonment_records,
             },
         )
     }
@@ -3354,7 +3367,7 @@ impl ShardCoordinator {
 
             // And over the records it writes down about departed shards,
             // which the same sets answer for.
-            if self.fence_terminal_verdicts(topology_schedule, block, block_hash) {
+            if self.fence_abandonment_records(topology_schedule, block, block_hash) {
                 return vec![];
             }
 
@@ -4616,7 +4629,7 @@ impl ShardCoordinator {
         ready_txs: &[Arc<Verified<Transaction>>],
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
-        terminal_verdicts: Vec<TerminalVerdict>,
+        abandonment_records: Vec<AbandonmentRecord>,
     ) -> Vec<Action> {
         let height = qc.height();
 
@@ -4695,7 +4708,7 @@ impl ShardCoordinator {
             ready_txs,
             finalizations,
             provisions,
-            terminal_verdicts,
+            abandonment_records,
         ));
 
         actions
@@ -6708,7 +6721,7 @@ mod tests {
         NetworkDefinition, NetworkParams, SettledTxsRoot, ShardAnchor, ShardId, Signer,
         SignerBitfield, TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot,
         Transaction, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
-        WeightedTimestamp, WitnessSources, terminal_verdict_root_from_records, test_utils,
+        WeightedTimestamp, WitnessSources, abandonment_root_from_records, test_utils,
     };
 
     use super::*;
@@ -7161,7 +7174,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -7703,7 +7716,7 @@ mod tests {
                 transactions: Arc::new(Vec::new()),
                 certificates: Arc::new(Vec::new()),
                 provisions: Arc::new(Vec::new()),
-                terminal_verdicts: Arc::new(Vec::new()),
+                abandonment_records: Arc::new(Vec::new()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             }
         };
@@ -7907,7 +7920,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -8348,7 +8361,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let parent_block_hash = parent_block.hash();
@@ -10462,7 +10475,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
         };
         let mut sub_quorum_signers = SignerBitfield::new(4);
         sub_quorum_signers.set(0); // single signer — far below 2f+1 = 3
@@ -10531,7 +10544,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
         };
         let block_hash = block.hash();
         // The linkage assert fires before the committee resolves, so a
@@ -10579,7 +10592,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
         };
         let qc = {
             let __qc = make_test_qc(block.hash(), BlockHeight::new(1));
@@ -10785,7 +10798,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
         };
         let ancestor_hash = ancestor_block.hash();
         install_complete_block(&mut state, &ancestor_block);
@@ -10819,7 +10832,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
         };
 
         let result = {
@@ -10864,7 +10877,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
         };
         let ancestor_hash = ancestor_block.hash();
 
@@ -10896,7 +10909,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
         };
 
         // Ancestor is at committed height, so walk stops before checking it
@@ -11113,7 +11126,7 @@ mod tests {
 
     /// A block carrying boundary records, anchored at `anchor_ms` — the
     /// clock the fence reads each named departure against.
-    fn block_with_records(anchor_ms: u64, records: Vec<TerminalVerdict>) -> Block {
+    fn block_with_records(anchor_ms: u64, records: Vec<AbandonmentRecord>) -> Block {
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
         Block::Live {
             header: BlockHeader::new(BlockHeaderParts {
@@ -11130,21 +11143,21 @@ mod tests {
                     WeightedTimestamp::from_millis(anchor_ms),
                 )
                 .into(),
-                terminal_verdict_root: terminal_verdict_root_from_records(&records),
+                abandonment_root: abandonment_root_from_records(&records),
                 ..Default::default()
             }),
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(records),
+            abandonment_records: Arc::new(records),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
     /// A record claiming `shard` left `tx` unsettled when it terminated at
     /// `terminal_wt`.
-    fn record_naming(shard: ShardId, terminal_wt: u64, tx: &[u8]) -> TerminalVerdict {
-        TerminalVerdict::new(
+    fn record_naming(shard: ShardId, terminal_wt: u64, tx: &[u8]) -> AbandonmentRecord {
+        AbandonmentRecord::departed(
             shard,
             WeightedTimestamp::from_millis(terminal_wt),
             [UnsettledTx {
@@ -11195,7 +11208,7 @@ mod tests {
             SettledSetVerdict::Pass,
             "the delegate passes over a live shard, so the fence must ask first",
         );
-        assert!(coord.fence_terminal_verdicts(
+        assert!(coord.fence_abandonment_records(
             &sched,
             &block_with_records(AFTER_CUT_MS, records),
             BlockHash::ZERO,
@@ -11209,7 +11222,7 @@ mod tests {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         let records = vec![record_naming(coord.local_shard, ROOT_CUT_MS, b"tx")];
-        assert!(coord.fence_terminal_verdicts(
+        assert!(coord.fence_abandonment_records(
             &sched,
             &block_with_records(AFTER_CUT_MS, records),
             BlockHash::ZERO,
@@ -11224,7 +11237,7 @@ mod tests {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS + 1, b"tx")];
-        assert!(coord.fence_terminal_verdicts(
+        assert!(coord.fence_abandonment_records(
             &sched,
             &block_with_records(AFTER_CUT_MS, records),
             BlockHash::ZERO,
@@ -11246,7 +11259,7 @@ mod tests {
             },
         );
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
-        assert!(!coord.fence_terminal_verdicts(
+        assert!(!coord.fence_abandonment_records(
             &sched,
             &block_with_records(AFTER_CUT_MS, records),
             BlockHash::ZERO,
@@ -11269,7 +11282,7 @@ mod tests {
             },
         );
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
-        assert!(coord.fence_terminal_verdicts(
+        assert!(coord.fence_abandonment_records(
             &sched,
             &block_with_records(AFTER_CUT_MS, records),
             BlockHash::ZERO,
@@ -11283,7 +11296,7 @@ mod tests {
             certificates: Arc::new(certs),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
         }
     }
 
@@ -11527,7 +11540,7 @@ mod tests {
             )]),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
         }
     }
 
@@ -11620,7 +11633,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
         }
     }
 
@@ -11641,7 +11654,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
         }
     }
 

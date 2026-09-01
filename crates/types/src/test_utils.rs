@@ -330,7 +330,7 @@ pub fn make_live_block(
         transactions: Arc::new(transactions),
         certificates: Arc::new(certificates),
         provisions: Arc::new(Vec::new()),
-        terminal_verdicts: Arc::new(Vec::new()),
+        abandonment_records: Arc::new(Vec::new()),
         witness_sources: Arc::new(WitnessSources::empty()),
     }
 }
@@ -754,14 +754,14 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             transactions,
             certificates,
             provisions,
-            terminal_verdicts,
+            abandonment_records,
             witness_sources,
         } => Block::Live {
             header: restamp(header),
             transactions,
             certificates,
             provisions,
-            terminal_verdicts,
+            abandonment_records,
             witness_sources,
         },
         Block::Sealed {
@@ -769,14 +769,14 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             transactions,
             certificates,
             provision_hashes,
-            terminal_verdicts,
+            abandonment_records,
             witness_sources,
         } => Block::Sealed {
             header: restamp(header),
             transactions,
             certificates,
             provision_hashes,
-            terminal_verdicts,
+            abandonment_records,
             witness_sources,
         },
     }

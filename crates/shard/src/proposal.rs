@@ -19,10 +19,10 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash, LocalTimestamp,
-    ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round,
-    ShardId, TerminalVerdict, TopologySchedule, TopologySnapshot, Transaction, TxHash, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp, sweep_admits_block,
+    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash,
+    LocalTimestamp, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger,
+    RevealChain, Round, ShardId, TopologySchedule, TopologySnapshot, Transaction, TxHash,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, sweep_admits_block,
 };
 use tracing::debug;
 
@@ -43,7 +43,7 @@ pub enum ProposalKind {
         transactions: Vec<Arc<Verified<Transaction>>>,
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
-        terminal_verdicts: Vec<TerminalVerdict>,
+        abandonment_records: Vec<AbandonmentRecord>,
     },
     /// View-change fallback: empty payload, parent's weighted timestamp
     /// (prevents Byzantine proposers from manipulating consensus time on
@@ -338,11 +338,11 @@ pub fn select_finalizations(
 /// depth: without this the proposer offers a record every voter refuses,
 /// and because a chain that commits nothing never advances the frontier
 /// that would retire the set, the next proposal carries it again.
-pub fn select_terminal_verdicts(
-    verdicts: Vec<TerminalVerdict>,
+pub fn select_abandonment_records(
+    verdicts: Vec<AbandonmentRecord>,
     topology_schedule: &TopologySchedule,
     anchor_wt: WeightedTimestamp,
-) -> Vec<TerminalVerdict> {
+) -> Vec<AbandonmentRecord> {
     verdicts
         .into_iter()
         .filter(|verdict| topology_schedule.terminal_evidence_readable(verdict.shard(), anchor_wt))
@@ -489,7 +489,7 @@ pub fn assemble_build_action(
         transactions,
         finalizations,
         provisions,
-        terminal_verdicts,
+        abandonment_records,
         log_label,
         record_leader_activity,
     ) = match kind {
@@ -497,14 +497,14 @@ pub fn assemble_build_action(
             transactions,
             finalizations,
             provisions,
-            terminal_verdicts,
+            abandonment_records,
         } => (
             ProposerTimestamp::from_local(now),
             false,
             transactions,
             finalizations,
             provisions,
-            terminal_verdicts,
+            abandonment_records,
             "Requesting block build for proposal",
             false,
         ),
@@ -548,7 +548,7 @@ pub fn assemble_build_action(
         transactions,
         finalizations,
         provisions,
-        terminal_verdicts,
+        abandonment_records,
         fee_checks,
         fee_read_height,
         parent_in_flight,
@@ -642,7 +642,7 @@ mod tests {
     /// so the anchor is what decides here too — against the same
     /// handoff-anchored evidence window the fence itself derives.
     #[test]
-    fn select_terminal_verdicts_stops_at_the_evidence_expiry() {
+    fn select_abandonment_records_stops_at_the_evidence_expiry() {
         use std::collections::{BTreeMap, BTreeSet, HashMap};
 
         use hyperscale_types::{
@@ -685,7 +685,7 @@ mod tests {
             sched
         };
 
-        let record = TerminalVerdict::new(
+        let record = AbandonmentRecord::departed(
             departed,
             WeightedTimestamp::from_millis(2_000),
             [UnsettledTx {
@@ -696,7 +696,7 @@ mod tests {
             }],
         );
         let offered = |sched: &TopologySchedule, anchor: WeightedTimestamp| {
-            select_terminal_verdicts(vec![record.clone()], sched, anchor).len()
+            select_abandonment_records(vec![record.clone()], sched, anchor).len()
         };
 
         let handoff = Epoch::new(4);

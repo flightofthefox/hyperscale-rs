@@ -18,9 +18,9 @@ use hyperscale_types::network::notification::{
     BlockHeaderNotification, BlockVoteNotification, ReadySignalNotification, TimeoutNotification,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BeaconWitnessRootContext, Block, BlockHash, BlockHeader,
-    BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote, BlockVoteMessage,
-    CertificateRoot, CertificateRootContext, CertifiedBlockHeader,
+    AbandonmentRecord, AbandonmentRoot, BeaconWitnessLeafCount, BeaconWitnessRootContext, Block,
+    BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote,
+    BlockVoteMessage, CertificateRoot, CertificateRootContext, CertifiedBlockHeader,
     CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError, ConsensusPublicKey,
     ConsensusReceipt, Derivation, Epoch, Finalization, Hash, LocalReceiptRoot,
     LocalReceiptRootContext, NetworkDefinition, PreparedCommit, PrincipalAddr as AccountAddr,
@@ -28,13 +28,12 @@ use hyperscale_types::{
     ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
     ReshapeTrigger, RevealChain, Round, ShardId, ShardLoad, SplitChildRoots, StateRoot,
     StateRootContext, StateRootVerifyError, Stopwatch, StoredReceipt, SubstateKey, SweepFrontier,
-    TerminalRoots, TerminalVerdict, TerminalVerdictRoot, Timeout, TimeoutContext, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionRootContext, TxHash, ValidatorId, Verifiable,
-    Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
-    WorkInFlight, absorb_committed_cells, commit_witness_window, derive_leaves,
-    local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
-    protocol_statics, shard_reveal_sign, signed_bytes, vrf_output_from_proof,
-    work_over_certificates,
+    TerminalRoots, Timeout, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
+    TransactionRootContext, TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
+    VrfProof, WeightedTimestamp, WitnessSources, WorkInFlight, absorb_committed_cells,
+    commit_witness_window, derive_leaves, local_settled_tx_hashes,
+    missed_proposals_since_prev_commit, next_reveal_chain, protocol_statics, shard_reveal_sign,
+    signed_bytes, vrf_output_from_proof, work_over_certificates,
 };
 
 /// Result of QC verification and assembly.
@@ -213,7 +212,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     local_shard: ShardId,
     topology_snapshot: &TopologySnapshot,
     provisions: Vec<Arc<Verifiable<Provisions>>>,
-    terminal_verdicts: Vec<TerminalVerdict>,
+    abandonment_records: Vec<AbandonmentRecord>,
     parent_in_flight: WorkInFlight,
     parent_settled_frontier: BlockHeight,
     parent_sweep_frontier: SweepFrontier,
@@ -371,8 +370,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
 
     // What departed shards left unresolved, committed so a verdict on it
     // outlives the settled set the records were read from.
-    let terminal_verdict_root =
-        Verified::<TerminalVerdictRoot>::compute(&terminal_verdicts).into_inner();
+    let abandonment_root = Verified::<AbandonmentRoot>::compute(&abandonment_records).into_inner();
 
     let header = BlockHeader::new(BlockHeaderParts {
         shard_id: local_shard,
@@ -389,7 +387,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         local_receipt_root,
         provision_root,
         provision_tx_roots,
-        terminal_verdict_root,
+        abandonment_root,
         work_in_flight,
         settled_tick_frontier,
         sweep_frontier,
@@ -407,7 +405,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         transactions: Arc::new(transactions),
         certificates: Arc::new(certificates),
         provisions: Arc::new(provisions),
-        terminal_verdicts: Arc::new(terminal_verdicts),
+        abandonment_records: Arc::new(abandonment_records),
         witness_sources,
     };
 
@@ -966,7 +964,7 @@ where
             transactions,
             finalizations,
             provisions,
-            terminal_verdicts,
+            abandonment_records,
             fee_checks,
             fee_read_height,
             parent_in_flight,
@@ -1121,7 +1119,7 @@ where
                 shard_id,
                 &classification_topology,
                 provisions.clone(),
-                terminal_verdicts,
+                abandonment_records,
                 parent_in_flight,
                 parent_settled_frontier,
                 parent_sweep_frontier,

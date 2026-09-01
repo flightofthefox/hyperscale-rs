@@ -41,15 +41,15 @@ use hyperscale_engine::{TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_unresolvable_tx};
 use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::{
-    Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
-    CertifiedBlock, DeclaredKey, Derivation, ExecutionCertificate, ExecutionCertificateVerifyError,
-    ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
-    Hash, MAX_FINALIZATION_DELAY, MAX_TERMINAL_VERDICTS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, Mode,
-    Provisions, RETENTION_HORIZON, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
-    ShardTrie, StoredReceipt, TerminalVerdict, TickId, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp, derive_block_transactions, settled_set_verdict, tick_leader,
-    tick_leader_at,
+    AbandonmentRecord, Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight,
+    BloomFilter, CertifiedBlock, DeclaredKey, Derivation, ExecutionCertificate,
+    ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationHash,
+    FinalizationVerifyError, GlobalReceiptRoot, Hash, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
+    MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, Mode, Provisions, RETENTION_HORIZON,
+    ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StoredReceipt, TickId,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxHash,
+    TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp, derive_block_transactions,
+    settled_set_verdict, tick_leader, tick_leader_at,
 };
 use tracing::instrument;
 
@@ -2174,7 +2174,7 @@ impl ExecutionCoordinator {
         // prune below reads what is still answerable.
         let rebuilt = self
             .unresolved
-            .record_terminal_verdicts(block.terminal_verdicts());
+            .record_abandonment_records(block.abandonment_records());
         for _ in 0..rebuilt {
             record_rebuilt_verdict_entry();
         }
@@ -2525,16 +2525,16 @@ impl ExecutionCoordinator {
     /// Ascending by shard, which is the one order a block may carry them
     /// in.
     #[must_use]
-    pub fn pending_terminal_verdicts(&self) -> Vec<TerminalVerdict> {
+    pub fn pending_abandonment_records(&self) -> Vec<AbandonmentRecord> {
         let mut budget = MAX_UNSETTLED_PER_BLOCK;
-        let mut records: Vec<TerminalVerdict> = Vec::new();
+        let mut records: Vec<AbandonmentRecord> = Vec::new();
         // `settled_sets` is a hash map, so the shards are walked in sorted
         // order rather than its own: which departures the budget reaches
         // must not turn on a per-process iteration order.
         let mut shards: Vec<ShardId> = self.settled_sets.keys().copied().collect();
         shards.sort_unstable();
         for shard in shards {
-            if budget == 0 || records.len() == MAX_TERMINAL_VERDICTS_PER_BLOCK {
+            if budget == 0 || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
                 break;
             }
             let settled = &self.settled_sets[&shard];
@@ -2545,7 +2545,11 @@ impl ExecutionCoordinator {
                 continue;
             }
             budget -= unsettled.len();
-            records.push(TerminalVerdict::new(shard, settled.terminal_wt, unsettled));
+            records.push(AbandonmentRecord::departed(
+                shard,
+                settled.terminal_wt,
+                unsettled,
+            ));
         }
         records
     }
@@ -6969,7 +6973,7 @@ mod tests {
     fn record_peer_left_unsettled(state: &mut ExecutionCoordinator, tx_hash: TxHash) {
         state
             .unresolved
-            .record_terminal_verdicts(&[TerminalVerdict::new(
+            .record_abandonment_records(&[AbandonmentRecord::departed(
                 PEER,
                 WeightedTimestamp::from_millis(60_000),
                 vec![UnsettledTx {
@@ -7073,7 +7077,7 @@ mod tests {
             },
         );
 
-        let records = state.pending_terminal_verdicts();
+        let records = state.pending_abandonment_records();
         assert_eq!(records.len(), 1, "the peer's departure is answerable");
         assert_eq!(records[0].shard(), PEER);
         assert_eq!(
@@ -7083,12 +7087,12 @@ mod tests {
         );
 
         // Committed, the record is what the account reads afterwards.
-        state.unresolved.record_terminal_verdicts(&records);
+        state.unresolved.record_abandonment_records(&records);
         assert!(state.unresolved.is_unsettled_by_departed(tx_hash));
 
         // And what it does not offer twice.
         assert!(
-            state.pending_terminal_verdicts().is_empty(),
+            state.pending_abandonment_records().is_empty(),
             "a departure is answered once",
         );
 
@@ -7127,11 +7131,11 @@ mod tests {
         state.record_settled_txs(&sched, peer_left, set(120_000));
         state.record_settled_txs(&sched, PEER, set(60_000));
 
-        let records = state.pending_terminal_verdicts();
+        let records = state.pending_abandonment_records();
         assert_eq!(
             records
                 .iter()
-                .map(TerminalVerdict::shard)
+                .map(AbandonmentRecord::shard)
                 .collect::<Vec<_>>(),
             vec![PEER, peer_left],
             "ascending by shard, whatever order the sets are held in",

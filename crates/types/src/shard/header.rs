@@ -10,12 +10,12 @@ use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
 use thiserror::Error;
 
 use crate::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
-    ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot, MAX_PROVISION_TARGET_SHARDS,
-    PredecessorTerminal, ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate,
-    RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot,
-    SweepFrontier, TerminalRoots, TerminalVerdictRoot, TransactionRoot, ValidatorId, Verifiable,
-    Verified, Verify, WeightedTimestamp, WorkInFlight,
+    AbandonmentRoot, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
+    CertificateRoot, ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot,
+    MAX_PROVISION_TARGET_SHARDS, PredecessorTerminal, ProposerTimestamp, ProvisionTxRoot,
+    ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad,
+    SplitChildRoots, StateRoot, SweepFrontier, TerminalRoots, TransactionRoot, ValidatorId,
+    Verifiable, Verified, Verify, WeightedTimestamp, WorkInFlight,
 };
 
 /// The running values a block extending the committed tip is checked
@@ -79,11 +79,11 @@ pub struct BlockHeader {
     provision_root: ProvisionsRoot,
     #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
     provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
-    /// Commits the block's [`TerminalVerdict`](crate::TerminalVerdict)
+    /// Commits the block's [`AbandonmentRecord`](crate::AbandonmentRecord)
     /// records — what departed shards left unresolved of this chain's
     /// business, written down while the evidence for it could still be
     /// read.
-    terminal_verdict_root: TerminalVerdictRoot,
+    abandonment_root: AbandonmentRoot,
     work_in_flight: WorkInFlight,
     /// The highest tick whose determined half has settled at or below
     /// this block: the parent's, raised to the last determined half this
@@ -187,7 +187,7 @@ pub struct BlockHeaderParts {
     pub local_receipt_root: LocalReceiptRoot,
     pub provision_root: ProvisionsRoot,
     pub provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
-    pub terminal_verdict_root: TerminalVerdictRoot,
+    pub abandonment_root: AbandonmentRoot,
     pub work_in_flight: WorkInFlight,
     pub settled_tick_frontier: BlockHeight,
     pub sweep_frontier: SweepFrontier,
@@ -218,7 +218,7 @@ impl Default for BlockHeaderParts {
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
             provision_tx_roots: BTreeMap::new(),
-            terminal_verdict_root: TerminalVerdictRoot::ZERO,
+            abandonment_root: AbandonmentRoot::ZERO,
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
             sweep_frontier: SweepFrontier::ZERO,
@@ -257,7 +257,7 @@ impl BlockHeader {
             local_receipt_root,
             provision_root,
             provision_tx_roots,
-            terminal_verdict_root,
+            abandonment_root,
             work_in_flight,
             settled_tick_frontier,
             sweep_frontier,
@@ -284,7 +284,7 @@ impl BlockHeader {
             local_receipt_root,
             provision_root,
             provision_tx_roots,
-            terminal_verdict_root,
+            abandonment_root,
             work_in_flight,
             settled_tick_frontier,
             sweep_frontier,
@@ -330,7 +330,7 @@ impl BlockHeader {
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
             provision_tx_roots: BTreeMap::new(),
-            terminal_verdict_root: TerminalVerdictRoot::ZERO,
+            abandonment_root: AbandonmentRoot::ZERO,
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
             sweep_frontier: SweepFrontier::ZERO,
@@ -384,7 +384,7 @@ impl BlockHeader {
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
             provision_tx_roots: BTreeMap::new(),
-            terminal_verdict_root: TerminalVerdictRoot::ZERO,
+            abandonment_root: AbandonmentRoot::ZERO,
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
             sweep_frontier: SweepFrontier::ZERO,
@@ -452,7 +452,7 @@ impl BlockHeader {
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
             provision_tx_roots: BTreeMap::new(),
-            terminal_verdict_root: TerminalVerdictRoot::ZERO,
+            abandonment_root: AbandonmentRoot::ZERO,
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
             sweep_frontier: SweepFrontier::ZERO,
@@ -596,10 +596,10 @@ impl BlockHeader {
         &self.provision_tx_roots
     }
 
-    /// Commitment to the block's terminal-verdict records.
+    /// Commitment to the block's abandonment records.
     #[must_use]
-    pub const fn terminal_verdict_root(&self) -> TerminalVerdictRoot {
-        self.terminal_verdict_root
+    pub const fn abandonment_root(&self) -> AbandonmentRoot {
+        self.abandonment_root
     }
 
     /// Approximate number of in-flight transactions on this shard at proposal time.
@@ -769,7 +769,7 @@ impl BlockHeader {
             local_receipt_root: self.local_receipt_root,
             provision_root: self.provision_root,
             provision_tx_roots: self.provision_tx_roots,
-            terminal_verdict_root: self.terminal_verdict_root,
+            abandonment_root: self.abandonment_root,
             work_in_flight: self.work_in_flight,
             settled_tick_frontier: self.settled_tick_frontier,
             sweep_frontier: self.sweep_frontier,

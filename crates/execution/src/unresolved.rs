@@ -22,8 +22,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    AbortCharge, Address, Finalization, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, ShardId,
-    ShardTrie, TerminalVerdict, Transaction, TxHash, UnsettledTx, Verifiable, WeightedTimestamp,
+    AbandonmentRecord, AbortCharge, Address, Finalization, MAX_FINALIZATION_DELAY,
+    MAX_VALIDITY_RANGE, ShardId, ShardTrie, Transaction, TxHash, UnsettledTx, Verifiable,
+    WeightedTimestamp,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -228,7 +229,7 @@ impl UnresolvedTxs {
     ///
     /// Returns how many it reconstructed, which is how far short this
     /// replica's replay window fell.
-    pub fn record_terminal_verdicts(&mut self, verdicts: &[TerminalVerdict]) -> usize {
+    pub fn record_abandonment_records(&mut self, verdicts: &[AbandonmentRecord]) -> usize {
         let mut reconstructed = 0usize;
         for verdict in verdicts {
             for entry in verdict.unsettled() {
@@ -243,10 +244,10 @@ impl UnresolvedTxs {
                         deadline: entry.deadline,
                         declared_work: entry.declared_work,
                         charge: entry.charge,
-                        // The record dates it no later than the cut, which
-                        // is the one bound on its commit the record itself
-                        // establishes.
-                        committed_ts: verdict.terminal_wt(),
+                        // The record dates it no later than the moment its
+                        // evidence was taken at, which is the one bound on
+                        // its commit the record itself establishes.
+                        committed_ts: verdict.evidence().moment(),
                         remote_prefixes: BTreeSet::new(),
                         certified: true,
                         unsettled_by: Some(verdict.shard()),
@@ -820,7 +821,11 @@ mod tests {
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
         assert_eq!(
-            ledger.record_terminal_verdicts(&[TerminalVerdict::new(PARTNER, cut, [names(&tx)])]),
+            ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+                PARTNER,
+                cut,
+                [names(&tx)]
+            )]),
             0,
             "the ledger holds the transaction the record names",
         );
@@ -847,7 +852,7 @@ mod tests {
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
 
         assert_eq!(
-            ledger.record_terminal_verdicts(&[TerminalVerdict::new(
+            ledger.record_abandonment_records(&[AbandonmentRecord::departed(
                 PARTNER,
                 cut,
                 [names(&one), names(&two)],
@@ -880,7 +885,11 @@ mod tests {
         let tx = tx(21, 60_000);
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
-        ledger.record_terminal_verdicts(&[TerminalVerdict::new(PARTNER, cut, [names(&tx)])]);
+        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+            PARTNER,
+            cut,
+            [names(&tx)],
+        )]);
 
         assert!(
             ledger.prune(cut).is_empty(),
@@ -915,7 +924,7 @@ mod tests {
             "on its own clock the shard has stopped speaking for it",
         );
 
-        ledger.record_terminal_verdicts(&[TerminalVerdict::new(
+        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
             PARTNER,
             ms(500_000),
             [names(&tx)],
@@ -937,7 +946,7 @@ mod tests {
         let tx = tx(18, 60_000);
         commit(&mut ledger, &tx);
         ledger.certify(tx.hash());
-        ledger.record_terminal_verdicts(&[TerminalVerdict::new(
+        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
             PARTNER,
             ms(500_000),
             [names(&tx)],

@@ -189,7 +189,7 @@ mod tests {
             transactions: Arc::new(txs),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let hash = block.hash();

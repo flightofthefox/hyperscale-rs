@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    Finalization, MAX_TXS_PER_BLOCK, Provisions, TerminalVerdict, TopologySchedule,
+    AbandonmentRecord, Finalization, MAX_TXS_PER_BLOCK, Provisions, TopologySchedule,
     TopologySnapshot, Transaction, Verifiable, Verified,
 };
 
@@ -19,7 +19,7 @@ pub(in crate::state) struct ProposalInputs {
     pub ready_txs: Vec<Arc<Verified<Transaction>>>,
     pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
     pub provisions: Vec<Arc<Verifiable<Provisions>>>,
-    pub terminal_verdicts: Vec<TerminalVerdict>,
+    pub abandonment_records: Vec<AbandonmentRecord>,
 }
 
 impl ShardParticipation {
@@ -52,7 +52,7 @@ impl ShardParticipation {
         let finalizations = self.execution_coordinator.get_finalizations();
         // What departed counterparts left of this chain's business, while
         // the settled sets that say so can still be read.
-        let terminal_verdicts = self.execution_coordinator.pending_terminal_verdicts();
+        let abandonment_records = self.execution_coordinator.pending_abandonment_records();
         let queued = self.provisions_coordinator.queued_provisions(self.now);
 
         // The engagement gate: a non-payer shard proposes a cross-shard
@@ -80,7 +80,7 @@ impl ShardParticipation {
             ready_txs,
             finalizations,
             provisions,
-            terminal_verdicts,
+            abandonment_records,
         }
     }
 
@@ -125,7 +125,7 @@ impl ShardParticipation {
             &inputs.ready_txs,
             inputs.finalizations,
             inputs.provisions,
-            inputs.terminal_verdicts,
+            inputs.abandonment_records,
         )
     }
 }

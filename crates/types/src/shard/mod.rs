@@ -25,6 +25,7 @@
 //! - [`witness_sources`]: [`WitnessSources`] — the proposer-supplied
 //!   beacon-witness inputs a block carries.
 
+pub mod abandonment;
 #[allow(clippy::module_inception)]
 mod block;
 pub mod certified;
@@ -43,7 +44,6 @@ pub mod reshape;
 pub mod roots;
 pub mod storage_commit;
 pub mod sweep;
-pub mod terminal_verdict;
 pub mod timeout;
 pub mod vote;
 pub mod vote_registers;
