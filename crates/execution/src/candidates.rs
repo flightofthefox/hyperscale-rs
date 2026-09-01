@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
-use hyperscale_engine::legs::{Classified, crossings_of};
+use hyperscale_engine::legs::{Classified, Runs, crossings_of};
 use hyperscale_types::{
     EscrowedValue, ShardId, ShardTrie, SubstateKey, Transaction, TxHash, Verified,
     WeightedTimestamp,
@@ -285,7 +285,7 @@ impl TickCandidates {
                     clock: anchor.map_or(candidate.committed_ts, |a| a.clock),
                     reaches_beyond,
                     abortable,
-                    classified: candidate.classified.clone(),
+                    runs: Runs::Shape(candidate.classified.clone()),
                     arrivals,
                 },
                 membership,

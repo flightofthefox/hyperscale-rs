@@ -135,6 +135,18 @@ impl Classified {
     }
 }
 
+/// What a member runs of its transaction: the shape its committing
+/// block froze, or the reclaim of what a leg here issued.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Runs {
+    /// The transaction as classified at commit — whole, or the legs
+    /// this shard's placement gives it.
+    Shape(Classified),
+    /// No node at all: the crossings an inbound leg here issued, taken
+    /// back on the evidence a committed record carries.
+    Reclaim,
+}
+
 /// The star `legs` implies under `trie` — the anchored half of the
 /// classification.
 ///
@@ -421,7 +433,7 @@ pub fn reclaim_for_shard(
     crossings: &[Crossing],
     trie: &ShardTrie,
     local: ShardId,
-) -> Result<LegPlan, PlanDefect> {
+) -> Result<ShardPlan, PlanDefect> {
     let star = Star::of(legs, trie);
     let mut plan = LegPlan::whole();
     for node in 0..star.len() {
@@ -460,7 +472,10 @@ pub fn reclaim_for_shard(
     if !reclaimed {
         return Err(PlanDefect::NothingToReclaim);
     }
-    Ok(plan)
+    Ok(ShardPlan {
+        legs: plan,
+        scope: star.scope_for(local),
+    })
 }
 
 /// The anchored star with the placement facts every question here reads:
@@ -869,8 +884,9 @@ mod tests {
     fn a_reclaim_takes_back_the_inbound_crossing_alone() {
         let legs = swap();
         let crossings = vec![crossing(&legs, 1, 0, true), crossing(&legs, 2, 0, true)];
-        let caller =
-            reclaim_for_shard(&legs, &crossings, &trie(), low()).expect("the caller issued");
+        let caller = reclaim_for_shard(&legs, &crossings, &trie(), low())
+            .expect("the caller issued")
+            .legs;
         let reclaimed: Vec<((u32, u32), Reclaim)> = caller.reclaimed().collect();
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].0, (1, 0));

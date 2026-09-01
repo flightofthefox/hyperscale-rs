@@ -35,8 +35,8 @@ use hyperscale_types::{
     install_protocol_statics,
 };
 use hyperscale_vm_effects::{
-    ChainRecords, Declaration, DeclaredAccess, NodeCall, PackageHash, PrefixShardResolver,
-    SubintentRecord, admit_tree, package_hash, route_tree,
+    ChainRecords, CrossingCell, Declaration, DeclaredAccess, NodeCall, PackageHash,
+    PrefixShardResolver, SubintentRecord, admit_tree, package_hash, route_tree,
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchTx, EnvInputs, ExecutionMode, LegPlan, Locality, ManifestWalk, Receipt,
@@ -44,12 +44,12 @@ use hyperscale_vm_kernel::{
 };
 use hyperscale_vm_types::{
     Address, CallTarget, CollectionId, Effect, EffectSet, EffectTarget, EntryKey, Mode, Moves,
-    Outcome, SubstateKey, UnmetCondition,
+    Outcome, ResourceAddr, SubstateKey, UnmetCondition,
 };
 
 use crate::backend::EngineBackend;
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
-use crate::legs::{Decomposed, ShardPlan, plan_for_shard};
+use crate::legs::{Decomposed, Runs, ShardPlan, plan_for_shard, reclaim_for_shard};
 use crate::records::BatchRecords;
 use crate::sharding::writes_root;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
@@ -93,12 +93,12 @@ pub struct PreparedTx {
 
 /// What kind of member a transaction is in its batch: whether it
 /// declares cells beyond this shard, whether a counterpart's verdict can
-/// still discard it, whether its legs run where their state lives, and
-/// what arrived for the legs this shard runs.
+/// still discard it, what it runs of the transaction, and what arrived
+/// for the legs this shard runs.
 struct MemberShape {
     reaches_beyond: bool,
     abortable: bool,
-    decomposed: Decomposed,
+    runs: Runs,
     arrivals: Vec<EscrowedValue>,
 }
 
@@ -481,6 +481,90 @@ impl Executor {
         chain: &dyn ChainRecords,
     ) -> Result<PreparedTx, String> {
         Self::prepare_with_authority(tx, chain, TargetAuthority::Required)
+    }
+
+    /// [`Self::prepare`] for a member running the transaction's shape:
+    /// the legs `decomposed` gives this shard under `ctx`, with its
+    /// crossing cells declared.
+    fn prepare_shape(
+        ctx: &TickBatchContext<'_>,
+        tx: &Transaction,
+        records: &BatchRecords,
+        decomposed: Decomposed,
+        arrivals: &[EscrowedValue],
+    ) -> Result<PreparedTx, String> {
+        let mut entry = Self::prepare(tx, records)?;
+        entry.plan = plan_for_shard(
+            tx.legs(),
+            tx.crossings(),
+            arrivals,
+            decomposed,
+            ctx.shard_trie,
+            ctx.local_shard,
+        )
+        .map_err(|defect| format!("no plan for this shard: {defect}"))?;
+        declare_crossing_cells(&mut entry.declaration, &entry.plan.legs)?;
+        Ok(entry)
+    }
+
+    /// The entry a reclaim runs: no call, no nullifier, and a declaration
+    /// of its own over exactly the cells a reclaim touches — each record
+    /// read, each claim written, each origin credited in the resource the
+    /// record names.
+    ///
+    /// A reclaim derives from the cell, not the manifest, so it carries
+    /// none of the transaction's declaration: no node is invoked, so no
+    /// table position matters, and the transaction's own mode on the
+    /// origin — a reservation, where the value left — is not the credit
+    /// a reclaim makes. The origin and its denomination are read off the
+    /// record here, as the kernel reads them again when it credits; a
+    /// record this shard cannot read is a refusal, since nothing else
+    /// says what the value was.
+    fn prepare_reclaim(
+        plan: ShardPlan,
+        snapshot: &(dyn Substates + Sync),
+    ) -> Result<PreparedTx, String> {
+        let mut declaration = Declaration::default();
+        for ((node, output), reclaim) in plan.legs.reclaimed() {
+            let record = snapshot
+                .cell(reclaim.record)
+                .and_then(|bytes| CrossingCell::from_bytes(&bytes))
+                .ok_or_else(|| format!("reclaim of edge ({node}, {output}) reads no record"))?;
+            for (effect, holds) in [
+                (
+                    Effect {
+                        target: EffectTarget::Point(reclaim.record),
+                        mode: Mode::Read,
+                    },
+                    None,
+                ),
+                (
+                    Effect {
+                        target: EffectTarget::Point(reclaim.claim.key()),
+                        mode: Mode::Write { moves: Moves::Both },
+                    },
+                    None,
+                ),
+                (
+                    Effect {
+                        target: EffectTarget::Point(record.origin),
+                        mode: Mode::Delta { moves: Moves::Both },
+                    },
+                    Some(record.resource),
+                ),
+            ] {
+                declare(&mut declaration, effect, holds).map_err(|conflict| {
+                    format!("reclaim cell contradicts the declaration: {conflict}")
+                })?;
+            }
+        }
+        Ok(PreparedTx {
+            calls: Vec::new(),
+            declaration,
+            nullifiers: Vec::new(),
+            gas_limit: 0,
+            plan,
+        })
     }
 
     /// [`Self::prepare`] with the target-authority rule made optional.
@@ -931,16 +1015,32 @@ fn declare_crossing_cells(declaration: &mut Declaration, legs: &LegPlan) -> Resu
             target: EffectTarget::Point(key),
             mode: Mode::Write { moves: Moves::Both },
         };
-        declaration.set.insert(effect).map_err(|conflict| {
+        declare(declaration, effect, None).map_err(|conflict| {
             format!("crossing cell {key:?} contradicts the declaration: {conflict}")
         })?;
-        declaration.ordered.push(DeclaredAccess {
-            effect,
-            holds: None,
-            reach: None,
-            clause: None,
-        });
     }
+    Ok(())
+}
+
+/// Append one access to both views of a declaration: the folded set and
+/// the clause order, at the end, so every position already fixed keeps
+/// its rep. `holds` is what the cell denominates, which a movement on it
+/// cannot do without.
+fn declare(
+    declaration: &mut Declaration,
+    effect: Effect,
+    holds: Option<ResourceAddr>,
+) -> Result<(), String> {
+    declaration
+        .set
+        .insert(effect)
+        .map_err(|conflict| conflict.to_string())?;
+    declaration.ordered.push(DeclaredAccess {
+        effect,
+        holds,
+        reach: None,
+        clause: None,
+    });
     Ok(())
 }
 
@@ -1165,27 +1265,24 @@ impl Executor {
             }
             // What this shard runs of the member: the whole shape unless
             // the coordinator froze a division, and then the legs its
-            // placement gives it. A plan that cannot be built is a
-            // deterministic refusal like a derivation that cannot be —
-            // every replica reads the same legs and the same arrivals.
-            let (decomposed, arrivals) = shapes
+            // placement gives it — or, for a reclaim, no node at all. A
+            // plan that cannot be built is a deterministic refusal like a
+            // derivation that cannot be — every replica reads the same
+            // legs and the same arrivals.
+            let planned = match shapes
                 .get(&vm_tx)
-                .map_or((Decomposed::WHOLE, &[][..]), |shape| {
-                    (shape.decomposed, shape.arrivals.as_slice())
-                });
-            let planned = Self::prepare(tx, &records).and_then(|mut entry| {
-                entry.plan = plan_for_shard(
-                    tx.legs(),
-                    tx.crossings(),
-                    arrivals,
-                    decomposed,
-                    ctx.shard_trie,
-                    ctx.local_shard,
-                )
-                .map_err(|defect| format!("no plan for this shard: {defect}"))?;
-                declare_crossing_cells(&mut entry.declaration, &entry.plan.legs)?;
-                Ok(entry)
-            });
+                .map(|shape| (&shape.runs, shape.arrivals.as_slice()))
+            {
+                Some((Runs::Reclaim, _)) => {
+                    reclaim_for_shard(tx.legs(), tx.crossings(), ctx.shard_trie, ctx.local_shard)
+                        .map_err(|defect| format!("no reclaim for this shard: {defect}"))
+                        .and_then(|plan| Self::prepare_reclaim(plan, snapshot))
+                }
+                Some((Runs::Shape(classified), arrivals)) => {
+                    Self::prepare_shape(ctx, tx, &records, classified.decomposed(), arrivals)
+                }
+                None => Self::prepare_shape(ctx, tx, &records, Decomposed::WHOLE, &[]),
+            };
             match planned {
                 Ok(entry) => {
                     record_transaction_executed();
@@ -1482,7 +1579,7 @@ impl Executor {
                     MemberShape {
                         reaches_beyond: i.reaches_beyond,
                         abortable: i.abortable,
-                        decomposed: i.decomposed,
+                        runs: i.runs.clone(),
                         arrivals: i.arrivals.to_vec(),
                     },
                 )

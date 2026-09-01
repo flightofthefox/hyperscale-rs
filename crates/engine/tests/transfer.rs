@@ -13,7 +13,7 @@ use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
 };
 use hyperscale_engine::legs::{
-    Decomposed, Placement, PlanDefect, core_shards, crossings_of, decomposes, plan_for_shard,
+    Classified, Placement, PlanDefect, Runs, core_shards, crossings_of, decomposes, plan_for_shard,
 };
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
@@ -1293,6 +1293,7 @@ fn a_transfer_executes_divided_on_both_shards() {
     derived_through(&executor, std::slice::from_ref(&tx));
     let leaving = BTreeSet::new();
     let divided = decomposes(tx.legs(), Placement::new(&trie, &leaving));
+    let classified = Classified::freeze(tx.legs(), Placement::new(&trie, &leaving));
     assert!(divided.holds());
     let edge = crossings_of(tx.legs(), tx.crossings(), divided, &trie).remove(0);
 
@@ -1313,7 +1314,7 @@ fn a_transfer_executes_divided_on_both_shards() {
             // A leg awaiting nobody but its own shard: nothing retracts
             // it, so no charge is held in reserve against an abort.
             abortable: false,
-            decomposed: divided,
+            runs: Runs::Shape(classified.clone()),
             arrivals,
         };
         executor
@@ -1369,6 +1370,74 @@ fn a_transfer_executes_divided_on_both_shards() {
     );
 }
 
+/// A refused transfer's escrow comes back. The sender's shard runs the
+/// reclaim — no node, no nullifier, a declaration of its own over the
+/// record, the claim and the origin — and the vault is back at its
+/// pre-escrow balance exactly, read off the cell; the record stays,
+/// saying only that the value was issued.
+#[test]
+fn a_reclaim_restores_the_senders_vault_exactly() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let near_shard = trie.shard_for_prefix(alice());
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let leaving = BTreeSet::new();
+    let classified = Classified::freeze(tx.legs(), Placement::new(&trie, &leaving));
+    assert!(classified.decomposed().holds());
+    let edge = crossings_of(tx.legs(), tx.crossings(), classified.decomposed(), &trie).remove(0);
+
+    let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+    let run = |store: &MapDb, runs: Runs, reaches_beyond: bool| {
+        let ctx = TickBatchContext {
+            local_shard: near_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            transaction: &tx,
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            reaches_beyond,
+            abortable: false,
+            runs,
+            arrivals: &[],
+        };
+        executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
+    };
+
+    let sent = run(&store, Runs::Shape(classified), true);
+    let ConsensusReceipt::Succeeded { writes, .. } = &sent.consensus else {
+        panic!("the sender's legs must succeed: {:?}", sent.metadata);
+    };
+    store.apply(writes);
+    assert_eq!(
+        store.cell(vault_key(alice(), *XRD)),
+        Some(encode_amount(900).to_vec()),
+        "the escrow debited the vault"
+    );
+
+    let reclaimed = run(&store, Runs::Reclaim, false);
+    let ConsensusReceipt::Succeeded { writes, .. } = &reclaimed.consensus else {
+        panic!("the reclaim must succeed: {:?}", reclaimed.metadata);
+    };
+    assert!(reclaimed.escrowed.is_empty(), "a reclaim issues nothing");
+    store.apply(writes);
+    assert_eq!(
+        store.cell(vault_key(alice(), *XRD)),
+        Some(encode_amount(1_000).to_vec()),
+        "and the reclaim restores it exactly"
+    );
+    assert!(
+        store.cell(edge.record).is_some(),
+        "the record stays: it says the value was issued"
+    );
+}
+
 /// A divided batch attests only what it ran. Each side's event root
 /// covers the events its own emitters produced — what its receipt
 /// stores — so the hash a shard signs is recomputable from exactly what
@@ -1399,7 +1468,7 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
             clock: WeightedTimestamp::from_millis(1_000),
             reaches_beyond: true,
             abortable: true,
-            decomposed: Decomposed::WHOLE,
+            runs: Runs::Shape(Classified::whole()),
             arrivals: &[],
         };
         executor

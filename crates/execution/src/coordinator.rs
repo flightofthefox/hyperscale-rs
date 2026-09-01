@@ -37,7 +37,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::{Classified, Placement, crossings_of, decomposition_enabled};
+use hyperscale_engine::legs::{Classified, Placement, Runs, crossings_of, decomposition_enabled};
 use hyperscale_engine::{TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_unresolvable_tx};
 use hyperscale_storage::{RecoveredState, TickResolution};
@@ -760,12 +760,6 @@ impl ExecutionCoordinator {
             classified,
         } in members
         {
-            // A leg is what this shard runs of a member frozen divided
-            // with it outside the core set. Marked here, beside the
-            // freeze, so a replay marks the same entries.
-            if classified.decomposed().holds() && !classified.core().contains(&local_shard) {
-                self.unresolved.mark_leg(tx.hash());
-            }
             // Block-container entries decoded from the wire land as
             // `Unverified`; lift via `from_persisted` under the same
             // BFT-transitive trust that gates the containing block. Honest
@@ -775,6 +769,12 @@ impl ExecutionCoordinator {
                 Ok(v) => Arc::new(v),
                 Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
             };
+            // A leg is what this shard runs of a member frozen divided
+            // with it outside the core set. Marked here, beside the
+            // freeze, so a replay marks the same entries.
+            if classified.decomposed().holds() && !classified.core().contains(&local_shard) {
+                self.unresolved.mark_leg(tx.hash(), Arc::clone(&verified));
+            }
             self.candidates
                 .register(verified, participating, ts, classified);
         }
@@ -913,6 +913,49 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Admit into the tick being composed every reclaim a committed
+    /// record has licensed: the leg entries whose core, the record says,
+    /// can never claim what they issued.
+    ///
+    /// Each joins dispatched and awaiting nobody but this shard, since
+    /// its own certificate is the whole of its settlement; reserving
+    /// nothing, since no block took a reservation for it; and running no
+    /// node, since the engine takes the crossings back on the cell's own
+    /// evidence. A tick still speaking for the transaction is left to:
+    /// the reclaim waits for the leg's own finalization to commit.
+    fn admit_reclaims(
+        &mut self,
+        tick_id: TickId,
+        tick_ts: WeightedTimestamp,
+        state: &mut TickState,
+        requests: &mut Vec<CrossShardExecutionRequest>,
+    ) {
+        let local_shard = self.local_shard;
+        for (tx_hash, transaction) in self.unresolved.reclaimable() {
+            if self.ticks.tick_assignment(tx_hash).is_some() {
+                continue;
+            }
+            state.admit(
+                tx_hash,
+                Membership::whole(BTreeSet::from([local_shard])),
+                0,
+                Admission::Executes,
+            );
+            self.ticks.assign_tx(tx_hash, tick_id);
+            self.unresolved.admit_reclaim(tx_hash);
+            requests.push(CrossShardExecutionRequest {
+                tx_hash,
+                transaction,
+                provisions: Vec::new(),
+                clock: tick_ts,
+                reaches_beyond: false,
+                abortable: false,
+                runs: Runs::Reclaim,
+                arrivals: Vec::new(),
+            });
+        }
+    }
+
     fn compose_tick(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -945,18 +988,20 @@ impl ExecutionCoordinator {
             );
             // Where this member's crossings land, off the frozen
             // classification: the shards its outcome promises a bundle
-            // to, if it issues anything.
-            let classified = &member.request.classified;
-            let targets: BTreeSet<ShardId> = crossings_of(
-                member.request.transaction.legs(),
-                member.request.transaction.crossings(),
-                classified.decomposed(),
-                trie,
-            )
-            .into_iter()
-            .filter(|edge| edge.from == local_shard)
-            .flat_map(|edge| edge.to)
-            .collect();
+            // to, if it issues anything. A reclaim issues nothing.
+            let targets: BTreeSet<ShardId> = match &member.request.runs {
+                Runs::Shape(classified) => crossings_of(
+                    member.request.transaction.legs(),
+                    member.request.transaction.crossings(),
+                    classified.decomposed(),
+                    trie,
+                )
+                .into_iter()
+                .filter(|edge| edge.from == local_shard)
+                .flat_map(|edge| edge.to)
+                .collect(),
+                Runs::Reclaim => BTreeSet::new(),
+            };
             state.record_crossing_targets(member.request.tx_hash, targets);
             self.ticks.assign_tx(member.request.tx_hash, tick_id);
             self.unresolved.certify(member.request.tx_hash);
@@ -969,6 +1014,7 @@ impl ExecutionCoordinator {
         }
 
         self.admit_abandoned(topology_schedule, tick_id, &mut state);
+        self.admit_reclaims(tick_id, block.ts, &mut state, &mut requests);
 
         if state.is_empty() {
             return (None, Vec::new(), Vec::new());
@@ -6880,6 +6926,74 @@ mod tests {
             tick.awaiting_tx_hashes().collect::<Vec<_>>(),
             vec![tx_hash],
             "and it settles as the leg it is, not as a determined member",
+        );
+    }
+
+    /// A committed record naming a leg entry licenses its reclaim: the
+    /// next commit composes the reclaim into its tick as a dispatched
+    /// member running no node, awaiting nobody, reserving nothing — and
+    /// never as an abandonment, whatever the clock reads.
+    #[test]
+    fn a_record_naming_a_leg_composes_its_reclaim() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let past_deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
+
+        state.unresolved.register_committed(
+            HOME,
+            WeightedTimestamp::ZERO,
+            std::iter::once(&transaction),
+        );
+        state.unresolved.mark_leg(
+            tx_hash,
+            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+        );
+        state.unresolved.certify(tx_hash);
+        state
+            .unresolved
+            .record_abandonment_records(&[AbandonmentRecord::departed(
+                PEER,
+                WeightedTimestamp::from_millis(1_000),
+                [UnsettledTx::for_transaction(&transaction)],
+            )]);
+
+        let block = make_live_block_on_shard(
+            HOME,
+            BlockHeight::new(1),
+            past_deadline_ms,
+            ValidatorId::new(0),
+            vec![],
+        );
+        let actions = state.on_block_committed(&schedule, &test_certify(block, past_deadline_ms));
+
+        let tick = state
+            .ticks
+            .get_tick(&TickId::new(HOME, BlockHeight::new(1)))
+            .expect("the commit composed the reclaim into a tick");
+        assert_eq!(
+            tick.determined_members(),
+            vec![tx_hash],
+            "it settles on this shard's certificate alone"
+        );
+        assert_eq!(tick.awaited_counterparts().count(), 0);
+        let request = actions
+            .iter()
+            .find_map(|action| match action {
+                Action::ExecuteTransactions { requests, .. } => {
+                    requests.iter().find(|request| request.tx_hash == tx_hash)
+                }
+                _ => None,
+            })
+            .expect("the reclaim is dispatched to the engine");
+        assert_eq!(request.runs, Runs::Reclaim);
+        assert!(!request.abortable, "nothing retracts a reclaim");
+        assert!(
+            state.unresolved.reclaimable().is_empty(),
+            "and the ledger has handed it to the tick"
         );
     }
 

@@ -21,7 +21,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_types::SeedWindow;
 
-use crate::legs::Decomposed;
+use crate::legs::Runs;
 
 /// What a block fixes about the environment its tick executes under.
 ///
@@ -138,12 +138,12 @@ pub struct TickTxInput<'a> {
     /// abort settles the floor in place of the discarded effects, so
     /// only a member that can be aborted holds one.
     pub abortable: bool,
-    /// Whether the transaction's legs run where their state lives, as
-    /// frozen when its block committed. Carried, never re-derived: a
-    /// reshape landing between composition and execution would
-    /// otherwise leave one shard running a whole manifest while its
-    /// counterpart waits to be sent half of it.
-    pub decomposed: Decomposed,
+    /// What this member runs: the transaction as its block froze it —
+    /// carried, never re-derived, since a reshape landing between
+    /// composition and execution would otherwise leave one shard running
+    /// a whole manifest while its counterpart waits to be sent half of
+    /// it — or the reclaim of what a leg here issued.
+    pub runs: Runs,
     /// What committed bundles attested for the edges this shard's legs
     /// consume. Empty for a member that runs whole.
     pub arrivals: &'a [EscrowedValue],

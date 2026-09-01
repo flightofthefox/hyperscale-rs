@@ -291,7 +291,7 @@ where
                     clock: r.clock,
                     reaches_beyond: r.reaches_beyond,
                     abortable: r.abortable,
-                    decomposed: r.classified.decomposed(),
+                    runs: r.runs.clone(),
                     arrivals: &r.arrivals,
                 })
                 .collect();

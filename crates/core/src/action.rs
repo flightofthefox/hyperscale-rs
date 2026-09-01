@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_engine::TickEnvironment;
-use hyperscale_engine::legs::Classified;
+use hyperscale_engine::legs::Runs;
 use hyperscale_storage::TickResolution;
 use hyperscale_types::{
     AbandonmentRecord, BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount,
@@ -65,10 +65,10 @@ pub struct CrossShardExecutionRequest {
     /// executes: its writes are readable at once, and the engine's own
     /// conflict groups are all that sequence its batch-mates against it.
     pub abortable: bool,
-    /// The classification frozen when the transaction's block committed:
-    /// whether its legs run where their state lives, and where its core
-    /// sits. Carried, never re-derived.
-    pub classified: Classified,
+    /// What this member runs: the transaction as classified when its
+    /// block committed — carried, never re-derived — or the reclaim of
+    /// what a leg here issued.
+    pub runs: Runs,
     /// What committed bundles attested for the edges this shard's legs
     /// consume, read off the record cells they proved. Empty for a
     /// member that runs the whole shape.

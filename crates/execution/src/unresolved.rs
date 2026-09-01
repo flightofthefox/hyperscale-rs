@@ -18,12 +18,12 @@
 //!
 //! [`TickRegistry`]: crate::ticks::TickRegistry
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, Finalization, MAX_VALIDITY_RANGE, ShardId, ShardTrie,
-    Transaction, TxHash, UnsettledTx, Verifiable, WeightedTimestamp,
+    Transaction, TxHash, UnsettledTx, Verifiable, Verified, WeightedTimestamp,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -86,6 +86,10 @@ struct Owed {
     /// the terms a reclaim states, and it lives — on the transaction's
     /// own clock — exactly as long as the record cell it would take back.
     leg: bool,
+    /// Whether a tick of this shard's has admitted the reclaim of a leg
+    /// entry, so the finalization naming the hash next is the
+    /// reclaim's. Meaningless off a leg entry.
+    reclaim_admitted: bool,
     /// The departed shard a committed record says left this transaction
     /// unsettled.
     ///
@@ -145,6 +149,11 @@ pub struct Unanswerable {
 #[derive(Debug, Default)]
 pub struct UnresolvedTxs {
     owed: BTreeMap<TxHash, Owed>,
+    /// The body of every leg entry, for the reclaim: it derives from the
+    /// transaction's legs and crossings, and the candidate pool let the
+    /// body go when the leg composed. Bounded by the entries' own
+    /// horizon, and dropped with them.
+    bodies: HashMap<TxHash, Arc<Verified<Transaction>>>,
     /// Where each departed participant's chain ended, for the entries
     /// whose fate only that shard's settled set can decide. Held against
     /// the schedule window that proves the terminal, which is retained on
@@ -190,6 +199,7 @@ impl UnresolvedTxs {
                     .collect(),
                 certified: false,
                 leg: false,
+                reclaim_admitted: false,
                 unsettled_by: None,
             };
             self.owed.entry(tx.hash()).or_insert(owed);
@@ -202,9 +212,36 @@ impl UnresolvedTxs {
     /// same commit, so a rebuilt ledger marks the same entries: the
     /// freeze is a function of the block and the placement it committed
     /// under, and the replay re-freezes both.
-    pub fn mark_leg(&mut self, tx_hash: TxHash) {
+    pub fn mark_leg(&mut self, tx_hash: TxHash, body: Arc<Verified<Transaction>>) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
             owed.leg = true;
+            self.bodies.insert(tx_hash, body);
+        }
+    }
+
+    /// The leg entries a committed record has licensed a reclaim of and
+    /// no tick has taken yet, each with the body the reclaim derives
+    /// from.
+    ///
+    /// Read off committed content alone, like [`Self::past_deadline`],
+    /// so every replica at the same frontier composes the same reclaims.
+    /// Never a clock reading: a record is the only thing that puts an
+    /// entry here, and a record carries evidence.
+    #[must_use]
+    pub fn reclaimable(&self) -> Vec<(TxHash, Arc<Verified<Transaction>>)> {
+        self.owed
+            .iter()
+            .filter(|(_, owed)| owed.leg && !owed.reclaim_admitted && owed.unsettled_by.is_some())
+            .filter_map(|(tx_hash, _)| Some((*tx_hash, Arc::clone(self.bodies.get(tx_hash)?))))
+            .collect()
+    }
+
+    /// Record that a tick of this shard's has admitted the reclaim of
+    /// `tx_hash`, so the finalization naming the hash next is the
+    /// reclaim's and releases the entry.
+    pub fn admit_reclaim(&mut self, tx_hash: TxHash) {
+        if let Some(owed) = self.owed.get_mut(&tx_hash) {
+            owed.reclaim_admitted = true;
         }
     }
 
@@ -277,6 +314,7 @@ impl UnresolvedTxs {
                         // record naming it lands, and nothing here has to
                         // recover the mark from the record.
                         leg: false,
+                        reclaim_admitted: false,
                         unsettled_by: Some(verdict.shard()),
                     },
                 );
@@ -408,14 +446,19 @@ impl UnresolvedTxs {
     /// path covers them all.
     ///
     /// A leg's own finalization bears no verdict on the transaction and
-    /// releases nothing: the entry stays for the reclaim, and lives to
+    /// releases nothing: the entry stays for the reclaim, whose
+    /// finalization is the one that releases it, and otherwise lives to
     /// its own horizon.
     pub fn release_resolved(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
         for finalization in finalizations {
             for tx_hash in finalization.tx_hashes() {
-                let bears_verdict = self.owed.get(&tx_hash).is_some_and(|owed| !owed.leg);
+                let bears_verdict = self
+                    .owed
+                    .get(&tx_hash)
+                    .is_some_and(|owed| !owed.leg || owed.reclaim_admitted);
                 if bears_verdict {
                     self.owed.remove(&tx_hash);
+                    self.bodies.remove(&tx_hash);
                 }
             }
         }
@@ -550,6 +593,8 @@ impl UnresolvedTxs {
             })
             .collect();
         self.owed = kept;
+        let owed = &self.owed;
+        self.bodies.retain(|tx_hash, _| owed.contains_key(tx_hash));
 
         // A terminal is what tells a prefix's owner apart from its
         // successor, so one still covering a live entry stays: dropping
@@ -627,6 +672,11 @@ mod tests {
     /// grid — the same derivation the commit path stamps departures with.
     fn expiry(cut: WeightedTimestamp) -> WeightedTimestamp {
         EpochWindows::new(EPOCH_DURATION.as_secs() * 1000).terminal_evidence_expiry(cut)
+    }
+
+    /// The body a leg entry keeps for its reclaim.
+    fn body(tx: &Arc<Verifiable<Transaction>>) -> Arc<Verified<Transaction>> {
+        Arc::new(Verified::new_unchecked_for_test(tx.as_unverified().clone()))
     }
 
     fn commit(ledger: &mut UnresolvedTxs, tx: &Arc<Verifiable<Transaction>>) {
@@ -1138,7 +1188,7 @@ mod tests {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(4, 60_000);
         commit(&mut ledger, &tx);
-        ledger.mark_leg(tx.hash());
+        ledger.mark_leg(tx.hash(), body(&tx));
         ledger.certify(tx.hash());
 
         let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Accept);
@@ -1165,6 +1215,48 @@ mod tests {
         assert_eq!(ledger.len(), 1);
     }
 
+    /// A committed record is what makes a leg entry reclaimable — never a
+    /// clock — and the reclaim's own finalization is what releases it,
+    /// body and all.
+    #[test]
+    fn a_record_licenses_the_reclaim_and_its_finalization_releases_the_entry() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(6, 60_000);
+        commit(&mut ledger, &tx);
+        ledger.mark_leg(tx.hash(), body(&tx));
+        ledger.certify(tx.hash());
+        assert!(
+            ledger.reclaimable().is_empty(),
+            "nothing is reclaimed on a clock"
+        );
+
+        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+            PARTNER,
+            ms(1_000),
+            [names(&tx)],
+        )]);
+        let reclaimable = ledger.reclaimable();
+        assert_eq!(
+            reclaimable.len(),
+            1,
+            "a committed record licenses the reclaim"
+        );
+        assert_eq!(reclaimable[0].0, tx.hash());
+        assert_eq!(
+            reclaimable[0].1.hash(),
+            tx.hash(),
+            "with the body the reclaim derives from"
+        );
+
+        ledger.admit_reclaim(tx.hash());
+        assert!(ledger.reclaimable().is_empty(), "a tick has taken it");
+        let reclaim =
+            make_finalization(BlockHeight::new(9), tx.hash(), TransactionDecision::Accept);
+        ledger.release_resolved(&[Arc::new(Verifiable::from(reclaim))]);
+        assert_eq!(ledger.len(), 0, "the reclaim's finalization releases it");
+        assert!(ledger.bodies.is_empty(), "and the body goes with it");
+    }
+
     /// A leg entry lives on the transaction's own clock, to the moment
     /// the record cell it would reclaim sweeps — whether or not a record
     /// has named it, and whatever its counterparts are doing.
@@ -1177,7 +1269,7 @@ mod tests {
             let mut ledger = UnresolvedTxs::default();
             let tx = tx(5, 60_000);
             commit(&mut ledger, &tx);
-            ledger.mark_leg(tx.hash());
+            ledger.mark_leg(tx.hash(), body(&tx));
             ledger.certify(tx.hash());
             if covered {
                 ledger.record_abandonment_records(&[AbandonmentRecord::departed(
