@@ -44,15 +44,27 @@ pub struct CrossShardExecutionRequest {
     /// bundle carried, so every participant executes the transaction
     /// under one clock.
     pub clock: WeightedTimestamp,
-    /// Whether this transaction reaches beyond the executing shard.
+    /// Whether this transaction declares cells beyond the executing
+    /// shard.
     ///
     /// A batch is not homogeneous in this: it carries whatever the tick
     /// admitted, single-shard and cross-shard alike. Reaching beyond is
-    /// what makes a transaction's contributions provisional — readable by
-    /// no later tick until a counterpart's outcome resolves them — and
-    /// what makes it abortable on a counterpart's verdict, so both are
-    /// decided per transaction rather than per batch.
+    /// what makes a member's provisions and arrivals necessary, and what
+    /// makes the engine filter its writes to the subtree this shard
+    /// owns.
     pub reaches_beyond: bool,
+    /// Whether a counterpart's verdict can still discard this member's
+    /// effects after it executed — it awaits a certificate other than
+    /// this shard's own.
+    ///
+    /// That is what makes its contributions provisional, readable by no
+    /// later tick until the verdict resolves them, and what makes its
+    /// declared cells a claim a later member must compose with. A member
+    /// nothing can retract — a single-shard transaction, or a divided
+    /// member awaiting only itself — is determined the moment it
+    /// executes: its writes are readable at once, and the engine's own
+    /// conflict groups are all that sequence its batch-mates against it.
+    pub abortable: bool,
     /// The classification frozen when the transaction's block committed:
     /// whether its legs run where their state lives, and where its core
     /// sits. Carried, never re-derived.

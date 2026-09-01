@@ -127,9 +127,16 @@ pub struct TickTxInput<'a> {
     /// committing block's parent-QC weighted timestamp for a cross-shard
     /// leg.
     pub clock: WeightedTimestamp,
-    /// Whether a tick verdict can still discard this member's effects
-    /// after execution — true for a cross-shard leg. Decides both the
-    /// reserve fee receipt and the batch's write locality.
+    /// Whether the transaction declares cells beyond the executing
+    /// shard. Decides the batch's write locality: a member declaring
+    /// remote cells has its writes filtered to the subtree this shard
+    /// owns.
+    pub reaches_beyond: bool,
+    /// Whether a counterpart's verdict can still discard this member's
+    /// effects after execution — a whole cross-shard leg, or a member of
+    /// a core that spans shards. Decides the reserve fee receipt: an
+    /// abort settles the floor in place of the discarded effects, so
+    /// only a member that can be aborted holds one.
     pub abortable: bool,
     /// Whether the transaction's legs run where their state lives, as
     /// frozen when its block committed. Carried, never re-derived: a

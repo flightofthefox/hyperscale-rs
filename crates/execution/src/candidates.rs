@@ -234,13 +234,25 @@ impl TickCandidates {
             if !candidate.engagement_settled(now) {
                 continue;
             }
+            let membership = Membership::of(
+                &candidate.classified,
+                local,
+                candidate.participating.clone(),
+            );
+            // A member whose effects a counterpart's verdict can still
+            // discard: its writes stay provisional, and its declaration
+            // is a claim the members after it must compose with. One
+            // that awaits nobody but this shard holds nothing back —
+            // its writes are determined at once, and the kernel's own
+            // conflict groups sequence its batch-mates against it.
+            let abortable = membership.awaited().iter().any(|&s| s != local);
             let declared = &candidate.tx.routing().declared_modes;
             if !held.is_empty() && held.blocks(declared) {
                 continue;
             }
             // After the test, never before: a transaction is not what
             // keeps itself out.
-            if reaches_beyond {
+            if abortable {
                 held.claim(declared);
             }
 
@@ -272,14 +284,11 @@ impl TickCandidates {
                     },
                     clock: anchor.map_or(candidate.committed_ts, |a| a.clock),
                     reaches_beyond,
+                    abortable,
                     classified: candidate.classified.clone(),
                     arrivals,
                 },
-                membership: Membership::of(
-                    &candidate.classified,
-                    local,
-                    candidate.participating.clone(),
-                ),
+                membership,
                 admission: if candidate.engagement_pending.is_empty() {
                     Admission::Executes
                 } else {
@@ -545,5 +554,61 @@ mod tests {
             admitted[0].request.reaches_beyond,
             "reach is what the request carries"
         );
+    }
+
+    /// The claim exists for a member a counterpart can still retract.
+    /// Two whole cross-shard members writing one cell take turns — the
+    /// first claims it and the second waits for the first's fate. Two
+    /// divided members of a single-shard core writing the same cell are
+    /// admitted together: nothing retracts either, so the kernel's own
+    /// conflict groups sequence them, and a contended core clears its
+    /// queue in one tick rather than one member per tick.
+    #[test]
+    fn a_member_nothing_can_retract_takes_no_provisional_claim() {
+        use hyperscale_engine::legs::Placement;
+
+        use crate::fixtures::{leaf, swap, trie};
+
+        let trie = trie();
+        let leaving = BTreeSet::new();
+        let (caller, venue) = (leaf(0), leaf(1));
+        let participating = BTreeSet::from([caller, venue]);
+        // Two transactions distinct by hash, both writing one pool cell.
+        let contending = |seed: u8| {
+            Arc::new(Verified::new_unchecked_for_test(
+                test_transaction_with_prefixes(
+                    &[seed, seed + 1, seed + 2],
+                    &[],
+                    &[test_prefix(99)],
+                ),
+            ))
+        };
+
+        let mut whole = TickCandidates::new(venue);
+        let mut provisioning = ProvisioningTracker::new();
+        for seed in [1, 2] {
+            let tx = contending(seed);
+            provisioning.record_required(tx.hash(), BTreeSet::new());
+            whole.register(tx, participating.clone(), ms(1_000), Classified::whole());
+        }
+        let mut held = ProvisionalCells::default();
+        let admitted = whole.compose(&provisioning, &mut held, ms(1_000), &trie);
+        assert_eq!(admitted.len(), 1, "a whole member claims the cell");
+        assert!(admitted[0].request.abortable);
+        assert_eq!(whole.len(), 1, "and the other waits on its fate");
+
+        let classified = Classified::freeze(&swap(), Placement::new(&trie, &leaving));
+        assert_eq!(classified.core(), &BTreeSet::from([venue]));
+        let mut divided = TickCandidates::new(venue);
+        for seed in [1, 2] {
+            let tx = contending(seed);
+            divided.register(tx, participating.clone(), ms(1_000), classified.clone());
+        }
+        let mut held = ProvisionalCells::default();
+        let admitted = divided.compose(&provisioning, &mut held, ms(1_000), &trie);
+        assert_eq!(admitted.len(), 2, "both core members clear in one tick");
+        assert!(admitted.iter().all(|member| !member.request.abortable));
+        assert!(held.is_empty(), "and neither claimed anything");
+        assert!(divided.is_empty());
     }
 }

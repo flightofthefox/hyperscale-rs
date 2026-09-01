@@ -91,10 +91,12 @@ pub struct PreparedTx {
     pub plan: ShardPlan,
 }
 
-/// What kind of member a transaction is in its batch: whether a tick
-/// verdict can still discard it, whether its legs run where their state
-/// lives, and what arrived for the legs this shard runs.
+/// What kind of member a transaction is in its batch: whether it
+/// declares cells beyond this shard, whether a counterpart's verdict can
+/// still discard it, whether its legs run where their state lives, and
+/// what arrived for the legs this shard runs.
 struct MemberShape {
+    reaches_beyond: bool,
     abortable: bool,
     decomposed: Decomposed,
     arrivals: Vec<EscrowedValue>,
@@ -1101,8 +1103,8 @@ impl Executor {
     /// The batch pipeline every dispatch arm shares: derive, pre-read the
     /// local baseline, layer provisioned remote cells, execute under the
     /// shard's locality, fold local keys, and project. `shapes` says what
-    /// kind of member each transaction is; a batch with no abortable
-    /// member — no cross-shard leg — executes under total locality.
+    /// kind of member each transaction is; a batch in which no member
+    /// declares a cell beyond this shard executes under total locality.
     #[allow(clippy::too_many_lines)] // one pipeline, stages in order
     fn run_batch(
         &self,
@@ -1116,11 +1118,11 @@ impl Executor {
         if transactions.is_empty() {
             return Vec::new();
         }
-        // A cross-shard leg declares remote cells, so its writes must be
-        // filtered to the local subtree; a batch of genuinely single-shard
-        // members owns every key it declares and total locality is the
-        // same filter without the trie walk.
-        let locality = if shapes.values().all(|shape| !shape.abortable) {
+        // A member declaring remote cells has its writes filtered to the
+        // local subtree; a batch of genuinely single-shard members owns
+        // every key it declares and total locality is the same filter
+        // without the trie walk.
+        let locality = if shapes.values().all(|shape| !shape.reaches_beyond) {
             Locality::All
         } else {
             let trie = ctx.shard_trie.clone();
@@ -1478,6 +1480,7 @@ impl Executor {
                 (
                     i.transaction.hash(),
                     MemberShape {
+                        reaches_beyond: i.reaches_beyond,
                         abortable: i.abortable,
                         decomposed: i.decomposed,
                         arrivals: i.arrivals.to_vec(),

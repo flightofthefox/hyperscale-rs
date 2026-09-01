@@ -444,7 +444,7 @@ impl ExecutionSim {
                     self.local_shard,
                     request.tx_hash,
                     &request.transaction,
-                    request.reaches_beyond,
+                    request.abortable,
                 )
             })
             .collect();

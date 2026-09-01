@@ -95,18 +95,18 @@ pub fn accumulate_tick_output(
     ordered.sort_by_key(|tx| tx.tx_hash);
 
     // A batch carries whatever the tick admitted, so it splits here rather
-    // than as a whole: a transaction that reaches beyond this shard leaves
-    // a provisional contribution no later tick may read until a
-    // counterpart resolves it, and one that does not is determined the
+    // than as a whole: a member a counterpart's verdict can still discard
+    // leaves a provisional contribution no later tick may read until that
+    // verdict resolves it, and one nothing can retract is determined the
     // moment it executes.
-    let reaches_beyond: HashSet<TxHash> = requests
+    let abortable: HashSet<TxHash> = requests
         .iter()
-        .filter(|r| r.reaches_beyond)
+        .filter(|r| r.abortable)
         .map(|r| r.tx_hash)
         .collect();
     let (beyond, local): (Vec<&ExecutedTx>, Vec<&ExecutedTx>) = ordered
         .into_iter()
-        .partition(|tx| reaches_beyond.contains(&tx.tx_hash));
+        .partition(|tx| abortable.contains(&tx.tx_hash));
 
     let mut members: Vec<(TxHash, StateWrites)> = Vec::new();
     for tx in local {
@@ -289,7 +289,8 @@ where
                     transaction: &r.transaction,
                     provisions: &r.provisions,
                     clock: r.clock,
-                    abortable: r.reaches_beyond,
+                    reaches_beyond: r.reaches_beyond,
+                    abortable: r.abortable,
                     decomposed: r.classified.decomposed(),
                     arrivals: &r.arrivals,
                 })

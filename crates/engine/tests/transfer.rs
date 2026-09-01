@@ -1309,7 +1309,10 @@ fn a_transfer_executes_divided_on_both_shards() {
             transaction: &tx,
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
-            abortable: true,
+            reaches_beyond: true,
+            // A leg awaiting nobody but its own shard: nothing retracts
+            // it, so no charge is held in reserve against an abort.
+            abortable: false,
             decomposed: divided,
             arrivals,
         };
@@ -1394,6 +1397,7 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
             transaction: &tx,
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
+            reaches_beyond: true,
             abortable: true,
             decomposed: Decomposed::WHOLE,
             arrivals: &[],

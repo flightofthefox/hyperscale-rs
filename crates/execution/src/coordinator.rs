@@ -98,14 +98,15 @@ struct CommittingBlock {
 
 /// A tick with entries on the tick chain and no committed fate yet.
 struct TickedBatch {
-    /// What its cross-shard legs declared they would mutate — the cells
-    /// nothing may read until this tick's certificate says which side of
-    /// each survives.
+    /// What its abortable members declared they would mutate — the cells
+    /// nothing may read until a counterpart's certificate says which
+    /// side of each survives.
     ///
     /// Its other members claim nothing: their writes are determined the
     /// moment they execute and readable at once, so a later tick may
-    /// fold over them freely. Empty for a tick that ran no leg reaching
-    /// beyond this shard, which is then held only for its own fate.
+    /// fold over them freely. Empty for a tick that ran no member a
+    /// counterpart can retract, which is then held only for its own
+    /// fate.
     provisional_claims: Vec<(DeclaredKey, Mode)>,
     /// The legs those claims belong to. A tick's fate arrives in halves,
     /// and only the half carrying the legs releases their cells — so the
@@ -953,7 +954,7 @@ impl ExecutionCoordinator {
             state.record_crossing_targets(member.request.tx_hash, targets);
             self.ticks.assign_tx(member.request.tx_hash, tick_id);
             self.unresolved.certify(member.request.tx_hash);
-            if member.request.reaches_beyond {
+            if member.request.abortable {
                 legs.insert(member.request.tx_hash);
                 provisional_claims
                     .extend(member.request.transaction.routing().declared_modes.clone());
