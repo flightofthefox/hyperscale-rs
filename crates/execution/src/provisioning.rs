@@ -354,9 +354,9 @@ impl ProvisioningTracker {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry};
-    use hyperscale_vm_types::LegRole;
 
     use super::*;
+    use crate::fixtures;
 
     fn shard(n: u64) -> ShardId {
         ShardId::leaf(2, n)
@@ -521,34 +521,6 @@ mod tests {
         assert!(both.is_fully_provisioned(tx));
     }
 
-    /// A hand-built leg on the leaf at `path` of a four-leaf trie.
-    fn leg(path: u8, role: LegRole, edges: &[(u32, u32)]) -> LegShape {
-        use hyperscale_types::{Address, AddressClass};
-        use hyperscale_vm_effects::{Hash32, SubintentHash};
-        use hyperscale_vm_types::ValueEdge;
-
-        let mut body = [0x11; 31];
-        body[0] = path << 6;
-        let target = Address::new(body, AddressClass::Component);
-        LegShape {
-            target,
-            role,
-            edges: edges
-                .iter()
-                .map(|(source, output)| ValueEdge {
-                    source: *source,
-                    output: *output,
-                    non_fungible: false,
-                })
-                .collect(),
-            presents: Vec::new(),
-            declares: vec![target],
-            intent: SubintentHash(Hash32([7; 32])),
-            local: 0,
-            expiry_ms: 1_000,
-        }
-    }
-
     fn record_of(legs: &[LegShape], node: u32) -> Crossing {
         use hyperscale_vm_effects::CrossingSite;
         use hyperscale_vm_types::ProtocolHasher;
@@ -588,12 +560,7 @@ mod tests {
 
         // A swap: sign-in, withdraw and deposit on the low shard, the
         // venue on the high one. The core is the venue alone.
-        let swap = vec![
-            leg(0, LegRole::Attesting, &[]),
-            leg(0, LegRole::Inbound, &[]),
-            leg(1, LegRole::Core, &[(1, 0)]),
-            leg(0, LegRole::Outbound, &[(2, 0)]),
-        ];
+        let swap = fixtures::swap();
         let crossings = vec![record_of(&swap, 1), record_of(&swap, 2)];
         let classified = Classified::freeze(&swap, Placement::new(&trie, &leaving));
         assert!(classified.decomposed().holds());
@@ -620,11 +587,7 @@ mod tests {
         // Two core nodes on two shards fed by an inbound leg on a third:
         // each core member files the other's committed state, and both
         // claim the inbound crossing, since neither runs its producer.
-        let route = vec![
-            leg(0, LegRole::Inbound, &[]),
-            leg(1, LegRole::Core, &[(0, 0)]),
-            leg(2, LegRole::Core, &[(1, 0)]),
-        ];
+        let route = fixtures::route();
         let crossings = vec![record_of(&route, 0), record_of(&route, 1)];
         let classified = Classified::freeze(&route, Placement::new(&trie, &leaving));
         assert!(classified.decomposed().holds());

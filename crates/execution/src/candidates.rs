@@ -25,7 +25,7 @@ use hyperscale_vm_effects::CrossingCell;
 
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
-use crate::tick_state::Admission;
+use crate::tick_state::{Admission, Membership};
 
 /// One committed transaction awaiting a tick.
 #[derive(Debug)]
@@ -123,8 +123,9 @@ pub struct TickCandidates {
 pub struct Admitted {
     /// The request the engine runs.
     pub request: CrossShardExecutionRequest,
-    /// The shards whose certificates its settlement needs.
-    pub participating: BTreeSet<ShardId>,
+    /// Whose certificate its settlement waits on, and who its own is
+    /// owed to.
+    pub membership: Membership,
     /// The terms it joins on. Everything composition admits runs; the
     /// payer's leg whose counterparts never engaged runs and is attested
     /// `Aborted` regardless.
@@ -274,7 +275,11 @@ impl TickCandidates {
                     classified: candidate.classified.clone(),
                     arrivals,
                 },
-                participating: candidate.participating.clone(),
+                membership: Membership::of(
+                    &candidate.classified,
+                    local,
+                    candidate.participating.clone(),
+                ),
                 admission: if candidate.engagement_pending.is_empty() {
                     Admission::Executes
                 } else {
@@ -499,5 +504,46 @@ mod tests {
             "the cell is spoken for",
         );
         assert!(candidates.contains(hash));
+    }
+
+    /// A divided member joins on the membership its frozen
+    /// classification implies, not on the participant set it was
+    /// registered with: a leg awaits itself and reaches every
+    /// participant.
+    #[test]
+    fn a_divided_member_joins_on_its_classified_membership() {
+        use hyperscale_engine::legs::Placement;
+
+        use crate::fixtures::{leaf, swap, trie};
+
+        let trie = trie();
+        let leaving = BTreeSet::new();
+        let (local, venue) = (leaf(0), leaf(1));
+        let classified = Classified::freeze(&swap(), Placement::new(&trie, &leaving));
+        assert!(classified.decomposed().holds());
+
+        let mut candidates = TickCandidates::new(local);
+        let tx = tx(5);
+        let hash = tx.hash();
+        candidates.register(tx, BTreeSet::from([local, venue]), ms(1_000), classified);
+        let mut provisioning = ProvisioningTracker::new();
+        provisioning.record_required(hash, BTreeSet::new());
+
+        let admitted = candidates.compose(
+            &provisioning,
+            &mut ProvisionalCells::default(),
+            ms(1_000),
+            &trie,
+        );
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].membership.awaited(), &BTreeSet::from([local]));
+        assert_eq!(
+            admitted[0].membership.reach(),
+            &BTreeSet::from([local, venue])
+        );
+        assert!(
+            admitted[0].request.reaches_beyond,
+            "reach is what the request carries"
+        );
     }
 }

@@ -66,7 +66,7 @@ use crate::lookups::{
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::{ProvisioningTracker, Requirement, divided_requirements};
-use crate::tick_state::{Admission, Divergence, TickState};
+use crate::tick_state::{Admission, Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
 use crate::unresolved::{Abandonable, Unanswerable, UnresolvedTxs};
 use crate::vote_tracker::VoteTracker;
@@ -849,11 +849,12 @@ impl ExecutionCoordinator {
     /// joined this tick is not taken from it — the tick that holds a
     /// transaction is the one that speaks for it.
     ///
-    /// Each joins undispatched, on the shards its committing block
+    /// Each joins undispatched, reaching the shards its committing block
     /// named. Those are what routes this tick's certificate to the
     /// counterparts still waiting on a verdict for it — the abort is
     /// dominant, so their coverage closes on it — and what the fence
-    /// asks its question about.
+    /// asks its question about. Nothing is awaited: an abort needs no
+    /// counterpart's verdict, so the whole shape's one set serves.
     fn admit_abandoned(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -877,7 +878,12 @@ impl ExecutionCoordinator {
             }
             let mut participating = self.unresolved.counterparts(tx_hash, trie);
             participating.insert(local_shard);
-            state.admit(tx_hash, participating, declared_work, Admission::Aborted);
+            state.admit(
+                tx_hash,
+                Membership::whole(participating),
+                declared_work,
+                Admission::Aborted,
+            );
             // An abandonment reaches no engine, so the charge its verdict
             // settles is built here rather than read off a result. The
             // floor is owed whether or not the transaction ever ran: the
@@ -926,7 +932,7 @@ impl ExecutionCoordinator {
         for member in admitted {
             state.admit(
                 member.request.tx_hash,
-                member.participating,
+                member.membership,
                 member.request.transaction.work(),
                 member.admission,
             );
@@ -1666,10 +1672,12 @@ impl ExecutionCoordinator {
         let head = topology_schedule.head();
 
         // Who should receive this certificate is a question about the
-        // batch's transactions, not about its identity: the shards their
-        // participants name, less our own. Read off the batch's own
-        // record rather than the provision accumulator, which may have
-        // been pruned by the time the certificate is aggregated.
+        // batch's transactions, not about its identity: the shards they
+        // reach, less our own — reach rather than awaited, since a shard
+        // this tick waits on nothing from may still claim what a member
+        // escrowed. Read off the batch's own record rather than the
+        // provision accumulator, which may have been pruned by the time
+        // the certificate is aggregated.
         //
         // The same record answers what each of them receives. A shard is
         // party to the transactions naming it and to no others, so that
@@ -1682,7 +1690,7 @@ impl ExecutionCoordinator {
             .map(|tick| {
                 tick.counterpart_shards()
                     .into_iter()
-                    .map(|shard| (shard, tick.txs_awaiting(shard).collect()))
+                    .map(|shard| (shard, tick.txs_reaching(shard).collect()))
                     .collect()
             })
             .unwrap_or_default();
@@ -2116,8 +2124,8 @@ impl ExecutionCoordinator {
             .collect()
     }
 
-    /// The subset of [`Self::awaited_txs`] whose ticks name `shard` as a
-    /// participant — what this shard owes us specifically.
+    /// The subset of [`Self::awaited_txs`] whose settlement waits on
+    /// `shard` — what this shard owes us specifically.
     fn awaited_txs_from(&self, shard: ShardId) -> HashSet<TxHash> {
         self.ticks
             .ticks_iter()
@@ -3738,7 +3746,12 @@ mod tests {
             tick_ts,
         );
         for (tx, participating) in txs {
-            state.admit(tx.hash(), participating, tx.work(), Admission::Executes);
+            state.admit(
+                tx.hash(),
+                Membership::whole(participating),
+                tx.work(),
+                Admission::Executes,
+            );
         }
         state
     }
@@ -6857,7 +6870,7 @@ mod tests {
             "so the certificate reaches the shard still waiting on it",
         );
         assert_eq!(
-            tick.cross_shard_tx_hashes().collect::<Vec<_>>(),
+            tick.awaiting_tx_hashes().collect::<Vec<_>>(),
             vec![tx_hash],
             "and it settles as the leg it is, not as a determined member",
         );
