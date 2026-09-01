@@ -1256,6 +1256,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
         output: edge.output,
         resource: *XRD,
         amount: 100,
+        record: edge.record,
     };
     let recipient = plan_for_shard(
         tx.legs(),
@@ -1274,6 +1275,95 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
         plan_for_shard(tx.legs(), tx.crossings(), &[], divided, &trie, far_shard),
         Err(PlanDefect::MissingArrival { .. }),
     ));
+}
+
+/// A transfer executed divided, end to end through the engine: the
+/// sender's shard runs the sign-in and the withdraw, escrows the value
+/// into the record cell the plan filed, and attests exactly that; the
+/// recipient's shard runs the deposit against the attested arrival and
+/// escrows nothing. Neither side runs the other's leg.
+#[test]
+fn a_transfer_executes_divided_on_both_shards() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let leaving = BTreeSet::new();
+    let divided = decomposes(tx.legs(), Placement::new(&trie, &leaving));
+    assert!(divided.holds());
+    let edge = crossings_of(tx.legs(), tx.crossings(), divided, &trie).remove(0);
+
+    let run = |local_shard: ShardId, arrivals: &[EscrowedValue]| {
+        let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+        let ctx = TickBatchContext {
+            local_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            transaction: &tx,
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            abortable: true,
+            decomposed: divided,
+            arrivals,
+        };
+        executor
+            .execute_tick_batch(&ctx, &snapshot_store, &[input])
+            .remove(0)
+    };
+
+    let sender = run(near_shard, &[]);
+    let ConsensusReceipt::Succeeded { writes, .. } = &sender.consensus else {
+        panic!("the sender's legs must succeed: {:?}", sender.metadata);
+    };
+    assert_eq!(
+        sender.escrowed,
+        vec![EscrowedValue {
+            node: edge.node,
+            output: edge.output,
+            resource: *XRD,
+            amount: 100,
+            record: edge.record,
+        }],
+        "the withdraw's value left into the record cell the plan filed",
+    );
+    assert!(
+        writes.cells.contains_key(&edge.record),
+        "the record cell is among the sender's writes"
+    );
+    assert!(
+        !writes
+            .movements
+            .keys()
+            .any(|key| key.owner == far().address()),
+        "the sender ran no leg of the recipient's"
+    );
+
+    let recipient = run(far_shard, &sender.escrowed);
+    let ConsensusReceipt::Succeeded { writes, .. } = &recipient.consensus else {
+        panic!("the recipient's leg must succeed: {:?}", recipient.metadata);
+    };
+    assert!(recipient.escrowed.is_empty(), "a deposit hands nothing on");
+    assert!(
+        writes
+            .movements
+            .keys()
+            .any(|key| key.owner == far().address()),
+        "the deposit credited the recipient"
+    );
+    assert!(
+        !writes
+            .movements
+            .keys()
+            .any(|key| key.owner == alice().address()),
+        "the recipient ran no leg of the sender's"
+    );
 }
 
 /// A divided batch attests only what it ran. Each side's event root

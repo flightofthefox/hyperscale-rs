@@ -12,8 +12,8 @@
 //!   writes the executor already projected.
 
 use hyperscale_types::{
-    Address, BeaconWitnessEvent, ConsensusReceipt, Event, ExecutionMetadata, GlobalReceiptHash,
-    ShardId, ShardTrie, StateWrites, TxHash,
+    Address, BeaconWitnessEvent, ConsensusReceipt, EscrowedValue, Event, ExecutionMetadata,
+    GlobalReceiptHash, ShardId, ShardTrie, StateWrites, TxHash,
 };
 
 use crate::output::ExecutedTx;
@@ -60,6 +60,8 @@ enum CachedOutputBody {
         /// consumed the same amount, and locality scoping shows up as a
         /// different batch rather than a different number.
         gas_consumed: u64,
+        /// What the execution escrowed out, per departing edge.
+        escrowed: Vec<EscrowedValue>,
     },
 }
 
@@ -76,6 +78,7 @@ impl CachedOutput {
         gas_consumed: u64,
         events: Vec<Event>,
         witnesses: Vec<(Address, BeaconWitnessEvent)>,
+        escrowed: Vec<EscrowedValue>,
     ) -> Self {
         Self {
             metadata,
@@ -85,6 +88,7 @@ impl CachedOutput {
                 receipt_hash,
                 witnesses,
                 gas_consumed,
+                escrowed,
             },
         }
     }
@@ -124,6 +128,7 @@ pub fn project_to_shard(
             receipt_hash,
             witnesses,
             gas_consumed,
+            escrowed,
         } => {
             let writes = filter_writes_for_shard(raw_writes, local_shard, shard_trie);
             // A fact's emitter is a substate prefix, so the shard that
@@ -154,6 +159,7 @@ pub fn project_to_shard(
             };
             let mut executed = ExecutedTx::new(tx_hash, consensus, cached.metadata.clone());
             executed.attested_work = *gas_consumed;
+            executed.escrowed.clone_from(escrowed);
             executed
         }
     }

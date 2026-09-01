@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
+    BlockHash, BlockHeight, EscrowedValue, ExecutionCertificate, ExecutionOutcome, Finalization,
     GlobalReceiptRoot, MAX_FINALIZATION_DELAY, Settles, ShardId, StoredReceipt, TickHalf, TickId,
     TransactionDecision, TxHash, TxOutcome, Verified, WeightedTimestamp,
     compute_global_receipt_root, refused_transactions, settles,
@@ -154,6 +154,13 @@ pub struct TickState {
     /// What this shard attests it did per member, carried from execution
     /// onto the outcomes it votes.
     attested_work: HashMap<TxHash, u64>,
+    /// What each member's execution escrowed out, carried from execution
+    /// onto the outcomes it votes.
+    escrowed: HashMap<TxHash, Vec<EscrowedValue>>,
+    /// The shards each member's crossings land on, read off the frozen
+    /// classification at admission. Attested on the outcome only where
+    /// the execution escrowed something.
+    crossing_targets: HashMap<TxHash, BTreeSet<ShardId>>,
     /// Whether the local vote has been emitted (`build_vote_data` called once).
     voted: bool,
     /// `global_receipt_root` carried on this validator's own emitted vote.
@@ -225,6 +232,8 @@ impl TickState {
             execution_receipts: HashMap::new(),
             fee_receipts: HashMap::new(),
             attested_work: HashMap::new(),
+            escrowed: HashMap::new(),
+            crossing_targets: HashMap::new(),
             voted: false,
             local_vote_global_receipt_root: None,
             admitted_local_ec_root: None,
@@ -427,6 +436,22 @@ impl TickState {
         self.attested_work.insert(tx_hash, work);
     }
 
+    /// Record what a member's execution escrowed out.
+    pub fn record_escrowed(&mut self, tx_hash: TxHash, escrowed: Vec<EscrowedValue>) {
+        if !self.tx_hash_set.contains(&tx_hash) {
+            return;
+        }
+        self.escrowed.insert(tx_hash, escrowed);
+    }
+
+    /// Record the shards a member's crossings land on.
+    pub fn record_crossing_targets(&mut self, tx_hash: TxHash, targets: BTreeSet<ShardId>) {
+        if !self.tx_hash_set.contains(&tx_hash) {
+            return;
+        }
+        self.crossing_targets.insert(tx_hash, targets);
+    }
+
     /// Record the fee receipt the engine built beside a member's
     /// execution receipt: what the payer owes if the transaction aborts.
     pub fn record_fee_receipt(&mut self, receipt: StoredReceipt) {
@@ -597,12 +622,26 @@ impl TickState {
                     .fee_receipts
                     .get(tx_hash)
                     .map(|fee| fee.consensus.receipt_hash());
+                // What left, and where it lands. The targets are attested
+                // only beside something escrowed: a member that issued
+                // nothing promises no bundle to anyone.
+                let escrowed = self.escrowed.get(tx_hash).cloned().unwrap_or_default();
+                let targets = if escrowed.is_empty() {
+                    BTreeSet::new()
+                } else {
+                    self.crossing_targets
+                        .get(tx_hash)
+                        .cloned()
+                        .unwrap_or_default()
+                };
                 match charge {
                     Some(fee) => TxOutcome::with_fee(*tx_hash, outcome, fee, work),
                     None => TxOutcome::attesting(*tx_hash, outcome, work),
                 }
                 .reserving(reserved)
                 .awaiting(counterparts)
+                .escrowing(escrowed)
+                .crossing_to(targets)
             })
             .collect();
 

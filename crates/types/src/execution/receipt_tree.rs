@@ -26,7 +26,7 @@ use crate::{
 ///
 /// The lists are led by their three counts. Each entry is fixed-width,
 /// which makes one list admit one reading; three lists in a row do not,
-/// because a 56-byte escrowed entry carries 32 bytes of manifest-chosen
+/// because a 104-byte escrowed entry carries 32 bytes of manifest-chosen
 /// resource address and can spell whatever separates them. The counts
 /// fix the split on their own, so the reading never rests on a tag
 /// being unspellable.
@@ -62,11 +62,12 @@ pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
         .escrowed()
         .iter()
         .flat_map(|entry| {
-            let mut bytes = [0u8; 56];
+            let mut bytes = [0u8; 104];
             bytes[..4].copy_from_slice(&entry.node.to_le_bytes());
             bytes[4..8].copy_from_slice(&entry.output.to_le_bytes());
             bytes[8..40].copy_from_slice(&entry.resource.to_bytes());
-            bytes[40..].copy_from_slice(&entry.amount.to_le_bytes());
+            bytes[40..56].copy_from_slice(&entry.amount.to_le_bytes());
+            bytes[56..].copy_from_slice(&entry.record.to_bytes());
             bytes
         })
         .collect();
@@ -180,7 +181,7 @@ mod reservation_tests {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_vm_types::ResourceAddr;
+    use hyperscale_vm_types::{Address, AddressClass, LocalKey, ResourceAddr, SubstateKey};
 
     use super::*;
     use crate::{EscrowedValue, GlobalReceiptHash, TxHash};
@@ -195,6 +196,10 @@ mod tests {
             output: 0,
             resource: ResourceAddr::new([0xE1; 31]),
             amount: 5,
+            record: SubstateKey {
+                owner: Address::new([0xC1; 31], AddressClass::Component),
+                local: LocalKey([u8::try_from(node).expect("a test node fits a byte"); 16]),
+            },
         }
     }
 
@@ -204,14 +209,14 @@ mod tests {
 
     /// The list region is one byte string whatever the split between
     /// its three lists, so the counts have to be what fixes the reading:
-    /// three escrowed entries and fourteen shards are the same 168 bytes
-    /// of region, and the leaves differ.
+    /// three escrowed entries and twenty-six shards are the same 312
+    /// bytes of region, and the leaves differ.
     #[test]
     fn two_list_splits_of_equal_length_give_different_leaves() {
         let escrowing = base().escrowing((0..3).map(escrowed));
-        let crossing = base().crossing_to((0..14).map(|path| ShardId::leaf(4, path)));
+        let crossing = base().crossing_to((0..26).map(|path| ShardId::leaf(5, path)));
         assert_eq!(
-            escrowing.escrowed().len() * 56,
+            escrowing.escrowed().len() * 104,
             crossing.crossing_targets().len() * 12,
             "the two regions have to be the same length, or this proves nothing"
         );
@@ -219,7 +224,7 @@ mod tests {
 
         // And the same shards awaited rather than crossed to is a third
         // reading of the same bytes.
-        let awaiting = base().awaiting((0..14).map(|path| ShardId::leaf(4, path)));
+        let awaiting = base().awaiting((0..26).map(|path| ShardId::leaf(5, path)));
         assert_ne!(tx_outcome_leaf(&awaiting), tx_outcome_leaf(&crossing));
     }
 
@@ -236,8 +241,13 @@ mod tests {
             resource: ResourceAddr::new([0xE2; 31]),
             ..escrowed(1)
         }]);
+        let moved = base().escrowing([EscrowedValue {
+            record: escrowed(2).record,
+            ..escrowed(1)
+        }]);
         assert_ne!(tx_outcome_leaf(&one), tx_outcome_leaf(&more));
         assert_ne!(tx_outcome_leaf(&one), tx_outcome_leaf(&elsewhere));
+        assert_ne!(tx_outcome_leaf(&one), tx_outcome_leaf(&moved));
         assert_ne!(tx_outcome_leaf(&one), tx_outcome_leaf(&base()));
     }
 

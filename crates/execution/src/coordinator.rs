@@ -37,7 +37,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::{Classified, Placement, decomposition_enabled};
+use hyperscale_engine::legs::{Classified, Placement, crossings_of, decomposition_enabled};
 use hyperscale_engine::{TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_unresolvable_tx};
 use hyperscale_storage::{RecoveredState, TickResolution};
@@ -920,6 +920,9 @@ impl ExecutionCoordinator {
         let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());
         let mut provisional_claims: Vec<(DeclaredKey, Mode)> = Vec::new();
         let mut legs: BTreeSet<TxHash> = BTreeSet::new();
+        let trie = self
+            .classification_committee(topology_schedule, self.committed_committee_anchor_wt)
+            .shard_trie();
         for member in admitted {
             state.admit(
                 member.request.tx_hash,
@@ -927,6 +930,21 @@ impl ExecutionCoordinator {
                 member.request.transaction.work(),
                 member.admission,
             );
+            // Where this member's crossings land, off the frozen
+            // classification: the shards its outcome promises a bundle
+            // to, if it issues anything.
+            let classified = &member.request.classified;
+            let targets: BTreeSet<ShardId> = crossings_of(
+                member.request.transaction.legs(),
+                member.request.transaction.crossings(),
+                classified.decomposed(),
+                trie,
+            )
+            .into_iter()
+            .filter(|edge| edge.from == local_shard)
+            .flat_map(|edge| edge.to)
+            .collect();
+            state.record_crossing_targets(member.request.tx_hash, targets);
             self.ticks.assign_tx(member.request.tx_hash, tick_id);
             self.unresolved.certify(member.request.tx_hash);
             if member.request.reaches_beyond {
@@ -1162,6 +1180,7 @@ impl ExecutionCoordinator {
                 state.record_attested_work(tx_hash, work);
             }
             for wr in tx_outcomes {
+                state.record_escrowed(wr.tx_hash(), wr.escrowed().to_vec());
                 let (tx_hash, outcome) = wr.into_parts();
                 state.record_execution_result(tx_hash, outcome);
             }

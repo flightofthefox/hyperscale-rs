@@ -624,6 +624,9 @@ mod tests {
             output,
             resource: RESOURCE,
             amount,
+            // The planner reads the edge, never the record: which cell a
+            // bundle proved is the requirement's business.
+            record: cell(owner(0xFF, true), 9),
         }
     }
 

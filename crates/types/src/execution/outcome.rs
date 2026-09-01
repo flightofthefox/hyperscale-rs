@@ -2,7 +2,7 @@
 //! carried inside execution certificates.
 
 use hyperscale_hbor::Hbor;
-use hyperscale_vm_types::{MAX_CROSSINGS_PER_TX, ResourceAddr};
+use hyperscale_vm_types::{MAX_CROSSINGS_PER_TX, ResourceAddr, SubstateKey};
 
 use crate::{GlobalReceiptHash, MAX_PROVISION_TARGET_SHARDS, ShardId, TxHash};
 
@@ -12,6 +12,10 @@ use crate::{GlobalReceiptHash, MAX_PROVISION_TARGET_SHARDS, ShardId, TxHash};
 /// edges carrying one resource with no way to say which value fed which
 /// consumer, and the consuming shard claims its own argument rather than
 /// a share of a total.
+///
+/// Self-describing: the record cell rides the entry, so a validator
+/// holding the certificate and not the transaction can build, serve and
+/// match the bundle that proves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hbor)]
 pub struct EscrowedValue {
     /// The producing node.
@@ -22,6 +26,10 @@ pub struct EscrowedValue {
     pub resource: ResourceAddr,
     /// How much of it.
     pub amount: u128,
+    /// The record cell the value left into, under the producing node's
+    /// target — what the bundle carrying it proves, and what the
+    /// consumer's requirement names.
+    pub record: SubstateKey,
 }
 
 /// Per-transaction execution outcome within a tick.

@@ -16,7 +16,7 @@
 //! transaction in a different block may abort differently.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use blake3::hash as blake3_hash;
 use hyperscale_effects_bridge::records::{PackageCache, record_address};
@@ -35,16 +35,16 @@ use hyperscale_types::{
     install_protocol_statics,
 };
 use hyperscale_vm_effects::{
-    ChainRecords, Declaration, NodeCall, PackageHash, PrefixShardResolver, SubintentRecord,
-    admit_tree, package_hash, route_tree,
+    ChainRecords, Declaration, DeclaredAccess, NodeCall, PackageHash, PrefixShardResolver,
+    SubintentRecord, admit_tree, package_hash, route_tree,
 };
 use hyperscale_vm_kernel::{
-    Baseline, BatchTx, EnvInputs, ExecutionMode, Locality, ManifestWalk, Receipt, Substates,
-    execute_batch,
+    Baseline, BatchTx, EnvInputs, ExecutionMode, LegPlan, Locality, ManifestWalk, Receipt,
+    Substates, execute_batch,
 };
 use hyperscale_vm_types::{
-    Address, CallTarget, CollectionId, EffectSet, EffectTarget, EntryKey, Outcome, SubstateKey,
-    UnmetCondition,
+    Address, CallTarget, CollectionId, Effect, EffectSet, EffectTarget, EntryKey, Mode, Moves,
+    Outcome, SubstateKey, UnmetCondition,
 };
 
 use crate::backend::EngineBackend;
@@ -801,6 +801,7 @@ pub fn build_fee_receipt(
         0,
         Vec::new(),
         Vec::new(),
+        Vec::new(),
     );
     project_to_shard(&cached, tx_hash, local_shard, shard_trie).consensus
 }
@@ -878,6 +879,7 @@ fn assemble_published_tx(
                 work,
                 Vec::new(),
                 witnesses,
+                Vec::new(),
             )
         },
         |reason| CachedOutput::failed(vm_metadata(work, Some(reason.clone()))),
@@ -902,12 +904,53 @@ fn assemble_published_tx(
     executed
 }
 
+/// The plan a member that ran the whole shape ran under, for a receipt
+/// with no prepared entry to read one off.
+static WHOLE_LEGS: LazyLock<LegPlan> = LazyLock::new(LegPlan::whole);
+
+/// Declare the record and claim cells a divided member's plan writes,
+/// as exclusive writes appended to its declaration.
+///
+/// Routing declares nothing here: the cells are written only by a
+/// divided execution, and which member writes which is a placement
+/// fact routing cannot know. The kernel refuses a plan whose cells are
+/// undeclared — the declaration is what puts every writer of one cell
+/// in one conflict group — so the engine declares them where it plans.
+/// Appended, never interleaved, so every capability rep admission fixed
+/// keeps its position.
+///
+/// # Errors
+///
+/// A cell the declaration already carries under another mode: the
+/// member is refused rather than run against a contradiction.
+fn declare_crossing_cells(declaration: &mut Declaration, legs: &LegPlan) -> Result<(), String> {
+    for key in legs.records().chain(legs.claims()) {
+        let effect = Effect {
+            target: EffectTarget::Point(key),
+            mode: Mode::Write { moves: Moves::Both },
+        };
+        declaration.set.insert(effect).map_err(|conflict| {
+            format!("crossing cell {key:?} contradicts the declaration: {conflict}")
+        })?;
+        declaration.ordered.push(DeclaredAccess {
+            effect,
+            holds: None,
+            reach: None,
+            clause: None,
+        });
+    }
+    Ok(())
+}
+
 /// What the kernel reported for one transaction: the effect record every
 /// participant derives identically, and this shard's own attested share.
 #[derive(Clone, Copy)]
 struct KernelOutput<'a> {
     receipt: &'a Receipt,
     work: u64,
+    /// The legs the member ran: what names the record cell of each
+    /// edge the receipt says it issued.
+    legs: &'a LegPlan,
 }
 
 /// What every transaction in a batch assembles against: the pre-read
@@ -936,6 +979,7 @@ fn assemble_executed_tx(
     let KernelOutput {
         receipt,
         work: attested_work,
+        legs,
     } = kernel;
     let tx_hash = vm_tx;
     let fee_receipt = fee.and_then(|payer| {
@@ -1013,6 +1057,25 @@ fn assemble_executed_tx(
             writes_root(&writes),
         )
         .receipt_hash();
+        // What left on each departing edge, with the record cell the plan
+        // filed for it. The kernel issues only what the plan departs, so
+        // an edge the plan has no site for is a kernel defect, not a
+        // silently shorter list.
+        let escrowed: Vec<EscrowedValue> = receipt
+            .escrow
+            .issues()
+            .map(|((node, output), crossed)| EscrowedValue {
+                node,
+                output,
+                resource: crossed.resource,
+                amount: crossed.amount,
+                record: legs
+                    .departing(node, output)
+                    .expect("the kernel issues only what the plan departs")
+                    .site
+                    .key(),
+            })
+            .collect();
         CachedOutput::succeeded(
             writes,
             receipt_hash,
@@ -1020,6 +1083,7 @@ fn assemble_executed_tx(
             receipt.fuel,
             events,
             witnesses,
+            escrowed,
         )
     } else {
         CachedOutput::failed(vm_metadata(
@@ -1117,6 +1181,7 @@ impl Executor {
                     ctx.local_shard,
                 )
                 .map_err(|defect| format!("no plan for this shard: {defect}"))?;
+                declare_crossing_cells(&mut entry.declaration, &entry.plan.legs)?;
                 Ok(entry)
             });
             match planned {
@@ -1266,6 +1331,9 @@ impl Executor {
             let kernel = KernelOutput {
                 receipt,
                 work: outcome.work.get(vm_tx).map_or(0, |w| w.units),
+                legs: prepared
+                    .get(vm_tx)
+                    .map_or(&WHOLE_LEGS, |entry| &entry.plan.legs),
             };
             let executed = assemble_executed_tx(
                 ctx,
