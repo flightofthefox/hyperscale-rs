@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use hyperscale_vm_types::NULLIFIER_GRACE_MS;
 
-use crate::MAX_VALIDITY_RANGE;
+use crate::{MAX_VALIDITY_RANGE, WeightedTimestamp};
 
 /// The longest a cross-shard transaction may take to finalize, past the
 /// last block that could have included it.
@@ -65,6 +65,36 @@ pub const REMOTE_HEADER_RETENTION: Duration = Duration::from_secs(30);
 /// runs inside its own window.
 pub const RETENTION_HORIZON: Duration =
     Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() + MAX_FINALIZATION_DELAY.as_secs());
+
+/// The earliest core-shard anchor at which a transaction's absence from
+/// the committed set means anything: its validity end plus
+/// [`MAX_FINALIZATION_DELAY`].
+///
+/// Before it the core may still legitimately commit — admission fences
+/// the core at `block_wt < validity_end`, and the extra term is the
+/// propagation budget for that block to be committed and served, not
+/// admission slack. Both sides derive this from signed content, so it is
+/// the same figure everywhere without coordinating.
+#[must_use]
+pub fn reclaim_probe_anchor(validity_end: WeightedTimestamp) -> WeightedTimestamp {
+    validity_end.plus(MAX_FINALIZATION_DELAY)
+}
+
+/// Whether an absence proof taken against a core-shard block at
+/// `probe_wt` licenses reclaiming a transaction's escrow.
+///
+/// Absence at or past the anchor says the core did not commit it and,
+/// by its own admission rule, never can. Absence before the anchor says
+/// nothing: a core block admitted at `validity_end - 1ms` may still be
+/// on its way. Misreading this by one term is a double spend, so the
+/// inequality is stated once, here, rather than at each consumer.
+#[must_use]
+pub fn absence_licenses_reclaim(
+    probe_wt: WeightedTimestamp,
+    validity_end: WeightedTimestamp,
+) -> bool {
+    probe_wt >= reclaim_probe_anchor(validity_end)
+}
 
 /// A nullifier's life and every other tx-derived artifact's are the same
 /// bound, asserted rather than assumed: the VM keys and values a
@@ -164,3 +194,46 @@ pub const SKIP_TIMEOUT: Duration = Duration::from_secs(45);
 /// within the epoch. A spuriously short value costs an extra benign
 /// round; a long one only delays skipping a genuinely dead committee.
 pub const RATIFY_ROUND_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{MAX_FINALIZATION_DELAY, absence_licenses_reclaim, reclaim_probe_anchor};
+    use crate::WeightedTimestamp;
+
+    /// The anchor is a boundary, and a reclaim is licensed on one side
+    /// of it and not the other — one millisecond either way.
+    #[test]
+    fn the_absence_anchor_is_inclusive_at_the_deadline_and_not_before() {
+        let validity_end = WeightedTimestamp::from_millis(60_000);
+        let anchor = reclaim_probe_anchor(validity_end);
+        assert_eq!(anchor, validity_end.plus(MAX_FINALIZATION_DELAY));
+
+        assert!(!absence_licenses_reclaim(
+            anchor.minus(Duration::from_millis(1)),
+            validity_end
+        ));
+        assert!(absence_licenses_reclaim(anchor, validity_end));
+        assert!(absence_licenses_reclaim(
+            anchor.plus(Duration::from_millis(1)),
+            validity_end
+        ));
+    }
+
+    /// A probe at the validity end itself licenses nothing: a core block
+    /// admitted a millisecond before it is inside the propagation budget
+    /// and may still commit. The gap is the whole of the delay, so the
+    /// latest legitimately admitted core block has that long to land.
+    #[test]
+    fn a_probe_at_the_validity_end_is_inside_the_propagation_budget() {
+        let validity_end = WeightedTimestamp::from_millis(60_000);
+        let latest_core_admission = validity_end.minus(Duration::from_millis(1));
+        assert!(!absence_licenses_reclaim(validity_end, validity_end));
+        assert!(
+            reclaim_probe_anchor(validity_end).elapsed_since(latest_core_admission)
+                > MAX_FINALIZATION_DELAY,
+            "the anchor sits a full delay past the last block the core could admit",
+        );
+    }
+}
