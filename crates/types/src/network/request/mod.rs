@@ -14,6 +14,7 @@ mod local_provision;
 mod provision;
 mod remote_header;
 mod settled_txs;
+mod state_proof;
 mod state_range;
 mod sync;
 mod transaction;
@@ -29,6 +30,7 @@ pub use package_artifact::{GetPackageArtifactsRequest, MAX_PACKAGE_ARTIFACTS_PER
 pub use provision::GetProvisionsRequest;
 pub use remote_header::{GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST};
 pub use settled_txs::GetSettledTxsRequest;
+pub use state_proof::GetStateProofRequest;
 pub use state_range::GetStateRangeRequest;
 pub use sync::SyncCompleteAnnouncement;
 pub use transaction::GetTransactionsRequest;

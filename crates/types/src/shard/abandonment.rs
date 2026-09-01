@@ -9,10 +9,10 @@
 //! from it is proof, but the set can only be fetched while the terminal
 //! it belongs to is still served. The core refused: its certificate says
 //! so, and a refusal ends the transaction outright. Or the core never
-//! committed it, as of one of its blocks past the deadline: an absence
-//! proof against that block's committed root says so, and before the
-//! deadline it says nothing, since the core may still legitimately
-//! commit.
+//! committed it, as of one of its blocks past the deadline: a
+//! non-inclusion proof of the committed-transaction cell against that
+//! block's state root says so, and before the deadline it says nothing,
+//! since the core may still legitimately commit.
 //!
 //! So the answer is written down while it can still be read. A record
 //! names the transactions this chain still owes an outcome for that its
@@ -110,10 +110,10 @@ impl UnsettledTx {
 /// and when that became so.
 ///
 /// Every arm carries a moment and none carries its proof. The proof is
-/// fetched by the voter — a settled set, a certificate, or a bracket
-/// against a committed root — and a voter that cannot verify defers. An
-/// absence proof is roughly `2·ceil(log2 N)` hashes; carrying one per
-/// entry would blow the record's size budget.
+/// fetched by the voter — a settled set, a certificate, or a state proof
+/// against a commit-proven header — and a voter that cannot verify
+/// defers. An absence proof is a JMT non-inclusion path; carrying one
+/// per entry would blow the record's size budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
 pub enum Unsettleable {
     /// The shard left without settling. Absence from its complete,
@@ -131,8 +131,11 @@ pub enum Unsettleable {
         refused_wt: WeightedTimestamp,
     },
     /// The core did not commit it, as of one of its blocks past the
-    /// deadline. A `CommittedTxAbsence` against that block's committed
-    /// root is the proof.
+    /// deadline. A non-inclusion proof of the transaction's committed
+    /// cell against that block's state root is the proof, and the fact
+    /// it proves is anchor-independent past the deadline: the core's
+    /// admission rule fences it at the validity end, so absent at one
+    /// block past the deadline is absent at every later one.
     Unclaimed {
         /// The weighted timestamp of the block the absence was proved
         /// against. At or past every named transaction's deadline, or
@@ -178,6 +181,25 @@ pub struct Refusal {
     /// The weighted timestamp of the refusing certificate's anchor.
     pub refused_wt: WeightedTimestamp,
     /// The refused transaction's deadline, as the leg's ledger holds it.
+    pub deadline: WeightedTimestamp,
+}
+
+/// A core shard's failure to commit a transaction a leg here issued
+/// for, as proved off its commit-proven state at a block past the
+/// transaction's deadline.
+///
+/// What an `Unclaimed` record restates and what a voter checks it
+/// against. The anchor is the voter's own probe, which need not be the
+/// proposer's: absence past the deadline is the same fact at every
+/// anchor, so a voter holding a proof at any block past the deadline
+/// holds the evidence the record claims. The deadline is the clock the
+/// mirror lives on, as a refusal's is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Absence {
+    /// The weighted timestamp of the block the absence was proved
+    /// against — at or past the transaction's deadline.
+    pub probed_wt: WeightedTimestamp,
+    /// The transaction's deadline, as the leg's ledger holds it.
     pub deadline: WeightedTimestamp,
 }
 
@@ -234,6 +256,17 @@ impl AbandonmentRecord {
         unsettled: impl IntoIterator<Item = UnsettledTx>,
     ) -> Self {
         Self::new(shard, Unsettleable::Refused { refused_wt }, unsettled)
+    }
+
+    /// A record over what `shard`, a core, had not committed as of its
+    /// block at `probed_wt`.
+    #[must_use]
+    pub fn unclaimed(
+        shard: ShardId,
+        probed_wt: WeightedTimestamp,
+        unsettled: impl IntoIterator<Item = UnsettledTx>,
+    ) -> Self {
+        Self::new(shard, Unsettleable::Unclaimed { probed_wt }, unsettled)
     }
 
     /// The counterpart shard.

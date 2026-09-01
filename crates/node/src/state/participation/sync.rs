@@ -101,6 +101,26 @@ impl ShardParticipation {
                 self.shard_coordinator
                     .redrive_pending_votes(topology_schedule)
             }
+            // A core shard is proved not to have committed a transaction
+            // a leg here issued for: the vote fence checks an absence
+            // record against this mirror, so record it and re-drive the
+            // votes that deferred without it.
+            ProtocolEvent::AbsenceObserved {
+                shard,
+                tx_hash,
+                absence,
+            } => {
+                self.shard_coordinator
+                    .record_absence(shard, tx_hash, absence);
+                self.shard_coordinator
+                    .redrive_pending_votes(topology_schedule)
+            }
+            // A state proof against a core's commit-proven header
+            // verified: the execution coordinator reads its probes off
+            // it and hands each absence on.
+            ProtocolEvent::StateProofVerified { anchor, inclusions } => self
+                .execution_coordinator
+                .on_state_proof_verified(anchor, &inclusions),
             // A predecessor answered which of the queried transactions it
             // committed. Record the answers, then re-drive the votes that
             // deferred for want of them and the proposal that was

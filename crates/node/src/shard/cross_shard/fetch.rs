@@ -16,12 +16,13 @@ use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
     GetCommittedTxsRequest, GetExecutionCertsRequest, GetFinalizationsRequest,
-    GetLocalProvisionsRequest, GetProvisionsRequest,
+    GetLocalProvisionsRequest, GetProvisionsRequest, GetStateProofRequest,
 };
 use hyperscale_types::network::response::CommittedTxVerdict;
 use hyperscale_types::{
     BlockHeight, ExecutionCertificate, Finalization, FinalizationHash, MessageClass,
-    PredecessorTerminal, ProvisionHash, ShardId, TxHash, ValidatorId, Verifiable,
+    PredecessorTerminal, ProvisionHash, ShardId, StateAnchor, SubstateKey, TxHash, ValidatorId,
+    Verifiable,
 };
 
 use crate::fetch::{Fetch, FetchBinding, partition_solicited};
@@ -45,6 +46,7 @@ pub type ProvisionFetch = Fetch<(ShardId, ShardId, BlockHeight)>;
 /// reconstruct, and its `committed_txs_root` is the key each absence
 /// proof is checked against.
 pub type CommittedTxFetch = Fetch<(PredecessorTerminal, TxHash)>;
+pub type StateProofFetch = Fetch<(StateAnchor, SubstateKey)>;
 
 // ─── Bindings ──────────────────────────────────────────────────────────
 
@@ -429,6 +431,107 @@ impl FetchBinding for CommittedTxBinding {
                             predecessor: predecessor.shard,
                             answers,
                         },
+                    );
+                    ResponseVerdict::Accept
+                }),
+            );
+        }
+    }
+}
+
+/// Marker type for the state-proof fetch against a commit-proven remote
+/// header.
+pub struct StateProofBinding;
+
+impl FetchBinding for StateProofBinding {
+    /// `(anchor, key)` — the commit-proven state the proof reconstructs
+    /// and one key whose presence under it is asked. The anchor rides
+    /// whole because its root is what the answer is checked against
+    /// before it reaches the coordinator.
+    type Id = (StateAnchor, SubstateKey);
+
+    const NAME: &'static str = "state_proof";
+
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+        &mut shard.cross_shard.state_proof
+    }
+
+    fn dispatch_chunk<N: Network>(
+        ids: Vec<Self::Id>,
+        local_shard: ShardId,
+        shard: ShardId,
+        preferred: Option<ValidatorId>,
+        class: Option<MessageClass>,
+        network: &N,
+        sender: &Sender<HostEvent>,
+    ) {
+        // A chunk is grouped by `(shard, preferred, class)`, which does
+        // not separate two anchors of the same shard, and one proof
+        // reconstructs exactly one root. Split by anchor here.
+        let mut by_anchor: BTreeMap<StateAnchor, Vec<SubstateKey>> = BTreeMap::new();
+        for (anchor, key) in ids {
+            by_anchor.entry(anchor).or_default().push(key);
+        }
+        for (anchor, keys) in by_anchor {
+            debug_assert_eq!(
+                shard, anchor.shard,
+                "StateProofBinding routes to the anchor's shard; the runner sets it from the id",
+            );
+            let requested: Vec<Self::Id> = keys.iter().map(|key| (anchor, *key)).collect();
+            let request = GetStateProofRequest::new(anchor.height, keys.clone());
+            let es = sender.clone();
+            network.request(
+                shard,
+                preferred,
+                request,
+                class,
+                Box::new(move |result| {
+                    let Ok(response) = result else {
+                        push_shard_input(
+                            &es,
+                            local_shard,
+                            ShardScopedInput::StateProofFetchFailed { ids: requested },
+                        );
+                        return ResponseVerdict::Accept;
+                    };
+                    // This peer doesn't hold the height — rotate.
+                    let Some(proof) = response.proof else {
+                        push_shard_input(
+                            &es,
+                            local_shard,
+                            ShardScopedInput::StateProofFetchFailed { ids: requested },
+                        );
+                        return ResponseVerdict::Reject;
+                    };
+                    let inclusions = match proof.inclusions(anchor.state_root, &keys) {
+                        Ok(inclusions) => inclusions,
+                        Err(error) => {
+                            tracing::warn!(
+                                shard = ?anchor.shard,
+                                height = anchor.height.inner(),
+                                %error,
+                                "Dropping state-proof response: unusable proof"
+                            );
+                            push_shard_input(
+                                &es,
+                                local_shard,
+                                ShardScopedInput::StateProofFetchFailed { ids: requested },
+                            );
+                            return ResponseVerdict::Reject;
+                        }
+                    };
+                    // Release the slots before delivering the answers, so
+                    // the freed capacity is available if handling the
+                    // delivery re-drives this fetch.
+                    push_shard_input(
+                        &es,
+                        local_shard,
+                        ShardScopedInput::StateProofFetchFulfilled { ids: requested },
+                    );
+                    push_protocol_event(
+                        &es,
+                        local_shard,
+                        ProtocolEvent::StateProofVerified { anchor, inclusions },
                     );
                     ResponseVerdict::Accept
                 }),

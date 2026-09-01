@@ -19,7 +19,7 @@
 
 use hyperscale_types::{
     BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, MessageClass, PredecessorTerminal,
-    ProvisionHash, ShardId, TxHash, ValidatorId,
+    ProvisionHash, ShardId, StateAnchor, SubstateKey, TxHash, ValidatorId,
 };
 
 /// Fetch family — one variant per payload type.
@@ -138,6 +138,27 @@ pub enum FetchRequest {
         /// Transactions whose membership in that chain's committed set
         /// is outstanding.
         tx_hashes: Vec<TxHash>,
+        /// Always `None` for this variant; see variant-level doc.
+        preferred: Option<ValidatorId>,
+        /// Optional class override; see enum-level doc.
+        class: Option<MessageClass>,
+    },
+    /// State proof of `keys` against a commit-proven remote header.
+    /// Routing shard is `anchor.shard`, whose committee holds the JMT
+    /// version the anchor's height names. `preferred` is `None`: every
+    /// member serves the same tree, so health-weighted rotation is what
+    /// moves off a peer that has pruned the height or serves a proof
+    /// against another root.
+    ///
+    /// The anchor rides whole rather than as a shard and height: its
+    /// root is what the proof is checked against before any answer
+    /// reaches the coordinator, and the answer is keyed by it so a
+    /// proof taken at one height never answers a probe at another.
+    StateProof {
+        /// The commit-proven state the proof reconstructs.
+        anchor: StateAnchor,
+        /// The keys whose presence or absence under it is wanted.
+        keys: Vec<SubstateKey>,
         /// Always `None` for this variant; see variant-level doc.
         preferred: Option<ValidatorId>,
         /// Optional class override; see enum-level doc.

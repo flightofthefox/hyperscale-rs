@@ -9,21 +9,22 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconBlockHash, BeaconProposal, BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block,
-    BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
+    Absence, BeaconBlockHash, BeaconProposal, BeaconWitnessRoot, BeaconWitnessRootVerifyError,
+    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
     CandidateBeaconBlockVerifyError, CertRootVerifyError, CertificateRoot, CertifiedBeaconBlock,
     CertifiedBeaconBlockVerifyError, CertifiedBlock, CertifiedBlockHeader,
     CertifiedHeaderVerifyError, Epoch, ExecutionCertificate, ExecutionCertificateVerifyError,
-    ExecutionVote, Finalization, FinalizationVerifyError, Hash, LeafIndex, LocalReceiptRoot,
-    LocalReceiptRootVerifyError, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
-    PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
-    Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate,
-    RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal, Refusal, Round,
-    ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg,
-    SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
-    SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError, StoredReceipt, TickId,
-    Timeout, Transaction, TransactionRoot, TxHash, TxOutcome, TxRootVerifyError, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp,
+    ExecutionVote, Finalization, FinalizationVerifyError, Hash, Inclusion, LeafIndex,
+    LocalReceiptRoot, LocalReceiptRootVerifyError, PcVote1, PcVote1VerifyError, PcVote2,
+    PcVote2VerifyError, PcVote3, PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap,
+    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError,
+    QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal,
+    Refusal, Round, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
+    SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
+    SpcProposalObject, SpcProposalObjectVerifyError, SpcView, StateAnchor, StateRoot,
+    StateRootVerifyError, StoredReceipt, SubstateKey, TickId, Timeout, Transaction,
+    TransactionRoot, TxHash, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp,
 };
 
 /// What one tick's batch produced.
@@ -802,6 +803,32 @@ pub enum ProtocolEvent {
         tx_hash: TxHash,
         /// The refusal as mirrored.
         refusal: Refusal,
+    },
+
+    /// The execution coordinator proved a core shard had not committed a
+    /// transaction a leg here issued for, off a state proof against one
+    /// of the core's commit-proven headers past the deadline. The shard
+    /// coordinator records it for the vote fence, which checks an
+    /// `Unclaimed` abandonment record against exactly this, and
+    /// re-drives the votes that deferred for want of it.
+    AbsenceObserved {
+        /// The core shard that did not commit it.
+        shard: ShardId,
+        /// The transaction it did not commit.
+        tx_hash: TxHash,
+        /// The absence as proved.
+        absence: Absence,
+    },
+
+    /// A state proof fetched against a commit-proven remote header
+    /// verified: each key asked is present or absent under the anchor's
+    /// root. Every answer here arrives already checked against that
+    /// root; the execution coordinator reads its probes off it.
+    StateProofVerified {
+        /// The state the proof was checked against.
+        anchor: StateAnchor,
+        /// What the proof attests for each key asked.
+        inclusions: Vec<(SubstateKey, Inclusion)>,
     },
 
     /// The `io_loop`'s settled-set acquisition verified a past-terminal

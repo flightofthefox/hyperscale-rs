@@ -53,8 +53,8 @@ pub use shard::pending_chain::{
 pub use shard::recovered_state::RecoveredState;
 pub use shard::store::{Anchored, SubstateStore, VersionedStore};
 pub use shard::sweep::{
-    SweepIndex, committed_tx_cells, merge_sweep_overlay, sweep_for_block, sweepable_expiry,
-    with_sweep,
+    SweepIndex, committed_tx_cell_key, committed_tx_cells, merge_sweep_overlay, sweep_for_block,
+    sweepable_expiry, with_sweep,
 };
 pub use shard::tick_certs::{covers_strictly_more, widest_tick_copies};
 pub use shard::tick_chain::{

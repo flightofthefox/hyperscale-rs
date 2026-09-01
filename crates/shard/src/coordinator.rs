@@ -89,11 +89,11 @@ use std::time::Duration;
 
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
-    BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootVerifyError,
-    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError,
-    CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
-    LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, MAX_VALIDITY_RANGE,
-    PredecessorTerminal, ProvisionRootVerifyError, ProvisionTxRootsMap,
+    Absence, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
+    BeaconWitnessRootVerifyError, Block, BlockHeader, BlockHeight, BlockManifest, BlockVote,
+    CertRootVerifyError, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
+    CommittedTip, Finalization, LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP,
+    MAX_VALIDITY_RANGE, PredecessorTerminal, ProvisionRootVerifyError, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext, QcVerifyError,
     QuorumCertificate, RecoveryCause, Refusal, Round, SafeVoteRegisters, StateRoot,
     StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, Transaction,
@@ -447,6 +447,14 @@ pub struct ShardCoordinator {
     /// this and nothing else: equality on the anchor, and a voter holding
     /// no mirror defers. Each lives to its transaction's horizon.
     refusals: HashMap<(TxHash, ShardId), Refusal>,
+    /// Core shards' proved absences of transactions legs here issued
+    /// for, as the execution coordinator proved them off commit-proven
+    /// headers past the deadline. An `Unclaimed` abandonment record is
+    /// checked against this and nothing else: a mirror at any anchor at
+    /// or past the name's deadline stands for it, since absence past the
+    /// deadline is one fact at every anchor, and a voter holding no
+    /// mirror defers. Each lives to its transaction's horizon.
+    absences: HashMap<(TxHash, ShardId), Absence>,
 }
 
 impl std::fmt::Debug for ShardCoordinator {
@@ -591,6 +599,7 @@ impl ShardCoordinator {
             precut: Precut::succeeding(recovered.predecessors),
             settled_sets: HashMap::new(),
             refusals: HashMap::new(),
+            absences: HashMap::new(),
         }
     }
 
@@ -871,6 +880,12 @@ impl ShardCoordinator {
         self.refusals.entry((tx_hash, shard)).or_insert(refusal);
     }
 
+    /// Record a core shard's proved absence for the vote fence.
+    /// First-write-wins: one proof past the deadline is the whole fact.
+    pub fn record_absence(&mut self, shard: ShardId, tx_hash: TxHash, absence: Absence) {
+        self.absences.entry((tx_hash, shard)).or_insert(absence);
+    }
+
     /// Drop settled-transaction sets past their evidence window. Once the
     /// committed chain advances beyond it, the fence rejects any tick
     /// naming the shard regardless of the set, so retaining it only leaks
@@ -884,6 +899,8 @@ impl ShardCoordinator {
         // record, past which nothing is offered against it.
         self.refusals
             .retain(|_, refusal| now < refusal.deadline.plus(MAX_VALIDITY_RANGE));
+        self.absences
+            .retain(|_, absence| now < absence.deadline.plus(MAX_VALIDITY_RANGE));
     }
 
     /// The settled-transaction set this validator has acquired for a terminated
@@ -1041,9 +1058,10 @@ impl ShardCoordinator {
     /// Whether one record's evidence stands for this validator, on the
     /// arm it carries. A departure is checked against the schedule; a
     /// refusal against this validator's own mirror of the core's
-    /// certificate, equality on the anchor; an absence against evidence
-    /// this fence does not hold. A voter that cannot check defers, which
-    /// is the same answer as a refusal here: not this vote.
+    /// certificate, equality on the anchor; an absence against this
+    /// validator's own proof, at any anchor past the name's deadline. A
+    /// voter that cannot check defers, which is the same answer as a
+    /// refusal here: not this vote.
     fn record_evidence_stands(
         &self,
         topology_schedule: &TopologySchedule,
@@ -1105,17 +1123,45 @@ impl ShardCoordinator {
                     }
                 }
             }
-            // An absence is checked against evidence this fence does
-            // not hold, and a voter that cannot check a record's
-            // evidence defers rather than accepting.
-            Unsettleable::Unclaimed { .. } => {
-                trace!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    shard = ?verdict.shard(),
-                    "Abandonment record carries evidence this fence cannot check; deferring"
-                );
-                return false;
+            // An absence is checked against this validator's own proof.
+            // The record's anchor has to sit at or past every name's
+            // deadline, which is the probe anchor — before it the core
+            // may still commit, so a probe there licenses nothing. The
+            // mirror need not be at the record's anchor: absence past
+            // the deadline is the same fact at every anchor, and two
+            // honest validators probe at whichever of the core's headers
+            // reached them first. A voter holding no proof defers.
+            Unsettleable::Unclaimed { probed_wt } => {
+                for entry in verdict.unsettled() {
+                    if probed_wt < entry.deadline {
+                        warn!(
+                            validator = ?self.me,
+                            block_hash = ?block_hash,
+                            shard = ?verdict.shard(),
+                            tx_hash = ?entry.tx_hash,
+                            probed = ?probed_wt,
+                            deadline = ?entry.deadline,
+                            "Abandonment record probes an absence before the deadline — \
+                             not voting"
+                        );
+                        return false;
+                    }
+                    let proved = self
+                        .absences
+                        .get(&(entry.tx_hash, verdict.shard()))
+                        .is_some_and(|absence| absence.probed_wt >= entry.deadline);
+                    if !proved {
+                        trace!(
+                            validator = ?self.me,
+                            block_hash = ?block_hash,
+                            shard = ?verdict.shard(),
+                            tx_hash = ?entry.tx_hash,
+                            "Abandonment record restates an absence this validator has not \
+                             proved; deferring"
+                        );
+                        return false;
+                    }
+                }
             }
         }
         true
@@ -11514,25 +11560,60 @@ mod tests {
         );
     }
 
-    /// The absence arm is checked against evidence this fence does not
-    /// hold, and is deferred rather than accepted.
+    /// An absence record is checked against this validator's own proof:
+    /// a proof at any anchor past the name's deadline passes it, the
+    /// record's own anchor short of the deadline refuses it whatever the
+    /// mirror says, and no proof defers it.
     #[test]
-    fn a_record_on_evidence_the_fence_cannot_check_is_deferred() {
-        let mut coord = fence_coordinator();
+    fn an_absence_record_stands_or_falls_on_the_mirror() {
         let sched = make_terminating_schedule(4);
-        coord.abandonment_figures.remember(figures_of(b"tx"));
-        let unclaimed = AbandonmentRecord::new(
-            ShardId::ROOT,
-            Unsettleable::Unclaimed {
-                probed_wt: WeightedTimestamp::from_millis(ROOT_CUT_MS),
-            },
-            [figures_of(b"tx")],
+        let deadline = figures_of(b"tx").deadline;
+        let tx_hash = figures_of(b"tx").tx_hash;
+        let mirror = |probed_wt: WeightedTimestamp| Absence {
+            probed_wt,
+            deadline,
+        };
+        let record = |probed_wt: WeightedTimestamp| {
+            block_with_records(
+                AFTER_CUT_MS,
+                vec![AbandonmentRecord::unclaimed(
+                    ShardId::ROOT,
+                    probed_wt,
+                    [figures_of(b"tx")],
+                )],
+            )
+        };
+
+        let mut matching = fence_coordinator();
+        matching.abandonment_figures.remember(figures_of(b"tx"));
+        matching.record_absence(ShardId::ROOT, tx_hash, mirror(deadline));
+        assert!(
+            !matching.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
+            "a proof at the deadline passes a record at the deadline"
         );
-        assert!(coord.fence_abandonment_records(
-            &sched,
-            &block_with_records(AFTER_CUT_MS, vec![unclaimed]),
-            BlockHash::ZERO,
-        ));
+        assert!(
+            !matching.fence_abandonment_records(
+                &sched,
+                &record(deadline.plus(Duration::from_secs(5))),
+                BlockHash::ZERO
+            ),
+            "and a record probed later, since the fact is the same at every anchor past it"
+        );
+        assert!(
+            matching.fence_abandonment_records(
+                &sched,
+                &record(deadline.minus(Duration::from_millis(1))),
+                BlockHash::ZERO
+            ),
+            "a record probed before the deadline is refused whatever the mirror holds"
+        );
+
+        let mut absent = fence_coordinator();
+        absent.abandonment_figures.remember(figures_of(b"tx"));
+        assert!(
+            absent.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
+            "no proof defers it"
+        );
     }
 
     /// Past the departure the record's own claim still stands or falls on

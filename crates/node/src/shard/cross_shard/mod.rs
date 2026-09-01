@@ -21,13 +21,14 @@ mod remote_header_sync;
 mod settled_set;
 mod settled_set_sync;
 mod settled_txs_serve;
+mod state_proof_serve;
 
 pub use committed_txs_serve::{CommittedTxsCache, serve_committed_txs_request};
 pub use exec_cert_serve::serve_execution_certs_request;
 pub use fetch::{
     CommittedTxBinding, CommittedTxFetch, ExecCertBinding, ExecCertFetch, FinalizationBinding,
     FinalizationFetch, LocalProvisionBinding, LocalProvisionFetch, ProvisionBinding,
-    ProvisionFetch,
+    ProvisionFetch, StateProofBinding, StateProofFetch,
 };
 pub use finalization_serve::serve_finalizations_request;
 use hyperscale_types::{BlockHeight, LocalTimestamp, ShardId};
@@ -37,6 +38,7 @@ use remote_header::{RemoteHeaderSync, RemoteHeaderSyncInput, RemoteHeaderSyncOut
 pub use remote_header_serve::{serve_local_certified_headers, serve_remote_headers_request};
 pub use settled_set::SettledTxsAcquisition;
 pub use settled_txs_serve::serve_settled_txs_request;
+pub use state_proof_serve::serve_state_proof_request;
 
 use crate::config::NodeConfig;
 use crate::fetch::FetchConfig;
@@ -60,6 +62,9 @@ pub struct CrossShardState {
     /// Committed-transaction membership fetch against the chains this
     /// one succeeds (rotates through the predecessor's committee).
     pub committed_tx: CommittedTxFetch,
+    /// State-proof fetch against other shards' commit-proven headers
+    /// (rotates through the anchor's committee).
+    pub state_proof: StateProofFetch,
 
     /// Settled-ticks acquisition drivers — one per past-terminal remote
     /// shard whose `S_P` this node is acquiring for the split-boundary fence.
@@ -98,6 +103,14 @@ impl CrossShardState {
                     parallel_chunks_per_tick: 2,
                 },
             ),
+            state_proof: StateProofFetch::new(
+                "state_proof",
+                FetchConfig {
+                    max_in_flight: 256,
+                    max_ids_per_request: 64,
+                    parallel_chunks_per_tick: 2,
+                },
+            ),
             settled_set_sync: SettledTxsAcquisition::new(),
         }
     }
@@ -114,6 +127,7 @@ impl CrossShardState {
             || self.finalization.has_pending()
             || self.local_provision.has_pending()
             || self.committed_tx.has_pending()
+            || self.state_proof.has_pending()
             || self.settled_set_sync.has_pending()
     }
 

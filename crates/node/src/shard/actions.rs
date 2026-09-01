@@ -32,7 +32,7 @@ use crate::shard::commit::{
 use crate::shard::consensus::BlockSyncInput;
 use crate::shard::cross_shard::{
     CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
-    ProvisionBinding,
+    ProvisionBinding, StateProofBinding,
 };
 use crate::shard::mempool::TransactionBinding;
 
@@ -684,6 +684,19 @@ where
                     class,
                 });
             }
+            FetchRequest::StateProof {
+                anchor,
+                keys,
+                preferred,
+                class,
+            } => {
+                self.drive_fetch::<StateProofBinding>(FetchInput::Request {
+                    ids: keys.into_iter().map(|key| (anchor, key)).collect(),
+                    shard: anchor.shard,
+                    preferred,
+                    class,
+                });
+            }
             FetchRequest::ShardWitnesses {
                 source_shard,
                 block_height,
@@ -752,6 +765,9 @@ where
             }
             FetchAbandon::CommittedTxs { ids } => {
                 self.drive_fetch::<CommittedTxBinding>(FetchInput::Abandoned { ids });
+            }
+            FetchAbandon::StateProofs { ids } => {
+                self.drive_fetch::<StateProofBinding>(FetchInput::Abandoned { ids });
             }
             FetchAbandon::BeaconProposal { ids } => {
                 self.drive_fetch::<BeaconProposalBinding>(FetchInput::Abandoned { ids });

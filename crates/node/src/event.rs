@@ -24,8 +24,8 @@ use hyperscale_types::{
     Address, BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ElidedCertifiedBlock, Epoch,
     FinalizationHash, Hash, HeaderFetchCount, LeafIndex, PredecessorTerminal, ProvisionHash,
-    ShardForkProof, ShardId, ShardVoteEquivocation, Transaction, TxHash, ValidatorId, Verifiable,
-    Verified,
+    ShardForkProof, ShardId, ShardVoteEquivocation, StateAnchor, SubstateKey, Transaction, TxHash,
+    ValidatorId, Verifiable, Verified,
 };
 
 use crate::shard::commit::QcOnlyDivergence;
@@ -446,6 +446,24 @@ pub enum ShardScopedInput {
         ids: Vec<(PredecessorTerminal, TxHash)>,
     },
 
+    /// A state-proof query went unanswered — a transport failure, a peer
+    /// that doesn't hold the height, or a proof this node can't lift to
+    /// the anchor's root. Whole-batch, because a proof is usable or it
+    /// isn't.
+    StateProofFetchFailed {
+        /// `(anchor, key)` pairs still owed an answer.
+        ids: Vec<(StateAnchor, SubstateKey)>,
+    },
+
+    /// A state-proof query was answered and verified: release the fetch
+    /// slots. Keyed by the *request* ids, so a peer's payload can't
+    /// leave a slot pinned. The answers themselves ride the
+    /// accompanying `ProtocolEvent::StateProofVerified`.
+    StateProofFetchFulfilled {
+        /// `(anchor, key)` pairs the response answered.
+        ids: Vec<(StateAnchor, SubstateKey)>,
+    },
+
     /// A shard-witness chunk fetch failed (network error, empty response,
     /// or the peer's window was pruned). Per-id so multiple in-flight
     /// runs can fail independently.
@@ -577,6 +595,8 @@ impl ShardScopedInput {
             | Self::FinalizationsFetchFailed { .. }
             | Self::CommittedTxsFetchFailed { .. }
             | Self::CommittedTxsFetchFulfilled { .. }
+            | Self::StateProofFetchFailed { .. }
+            | Self::StateProofFetchFulfilled { .. }
             | Self::ShardWitnessesFetchFailed { .. }
             | Self::ShardWitnessesFetchFulfilled { .. }
             | Self::BeaconProposalFetchFailed { .. }

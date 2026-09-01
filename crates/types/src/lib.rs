@@ -134,7 +134,7 @@ pub use primitives::seeds::{EpochSeed, SEED_WINDOW_EPOCHS, SeedLookup, SeedRing,
 pub use primitives::signer_bitfield::SignerBitfield;
 pub use provisioning::entry::ProvisionEntry;
 pub use provisioning::limits::{MAX_MERKLE_PROOF_LEN, MAX_STATE_ENTRIES_PER_TX};
-pub use provisioning::proof::MerkleInclusionProof;
+pub use provisioning::proof::{Inclusion, MerkleInclusionProof, StateProofError};
 pub use provisioning::provisions::{Provisions, ProvisionsContext, ProvisionsVerifyError};
 pub use provisioning::substate::{SubstateEntry, SubstateLeaf};
 pub use receipt::consensus::{ConsensusReceipt, FAILED_RECEIPT_HASH, absorb_committed_cells};
@@ -144,7 +144,9 @@ pub use receipt::event::{
 pub use receipt::global::GlobalReceipt;
 pub use receipt::metadata::{ExecutionMetadata, FeeSummary, LogLevel};
 pub use receipt::stored::StoredReceipt;
-pub use shard::abandonment::{AbandonmentRecord, AbortCharge, Refusal, Unsettleable, UnsettledTx};
+pub use shard::abandonment::{
+    AbandonmentRecord, AbortCharge, Absence, Refusal, Unsettleable, UnsettledTx,
+};
 pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch, LinkageError};
 pub use shard::certified_header::{CertifiedBlockHeader, CertifiedHeaderVerifyError};
 pub use shard::chain_origin::{ChainOrigin, PredecessorTerminal};
@@ -184,6 +186,7 @@ pub use shard::roots::{
     missed_proposals_since_prev_commit, next_reveal_chain, prove_committed_tx_absent,
     ready_leaf_payload, settled_txs_root_from_hashes,
 };
+pub use shard::state_anchor::StateAnchor;
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};

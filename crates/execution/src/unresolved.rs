@@ -151,6 +151,24 @@ struct Leg {
     core: BTreeSet<ShardId>,
 }
 
+/// A leg entry whose core has been silent past the transaction's
+/// deadline — what a probe of the core's committed set asks about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probeable {
+    /// The transaction.
+    pub tx_hash: TxHash,
+    /// Its deadline: the earliest core anchor at which absence means
+    /// anything, and the figure the probe's answer is dated against.
+    pub deadline: WeightedTimestamp,
+    /// Its validity end, which names the committed cell the core would
+    /// have written.
+    pub validity_end: WeightedTimestamp,
+    /// The core set. Any one core shard's absence suffices — no core
+    /// shard finalizes without every other's certificate — so the probe
+    /// goes to one of them.
+    pub core: BTreeSet<ShardId>,
+}
+
 /// Committed-but-unresolved transactions, each against its deadline and
 /// the reservation it holds.
 #[derive(Debug, Default)]
@@ -253,6 +271,31 @@ impl UnresolvedTxs {
                 declared_work: owed.declared_work,
                 charge: owed.charge,
             })
+    }
+
+    /// The leg entries whose core may now be asked whether it committed
+    /// the transaction: past the deadline and covered by no record yet.
+    ///
+    /// The deadline gates the probe and nothing else. Before it the core
+    /// may still legitimately commit, so absence says nothing; past it
+    /// absence is proof, and the proof is what a record is composed on.
+    /// Read off committed content alone, like [`Self::past_deadline`],
+    /// so every replica at the same frontier asks about the same set.
+    #[must_use]
+    pub fn probeable(&self, now: WeightedTimestamp) -> Vec<Probeable> {
+        self.owed
+            .iter()
+            .filter(|(_, owed)| owed.leg && owed.unsettled_by.is_none() && now >= owed.deadline)
+            .filter_map(|(tx_hash, owed)| {
+                let leg = self.legs.get(tx_hash)?;
+                Some(Probeable {
+                    tx_hash: *tx_hash,
+                    deadline: owed.deadline,
+                    validity_end: leg.body.validity_range().end_timestamp_exclusive,
+                    core: leg.core.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Whether this ledger still holds `tx_hash`.
@@ -1224,6 +1267,54 @@ mod tests {
             "the shard owning the prefix at commit is the successor, still running",
         );
         assert_eq!(ledger.len(), 1, "so nothing has fallen silent on it");
+    }
+
+    /// A leg entry is probeable from its deadline and not a moment
+    /// before, and only while no record covers it; an entry this shard
+    /// ran whole is never probed, since nothing it awaits is a core.
+    #[test]
+    fn a_leg_entry_is_probeable_past_its_deadline_until_a_record_covers_it() {
+        let mut ledger = UnresolvedTxs::default();
+        let leg = tx(4, 60_000);
+        let whole = tx(5, 60_000);
+        commit(&mut ledger, &leg);
+        commit(&mut ledger, &whole);
+        ledger.mark_leg(leg.hash(), body(&leg), BTreeSet::from([PARTNER]));
+        ledger.certify(leg.hash());
+        ledger.certify(whole.hash());
+
+        let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
+        assert!(
+            ledger
+                .probeable(deadline.minus(Duration::from_millis(1)))
+                .is_empty(),
+            "before the deadline the core may still commit"
+        );
+        assert_eq!(
+            ledger.probeable(deadline),
+            vec![Probeable {
+                tx_hash: leg.hash(),
+                deadline,
+                validity_end: ms(60_000),
+                core: BTreeSet::from([PARTNER]),
+            }],
+            "at the deadline the leg is probeable and the whole entry is not"
+        );
+
+        ledger.record_abandonment_records(&[AbandonmentRecord::unclaimed(
+            PARTNER,
+            deadline,
+            [names(&leg)],
+        )]);
+        assert!(
+            ledger.probeable(deadline).is_empty(),
+            "a covered entry is asked about once"
+        );
+        assert_eq!(
+            ledger.reclaimable().len(),
+            1,
+            "and the record licenses the reclaim"
+        );
     }
 
     /// A leg's own finalization bears no verdict on the transaction, so

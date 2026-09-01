@@ -177,6 +177,7 @@ impl NodeStateMachine {
             certified_header.shard_id(),
             certified_header.header().height(),
             certified_header.header().parent_qc().weighted_timestamp(),
+            certified_header.state_root(),
         ));
         actions
     }

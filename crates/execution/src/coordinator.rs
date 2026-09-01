@@ -40,17 +40,18 @@ use hyperscale_core::{
 use hyperscale_engine::legs::{Classified, Placement, Runs, crossings_of, decomposition_enabled};
 use hyperscale_engine::{TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_unresolvable_tx};
-use hyperscale_storage::{RecoveredState, TickResolution};
+use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
 use hyperscale_types::{
-    AbandonmentRecord, Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight,
-    BloomFilter, CertifiedBlock, DeclaredKey, Derivation, ExecutionCertificate,
+    AbandonmentRecord, Absence, Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader,
+    BlockHeight, BloomFilter, CertifiedBlock, DeclaredKey, Derivation, ExecutionCertificate,
     ExecutionCertificateVerifyError, ExecutionOutcome, ExecutionVote, Finalization,
-    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash,
+    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
     MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, Mode,
     Provisions, RETENTION_HORIZON, Refusal, ScheduleLookup, SettledSetVerdict, SettledTxSet,
-    ShardId, ShardTrie, StoredReceipt, TickId, TopologySchedule, TopologySnapshot, Transaction,
-    TransactionDecision, TxClaim, TxHash, TxOutcome, UnsettledTx, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp, derive_block_transactions, settled_set_verdict, tick_leader,
+    ShardId, ShardTrie, StateAnchor, StateRoot, StoredReceipt, SubstateKey, TickId,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxHash,
+    TxOutcome, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    absence_licenses_reclaim, derive_block_transactions, settled_set_verdict, tick_leader,
     tick_leader_at,
 };
 use tracing::instrument;
@@ -202,6 +203,32 @@ pub struct ExecutionMemoryStats {
     /// sustained rise means a source shard certifies without proving
     /// commits — the fork/withholding signature.
     pub unproven_ecs: usize,
+}
+
+/// A commit-proven remote source block: its authenticated timestamp and
+/// the state root its header carries.
+#[derive(Debug, Clone, Copy)]
+struct ProvenSource {
+    ts: WeightedTimestamp,
+    state_root: StateRoot,
+}
+
+/// What this shard has asked a silent core about one transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    /// A proof of `key` is out against `anchor`, whose block sits at
+    /// `probed_wt`; `deadline` is the entry's own, kept beside it so
+    /// the absence can be dated without the ledger.
+    Issued {
+        anchor: StateAnchor,
+        key: SubstateKey,
+        probed_wt: WeightedTimestamp,
+        deadline: WeightedTimestamp,
+    },
+    /// The core committed it: its certificate is what speaks next.
+    Committed,
+    /// The core had not committed it past the deadline.
+    Absent(Absence),
 }
 
 /// Execution state machine.
@@ -379,8 +406,10 @@ pub struct ExecutionCoordinator {
     /// source block — a bare QC certifies availability, and an f+1..2f
     /// corrupt committee can certify a sibling that never commits and
     /// export ECs computed from it. Values are the source block's
-    /// authenticated timestamp, the pruning anchor.
-    proven_remote: HashMap<(ShardId, BlockHeight), WeightedTimestamp>,
+    /// authenticated timestamp — the pruning anchor — and its state
+    /// root, which a probe of the shard's committed set is taken
+    /// against.
+    proven_remote: HashMap<(ShardId, BlockHeight), ProvenSource>,
 
     /// Cross-shard ECs racing ahead of their source block's commit proof,
     /// keyed by the EC's shard, bounded per shard (drop-oldest). Replayed
@@ -405,6 +434,14 @@ pub struct ExecutionCoordinator {
     /// the vote fence the moment it is mirrored, so nothing here is
     /// collected before it is drained. Each lives to its leg entry.
     refusals: BTreeMap<(TxHash, ShardId), Refusal>,
+
+    /// What this shard has asked a silent core about a transaction a
+    /// leg here issued for, keyed like the refusals: a probe in flight,
+    /// a core that turned out to have committed it, or an absence
+    /// proved — which is what an `Unclaimed` abandonment record is
+    /// offered from, and which is handed to the vote fence the moment
+    /// it is proved. Each lives to its leg entry.
+    probes: BTreeMap<(TxHash, ShardId), Probe>,
 
     /// Finalizations built but withheld because a contained EC names a
     /// shard that is scheduled to terminate, or past-terminal with its
@@ -518,6 +555,7 @@ impl ExecutionCoordinator {
             unproven_ecs: AwaitingTopologyBuffer::new(),
             settled_sets: HashMap::new(),
             refusals: BTreeMap::new(),
+            probes: BTreeMap::new(),
             gated_finalized: BTreeMap::new(),
             me,
             local_shard,
@@ -2110,19 +2148,171 @@ impl ExecutionCoordinator {
         source_shard: ShardId,
         block_height: BlockHeight,
         source_ts: WeightedTimestamp,
+        state_root: StateRoot,
     ) -> Vec<Action> {
         if source_shard == self.local_shard {
             return vec![];
         }
-        self.proven_remote
-            .insert((source_shard, block_height), source_ts);
+        self.proven_remote.insert(
+            (source_shard, block_height),
+            ProvenSource {
+                ts: source_ts,
+                state_root,
+            },
+        );
 
         let deferred = self.unproven_ecs.drain_shard(source_shard);
         let mut actions = Vec::new();
         for cert in deferred {
             actions.extend(self.on_execution_certificate(topology_schedule, cert));
         }
+        // A core's header past a leg's deadline is what a probe of its
+        // committed set waits on.
+        actions.extend(self.probe_silent_cores());
         actions
+    }
+
+    /// Ask each silent core whether it committed the transaction a leg
+    /// here issued for, once the transaction's deadline has passed.
+    ///
+    /// The deadline gates the probe and never the reclaim: absence from
+    /// the core's committed set at a block past the deadline is the
+    /// evidence, and before it the core may still legitimately commit.
+    /// The probe goes to the core's lowest shard — any one core shard's
+    /// absence suffices, and the choice has to be the same on every
+    /// validator or a voter's mirror would name a shard the record does
+    /// not — against the lowest commit-proven header of that shard at
+    /// or past the deadline, so validators reaching the same headers
+    /// probe at the same anchor. A shard whose header has not reached
+    /// here yet is asked when it does.
+    ///
+    /// The cell is named from signed content and the core shard alone,
+    /// so nothing but the header and the proof is fetched.
+    fn probe_silent_cores(&mut self) -> Vec<Action> {
+        let mut wanted: BTreeMap<StateAnchor, Vec<SubstateKey>> = BTreeMap::new();
+        for entry in self.unresolved.probeable(self.committed_ts) {
+            let Some(&shard) = entry.core.iter().next() else {
+                continue;
+            };
+            if self.probes.contains_key(&(entry.tx_hash, shard)) {
+                continue;
+            }
+            let Some((height, source)) = self
+                .proven_remote
+                .iter()
+                .filter(|((source_shard, _), source)| {
+                    *source_shard == shard
+                        && absence_licenses_reclaim(source.ts, entry.validity_end)
+                })
+                .map(|((_, height), source)| (*height, *source))
+                .min_by_key(|(height, _)| *height)
+            else {
+                continue;
+            };
+            let anchor = StateAnchor {
+                shard,
+                height,
+                state_root: source.state_root,
+            };
+            let key = committed_tx_cell_key(shard, entry.tx_hash, entry.validity_end);
+            self.probes.insert(
+                (entry.tx_hash, shard),
+                Probe::Issued {
+                    anchor,
+                    key,
+                    probed_wt: source.ts,
+                    deadline: entry.deadline,
+                },
+            );
+            wanted.entry(anchor).or_default().push(key);
+        }
+        wanted
+            .into_iter()
+            .map(|(anchor, keys)| {
+                Action::Fetch(FetchRequest::StateProof {
+                    anchor,
+                    keys,
+                    preferred: None,
+                    class: None,
+                })
+            })
+            .collect()
+    }
+
+    /// Read a verified state proof off the probes it answers, and hand
+    /// each absence to the vote fence.
+    ///
+    /// An answer is matched on the anchor as well as the key: a proof
+    /// taken at another height says nothing about the probe issued at
+    /// this one. A key found present means the core committed the
+    /// transaction, and what speaks for it next is the core's own
+    /// certificate — a refusal there is mirrored on arrival, and a
+    /// success leaves nothing to reclaim. The hand-off is a
+    /// continuation emitted here rather than a map the fence reads
+    /// later, so an absence is never collected before it is drained.
+    pub fn on_state_proof_verified(
+        &mut self,
+        anchor: StateAnchor,
+        inclusions: &[(SubstateKey, Inclusion)],
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+        for &(key, inclusion) in inclusions {
+            for (&(tx_hash, shard), probe) in &mut self.probes {
+                let Probe::Issued {
+                    anchor: issued,
+                    key: asked,
+                    probed_wt,
+                    deadline,
+                } = *probe
+                else {
+                    continue;
+                };
+                if issued != anchor || asked != key {
+                    continue;
+                }
+                match inclusion {
+                    Inclusion::Present => *probe = Probe::Committed,
+                    Inclusion::Absent => {
+                        let absence = Absence {
+                            probed_wt,
+                            deadline,
+                        };
+                        *probe = Probe::Absent(absence);
+                        actions.push(Action::Continuation(ProtocolEvent::AbsenceObserved {
+                            shard,
+                            tx_hash,
+                            absence,
+                        }));
+                    }
+                }
+            }
+        }
+        actions
+    }
+
+    /// Drop the probes whose leg entries are gone — released by the
+    /// reclaim, or dropped at their horizon — and release the fetch slot
+    /// of any still in flight, so a core that never serves the height
+    /// does not pin it.
+    fn gc_probes(&mut self) -> Vec<Action> {
+        let unresolved = &self.unresolved;
+        let mut abandoned = Vec::new();
+        self.probes.retain(|(tx_hash, _), probe| {
+            if unresolved.contains(*tx_hash) {
+                return true;
+            }
+            if let Probe::Issued { anchor, key, .. } = probe {
+                abandoned.push((*anchor, *key));
+            }
+            false
+        });
+        if abandoned.is_empty() {
+            Vec::new()
+        } else {
+            vec![Action::AbandonFetch(FetchAbandon::StateProofs {
+                ids: abandoned,
+            })]
+        }
     }
 
     /// Eager-fetch every expected execution cert whose fallback hasn't fired,
@@ -2333,6 +2523,7 @@ impl ExecutionCoordinator {
         self.provisioning.advance_clock(self.committed_ts);
         self.gc_settled_sets(topology_schedule);
         self.gc_refusals();
+        let mut actions = self.gc_probes();
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
         // could still carry one is nobody's to resolve.
@@ -2348,8 +2539,9 @@ impl ExecutionCoordinator {
         self.stamp_departures(topology_schedule);
         let unanswerable = self.unresolved.prune(self.committed_ts);
         self.release_unanswerable(&unanswerable);
-
-        let mut actions = Vec::new();
+        // The committed clock is what opens a leg's deadline, so the
+        // cores gone silent past it are asked here.
+        actions.extend(self.probe_silent_cores());
 
         // Timeout checks + pruning run every block, not just commits that
         // carry txs.
@@ -2362,7 +2554,7 @@ impl ExecutionCoordinator {
         // retention horizon no EC against the block is consumable anywhere.
         // Deferred ECs likewise drop at their own deadline.
         let horizon = self.committed_ts.minus(RETENTION_HORIZON);
-        self.proven_remote.retain(|_, ts| *ts >= horizon);
+        self.proven_remote.retain(|_, source| source.ts >= horizon);
 
         // Re-check gate-held finalizations against the advanced schedule:
         // emit any it now resolves, and drop any whose partner it has
@@ -2727,36 +2919,70 @@ impl ExecutionCoordinator {
         // core refused at: one anchor per shard per block, earliest
         // first, because a record spanning two anchors satisfies the
         // fence's equality check for neither.
-        let mut refused: BTreeMap<ShardId, BTreeMap<WeightedTimestamp, Vec<UnsettledTx>>> =
+        let refused = self
+            .refusals
+            .iter()
+            .map(|((tx_hash, shard), refusal)| (*tx_hash, *shard, refusal.refused_wt));
+        self.offer_at_earliest_anchor(
+            &mut records,
+            &mut budget,
+            refused,
+            AbandonmentRecord::refused,
+        );
+        // Proved absences, grouped the same way: a record states the
+        // one anchor every name in it was proved at.
+        let absent = self
+            .probes
+            .iter()
+            .filter_map(|((tx_hash, shard), probe)| match probe {
+                Probe::Absent(absence) => Some((*tx_hash, *shard, absence.probed_wt)),
+                Probe::Issued { .. } | Probe::Committed => None,
+            });
+        self.offer_at_earliest_anchor(
+            &mut records,
+            &mut budget,
+            absent,
+            AbandonmentRecord::unclaimed,
+        );
+        records.into_values().collect()
+    }
+
+    /// Offer one record per shard from `mirrored`, at the shard's
+    /// earliest anchor, for the shards `records` does not yet name and
+    /// the names no record covers yet, under the shared budget.
+    fn offer_at_earliest_anchor(
+        &self,
+        records: &mut BTreeMap<ShardId, AbandonmentRecord>,
+        budget: &mut usize,
+        mirrored: impl IntoIterator<Item = (TxHash, ShardId, WeightedTimestamp)>,
+        record: fn(ShardId, WeightedTimestamp, Vec<UnsettledTx>) -> AbandonmentRecord,
+    ) {
+        let mut anchored: BTreeMap<ShardId, BTreeMap<WeightedTimestamp, Vec<UnsettledTx>>> =
             BTreeMap::new();
-        for ((tx_hash, shard), refusal) in &self.refusals {
-            if let Some(figures) = self.unresolved.unsettled_leg_figures(*tx_hash) {
-                refused
-                    .entry(*shard)
+        for (tx_hash, shard, anchor) in mirrored {
+            if let Some(figures) = self.unresolved.unsettled_leg_figures(tx_hash) {
+                anchored
+                    .entry(shard)
                     .or_default()
-                    .entry(refusal.refused_wt)
+                    .entry(anchor)
                     .or_default()
                     .push(figures);
             }
         }
-        for (shard, anchors) in refused {
-            if budget == 0 || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
+        for (shard, anchors) in anchored {
+            if *budget == 0 || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
                 break;
             }
             if records.contains_key(&shard) {
                 continue;
             }
-            let Some((refused_wt, mut unsettled)) = anchors.into_iter().next() else {
+            let Some((anchor, mut unsettled)) = anchors.into_iter().next() else {
                 continue;
             };
-            unsettled.truncate(budget);
-            budget -= unsettled.len();
-            records.insert(
-                shard,
-                AbandonmentRecord::refused(shard, refused_wt, unsettled),
-            );
+            unsettled.truncate(*budget);
+            *budget -= unsettled.len();
+            records.insert(shard, record(shard, anchor, unsettled));
         }
-        records.into_values().collect()
     }
 
     /// Let go of what this shard holds against transactions no shard can
@@ -3825,6 +4051,7 @@ impl std::fmt::Debug for ExecutionCoordinator {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_storage::ReplayWindow;
@@ -5090,6 +5317,7 @@ mod tests {
             remote_shard,
             BlockHeight::new(5),
             WeightedTimestamp::ZERO,
+            StateRoot::ZERO,
         );
         assert!(
             actions
@@ -5579,6 +5807,7 @@ mod tests {
             remote_shard,
             BlockHeight::new(5),
             WeightedTimestamp::ZERO,
+            StateRoot::ZERO,
         );
         let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(
@@ -7200,6 +7429,181 @@ mod tests {
             "a success is not a refusal"
         );
         assert!(accepting.pending_abandonment_records().is_empty());
+    }
+
+    /// A state on [`HOME`] holding `transaction` as a leg whose core is
+    /// [`PEER`], certified and never resolved.
+    fn leg_state(transaction: &Arc<Verifiable<Transaction>>) -> ExecutionCoordinator {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        state.unresolved.register_committed(
+            HOME,
+            WeightedTimestamp::ZERO,
+            std::iter::once(transaction),
+        );
+        state.unresolved.mark_leg(
+            transaction.hash(),
+            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+            BTreeSet::from([PEER]),
+        );
+        state.unresolved.certify(transaction.hash());
+        state
+    }
+
+    /// The state-proof fetches among `actions`, by anchor.
+    fn state_proof_fetches(actions: &[Action]) -> Vec<(StateAnchor, Vec<SubstateKey>)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Fetch(FetchRequest::StateProof { anchor, keys, .. }) => {
+                    Some((*anchor, keys.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The absences of `tx_hash` at [`PEER`] handed to the fence among
+    /// `actions`.
+    fn absences_observed(actions: &[Action], tx_hash: TxHash) -> Vec<Absence> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Continuation(ProtocolEvent::AbsenceObserved {
+                    shard,
+                    tx_hash: named,
+                    absence,
+                }) if *shard == PEER && *named == tx_hash => Some(*absence),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A core silent past a leg's deadline is asked whether it committed
+    /// the transaction, against its lowest commit-proven header at or
+    /// past the deadline and never against one short of it. An absence
+    /// reaches the vote fence and is offered under the anchor it was
+    /// proved at; an answer at another anchor is nobody's.
+    #[test]
+    fn a_silent_core_is_probed_past_the_deadline_and_its_absence_offered() {
+        let schedule = two_shard_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let figures = UnsettledTx::for_transaction(&transaction);
+        let deadline = figures.deadline;
+        let key = committed_tx_cell_key(
+            PEER,
+            tx_hash,
+            transaction.validity_range().end_timestamp_exclusive,
+        );
+        let root = |tag: &[u8]| StateRoot::from_raw(Hash::from_bytes(tag));
+        let mut state = leg_state(&transaction);
+
+        // Three of the core's headers, none of them asked about while
+        // the committed clock is short of the deadline.
+        let held: [(u64, WeightedTimestamp, &[u8]); 3] = [
+            (3, deadline.minus(Duration::from_millis(1)), b"short"),
+            (5, deadline.plus(Duration::from_secs(1)), b"later"),
+            (4, deadline, b"at"),
+        ];
+        for (height, ts, tag) in held {
+            let actions = state.on_committed_remote_header(
+                &schedule,
+                PEER,
+                BlockHeight::new(height),
+                ts,
+                root(tag),
+            );
+            assert!(
+                state_proof_fetches(&actions).is_empty(),
+                "before the deadline nothing is asked"
+            );
+        }
+        state.committed_ts = deadline;
+        let anchor = StateAnchor {
+            shard: PEER,
+            height: BlockHeight::new(4),
+            state_root: root(b"at"),
+        };
+        assert_eq!(
+            state_proof_fetches(&state.probe_silent_cores()),
+            vec![(anchor, vec![key])],
+            "the lowest header at or past the deadline is the anchor"
+        );
+        assert!(
+            state_proof_fetches(&state.probe_silent_cores()).is_empty(),
+            "a probe in flight is not re-issued"
+        );
+
+        let elsewhere = StateAnchor {
+            height: BlockHeight::new(5),
+            state_root: root(b"later"),
+            ..anchor
+        };
+        let answered = state.on_state_proof_verified(elsewhere, &[(key, Inclusion::Absent)]);
+        assert!(
+            absences_observed(&answered, tx_hash).is_empty(),
+            "a proof at another anchor answers nothing"
+        );
+        let answered = state.on_state_proof_verified(anchor, &[(key, Inclusion::Absent)]);
+        assert_eq!(
+            absences_observed(&answered, tx_hash),
+            vec![Absence {
+                probed_wt: deadline,
+                deadline
+            }],
+            "the absence reaches the vote fence"
+        );
+        assert_eq!(
+            state.pending_abandonment_records(),
+            vec![AbandonmentRecord::unclaimed(PEER, deadline, [figures])],
+            "and a record is offered under the anchor it was proved at"
+        );
+        let again = state.on_state_proof_verified(anchor, &[(key, Inclusion::Absent)]);
+        assert!(
+            absences_observed(&again, tx_hash).is_empty(),
+            "a second copy adds nothing"
+        );
+    }
+
+    /// A core that turns out to have committed the transaction is not
+    /// absent: the presence closes the probe, offers nothing, and the
+    /// core is not asked again — its own certificate speaks next.
+    #[test]
+    fn a_core_that_committed_the_transaction_is_not_probed_again() {
+        let schedule = two_shard_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let deadline = UnsettledTx::for_transaction(&transaction).deadline;
+        let key = committed_tx_cell_key(
+            PEER,
+            tx_hash,
+            transaction.validity_range().end_timestamp_exclusive,
+        );
+        let mut state = leg_state(&transaction);
+        state.committed_ts = deadline;
+        let root = StateRoot::from_raw(Hash::from_bytes(b"at"));
+        let actions =
+            state.on_committed_remote_header(&schedule, PEER, BlockHeight::new(4), deadline, root);
+        let anchor = StateAnchor {
+            shard: PEER,
+            height: BlockHeight::new(4),
+            state_root: root,
+        };
+        assert_eq!(state_proof_fetches(&actions), vec![(anchor, vec![key])]);
+        let answered = state.on_state_proof_verified(anchor, &[(key, Inclusion::Present)]);
+        assert!(
+            absences_observed(&answered, tx_hash).is_empty(),
+            "a core that committed it is not absent"
+        );
+        assert!(state.pending_abandonment_records().is_empty());
+        assert!(
+            state_proof_fetches(&state.probe_silent_cores()).is_empty(),
+            "and is not asked again"
+        );
     }
 
     /// Before its deadline a transaction is merely slow, and nothing

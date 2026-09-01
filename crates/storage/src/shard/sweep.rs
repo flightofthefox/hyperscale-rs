@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     MAX_SWEEP_PER_BLOCK, SettledWrites, ShardId, ShardTrie, SubstateKey, SweepFrontier,
-    Transaction, WeightedTimestamp, protocol_statics, protocol_statics_installed,
+    Transaction, TxHash, WeightedTimestamp, protocol_statics, protocol_statics_installed,
 };
 use hyperscale_vm_effects::{CommittedTxCell, ProtocolHasher, committed_tx_key};
 use hyperscale_vm_types::NULLIFIER_GRACE_MS;
@@ -239,25 +239,46 @@ pub fn committed_tx_cells<'a>(
     local_shard: ShardId,
     transactions: impl IntoIterator<Item = &'a Transaction>,
 ) -> Vec<(SubstateKey, Vec<u8>)> {
-    let owner = ShardTrie::shard_owner(local_shard);
     transactions
         .into_iter()
         .map(|tx| {
-            let expiry_ms = tx
-                .validity_range()
-                .end_timestamp_exclusive
-                .as_millis()
-                .saturating_add(NULLIFIER_GRACE_MS);
+            let validity_end = tx.validity_range().end_timestamp_exclusive;
             let cell = CommittedTxCell {
                 tx: tx.hash(),
-                expiry_ms,
+                expiry_ms: committed_tx_expiry_ms(validity_end),
             };
             (
-                committed_tx_key(&ProtocolHasher, owner, cell.tx, expiry_ms),
+                committed_tx_cell_key(local_shard, cell.tx, validity_end),
                 cell.to_bytes(),
             )
         })
         .collect()
+}
+
+/// The key `shard` writes its committed cell for `tx` under.
+///
+/// Derived from signed content and the shard alone, so a prober asking
+/// whether a shard committed a transaction names the same cell the
+/// shard's own commit wrote, from nothing but the transaction and the
+/// shard.
+#[must_use]
+pub fn committed_tx_cell_key(
+    shard: ShardId,
+    tx: TxHash,
+    validity_end: WeightedTimestamp,
+) -> SubstateKey {
+    committed_tx_key(
+        &ProtocolHasher,
+        ShardTrie::shard_owner(shard),
+        tx,
+        committed_tx_expiry_ms(validity_end),
+    )
+}
+
+/// When a committed cell stops being needed: the transaction's validity
+/// end plus the grace, on the nullifier's clock.
+const fn committed_tx_expiry_ms(validity_end: WeightedTimestamp) -> u64 {
+    validity_end.as_millis().saturating_add(NULLIFIER_GRACE_MS)
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@
 
 use hyperscale_types::{
     BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, PredecessorTerminal, ProvisionHash,
-    ShardId, TxHash, ValidatorId,
+    ShardId, StateAnchor, SubstateKey, TxHash, ValidatorId,
 };
 
 /// Fetch-cancel family — one variant per payload type. Variants are added
@@ -81,6 +81,14 @@ pub enum FetchAbandon {
     CommittedTxs {
         /// `(predecessor, transaction)` pairs whose query should stop.
         ids: Vec<(PredecessorTerminal, TxHash)>,
+    },
+    /// State-proof fetch keyed by `(anchor, key)`. Emitted by the
+    /// execution coordinator when the leg entry a probe was issued for
+    /// reaches its horizon still unanswered, so a core that never
+    /// serves the height does not pin the slot for the process's life.
+    StateProofs {
+        /// `(anchor, key)` pairs whose probe should stop.
+        ids: Vec<(StateAnchor, SubstateKey)>,
     },
     /// Missing-proposal fetch keyed by `(epoch, validator)`. Emitted by
     /// the beacon coordinator when a pending commit-assembly stash is
