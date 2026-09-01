@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
+use hyperscale_engine::legs::Classified;
 use hyperscale_types::{ShardId, Transaction, TxHash, Verified, WeightedTimestamp};
 
 use crate::provisional::ProvisionalCells;
@@ -40,6 +41,8 @@ struct Candidate {
     /// executes anyway, to be attested `Aborted` by the tick that runs it.
     /// `None` when nothing is engagement-gated.
     engagement_deadline: Option<WeightedTimestamp>,
+    /// The classification its committing block froze.
+    classified: Classified,
 }
 
 impl Candidate {
@@ -101,6 +104,7 @@ impl TickCandidates {
         tx: Arc<Verified<Transaction>>,
         participating: BTreeSet<ShardId>,
         committed_ts: WeightedTimestamp,
+        classified: Classified,
     ) {
         self.candidates.entry(tx.hash()).or_insert(Candidate {
             tx,
@@ -108,6 +112,7 @@ impl TickCandidates {
             committed_ts,
             engagement_pending: BTreeSet::new(),
             engagement_deadline: None,
+            classified,
         });
     }
 
@@ -208,6 +213,7 @@ impl TickCandidates {
                     },
                     clock: anchor.map_or(candidate.committed_ts, |a| a.clock),
                     reaches_beyond,
+                    classified: candidate.classified.clone(),
                 },
                 participating: candidate.participating.clone(),
                 admission: if candidate.engagement_pending.is_empty() {
@@ -281,7 +287,7 @@ mod tests {
 
     fn local_only(candidates: &mut TickCandidates, tx: Arc<Verified<Transaction>>) -> TxHash {
         let hash = tx.hash();
-        candidates.register(tx, BTreeSet::from([LOCAL]), ms(1_000));
+        candidates.register(tx, BTreeSet::from([LOCAL]), ms(1_000), Classified::whole());
         hash
     }
 
@@ -311,7 +317,12 @@ mod tests {
         let remote = ShardId::leaf(1, 1);
         let tx = tx(2);
         let hash = tx.hash();
-        candidates.register(tx, BTreeSet::from([LOCAL, remote]), ms(1_000));
+        candidates.register(
+            tx,
+            BTreeSet::from([LOCAL, remote]),
+            ms(1_000),
+            Classified::whole(),
+        );
 
         let mut provisioning = ProvisioningTracker::new();
         assert!(
@@ -338,7 +349,12 @@ mod tests {
         let remote = ShardId::leaf(1, 1);
         let tx = tx(3);
         let hash = tx.hash();
-        candidates.register(tx, BTreeSet::from([LOCAL, remote]), ms(1_000));
+        candidates.register(
+            tx,
+            BTreeSet::from([LOCAL, remote]),
+            ms(1_000),
+            Classified::whole(),
+        );
         candidates.record_engagement_wait(hash, BTreeSet::from([remote]), ms(60_000));
 
         let mut provisioning = ProvisioningTracker::new();
@@ -361,7 +377,12 @@ mod tests {
         let remote = ShardId::leaf(1, 1);
         let tx = tx(4);
         let hash = tx.hash();
-        candidates.register(tx, BTreeSet::from([LOCAL, remote]), ms(1_000));
+        candidates.register(
+            tx,
+            BTreeSet::from([LOCAL, remote]),
+            ms(1_000),
+            Classified::whole(),
+        );
         candidates.record_engagement_wait(hash, BTreeSet::from([remote]), ms(60_000));
 
         let mut provisioning = ProvisioningTracker::new();

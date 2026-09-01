@@ -14,7 +14,6 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, ActionContext, CrossShardExecutionRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::Decomposed;
 use hyperscale_engine::{ExecutedTx, TickBatchContext, TickTxInput};
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
@@ -291,10 +290,10 @@ where
                     provisions: &r.provisions,
                     clock: r.clock,
                     abortable: r.reaches_beyond,
-                    // Every member runs the whole shape: nothing freezes
-                    // a division at commit yet, and nothing attests an
-                    // arrival.
-                    decomposed: Decomposed::WHOLE,
+                    decomposed: r.classified.decomposed(),
+                    // Nothing attests an arrival yet, so a divided member
+                    // consuming one cannot plan — and none is frozen
+                    // divided until the cut-over.
                     arrivals: &[],
                 })
                 .collect();

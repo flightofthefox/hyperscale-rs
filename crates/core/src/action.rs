@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_engine::TickEnvironment;
+use hyperscale_engine::legs::Classified;
 use hyperscale_storage::TickResolution;
 use hyperscale_types::{
     AbandonmentRecord, BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount,
@@ -52,6 +53,10 @@ pub struct CrossShardExecutionRequest {
     /// what makes it abortable on a counterpart's verdict, so both are
     /// decided per transaction rather than per batch.
     pub reaches_beyond: bool,
+    /// The classification frozen when the transaction's block committed:
+    /// whether its legs run where their state lives, and where its core
+    /// sits. Carried, never re-derived.
+    pub classified: Classified,
 }
 
 /// A change to the local vnode's reshape-observer duty, carried on

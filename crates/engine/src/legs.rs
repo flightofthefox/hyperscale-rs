@@ -82,6 +82,64 @@ impl Decomposed {
     }
 }
 
+/// The classification frozen onto a transaction when its block
+/// committed: whether it divides, and the shards its core sits on.
+///
+/// Taken once, at one placement, and carried from there — every consumer
+/// reads this and none re-derives it, so a reshape landing between
+/// composition and execution cannot leave one shard running a whole
+/// manifest while its counterpart waits to be sent half of it. Only
+/// [`Self::freeze`] can answer that a transaction divides;
+/// [`Self::whole`] is the always-correct answer for a caller with no
+/// placement to freeze against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Classified {
+    decomposed: Decomposed,
+    core: BTreeSet<ShardId>,
+}
+
+impl Classified {
+    /// Freeze `legs` against `placement`.
+    ///
+    /// Divides only where the classifier says so and the build runs
+    /// divided shapes at all ([`decomposition_enabled`]); the core set
+    /// is read either way, since it costs nothing and is what the
+    /// awaited set is built from.
+    #[must_use]
+    pub fn freeze(legs: &[LegShape], placement: Placement<'_>) -> Self {
+        let decomposed = if decomposition_enabled() {
+            decomposes(legs, placement)
+        } else {
+            Decomposed::WHOLE
+        };
+        Self {
+            decomposed,
+            core: core_shards(legs, placement.trie()),
+        }
+    }
+
+    /// The whole shape on every participant, with no core set read.
+    #[must_use]
+    pub const fn whole() -> Self {
+        Self {
+            decomposed: Decomposed::WHOLE,
+            core: BTreeSet::new(),
+        }
+    }
+
+    /// Whether the legs run where their state lives.
+    #[must_use]
+    pub const fn decomposed(&self) -> Decomposed {
+        self.decomposed
+    }
+
+    /// The shards the core's nodes sit on.
+    #[must_use]
+    pub const fn core(&self) -> &BTreeSet<ShardId> {
+        &self.core
+    }
+}
+
 /// The star `legs` implies under `trie` — the anchored half of the
 /// classification.
 ///

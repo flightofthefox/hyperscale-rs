@@ -37,6 +37,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
+use hyperscale_engine::legs::{Classified, Placement};
 use hyperscale_engine::{TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_unresolvable_tx};
 use hyperscale_storage::{RecoveredState, TickResolution};
@@ -663,12 +664,22 @@ impl ExecutionCoordinator {
     /// at this commit is composition's question, asked again at every one.
     fn register_committed_txs(
         &mut self,
+        topology_schedule: &TopologySchedule,
         classification: &TopologySnapshot,
         ts: WeightedTimestamp,
         transactions: &[Arc<Verifiable<Transaction>>],
     ) {
         let local_shard = self.local_shard;
         let members = assign_participants(classification, transactions);
+        // One placement at one anchor: the trie this block committed
+        // under and the shards leaving it, read together, and the answer
+        // frozen onto each transaction from here.
+        let trie = classification.shard_trie();
+        let leaving: BTreeSet<ShardId> = trie
+            .leaves()
+            .filter(|shard| topology_schedule.termination_scheduled(*shard, ts))
+            .collect();
+        let placement = Placement::new(trie, &leaving);
         // The ledger takes the transactions themselves. What it needs of
         // them — when they expire, what they reserved, what they reach
         // outside this shard — is theirs and this shard's, so a rebuild
@@ -696,7 +707,9 @@ impl ExecutionCoordinator {
                 Ok(v) => Arc::new(v),
                 Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
             };
-            self.candidates.register(verified, participating, ts);
+            let classified = Classified::freeze(verified.legs(), placement);
+            self.candidates
+                .register(verified, participating, ts, classified);
         }
 
         for (tx_hash, counterparts, validity_end) in engagement_waits {
@@ -2319,7 +2332,7 @@ impl ExecutionCoordinator {
         // anything is composed from it: the block's own transactions, and
         // the provisions and engagement echoes its batches carry.
         if !transactions.is_empty() {
-            self.register_committed_txs(anchored, block.ts, transactions);
+            self.register_committed_txs(topology_schedule, anchored, block.ts, transactions);
         }
         if !provisions.is_empty() {
             self.apply_committed_provisions(provisions);
