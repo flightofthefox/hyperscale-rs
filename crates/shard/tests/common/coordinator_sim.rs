@@ -1097,6 +1097,7 @@ impl ShardCoordinatorSim {
                 expected_local_receipt_root: ready.expected_local_receipt_root,
                 finalizations: ready.finalizations,
                 block_tx_hashes: ready.block_tx_hashes,
+                creations: ready.creations,
                 block_height: ready.block_height,
                 claimed_split_child_roots: ready.claimed_split_child_roots,
                 split_child_roots_required: ready.split_child_roots_required,
@@ -1776,6 +1777,7 @@ impl ShardCoordinatorSim {
                 expected_local_receipt_root,
                 finalizations,
                 block_tx_hashes,
+                creations,
                 block_height,
                 claimed_split_child_roots,
                 split_child_roots_required,
@@ -1840,6 +1842,7 @@ impl ShardCoordinatorSim {
                         base_reads: None,
                     },
                     &finalizations,
+                    &creations,
                     &removals,
                     block_height,
                 );

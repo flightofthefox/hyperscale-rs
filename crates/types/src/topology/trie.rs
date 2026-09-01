@@ -8,6 +8,8 @@
 
 use std::collections::BTreeSet;
 
+use hyperscale_vm_types::AddressClass;
+
 use crate::{Address, ShardId};
 
 /// The set of live shards, forming a complete partition of the keyspace: every
@@ -70,6 +72,24 @@ impl ShardTrie {
         self.walk(u64::from_be_bytes(
             bytes[..8].try_into().expect("an address is 32 bytes"),
         ))
+    }
+
+    /// The owner a shard writes its own cells under: an address whose
+    /// leading bits are the shard's path, so it routes to the shard at
+    /// any depth up to the shard's own, and whose body is fixed, so every
+    /// replica and every prober derives the same one from the shard id
+    /// alone. What the chain writes of its own accord — the committed
+    /// transaction family — lives here, under the `Native` class, which
+    /// no package or principal can occupy.
+    #[must_use]
+    pub fn shard_owner(shard: ShardId) -> Address {
+        let mut body = [0u8; 31];
+        let depth = shard.depth();
+        if depth > 0 {
+            body[..8].copy_from_slice(&(shard.path() << (64 - depth)).to_be_bytes());
+        }
+        body[8..21].copy_from_slice(b"committed-txs");
+        Address::new(body, AddressClass::Native)
     }
 
     /// Whether `shard` owns `prefix`'s key space, asked without a trie.
@@ -312,5 +332,32 @@ mod tests {
         // Merging the two depth-2 leaves restores the 2-shard partition.
         assert_eq!(trie.merge(left0, left1), ShardId::leaf(1, 0));
         assert_eq!(trie.len(), 2);
+    }
+
+    /// A shard's own owner routes to the shard at its own depth and at
+    /// every shallower one, and two shards derive two owners.
+    #[test]
+    fn a_shards_owner_routes_to_it() {
+        for shard in [
+            ShardId::ROOT,
+            ShardId::leaf(1, 0),
+            ShardId::leaf(1, 1),
+            ShardId::leaf(3, 5),
+        ] {
+            let owner = ShardTrie::shard_owner(shard);
+            assert!(ShardTrie::shard_owns_prefix(shard, owner), "{shard:?}");
+        }
+        assert!(ShardTrie::shard_owns_prefix(
+            ShardId::leaf(1, 1),
+            ShardTrie::shard_owner(ShardId::leaf(3, 5))
+        ));
+        assert!(!ShardTrie::shard_owns_prefix(
+            ShardId::leaf(1, 0),
+            ShardTrie::shard_owner(ShardId::leaf(3, 5))
+        ));
+        assert_ne!(
+            ShardTrie::shard_owner(ShardId::leaf(1, 0)),
+            ShardTrie::shard_owner(ShardId::leaf(1, 1))
+        );
     }
 }

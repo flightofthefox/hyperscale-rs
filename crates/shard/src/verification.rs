@@ -12,12 +12,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
+use hyperscale_storage::committed_tx_cells;
 use hyperscale_types::{
     BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertificateRoot,
     CertifiedBlock, ChainOrigin, Finalization, LinkageError, LocalReceiptRoot, ProvisionTxRootsMap,
     ProvisionsRoot, QuorumCertificate, ReshapeThresholds, RevealChain, ShardId, SplitChildRoots,
-    StateRoot, SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot, TransactionRoot,
-    TxHash, Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp, WorkInFlight,
+    StateRoot, SubstateKey, SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot,
+    TransactionRoot, TxHash, Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp,
+    WorkInFlight,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -110,6 +112,9 @@ pub struct ReadyStateRootVerification {
     /// Hashes of the block's own transactions — its contribution to the
     /// committed-transaction window a terminating boundary header roots.
     pub block_tx_hashes: Vec<TxHash>,
+    /// The committed-transaction cells the block itself writes, one per
+    /// transaction it carries, folded under the root being verified.
+    pub creations: Vec<(SubstateKey, Vec<u8>)>,
     /// Height of the block being verified.
     pub block_height: BlockHeight,
     /// The header's `split_child_roots` claim, verified beside the
@@ -2159,6 +2164,10 @@ impl VerificationPipeline {
             block.certificates().iter().cloned().collect();
         let block_tx_hashes: Vec<TxHash> =
             block.transactions().iter().map(|tx| tx.hash()).collect();
+        let creations = committed_tx_cells(
+            block.header().shard_id(),
+            block.transactions().iter().map(|tx| tx.as_unverified()),
+        );
         Some(ReadyStateRootVerification {
             block_hash: pending.block_hash,
             parent_block_hash: pending.parent_block_hash,
@@ -2168,6 +2177,7 @@ impl VerificationPipeline {
             expected_local_receipt_root: pending.expected_local_receipt_root,
             finalizations,
             block_tx_hashes,
+            creations,
             block_height: pending.block_height,
             claimed_split_child_roots: pending.claimed_split_child_roots,
             split_child_roots_required: pending.split_child_roots_required,

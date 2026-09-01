@@ -24,7 +24,8 @@ use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
 use hyperscale_storage::{
-    ChainEntry, ParentAnchor, PendingChain, ShardStorage, SubstateStore, sweep_for_block,
+    ChainEntry, ParentAnchor, PendingChain, ShardStorage, SubstateStore, committed_tx_cells,
+    sweep_for_block,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, Derivation,
@@ -186,6 +187,10 @@ where
         pending.parent_sweep_frontier,
         block.header().parent_qc().weighted_timestamp(),
     );
+    let creations = committed_tx_cells(
+        block.header().shard_id(),
+        block.transactions().iter().map(|tx| tx.as_unverified()),
+    );
     let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
         ParentAnchor {
             state_root: pending.parent_state_root,
@@ -195,6 +200,7 @@ where
             base_reads: None,
         },
         &finalizations,
+        &creations,
         &removals,
         height,
     );

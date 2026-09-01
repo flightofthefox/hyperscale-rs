@@ -694,6 +694,11 @@ pub enum Action {
         /// the committed-transaction window a terminating boundary header
         /// roots. Carried as hashes because that is all the root needs.
         block_tx_hashes: Vec<TxHash>,
+        /// The committed-transaction cells the block itself writes, one
+        /// per transaction it carries, derived by the coordinator that
+        /// holds the block. They fold with the receipts' writes under the
+        /// root being verified.
+        creations: Vec<(SubstateKey, Vec<u8>)>,
         /// Block height being verified.
         block_height: BlockHeight,
         /// The header's `split_child_roots` claim, verified beside the

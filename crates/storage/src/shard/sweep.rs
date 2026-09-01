@@ -11,9 +11,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    MAX_SWEEP_PER_BLOCK, SettledWrites, SubstateKey, SweepFrontier, WeightedTimestamp,
-    protocol_statics, protocol_statics_installed,
+    MAX_SWEEP_PER_BLOCK, SettledWrites, ShardId, ShardTrie, SubstateKey, SweepFrontier,
+    Transaction, WeightedTimestamp, protocol_statics, protocol_statics_installed,
 };
+use hyperscale_vm_effects::{CommittedTxCell, ProtocolHasher, committed_tx_key};
+use hyperscale_vm_types::NULLIFIER_GRACE_MS;
 
 use crate::tree::JmtSnapshot;
 
@@ -180,27 +182,40 @@ pub fn merge_sweep_overlay(
     merged.into_values().take(limit).collect()
 }
 
-/// Fold a block's removals into the settled set its receipts produced.
+/// Fold what the block itself writes — the committed-transaction cells
+/// it creates and the sweep's removals — into the settled set its
+/// receipts produced.
 ///
-/// A removal is an ordinary write — `None` at the key — so a sweep needs
-/// no commit path of its own: the tombstones fold with everything else
-/// and land under `state_root` like any other change. That is the fact
-/// that makes this tractable rather than novel.
+/// Both are ordinary writes, a value at the key or `None` at it, so
+/// neither needs a commit path of its own: they fold with everything
+/// else and land under `state_root` like any other change. That is the
+/// fact that makes this tractable rather than novel.
 ///
 /// # Panics
 ///
-/// If a removal names a cell the block's own receipts also write. The
-/// two would be one entry in the settled map, so one of them would
-/// silently not happen — and which one is decided by insertion order,
-/// which is not something a validator can check. Validation refuses such
-/// a block before anything reaches here; this is the assertion that it
-/// did.
+/// If a creation or a removal names a cell the block's own receipts
+/// also write. The two would be one entry in the settled map, so one of
+/// them would silently not happen — and which one is decided by
+/// insertion order, which is not something a validator can check. A
+/// creation sits under the shard's own owner, which no receipt writes,
+/// and validation refuses a block sweeping what it writes before
+/// anything reaches here; this is the assertion that both hold.
 #[must_use]
-pub fn with_removals(settled: SettledWrites, removals: &[SubstateKey]) -> SettledWrites {
-    if removals.is_empty() {
+pub fn with_sweep(
+    settled: SettledWrites,
+    creations: &[(SubstateKey, Vec<u8>)],
+    removals: &[SubstateKey],
+) -> SettledWrites {
+    if creations.is_empty() && removals.is_empty() {
         return settled;
     }
     let (mut cells, entries) = settled.into_parts();
+    for (key, value) in creations {
+        assert!(
+            cells.insert(*key, Some(value.clone())).is_none(),
+            "the chain created {key:?}, which this block's receipts also write",
+        );
+    }
     for key in removals {
         assert!(
             cells.insert(*key, None).is_none(),
@@ -208,6 +223,41 @@ pub fn with_removals(settled: SettledWrites, removals: &[SubstateKey]) -> Settle
         );
     }
     SettledWrites::from_parts(cells, entries)
+}
+
+/// The committed-transaction cells a block of `local_shard` creates: one
+/// per transaction it carries, under the shard's own owner, expiring at
+/// the transaction's validity end plus the grace.
+///
+/// What makes a shard's committed set provable and refutable against the
+/// state root every header carries. Derived from the block's own
+/// transactions and the shard's identity, so the proposer and every
+/// verifier fold the same cells, and a prober holding the transaction
+/// derives the same key from nothing else.
+#[must_use]
+pub fn committed_tx_cells<'a>(
+    local_shard: ShardId,
+    transactions: impl IntoIterator<Item = &'a Transaction>,
+) -> Vec<(SubstateKey, Vec<u8>)> {
+    let owner = ShardTrie::shard_owner(local_shard);
+    transactions
+        .into_iter()
+        .map(|tx| {
+            let expiry_ms = tx
+                .validity_range()
+                .end_timestamp_exclusive
+                .as_millis()
+                .saturating_add(NULLIFIER_GRACE_MS);
+            let cell = CommittedTxCell {
+                tx: tx.hash(),
+                expiry_ms,
+            };
+            (
+                committed_tx_key(&ProtocolHasher, owner, cell.tx, expiry_ms),
+                cell.to_bytes(),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -327,5 +377,52 @@ mod tests {
             10,
         );
         assert!(merged.is_empty());
+    }
+
+    /// The chain's own creations fold in beside the sweep's removals, as
+    /// ordinary writes under the same root.
+    #[test]
+    fn creations_fold_in_beside_removals() {
+        let (created, _, value) = cell(1, 3, 0xC1);
+        let (removed, _, _) = cell(2, 1, 0xD1);
+        let settled = with_sweep(
+            SettledWrites::default(),
+            &[(created, value.clone())],
+            &[removed],
+        );
+        assert_eq!(settled.cells().get(&created), Some(&Some(value)));
+        assert_eq!(settled.cells().get(&removed), Some(&None));
+    }
+
+    /// One committed cell per transaction, under the shard's own owner,
+    /// self-describing as sweepable at the transaction's validity end
+    /// plus the grace — the same cells whether a proposer or a verifier
+    /// derives them.
+    #[test]
+    fn a_block_creates_one_committed_cell_per_transaction() {
+        use hyperscale_hbor::from_slice;
+        use hyperscale_types::test_utils::{install_stub_protocol_statics, test_transaction};
+        use hyperscale_vm_effects::CommittedTxCell;
+        use hyperscale_vm_types::NULLIFIER_GRACE_MS;
+
+        install_stub_protocol_statics();
+        let shard = ShardId::leaf(1, 1);
+        let txs = [test_transaction(1), test_transaction(2)];
+        let cells = committed_tx_cells(shard, txs.iter());
+        assert_eq!(cells.len(), 2);
+        for ((key, value), tx) in cells.iter().zip(&txs) {
+            assert!(ShardTrie::shard_owns_prefix(shard, key.owner));
+            let decoded: CommittedTxCell = from_slice(value).expect("decodes");
+            assert_eq!(decoded.tx, tx.hash());
+            assert_eq!(
+                decoded.expiry_ms,
+                tx.validity_range().end_timestamp_exclusive.as_millis() + NULLIFIER_GRACE_MS
+            );
+        }
+        assert_eq!(
+            cells,
+            committed_tx_cells(shard, txs.iter()),
+            "derived the same way on every replica"
+        );
     }
 }

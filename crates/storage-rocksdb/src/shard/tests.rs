@@ -695,6 +695,7 @@ fn test_prepare_then_commit_matches_direct() {
         },
         &[],
         &[],
+        &[],
         BlockHeight::new(1),
     );
     let block = make_test_block(BlockHeight::new(1));
@@ -769,6 +770,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
             writes.clone(),
         )],
         &[],
+        &[],
         BlockHeight::new(1),
     );
     prepared1(
@@ -792,6 +794,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
         },
         &[finalization_with_writes(BlockHeight::new(2), tombstones)],
         &[],
+        &[],
         BlockHeight::new(2),
     );
     let (_root3, _snap3, prepared3) = storage.prepare_block_commit(
@@ -811,6 +814,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
             base_reads: None,
         },
         &[finalization_with_writes(BlockHeight::new(3), writes)],
+        &[],
         &[],
         BlockHeight::new(3),
     );

@@ -83,6 +83,11 @@ pub trait ShardChainWriter: Send + Sync + 'static {
     /// The parent's height must be a committed height or have its tree
     /// nodes provided via `parent.pending`.
     ///
+    /// `creations` is what the chain itself writes for the block — the
+    /// committed-transaction cells, one per transaction it carries — and
+    /// `removals` is what its sweep retires; both fold with the
+    /// receipts' writes under the root this returns.
+    ///
     /// `block_height` is the height of the block being prepared (used as
     /// the JMT new version).
     ///
@@ -91,6 +96,7 @@ pub trait ShardChainWriter: Send + Sync + 'static {
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
         finalizations: &[Arc<Verifiable<Finalization>>],
+        creations: &[(SubstateKey, Vec<u8>)],
         removals: &[SubstateKey],
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit);
@@ -102,7 +108,9 @@ pub trait ShardChainWriter: Send + Sync + 'static {
     /// beacon-witness leaves to fold into the same atomic batch. Used when
     /// no `PreparedCommit` is available.
     ///
-    /// `removals` is what the block's sweep retires, on the same terms as
+    /// The committed-transaction cells are derived here from the block
+    /// itself, which this path holds whole. `removals` is what the
+    /// block's sweep retires, on the same terms as
     /// [`Self::prepare_block_commit`]: a caller that walked the frontier
     /// interval supplies it, and one whose block sweeps nothing passes an
     /// empty slice. It is a parameter rather than something derived here

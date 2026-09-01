@@ -35,13 +35,19 @@ pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 /// the removal side would leave a sweep that bounds ordinary operation
 /// and not the peak, which is not a bound.
 ///
-/// Set at [`MAX_TXS_PER_BLOCK`] — an average of one per transaction,
-/// which a block may distribute unevenly. Nothing else in the block
-/// budget reaches this: a nullifier costs its transaction a footprint
-/// unit and a signature, so the work budget admits thirty-two of them
-/// per transaction and the creation ceiling would otherwise sit two
-/// orders of magnitude above any removal count a block can carry.
-pub const MAX_SWEEPABLE_CREATED_PER_BLOCK: usize = MAX_TXS_PER_BLOCK;
+/// Five families share it — the nullifier, the escrow record, the
+/// escrow claim, the reclaim's claim, and the committed-transaction cell
+/// the chain writes for every transaction it carries — because the
+/// removal capacity they draw on is one capacity. Set at four times
+/// [`MAX_TXS_PER_BLOCK`]: the committed cell is one per transaction by
+/// construction, and a full block of any shape the corpus produces has
+/// to stay admissible beside it, which a block distributes unevenly.
+/// Nothing else in the block budget reaches this: a nullifier costs its
+/// transaction a footprint unit and a signature, so the work budget
+/// admits thirty-two of them per transaction and the creation ceiling
+/// would otherwise sit two orders of magnitude above any removal count a
+/// block can carry.
+pub const MAX_SWEEPABLE_CREATED_PER_BLOCK: usize = 4 * MAX_TXS_PER_BLOCK;
 
 /// Hard cap on the cells one block's sweep may remove.
 ///

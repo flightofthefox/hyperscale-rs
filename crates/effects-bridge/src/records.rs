@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arc_swap::ArcSwap;
 use hyperscale_hbor::from_slice as hbor_from_slice;
 use hyperscale_vm_effects::{
-    ChainRecords, Hasher, InstanceMeta, InstanceRegistry, Issuance, MetadataCache, NullifierCell,
-    PackageHash, PackageMetadata, ResourceMeta, Value, nullifier_key, package_hash,
+    ChainRecords, CommittedTxCell, Hasher, InstanceMeta, InstanceRegistry, Issuance, MetadataCache,
+    NullifierCell, PackageHash, PackageMetadata, ResourceMeta, Value, committed_tx_key,
+    nullifier_key, package_hash,
 };
 use hyperscale_vm_types::{
     Address, CallTarget, ComponentAddr, LocalKey, ResourceAddr, SubstateKey, SweepBucket,
@@ -75,11 +76,29 @@ const WASM_PREAMBLE: &[u8] = b"\0asm";
 /// agree; only then is a hash worth taking.
 #[must_use]
 pub fn sweepable_cell(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u64> {
+    nullifier_expiry(owner, local, value).or_else(|| committed_tx_expiry(owner, local, value))
+}
+
+/// The expiry a nullifier cell carries, or `None` for every other cell.
+fn nullifier_expiry(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u64> {
     let cell: NullifierCell = hbor_from_slice(value).ok()?;
     if SweepBucket::claimed_by(LocalKey(local)) != SweepBucket::of(cell.expiry_ms) {
         return None;
     }
     let key = nullifier_key(&ProtocolHasher, owner, cell.subintent, cell.expiry_ms);
+    (key.local.0 == local).then_some(cell.expiry_ms)
+}
+
+/// The expiry a committed-transaction cell carries, or `None` for every
+/// other cell. Judged the way a nullifier is: the value re-derives the
+/// key under the family's own role, so nothing about the writer enters
+/// into it.
+fn committed_tx_expiry(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u64> {
+    let cell: CommittedTxCell = hbor_from_slice(value).ok()?;
+    if SweepBucket::claimed_by(LocalKey(local)) != SweepBucket::of(cell.expiry_ms) {
+        return None;
+    }
+    let key = committed_tx_key(&ProtocolHasher, owner, cell.tx, cell.expiry_ms);
     (key.local.0 == local).then_some(cell.expiry_ms)
 }
 
@@ -841,6 +860,34 @@ mod tests {
         assert!(
             instances.record(address.into()).is_none(),
             "and nothing it refused is seated"
+        );
+    }
+
+    /// A committed-transaction cell is judged sweepable off its own
+    /// leaf: the value re-derives the key, the bucket the key leads with
+    /// is the expiry's, and a leaf at any other local is nothing.
+    #[test]
+    fn a_committed_transaction_cell_is_judged_off_its_leaf() {
+        use hyperscale_vm_effects::{CommittedTxCell, committed_tx_key};
+        use hyperscale_vm_types::{AddressClass, TxHash};
+
+        let owner = Address::new([0x5A; 31], AddressClass::Native);
+        let cell = CommittedTxCell {
+            tx: TxHash(Hash32([0xC0; 32])),
+            expiry_ms: 200_000,
+        };
+        let key = committed_tx_key(&ProtocolHasher, owner, cell.tx, cell.expiry_ms);
+        assert_eq!(
+            sweepable_cell(owner, key.local.0, &cell.to_bytes()),
+            Some(200_000)
+        );
+        let mut elsewhere = key.local.0;
+        elsewhere[15] ^= 1;
+        assert_eq!(sweepable_cell(owner, elsewhere, &cell.to_bytes()), None);
+        let other_owner = Address::new([0x5B; 31], AddressClass::Native);
+        assert_eq!(
+            sweepable_cell(other_owner, key.local.0, &cell.to_bytes()),
+            None
         );
     }
 }

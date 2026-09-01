@@ -532,6 +532,7 @@ fn test_prepare_then_commit_fast_path() {
         },
         &[],
         &[],
+        &[],
         BlockHeight::new(1),
     );
     let certified = make_test_certified(block.clone());
@@ -559,6 +560,7 @@ fn test_prepare_commit_state_root_matches() {
             pending: &[],
             base_reads: None,
         },
+        &[],
         &[],
         &[],
         BlockHeight::new(1),

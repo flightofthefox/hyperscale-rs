@@ -11,7 +11,7 @@ use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
     JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage, SubstateStore, SubstateView,
-    SweepIndex, TerminalWindow, VersionedStore, sweep_for_block,
+    SweepIndex, TerminalWindow, VersionedStore, committed_tx_cells, sweep_for_block,
 };
 use hyperscale_types::network::gossip::{CertifiedBlockHeaderGossip, ShardForkProofGossip};
 use hyperscale_types::network::notification::{
@@ -252,6 +252,9 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         parent_sweep_frontier,
         parent_qc.weighted_timestamp(),
     );
+    // What the chain writes of its own accord: one committed-transaction
+    // cell per transaction the block carries.
+    let creations = committed_tx_cells(local_shard, transactions.iter().map(|tx| &***tx));
     let (state_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
         ParentAnchor {
             state_root: parent_state_root,
@@ -261,6 +264,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
             base_reads: Some(&base_reads),
         },
         &certificates,
+        &creations,
         &removals,
         height,
     );
@@ -806,6 +810,7 @@ where
             expected_local_receipt_root,
             finalizations,
             block_tx_hashes,
+            creations,
             block_height,
             claimed_split_child_roots,
             split_child_roots_required,
@@ -896,6 +901,7 @@ where
                     base_reads: None,
                 },
                 &finalizations,
+                &creations,
                 &removals,
                 block_height,
             );

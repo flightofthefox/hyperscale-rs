@@ -7,8 +7,8 @@ use hyperscale_storage::tree::{
     resolve_materialized_root,
 };
 use hyperscale_storage::{
-    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, merge_writes_from_receipts,
-    with_removals,
+    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, committed_tx_cells,
+    merge_writes_from_receipts, with_sweep,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, Finalization, PreparedCommit,
@@ -29,6 +29,7 @@ impl ShardChainWriter for RocksDbShardStorage {
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
         finalizations: &[Arc<Verifiable<Finalization>>],
+        creations: &[(SubstateKey, Vec<u8>)],
         removals: &[SubstateKey],
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
@@ -93,8 +94,9 @@ impl ShardChainWriter for RocksDbShardStorage {
             parent.height,
             "a movement's baseline is anchored at the wrong height",
         );
-        let settled = with_removals(
+        let settled = with_sweep(
             merge_writes_from_receipts(&settling, parent.state),
+            creations,
             removals,
         );
 
@@ -166,8 +168,13 @@ impl ShardChainWriter for RocksDbShardStorage {
         // and this node's own persistence depth move a live read out
         // from under it.
         let _commit_guard = self.commit_lock.lock().unwrap();
-        let merged_writes = with_removals(
+        let creations = committed_tx_cells(
+            block.header().shard_id(),
+            block.transactions().iter().map(|tx| tx.as_unverified()),
+        );
+        let merged_writes = with_sweep(
             merge_writes_from_receipts(&settling, &self.snapshot()),
+            &creations,
             removals,
         );
         self.commit_block_inner_locked(&merged_writes, block, qc, &receipts, witness)

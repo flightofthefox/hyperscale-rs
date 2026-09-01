@@ -509,11 +509,13 @@ pub fn validate_packages_usable(
 ///
 /// Counted off the derivations, which is where the answer is: what makes
 /// a write sweepable is the family it belongs to, and nothing about a
-/// routed key says which family it is. Deterministic over block content,
-/// since every replica derives the same transactions the same way.
+/// routed key says which family it is — plus the committed-transaction
+/// cell the chain itself writes for every transaction the block
+/// carries. Deterministic over block content, since every replica
+/// derives the same transactions the same way.
 pub fn validate_sweepable_creation(block: &Block) -> Result<(), String> {
     let created = block.transactions().iter().fold(0usize, |total, tx| {
-        total.saturating_add(tx.sweepable_writes() as usize)
+        total.saturating_add(tx.sweepable_writes() as usize + 1)
     });
     if !sweep_admits_block(created) {
         return Err(format!(
@@ -1193,8 +1195,8 @@ mod tests {
         }
     }
 
-    /// A block creating sweepable cells fits the cap right up to it, and
-    /// one cell past is refused.
+    /// A block creating sweepable cells fits the cap right up to what a
+    /// transaction can add, and one that would pass it is refused.
     ///
     /// The count is summed off the derivations rather than off anything
     /// the header claims, so a proposer cannot understate what its block
@@ -1205,11 +1207,13 @@ mod tests {
     /// transaction — which is the shape it is sized for.
     #[test]
     fn a_block_may_create_sweepable_cells_up_to_the_cap() {
-        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / MAX_SUBINTENTS;
+        // Each fully composed transaction creates its subintents'
+        // nullifiers and the one committed cell the chain writes for it.
+        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / (MAX_SUBINTENTS + 1);
         let mut txs: Vec<Arc<Verifiable<Transaction>>> = (0..full)
             .map(|i| {
                 Arc::new(Verifiable::from(test_utils::stub_transaction_binding(
-                    u8::try_from(i).expect("fewer than 256 transactions"),
+                    u32::try_from(i).expect("fewer than u32 transactions"),
                     MAX_SUBINTENTS,
                     test_utils::test_validity_range(),
                 )))
@@ -1219,10 +1223,14 @@ mod tests {
         assert!(validate_sweepable_creation(&at_cap).is_ok());
 
         txs.push(Arc::new(Verifiable::from(
-            test_utils::stub_transaction_binding(u8::MAX, 1, test_utils::test_validity_range()),
+            test_utils::stub_transaction_binding(
+                u32::MAX,
+                MAX_SUBINTENTS,
+                test_utils::test_validity_range(),
+            ),
         )));
         let over = block_with_transactions(BlockHeight::new(3), txs);
-        let err = validate_sweepable_creation(&over).expect_err("one past the cap is refused");
+        let err = validate_sweepable_creation(&over).expect_err("past the cap is refused");
         assert!(err.contains("sweepable cells"), "{err}");
 
         // A block that binds nothing creates nothing, whatever else it

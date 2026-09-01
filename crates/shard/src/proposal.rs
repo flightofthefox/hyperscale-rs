@@ -218,7 +218,9 @@ pub fn select_transactions(
                 unrunnable += 1;
                 return false;
             }
-            let with_this = sweepable.saturating_add(tx.sweepable_writes() as usize);
+            // What the transaction's execution creates, and the committed
+            // cell the chain writes for it.
+            let with_this = sweepable.saturating_add(tx.sweepable_writes() as usize + 1);
             if !sweep_admits_block(with_this) {
                 oversweeping += 1;
                 return false;
@@ -1152,7 +1154,7 @@ mod tests {
         install_stub_protocol_statics();
         let anchor = ts(1_000);
         let range = TimestampRange::new(ts(500), anchor.plus(Duration::from_mins(1)));
-        let binding = |seed: u8, bound: usize| -> Arc<Verified<Transaction>> {
+        let binding = |seed: u32, bound: usize| -> Arc<Verified<Transaction>> {
             Arc::new(Verified::<Transaction>::from_persisted(
                 stub_transaction_binding(seed, bound, range),
             ))
@@ -1160,12 +1162,19 @@ mod tests {
         // Fill the cap exactly, then offer one that cannot fit followed
         // by one that can. Skipping rather than stopping is what keeps a
         // large composition from starving the small ones behind it.
-        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / MAX_SUBINTENTS;
+        // Each fully composed transaction creates its subintents'
+        // nullifiers and the committed cell the chain writes for it.
+        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / (MAX_SUBINTENTS + 1);
         let mut txs: Vec<Arc<Verified<Transaction>>> = (0..full)
-            .map(|i| binding(u8::try_from(i).expect("fewer than 256"), MAX_SUBINTENTS))
+            .map(|i| {
+                binding(
+                    u32::try_from(i).expect("fewer than u32 transactions"),
+                    MAX_SUBINTENTS,
+                )
+            })
             .collect();
-        let overflows = binding(u8::MAX, MAX_SUBINTENTS);
-        let fits = binding(u8::MAX - 1, 0);
+        let overflows = binding(u32::MAX, MAX_SUBINTENTS);
+        let fits = binding(u32::MAX - 1, 0);
         txs.push(overflows.clone());
         txs.push(fits.clone());
 

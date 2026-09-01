@@ -9,8 +9,8 @@ use hyperscale_storage::tree::{
     resolve_materialized_root,
 };
 use hyperscale_storage::{
-    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, covers_strictly_more,
-    merge_writes_from_receipts, widest_tick_copies, with_removals,
+    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, committed_tx_cells,
+    covers_strictly_more, merge_writes_from_receipts, widest_tick_copies, with_sweep,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, Finalization, PreparedCommit,
@@ -26,6 +26,7 @@ impl ShardChainWriter for SimShardStorage {
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
         finalizations: &[Arc<Verifiable<Finalization>>],
+        creations: &[(SubstateKey, Vec<u8>)],
         removals: &[SubstateKey],
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
@@ -90,8 +91,9 @@ impl ShardChainWriter for SimShardStorage {
             parent.height,
             "a movement's baseline is anchored at the wrong height",
         );
-        let settled = with_removals(
+        let settled = with_sweep(
             merge_writes_from_receipts(&settling, parent.state),
+            creations,
             removals,
         );
 
@@ -137,7 +139,11 @@ impl ShardChainWriter for SimShardStorage {
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
-        let merged_writes = with_removals(
+        let creations = committed_tx_cells(
+            block.header().shard_id(),
+            block.transactions().iter().map(|tx| tx.as_unverified()),
+        );
+        let merged_writes = with_sweep(
             merge_writes_from_receipts(
                 &block
                     .certificates()
@@ -146,6 +152,7 @@ impl ShardChainWriter for SimShardStorage {
                     .collect::<Vec<_>>(),
                 &self.snapshot(),
             ),
+            &creations,
             removals,
         );
         self.append_beacon_witnesses(witness);

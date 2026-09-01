@@ -233,11 +233,12 @@ impl ShardChainWriter for SharedStorage {
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
         finalizations: &[Arc<Verifiable<Finalization>>],
+        creations: &[(SubstateKey, Vec<u8>)],
         removals: &[SubstateKey],
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
         self.0
-            .prepare_block_commit(parent, finalizations, removals, block_height)
+            .prepare_block_commit(parent, finalizations, creations, removals, block_height)
     }
 
     fn commit_block(

@@ -1046,8 +1046,14 @@ pub fn install_stub_protocol_statics() {
 ///
 /// Panics if the fixture signing key fails to construct.
 #[must_use]
-pub fn stub_transaction_binding(seed: u8, bound: usize, validity: TimestampRange) -> Transaction {
-    let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).expect("fixture key");
+pub fn stub_transaction_binding(seed: u32, bound: usize, validity: TimestampRange) -> Transaction {
+    // A four-byte seed: filling a creation cap sized in thousands of
+    // transactions takes more distinct payers than a byte names.
+    let mut key_bytes = [0x5Eu8; 32];
+    key_bytes[..4].copy_from_slice(&seed.to_le_bytes());
+    let key = Ed25519PrivateKey::from_bytes(&key_bytes).expect("fixture key");
+    let mut payer = [0x5Eu8; 31];
+    payer[..4].copy_from_slice(&seed.to_le_bytes());
     let vm = TransactionEnvelope {
         body: TransactionBody::Call(vec![0]),
         subintent_sigs: (0..bound)
@@ -1057,7 +1063,7 @@ pub fn stub_transaction_binding(seed: u8, bound: usize, validity: TimestampRange
                 signature: vec![0x22; 64],
             })
             .collect(),
-        fee_payer: test_principal(seed),
+        fee_payer: PrincipalAddr::new(payer),
         max_fee: 1_000,
         gas_limit: 1_000_000,
         validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
