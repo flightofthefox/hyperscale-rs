@@ -2,8 +2,27 @@
 //! carried inside execution certificates.
 
 use hyperscale_hbor::Hbor;
+use hyperscale_vm_types::{MAX_CROSSINGS_PER_TX, ResourceAddr};
 
 use crate::{GlobalReceiptHash, MAX_PROVISION_TARGET_SHARDS, ShardId, TxHash};
+
+/// What one value edge escrowed out of this shard's execution.
+///
+/// Per edge, not per resource: a sum over the outcome would leave two
+/// edges carrying one resource with no way to say which value fed which
+/// consumer, and the consuming shard claims its own argument rather than
+/// a share of a total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hbor)]
+pub struct EscrowedValue {
+    /// The producing node.
+    pub node: u32,
+    /// Which of its outputs left.
+    pub output: u32,
+    /// The resource that left.
+    pub resource: ResourceAddr,
+    /// How much of it.
+    pub amount: u128,
+}
 
 /// Per-transaction execution outcome within a tick.
 ///
@@ -76,6 +95,23 @@ pub struct TxOutcome {
     /// unanimous.
     #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
     counterparts: Vec<ShardId>,
+    /// What this shard's execution escrowed out, one entry per value
+    /// edge. Sorted on the whole entry and one per `(node, output)`, so
+    /// which of two entries naming one edge survives is never a fact
+    /// about a caller's iteration order.
+    ///
+    /// Attested rather than read off the record cells because the shard
+    /// claiming an edge reads this a block before it can read the cell,
+    /// and because the leaf commits to what left, not only that it did.
+    #[hbor(max = MAX_CROSSINGS_PER_TX)]
+    escrowed: Vec<EscrowedValue>,
+    /// The shards those crossings land on. Ascending and distinct.
+    ///
+    /// Derivable from `escrowed` and the trie, and attested anyway: the
+    /// shard promising a bundle reads this a block earlier than it can
+    /// resolve the trie the issuer used.
+    #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
+    crossing_targets: Vec<ShardId>,
 }
 
 impl TxOutcome {
@@ -95,6 +131,8 @@ impl TxOutcome {
             outcome,
             fee_receipt: None,
             counterparts: Vec::new(),
+            escrowed: Vec::new(),
+            crossing_targets: Vec::new(),
         }
     }
 
@@ -114,6 +152,28 @@ impl TxOutcome {
         counterparts.sort_unstable();
         counterparts.dedup();
         self.counterparts = counterparts;
+        self
+    }
+
+    /// Bind what this execution escrowed out, in its one form: sorted on
+    /// the whole entry, one per edge.
+    #[must_use]
+    pub fn escrowing(mut self, escrowed: impl IntoIterator<Item = EscrowedValue>) -> Self {
+        let mut escrowed: Vec<EscrowedValue> = escrowed.into_iter().collect();
+        escrowed.sort_unstable();
+        escrowed.dedup_by_key(|entry| (entry.node, entry.output));
+        self.escrowed = escrowed;
+        self
+    }
+
+    /// Bind the shards this execution's crossings land on, in the one
+    /// form the set may take: ascending and distinct.
+    #[must_use]
+    pub fn crossing_to(mut self, targets: impl IntoIterator<Item = ShardId>) -> Self {
+        let mut targets: Vec<ShardId> = targets.into_iter().collect();
+        targets.sort_unstable();
+        targets.dedup();
+        self.crossing_targets = targets;
         self
     }
 
@@ -140,6 +200,8 @@ impl TxOutcome {
             outcome,
             fee_receipt: Some(fee_receipt),
             counterparts: Vec::new(),
+            escrowed: Vec::new(),
+            crossing_targets: Vec::new(),
         }
     }
 
@@ -166,6 +228,18 @@ impl TxOutcome {
     #[must_use]
     pub fn counterparts(&self) -> &[ShardId] {
         &self.counterparts
+    }
+
+    /// What this shard's execution escrowed out, one entry per edge.
+    #[must_use]
+    pub fn escrowed(&self) -> &[EscrowedValue] {
+        &self.escrowed
+    }
+
+    /// The shards this execution's crossings land on.
+    #[must_use]
+    pub fn crossing_targets(&self) -> &[ShardId] {
+        &self.crossing_targets
     }
 
     /// Transaction hash.
