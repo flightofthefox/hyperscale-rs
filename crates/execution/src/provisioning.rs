@@ -6,21 +6,92 @@
 //! - [`verified`](ProvisioningTracker::verified) — committed entry lists
 //!   keyed by `tx_hash`, one `Arc<Vec<SubstateEntry>>` per source shard
 //!   contribution. Feeds the cross-shard dispatch action for each tx.
-//! - `required` — the set of remote shards each cross-shard tx needs
-//!   provisions from. Populated when the tx's tick is created.
-//! - `received` — the set of remote shards whose provisions have actually
-//!   landed. Populated by [`absorb_provisions`](ProvisioningTracker::absorb_provisions).
+//! - `required` — what each cross-shard tx waits for, as one set of
+//!   [`Requirement`]s. Populated when the tx's tick is created.
+//! - `received` — the remote shards whose provisions have actually
+//!   landed, and the cells those bundles carried present. Populated by
+//!   [`absorb_provisions`](ProvisioningTracker::absorb_provisions).
 //!
-//! A tx is fully provisioned when `required ⊆ received`; that predicate is
-//! surfaced as [`is_fully_provisioned`](ProvisioningTracker::is_fully_provisioned)
+//! A tx is fully provisioned when every requirement is met; that predicate
+//! is surfaced as [`is_fully_provisioned`](ProvisioningTracker::is_fully_provisioned)
 //! so callers never inspect the underlying sets.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+use hyperscale_engine::legs::{Classified, crossings_of};
 use hyperscale_types::{
-    Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, TxHash, Verified, WeightedTimestamp,
+    Provisions, RETENTION_HORIZON, ShardId, ShardTrie, SubstateEntry, SubstateKey, TxHash,
+    Verified, WeightedTimestamp,
 };
+use hyperscale_vm_types::{Crossing, LegShape};
+
+/// One thing a cross-shard member waits for before it can run.
+///
+/// The kind is part of the key, because a shard can owe both and an
+/// arrival of one must not read as an answer to the other. What a member
+/// files is its execution scope minus itself: a member running only its
+/// own legs files no [`CommittedState`](Self::CommittedState) at all, a
+/// core member files one per other core shard, and any member consuming
+/// a value edge its own shard does not produce files the
+/// [`Crossing`](Self::Crossing) for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Requirement {
+    /// A counterpart's committed state for the transaction, carried by a
+    /// bundle from that shard.
+    CommittedState(ShardId),
+    /// A crossing's record cell, present in a committed bundle.
+    ///
+    /// Satisfied by a present value at `key` from any source: an edge's
+    /// producer is one manifest node and a node runs on one shard, so a
+    /// key names exactly one bundle. `source` is the shard whose verdict
+    /// commits it — what a fetch chases, never what satisfaction reads.
+    Crossing {
+        /// The shard that writes the record.
+        source: ShardId,
+        /// The record cell.
+        key: SubstateKey,
+    },
+}
+
+/// What a divided member of a transaction files: its execution scope
+/// minus itself, and the crossings the legs it runs consume.
+///
+/// A member running only its own legs is in no core set and files no
+/// committed state at all; a core member files one per other core shard;
+/// and either files a crossing for every value edge landing on it from a
+/// node it does not run. Nothing else — the engagement exchange a whole
+/// shape files is not here, since a divided member's inbound escrow is
+/// its engagement and the crossing bundle it consumes is its
+/// counterpart's commitment.
+#[must_use]
+pub fn divided_requirements(
+    legs: &[LegShape],
+    crossings: &[Crossing],
+    classified: &Classified,
+    trie: &ShardTrie,
+    local: ShardId,
+) -> BTreeSet<Requirement> {
+    let mut requirements: BTreeSet<Requirement> = BTreeSet::new();
+    let core = classified.core();
+    if core.contains(&local) {
+        requirements.extend(
+            core.iter()
+                .filter(|&&shard| shard != local)
+                .map(|&shard| Requirement::CommittedState(shard)),
+        );
+    }
+    requirements.extend(
+        crossings_of(legs, crossings, classified.decomposed(), trie)
+            .into_iter()
+            .filter(|edge| edge.to.contains(&local))
+            .map(|edge| Requirement::Crossing {
+                source: edge.from,
+                key: edge.record,
+            }),
+    );
+    requirements
+}
 
 /// The environment a source block's bundle carries for the transactions
 /// that block committed: the clock, checked against the commit-proven
@@ -44,9 +115,13 @@ pub struct ProvisioningTracker {
     /// retention horizon elapsed without ever finalizing.
     verified: HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
 
-    /// Remote shards each cross-shard tx needs provisions from. Populated
-    /// at tick creation.
-    required: HashMap<TxHash, BTreeSet<ShardId>>,
+    /// What each cross-shard tx waits for. One set per transaction,
+    /// indexed by nothing else. Populated at tick creation.
+    required: HashMap<TxHash, BTreeSet<Requirement>>,
+
+    /// The cells committed bundles carried present for each tx, whatever
+    /// shard sent them — what a [`Requirement::Crossing`] reads.
+    present: HashMap<TxHash, BTreeSet<SubstateKey>>,
 
     /// Remote shards whose provisions have been received, each with the
     /// environment anchor its bundle carried. Populated by
@@ -80,6 +155,7 @@ impl ProvisioningTracker {
         Self {
             verified: HashMap::new(),
             required: HashMap::new(),
+            present: HashMap::new(),
             received: HashMap::new(),
             payer_shards: HashMap::new(),
             deadlines: HashMap::new(),
@@ -114,10 +190,12 @@ impl ProvisioningTracker {
 
     // ─── Required / received ────────────────────────────────────────────
 
-    /// Record the remote shards `tx_hash` needs provisions from. Overwrites
-    /// any previous entry — callers set this once per tick creation.
-    pub fn record_required(&mut self, tx_hash: TxHash, remote_shards: BTreeSet<ShardId>) {
-        self.required.insert(tx_hash, remote_shards);
+    /// Record what `tx_hash` waits for. Overwrites any previous entry —
+    /// callers set this once per tick creation. Arrival order does not
+    /// matter: a bundle absorbed before its requirement is filed still
+    /// answers it.
+    pub fn record_required(&mut self, tx_hash: TxHash, requirements: BTreeSet<Requirement>) {
+        self.required.insert(tx_hash, requirements);
         self.stamp_deadline(tx_hash);
     }
 
@@ -149,17 +227,22 @@ impl ProvisioningTracker {
         self.received.get(&tx_hash)?.get(payer).copied()
     }
 
-    /// Whether every required provision for `tx_hash` has been received.
-    /// Returns `false` for txs with no recorded requirements (single-shard
-    /// txs or txs we aren't tracking). A recorded empty requirement is
-    /// immediately satisfied — the dependency-free cross-shard leg that
-    /// dispatches without waiting.
+    /// Whether every requirement for `tx_hash` is met. Returns `false`
+    /// for txs with no recorded requirements (single-shard txs or txs we
+    /// aren't tracking). A recorded empty set is immediately satisfied —
+    /// the member that waits on nothing and dispatches without waiting.
     pub fn is_fully_provisioned(&self, tx_hash: TxHash) -> bool {
         self.required.get(&tx_hash).is_some_and(|required| {
-            required.is_empty()
-                || self.received.get(&tx_hash).is_some_and(|received| {
-                    required.iter().all(|shard| received.contains_key(shard))
-                })
+            required.iter().all(|requirement| match requirement {
+                Requirement::CommittedState(shard) => self
+                    .received
+                    .get(&tx_hash)
+                    .is_some_and(|received| received.contains_key(shard)),
+                Requirement::Crossing { key, .. } => self
+                    .present
+                    .get(&tx_hash)
+                    .is_some_and(|present| present.contains(key)),
+            })
         })
     }
 
@@ -182,6 +265,12 @@ impl ProvisioningTracker {
         for tx_entry in provisions.transactions() {
             let tx_hash = tx_entry.tx_hash;
             let entries = Arc::new(tx_entry.entries.clone());
+            self.present.entry(tx_hash).or_default().extend(
+                entries
+                    .iter()
+                    .filter(|entry| entry.value.is_some())
+                    .map(|entry| entry.key),
+            );
             self.verified.entry(tx_hash).or_default().push(entries);
             self.received
                 .entry(tx_hash)
@@ -200,6 +289,7 @@ impl ProvisioningTracker {
     pub fn remove_tx(&mut self, tx_hash: TxHash) {
         self.verified.remove(&tx_hash);
         self.required.remove(&tx_hash);
+        self.present.remove(&tx_hash);
         self.received.remove(&tx_hash);
         self.payer_shards.remove(&tx_hash);
         self.deadlines.remove(&tx_hash);
@@ -264,6 +354,7 @@ impl ProvisioningTracker {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry};
+    use hyperscale_vm_types::LegRole;
 
     use super::*;
 
@@ -333,7 +424,13 @@ mod tests {
     fn is_fully_provisioned_requires_required_subset_of_received() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
-        t.record_required(tx, [shard(1), shard(2)].into_iter().collect());
+        t.record_required(
+            tx,
+            [shard(1), shard(2)]
+                .into_iter()
+                .map(Requirement::CommittedState)
+                .collect(),
+        );
 
         assert!(!t.is_fully_provisioned(tx));
 
@@ -346,6 +443,209 @@ mod tests {
         let batch2 = make_provisions(shard(2), BlockHeight::new(5), vec![tx]);
         t.absorb_provisions(&batch2);
         assert!(t.is_fully_provisioned(tx));
+    }
+
+    /// A crossing is answered by a present value at its cell from any
+    /// source — an absent value, or a bundle from the named shard that
+    /// carries other cells, answers nothing — and a bundle absorbed
+    /// before the requirement was filed still answers it.
+    #[test]
+    fn a_crossing_is_met_by_the_cell_present_whoever_sent_it() {
+        use hyperscale_types::{Address, AddressClass, LocalKey};
+
+        let record = SubstateKey {
+            owner: Address::new([0xC1; 31], AddressClass::Component),
+            local: LocalKey([1; 16]),
+        };
+        let other = SubstateKey {
+            owner: Address::new([0xC1; 31], AddressClass::Component),
+            local: LocalKey([2; 16]),
+        };
+        let tx = TxHash::from(Hash::from_bytes(b"tx"));
+        let bundle = |source: ShardId, entries: Vec<SubstateEntry>| {
+            Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
+                source,
+                ShardId::leaf(2, 0),
+                BlockHeight::new(5),
+                anchor(0).clock,
+                MerkleInclusionProof::dummy(),
+                vec![ProvisionEntry::new(tx, entries)],
+            ))
+        };
+        let requirement = Requirement::Crossing {
+            source: shard(1),
+            key: record,
+        };
+
+        // Absorbed first, filed second.
+        let mut early = ProvisioningTracker::new();
+        early.absorb_provisions(&bundle(
+            shard(3),
+            vec![SubstateEntry::new(record, Some(vec![7]))],
+        ));
+        early.record_required(tx, BTreeSet::from([requirement]));
+        assert!(
+            early.is_fully_provisioned(tx),
+            "the source is not consulted"
+        );
+
+        // The named source, carrying the wrong cell or an absent value.
+        let mut wrong = ProvisioningTracker::new();
+        wrong.record_required(tx, BTreeSet::from([requirement]));
+        wrong.absorb_provisions(&bundle(
+            shard(1),
+            vec![SubstateEntry::new(other, Some(vec![7]))],
+        ));
+        assert!(!wrong.is_fully_provisioned(tx));
+        wrong.absorb_provisions(&bundle(shard(1), vec![SubstateEntry::new(record, None)]));
+        assert!(!wrong.is_fully_provisioned(tx), "absent answers nothing");
+        wrong.absorb_provisions(&bundle(
+            shard(1),
+            vec![SubstateEntry::new(record, Some(vec![7]))],
+        ));
+        assert!(wrong.is_fully_provisioned(tx));
+
+        // A committed-state requirement beside it is a different key: the
+        // crossing's bundle does not answer it.
+        let mut both = ProvisioningTracker::new();
+        both.record_required(
+            tx,
+            BTreeSet::from([requirement, Requirement::CommittedState(shard(2))]),
+        );
+        both.absorb_provisions(&bundle(
+            shard(1),
+            vec![SubstateEntry::new(record, Some(vec![7]))],
+        ));
+        assert!(!both.is_fully_provisioned(tx));
+        both.absorb_provisions(&bundle(shard(2), Vec::new()));
+        assert!(both.is_fully_provisioned(tx));
+    }
+
+    /// A hand-built leg on the leaf at `path` of a four-leaf trie.
+    fn leg(path: u8, role: LegRole, edges: &[(u32, u32)]) -> LegShape {
+        use hyperscale_types::{Address, AddressClass};
+        use hyperscale_vm_effects::{Hash32, SubintentHash};
+        use hyperscale_vm_types::ValueEdge;
+
+        let mut body = [0x11; 31];
+        body[0] = path << 6;
+        let target = Address::new(body, AddressClass::Component);
+        LegShape {
+            target,
+            role,
+            edges: edges
+                .iter()
+                .map(|(source, output)| ValueEdge {
+                    source: *source,
+                    output: *output,
+                    non_fungible: false,
+                })
+                .collect(),
+            presents: Vec::new(),
+            declares: vec![target],
+            intent: SubintentHash(Hash32([7; 32])),
+            local: 0,
+            expiry_ms: 1_000,
+        }
+    }
+
+    fn record_of(legs: &[LegShape], node: u32) -> Crossing {
+        use hyperscale_vm_effects::CrossingSite;
+        use hyperscale_vm_types::ProtocolHasher;
+
+        let producer = &legs[node as usize];
+        Crossing {
+            node,
+            output: 0,
+            record: CrossingSite::record(
+                &ProtocolHasher,
+                producer.target,
+                producer.intent,
+                producer.local,
+                0,
+                producer.expiry_ms,
+            )
+            .key(),
+            origin: None,
+        }
+    }
+
+    /// A divided member files its scope minus itself and the crossings
+    /// it consumes: a leg member files no committed state, a member of a
+    /// two-shard core files exactly one, and a consumer of an edge its
+    /// shard does not produce files that crossing.
+    #[test]
+    fn a_divided_member_files_its_scope_minus_itself() {
+        use hyperscale_engine::legs::Placement;
+
+        let trie = ShardTrie::uniform(2);
+        let (low, high, third) = (
+            ShardId::leaf(2, 0),
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 2),
+        );
+        let leaving = BTreeSet::new();
+
+        // A swap: sign-in, withdraw and deposit on the low shard, the
+        // venue on the high one. The core is the venue alone.
+        let swap = vec![
+            leg(0, LegRole::Attesting, &[]),
+            leg(0, LegRole::Inbound, &[]),
+            leg(1, LegRole::Core, &[(1, 0)]),
+            leg(0, LegRole::Outbound, &[(2, 0)]),
+        ];
+        let crossings = vec![record_of(&swap, 1), record_of(&swap, 2)];
+        let classified = Classified::freeze(&swap, Placement::new(&trie, &leaving));
+        assert!(classified.decomposed().holds());
+
+        let caller = divided_requirements(&swap, &crossings, &classified, &trie, low);
+        assert_eq!(
+            caller,
+            BTreeSet::from([Requirement::Crossing {
+                source: high,
+                key: crossings[1].record,
+            }]),
+            "the caller's legs wait on the venue's output and no committed state",
+        );
+        let venue = divided_requirements(&swap, &crossings, &classified, &trie, high);
+        assert_eq!(
+            venue,
+            BTreeSet::from([Requirement::Crossing {
+                source: low,
+                key: crossings[0].record,
+            }]),
+            "a single-shard core waits on its arrival alone",
+        );
+
+        // Two core nodes on two shards fed by an inbound leg on a third:
+        // each core member files the other's committed state, and both
+        // claim the inbound crossing, since neither runs its producer.
+        let route = vec![
+            leg(0, LegRole::Inbound, &[]),
+            leg(1, LegRole::Core, &[(0, 0)]),
+            leg(2, LegRole::Core, &[(1, 0)]),
+        ];
+        let crossings = vec![record_of(&route, 0), record_of(&route, 1)];
+        let classified = Classified::freeze(&route, Placement::new(&trie, &leaving));
+        assert!(classified.decomposed().holds());
+        assert_eq!(classified.core(), &BTreeSet::from([high, third]));
+        let arrival = Requirement::Crossing {
+            source: low,
+            key: crossings[0].record,
+        };
+        assert_eq!(
+            divided_requirements(&route, &crossings, &classified, &trie, high),
+            BTreeSet::from([Requirement::CommittedState(third), arrival]),
+        );
+        assert_eq!(
+            divided_requirements(&route, &crossings, &classified, &trie, third),
+            BTreeSet::from([Requirement::CommittedState(high), arrival]),
+        );
+        assert_eq!(
+            divided_requirements(&route, &crossings, &classified, &trie, low),
+            BTreeSet::new(),
+            "the inbound leg waits on nothing",
+        );
     }
 
     #[test]
@@ -417,7 +717,13 @@ mod tests {
     fn payer_anchor_reads_the_payer_bundles_clock_and_draw() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
-        t.record_required(tx, [shard(1), shard(2)].into_iter().collect());
+        t.record_required(
+            tx,
+            [shard(1), shard(2)]
+                .into_iter()
+                .map(Requirement::CommittedState)
+                .collect(),
+        );
         t.record_payer_shard(tx, shard(2));
 
         // A read-set owner's bundle lands first: no payer anchor yet.
@@ -448,7 +754,10 @@ mod tests {
     fn remove_tx_drops_state_from_every_owned_map() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
-        t.record_required(tx, std::iter::once(shard(1)).collect());
+        t.record_required(
+            tx,
+            std::iter::once(Requirement::CommittedState(shard(1))).collect(),
+        );
         let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
         t.absorb_provisions(&provisions);
         assert!(t.is_fully_provisioned(tx));
@@ -465,9 +774,18 @@ mod tests {
     fn record_required_overwrites_existing_entry() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
-        t.record_required(tx, std::iter::once(shard(1)).collect());
+        t.record_required(
+            tx,
+            std::iter::once(Requirement::CommittedState(shard(1))).collect(),
+        );
         // Re-record with a different requirement set.
-        t.record_required(tx, [shard(1), shard(2)].into_iter().collect());
+        t.record_required(
+            tx,
+            [shard(1), shard(2)]
+                .into_iter()
+                .map(Requirement::CommittedState)
+                .collect(),
+        );
         assert_eq!(t.required.get(&tx).map_or(0, BTreeSet::len), 2);
     }
 
@@ -481,7 +799,10 @@ mod tests {
 
         // Old tx absorbed at clock = ms(1_000).
         t.advance_clock(WeightedTimestamp::from_millis(1_000));
-        t.record_required(tx_old, std::iter::once(shard(1)).collect());
+        t.record_required(
+            tx_old,
+            std::iter::once(Requirement::CommittedState(shard(1))).collect(),
+        );
         t.absorb_provisions(&make_provisions(
             shard(1),
             BlockHeight::new(5),
@@ -490,7 +811,10 @@ mod tests {
 
         // Fresh tx absorbed at clock = ms(60_000).
         t.advance_clock(WeightedTimestamp::from_millis(60_000));
-        t.record_required(tx_fresh, std::iter::once(shard(1)).collect());
+        t.record_required(
+            tx_fresh,
+            std::iter::once(Requirement::CommittedState(shard(1))).collect(),
+        );
         t.absorb_provisions(&make_provisions(
             shard(1),
             BlockHeight::new(6),

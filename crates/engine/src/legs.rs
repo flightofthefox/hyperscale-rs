@@ -99,21 +99,16 @@ pub struct Classified {
 }
 
 impl Classified {
-    /// Freeze `legs` against `placement`.
+    /// Freeze `legs` against `placement`: the classifier's own answer,
+    /// and the core set beside it.
     ///
-    /// Divides only where the classifier says so and the build runs
-    /// divided shapes at all ([`decomposition_enabled`]); the core set
-    /// is read either way, since it costs nothing and is what the
-    /// awaited set is built from.
+    /// Whether a build runs divided shapes at all is
+    /// [`decomposition_enabled`]'s question, asked by the coordinator
+    /// that freezes — so this answers honestly wherever it is asked.
     #[must_use]
     pub fn freeze(legs: &[LegShape], placement: Placement<'_>) -> Self {
-        let decomposed = if decomposition_enabled() {
-            decomposes(legs, placement)
-        } else {
-            Decomposed::WHOLE
-        };
         Self {
-            decomposed,
+            decomposed: decomposes(legs, placement),
             core: core_shards(legs, placement.trie()),
         }
     }

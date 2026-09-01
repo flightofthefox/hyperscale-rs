@@ -37,7 +37,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::{Classified, Placement};
+use hyperscale_engine::legs::{Classified, Placement, decomposition_enabled};
 use hyperscale_engine::{TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_unresolvable_tx};
 use hyperscale_storage::{RecoveredState, TickResolution};
@@ -65,7 +65,7 @@ use crate::lookups::{
 };
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::provisional::ProvisionalCells;
-use crate::provisioning::ProvisioningTracker;
+use crate::provisioning::{ProvisioningTracker, Requirement, divided_requirements};
 use crate::tick_state::{Admission, Divergence, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
 use crate::unresolved::{Abandonable, Unanswerable, UnresolvedTxs};
@@ -75,6 +75,16 @@ use crate::vote_tracker::VoteTracker;
 /// shards whose echo its vote waits on, and the signed window end that
 /// bounds the wait.
 type EngagementWait = (TxHash, BTreeSet<ShardId>, WeightedTimestamp);
+
+/// One transaction a committed block put in flight, as this shard sees
+/// it: the shards party to it and the classification frozen at that
+/// commit.
+#[derive(Clone)]
+struct CommittedMember {
+    tx: Arc<Verifiable<Transaction>>,
+    participating: BTreeSet<ShardId>,
+    classified: Classified,
+}
 
 /// The committed block a tick is created against: its identity, and the
 /// environment anchors the transactions it commits execute under.
@@ -592,13 +602,38 @@ impl ExecutionCoordinator {
     fn register_cross_shard_txs(
         &mut self,
         classification: &TopologySnapshot,
-        txs: &[(Arc<Verifiable<Transaction>>, BTreeSet<ShardId>)],
+        txs: &[CommittedMember],
     ) -> Vec<EngagementWait> {
         let local_shard = self.local_shard;
         let mut engagement_waits: Vec<EngagementWait> = Vec::new();
 
-        for (tx, participating) in txs {
+        for CommittedMember {
+            tx,
+            participating,
+            classified,
+        } in txs
+        {
             let tx_hash = tx.hash();
+            // A divided member waits on its execution scope minus itself
+            // and on the crossings its legs consume, and on nothing else.
+            // Its inbound escrow is its engagement — reclaimable if
+            // nothing follows — and the crossing bundle it consumes is
+            // its counterpart's commitment, so neither half of the
+            // engagement exchange is filed, and it runs under its own
+            // committing block's clock.
+            if classified.decomposed().holds() {
+                self.provisioning.record_required(
+                    tx_hash,
+                    divided_requirements(
+                        tx.legs(),
+                        tx.crossings(),
+                        classified,
+                        classification.shard_trie(),
+                        local_shard,
+                    ),
+                );
+                continue;
+            }
             let remote_participants = || -> BTreeSet<ShardId> {
                 participating
                     .iter()
@@ -645,7 +680,13 @@ impl ExecutionCoordinator {
                 // remember whose entry to read it from at dispatch.
                 self.provisioning.record_payer_shard(tx_hash, payer_shard);
             }
-            self.provisioning.record_required(tx_hash, remote_shards);
+            self.provisioning.record_required(
+                tx_hash,
+                remote_shards
+                    .into_iter()
+                    .map(Requirement::CommittedState)
+                    .collect(),
+            );
         }
 
         engagement_waits
@@ -686,9 +727,24 @@ impl ExecutionCoordinator {
         // reads the same account off the same blocks however long after.
         self.unresolved
             .register_committed(local_shard, ts, transactions.iter());
-        let reaches_beyond: Vec<_> = members
+        let members: Vec<CommittedMember> = members
+            .into_iter()
+            .map(|(tx, participating)| CommittedMember {
+                // Frozen honestly, and carried only where the build runs
+                // divided shapes: until the cut-over every member is the
+                // whole shape, and nothing reads a core set for one.
+                classified: if decomposition_enabled() {
+                    Classified::freeze(tx.legs(), placement)
+                } else {
+                    Classified::whole()
+                },
+                tx,
+                participating,
+            })
+            .collect();
+        let reaches_beyond: Vec<CommittedMember> = members
             .iter()
-            .filter(|(_, shards)| shards.iter().any(|&s| s != local_shard))
+            .filter(|member| member.participating.iter().any(|&s| s != local_shard))
             .cloned()
             .collect();
         let engagement_waits = if reaches_beyond.is_empty() {
@@ -697,7 +753,12 @@ impl ExecutionCoordinator {
             self.register_cross_shard_txs(classification, &reaches_beyond)
         };
 
-        for (tx, participating) in members {
+        for CommittedMember {
+            tx,
+            participating,
+            classified,
+        } in members
+        {
             // Block-container entries decoded from the wire land as
             // `Unverified`; lift via `from_persisted` under the same
             // BFT-transitive trust that gates the containing block. Honest
@@ -707,7 +768,6 @@ impl ExecutionCoordinator {
                 Ok(v) => Arc::new(v),
                 Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
             };
-            let classified = Classified::freeze(verified.legs(), placement);
             self.candidates
                 .register(verified, participating, ts, classified);
         }
@@ -7580,9 +7640,10 @@ mod tests {
         // Seed every sub-machine with state for this tick's tx.
         state.ticks.insert_tick(tick_id, tick);
         state.ticks.assign_tx(tx_hash, tick_id);
-        state
-            .provisioning
-            .record_required(tx_hash, std::iter::once(ShardId::leaf(1, 1)).collect());
+        state.provisioning.record_required(
+            tx_hash,
+            std::iter::once(Requirement::CommittedState(ShardId::leaf(1, 1))).collect(),
+        );
         // Drive finalize to populate the FinalizationStore naturally.
         let _ = state.finalize(&make_test_topology(), &tick_id);
         let finalized = state
