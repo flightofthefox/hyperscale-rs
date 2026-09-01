@@ -139,8 +139,8 @@ pub fn project_to_shard(
                 .collect();
             // An event is stored where its emitter lives, so each shard
             // keeps its own and the rest are another shard's to hold. The
-            // receipt hash covers the whole union, so dropping them here
-            // costs no agreement.
+            // receipt hash's event root covers exactly these, so what is
+            // stored is what was signed over.
             let events: Vec<Event> = events
                 .iter()
                 .filter(|event| shard_trie.shard_for_prefix(event.emitter) == local_shard)

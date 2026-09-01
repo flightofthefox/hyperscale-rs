@@ -12,9 +12,11 @@ use hyperscale_effects_bridge::{
 use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
 };
+use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PreviewGrants, PreviewInputs, PreviewOutcome,
-    PreviewReport, ResourceChange, TickBatchContext, TickEnvironment, XRD, genesis_writes,
+    PreviewReport, ResourceChange, TickBatchContext, TickEnvironment, TickTxInput, XRD,
+    genesis_writes,
 };
 use hyperscale_hbor::TypeShape;
 use hyperscale_storage::{
@@ -22,11 +24,12 @@ use hyperscale_storage::{
 };
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
-    BeaconWitnessEvent, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
-    Ed25519PrivateKey, EnvelopeExt, EpochWindows, Hash, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId,
-    PrincipalAddr, ProvisionalHolds, SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot,
-    StateWrites, SubstateKey, TimestampRange, Transaction, TransactionBody, TransactionEnvelope,
-    Verified, WeightedTimestamp, absorb_committed_cells,
+    BeaconWitnessEvent, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt,
+    DeclaredRange, Ed25519PrivateKey, EnvelopeExt, EpochWindows, EventExt, EventRoot,
+    GlobalReceipt, Hash, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PrincipalAddr, ProvisionalHolds,
+    SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey,
+    TimestampRange, Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
+    absorb_committed_cells, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
     AbiParam, Composed, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader, PackageHash,
@@ -1206,6 +1209,69 @@ fn an_event_lands_only_on_its_emitters_home_shard() {
         hash_of(&recipient_side[0]),
         "under whole locality the hash covers the full fold, so it cannot differ by shard",
     );
+}
+
+/// A divided batch attests only what it ran. Each side's event root
+/// covers the events its own emitters produced — what its receipt
+/// stores — so the hash a shard signs is recomputable from exactly what
+/// it keeps. A participant running only its own legs could not assemble
+/// a union, and two attesting different unions under one signed root
+/// would contradict each other.
+#[test]
+fn a_divided_batch_hashes_only_its_own_emitters_events() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let run = |local_shard: ShardId| {
+        let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+        let ctx = TickBatchContext {
+            local_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            transaction: &tx,
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            abortable: true,
+        };
+        executor
+            .execute_tick_batch(&ctx, &snapshot_store, &[input])
+            .remove(0)
+    };
+    let (sender_side, recipient_side) = (run(near_shard), run(far_shard));
+
+    assert_eq!(events_of(&sender_side), vec![(alice().address(), 0)]);
+    assert_eq!(events_of(&recipient_side), vec![(far().address(), 1)]);
+    for side in [&sender_side, &recipient_side] {
+        let ConsensusReceipt::Succeeded {
+            receipt_hash,
+            writes,
+            events,
+            ..
+        } = &side.consensus
+        else {
+            panic!("the leg must succeed: {:?}", side.consensus);
+        };
+        let event_hashes: Vec<Hash> = events.iter().map(EventExt::hash).collect();
+        let recomputed = GlobalReceipt::new(
+            true,
+            EventRoot::from_raw(compute_merkle_root(&event_hashes)),
+            BeaconWitnessRoot::ZERO,
+            writes_root(writes),
+        )
+        .receipt_hash();
+        assert_eq!(
+            *receipt_hash, recomputed,
+            "the hash a divided member signs covers exactly what it stores",
+        );
+    }
 }
 
 /// A reservation is judged against committed balance less what

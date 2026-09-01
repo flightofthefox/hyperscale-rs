@@ -58,10 +58,8 @@ pub enum ConsensusReceipt {
     /// the writes/events the local shard needs.
     Succeeded {
         /// Precomputed [`GlobalReceiptHash`] — cannot be recomputed from
-        /// this variant alone: its event root covers the union of every
-        /// shard's events while only the local emitters' are carried,
-        /// and under whole locality its writes root can cover more than
-        /// the local slice.
+        /// this variant alone: under whole locality its writes root can
+        /// cover more than the local slice.
         receipt_hash: GlobalReceiptHash,
         /// Substate writes filtered to the local shard — what this shard
         /// applies at settlement. For a cross-shard member this is also
@@ -73,11 +71,11 @@ pub enum ConsensusReceipt {
         /// time; the root of those events is bound into `receipt_hash`
         /// via [`GlobalReceipt::beacon_witness_root`].
         beacon_witness_events: Vec<BeaconWitnessEvent>,
-        /// Events whose emitting instance lives on this shard. These
-        /// differ per shard by design: an event is stored where its
-        /// emitter lives, while `receipt_hash` binds the canonical union
-        /// through [`GlobalReceipt::event_root`], so committees still
-        /// agree on what the transaction emitted.
+        /// Events whose emitting instance lives on this shard — and
+        /// exactly what `receipt_hash` commits to through
+        /// [`GlobalReceipt::event_root`]. These differ per shard by
+        /// design: an event is stored where its emitter lives, and each
+        /// shard attests its own.
         events: Vec<Event>,
     },
     /// All failures collapse to one variant — the canonical

@@ -958,9 +958,6 @@ fn assemble_executed_tx(
             fold.running_entries.insert(*key, change.clone());
         }
         apply_fee_burn(&mut writes, fee, receipt.fuel);
-        // Every participant derives the same events from the same
-        // manifest, so the root covers the whole union while each shard's
-        // receipt keeps only what its own instances emitted.
         // The kernel's record is the wire record — one shared type, so
         // there is nothing to convert.
         let events: Vec<Event> = receipt.events.clone();
@@ -982,7 +979,17 @@ fn assemble_executed_tx(
                 .map(|witness| (event.emitter, witness))
             })
             .collect();
-        let event_hashes: Vec<Hash> = events.iter().map(EventExt::hash).collect();
+        // The root covers the events this shard's own emitters produced
+        // — what its receipt stores — and not a union: a participant
+        // running only its own legs cannot assemble one, and two
+        // participants attesting different unions under one signed root
+        // would contradict each other. Agreement across shards is
+        // outcome-level in the certificates, never hash equality.
+        let event_hashes: Vec<Hash> = events
+            .iter()
+            .filter(|event| locality.is_local(event.emitter))
+            .map(EventExt::hash)
+            .collect();
         let receipt_hash = GlobalReceipt::new(
             true,
             EventRoot::from_raw(compute_merkle_root(&event_hashes)),

@@ -12,9 +12,10 @@
 //! with cross-shard members hashes the shard-projected delta, and the
 //! fee burn is a payer-shard write, so participants certify per-shard
 //! hashes and no verifier compares them across shards — agreement is
-//! outcome-level, settlement combines verdicts. The event root is the
-//! one union term: it covers every shard's events while each shard
-//! stores only its own emitters'.
+//! outcome-level, settlement combines verdicts. The event root is per
+//! shard on the same terms: it covers the events this shard's own
+//! emitters produced, which is what it stores. A shard that ran only
+//! its own legs of a transaction could not attest a union anyway.
 //! Per-shard state correctness is enforced by `state_root` in the block
 //! header, with per-tx attribution via `local_receipt_root`
 //! (`ConsensusReceipt::local_receipt_hash`).
