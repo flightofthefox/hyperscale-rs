@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 use blake3::Hasher;
 use hyperscale_hbor::{Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+use hyperscale_vm_types::{Crossing, LegShape};
 use thiserror::Error;
 
 use crate::transaction::vm::{Derivation, ProtocolVerifier, SchemeVerifier};
@@ -165,6 +166,46 @@ impl Transaction {
     #[must_use]
     pub fn work(&self) -> u64 {
         self.derived().work
+    }
+
+    /// What the declaration claims it will touch, in footprint units.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn footprint(&self) -> u64 {
+        self.derived().footprint
+    }
+
+    /// Each manifest node's placement-free shape, in node order.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn legs(&self) -> &[LegShape] {
+        &self.derived().legs
+    }
+
+    /// The record cell of every value edge, in (node, output) order.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn crossings(&self) -> &[Crossing] {
+        &self.derived().crossings
+    }
+
+    /// The cells the kernel writes of its own accord.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn kernel_cells(&self) -> &[SubstateKey] {
+        &self.derived().kernel_cells
     }
 
     /// How many cells this transaction creates that a sweep will later
@@ -604,6 +645,10 @@ mod tests {
                 },
                 subintent_hashes,
                 work: declared_work(0, 0, 0),
+                footprint: 0,
+                legs: Vec::new(),
+                crossings: Vec::new(),
+                kernel_cells: Vec::new(),
                 packages: Vec::new(),
             })
         }

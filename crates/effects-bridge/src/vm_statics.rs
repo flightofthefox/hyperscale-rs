@@ -24,16 +24,16 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
-    ChainRecords, Claim, EnvelopeTree, IntentHeader, ManifestHash, PackageHash,
-    PrefixShardResolver, Routing as RoutedTransaction, RuleBytes, Value, admit_tree, child_key,
-    footprint, package_hash, package_key as canonical_package_key, principal_address, route_tree,
-    xrd,
+    AdmittedTree, ChainRecords, Claim, Composed, CrossingSite, EnvelopeTree, FrameDeclaration,
+    IntentHeader, ManifestHash, PackageHash, PrefixShardResolver, Routing as RoutedTransaction,
+    RuleBytes, Value, admit_tree, child_key, footprint, legs_of, package_hash,
+    package_key as canonical_package_key, principal_address, route_tree, xrd,
 };
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
-    Address, EffectSet, EffectTarget, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId,
-    SubstateKey,
+    Address, Crossing, EffectSet, EffectTarget, LegShape, Mode, Moves, PrincipalAddr, ResourceAddr,
+    SchemeId, SubstateKey,
 };
 
 use crate::ProtocolHasher;
@@ -470,6 +470,12 @@ impl BridgeStatics {
             effective_window: vm.validity_window(),
             sweepable_writes: 0,
             work,
+            footprint,
+            // No manifest, so nothing to divide, nothing crossing, and no
+            // cell the kernel writes of its own accord.
+            legs: Vec::new(),
+            crossings: Vec::new(),
+            kernel_cells: Vec::new(),
             signer,
             routing: Routing {
                 read_prefixes: Vec::new(),
@@ -489,6 +495,116 @@ impl BridgeStatics {
             // A publish runs no package: it writes one and calls nothing.
             packages: Vec::new(),
         })
+    }
+}
+
+/// The placement-free half of a transaction's division: its legs, the
+/// record cell of every value edge, and every cell the kernel will write
+/// of its own accord.
+struct Division {
+    legs: Vec<LegShape>,
+    crossings: Vec<Crossing>,
+    kernel_cells: Vec<SubstateKey>,
+}
+
+/// Divide an admitted tree.
+///
+/// Classified against the view admission lowered it under — the chain's
+/// records with the tree's own layered behind them — since a node
+/// targeting a component the envelope itself carries resolves there and
+/// nowhere else.
+///
+/// Keys are made of what each node's own signer signed — the intent, the
+/// node's index within it, and that intent's expiry — so two compositions
+/// of one subintent derive the same cells for its nodes, and nothing
+/// here consults placement.
+///
+/// The record and the reclaim claim sit under the producing node's
+/// target, the claim under the consuming node's. Walked from the
+/// consumer side because that is where an edge is named, and admission
+/// has already refused an edge with two consumers.
+fn divide(
+    tree: &EnvelopeTree,
+    admitted: &AdmittedTree,
+    chain: &dyn ChainRecords,
+) -> Result<Division, DerivationError> {
+    let manifest = admitted.admitted.manifest();
+    let resolvable = Composed::new(chain, &tree.instances, &ProtocolHasher);
+    let legs = legs_of(&admitted.admitted, &resolvable).map_err(|unresolved| {
+        // Admission resolved every target it lowered, so this is a
+        // package the chain has since stopped answering for — a gap this
+        // node's, which closes when the record lands, not a verdict.
+        let target = manifest.nodes.get(unresolved.node).map(|node| node.target);
+        DerivationError::Unresolved(target.into_iter().collect())
+    })?;
+    let mut crossings = Vec::new();
+    let mut kernel_cells: Vec<SubstateKey> = admitted
+        .subintents
+        .iter()
+        .map(|record| record.nullifier)
+        .collect();
+    for consumer in &legs {
+        for edge in &consumer.edges {
+            let Some(producer) = legs.get(edge.source as usize) else {
+                return Err(DerivationError::Refused(format!(
+                    "edge names node {} past the manifest",
+                    edge.source
+                )));
+            };
+            let site = |owner: Address, claim: bool| {
+                let (hasher, intent, local, expiry) = (
+                    &ProtocolHasher,
+                    producer.intent,
+                    producer.local,
+                    producer.expiry_ms,
+                );
+                if claim {
+                    CrossingSite::claim(hasher, owner, intent, local, edge.output, expiry)
+                } else {
+                    CrossingSite::record(hasher, owner, intent, local, edge.output, expiry)
+                }
+                .key()
+            };
+            let record = site(producer.target, false);
+            crossings.push(Crossing {
+                node: edge.source,
+                output: edge.output,
+                record,
+                origin: admitted
+                    .admitted
+                    .frames()
+                    .iter()
+                    .find(|frame| frame.node == edge.source)
+                    .and_then(reserved_origin),
+            });
+            kernel_cells.push(record);
+            kernel_cells.push(site(consumer.target, true));
+            kernel_cells.push(site(producer.target, true));
+        }
+    }
+    crossings.sort_unstable_by_key(|crossing| (crossing.node, crossing.output));
+    Ok(Division {
+        legs,
+        crossings,
+        kernel_cells,
+    })
+}
+
+/// The one cell a frame reserves, where it reserves exactly one — the
+/// shape an inbound leg takes, and the cell its departing value leaves
+/// from. A frame reserving nothing, several cells, or a range names no
+/// origin.
+fn reserved_origin(frame: &FrameDeclaration) -> Option<SubstateKey> {
+    let mut reserves = frame
+        .ordered
+        .iter()
+        .filter(|access| matches!(access.effect.mode, Mode::Reserve { .. }));
+    match (reserves.next(), reserves.next()) {
+        (Some(only), None) => match only.effect.target {
+            EffectTarget::Point(key) => Some(key),
+            EffectTarget::Entry { .. } | EffectTarget::Range { .. } => None,
+        },
+        _ => None,
     }
 }
 
@@ -595,17 +711,23 @@ impl Derivation for BridgeStatics {
         // would touch, and the ceiling it signed for its own execution.
         // The declaration spans every shard it routes to, because the
         // reservation is taken once against the whole of it.
-        let work = declared_work(
-            routing
-                .per_shard
-                .values()
-                .fold(0u64, |total, set| total.saturating_add(footprint(set))),
-            vm.gas_limit,
-            vm.signature_work(),
-        );
+        let declared_footprint = routing
+            .per_shard
+            .values()
+            .fold(0u64, |total, set| total.saturating_add(footprint(set)));
+        let work = declared_work(declared_footprint, vm.gas_limit, vm.signature_work());
+        let Division {
+            legs,
+            crossings,
+            kernel_cells,
+        } = divide(&tree, &admitted, &chain)?;
         Ok(Derived {
             effective_window,
             work,
+            footprint: declared_footprint,
+            legs,
+            crossings,
+            kernel_cells,
             signer,
             routing: Routing {
                 read_prefixes: prefixes(&read_keys),
@@ -683,7 +805,7 @@ mod tests {
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
     use hyperscale_vm_stdlib::account;
-    use hyperscale_vm_types::{AddressClass, CollectionId, ResourceAddr};
+    use hyperscale_vm_types::{AddressClass, CollectionId, LegRole, ResourceAddr};
 
     use super::*;
     use crate::records::record_address;
@@ -879,6 +1001,108 @@ mod tests {
             signature: Vec::new(),
         }
         .sign(&key(7))
+    }
+
+    /// A transfer divides into a sign-in, a withdraw and a deposit. Its
+    /// one value edge is one crossing, whose record sits under the
+    /// sender and names the vault the withdraw reserved; and the kernel
+    /// writes three cells for it — the record, the recipient's claim,
+    /// and the sender's reclaim claim — with no nullifier, since nothing
+    /// is bound.
+    #[test]
+    fn a_transfer_derives_one_crossing_per_value_edge() {
+        let tree = single_intent_tree(vec![
+            sign_in(composer_addr()),
+            withdraw(composer_addr(), RES_X, 100),
+            deposit_edge(bob_addr(), 1, RES_X),
+        ]);
+        let vm = envelope(&tree, &[]);
+        let derived = statics().derive(&vm).expect("derives");
+
+        let roles: Vec<LegRole> = derived.legs.iter().map(|leg| leg.role).collect();
+        assert_eq!(
+            roles,
+            vec![LegRole::Attesting, LegRole::Inbound, LegRole::Outbound]
+        );
+        assert_eq!(derived.crossings.len(), 1);
+        let crossing = derived.crossings[0];
+        assert_eq!((crossing.node, crossing.output), (1, 0));
+        assert_eq!(
+            crossing.record.owner,
+            composer_addr().address(),
+            "the record sits under the producing node's target"
+        );
+        assert_eq!(
+            crossing.origin,
+            Some(vault_key(composer_addr(), RES_X)),
+            "and names the cell the withdraw reserved"
+        );
+
+        let distinct: BTreeSet<SubstateKey> = derived.kernel_cells.iter().copied().collect();
+        assert_eq!(derived.kernel_cells.len(), 3);
+        assert_eq!(distinct.len(), 3, "three cells, none aliasing another");
+        assert!(distinct.contains(&crossing.record));
+        let under_recipient = derived
+            .kernel_cells
+            .iter()
+            .filter(|cell| cell.owner == bob_addr().address())
+            .count();
+        assert_eq!(under_recipient, 1, "the claim, under the consumer");
+
+        // The footprint is the term of the price the declaration fixes,
+        // carried whole beside the sum it feeds.
+        assert!(derived.footprint > 0);
+        assert_eq!(
+            derived.work,
+            declared_work(derived.footprint, vm.gas_limit, vm.signature_work())
+        );
+    }
+
+    /// An escrow cell is keyed by what its node's own signer signed. Two
+    /// compositions of one subintent derive the same cells for that
+    /// subintent's nodes, and the composer moving the root's own window
+    /// moves the root's cells and nobody else's.
+    #[test]
+    fn escrow_cells_follow_the_signing_intent() {
+        let first = composed_tree();
+        let mut second = composed_tree();
+        second.root.header.validity_end_ms -= 1_000;
+        let derive = |tree: &EnvelopeTree| {
+            statics()
+                .derive(&envelope(tree, &[&key(9)]))
+                .expect("derives")
+        };
+        let (one, other) = (derive(&first), derive(&second));
+        let bob = first.subintents[0].decl.hash(&ProtocolHasher);
+
+        // The interleave puts Bob's withdraw at manifest node 3, second
+        // in his own intent — and the leg says which of those it is.
+        assert_eq!(one.legs[3].intent, bob);
+        assert_eq!(one.legs[3].local, 1);
+        assert_eq!(one.legs[1].intent, first.root.hash(&ProtocolHasher));
+
+        let produced_by = |derived: &Derived, node: u32| {
+            derived
+                .crossings
+                .iter()
+                .find(|crossing| crossing.node == node)
+                .copied()
+                .expect("the edge crosses")
+        };
+        assert_eq!(
+            produced_by(&one, 3).record,
+            produced_by(&other, 3).record,
+            "Bob's record is fixed by Bob's signature"
+        );
+        assert_ne!(
+            produced_by(&one, 1).record,
+            produced_by(&other, 1).record,
+            "the root's record moves with the root's window"
+        );
+        assert_eq!(
+            one.kernel_cells[0], other.kernel_cells[0],
+            "and so is his nullifier"
+        );
     }
 
     /// Work is what a block pays to carry a transaction: a fixed charge

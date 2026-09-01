@@ -14,6 +14,7 @@ pub use hyperscale_vm_types::{
     AccountSigner, MAX_MESSAGE_LEN, MAX_SUBINTENTS, Mode, SchemeId, SchemeVerifier, SubintentSig,
     TransactionBody, TransactionEnvelope,
 };
+use hyperscale_vm_types::{Crossing, LegShape, SubstateKey};
 use thiserror::Error;
 
 use crate::crypto::{
@@ -287,6 +288,31 @@ pub struct Derived {
     /// every other routing quantity — nothing about it travels on the
     /// wire, so a sender cannot understate it.
     pub work: u64,
+    /// What the declaration claims it will touch, priced on the effects
+    /// crate's schedule — the one term of `work` a burn reads whole.
+    /// Carried beside the sum because the sum is not invertible.
+    pub footprint: u64,
+    /// Each manifest node's placement-free shape, in node order. Empty
+    /// for a publish, which has no manifest to divide.
+    pub legs: Vec<LegShape>,
+    /// The record cell of every value edge, in (node, output) order.
+    ///
+    /// Every edge, not only the ones that turn out to cross: which cross
+    /// is a placement fact read at an anchor, while the declaration is
+    /// fixed when the envelope is composed.
+    pub crossings: Vec<Crossing>,
+    /// The cells the kernel writes of its own accord: a nullifier per
+    /// subintent and, per value edge, the record under the producing
+    /// node's target, the claim under the consuming node's, and the
+    /// reclaim claim under the producer's again — three per edge, the
+    /// last on the abort path, where an omission halts a shard rather
+    /// than refusing a batch.
+    ///
+    /// Keyed by the signing intent and the node's index within it, under
+    /// that intent's own expiry, so two compositions of one subintent
+    /// name the same cells and a composer moving the interleave moves
+    /// none of them.
+    pub kernel_cells: Vec<SubstateKey>,
 }
 
 /// Why a derivation did not answer.

@@ -946,6 +946,12 @@ impl Derivation for StubVmStatics {
                 vm.gas_limit,
                 vm.signature_work(),
             ),
+            footprint: (read_prefixes.len() + write_prefixes.len()) as u64,
+            // A stub derives no manifest, so it has no legs to divide and
+            // writes no cell of its own.
+            legs: Vec::new(),
+            crossings: Vec::new(),
+            kernel_cells: Vec::new(),
         })
     }
 }
