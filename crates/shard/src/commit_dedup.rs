@@ -168,10 +168,14 @@ impl CommitDedupIndex {
     /// Record every transaction a block's finalizations resolved. Each
     /// entry's deadline is the resolving tick's local EC
     /// `vote_anchor_ts + RETENTION_HORIZON`.
+    ///
+    /// The deciding outcomes only: a leg's finalization names its hash
+    /// without resolving it, and the reclaim's finalization naming the
+    /// hash later is the one this index must not refuse.
     pub fn register_committed_certs(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
         for fw in finalizations {
             let deadline = fw.local_ec().deadline();
-            for tx_hash in fw.tx_hashes() {
+            for tx_hash in fw.deciding_tx_hashes() {
                 self.resolved_tx_retention
                     .entry(tx_hash)
                     .or_insert(deadline);
@@ -399,5 +403,34 @@ mod tests {
             .plus(std::time::Duration::from_millis(1));
         idx.prune(past);
         assert!(!idx.contains_provision(&p.hash()));
+    }
+
+    /// A leg's finalization names its hash without resolving it, so the
+    /// reclaim's finalization naming the hash later is not a duplicate.
+    #[test]
+    fn a_leg_finalization_does_not_resolve_its_transaction() {
+        use hyperscale_types::test_utils::{make_finalization, make_leg_finalization};
+        use hyperscale_types::{BlockHeight, TransactionDecision};
+
+        let tx_hash = tx_with_end(7, 60_000).hash();
+        let mut index = CommitDedupIndex::new();
+        index.register_committed_certs(&[Arc::new(Verifiable::from(make_leg_finalization(
+            BlockHeight::new(1),
+            tx_hash,
+        )))]);
+        assert!(
+            !index.contains_resolved_tx(&tx_hash),
+            "the leg decided nothing"
+        );
+
+        index.register_committed_certs(&[Arc::new(Verifiable::from(make_finalization(
+            BlockHeight::new(5),
+            tx_hash,
+            TransactionDecision::Accept,
+        )))]);
+        assert!(
+            index.contains_resolved_tx(&tx_hash),
+            "the reclaim's finalization does"
+        );
     }
 }

@@ -82,6 +82,8 @@ pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
         &escrowed,
         b"CROSSING:",
         &targets,
+        b"DECIDES:",
+        &[u8::from(outcome.decides())],
     ])
 }
 
@@ -185,6 +187,26 @@ mod tests {
 
     use super::*;
     use crate::{EscrowedValue, GlobalReceiptHash, TxHash};
+
+    /// Whether an outcome decides its transaction is under the signed
+    /// leaf: a leg's success and a core's are otherwise identical bytes.
+    #[test]
+    fn a_leg_that_decides_nothing_leafs_differently() {
+        let outcome = TxOutcome::new(
+            TxHash::from(Hash::from_bytes(b"leg")),
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        );
+        assert!(
+            outcome.decides(),
+            "an outcome decides unless told otherwise"
+        );
+        assert_ne!(
+            tx_outcome_leaf(&outcome),
+            tx_outcome_leaf(&outcome.clone().deciding(false)),
+        );
+    }
 
     fn tx_hash() -> TxHash {
         TxHash::from(Hash::from_bytes(b"leaf-tx"))

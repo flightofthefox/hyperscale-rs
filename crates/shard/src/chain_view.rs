@@ -276,7 +276,7 @@ impl<'a> ChainView<'a> {
                 break;
             }
             for fw in pending.finalizations() {
-                resolved.extend(fw.tx_hashes());
+                resolved.extend(fw.deciding_tx_hashes());
             }
             current_hash = pending.header().parent_block_hash();
         }

@@ -819,6 +819,31 @@ pub fn make_finalization(
     Finalization::new(tick_id, TickHalf::Determined, vec![Arc::new(ec)], vec![])
 }
 
+/// A leg's finalization at `block_height`: `tx_hash` succeeded here and
+/// the outcome decides nothing, since the transaction's core decides it.
+#[must_use]
+pub fn make_leg_finalization(block_height: BlockHeight, tx_hash: TxHash) -> Finalization {
+    let tick_id = TickId::new(ShardId::ROOT, block_height);
+    let outcomes = vec![
+        TxOutcome::new(
+            tx_hash,
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        )
+        .deciding(false),
+    ];
+    let ec = ExecutionCertificate::new(
+        tick_id,
+        WeightedTimestamp::from_millis(block_height.inner() + 1),
+        compute_global_receipt_root(&outcomes),
+        outcomes,
+        AggregateSignature::new([0u8; 96]),
+        SignerBitfield::new(4),
+    );
+    Finalization::new(tick_id, TickHalf::Determined, vec![Arc::new(ec)], vec![])
+}
+
 /// The one synthetic cell the stub declares per owner. All of an
 /// owner's stubbed accesses collapse to this cell, so two stubbed
 /// transactions conflict exactly when they share an owner — the

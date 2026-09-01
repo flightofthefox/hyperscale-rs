@@ -303,11 +303,13 @@ pub fn select_finalizations(
             true
         })
         .filter(|fw| {
-            let unresolved = fw.tx_hashes().all(|tx_hash| {
-                !resolved_here.contains(&tx_hash)
-                    && !qc_chain_resolved_txs.contains(&tx_hash)
-                    && !dedup_index.contains_resolved_tx(&tx_hash)
-            });
+            let unresolved = fw
+                .tx_hashes()
+                .all(|tx_hash| !resolved_here.contains(&tx_hash))
+                && fw.deciding_tx_hashes().all(|tx_hash| {
+                    !qc_chain_resolved_txs.contains(&tx_hash)
+                        && !dedup_index.contains_resolved_tx(&tx_hash)
+                });
             if unresolved {
                 resolved_here.extend(fw.tx_hashes());
             }

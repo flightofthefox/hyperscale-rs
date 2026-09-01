@@ -385,6 +385,18 @@ impl Finalization {
         self.local_ec().tx_outcomes().iter().map(TxOutcome::tx_hash)
     }
 
+    /// The transactions this finalization resolves: those whose local
+    /// outcome bears the verdict. A leg that succeeded is named here and
+    /// resolved elsewhere, so it is among [`Self::tx_hashes`] and not
+    /// among these.
+    pub fn deciding_tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
+        self.local_ec()
+            .tx_outcomes()
+            .iter()
+            .filter(|outcome| outcome.decides())
+            .map(TxOutcome::tx_hash)
+    }
+
     /// Whether the tick contains a given tx.
     #[must_use]
     pub fn contains_tx(&self, tx_hash: &TxHash) -> bool {

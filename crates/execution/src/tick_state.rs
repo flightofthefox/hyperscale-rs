@@ -80,10 +80,17 @@ pub struct Divergence {
 /// claims it.
 ///
 /// Both include this shard, and awaited is a subset of reach.
+///
+/// Beside them, whether this shard's certificate **decides** the
+/// transaction: it does unless the member is a leg, whose transaction
+/// its core decides. Not a third awaited case — a leg and a single-shard
+/// core await the same set — but the one fact the wire cannot derive
+/// from that set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Membership {
     awaited: BTreeSet<ShardId>,
     reach: BTreeSet<ShardId>,
+    decides: bool,
 }
 
 impl Membership {
@@ -91,9 +98,10 @@ impl Membership {
     /// `classified`, on `local`.
     #[must_use]
     pub fn of(classified: &Classified, local: ShardId, participating: BTreeSet<ShardId>) -> Self {
+        let in_core = classified.core().contains(&local);
         let awaited = if !classified.decomposed().holds() {
             participating.clone()
-        } else if classified.core().contains(&local) {
+        } else if in_core {
             classified.core().clone()
         } else {
             BTreeSet::from([local])
@@ -105,17 +113,26 @@ impl Membership {
         Self {
             awaited,
             reach: participating,
+            decides: !classified.decomposed().holds() || in_core,
         }
     }
 
     /// A whole shape on every participant: one set answers both
-    /// questions.
+    /// questions, and the certificate decides.
     #[must_use]
     pub fn whole(participating: BTreeSet<ShardId>) -> Self {
         Self {
             awaited: participating.clone(),
             reach: participating,
+            decides: true,
         }
+    }
+
+    /// Whether this shard's certificate bears the verdict on the
+    /// transaction.
+    #[must_use]
+    pub const fn decides(&self) -> bool {
+        self.decides
     }
 
     /// The shards whose certificates settlement waits on, this one
@@ -699,6 +716,11 @@ impl TickState {
                     .iter()
                     .copied()
                     .filter(|&shard| shard != local);
+                // Whether this certificate decides the transaction. A
+                // leg's success decides nothing — its core does — but
+                // a leg that failed is the transaction's end here.
+                let decides = self.membership.get(tx_hash).is_none_or(Membership::decides)
+                    || !matches!(outcome, ExecutionOutcome::Succeeded { .. });
                 let charge = self
                     .fee_receipts
                     .get(tx_hash)
@@ -723,6 +745,7 @@ impl TickState {
                 .awaiting(counterparts)
                 .escrowing(escrowed)
                 .crossing_to(targets)
+                .deciding(decides)
             })
             .collect();
 
@@ -1463,6 +1486,7 @@ mod tests {
             "a leg awaits itself"
         );
         assert_eq!(caller.reach(), &participating);
+        assert!(!caller.decides(), "and its core decides the transaction");
         let venue = Membership::of(&swap, high, participating.clone());
         assert_eq!(
             venue.awaited(),
@@ -1470,6 +1494,7 @@ mod tests {
             "a single-shard core awaits itself"
         );
         assert_eq!(venue.reach(), &participating);
+        assert!(venue.decides(), "and decides");
 
         let route = Classified::freeze(&route(), Placement::new(&trie, &leaving));
         let participating = BTreeSet::from([low, high, third]);
@@ -1542,6 +1567,10 @@ mod tests {
         assert!(
             outcomes[0].counterparts().is_empty(),
             "the outcome names no counterpart, so the finalization is complete on its own"
+        );
+        assert!(
+            !outcomes[0].decides(),
+            "and decides nothing: the venue's verdict is the transaction's"
         );
 
         // The venue's refusal lands before this shard's own certificate.

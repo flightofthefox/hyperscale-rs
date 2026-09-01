@@ -315,13 +315,19 @@ pub fn validate_no_duplicate_resolutions(
 ) -> Result<(), String> {
     let mut resolved_here: HashSet<TxHash> = HashSet::new();
     for fw in block.certificates().iter() {
-        for tx_hash in fw.tx_hashes() {
+        // Every name is held to once per block; only a deciding one is
+        // held against what the chain already resolved, since a leg's
+        // finalization resolves nothing and the reclaim's may follow it.
+        for outcome in fw.local_ec().tx_outcomes() {
+            let tx_hash = outcome.tx_hash();
             if !resolved_here.insert(tx_hash) {
                 return Err(format!(
                     "transaction {tx_hash} resolved twice within the same block"
                 ));
             }
-            reject_if_resolved(tx_hash, qc_chain_resolved_txs, dedup_index)?;
+            if outcome.decides() {
+                reject_if_resolved(tx_hash, qc_chain_resolved_txs, dedup_index)?;
+            }
         }
     }
     for verdict in block.abandonment_records() {

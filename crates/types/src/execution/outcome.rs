@@ -120,6 +120,19 @@ pub struct TxOutcome {
     /// resolve the trie the issuer used.
     #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
     crossing_targets: Vec<ShardId>,
+    /// Whether this outcome bears the verdict on the transaction for the
+    /// certifying shard.
+    ///
+    /// False for a leg that succeeded: it ran only its own part, and the
+    /// transaction is decided by its core, so the finalization carrying
+    /// it resolves nothing and a later one — the reclaim's — may name
+    /// the hash again. True for everything else, a failed leg included:
+    /// a leg that could not issue is the transaction's end on its shard.
+    ///
+    /// Attested rather than derived because it cannot be: a leg and a
+    /// single-shard core both await nobody and both may escrow, and only
+    /// the classification the certifying shard froze tells them apart.
+    decides: bool,
 }
 
 impl TxOutcome {
@@ -141,6 +154,7 @@ impl TxOutcome {
             counterparts: Vec::new(),
             escrowed: Vec::new(),
             crossing_targets: Vec::new(),
+            decides: true,
         }
     }
 
@@ -185,6 +199,20 @@ impl TxOutcome {
         self
     }
 
+    /// Bind whether this outcome bears the verdict on the transaction.
+    #[must_use]
+    pub const fn deciding(mut self, decides: bool) -> Self {
+        self.decides = decides;
+        self
+    }
+
+    /// Whether this outcome bears the verdict on the transaction for the
+    /// certifying shard — what lets its finalization resolve the hash.
+    #[must_use]
+    pub const fn decides(&self) -> bool {
+        self.decides
+    }
+
     /// Create a `TxOutcome` that settles the payer's charge through the
     /// named fee receipt.
     ///
@@ -210,6 +238,7 @@ impl TxOutcome {
             counterparts: Vec::new(),
             escrowed: Vec::new(),
             crossing_targets: Vec::new(),
+            decides: true,
         }
     }
 
