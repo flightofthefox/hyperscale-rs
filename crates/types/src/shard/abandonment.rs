@@ -36,7 +36,10 @@
 
 use hyperscale_hbor::Hbor;
 
-use crate::{MAX_UNSETTLED_PER_BLOCK, ShardId, SubstateKey, TxHash, WeightedTimestamp};
+use crate::{
+    MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, ShardId, SubstateKey, Transaction, TxHash,
+    WeightedTimestamp,
+};
 
 /// What an abort of one transaction burns, and out of whose vault.
 ///
@@ -72,6 +75,35 @@ pub struct UnsettledTx {
     /// What the abandonment burns, settled by the shard holding the
     /// vault and by no other.
     pub charge: AbortCharge,
+}
+
+impl UnsettledTx {
+    /// What abandoning `tx` states, read off the transaction itself.
+    ///
+    /// The one place every figure is derived, so a proposer restating
+    /// them and a voter checking the restatement compute one value: the
+    /// deadline is the validity end plus [`MAX_FINALIZATION_DELAY`], the
+    /// reservation is the declared work, and the charge is the fee vault
+    /// at the abort floor.
+    ///
+    /// # Panics
+    ///
+    /// As [`Transaction::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn for_transaction(tx: &Transaction) -> Self {
+        Self {
+            tx_hash: tx.hash(),
+            deadline: tx
+                .validity_range()
+                .end_timestamp_exclusive
+                .plus(MAX_FINALIZATION_DELAY),
+            declared_work: tx.work(),
+            charge: AbortCharge {
+                vault: tx.fee_vault(),
+                floor: tx.body().abort_floor(),
+            },
+        }
+    }
 }
 
 /// Why a counterpart can never settle the transactions a record names,

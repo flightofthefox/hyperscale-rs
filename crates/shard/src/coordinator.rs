@@ -103,6 +103,7 @@ use hyperscale_types::{
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
 
+use crate::abandonment_figures::{AbandonmentFigures, Restatement};
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::block_sync::{
     BlockSyncHealthDecision, BlockSyncManager, BlockSyncVerificationResult, IngestOutcome,
@@ -308,6 +309,10 @@ pub struct ShardCoordinator {
     /// In-flight fee reservations at this (payer) shard — committed VM
     /// transactions whose ticks have not yet finalized.
     fee_ledger: FeeReservationLedger,
+    /// The figures an abandonment record must restate for every
+    /// committed transaction a record may still name — what the vote
+    /// fence checks a record's entries against.
+    abandonment_figures: AbandonmentFigures,
     /// Fee-reservation verifications whose balance-read anchor the local
     /// commit pipeline hasn't materialized yet: block hash → (demands,
     /// anchor). The anchor is ancestry-proven, so the commit that
@@ -547,6 +552,7 @@ impl ShardCoordinator {
             deferred_qc: DeferredQc::new(),
             pending_blocks: PendingBlocks::new(),
             fee_ledger: FeeReservationLedger::new(),
+            abandonment_figures: AbandonmentFigures::new(),
             votes: VoteKeeper::new(),
             timeouts: TimeoutKeeper::new(),
             last_timed_out_round: None,
@@ -1079,6 +1085,39 @@ impl ShardCoordinator {
                      not voting"
                 );
                 return true;
+            }
+        }
+        // Each name restates the figures composing its abort takes. A
+        // validator holding the transaction checks them and refuses a
+        // block that misstates one; a validator that does not hold it
+        // cannot say either way and defers rather than accepting.
+        for entry in block
+            .abandonment_records()
+            .iter()
+            .flat_map(AbandonmentRecord::unsettled)
+        {
+            match self.abandonment_figures.check(entry) {
+                Restatement::Exact => {}
+                Restatement::Wrong => {
+                    warn!(
+                        validator = ?self.me,
+                        block_hash = ?block_hash,
+                        tx_hash = ?entry.tx_hash,
+                        "Abandonment record restates figures its transaction does not fix — \
+                         not voting"
+                    );
+                    return true;
+                }
+                Restatement::Unknown => {
+                    trace!(
+                        validator = ?self.me,
+                        block_hash = ?block_hash,
+                        tx_hash = ?entry.tx_hash,
+                        "Abandonment record names a transaction this validator does not hold; \
+                         deferring"
+                    );
+                    return true;
+                }
             }
         }
         let claims = block.abandonment_records().iter().flat_map(|verdict| {
@@ -4941,6 +4980,9 @@ impl ShardCoordinator {
         );
         self.register_dedup_artifacts(block, &manifest, commit_ts);
         self.register_fee_holds(topology_schedule, block, commit_ts);
+        self.abandonment_figures
+            .register_committed(block.transactions());
+        self.abandonment_figures.prune(commit_ts);
 
         // Derive this block's beacon-witness leaves from the same
         // canonical sources the proposer used (receipts from finalized
@@ -11154,19 +11196,32 @@ mod tests {
         }
     }
 
+    /// What abandoning `tx` takes, as the transaction fixes it.
+    fn figures_of(tx: &[u8]) -> UnsettledTx {
+        UnsettledTx {
+            tx_hash: TxHash::from(Hash::from_bytes(tx)),
+            deadline: WeightedTimestamp::from_millis(1_200),
+            declared_work: 5,
+            charge: stub_abort_charge(5),
+        }
+    }
+
     /// A record claiming `shard` left `tx` unsettled when it terminated at
-    /// `terminal_wt`.
+    /// `terminal_wt`, restating the figures [`figures_of`] fixes.
     fn record_naming(shard: ShardId, terminal_wt: u64, tx: &[u8]) -> AbandonmentRecord {
         AbandonmentRecord::departed(
             shard,
             WeightedTimestamp::from_millis(terminal_wt),
-            [UnsettledTx {
-                tx_hash: TxHash::from(Hash::from_bytes(tx)),
-                deadline: WeightedTimestamp::from_millis(1_200),
-                declared_work: 5,
-                charge: stub_abort_charge(5),
-            }],
+            [figures_of(tx)],
         )
+    }
+
+    /// The settled set `ROOT` left, naming `settled` and nothing else.
+    fn root_settled(settled: &[u8]) -> SettledTxSet {
+        SettledTxSet {
+            txs: std::iter::once(TxHash::from(Hash::from_bytes(settled))).collect(),
+            terminal_wt: WeightedTimestamp::from_millis(ROOT_CUT_MS),
+        }
     }
 
     /// `ROOT` terminates at the close of window 0, so a record against it
@@ -11251,17 +11306,74 @@ mod tests {
     fn a_record_the_schedule_attests_is_voted_on() {
         let mut coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
-            ShardId::ROOT,
-            SettledTxSet {
-                txs: std::iter::once(TxHash::from(Hash::from_bytes(b"other"))).collect(),
-                terminal_wt: WeightedTimestamp::from_millis(ROOT_CUT_MS),
-            },
-        );
+        coord.record_settled_txs(ShardId::ROOT, root_settled(b"other"));
+        coord.abandonment_figures.remember(figures_of(b"tx"));
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
         assert!(!coord.fence_abandonment_records(
             &sched,
             &block_with_records(AFTER_CUT_MS, records),
+            BlockHash::ZERO,
+        ));
+    }
+
+    /// A validator holding the transaction checks the restated figures:
+    /// a record naming a vault the transaction does not pay from is
+    /// refused, whatever the settled set says.
+    #[test]
+    fn a_record_restating_the_charge_is_refused_by_a_holder() {
+        let mut coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        coord.record_settled_txs(ShardId::ROOT, root_settled(b"other"));
+        coord.abandonment_figures.remember(figures_of(b"tx"));
+        let restated = AbandonmentRecord::departed(
+            ShardId::ROOT,
+            WeightedTimestamp::from_millis(ROOT_CUT_MS),
+            [UnsettledTx {
+                charge: stub_abort_charge(6),
+                ..figures_of(b"tx")
+            }],
+        );
+        assert!(coord.fence_abandonment_records(
+            &sched,
+            &block_with_records(AFTER_CUT_MS, vec![restated]),
+            BlockHash::ZERO,
+        ));
+    }
+
+    /// A validator that does not hold the transaction cannot check the
+    /// restatement, and defers rather than accepting it — the same
+    /// record its holding peer votes for.
+    #[test]
+    fn a_record_naming_a_transaction_this_validator_does_not_hold_is_deferred() {
+        let mut coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        coord.record_settled_txs(ShardId::ROOT, root_settled(b"other"));
+        let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
+        assert!(coord.fence_abandonment_records(
+            &sched,
+            &block_with_records(AFTER_CUT_MS, records),
+            BlockHash::ZERO,
+        ));
+    }
+
+    /// The arms a departure check cannot answer for are deferred, not
+    /// accepted: a refusal record carries evidence this fence does not
+    /// hold.
+    #[test]
+    fn a_record_on_evidence_the_fence_cannot_check_is_deferred() {
+        let mut coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        coord.abandonment_figures.remember(figures_of(b"tx"));
+        let refused = AbandonmentRecord::new(
+            ShardId::ROOT,
+            Unsettleable::Refused {
+                refused_wt: WeightedTimestamp::from_millis(ROOT_CUT_MS),
+            },
+            [figures_of(b"tx")],
+        );
+        assert!(coord.fence_abandonment_records(
+            &sched,
+            &block_with_records(AFTER_CUT_MS, vec![refused]),
             BlockHash::ZERO,
         ));
     }

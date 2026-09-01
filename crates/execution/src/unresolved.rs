@@ -22,9 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Address, Finalization, MAX_FINALIZATION_DELAY,
-    MAX_VALIDITY_RANGE, ShardId, ShardTrie, Transaction, TxHash, UnsettledTx, Verifiable,
-    WeightedTimestamp,
+    AbandonmentRecord, AbortCharge, Address, Finalization, MAX_VALIDITY_RANGE, ShardId, ShardTrie,
+    Transaction, TxHash, UnsettledTx, Verifiable, WeightedTimestamp,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -163,17 +162,17 @@ impl UnresolvedTxs {
         txs: impl IntoIterator<Item = &'a Arc<Verifiable<Transaction>>>,
     ) {
         for tx in txs {
+            let UnsettledTx {
+                deadline,
+                declared_work,
+                charge,
+                ..
+            } = UnsettledTx::for_transaction(tx);
             let owed = Owed {
                 committed_ts,
-                deadline: tx
-                    .validity_range()
-                    .end_timestamp_exclusive
-                    .plus(MAX_FINALIZATION_DELAY),
-                declared_work: tx.work(),
-                charge: AbortCharge {
-                    vault: tx.fee_vault(),
-                    floor: tx.body().abort_floor(),
-                },
+                deadline,
+                declared_work,
+                charge,
                 remote_prefixes: tx
                     .routing()
                     .all_prefixes()
@@ -533,8 +532,8 @@ mod tests {
         make_finalization, stub_transaction, test_prefix, test_principal,
     };
     use hyperscale_types::{
-        BlockHeight, EPOCH_DURATION, EpochWindows, TimestampRange, TransactionDecision,
-        UnsettledTx, Verified, WeightedTimestamp,
+        BlockHeight, EPOCH_DURATION, EpochWindows, MAX_FINALIZATION_DELAY, TimestampRange,
+        TransactionDecision, UnsettledTx, Verified, WeightedTimestamp,
     };
 
     use super::*;
@@ -604,10 +603,7 @@ mod tests {
 
     /// The burn an abort of `tx` settles.
     fn charge(tx: &Arc<Verifiable<Transaction>>) -> AbortCharge {
-        AbortCharge {
-            vault: tx.fee_vault(),
-            floor: tx.body().abort_floor(),
-        }
+        UnsettledTx::for_transaction(tx).charge
     }
 
     /// A committed transaction is owed an outcome from the moment its
