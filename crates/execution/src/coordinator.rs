@@ -760,6 +760,12 @@ impl ExecutionCoordinator {
             classified,
         } in members
         {
+            // A leg is what this shard runs of a member frozen divided
+            // with it outside the core set. Marked here, beside the
+            // freeze, so a replay marks the same entries.
+            if classified.decomposed().holds() && !classified.core().contains(&local_shard) {
+                self.unresolved.mark_leg(tx.hash());
+            }
             // Block-container entries decoded from the wire land as
             // `Unverified`; lift via `from_persisted` under the same
             // BFT-transitive trust that gates the containing block. Honest

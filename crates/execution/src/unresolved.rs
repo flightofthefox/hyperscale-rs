@@ -77,6 +77,15 @@ struct Owed {
     /// certificate outlives the tick, and a shard that could not say
     /// whether it had issued one would have to assume it had.
     certified: bool,
+    /// Whether this shard ran only a leg of the transaction: it froze
+    /// divided with this shard outside the core set.
+    ///
+    /// A leg's tick attests it and its certificate settles alone, so the
+    /// entry is never abandoned and its own finalization bears no verdict
+    /// on the transaction. What the entry is for is the reclaim: it holds
+    /// the terms a reclaim states, and it lives — on the transaction's
+    /// own clock — exactly as long as the record cell it would take back.
+    leg: bool,
     /// The departed shard a committed record says left this transaction
     /// unsettled.
     ///
@@ -180,9 +189,22 @@ impl UnresolvedTxs {
                     .filter(|prefix| !ShardTrie::shard_owns_prefix(local_shard, *prefix))
                     .collect(),
                 certified: false,
+                leg: false,
                 unsettled_by: None,
             };
             self.owed.entry(tx.hash()).or_insert(owed);
+        }
+    }
+
+    /// Record that this shard runs only a leg of `tx_hash`.
+    ///
+    /// Read off the classification its committing block froze, at the
+    /// same commit, so a rebuilt ledger marks the same entries: the
+    /// freeze is a function of the block and the placement it committed
+    /// under, and the replay re-freezes both.
+    pub fn mark_leg(&mut self, tx_hash: TxHash) {
+        if let Some(owed) = self.owed.get_mut(&tx_hash) {
+            owed.leg = true;
         }
     }
 
@@ -249,6 +271,12 @@ impl UnresolvedTxs {
                         committed_ts: verdict.evidence().moment(),
                         remote_prefixes: BTreeSet::new(),
                         certified: true,
+                        // A leg entry lives inside the replay window —
+                        // its horizon is the transaction's own — so a
+                        // replay registers and marks it before any
+                        // record naming it lands, and nothing here has to
+                        // recover the mark from the record.
+                        leg: false,
                         unsettled_by: Some(verdict.shard()),
                     },
                 );
@@ -378,10 +406,17 @@ impl UnresolvedTxs {
     /// Drop what a committed block's finalizations resolve. Every verdict
     /// arrives this way — accepted, refused, or aborted — so one release
     /// path covers them all.
+    ///
+    /// A leg's own finalization bears no verdict on the transaction and
+    /// releases nothing: the entry stays for the reclaim, and lives to
+    /// its own horizon.
     pub fn release_resolved(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
         for finalization in finalizations {
             for tx_hash in finalization.tx_hashes() {
-                self.owed.remove(&tx_hash);
+                let bears_verdict = self.owed.get(&tx_hash).is_some_and(|owed| !owed.leg);
+                if bears_verdict {
+                    self.owed.remove(&tx_hash);
+                }
             }
         }
     }
@@ -407,10 +442,15 @@ impl UnresolvedTxs {
     /// committed blocks and `now` is the committed weighted timestamp —
     /// so every replica at the same frontier names the same set, which is
     /// what lets a committee sign the abort it composes.
+    ///
+    /// A leg entry is never here: its tick attested it and its
+    /// certificate settled alone, so there is nothing to abandon. What a
+    /// record licenses on one is a reclaim.
     #[must_use]
     pub fn past_deadline(&self, now: WeightedTimestamp) -> Vec<Abandonable> {
         self.owed
             .iter()
+            .filter(|(_, owed)| !owed.leg)
             .filter(|(_, owed)| {
                 now >= owed.deadline
                     && (owed.unsettled_by.is_some() || now < owed.deadline.plus(MAX_VALIDITY_RANGE))
@@ -449,15 +489,30 @@ impl UnresolvedTxs {
     /// counterpart's is not — which is what lets a replay floor reach
     /// every record still owed a verdict.
     ///
+    /// A leg entry has a clock of its own, and it is the transaction's:
+    /// `deadline + MAX_VALIDITY_RANGE`, which is the validity end plus the
+    /// retention horizon — the moment the record cell it would reclaim
+    /// sweeps. Past it there is nothing to take back, whatever evidence
+    /// arrives, so the entry goes on that reading alone. Dropping gives a
+    /// reclaim up; it never licenses one. A record's evidence does not
+    /// extend it, and no counterpart's silence shortens it: a reclaim
+    /// waits on a record, and the record's arms are the evidence, not the
+    /// counterpart's answerability.
+    ///
     /// Returns the transactions dropped because every counterpart has
     /// fallen silent. Each carries whether a committed record had covered
     /// it, which separates a chain that ran out of room to commit the abort
-    /// from one that never had the evidence to compose it.
+    /// from one that never had the evidence to compose it. A leg entry
+    /// dropped at its horizon is not among them: its reservation came
+    /// back with its own finalization, so nothing leaks with it.
     pub fn prune(&mut self, now: WeightedTimestamp) -> Vec<Unanswerable> {
         let mut unanswerable = Vec::new();
         let kept: BTreeMap<TxHash, Owed> = std::mem::take(&mut self.owed)
             .into_iter()
             .filter(|(tx_hash, owed)| {
+                if owed.leg {
+                    return owed.deadline.plus(MAX_VALIDITY_RANGE) > now;
+                }
                 if let Some(shard) = owed.unsettled_by {
                     if self.departed.get(&shard).is_some_and(|departure| {
                         departure.readable_until.is_none_or(|until| now <= until)
@@ -1073,5 +1128,79 @@ mod tests {
             "the shard owning the prefix at commit is the successor, still running",
         );
         assert_eq!(ledger.len(), 1, "so nothing has fallen silent on it");
+    }
+
+    /// A leg's own finalization bears no verdict on the transaction, so
+    /// it releases nothing, and the entry is never abandoned — not at its
+    /// deadline, and not when a committed record names it.
+    #[test]
+    fn a_leg_entry_outlives_its_own_finalization_and_is_never_abandoned() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(4, 60_000);
+        commit(&mut ledger, &tx);
+        ledger.mark_leg(tx.hash());
+        ledger.certify(tx.hash());
+
+        let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Accept);
+        ledger.release_resolved(&[Arc::new(Verifiable::from(own))]);
+        assert_eq!(ledger.len(), 1, "the leg's finalization decides nothing");
+
+        let past = ms(60_000)
+            .plus(MAX_FINALIZATION_DELAY)
+            .plus(Duration::from_secs(1));
+        assert!(
+            ledger.past_deadline(past).is_empty(),
+            "a leg is never abandoned"
+        );
+
+        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+            PARTNER,
+            ms(1_000),
+            [names(&tx)],
+        )]);
+        assert!(
+            ledger.past_deadline(past).is_empty(),
+            "a record licenses a reclaim of it, never an abort"
+        );
+        assert_eq!(ledger.len(), 1);
+    }
+
+    /// A leg entry lives on the transaction's own clock, to the moment
+    /// the record cell it would reclaim sweeps — whether or not a record
+    /// has named it, and whatever its counterparts are doing.
+    #[test]
+    fn a_leg_entry_lives_to_the_record_cells_own_horizon() {
+        let horizon = ms(60_000)
+            .plus(MAX_FINALIZATION_DELAY)
+            .plus(MAX_VALIDITY_RANGE);
+        for covered in [false, true] {
+            let mut ledger = UnresolvedTxs::default();
+            let tx = tx(5, 60_000);
+            commit(&mut ledger, &tx);
+            ledger.mark_leg(tx.hash());
+            ledger.certify(tx.hash());
+            if covered {
+                ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+                    PARTNER,
+                    ms(1_000),
+                    [names(&tx)],
+                )]);
+            }
+            assert!(
+                ledger
+                    .prune(horizon.minus(Duration::from_millis(1)))
+                    .is_empty()
+            );
+            assert_eq!(
+                ledger.len(),
+                1,
+                "covered={covered}: readable until the sweep"
+            );
+            assert!(
+                ledger.prune(horizon).is_empty(),
+                "covered={covered}: a leg dropped at its horizon leaks no reservation"
+            );
+            assert_eq!(ledger.len(), 0, "covered={covered}: gone with the cell");
+        }
     }
 }
