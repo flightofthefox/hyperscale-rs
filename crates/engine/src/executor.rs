@@ -552,6 +552,8 @@ pub fn abort_reason(outcome: &Outcome) -> String {
             amount,
         } => format!("constraint unmet: node {node} parameter {param} carried {amount}"),
         Outcome::NullifierSpent { key } => format!("subintent already spent at {key:?}"),
+        Outcome::EscrowAlreadyClaimed { key } => format!("crossing already claimed at {key:?}"),
+        Outcome::EscrowAlreadyIssued { key } => format!("crossing already issued at {key:?}"),
         Outcome::BaselineDiscarded { flipped } => {
             format!("baseline discarded: group-mate {flipped:?} flipped at apply")
         }
@@ -703,9 +705,15 @@ pub const fn charge_for(outcome: &Outcome, payer: PayerFee) -> Option<u128> {
         // A discarded baseline is the same lost race one step removed:
         // a group-mate flipped at apply and this execution read writes
         // that never committed. Nothing the sender signed caused it.
+        // A crossing another party already took, or one this execution
+        // already issued, joins them on the nullifier's reading: the
+        // cell is committed state no composer could have read at
+        // signing time.
         Outcome::Infeasible { .. }
         | Outcome::ConstraintUnmet { .. }
         | Outcome::NullifierSpent { .. }
+        | Outcome::EscrowAlreadyClaimed { .. }
+        | Outcome::EscrowAlreadyIssued { .. }
         | Outcome::ConditionUnmet { .. }
         | Outcome::BaselineDiscarded { .. }
         | Outcome::Declined { .. } => Some(payer.floor),
