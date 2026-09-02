@@ -19,12 +19,12 @@ use hyperscale_types::{
     PcVote2VerifyError, PcVote3, PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError,
     QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal,
-    Refusal, Round, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
-    SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
-    SpcProposalObject, SpcProposalObjectVerifyError, SpcView, StateAnchor, StateRoot,
-    StateRootVerifyError, StoredReceipt, SubstateKey, TickId, Timeout, Transaction,
-    TransactionRoot, TxHash, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp,
+    Refusal, Restatement, Round, ShardForkProof, ShardId, ShardVoteEquivocation,
+    ShardWitnessPayload, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
+    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
+    StateAnchor, StateRoot, StateRootVerifyError, StoredReceipt, SubstateKey, TickId, Timeout,
+    Transaction, TransactionRoot, TxHash, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp,
 };
 
 /// What one tick's batch produced.
@@ -418,6 +418,14 @@ pub enum ProtocolEvent {
         /// `Ok` when every payer's balance covers its demand; the
         /// failing diagnostic otherwise.
         result: Result<(), String>,
+    },
+
+    /// Abandonment-figure check completed for a pending block.
+    AbandonmentFiguresVerified {
+        /// Block whose records were checked.
+        block_hash: BlockHash,
+        /// How the records' names stand against the committed bodies.
+        restatement: Restatement,
     },
 
     /// Beacon-witness-root verification completed for a pending block.

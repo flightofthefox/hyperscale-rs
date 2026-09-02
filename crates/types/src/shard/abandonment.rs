@@ -105,6 +105,51 @@ impl UnsettledTx {
     }
 }
 
+/// How a record's restatement of its names' figures stands against the
+/// transactions themselves.
+///
+/// The voter's answer to a record. Every figure is read off the
+/// committed body, so a validator whose store holds a transaction
+/// answers for it exactly or wrongly, and one whose store never held it
+/// — having synced past its block — cannot say, which is a third answer
+/// and not a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restatement {
+    /// Every figure of every name is the one its transaction fixes.
+    Exact,
+    /// A figure of this name differs from the one its transaction fixes:
+    /// the record is refused.
+    Wrong(TxHash),
+    /// This validator does not hold this name's transaction, so it cannot
+    /// say: the vote is deferred.
+    Unknown(TxHash),
+}
+
+impl Restatement {
+    /// How `entries` stand against the figures `held` reads off each
+    /// named transaction, `None` for one it does not hold.
+    ///
+    /// A misstatement answers over an unknown name: a proposer who
+    /// restates one figure wrongly is refused whatever else the record
+    /// names, and only a record every name of which checks out is exact.
+    pub fn of(
+        entries: impl IntoIterator<Item = UnsettledTx>,
+        held: impl Fn(TxHash) -> Option<UnsettledTx>,
+    ) -> Self {
+        let mut unknown = None;
+        for entry in entries {
+            match held(entry.tx_hash) {
+                Some(figures) if figures == entry => {}
+                Some(_) => return Self::Wrong(entry.tx_hash),
+                None => {
+                    unknown.get_or_insert(entry.tx_hash);
+                }
+            }
+        }
+        unknown.map_or(Self::Exact, Self::Unknown)
+    }
+}
+
 /// Why a counterpart can never settle the transactions a record names,
 /// and when that became so.
 ///
@@ -313,6 +358,8 @@ impl AbandonmentRecord {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::{Address, AddressClass, Hash, LocalKey};
 
@@ -337,6 +384,82 @@ mod tests {
 
     /// One form: whatever order a caller offers, the record it builds is
     /// the record every other builder would have produced.
+    /// A holder checks every figure: the same entry is exact, and one
+    /// naming another vault, another amount, another reservation or
+    /// another deadline is wrong.
+    #[test]
+    fn a_holder_checks_every_figure() {
+        let held = |hash: TxHash| (hash == tx(1).tx_hash).then(|| tx(1));
+        let restated = |entry: UnsettledTx| Restatement::of([entry], held);
+
+        assert_eq!(restated(tx(1)), Restatement::Exact);
+        let wrong = Restatement::Wrong(tx(1).tx_hash);
+        assert_eq!(
+            restated(UnsettledTx {
+                charge: AbortCharge {
+                    vault: tx(2).charge.vault,
+                    ..tx(1).charge
+                },
+                ..tx(1)
+            }),
+            wrong,
+        );
+        assert_eq!(
+            restated(UnsettledTx {
+                charge: AbortCharge {
+                    amount: tx(1).charge.amount + 1,
+                    ..tx(1).charge
+                },
+                ..tx(1)
+            }),
+            wrong,
+        );
+        assert_eq!(
+            restated(UnsettledTx {
+                declared_work: tx(1).declared_work + 1,
+                ..tx(1)
+            }),
+            wrong,
+        );
+        assert_eq!(
+            restated(UnsettledTx {
+                deadline: tx(1).deadline.plus(Duration::from_millis(1)),
+                ..tx(1)
+            }),
+            wrong,
+        );
+    }
+
+    /// A validator that does not hold a transaction cannot say either
+    /// way, which is a third answer and not a pass — and a misstatement
+    /// elsewhere in the record answers over it.
+    #[test]
+    fn a_non_holder_cannot_say_unless_a_figure_is_wrong() {
+        let held = |hash: TxHash| (hash == tx(1).tx_hash).then(|| tx(1));
+        assert_eq!(
+            Restatement::of([tx(2)], held),
+            Restatement::Unknown(tx(2).tx_hash)
+        );
+        assert_eq!(
+            Restatement::of([tx(2), tx(1)], held),
+            Restatement::Unknown(tx(2).tx_hash)
+        );
+        assert_eq!(
+            Restatement::of(
+                [
+                    tx(2),
+                    UnsettledTx {
+                        declared_work: tx(1).declared_work + 1,
+                        ..tx(1)
+                    }
+                ],
+                held
+            ),
+            Restatement::Wrong(tx(1).tx_hash)
+        );
+        assert_eq!(Restatement::of([], held), Restatement::Exact);
+    }
+
     #[test]
     fn a_record_is_built_in_its_canonical_order() {
         let jumbled =

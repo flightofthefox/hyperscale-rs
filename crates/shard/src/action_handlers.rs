@@ -4,6 +4,7 @@
 //! algorithms, separated from dispatch (thread pool vs inline) and result
 //! delivery (channel vs event queue) concerns.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
@@ -26,14 +27,15 @@ use hyperscale_types::{
     LocalReceiptRootContext, NetworkDefinition, PreparedCommit, PrincipalAddr as AccountAddr,
     ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
-    ReshapeTrigger, RevealChain, Round, ShardId, ShardLoad, SplitChildRoots, StateRoot,
-    StateRootContext, StateRootVerifyError, Stopwatch, StoredReceipt, SubstateKey, SweepFrontier,
-    TerminalRoots, Timeout, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
-    TransactionRootContext, TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
-    VrfProof, WeightedTimestamp, WitnessSources, WorkInFlight, absorb_committed_cells,
-    commit_witness_window, derive_leaves, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, protocol_statics, shard_reveal_sign,
-    signed_bytes, vrf_output_from_proof, work_over_certificates,
+    ReshapeTrigger, Restatement, RevealChain, Round, ShardId, ShardLoad, SplitChildRoots,
+    StateRoot, StateRootContext, StateRootVerifyError, Stopwatch, StoredReceipt, SubstateKey,
+    SweepFrontier, TerminalRoots, Timeout, TimeoutContext, TopologySnapshot, Transaction,
+    TransactionRoot, TransactionRootContext, TxHash, UnsettledTx, ValidatorId, Verifiable,
+    Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
+    WorkInFlight, absorb_committed_cells, commit_witness_window, derive_leaves,
+    local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
+    protocol_statics, shard_reveal_sign, signed_bytes, vrf_output_from_proof,
+    work_over_certificates,
 };
 
 /// Result of QC verification and assembly.
@@ -705,6 +707,39 @@ where
             ctx.notify_protocol(ProtocolEvent::ReservationsVerified { block_hash, result });
         }
 
+        Action::VerifyAbandonmentFigures {
+            block_hash,
+            entries,
+        } => {
+            // A record names transactions committed long before it — a
+            // departure's terminal, a refusal, a deadline probe all come
+            // epochs after the commit — so the store's persist lag never
+            // reaches a name, and a body lifted out of it carries no
+            // derivation of its own: this node derives it, and one it
+            // cannot derive it does not hold.
+            let hashes: Vec<TxHash> = entries.iter().map(|entry| entry.tx_hash).collect();
+            let derivation = ctx.executor.derivation();
+            let held: HashMap<TxHash, UnsettledTx> = ctx
+                .pending_chain
+                .transactions_batch(&hashes)
+                .iter()
+                .filter(|tx| tx.try_derived(derivation.as_ref()).is_ok())
+                .map(|tx| (tx.hash(), UnsettledTx::for_transaction(tx)))
+                .collect();
+            let restatement = Restatement::of(entries, |tx_hash| held.get(&tx_hash).copied());
+            if let Restatement::Wrong(tx_hash) = restatement {
+                tracing::warn!(
+                    ?block_hash,
+                    ?tx_hash,
+                    "Abandonment-figure verification FAILED: the record misstates a figure"
+                );
+            }
+            ctx.notify_protocol(ProtocolEvent::AbandonmentFiguresVerified {
+                block_hash,
+                restatement,
+            });
+        }
+
         Action::VerifyProvisionRoot {
             block_hash,
             expected_root,
@@ -1026,21 +1061,20 @@ where
             let transactions = if fee_checks.is_empty() {
                 transactions
             } else {
-                let mut running: std::collections::HashMap<SubstateKey, u128> = fee_checks
+                let mut running: HashMap<SubstateKey, u128> = fee_checks
                     .iter()
                     .map(|check| (check.vault, check.demand))
                     .collect();
-                let auth_cells: std::collections::HashMap<SubstateKey, Option<Vec<u8>>> =
-                    fee_checks
-                        .iter()
-                        .map(|check| {
-                            let cell = view
-                                .get_substate_at_height(check.auth_cell, fee_read_height)
-                                .flatten();
-                            (check.vault, cell)
-                        })
-                        .collect();
-                let balances: std::collections::HashMap<SubstateKey, u128> = fee_checks
+                let auth_cells: HashMap<SubstateKey, Option<Vec<u8>>> = fee_checks
+                    .iter()
+                    .map(|check| {
+                        let cell = view
+                            .get_substate_at_height(check.auth_cell, fee_read_height)
+                            .flatten();
+                        (check.vault, cell)
+                    })
+                    .collect();
+                let balances: HashMap<SubstateKey, u128> = fee_checks
                     .iter()
                     .map(|check| {
                         let balance = view

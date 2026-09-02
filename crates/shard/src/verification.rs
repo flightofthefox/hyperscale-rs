@@ -14,12 +14,12 @@ use std::sync::Arc;
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_storage::committed_tx_cells;
 use hyperscale_types::{
-    BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertificateRoot,
-    CertifiedBlock, ChainOrigin, Finalization, LinkageError, LocalReceiptRoot, ProvisionTxRootsMap,
-    ProvisionsRoot, QuorumCertificate, ReshapeThresholds, RevealChain, ShardId, SplitChildRoots,
-    StateRoot, SubstateKey, SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot,
-    TransactionRoot, TxHash, Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp,
-    WorkInFlight,
+    AbandonmentRecord, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
+    BlockManifest, CertificateRoot, CertifiedBlock, ChainOrigin, Finalization, LinkageError,
+    LocalReceiptRoot, ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ReshapeThresholds,
+    RevealChain, ShardId, SplitChildRoots, StateRoot, SubstateKey, SweepFrontier, TerminalRoots,
+    TopologySchedule, TopologySnapshot, TransactionRoot, TxHash, UnsettledTx, Verifiable, Verified,
+    VerifiedBlockAssembleError, WeightedTimestamp, WorkInFlight,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -54,6 +54,9 @@ pub enum VerificationKind {
     /// Payer-shard fee reservations against vault balances at the
     /// committed frontier.
     Reservations,
+    /// The figures the block's abandonment records restate, against the
+    /// committed transactions they name.
+    AbandonmentFigures,
 }
 
 /// Lifecycle position for a verification entry. `InFlight` covers the
@@ -415,7 +418,7 @@ impl VerificationPipeline {
 
     /// Whether the given merkle root has been verified for `block_hash`.
     /// State-root callers use [`Self::is_state_root_verified`] instead.
-    fn is_root_verified(&self, block_hash: BlockHash, kind: VerificationKind) -> bool {
+    pub(crate) fn is_root_verified(&self, block_hash: BlockHash, kind: VerificationKind) -> bool {
         matches!(
             self.roots.get(&(block_hash, kind)),
             Some(RootStage::Verified)
@@ -424,7 +427,7 @@ impl VerificationPipeline {
 
     /// Whether a merkle-root verification is currently in-flight for
     /// `(block_hash, kind)`.
-    fn is_root_in_flight(&self, block_hash: BlockHash, kind: VerificationKind) -> bool {
+    pub(crate) fn is_root_in_flight(&self, block_hash: BlockHash, kind: VerificationKind) -> bool {
         matches!(
             self.roots.get(&(block_hash, kind)),
             Some(RootStage::InFlight)
@@ -895,6 +898,10 @@ impl VerificationPipeline {
                 VerificationKind::Reservations,
                 self.is_root_tracked(block_hash, VerificationKind::Reservations),
             )
+            && root_ok(
+                VerificationKind::AbandonmentFigures,
+                !block.abandonment_records().is_empty(),
+            )
             && self.verified_in_flight.contains(&block_hash)
     }
 
@@ -960,6 +967,11 @@ impl VerificationPipeline {
             "skipped(no_local_payers)",
             self.is_root_tracked(block_hash, VerificationKind::Reservations),
         );
+        let abandonment_figures_status = root_status(
+            VerificationKind::AbandonmentFigures,
+            "skipped(no_records)",
+            !block.abandonment_records().is_empty(),
+        );
         let beacon_witness_defer = self.beacon_witness_defer(block_hash);
         let beacon_witness_root_status = match beacon_witness_defer {
             Some((_, BeaconWitnessDefer::WitnessAncestor)) => "deferred(witness_ancestor)",
@@ -987,6 +999,7 @@ impl VerificationPipeline {
             provision_root = provision_root_status,
             provision_tx_root = provision_tx_root_status,
             reservations = reservations_status,
+            abandonment_figures = abandonment_figures_status,
             beacon_witness_root = beacon_witness_root_status,
             beacon_witness_blocker = ?beacon_witness_defer.map(|(blocker, _)| blocker),
             in_flight = in_flight_status,
@@ -1279,6 +1292,36 @@ impl VerificationPipeline {
             demands,
             read_height,
             clock,
+        }]
+    }
+
+    /// Initiate the check of the figures a block's abandonment records
+    /// restate, over every name the records carry; callers skip the
+    /// dispatch when there are none. The handler reads each named
+    /// transaction off the store and answers with a [`Restatement`](hyperscale_types::Restatement),
+    /// which the coordinator folds into the pipeline: exact verifies,
+    /// wrong refuses, and unknown leaves the root in flight — the vote
+    /// deferred, the block pending.
+    pub fn initiate_abandonment_figures_verification(
+        &mut self,
+        block_hash: BlockHash,
+        block: &Block,
+    ) -> Vec<Action> {
+        let entries: Vec<UnsettledTx> = block
+            .abandonment_records()
+            .iter()
+            .flat_map(AbandonmentRecord::unsettled)
+            .copied()
+            .collect();
+        debug!(
+            ?block_hash,
+            names = entries.len(),
+            "Initiating abandonment-figure verification"
+        );
+        self.mark_root_in_flight(block_hash, VerificationKind::AbandonmentFigures);
+        vec![Action::VerifyAbandonmentFigures {
+            block_hash,
+            entries,
         }]
     }
 
@@ -1917,6 +1960,14 @@ impl VerificationPipeline {
                 // anchor lands.
                 self.mark_root_in_flight(block_hash, VerificationKind::Reservations);
             }
+        }
+
+        if self.needs_root(
+            block_hash,
+            VerificationKind::AbandonmentFigures,
+            !block.abandonment_records().is_empty(),
+        ) {
+            actions.extend(self.initiate_abandonment_figures_verification(block_hash, block));
         }
 
         if self.needs_root(block_hash, VerificationKind::BeaconWitnessRoot, true)

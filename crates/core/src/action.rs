@@ -22,8 +22,8 @@ use hyperscale_types::{
     SharedCertificates, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
     SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry,
     SubstateKey, SweepFrontier, TerminalEvidence, TerminalRoots, TickId, Timeout, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable,
-    Verified, VoteCount, WeightedTimestamp, WorkInFlight,
+    Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome, UnsettledTx, ValidatorId,
+    Verifiable, Verified, VoteCount, WeightedTimestamp, WorkInFlight,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -917,6 +917,26 @@ pub enum Action {
         clock: WeightedTimestamp,
     },
 
+    /// Check the figures a block's abandonment records restate against
+    /// the committed transactions they name.
+    ///
+    /// A record restates each name's deadline, reservation and charge so
+    /// a replica whose replay never reached the transaction composes the
+    /// same abort as one that held it; unchecked, that would let a
+    /// proposer choose the vault and the amount an abort burns. Every
+    /// figure is a function of the body, and the body is read off the
+    /// store — where a validator that committed the transaction holds it
+    /// at any distance — so the check needs no window of its own. A body
+    /// the store never held answers `Unknown`, and the vote defers on it
+    /// rather than accepting.
+    /// Returns `ProtocolEvent::AbandonmentFiguresVerified`.
+    VerifyAbandonmentFigures {
+        /// Block whose records are being checked.
+        block_hash: BlockHash,
+        /// Every name the block's records carry; empty never dispatches.
+        entries: Vec<UnsettledTx>,
+    },
+
     /// Build a complete block proposal.
     ///
     /// Computes the new state root from certificates, builds the complete block,
@@ -1708,6 +1728,7 @@ impl Action {
             | Self::VerifyCertificateRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyReservations { .. }
+            | Self::VerifyAbandonmentFigures { .. }
             | Self::VerifyStateRoot { .. }
             | Self::VerifyBeaconWitnessRoot { .. }
             | Self::BuildProposal { .. }
@@ -1814,6 +1835,7 @@ impl Action {
             | Self::VerifyCertificateRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyReservations { .. }
+            | Self::VerifyAbandonmentFigures { .. }
             | Self::BuildProposal { .. }
             | Self::ExecuteTransactions { .. }
             | Self::ResolveTicks { .. }
@@ -1899,6 +1921,7 @@ impl Action {
             | Self::VerifyCertificateRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyReservations { .. }
+            | Self::VerifyAbandonmentFigures { .. }
             | Self::VerifyStateRoot { .. }
             | Self::VerifyBeaconWitnessRoot { .. }
             | Self::BuildProposal { .. }

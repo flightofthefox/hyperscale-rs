@@ -19,9 +19,10 @@ use hyperscale_types::{
     AbandonmentRecord, BlockHash, FinalizationHash, Hash, LocalTimestamp,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK,
     PrincipalAddr, ProposerTimestamp, ProvisionHash, ReadySignal, ReshapeThresholds,
-    ReshapeTrigger, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary,
-    StoredReceipt, SubstateKey, TxClaim, TxOutcome, Unsettleable, WeightedTimestamp, WorkInFlight,
-    derive_reshape_trigger, ready_signal_window, settled_set_verdict,
+    ReshapeTrigger, Restatement, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
+    SplitAtBoundary, StoredReceipt, SubstateKey, TxClaim, TxOutcome, Unsettleable,
+    WeightedTimestamp, WorkInFlight, derive_reshape_trigger, ready_signal_window,
+    settled_set_verdict,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -103,7 +104,6 @@ use hyperscale_types::{
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
 
-use crate::abandonment_figures::{AbandonmentFigures, Restatement};
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::block_sync::{
     BlockSyncHealthDecision, BlockSyncManager, BlockSyncVerificationResult, IngestOutcome,
@@ -312,7 +312,6 @@ pub struct ShardCoordinator {
     /// The figures an abandonment record must restate for every
     /// committed transaction a record may still name — what the vote
     /// fence checks a record's entries against.
-    abandonment_figures: AbandonmentFigures,
     /// Fee-reservation verifications whose balance-read anchor the local
     /// commit pipeline hasn't materialized yet: block hash → (demands,
     /// anchor). The anchor is ancestry-proven, so the commit that
@@ -566,7 +565,6 @@ impl ShardCoordinator {
             deferred_qc: DeferredQc::new(),
             pending_blocks: PendingBlocks::new(),
             fee_ledger: FeeReservationLedger::new(),
-            abandonment_figures: AbandonmentFigures::new(),
             votes: VoteKeeper::new(),
             timeouts: TimeoutKeeper::new(),
             last_timed_out_round: None,
@@ -1196,6 +1194,11 @@ impl ShardCoordinator {
     /// the record is only proposable inside the window where the set can
     /// be read, so a voter inside it either has the set or is about to.
     /// After that window the record is history and nothing re-asks this.
+    ///
+    /// The figures each name restates are not this fence's to check:
+    /// they are read off the committed body, which lives in the store,
+    /// and so are checked by the delegated verification the vote also
+    /// waits on ([`Self::on_abandonment_figures_verified`]).
     fn fence_abandonment_records(
         &self,
         topology_schedule: &TopologySchedule,
@@ -1209,39 +1212,6 @@ impl ShardCoordinator {
         for verdict in block.abandonment_records() {
             if !self.record_evidence_stands(topology_schedule, block_hash, anchored_wt, verdict) {
                 return true;
-            }
-        }
-        // Each name restates the figures composing its abort takes. A
-        // validator holding the transaction checks them and refuses a
-        // block that misstates one; a validator that does not hold it
-        // cannot say either way and defers rather than accepting.
-        for entry in block
-            .abandonment_records()
-            .iter()
-            .flat_map(AbandonmentRecord::unsettled)
-        {
-            match self.abandonment_figures.check(entry) {
-                Restatement::Exact => {}
-                Restatement::Wrong => {
-                    warn!(
-                        validator = ?self.me,
-                        block_hash = ?block_hash,
-                        tx_hash = ?entry.tx_hash,
-                        "Abandonment record restates figures its transaction does not fix — \
-                         not voting"
-                    );
-                    return true;
-                }
-                Restatement::Unknown => {
-                    trace!(
-                        validator = ?self.me,
-                        block_hash = ?block_hash,
-                        tx_hash = ?entry.tx_hash,
-                        "Abandonment record names a transaction this validator does not hold; \
-                         deferring"
-                    );
-                    return true;
-                }
             }
         }
         // Only a departure is a claim about a settled set; a refusal is a
@@ -4346,6 +4316,50 @@ impl ShardCoordinator {
         )
     }
 
+    /// Handle a completed abandonment-figure check.
+    ///
+    /// An exact restatement verifies the root and a wrong one refuses
+    /// the block, as any root does. An unknown name is neither: this
+    /// validator's store never held the transaction, so it cannot say,
+    /// and the root is left in flight — the block stays pending and
+    /// unvoted here, and commits on a quorum's certificate like any
+    /// block this validator did not vote for.
+    pub fn on_abandonment_figures_verified(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        block_hash: BlockHash,
+        restatement: Restatement,
+    ) -> Vec<Action> {
+        match restatement {
+            Restatement::Exact => {}
+            Restatement::Wrong(tx_hash) => {
+                warn!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    ?tx_hash,
+                    "Abandonment record restates figures its transaction does not fix — \
+                     not voting"
+                );
+            }
+            Restatement::Unknown(tx_hash) => {
+                trace!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    ?tx_hash,
+                    "Abandonment record names a transaction this validator does not hold; \
+                     deferring"
+                );
+                return vec![];
+            }
+        }
+        self.on_root_verified_impl(
+            topology_schedule,
+            VerificationKind::AbandonmentFigures,
+            block_hash,
+            matches!(restatement, Restatement::Exact),
+        )
+    }
+
     /// Handle a completed beacon-witness-root verification.
     pub fn on_beacon_witness_root_verified(
         &mut self,
@@ -5153,9 +5167,6 @@ impl ShardCoordinator {
         );
         self.register_dedup_artifacts(block, &manifest, commit_ts);
         self.register_fee_holds(topology_schedule, block, commit_ts);
-        self.abandonment_figures
-            .register_committed(block.transactions());
-        self.abandonment_figures.prune(commit_ts);
 
         // Derive this block's beacon-witness leaves from the same
         // canonical sources the proposer used (receipts from finalized
@@ -11524,7 +11535,6 @@ mod tests {
         let mut coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         coord.record_settled_txs(ShardId::ROOT, root_settled(b"other"));
-        coord.abandonment_figures.remember(figures_of(b"tx"));
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
         assert!(!coord.fence_abandonment_records(
             &sched,
@@ -11533,44 +11543,62 @@ mod tests {
         ));
     }
 
-    /// A validator holding the transaction checks the restated figures:
-    /// a record naming a vault the transaction does not pay from is
-    /// refused, whatever the settled set says.
+    /// The figures each name restates are checked off the committed body
+    /// by a delegated verification, whose three answers fold in
+    /// differently: exact verifies the root, wrong refuses the block, and
+    /// unknown leaves the root in flight — the block pending, the vote
+    /// deferred.
     #[test]
-    fn a_record_restating_the_charge_is_refused_by_a_holder() {
-        let mut coord = fence_coordinator();
+    fn a_records_figures_are_checked_off_the_body_and_folded_three_ways() {
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(ShardId::ROOT, root_settled(b"other"));
-        coord.abandonment_figures.remember(figures_of(b"tx"));
-        let restated = AbandonmentRecord::departed(
-            ShardId::ROOT,
-            WeightedTimestamp::from_millis(ROOT_CUT_MS),
-            [UnsettledTx {
-                charge: stub_abort_charge(6),
-                ..figures_of(b"tx")
-            }],
+        let block = block_with_records(
+            AFTER_CUT_MS,
+            vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")],
         );
-        assert!(coord.fence_abandonment_records(
-            &sched,
-            &block_with_records(AFTER_CUT_MS, vec![restated]),
-            BlockHash::ZERO,
-        ));
-    }
+        let block_hash = block.hash();
+        let tx_hash = figures_of(b"tx").tx_hash;
+        let kind = VerificationKind::AbandonmentFigures;
 
-    /// A validator that does not hold the transaction cannot check the
-    /// restatement, and defers rather than accepting it — the same
-    /// record its holding peer votes for.
-    #[test]
-    fn a_record_naming_a_transaction_this_validator_does_not_hold_is_deferred() {
         let mut coord = fence_coordinator();
-        let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(ShardId::ROOT, root_settled(b"other"));
-        let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
-        assert!(coord.fence_abandonment_records(
-            &sched,
-            &block_with_records(AFTER_CUT_MS, records),
-            BlockHash::ZERO,
-        ));
+        install_complete_block(&mut coord, &block);
+        let actions = coord
+            .verification
+            .initiate_abandonment_figures_verification(block_hash, &block);
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::VerifyAbandonmentFigures { entries, .. }] if *entries == vec![figures_of(b"tx")]
+            ),
+            "the names go to the store: {actions:?}"
+        );
+        assert!(coord.verification.is_root_in_flight(block_hash, kind));
+
+        coord.on_abandonment_figures_verified(&sched, block_hash, Restatement::Unknown(tx_hash));
+        assert!(
+            coord.verification.is_root_in_flight(block_hash, kind),
+            "an unknown name leaves the root in flight"
+        );
+        assert!(
+            coord.pending_blocks.get(block_hash).is_some(),
+            "and the block pending"
+        );
+
+        coord.on_abandonment_figures_verified(&sched, block_hash, Restatement::Wrong(tx_hash));
+        assert!(
+            coord.pending_blocks.get(block_hash).is_none(),
+            "a wrong figure refuses the block"
+        );
+
+        let mut coord = fence_coordinator();
+        install_complete_block(&mut coord, &block);
+        coord
+            .verification
+            .initiate_abandonment_figures_verification(block_hash, &block);
+        coord.on_abandonment_figures_verified(&sched, block_hash, Restatement::Exact);
+        assert!(
+            coord.verification.is_root_verified(block_hash, kind),
+            "an exact restatement verifies the root"
+        );
     }
 
     /// A refusal record is checked against this validator's own mirror
@@ -11590,7 +11618,6 @@ mod tests {
         };
 
         let mut matching = fence_coordinator();
-        matching.abandonment_figures.remember(figures_of(b"tx"));
         matching.record_refusal(ShardId::ROOT, tx_hash, mirror(refused_wt));
         assert!(
             !matching.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
@@ -11598,7 +11625,6 @@ mod tests {
         );
 
         let mut mismatched = fence_coordinator();
-        mismatched.abandonment_figures.remember(figures_of(b"tx"));
         mismatched.record_refusal(
             ShardId::ROOT,
             tx_hash,
@@ -11609,8 +11635,7 @@ mod tests {
             "a mirror at another anchor refuses it"
         );
 
-        let mut absent = fence_coordinator();
-        absent.abandonment_figures.remember(figures_of(b"tx"));
+        let absent = fence_coordinator();
         assert!(
             absent.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
             "no mirror defers it"
@@ -11642,7 +11667,6 @@ mod tests {
         };
 
         let mut matching = fence_coordinator();
-        matching.abandonment_figures.remember(figures_of(b"tx"));
         matching.record_absence(ShardId::ROOT, tx_hash, mirror(deadline));
         assert!(
             !matching.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
@@ -11665,8 +11689,7 @@ mod tests {
             "a record probed before the deadline is refused whatever the mirror holds"
         );
 
-        let mut absent = fence_coordinator();
-        absent.abandonment_figures.remember(figures_of(b"tx"));
+        let absent = fence_coordinator();
         assert!(
             absent.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
             "no proof defers it"

@@ -145,7 +145,7 @@ pub use receipt::global::GlobalReceipt;
 pub use receipt::metadata::{ExecutionMetadata, FeeSummary, LogLevel};
 pub use receipt::stored::StoredReceipt;
 pub use shard::abandonment::{
-    AbandonmentRecord, AbortCharge, Absence, Refusal, Unsettleable, UnsettledTx,
+    AbandonmentRecord, AbortCharge, Absence, Refusal, Restatement, Unsettleable, UnsettledTx,
 };
 pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch, LinkageError};
 pub use shard::certified_header::{CertifiedBlockHeader, CertifiedHeaderVerifyError};
