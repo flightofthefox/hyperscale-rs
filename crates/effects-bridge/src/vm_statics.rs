@@ -261,7 +261,18 @@ struct DeclaredAccess {
 /// exclusive class by the time they are built — and which of the three a
 /// key holds is exactly what decides whether two transactions may be in
 /// flight on it together.
-fn classify_declared_access(routing: &RoutedTransaction) -> DeclaredAccess {
+///
+/// The price is a debit on `fee_payer`'s vault, and the declaration
+/// names it like every other debit: the payer's shard is then a
+/// participant by the rule every written shard is one by, whether or
+/// not the payer touches a node — a sponsored transaction reaches the
+/// shard that charges it — and the charge contends with whatever else
+/// reaches the vault on the mode a debit has, commutative with another
+/// debit and exclusive with a write.
+fn classify_declared_access(
+    routing: &RoutedTransaction,
+    fee_payer: PrincipalAddr,
+) -> DeclaredAccess {
     let mut access = DeclaredAccess {
         read_keys: BTreeSet::new(),
         write_keys: BTreeSet::new(),
@@ -284,6 +295,12 @@ fn classify_declared_access(routing: &RoutedTransaction) -> DeclaredAccess {
             }
         }
         access.declared_modes.push((key, effect.mode));
+    }
+    let fee_vault = DeclaredKey::Cell(vault_key(fee_payer, *XRD));
+    let fee_mode = (fee_vault, Mode::Delta { moves: Moves::Out });
+    access.write_keys.insert(fee_vault);
+    if !access.declared_modes.contains(&fee_mode) {
+        access.declared_modes.push(fee_mode);
     }
     access.declared_modes.sort_unstable();
     access
@@ -688,7 +705,7 @@ impl Derivation for BridgeStatics {
             write_keys,
             provision_keys,
             declared_modes,
-        } = classify_declared_access(&routing);
+        } = classify_declared_access(&routing, vm.fee_payer);
         check_provision_weight(&provision_keys)?;
         let prefixes = |keys: &BTreeSet<DeclaredKey>| -> Vec<Address> {
             keys.iter()
