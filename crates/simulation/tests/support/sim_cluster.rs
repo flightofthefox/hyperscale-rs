@@ -236,6 +236,30 @@ impl SimCluster {
         accounts: &[(PrincipalAddr, u128)],
         packages: GenesisPackages,
     ) -> Self {
+        Self::grown(config, seed, accounts, packages, false)
+    }
+
+    /// [`Self::with_grown_packages`] with every pool extra on its own
+    /// host, so the committees the grow seats share no host — what a
+    /// fault rule keyed on committee hosts needs to cut one shard's
+    /// traffic and no other's.
+    #[must_use]
+    pub fn with_grown_packages_on_dedicated_pool_hosts(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+        packages: GenesisPackages,
+    ) -> Self {
+        Self::grown(config, seed, accounts, packages, true)
+    }
+
+    fn grown(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+        packages: GenesisPackages,
+        dedicated_pool_hosts: bool,
+    ) -> Self {
         let grow_config = ScenarioConfig {
             split_bytes: 0,
             ..*config
@@ -243,7 +267,7 @@ impl SimCluster {
         let mut cluster = Self::build_full(&BuildArgs {
             config: &grow_config,
             seed,
-            dedicated_pool_hosts: false,
+            dedicated_pool_hosts,
             accounts,
             execution_mode: ExecutionMode::Serial,
             packages,

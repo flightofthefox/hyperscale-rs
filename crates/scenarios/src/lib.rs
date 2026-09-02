@@ -67,6 +67,7 @@ pub use reshape::{
 };
 pub use route::{
     FIRST_VENUE_SHARD, ROUTE_INPUT, ROUTES, RouteReport, SECOND_VENUE_SHARD, TRADER_SHARD,
+    a_route_cut_off_across_its_deadline_is_not_reclaimed,
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
     a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
     route_genesis_accounts,

@@ -28,6 +28,7 @@ use hyperscale_scenarios::{
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_published_package_matures_before_it_runs,
+    a_route_cut_off_across_its_deadline_is_not_reclaimed,
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
     a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
     a_spent_nullifier_is_swept_once_unreachable, a_swap_charges_its_caller_its_input_and_one_price,
@@ -432,6 +433,27 @@ fn a_route_settles_across_two_venues_sim() {
 fn a_route_settles_when_its_venues_certificates_are_dropped_sim() {
     let mut cluster = route_cluster();
     cluster.run_faultable(a_route_settles_when_its_venues_certificates_are_dropped);
+}
+
+/// [`route_cluster`] with every committee on hosts of its own, for a cut
+/// keyed on the venues' hosts.
+fn route_cluster_on_dedicated_hosts() -> SimCluster {
+    SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &ScenarioConfig {
+            num_shards: 4,
+            pool_surplus: 14,
+            ..cross_shard_config()
+        },
+        42,
+        &route_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    )
+}
+
+#[test]
+fn a_route_cut_off_across_its_deadline_is_not_reclaimed_sim() {
+    let mut cluster = route_cluster_on_dedicated_hosts();
+    cluster.run_faultable(a_route_cut_off_across_its_deadline_is_not_reclaimed);
 }
 
 #[test]

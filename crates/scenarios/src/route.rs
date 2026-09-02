@@ -13,11 +13,12 @@ use std::time::Duration;
 use hyperscale_engine::XRD;
 use hyperscale_types::{
     Address, Ed25519PrivateKey, PrincipalAddr, ShardId, TransactionDecision, TransactionStatus,
-    TxHash,
+    TxHash, WeightedTimestamp, delivery_window_close, reclaim_probe_anchor,
 };
 
+use crate::straddler::isolate_ec_intake;
 use crate::support::conservation::{Charges, World};
-use crate::support::query::{declared_price, held_at, vault_balance};
+use crate::support::query::{declared_price, held, held_at, vault_balance};
 use crate::support::tx::{build_route_tx, validity_around};
 use crate::support::{Budget, Cluster, FaultableCluster, epochs};
 use crate::venue::{
@@ -128,6 +129,138 @@ pub fn a_route_settles_when_its_venues_certificates_are_dropped<C: FaultableClus
     assert!(
         dropped.fired() > 0,
         "the certificate channel must actually have been exercised and cut",
+    );
+}
+
+/// How long past the reclaim probe's anchor the cut is held: enough for
+/// a probe issued at the anchor to have fetched its proof and for any
+/// reclaim it licensed to have composed and committed.
+const PROBE_SETTLING: Duration = Duration::from_secs(12);
+
+/// One route with the certificate channel cut across the trader's
+/// deadline, and the trader's paid leg not reclaimed at it.
+///
+/// Neither venue can hear the other, pushes and pulls alike, so the
+/// two-shard core commits the route and cannot settle it while the cut
+/// stands. The trader's leg meanwhile pays its input, reaches its
+/// deadline with the core silent, and asks the core's chain whether it
+/// committed the transaction — a leg's crossing is reclaimed only on
+/// proof the core never did, and a core that committed and cannot yet
+/// answer is exactly what that probe must not mistake for absence. So
+/// the leg stays paid. The cut lifts inside the delivery window, the
+/// core settles, and the route accepts: paid once, delivered once.
+///
+/// One route rather than the usual four: the core's tick for the first
+/// holds the venues' reserves as provisional claims until its
+/// counterpart's certificate arrives, so a second route could not
+/// compose while the cut stood and would be abandoned at the deadline
+/// instead — a refusal the leg's reclaim rightly follows, and not the
+/// boundary this pins.
+///
+/// Requires disjoint committees — a host serving both venues, or a venue
+/// and the trader, would carry certificates in-process past the cut or
+/// be cut off from its own shard by it.
+///
+/// # Panics
+///
+/// Panics if either venue misses its budget standing up, if the trader's
+/// leg never pays, if the cut never fires or lifts outside the delivery
+/// window, if the trader is refunded while the cut stands past the
+/// probe's anchor, if the route does not accept once the cut lifts, or
+/// if either side of the pair is not conserved.
+pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let (key, trader) = &traders[0];
+    // Neither venue can obtain the other's certificate by any path, push
+    // or pull; the trader's shard is untouched, and its leg awaits nobody.
+    let cut = [
+        isolate_ec_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
+        isolate_ec_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
+    ];
+    let (xrd, units) = route_worlds(c, &first, &second, &traders);
+
+    let mut charges = Charges::default();
+    let validity = validity_around(c.now());
+    let route = build_route_tx(
+        key,
+        *trader,
+        (&first.meta, &second.meta),
+        *XRD,
+        ROUTE_INPUT,
+        0,
+        validity,
+    );
+    let hash = charges.submit(c, route);
+
+    // The trader's withdraw is a leg, its own to reach: it pays the input
+    // and the price whatever the core does after.
+    assert!(
+        c.run_until(epochs(8), |c| held(c, trader.address(), *XRD)
+            < SWAPPER_FUNDING - ROUTE_INPUT),
+        "the trader's leg must pay before the core is asked anything",
+    );
+    let paid = held(c, trader.address(), *XRD);
+
+    // Past the anchor a probe of the core is licensed at, and far enough
+    // past it that the proof has come back and any reclaim it licensed
+    // has composed and committed.
+    let validity_end = validity.end_timestamp_exclusive;
+    let held_until = reclaim_probe_anchor(validity_end).plus(PROBE_SETTLING);
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    assert!(
+        c.run_until(epochs(8), |c| clock(c) >= held_until),
+        "the cut must stand past the reclaim probe's anchor",
+    );
+    assert!(
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the certificate channel must actually have been exercised and cut",
+    );
+    assert!(
+        clock(c) < delivery_window_close(validity_end),
+        "the cut has to lift inside the delivery window, or the core's output has nowhere to land",
+    );
+    for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+        assert!(
+            c.chain_fate(shard, hash).1.is_none(),
+            "the core must still be waiting on its certificates when the cut lifts, \
+             or the reclaim below is answered by its verdict rather than by the probe",
+        );
+    }
+    assert_eq!(
+        held(c, trader.address(), *XRD),
+        paid,
+        "a leg whose core committed the transaction must stay paid at its deadline: \
+         the probe finds the core's block, and the reclaim is refused",
+    );
+
+    // Whole network from here: the certificates flow, the core settles,
+    // and the trader banks the route's output.
+    c.clear_drops();
+    assert!(
+        c.run_until(epochs(8), |c| held(c, trader.address(), *XRD) > paid),
+        "the core must settle once its certificates flow, and the route bank its output",
+    );
+    let status = c.tx_status(hash);
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "a route cut off across its deadline must still settle whole; status = {status:?}",
+    );
+    xrd.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a route cut off across the deadline",
+    );
+    units.assert_settles_within(
+        c,
+        &Charges::default(),
+        epochs(8),
+        "a route cut off across the deadline",
     );
 }
 
