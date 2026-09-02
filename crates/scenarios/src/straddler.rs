@@ -508,12 +508,13 @@ fn terminating_payer_world<C: Cluster>(c: &C, setup: &SplitStraddlerSetup) -> Wo
 /// state, and the claim here is about all of it at once.
 ///
 /// Then the shard terminates and the refused shape is admitted by the
-/// successor: the probe it refused is handed back at the cut with its window
-/// still open, and the successor includes it. Neither the ledger nor the lock
-/// set is carried across: both are projections of a shard's own committed
-/// chain, and the successor's chain begins at its seeded genesis. The release
-/// is by construction rather than by an explicit sweep, which is what this
-/// pins.
+/// successor. Neither the ledger nor the lock set is carried across: both
+/// are projections of a shard's own committed chain, and the successor's
+/// chain begins at its seeded genesis. The release is by construction
+/// rather than by an explicit sweep, which is what this pins. The refused
+/// probe itself is handed back at the cut only where its window is still
+/// open there, which one clock's epoch allows and another's does not, so
+/// the release is a fresh submission and the probe's fate is not read.
 ///
 /// The payer is funded above one fee ceiling and below two, so an inherited
 /// reservation would refuse the successor's probe on its own.
@@ -527,8 +528,8 @@ fn terminating_payer_world<C: Cluster>(c: &C, setup: &SplitStraddlerSetup) -> Wo
 /// Panics if the splitter never commits the transaction, the control is
 /// refused, the encumbered probe is admitted anyway, the transaction never goes
 /// terminal or finalizes despite the cut, the split misses its budget, the
-/// transaction applies on either chain, or the successor refuses the probe
-/// its predecessor refused.
+/// transaction applies on either chain, the splitter included the probe
+/// after all, or the successor refuses the shape its predecessor refused.
 pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCluster) {
     let splitter = STRADDLER_SPLITTER;
     let survivor = STRADDLER_SURVIVOR;
@@ -621,13 +622,30 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
         );
     }
 
-    // The release: the shape the predecessor refused is admitted by the
-    // successor — the very probe it refused, handed back at the cut with
-    // its window still open. The successor's ledger is a projection of its
-    // own committed chain, which begins at the seeded genesis, so there is
-    // no hold left to count against the payer — the reservation died with
-    // the shard that held it, without anything having to sweep it.
-    let status = await_tx_terminal(c, blocked_hash, epochs(10));
+    // The refused probe never reached the chain that refused it. Whether
+    // the successor admits it is its window's to say — handed back at the
+    // cut with the window still open it lands there, and closed before
+    // the cut it lapses — so the release is a fresh submission of the
+    // same shape rather than a reading of the probe's fate.
+    assert!(
+        c.chain_fate(splitter, blocked_hash).0.is_none(),
+        "the splitter must never have included the probe it refused",
+    );
+
+    // The release: the same shape the predecessor refused is admitted by
+    // the successor. Its ledger is a projection of its own committed
+    // chain, which begins at the seeded genesis, so there is no hold left
+    // to count against the payer — the reservation died with the shard
+    // that held it, without anything having to sweep it.
+    let released = build_transfer_tx(
+        payer_key,
+        *payer,
+        setup.successor_recipient,
+        STRADDLER_PAYMENT,
+        validity_around(c.now()),
+    );
+    let released_hash = charges.submit(c, released);
+    let status = await_tx_terminal(c, released_hash, epochs(10));
     assert!(
         matches!(
             status,
@@ -637,7 +655,7 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
          in-flight state outlives the shard; status = {status:?}",
     );
     assert!(
-        c.chain_fate(successor, blocked_hash).1.is_some(),
+        c.chain_fate(successor, released_hash).1.is_some(),
         "the release must land on the successor, not on the chain that refused it",
     );
     // A terminal status is reported when this shard decides the outcome,
@@ -651,8 +669,9 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
         "the released transaction must actually have spent from the payer's vault",
     );
 
-    // The abort moved nothing and charged nothing, and the control and the
-    // release each moved their payment once and paid once.
+    // The abort moved nothing and charged nothing; the control, the
+    // release, and the refused probe where the successor admitted it,
+    // each moved their payment once and paid once.
     world.assert_settles_within(
         c,
         &charges,
