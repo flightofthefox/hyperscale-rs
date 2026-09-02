@@ -21,15 +21,15 @@ use hyperscale_transactions::{Client, DEFAULT_GAS_LIMIT, Terms};
 use hyperscale_types::{
     AccountSigner, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
     EnvelopeExt, Epoch, MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR,
-    MlDsa65PrivateKey, NetworkId, NetworkParams, PrincipalAddr, SchemeId, ShardId, ShardTrie,
-    StakePoolId, StakePoolSeat, TimestampRange, Transaction, TransactionBody, TransactionEnvelope,
-    ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
+    MlDsa65PrivateKey, NetworkId, NetworkParams, PrincipalAddr, ResourceAddr, SchemeId, ShardId,
+    ShardTrie, StakePoolId, StakePoolSeat, TimestampRange, Transaction, TransactionBody,
+    TransactionEnvelope, ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
     Composed, Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader,
     ManifestGraph, ResourceKind, Totality, Value, issued_resource, package_hash,
 };
-use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
+use hyperscale_vm_fixtures::{amm, amm_package_hash, lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::signing::{self, sign_subintent};
 use hyperscale_vm_manifest_builder::{
     EnvelopeBuilder, GraphBuilder, IntentBuilder, TypedBuilder, TypedError,
@@ -1665,6 +1665,201 @@ pub fn published_instance(artifact: &[u8], salt: u8, founder: PrincipalAddr) -> 
         ],
         salt: Hash32([salt; 32]),
     }
+}
+
+/// The fee a scenario venue takes: thirty basis points, at the scale the
+/// pool's bounded fee type holds.
+const VENUE_FEE: u128 = 30 * (1_000_000_000_000_000_000 / 10_000);
+
+/// The metadata of a venue trading `pair` whose address routes to
+/// `shard`.
+///
+/// A venue's address derives from its package, its configuration and a
+/// salt, so a venue on one shard in particular asks for the salt that
+/// puts it there.
+///
+/// # Panics
+///
+/// If no salt in a byte lands the venue on `shard`, which would mean the
+/// derivation had stopped spreading addresses.
+#[must_use]
+pub fn venue_on(shard: ShardId, pair: (ResourceAddr, ResourceAddr)) -> InstanceMeta {
+    // The uniform trie the target leaf belongs to, so a venue grinds onto
+    // a shard of whatever depth the world has.
+    let trie = ShardTrie::uniform_from_count(1u64 << shard.depth());
+    for salt in 0..=u8::MAX {
+        let meta = InstanceMeta {
+            package: amm_package_hash(&ProtocolHasher),
+            config: vec![
+                Value::Address(pair.0.address()),
+                Value::Address(pair.1.address()),
+                Value::U128(VENUE_FEE),
+            ],
+            salt: Hash32([salt; 32]),
+        };
+        if trie.shard_for_prefix(meta.address(&ProtocolHasher).address()) == shard {
+            return meta;
+        }
+    }
+    panic!("no venue salt lands on {shard:?}");
+}
+
+/// Stock a venue: both sides withdrawn from one account, handed in
+/// together, and the claim they mint filed back.
+///
+/// One transaction because the curve prices a pair — a pool holding one
+/// side quotes against an empty reserve, which is the shape its own
+/// refusal exists to name.
+///
+/// # Panics
+///
+/// If the scenario world does not answer the call, which would be a
+/// defect in the world rather than in the call.
+#[must_use]
+pub fn build_add_liquidity_tx(
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    venue: &InstanceMeta,
+    pair: (ResourceAddr, ResourceAddr),
+    sides: (u128, u128),
+    validity: TimestampRange,
+) -> Transaction {
+    build_venue_tx(payer, venue, validity, &|pool, b| {
+        let x = account::withdraw(b, from, pair.0, sides.0)?;
+        let y = account::withdraw(b, from, pair.1, sides.1)?;
+        let claim = pool.add_liquidity(b, x, y)?;
+        account::deposit(b, from, claim)
+    })
+}
+
+/// A swap: withdraw one side, hand it to the venue, bank what comes
+/// back.
+///
+/// The shape the whole venue question is about: the withdraw is a leg
+/// on the caller's shard, the pricing is the core on the venue's, and
+/// the deposit is a delivery back — so the caller is the leg and the
+/// venue the core, as a stake into a remote pool is.
+///
+/// # Panics
+///
+/// If the scenario world does not answer the call, which would be a
+/// defect in the world rather than in the call.
+#[must_use]
+pub fn build_swap_tx(
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    venue: &InstanceMeta,
+    paying: ResourceAddr,
+    amount: u128,
+    min_out: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    build_venue_tx(payer, venue, validity, &|pool, b| {
+        let funds = account::withdraw(b, from, paying, amount)?;
+        let bought = pool.swap(b, funds, min_out)?;
+        account::deposit(b, from, bought)
+    })
+}
+
+/// A two-hop route: withdraw one side, price it at the first venue,
+/// price what comes back at the second, and bank the result.
+///
+/// `second_min_out` is the floor the second hop holds out for — zero to
+/// take whatever it is quoted, and more than the pool can pay to make
+/// the route refuse at its second venue, where a refusal has the most to
+/// take back.
+///
+/// The shape a multi-shard core takes. Both venues are core — a swap
+/// prices against reserves it also writes, so neither is reservation
+/// shaped nor total — and where they sit on different shards the core
+/// spans both and each awaits the other's certificate.
+///
+/// # Panics
+///
+/// If the scenario world does not answer either call.
+#[must_use]
+pub fn build_route_tx(
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    venues: (&InstanceMeta, &InstanceMeta),
+    paying: ResourceAddr,
+    amount: u128,
+    second_min_out: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    let metas = [venues.0.clone(), venues.1.clone()];
+    build_venues_tx(payer, &metas, validity, &|pools, b| {
+        let funds = account::withdraw(b, from, paying, amount)?;
+        let mid = pools[0].swap(b, funds, 0)?;
+        let out = pools[1].swap(b, mid, second_min_out)?;
+        account::deposit(b, from, out)
+    })
+}
+
+/// One call against a sealed venue, typed against the record the seal
+/// wrote.
+fn build_venue_tx(
+    payer: &Ed25519PrivateKey,
+    venue: &InstanceMeta,
+    validity: TimestampRange,
+    leg: &dyn Fn(&amm::Amm, &mut TypedBuilder<'_>) -> Result<(), TypedError>,
+) -> Transaction {
+    build_venues_tx(payer, std::slice::from_ref(venue), validity, &|pools, b| {
+        leg(&pools[0], b)
+    })
+}
+
+/// What a route does with the venues an envelope composed: one closure
+/// over all of them, so a hop can hand its output to the next.
+type VenueRoute<'a> = dyn Fn(&[amm::Amm], &mut TypedBuilder<'_>) -> Result<(), TypedError> + 'a;
+
+/// One call against every venue in `venues`, each typed against the
+/// record its own seal wrote.
+///
+/// The composer is handed all of them at once, which is what lets a
+/// route hand one venue's output to the next: a call types against the
+/// record the chain answers with, and a bucket only names a producer the
+/// same envelope declares.
+///
+/// # Panics
+///
+/// If the scenario world does not answer the call.
+fn build_venues_tx(
+    payer: &Ed25519PrivateKey,
+    venues: &[InstanceMeta],
+    validity: TimestampRange,
+    route: &VenueRoute<'_>,
+) -> Transaction {
+    let client = client();
+    let chain = client.records();
+    let composed = Composed::new(&chain, venues, &ProtocolHasher);
+    let pools: Vec<amm::Amm> = venues
+        .iter()
+        .map(|venue| amm::Amm::at(venue.address(&ProtocolHasher)))
+        .collect();
+    let (mut env, mut root) = EnvelopeBuilder::new(
+        &composed,
+        &ProtocolHasher,
+        account_address(&payer.public_key().0),
+        scenario_header(validity),
+    );
+    route(&pools, &mut root).expect("every venue call types against its signature");
+    env.seal(root)
+        .expect("the root declares nothing to discharge")
+        .none()
+        .expect("the root declares no socket");
+    let tree = env.build().expect("the intent declares no hole");
+
+    Transaction::new(client.sign_tree(
+        &tree,
+        Vec::new(),
+        payer,
+        Terms {
+            max_fee: MAX_FEE,
+            validity,
+            message: Vec::new(),
+        },
+    ))
 }
 
 /// Build the seal of an instance of a runtime-published package.

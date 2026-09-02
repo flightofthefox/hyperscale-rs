@@ -23,8 +23,10 @@ mod faults;
 mod liveness;
 mod multi_vnode;
 mod reshape;
+mod route;
 mod straddler;
 mod transactions;
+mod venue;
 mod witnesses;
 
 pub use contention::{ContentionReport, cross_shard_fraction, participant_count_sweep};
@@ -62,6 +64,12 @@ pub use reshape::{
     split_boundary_hands_back_what_it_never_included, split_boundary_refuses_a_replay,
     split_lifecycle,
 };
+pub use route::{
+    FIRST_VENUE_SHARD, ROUTE_INPUT, ROUTES, RouteReport, SECOND_VENUE_SHARD, TRADER_SHARD,
+    a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
+    a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
+    route_genesis_accounts,
+};
 pub use straddler::{
     isolate_ec_intake, merge_straddler_atomic, split_straddler_atomic,
     split_straddler_ec_partition_atomic, split_straddler_run,
@@ -75,6 +83,14 @@ pub use support::{
     vote_reshape_threshold, wait,
 };
 pub use transactions::livelock_resolves_promptly;
+pub use venue::{
+    SWAP_INPUT, SWAPPER_SHARD, SWAPPERS, VENUE_SHARD, VenueReport, WIDE_VENUE_SHARD,
+    a_swap_charges_its_caller_its_input_and_one_price,
+    a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,
+    a_swap_the_venue_refuses_gives_its_caller_back_its_leg, hot_venue_clears_swaps,
+    hot_venue_clears_swaps_on, venue_genesis_accounts, venue_genesis_accounts_on,
+    wide_swapper_shards,
+};
 pub use witnesses::{
     delegation_folds_into_beacon_state, pool_capacity_caps_registrations,
     pool_transfer_moves_operatorship, re_registration_of_a_live_validator_is_a_no_op,

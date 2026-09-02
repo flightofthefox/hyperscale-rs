@@ -12,12 +12,88 @@ use hyperscale_engine::XRD;
 use hyperscale_engine::genesis::vault_key;
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
-    Address, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, PendingReshape, ShardId, Stake,
-    StakePool, StakePoolId, StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
-    ValidatorStatus,
+    Address, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, PendingReshape, ResourceAddr,
+    ShardId, Stake, StakePool, StakePoolId, StateRoot, SubstateKey, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
 };
 
 use super::Cluster;
+
+/// The deepest leaf [`served_shards`] looks for. A scenario that grows or
+/// splits reaches depth two; nothing here goes deeper.
+const MAX_SEARCHED_DEPTH: u32 = 3;
+
+/// What a scenario transaction is charged, whatever refuses it.
+///
+/// The one figure the fee schedule has: a success burns it, and so does
+/// every refusal a sender can reach, so a scenario asserting what a
+/// vault moved reads it once and compares against it either way.
+/// Borrowed from the cluster's own derivation, because a transaction a
+/// scenario assembled has been derived by nobody.
+///
+/// # Panics
+///
+/// Panics if the transaction does not derive, which for a scenario
+/// fixture means it was built wrong.
+pub fn declared_price<C: Cluster + ?Sized>(c: &C, tx: &Transaction) -> u128 {
+    tx.price_under(c.derivation().as_ref())
+        .expect("a scenario fixture derives")
+}
+
+/// Every shard this cluster currently serves, ascending.
+///
+/// There is no enumeration on [`Cluster`] — a scenario names the shards
+/// it stood up — so this asks the only question the trait answers, over
+/// every leaf a scenario could have reached.
+#[must_use]
+pub fn served_shards<C: Cluster + ?Sized>(c: &C) -> Vec<ShardId> {
+    (0..=MAX_SEARCHED_DEPTH)
+        .flat_map(|depth| (0..1u64 << depth).map(move |path| ShardId::leaf(depth, path)))
+        .filter(|shard| c.serves_shard(*shard))
+        .collect()
+}
+
+/// What `owner` holds of `resource`, wherever its prefix currently sits.
+///
+/// Searched rather than routed, because a scenario that reshapes moves
+/// the answer: the cell keeps its key across a split — the key is the
+/// owner's prefix and a local half, neither of which a reshape rewrites
+/// — but the shard serving it changes.
+#[must_use]
+pub fn held<C: Cluster + ?Sized>(c: &C, owner: Address, resource: ResourceAddr) -> u128 {
+    held_at(c, vault_key(owner, resource))
+}
+
+/// The committed amount in one cell, wherever its prefix currently sits.
+///
+/// The general form of [`held`], for value a component keeps in its own
+/// state rather than in the protocol's vault slot: an account's balance
+/// is reachable from its address, and a pool's reserves are reachable
+/// only from the package's own slot, which the scenario declaring the
+/// package is what knows.
+#[must_use]
+pub fn held_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> u128 {
+    served_shards(c)
+        .into_iter()
+        .find_map(|shard| c.substate(shard, cell.owner, cell.local.0))
+        .map_or(0, |bytes| {
+            <[u8; 16]>::try_from(bytes.as_slice()).map_or(0, u128::from_le_bytes)
+        })
+}
+
+/// What `owners` hold of `resource` between them.
+///
+/// Accounts only. Value a component keeps in its own state — a pool's
+/// reserves — is not reachable from an address, so a scenario holding a
+/// component to conservation adds those cells itself through
+/// [`held_at`]. A sum that omits them is not wrong, but it is blind to
+/// exactly the half a cross-shard route moves.
+#[must_use]
+pub fn total_held<C: Cluster + ?Sized>(c: &C, owners: &[Address], resource: ResourceAddr) -> u128 {
+    owners.iter().fold(0u128, |sum, owner| {
+        sum.saturating_add(held(c, *owner, resource))
+    })
+}
 
 /// Walk `store`'s committed chain from height 1 for `tx`'s fate.
 ///

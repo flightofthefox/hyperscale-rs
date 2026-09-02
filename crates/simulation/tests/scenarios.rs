@@ -26,11 +26,16 @@ use hyperscale_scenarios::{
     Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig,
     a_failed_attempt_still_attests_work, a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
-    a_published_package_matures_before_it_runs, a_spent_nullifier_is_swept_once_unreachable,
-    abort_converges, attested_load_reaches_the_beacon,
-    beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
-    cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
-    cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
+    a_published_package_matures_before_it_runs,
+    a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
+    a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
+    a_spent_nullifier_is_swept_once_unreachable, a_swap_charges_its_caller_its_input_and_one_price,
+    a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,
+    a_swap_the_venue_refuses_gives_its_caller_back_its_leg, abort_converges,
+    attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
+    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
+    cross_shard_credit_survives_a_later_local_credit, cross_shard_exec_cert_drop_is_inert,
+    cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
@@ -48,7 +53,7 @@ use hyperscale_scenarios::{
     pool_transfer_moves_operatorship, preview_reports_resource_changes,
     re_registration_of_a_live_validator_is_a_no_op, reads_the_committed_baseline,
     register_validator_pools_a_node, register_without_capacity_is_rejected,
-    registered_validator_activates_onto_a_shard,
+    registered_validator_activates_onto_a_shard, route_genesis_accounts,
     sealed_rounds_settle_on_the_seed_they_committed_to,
     securify_retires_the_key_at_the_payer_shard, single_transfer,
     split_boundary_admits_an_uncommitted_precut_tx,
@@ -58,8 +63,9 @@ use hyperscale_scenarios::{
     split_survivor_recovers_a_settlement_it_never_received,
     split_terminating_payer_releases_its_reservation, stake_withdraw_drops_effective_stake,
     surviving_sibling_split_seats_full_committees, unbound_payer_engages_nothing,
-    unbound_remote_payer_engages_nothing, withdrawal_ejects_a_validator_that_a_deposit_reactivates,
-    withdrawals_compose_over_one_vault, zipf_payments,
+    unbound_remote_payer_engages_nothing, venue_genesis_accounts,
+    withdrawal_ejects_a_validator_that_a_deposit_reactivates, withdrawals_compose_over_one_vault,
+    zipf_payments,
 };
 use hyperscale_simulation::ExecutionMode;
 use hyperscale_storage::ShardChainReader;
@@ -324,6 +330,71 @@ fn sealed_rounds_settle_on_the_seed_they_committed_to_sim() {
         GenesisPackages::with_fixtures(),
     );
     sealed_rounds_settle_on_the_seed_they_committed_to(&mut cluster);
+}
+
+/// A venue on one shard and its callers on the other, over a network
+/// born running the fixture packages the venue is built from.
+fn venue_cluster() -> SimCluster {
+    SimCluster::with_grown_packages(
+        &cross_shard_config(),
+        42,
+        &venue_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    )
+}
+
+/// Two venues on two shards and the traders on a third.
+fn route_cluster() -> SimCluster {
+    SimCluster::with_grown_packages(
+        &ScenarioConfig {
+            num_shards: 4,
+            pool_surplus: 14,
+            ..cross_shard_config()
+        },
+        42,
+        &route_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    )
+}
+
+#[test]
+fn a_swap_charges_its_caller_its_input_and_one_price_sim() {
+    let mut cluster = venue_cluster();
+    a_swap_charges_its_caller_its_input_and_one_price(&mut cluster, epochs(40));
+}
+
+#[test]
+fn a_swap_the_venue_refuses_gives_its_caller_back_its_leg_sim() {
+    let mut cluster = venue_cluster();
+    a_swap_the_venue_refuses_gives_its_caller_back_its_leg(&mut cluster, epochs(40));
+}
+
+#[test]
+fn a_swap_refused_at_its_inbound_leg_never_reaches_the_venue_sim() {
+    let mut cluster = venue_cluster();
+    a_swap_refused_at_its_inbound_leg_never_reaches_the_venue(&mut cluster, epochs(40));
+}
+
+#[test]
+fn a_route_settles_across_two_venues_sim() {
+    let mut cluster = route_cluster();
+    let report = a_route_settles_across_two_venues(&mut cluster, epochs(40));
+    println!(
+        "two-venue route: {} routes settled in {:?}",
+        report.submitted, report.elapsed,
+    );
+}
+
+#[test]
+fn a_route_settles_when_its_venues_certificates_are_dropped_sim() {
+    let mut cluster = route_cluster();
+    cluster.run_faultable(a_route_settles_when_its_venues_certificates_are_dropped);
+}
+
+#[test]
+fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took_sim() {
+    let mut cluster = route_cluster();
+    a_route_refused_at_its_second_venue_gives_back_what_the_first_took(&mut cluster, epochs(40));
 }
 
 #[test]
