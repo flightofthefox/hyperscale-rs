@@ -1068,11 +1068,13 @@ fn assemble_executed_tx(
         // this one: a later transaction in this tick must see what an
         // earlier one left. It mirrors the kernel's store, so it takes
         // the resolved form.
-        let resolved = writes.resolve(&mut |key| {
-            fold.running
-                .get(&key)
-                .map_or_else(|| base.cells.get(&key).cloned(), Clone::clone)
-        });
+        let resolved = writes
+            .resolve(&mut |key| {
+                fold.running
+                    .get(&key)
+                    .map_or_else(|| base.cells.get(&key).cloned(), Clone::clone)
+            })
+            .expect("the kernel judged every movement it recorded against this baseline");
         for (key, change) in resolved.cells() {
             fold.running.insert(*key, change.clone());
         }

@@ -588,7 +588,8 @@ impl<Snap: Substates> Substates for TickViewSnapshot<Snap> {
         let mut written: Option<&Option<Vec<u8>>> = None;
         for overlay in self.overlays.iter().rev() {
             if let Some(movement) = overlay.movements.get(&key) {
-                moved = Some(moved.map_or(*movement, |above| compose_movements(*movement, above)));
+                moved =
+                    Some(moved.map_or(*movement, |above| compose_movements(key, *movement, above)));
             }
             if let Some(change) = overlay.cells.get(&key) {
                 written = Some(change);
@@ -607,7 +608,13 @@ impl<Snap: Substates> Substates for TickViewSnapshot<Snap> {
             .as_deref()
             .and_then(read_amount)
             .unwrap_or(0);
-        amount_cell(moved.apply(before).unwrap_or(0)).map(|cell| cell.to_vec())
+        let after = moved.apply(before).unwrap_or_else(|| {
+            panic!(
+                "BFT CRITICAL: a certified debit runs past what {key:?} holds: held {before}, \
+                 moved {moved:?}"
+            )
+        });
+        amount_cell(after).map(|cell| cell.to_vec())
     }
 
     fn entries_in_range(

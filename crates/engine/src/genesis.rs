@@ -261,6 +261,7 @@ fn minted_allocations(accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
         .project(&Locality::All)
         .expect("kernel-produced movements compose")
         .resolve(&mut |_| None)
+        .expect("an opening balance lands on nothing")
 }
 
 /// The packages the chain is born running, as the beacon registry holds

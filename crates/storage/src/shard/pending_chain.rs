@@ -1391,7 +1391,7 @@ mod tests {
             height,
             settled_txs: Vec::new(),
             committed_txs: Vec::new(),
-            jmt_snapshot: snapshot_of(writes.resolve(&mut |_| None)),
+            jmt_snapshot: snapshot_of(writes.resolve(&mut |_| None).expect("nothing moved")),
             certified_block: None,
             certified_uncommitted: None,
         }

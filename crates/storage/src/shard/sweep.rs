@@ -20,7 +20,9 @@ use hyperscale_vm_effects::{CommittedTxCell, ProtocolHasher, committed_tx_key};
 use hyperscale_vm_types::NULLIFIER_GRACE_MS;
 
 use crate::tree::JmtSnapshot;
-use crate::{Anchored, filter_writes_to_prefix, merge_writes_from_receipts};
+use crate::{
+    Anchored, filter_state_writes_to_prefix, filter_writes_to_prefix, merge_receipts, settle_writes,
+};
 
 /// When a committed cell stops being needed, or `None` for every cell a
 /// sweep does not reach.
@@ -273,7 +275,13 @@ pub fn followed_block_writes(
         .iter()
         .flat_map(|fw| fw.settling_receipts())
         .collect();
-    let merged = merge_writes_from_receipts(&settling, prior);
+    // Restricted before resolving: a follower holds its prefix of the
+    // tree and nothing else, so a movement on any other cell reads an
+    // empty prior here and is the owning store's to judge, not this one's.
+    let merged = settle_writes(
+        &filter_state_writes_to_prefix(&merge_receipts(&settling), prefix),
+        prior,
+    );
     let creations = committed_tx_cells(
         block.header().shard_id(),
         block.transactions().iter().map(|tx| tx.as_unverified()),

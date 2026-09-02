@@ -130,12 +130,14 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
 /// A receipt says what it moved, not what the cell ends at, so a balance
 /// assertion has to name the state the movement lands on.
 fn settled(writes: &StateWrites, accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
-    writes.resolve(&mut |key| {
-        accounts
-            .iter()
-            .find(|(owner, _)| vault_key(*owner, *XRD) == key)
-            .and_then(|(_, amount)| amount_cell(*amount).map(|cell| cell.to_vec()))
-    })
+    writes
+        .resolve(&mut |key| {
+            accounts
+                .iter()
+                .find(|(owner, _)| vault_key(*owner, *XRD) == key)
+                .and_then(|(_, amount)| amount_cell(*amount).map(|cell| cell.to_vec()))
+        })
+        .expect("the debit fits")
 }
 
 /// An account's native vault as the batch left it.

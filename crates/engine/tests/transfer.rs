@@ -101,7 +101,9 @@ impl MapDb {
     /// resolving what it moved against what this map holds, which is
     /// what settlement does.
     fn apply(&mut self, writes: &StateWrites) {
-        let writes = writes.resolve(&mut |key| self.0.get(&key).cloned());
+        let writes = writes
+            .resolve(&mut |key| self.0.get(&key).cloned())
+            .expect("the debit fits");
         for (key, change) in writes.cells() {
             match change {
                 Some(value) => {
@@ -663,7 +665,9 @@ fn execute_batch_on(
 /// on. These tests start from `accounts` and settle one batch onto it.
 /// A receipt's writes as they settle onto the state they land on.
 fn settled_on(writes: &StateWrites, state: &impl Substates) -> SettledWrites {
-    writes.resolve(&mut |key| state.cell(key))
+    writes
+        .resolve(&mut |key| state.cell(key))
+        .expect("the debit fits")
 }
 
 fn settled(writes: &StateWrites, accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
@@ -676,12 +680,14 @@ fn settled(writes: &StateWrites, accounts: &[(PrincipalAddr, u128)]) -> SettledW
             .map(|(o, a)| (vault_key(*o, *XRD), a))
             .collect::<Vec<_>>()
     );
-    writes.resolve(&mut |key| {
-        accounts
-            .iter()
-            .find(|(owner, _)| vault_key(*owner, *XRD) == key)
-            .and_then(|(_, amount)| amount_cell(*amount).map(|cell| cell.to_vec()))
-    })
+    writes
+        .resolve(&mut |key| {
+            accounts
+                .iter()
+                .find(|(owner, _)| vault_key(*owner, *XRD) == key)
+                .and_then(|(_, amount)| amount_cell(*amount).map(|cell| cell.to_vec()))
+        })
+        .expect("the debit fits")
 }
 
 fn vault_cell(writes: &SettledWrites, owner: impl Into<Address>) -> Option<Vec<u8>> {

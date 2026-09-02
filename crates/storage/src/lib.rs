@@ -64,8 +64,9 @@ pub use shard::unresolved::{ReplayWindow, replay_window, unresolved_replay_floor
 pub use shard::vote_registers::SafeVoteRegisterStore;
 pub use shard::writes::{
     entry_from_leaf, entry_leaf_rows, entry_leaf_value, entry_overlay_range,
-    filter_writes_to_prefix, fold_state_writes, key_under_prefix, merge_entry_overlay,
-    merge_entry_overlay_with, merge_state_writes, merge_writes_from_receipts, pending_write,
+    filter_state_writes_to_prefix, filter_writes_to_prefix, fold_state_writes, key_under_prefix,
+    merge_entry_overlay, merge_entry_overlay_with, merge_receipts, merge_state_writes,
+    merge_writes_from_receipts, pending_write, settle_writes,
 };
 pub use tree::{CollectedWrites, JmtSnapshot};
 
