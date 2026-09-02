@@ -4,7 +4,6 @@ use std::time::Instant;
 
 use hex::encode as hex_encode;
 use hyperscale_metrics::{record_storage_operation, record_storage_write};
-use hyperscale_storage::tree::carry_noop_root;
 use hyperscale_storage::{
     JmtSnapshot, PackageArtifactStore, SubstateStore, SweepIndex, VersionedStore, sweepable_expiry,
 };
@@ -17,7 +16,6 @@ use rocksdb::{WriteBatch, WriteOptions};
 use super::column_families::{PackageArtifactsCf, StateCf, SweepIndexCf};
 use super::core::RocksDbShardStorage;
 use super::execution_certs::append_block_certs_to_batch;
-use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::metadata::read_jmt_metadata;
 use super::snapshot::RocksDbSnapshot;
 use super::substate_key::SubstateKeyCodec;
@@ -195,17 +193,6 @@ impl RocksDbShardStorage {
         let stale_count = jmt_snapshot.stale_node_keys.len();
         let new_version = jmt_snapshot.new_height.inner();
         let new_root = jmt_snapshot.result_root;
-
-        // A no-op snapshot prepared before its parent's tree existed (the
-        // recovery bridge over a sync-admitted parent) carries no nodes;
-        // the parent's root is durable by this height-ordered write, so
-        // complete the carry the prepare couldn't.
-        if let Some((key, node)) = carry_noop_root(
-            &SnapshotTreeStore::new(&self.db, self.root_path.clone()),
-            jmt_snapshot,
-        ) {
-            self.append_jmt_node_to_batch(&mut write_batch, &key, &node);
-        }
 
         self.append_jmt_to_batch(&mut write_batch, jmt_snapshot, new_version);
 

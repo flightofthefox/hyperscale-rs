@@ -599,8 +599,9 @@ impl ShardCoordinatorSim {
     /// protocol feeding a fetched block back into the coordinator.
     pub fn deliver_synced_block(&mut self, replica: ValidatorId, certified: &CertifiedBlock) {
         let idx = self.idx_of(replica);
-        let actions = self.coordinators[idx]
+        let mut actions = self.coordinators[idx]
             .on_sync_block_ready_to_apply(&self.topology_schedule, certified.clone());
+        actions.extend(self.drain_post_dispatch(idx));
         self.absorb(idx, actions);
     }
 
@@ -1083,10 +1084,15 @@ impl ShardCoordinatorSim {
     fn deliver(&mut self, env: Envelope) -> Vec<Action> {
         let to_idx = env.to_idx;
         let mut actions = self.deliver_inner(env);
-        // Mirror the node state machine's post-dispatch hook:
-        // drain ready state-root verifications into
-        // `VerifyStateRoot` actions, then re-enter `try_propose`
-        // once if any path latched a retry.
+        actions.extend(self.drain_post_dispatch(to_idx));
+        actions
+    }
+
+    /// Mirror the node state machine's post-dispatch hook: drain ready
+    /// state-root verifications into `VerifyStateRoot` actions, then
+    /// re-enter `try_propose` once if any path latched a retry.
+    fn drain_post_dispatch(&mut self, to_idx: usize) -> Vec<Action> {
+        let mut actions = Vec::new();
         for ready in self.coordinators[to_idx].drain_ready_state_root_verifications() {
             actions.push(Action::VerifyStateRoot {
                 block_hash: ready.block_hash,

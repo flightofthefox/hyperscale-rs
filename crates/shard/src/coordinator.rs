@@ -2489,10 +2489,6 @@ impl ShardCoordinator {
         round: Round,
         kind: ProposalKind,
     ) -> Vec<Action> {
-        let tickless = match &kind {
-            ProposalKind::Normal { finalizations, .. } => finalizations.is_empty(),
-            ProposalKind::Fallback | ProposalKind::Sync => true,
-        };
         let (parent_block_hash, parent_qc) = self.chain_view().proposal_parent();
         // The block we build belongs to its parent's window — the same
         // committee `can_propose` drew our slot from and the same one every
@@ -2654,24 +2650,12 @@ impl ShardCoordinator {
             self.record_leader_activity();
         }
 
-        // The build-side recovery-bridge escape, under the same conditions as
-        // the verifier's (`initiate_state_root_verification`): a tick-less
-        // block in the bridge band whose parent is a sync-admitted,
-        // QC-attested certified block dispatches without the parent tree.
-        let bridge_over_attested_parent = tickless
-            && self.recovery_bridging(topology_schedule, parent_qc.weighted_timestamp())
-            && self
-                .verification
-                .cached_verified_certified_block(plan.parent_block_hash)
-                .is_some();
-
         dispatch_or_defer(
             &mut self.proposal,
             &mut self.verification,
             plan,
             height,
             round,
-            bridge_over_attested_parent,
         )
     }
 
@@ -5521,7 +5505,7 @@ impl ShardCoordinator {
             let shard = certified.qc().shard_id();
             let (block, _) = certified.into_parts();
             let verified_qc = Verified::<QuorumCertificate>::genesis(shard, self.chain_origin);
-            return self.apply_synced_block(block, verified_qc);
+            return self.apply_synced_block(topology_schedule, block, verified_qc);
         }
 
         // A fork-caused recovery pins the seed to the beacon-attested
@@ -5697,12 +5681,16 @@ impl ShardCoordinator {
     /// the only one that distinguishes a committed block from a
     /// certified-but-orphaned sibling at one height (both carry a valid QC). A
     /// single QC is not a commit certificate; committing on it would let a
-    /// peer-served orphan sibling fork a lagging node. The eventual commit
-    /// flows through `commit_one_buffered_block`, which selects the
-    /// synchronous inline-JMT `CommitBlockByQcOnly` path for blocks whose
-    /// state root was not locally verified.
+    /// peer-served orphan sibling fork a lagging node.
+    ///
+    /// Its tree is prepared here, at admission, through the same state-root
+    /// verification a live block gets: the QC attests the root, and the
+    /// verification is what puts the block's JMT snapshot in the overlay
+    /// for its children to build on. A block this node never verified
+    /// itself commits through `CommitBlockByQcOnly`, which prepares inline.
     fn apply_synced_block(
         &mut self,
+        topology_schedule: &TopologySchedule,
         block: Block,
         verified_qc: Verified<QuorumCertificate>,
     ) -> Vec<Action> {
@@ -5781,6 +5769,7 @@ impl ShardCoordinator {
         self.verification
             .insert_verified_certified_block(block_hash, Arc::clone(&certified));
         self.block_sync.mark_applied(height, block_hash);
+        self.initiate_synced_state_root_verification(topology_schedule, certified.block());
 
         let mut actions = self.try_two_chain_commit(certified.qc_verified(), CommitSource::Sync);
 
@@ -5791,6 +5780,45 @@ impl ShardCoordinator {
         }
 
         actions
+    }
+
+    /// Queue a sync-admitted block's state-root verification, so its tree
+    /// lands in the overlay for its children.
+    ///
+    /// Genesis is seated by the store's adoption and has no parent to
+    /// verify against. The per-window verdict bits read the block's own
+    /// window; a window the schedule has not resolved leaves the block
+    /// unverified, and its commit prepares inline instead.
+    fn initiate_synced_state_root_verification(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        block: &Block,
+    ) {
+        if block.is_genesis() || !self.verification.needs_state_root_verification(block) {
+            return;
+        }
+        let anchor_wt = block.header().parent_qc().weighted_timestamp();
+        let (Some(split_child_roots_required), Some(terminal_roots_required)) = (
+            self.split_child_roots_bit(topology_schedule, anchor_wt),
+            self.terminal_roots_bit(topology_schedule, anchor_wt),
+        ) else {
+            debug!(
+                validator = ?self.me,
+                height = block.height().inner(),
+                "Synced block's window missing from the schedule; leaving its tree to the commit"
+            );
+            return;
+        };
+        let settled_txs_window_floor =
+            topology_schedule.settled_window_floor(self.local_shard, anchor_wt);
+        self.verification.initiate_state_root_verification(
+            block.hash(),
+            block,
+            block.header().parent_qc().height(),
+            split_child_roots_required,
+            terminal_roots_required,
+            settled_txs_window_floor,
+        );
     }
 
     /// Apply all consecutive verified synced blocks, then drain the buffer
@@ -5805,7 +5833,7 @@ impl ShardCoordinator {
         while let Some((block, verified_qc)) =
             self.block_sync.take_next_verified(self.committed_height)
         {
-            actions.extend(self.apply_synced_block(block, verified_qc));
+            actions.extend(self.apply_synced_block(topology_schedule, block, verified_qc));
         }
         actions.extend(self.try_drain_buffered_synced_blocks(topology_schedule));
 

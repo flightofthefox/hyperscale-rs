@@ -1068,31 +1068,7 @@ impl VerificationPipeline {
         // the tree store or in the snapshot cache (from a prior verification).
         // Defer if: parent height exceeds committed JMT AND parent hasn't
         // been verified (no snapshot in the overlay).
-        let parent_tree_available = parent_block_height <= self.last_persisted_height
-            || self.is_state_root_verified(&parent_block_hash);
-
-        // A sync-admitted parent is QC-attested but never locally verified,
-        // and its tree materializes only at commit — which needs the
-        // successor QC this very verification gates. A tick-less child
-        // applies no updates, so it reads no tree version and its root is
-        // decided by the attested parent root alone; the parent commits
-        // first in height order, so nothing prepares over a version the
-        // tree never persisted. A child that does apply updates keeps
-        // deferring, because its prepared snapshot would chain to one.
-        //
-        // A terminating boundary block is the exception the emptiness test
-        // alone does not catch: it coasts its chain to the cut carrying no
-        // certificates, but its child-subtree and terminal root claims are
-        // answered from the tree, so it needs the version a bare tick-less
-        // block does not.
-        let reads_the_tree = split_child_roots_required || terminal_roots_required;
-        let parent_qc_attested = block.certificates().is_empty()
-            && !reads_the_tree
-            && self
-                .verified_certified_blocks
-                .contains_key(&parent_block_hash);
-
-        if parent_tree_available || parent_qc_attested {
+        if self.parent_tree_available(parent_block_height, parent_block_hash) {
             self.enqueue_ready_state_root(ready);
         } else {
             debug!(
@@ -1116,17 +1092,7 @@ impl VerificationPipeline {
             self.state_roots.insert(block_hash, RootStage::Verified);
             debug!(block_hash = ?block_hash, "State root verified successfully");
 
-            // Unblock children that were waiting for this parent.
-            if let Some(deferred) = self.deferred_state_root_verifications.remove(&block_hash) {
-                for ready in deferred {
-                    debug!(
-                        child = ?ready.block_hash,
-                        parent = ?block_hash,
-                        "Unblocking deferred state root verification"
-                    );
-                    self.enqueue_ready_state_root(ready);
-                }
-            }
+            self.release_deferred_children(block_hash);
 
             // Unblock deferred proposal if it was waiting for this parent.
             self.try_unblock_proposal(block_hash);
@@ -1159,18 +1125,7 @@ impl VerificationPipeline {
     /// blocks can verify without waiting for the block to be committed.
     fn mark_proposal_state_root_verified(&mut self, block_hash: BlockHash) {
         self.state_roots.insert(block_hash, RootStage::Verified);
-
-        // Unblock children deferred on this parent.
-        if let Some(deferred) = self.deferred_state_root_verifications.remove(&block_hash) {
-            for ready in deferred {
-                debug!(
-                    child = ?ready.block_hash,
-                    parent = ?block_hash,
-                    "Unblocking deferred state root verification (proposer verified)"
-                );
-                self.enqueue_ready_state_root(ready);
-            }
-        }
+        self.release_deferred_children(block_hash);
 
         // Unblock deferred proposal if it was waiting for this parent.
         self.try_unblock_proposal(block_hash);
@@ -2158,16 +2113,13 @@ impl VerificationPipeline {
         pending: &PendingStateRootVerification,
         chain: &ChainView<'_>,
     ) -> Option<ReadyStateRootVerification> {
-        let block = chain
-            .get_pending(pending.block_hash)
-            .and_then(PendingBlock::block)
-            .or_else(|| {
-                debug!(
-                    block_hash = ?pending.block_hash,
-                    "Skipping state root verification — pending block no longer present"
-                );
-                None
-            })?;
+        let block = chain.get_block(pending.block_hash).or_else(|| {
+            debug!(
+                block_hash = ?pending.block_hash,
+                "Skipping state root verification — block no longer present"
+            );
+            None
+        })?;
         let parent_state_root = chain.parent_state_root(pending.parent_block_hash);
         let finalizations: Vec<Arc<Verifiable<Finalization>>> =
             block.certificates().iter().cloned().collect();
@@ -2220,9 +2172,10 @@ impl VerificationPipeline {
         self.proposal_unblocked = true;
     }
 
-    /// Check if a parent's tree nodes are available (persisted or verified
-    /// or consensus-committed — all three place the parent's JMT snapshot
-    /// either on disk or in the `PendingChain` overlay).
+    /// Check if a parent's tree nodes are available: persisted, or
+    /// verified with its JMT snapshot in the `PendingChain` overlay.
+    /// Verification is the same act on a live block and a sync-admitted
+    /// one, so a verified parent always has a tree to build on.
     pub fn parent_tree_available(
         &self,
         parent_block_height: BlockHeight,
@@ -2230,6 +2183,25 @@ impl VerificationPipeline {
     ) -> bool {
         parent_block_height <= self.last_persisted_height
             || self.is_state_root_verified(&parent_block_hash)
+    }
+
+    /// Release the children deferred on `parent_block_hash` now that its
+    /// tree is in the overlay.
+    fn release_deferred_children(&mut self, parent_block_hash: BlockHash) {
+        let Some(deferred) = self
+            .deferred_state_root_verifications
+            .remove(&parent_block_hash)
+        else {
+            return;
+        };
+        for ready in deferred {
+            debug!(
+                child = ?ready.block_hash,
+                parent = ?parent_block_hash,
+                "Unblocking deferred state root verification"
+            );
+            self.enqueue_ready_state_root(ready);
+        }
     }
 
     /// Record that a proposal is deferred until the parent's tree nodes are
@@ -2357,24 +2329,11 @@ impl VerificationPipeline {
     /// verifications proceed as soon as the parent's tree is readable from
     /// the overlay, without waiting for `BlockPersisted`.
     pub fn on_block_committed(&mut self, block_hash: BlockHash) {
-        let was_verified = matches!(
-            self.state_roots.insert(block_hash, RootStage::Verified),
-            Some(RootStage::Verified)
-        );
-        if was_verified {
+        if self.is_state_root_verified(&block_hash) {
             return;
         }
-
-        if let Some(deferred) = self.deferred_state_root_verifications.remove(&block_hash) {
-            for ready in deferred {
-                debug!(
-                    child = ?ready.block_hash,
-                    parent = ?block_hash,
-                    "Unblocking deferred state root verification (parent committed)"
-                );
-                self.enqueue_ready_state_root(ready);
-            }
-        }
+        self.state_roots.insert(block_hash, RootStage::Verified);
+        self.release_deferred_children(block_hash);
 
         self.try_unblock_proposal(block_hash);
         // A sync-admitted block is never locally executed, so no delta can
@@ -2387,7 +2346,8 @@ impl VerificationPipeline {
     // Cleanup
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Remove verification state for blocks no longer in `pending_blocks`.
+    /// Remove verification state for blocks no longer in `pending_blocks`
+    /// or in the certified cache.
     ///
     /// Called by `ShardCoordinator::cleanup_old_state()` after it has cleaned up
     /// `pending_blocks`. We use the surviving `pending_blocks` set to determine
@@ -2395,24 +2355,35 @@ impl VerificationPipeline {
     ///
     /// Most verification state is keyed by block hash and cleaned up based on
     /// `pending_blocks` membership (if the block is gone, its verification state
-    /// is stale). The `verified_qcs` cache is the exception: it's keyed by the
-    /// QC's certified block hash (not the proposing block), so it uses
-    /// height-based retention with a 2-block buffer to support view-change
-    /// scenarios where multiple proposals share the same parent QC.
+    /// is stale). State-root state also lives for a sync-admitted block,
+    /// which is never pending: it is retained with the certified cache,
+    /// whose entries outlive their commit. The `verified_qcs` cache is the
+    /// other exception: it's keyed by the QC's certified block hash (not
+    /// the proposing block), so it uses height-based retention with a
+    /// 2-block buffer to support view-change scenarios where multiple
+    /// proposals share the same parent QC.
     pub fn cleanup(&mut self, pending_blocks: &PendingBlocks, committed_height: BlockHeight) {
         self.pending_qc_verifications
             .retain(|hash, _| pending_blocks.contains_key(*hash));
 
-        self.state_roots
-            .retain(|hash, _| pending_blocks.contains_key(*hash));
+        // The certified cache prunes first, so what it keeps is what a
+        // state-root entry may still serve.
+        self.verified_certified_blocks.retain(|hash, certified| {
+            pending_blocks.contains_key(*hash) || certified.block().height() > committed_height
+        });
+        let certified = &self.verified_certified_blocks;
+        let tracked =
+            |hash: BlockHash| pending_blocks.contains_key(hash) || certified.contains_key(&hash);
+
+        self.state_roots.retain(|hash, _| tracked(*hash));
 
         self.ready_state_root_verifications
-            .retain(|r| pending_blocks.contains_key(r.block_hash));
+            .retain(|r| tracked(r.block_hash));
 
         // Clean up deferred verifications: remove entries whose child blocks
-        // are no longer pending, and remove parent keys with empty lists.
+        // are no longer tracked, and remove parent keys with empty lists.
         for entries in self.deferred_state_root_verifications.values_mut() {
-            entries.retain(|r| pending_blocks.contains_key(r.block_hash));
+            entries.retain(|r| tracked(r.block_hash));
         }
         self.deferred_state_root_verifications
             .retain(|_, entries| !entries.is_empty());
@@ -2454,9 +2425,6 @@ impl VerificationPipeline {
         // (consensus path) or still above the committed tip (sync path, which
         // caches the handle without a `pending_blocks` entry and needs it kept
         // until the round-contiguous two-chain commit drains it).
-        self.verified_certified_blocks.retain(|hash, certified| {
-            pending_blocks.contains_key(*hash) || certified.block().height() > committed_height
-        });
     }
 
     /// Number of pending QC verifications.
@@ -2889,6 +2857,68 @@ mod tests {
 
         // Taking again without another initiate yields nothing.
         assert!(vp.take_ready_state_root_verifications().is_empty());
+    }
+
+    #[test]
+    fn a_synced_block_verifies_out_of_the_certified_cache() {
+        // A sync-admitted block is never pending: its verification is
+        // queued at admission and resolves its inputs off the certified
+        // cache, so its tree lands in the overlay like a live block's.
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let synced = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
+        let synced_hash = synced.hash();
+        let qc = QuorumCertificate::new(
+            synced_hash,
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::ZERO,
+        );
+        vp.insert_verified_certified_block(
+            synced_hash,
+            Arc::new(Verified::new_unchecked_for_test(
+                CertifiedBlock::new_unchecked(synced.clone(), qc),
+            )),
+        );
+        vp.initiate_state_root_verification(
+            synced_hash,
+            &synced,
+            BlockHeight::GENESIS,
+            false,
+            false,
+            None,
+        );
+
+        let pending = PendingBlocks::new();
+        let certified = vp.verified_certified_blocks().clone();
+        let chain = ChainView::new(
+            ShardId::ROOT,
+            ChainOrigin::ROOT,
+            BlockHeight::GENESIS,
+            BlockHash::ZERO,
+            StateRoot::ZERO,
+            None,
+            None,
+            &pending,
+            &certified,
+        );
+        let resolved: Vec<_> = vp
+            .take_ready_state_root_verifications()
+            .into_iter()
+            .filter_map(|pending| {
+                VerificationPipeline::resolve_ready_state_root_verification(&pending, &chain)
+            })
+            .collect();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].block_hash, synced_hash);
+
+        // Its completion is what makes a child's parent tree available.
+        assert!(!vp.parent_tree_available(BlockHeight::new(1), synced_hash));
+        assert!(vp.on_state_root_verified(synced_hash, true));
+        assert!(vp.parent_tree_available(BlockHeight::new(1), synced_hash));
     }
 
     #[test]

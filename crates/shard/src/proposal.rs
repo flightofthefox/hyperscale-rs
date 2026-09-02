@@ -686,20 +686,10 @@ pub fn assemble_build_action(
 ///
 /// Even empty blocks need the parent root node: `noop_jmt_snapshot` copies
 /// it to the new version so the overlay chain stays intact. Without that, a
-/// child block's `VerifyStateRoot` hits `ParentVersionMissing`.
-///
-/// The one exception is `bridge_over_attested_parent` — the build-side
-/// mirror of the verifier's recovery-bridge escape (see
-/// `initiate_state_root_verification`): a tick-less block in the bridge
-/// band whose parent is a sync-admitted, QC-attested certified block
-/// dispatches without the parent tree. Its prepare applies no updates and
-/// inherits the attested parent root; the commit pipeline releases store
-/// persists strictly height contiguous, so by the time this block
-/// persists its parent's tree is durable and the no-op root carry
-/// completes. Without the escape a fully redrawn recovery committee
-/// deadlocks: no member ever verified the halted tip through the live
-/// pipeline, the tip's tree materializes only at commit, and that commit
-/// needs the successor QC this very build produces.
+/// child block's `VerifyStateRoot` hits `ParentVersionMissing`. A
+/// sync-admitted parent is verified at admission like any other, so a
+/// fully redrawn recovery committee builds over the halted tip once that
+/// verification lands.
 ///
 /// When deferred, the verification pipeline unblocks and re-enters
 /// `try_propose` via the proposal-retry latch when the parent tree lands.
@@ -709,11 +699,8 @@ pub fn dispatch_or_defer(
     plan: BuildActionPlan,
     block_height: BlockHeight,
     round: Round,
-    bridge_over_attested_parent: bool,
 ) -> Vec<Action> {
-    if bridge_over_attested_parent
-        || verification.parent_tree_available(plan.parent_block_height, plan.parent_block_hash)
-    {
+    if verification.parent_tree_available(plan.parent_block_height, plan.parent_block_hash) {
         tracker.start(block_height, round);
         vec![plan.action]
     } else {

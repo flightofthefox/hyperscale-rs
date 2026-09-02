@@ -724,9 +724,9 @@ impl BlockCommitCoordinator {
         // different latencies — a `CommitBlock` lands inline while a
         // `CommitBlockByQcOnly` round-trips the prep pool — so arrival
         // order at this queue can invert around a sync/live junction (a
-        // recovery bridge committing over a sync-admitted suffix). An
-        // out-of-order persist writes a no-op block's root carry over an
-        // unmaterialized parent version, holing the JMT version chain.
+        // recovery committee committing over a sync-admitted suffix). An
+        // out-of-order persist would write a block's tree over a parent
+        // version the store does not hold yet, holing the version chain.
         // Deferral also covers a block still awaiting the PreparedCommit
         // that `VerifyStateRoot` produces asynchronously.
         let mut ready_commits: Vec<PendingCommit> = Vec::with_capacity(commits.len());

@@ -14,9 +14,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin, CommittedTip, ProvisionHash,
-    QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot, SweepFrontier, TxHash, Verified,
-    WorkInFlight,
+    Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin, CommittedTip,
+    ProvisionHash, QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot, SweepFrontier,
+    TxHash, Verified, WorkInFlight,
 };
 use tracing::warn;
 
@@ -65,6 +65,20 @@ impl<'a> ChainView<'a> {
     /// the dedicated header / state-root accessors expose.
     pub fn get_pending(&self, block_hash: BlockHash) -> Option<&PendingBlock> {
         self.pending.get(block_hash)
+    }
+
+    /// The complete block for `block_hash`: a constructed pending block,
+    /// or a certified one admitted through sync.
+    pub fn get_block(&self, block_hash: BlockHash) -> Option<&Block> {
+        self.pending
+            .get(block_hash)
+            .and_then(PendingBlock::block)
+            .map(Arc::as_ref)
+            .or_else(|| {
+                self.certified
+                    .get(&block_hash)
+                    .map(|certified| certified.block())
+            })
     }
 
     /// Header-only lookup. Pending blocks always carry their header even

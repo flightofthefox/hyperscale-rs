@@ -1106,8 +1106,9 @@ pub enum Action {
     },
 
     /// Commit a block trusted via QC only — no cached `PreparedCommit` exists
-    /// because we didn't run state root verification ourselves (sync path,
-    /// or consensus path when we didn't participate in voting).
+    /// because this node's own state root verification has not landed: an
+    /// aggregator that formed the QC without voting, or a sync-admitted
+    /// block whose verification is still in flight at its commit.
     ///
     /// The `io_loop` computes the `PreparedCommit` inline and asserts the
     /// computed root matches the block's declared root (same Byzantine
