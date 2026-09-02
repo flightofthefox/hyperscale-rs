@@ -39,7 +39,7 @@ use hyperscale_vm_effects::{
     PrefixShardResolver, SubintentRecord, admit_tree, package_hash, route_tree,
 };
 use hyperscale_vm_kernel::{
-    Baseline, BatchTx, EnvInputs, ExecutionMode, LegPlan, Locality, ManifestWalk, Receipt,
+    Baseline, BatchTx, EnvInputs, ExecutionMode, FeeBurn, LegPlan, Locality, ManifestWalk, Receipt,
     Substates, execute_batch,
 };
 use hyperscale_vm_types::{
@@ -701,17 +701,15 @@ fn vm_metadata(charged: u128, error: Option<String>) -> ExecutionMetadata {
         error,
     )
 }
-/// Debit the payer's vault by `amount`, held to the signed ceiling.
+/// Debit the payer's vault by `amount`, held to the signed ceiling: a
+/// publish's burn, priced by its artifact, on the one path that runs no
+/// kernel session to record it inside the receipt.
 ///
 /// A movement, like every other debit, which is what makes the burn
 /// compose with whatever else reaches the vault instead of having to be
 /// re-derived into each sibling's absolute. There is nothing cumulative
 /// to track and nothing to re-stamp: two transactions burning against
 /// one vault each record their own debit and settlement adds them.
-///
-/// The clamp is a cap for a publish, priced by its artifact, and a
-/// backstop for a call, whose declared price admission already held the
-/// ceiling to.
 fn apply_fee_burn(writes: &mut StateWrites, fee: Option<PayerFee>, amount: u128) {
     let Some(payer) = fee else {
         return;
@@ -1062,15 +1060,14 @@ fn assemble_executed_tx(
         // everything commutative as the movement it was. Unresolved,
         // because the state this lands on is not the state it ran
         // against — that is settlement's question.
-        let mut writes = receipt
+        let writes = receipt
             .delta
             .project(locality)
             .expect("kernel-produced movements compose");
         // The batch's own fold is the one reader whose baseline really is
         // this one: a later transaction in this tick must see what an
         // earlier one left. It mirrors the kernel's store, so it takes
-        // the resolved form and takes it before the burn, which the
-        // kernel does not know about.
+        // the resolved form.
         let resolved = writes.resolve(&mut |key| {
             fold.running
                 .get(&key)
@@ -1082,7 +1079,6 @@ fn assemble_executed_tx(
         for (key, change) in resolved.entries() {
             fold.running_entries.insert(*key, change.clone());
         }
-        apply_fee_burn(&mut writes, fee, fee.map_or(0, |payer| payer.price));
         // The kernel's record is the wire record — one shared type, so
         // there is nothing to convert.
         let events: Vec<Event> = receipt.events.clone();
@@ -1318,40 +1314,6 @@ impl Executor {
             .collect();
         let base = Arc::new(base);
 
-        let batch: Vec<BatchTx> = prepared
-            .iter()
-            .map(|(vm_tx, entry)| {
-                // Total: both dispatch arms build the map from the same
-                // transactions the derivation ran over, and `prepared` is
-                // a subset of those.
-                let env = env_by_tx
-                    .get(vm_tx)
-                    .cloned()
-                    .expect("every prepared transaction has an environment");
-                BatchTx::new(*vm_tx, entry.declaration.clone(), env)
-                    .with_calls(entry.calls.clone())
-                    .with_nullifiers(entry.nullifiers.clone())
-                    .with_gas_limit(entry.gas_limit)
-                    .with_legs(entry.plan.legs.clone())
-                    .with_scope(entry.plan.scope.clone())
-            })
-            .collect();
-        let walk = ManifestWalk {
-            backend: &self.backend,
-        };
-        let outcome = execute_batch(
-            Arc::clone(&base) as Arc<dyn Baseline>,
-            &batch,
-            &walk,
-            protocol_hash,
-            self.mode,
-            &locality,
-        )
-        .unwrap_or_else(|error| panic!("BFT CRITICAL: VM batch execution failed: {error}"));
-
-        // Fold receipts into per-transaction absolute updates in
-        // canonical order, then check the folded end state against the
-        // kernel's own applied store — the fold must be the same fold.
         // The fee payers this shard settles: a completed transaction
         // burns its attested actual from its payer's vault, on the
         // payer's shard only.
@@ -1401,6 +1363,45 @@ impl Executor {
             })
             .collect();
 
+        let batch: Vec<BatchTx> = prepared
+            .iter()
+            .map(|(vm_tx, entry)| {
+                // Total: both dispatch arms build the map from the same
+                // transactions the derivation ran over, and `prepared` is
+                // a subset of those.
+                let env = env_by_tx
+                    .get(vm_tx)
+                    .cloned()
+                    .expect("every prepared transaction has an environment");
+                BatchTx::new(*vm_tx, entry.declaration.clone(), env)
+                    .with_calls(entry.calls.clone())
+                    .with_nullifiers(entry.nullifiers.clone())
+                    .with_gas_limit(entry.gas_limit)
+                    .with_legs(entry.plan.legs.clone())
+                    .with_scope(entry.plan.scope.clone())
+                    .with_fee(fee_by_tx.get(vm_tx).map(|payer| FeeBurn {
+                        vault: payer.vault,
+                        resource: *XRD,
+                        amount: payer.price.min(payer.max_fee),
+                    }))
+            })
+            .collect();
+        let walk = ManifestWalk {
+            backend: &self.backend,
+        };
+        let outcome = execute_batch(
+            Arc::clone(&base) as Arc<dyn Baseline>,
+            &batch,
+            &walk,
+            protocol_hash,
+            self.mode,
+            &locality,
+        )
+        .unwrap_or_else(|error| panic!("BFT CRITICAL: VM batch execution failed: {error}"));
+
+        // Fold receipts into per-transaction absolute updates in
+        // canonical order, then check the folded end state against the
+        // kernel's own applied store — the fold must be the same fold.
         let mut fold = FoldState {
             running: BTreeMap::new(),
             running_entries: BTreeMap::new(),
