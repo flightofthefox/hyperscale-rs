@@ -982,6 +982,12 @@ impl ShardCoordinator {
     /// settled — a verdict that would tear a cross-shard transaction in
     /// half, and the one thing about an abandonment a voter can check.
     ///
+    /// An abandonment is a local-only outcome that awaited a counterpart
+    /// and never heard from it; its certificate names them. A local-only
+    /// outcome that awaited nobody — a leg, a core answering alone, a
+    /// reclaim — is this shard's own verdict, which no counterpart's set
+    /// can contradict, so it is left alone whatever a set says.
+    ///
     /// The question is put to the sets rather than to the transaction. A
     /// settled set names only what its shard settled, so a hit is proof
     /// the transaction reached an outcome there and this shard may not
@@ -1007,7 +1013,11 @@ impl ShardCoordinator {
                 .filter(|ec| ec.shard_id() != self.local_shard)
                 .flat_map(|ec| ec.tx_outcomes().iter().map(TxOutcome::tx_hash))
                 .collect();
-            fw.tx_hashes()
+            fw.local_ec()
+                .tx_outcomes()
+                .iter()
+                .filter(|outcome| !outcome.counterparts().is_empty())
+                .map(TxOutcome::tx_hash)
                 .filter(|tx_hash| !attested_remotely.contains(tx_hash))
                 .any(|tx_hash| {
                     self.settled_sets
@@ -11731,11 +11741,39 @@ mod tests {
     }
 
     /// An abandonment: this shard's certificate alone, attesting the
-    /// transaction aborted, with no counterpart certificate beside it.
+    /// transaction aborted after awaiting `ShardId::ROOT`, with no
+    /// counterpart certificate beside it.
     fn abandonment_tick(local: ShardId, height: u64) -> Arc<Verifiable<Finalization>> {
+        use hyperscale_types::ExecutionOutcome;
+        lone_tick(
+            local,
+            height,
+            TxOutcome::new(
+                TxHash::from(Hash::from_bytes(b"tx")),
+                ExecutionOutcome::Aborted,
+            )
+            .awaiting([ShardId::ROOT]),
+        )
+    }
+
+    /// A verdict that awaited nobody: this shard's certificate alone,
+    /// attesting the transaction refused by a member with no counterpart
+    /// to hear from — a leg's own verdict.
+    fn lone_verdict_tick(local: ShardId, height: u64) -> Arc<Verifiable<Finalization>> {
+        use hyperscale_types::ExecutionOutcome;
+        lone_tick(
+            local,
+            height,
+            TxOutcome::new(
+                TxHash::from(Hash::from_bytes(b"tx")),
+                ExecutionOutcome::Failed,
+            ),
+        )
+    }
+
+    fn lone_tick(local: ShardId, height: u64, outcome: TxOutcome) -> Arc<Verifiable<Finalization>> {
         use hyperscale_types::{
-            ExecutionCertificate, ExecutionOutcome, GlobalReceiptRoot, SignerBitfield, TickHalf,
-            TickId, TxOutcome,
+            ExecutionCertificate, GlobalReceiptRoot, SignerBitfield, TickHalf, TickId,
         };
         let tick = TickId::new(local, BlockHeight::new(height));
         Arc::new(Verifiable::from(Finalization::new(
@@ -11745,10 +11783,7 @@ mod tests {
                 tick,
                 WeightedTimestamp::from_millis(height),
                 GlobalReceiptRoot::ZERO,
-                vec![TxOutcome::new(
-                    TxHash::from(Hash::from_bytes(b"tx")),
-                    ExecutionOutcome::Aborted,
-                )],
+                vec![outcome],
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ))],
@@ -11820,6 +11855,29 @@ mod tests {
             ShardId::ROOT,
             1,
         )]);
+        assert_eq!(
+            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            SettledSetVerdict::Pass,
+        );
+    }
+
+    /// A verdict that awaited nobody is left alone too: a leg's own
+    /// finalization carries only this shard's certificate, as an
+    /// abandonment does, but it makes no claim about any counterpart's
+    /// set — the core settles its half on the record cell — so the set
+    /// naming the transaction refuses nothing.
+    #[test]
+    fn the_abandonment_scan_leaves_a_verdict_that_awaited_nobody_alone() {
+        let mut coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        coord.record_settled_txs(
+            ShardId::ROOT,
+            SettledTxSet {
+                txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
+                terminal_wt: WeightedTimestamp::from_millis(1000),
+            },
+        );
+        let block = block_with_certs(vec![lone_verdict_tick(ShardId::leaf(1, 0), 1)]);
         assert_eq!(
             coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
             SettledSetVerdict::Pass,
