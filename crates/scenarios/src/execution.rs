@@ -1389,12 +1389,25 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
         "the delegator's shard must commit and reserve for the stake"
     );
     // The leg waits on its core rather than deciding on its own: a
-    // verdict this early would be the leg refusing the stake itself,
-    // which is a different scenario from a core that never answers.
+    // verdict within a few blocks of its commit would be the leg refusing
+    // the stake itself, which is a different scenario from a core that
+    // never answers. Measured in blocks, since a deadline is a span of
+    // weighted time and an epoch is whatever the harness makes it.
+    let committed_at = c
+        .chain_fate(payer_shard, hash)
+        .0
+        .expect("the stake's commit height was just observed");
     assert!(
-        !c.run_until(epochs(3), |c| c
-            .tx_status(hash)
-            .is_some_and(|s| s.is_final())),
+        await_height(
+            c,
+            payer_shard,
+            committed_at.inner() + WAITING_BLOCKS,
+            epochs(4)
+        ),
+        "the delegator's shard must keep committing past the stake",
+    );
+    assert!(
+        !c.tx_status(hash).is_some_and(|s| s.is_final()),
         "the leg must wait on its core; status = {:?}",
         c.tx_status(hash),
     );
@@ -1434,6 +1447,11 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
 /// What the deadline scenario stakes: well under its funding, so the
 /// vault's reading is legible against the price.
 const STAKE: u128 = 1_000;
+
+/// Blocks a waiting leg is watched for past its commit before the
+/// deadline is awaited: enough that a leg refusing on its own would
+/// have spoken.
+const WAITING_BLOCKS: u64 = 8;
 
 /// A transaction that fails still pays, and what it pays is the one
 /// declared price.
