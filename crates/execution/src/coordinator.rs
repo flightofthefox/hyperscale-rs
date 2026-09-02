@@ -3045,6 +3045,21 @@ impl ExecutionCoordinator {
                 );
             }
         }
+        // A departure held open is asked about by name on every commit,
+        // since the schedule lists it only while a retained window
+        // carries the shard and the stamp lands on the head's boundary
+        // record, which outlives that window. One whose evidence the
+        // schedule no longer reads at all closes now — the same reading
+        // the settled sets are dropped on — so an entry a record covers
+        // against it retires with the set that could have answered.
+        let now = self.committed_ts;
+        for shard in self.unresolved.unstamped_departures() {
+            if let Some(expiry) = topology_schedule.handoff_evidence_expiry(shard) {
+                self.unresolved.stamp_terminal(shard, expiry);
+            } else if !topology_schedule.terminal_evidence_readable(shard, now) {
+                self.unresolved.stamp_terminal(shard, now);
+            }
+        }
     }
 
     /// Record a tick's fate for the tick chain.
@@ -8313,6 +8328,67 @@ mod tests {
         assert!(
             state.gated_finalized.is_empty(),
             "and it is refused rather than held: no later set will answer",
+        );
+    }
+
+    /// A departure the ledger recorded before its window went is
+    /// stamped off the head's boundary record when the handoff completes,
+    /// though no retained window lists it any more — and the entry a
+    /// record covers against it then retires on that clock rather than
+    /// holding the departure open for good.
+    #[test]
+    fn a_departure_no_window_carries_is_stamped_off_the_head() {
+        let (left, right) = PEER.children();
+        let stamped = TopologySchedule::single(leaves_snap_departed(
+            &[HOME, left, right],
+            &[],
+            &[(PEER, Some(Epoch::new(0)))],
+        ));
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(7)),
+        ));
+        let tx_hash = transaction.hash();
+        let mut state = state_abandoning(&stamped, HOME, &transaction);
+        state
+            .unresolved
+            .record_terminal(PEER, WeightedTimestamp::from_millis(1000), None);
+        record_peer_left_unsettled(&mut state, tx_hash);
+        assert_eq!(state.unresolved.unstamped_departures(), vec![PEER]);
+
+        state.stamp_departures(&stamped);
+        assert!(
+            state.unresolved.unstamped_departures().is_empty(),
+            "the head's stamp reaches a departure no window lists"
+        );
+        let expiry = stamped
+            .handoff_evidence_expiry(PEER)
+            .expect("the head carries the stamp");
+        assert!(
+            state
+                .unresolved
+                .prune(expiry.plus(Duration::from_millis(1)))
+                .iter()
+                .any(|entry| entry.tx_hash == tx_hash && entry.covered_by_record),
+            "and the covered entry retires past it"
+        );
+
+        // With no stamp and no evidence readable at all, the departure
+        // closes at the commit that finds it so, as the settled sets do.
+        let gone = TopologySchedule::single(leaves_snap(&[HOME, left, right], &[]));
+        let mut state = state_abandoning(&gone, HOME, &transaction);
+        state
+            .unresolved
+            .record_terminal(PEER, WeightedTimestamp::from_millis(1000), None);
+        record_peer_left_unsettled(&mut state, tx_hash);
+        state.stamp_departures(&gone);
+        assert!(state.unresolved.unstamped_departures().is_empty());
+        assert!(
+            state
+                .unresolved
+                .prune(state.committed_ts.plus(Duration::from_millis(1)))
+                .iter()
+                .any(|entry| entry.tx_hash == tx_hash && entry.covered_by_record),
+            "an unreadable departure closes at once"
         );
     }
 

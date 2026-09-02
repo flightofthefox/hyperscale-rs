@@ -465,13 +465,42 @@ impl UnresolvedTxs {
         cut: WeightedTimestamp,
         readable_until: Option<WeightedTimestamp>,
     ) {
-        let entry = self.departed.entry(shard).or_insert(Departure {
+        self.departed.entry(shard).or_insert(Departure {
             cut,
-            readable_until,
+            readable_until: None,
         });
-        if entry.readable_until.is_none() {
-            entry.readable_until = readable_until;
+        if let Some(until) = readable_until {
+            self.stamp_terminal(shard, until);
         }
+    }
+
+    /// Give a departure this ledger holds open its expiry, once. A
+    /// departure not held is not invented here: the cut is the schedule's
+    /// to state, and [`Self::record_terminal`] is where it is read.
+    pub fn stamp_terminal(&mut self, shard: ShardId, readable_until: WeightedTimestamp) {
+        if let Some(departure) = self.departed.get_mut(&shard)
+            && departure.readable_until.is_none()
+        {
+            departure.readable_until = Some(readable_until);
+        }
+    }
+
+    /// The departures this ledger holds with no expiry yet.
+    ///
+    /// An open window is the transient case — the beacon stamps the
+    /// handoff some epochs after the cut — but the schedule only lists a
+    /// departure while a retained window carries the shard, and the
+    /// stamp lands on the head's boundary record, which outlives that
+    /// window. A departure recorded before its window went and stamped
+    /// after has to be asked about by name, or it and every entry a
+    /// record covers against it hold each other open for good.
+    #[must_use]
+    pub fn unstamped_departures(&self) -> Vec<ShardId> {
+        self.departed
+            .iter()
+            .filter(|(_, departure)| departure.readable_until.is_none())
+            .map(|(shard, _)| *shard)
+            .collect()
     }
 
     /// When the shard that held `prefix` when the transaction committed
@@ -1267,6 +1296,56 @@ mod tests {
             "the shard owning the prefix at commit is the successor, still running",
         );
         assert_eq!(ledger.len(), 1, "so nothing has fallen silent on it");
+    }
+
+    /// A departure held with no expiry holds the entry a record covers
+    /// against it, however far the clock runs; a stamp landing later
+    /// gives both their end, and the entry retires as covered once it is
+    /// past.
+    #[test]
+    fn a_departure_stamped_late_still_retires_what_it_covers() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(4, 60_000);
+        commit(&mut ledger, &tx);
+        ledger.certify(tx.hash());
+        let cut = ms(100_000);
+        ledger.record_terminal(PARTNER, cut, None);
+        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+            PARTNER,
+            cut,
+            [names(&tx)],
+        )]);
+        assert_eq!(ledger.unstamped_departures(), vec![PARTNER]);
+
+        let far = expiry(cut).plus(EPOCH_DURATION * 100);
+        assert!(
+            ledger.prune(far).is_empty(),
+            "an open window holds the covered entry"
+        );
+        assert_eq!(ledger.len(), 1);
+
+        ledger.stamp_terminal(PARTNER, expiry(cut));
+        assert!(ledger.unstamped_departures().is_empty());
+        let dropped = ledger.prune(far);
+        assert_eq!(
+            dropped,
+            vec![Unanswerable {
+                tx_hash: tx.hash(),
+                covered_by_record: true,
+            }],
+            "past the stamp the covered entry retires"
+        );
+        assert_eq!(ledger.len(), 0);
+        assert!(
+            ledger.unstamped_departures().is_empty(),
+            "and the departure goes with the last entry naming it"
+        );
+
+        ledger.stamp_terminal(PARTNER, cut);
+        assert!(
+            ledger.unstamped_departures().is_empty(),
+            "a stamp for a departure not held invents nothing"
+        );
     }
 
     /// A leg entry is probeable from its deadline and not a moment
