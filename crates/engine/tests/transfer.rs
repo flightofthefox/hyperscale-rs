@@ -13,7 +13,8 @@ use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
 };
 use hyperscale_engine::legs::{
-    Classified, Placement, PlanDefect, Runs, core_shards, crossings_of, decomposes, plan_for_shard,
+    Classified, Placement, PlanDefect, Runs, Side, core_shards, crossings_of, decomposes,
+    plan_for_shard,
 };
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
@@ -1241,14 +1242,22 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
     assert_eq!(edge.from, near_shard);
     assert_eq!(edge.to, BTreeSet::from([far_shard]));
 
-    let sender = plan_for_shard(tx.legs(), tx.crossings(), &[], divided, &trie, near_shard)
-        .expect("the sender's legs take no arrival");
+    let sender = plan_for_shard(
+        tx.legs(),
+        tx.crossings(),
+        &[],
+        divided,
+        &trie,
+        near_shard,
+        Side::Issuing,
+    )
+    .expect("the sender's legs take no arrival");
     assert!(!sender.legs.is_whole());
     assert_eq!(
         sender
             .legs
             .departing(edge.node, edge.output)
-            .map(|departure| departure.origin),
+            .and_then(|departure| departure.origin),
         Some(vault_key(alice(), *XRD)),
         "the withdraw departs from the sender's vault",
     );
@@ -1268,6 +1277,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
         divided,
         &trie,
         far_shard,
+        Side::Delivering,
     )
     .expect("the recipient's leg has its arrival");
     assert!(recipient.legs.arrival(edge.node, edge.output).is_some());
@@ -1275,7 +1285,15 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
     assert!(recipient.scope.covers(far()) && !recipient.scope.covers(alice()));
 
     assert!(matches!(
-        plan_for_shard(tx.legs(), tx.crossings(), &[], divided, &trie, far_shard),
+        plan_for_shard(
+            tx.legs(),
+            tx.crossings(),
+            &[],
+            divided,
+            &trie,
+            far_shard,
+            Side::Delivering
+        ),
         Err(PlanDefect::MissingArrival { .. }),
     ));
 }
@@ -1317,7 +1335,10 @@ fn a_transfer_executes_divided_on_both_shards() {
             // A leg awaiting nobody but its own shard: nothing retracts
             // it, so no charge is held in reserve against an abort.
             abortable: false,
-            runs: Runs::Shape(classified.clone()),
+            runs: Runs::Shape {
+                classified: classified.clone(),
+                side: classified.first_side_at(local_shard),
+            },
             arrivals,
         };
         executor
@@ -1413,7 +1434,14 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
         executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
     };
 
-    let sent = run(&store, Runs::Shape(classified), true);
+    let sent = run(
+        &store,
+        Runs::Shape {
+            classified,
+            side: Side::Issuing,
+        },
+        true,
+    );
     let ConsensusReceipt::Succeeded { writes, .. } = &sent.consensus else {
         panic!("the sender's legs must succeed: {:?}", sent.metadata);
     };
@@ -1542,7 +1570,10 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
             clock: WeightedTimestamp::from_millis(1_000),
             reaches_beyond: true,
             abortable: true,
-            runs: Runs::Shape(Classified::whole()),
+            runs: Runs::Shape {
+                classified: Classified::whole(),
+                side: Side::Issuing,
+            },
             arrivals: &[],
         };
         executor

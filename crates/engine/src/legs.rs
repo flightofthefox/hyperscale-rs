@@ -94,6 +94,43 @@ pub struct Classified {
     decomposed: Decomposed,
     core: BTreeSet<ShardId>,
     delivering: BTreeSet<ShardId>,
+    /// The shards that run an outbound leg beside an inbound or core
+    /// one: a swap's caller, which withdraws before the venue and banks
+    /// after it.
+    mixed: BTreeSet<ShardId>,
+}
+
+/// Which of a shard's legs a member runs.
+///
+/// A shard outside the core may hold legs on both sides of it: inbound
+/// ones that feed it and outbound ones that consume what it returns. The
+/// two cannot be one admission, since the outbound legs wait on a
+/// crossing the core issues only after the inbound ones have crossed to
+/// it. So a shard's work divides into at most two members — an issuing
+/// one that runs its inbound legs and its share of the core, and a
+/// delivering one that runs its outbound legs once their arrivals land —
+/// and a shard with legs on one side only has the one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Side {
+    /// The inbound legs and the core share: what settles, what issues,
+    /// what a verdict is drawn from.
+    Issuing,
+    /// The outbound legs: a delivery, admitted when what it consumes has
+    /// crossed, deciding nothing and reserving nothing.
+    Delivering,
+}
+
+impl Side {
+    /// Whether a node of `role` runs on this side.
+    #[must_use]
+    pub const fn runs(self, role: LegRole) -> bool {
+        match (self, role) {
+            (Self::Issuing, LegRole::Inbound | LegRole::Core | LegRole::Attesting)
+            | (Self::Delivering, LegRole::Outbound) => true,
+            (Self::Issuing, LegRole::Outbound)
+            | (Self::Delivering, LegRole::Inbound | LegRole::Core | LegRole::Attesting) => false,
+        }
+    }
 }
 
 impl Classified {
@@ -106,14 +143,20 @@ impl Classified {
     #[must_use]
     pub fn freeze(legs: &[LegShape], placement: Placement<'_>) -> Self {
         let decomposed = decomposes(legs, placement);
+        let (delivering, mixed) = if decomposed.holds() {
+            let (delivers, settles) = delivery_sides(legs, placement.trie());
+            (
+                delivers.difference(&settles).copied().collect(),
+                delivers.intersection(&settles).copied().collect(),
+            )
+        } else {
+            (BTreeSet::new(), BTreeSet::new())
+        };
         Self {
             decomposed,
             core: core_shards(legs, placement.trie()),
-            delivering: if decomposed.holds() {
-                delivering_shards(legs, placement.trie())
-            } else {
-                BTreeSet::new()
-            },
+            delivering,
+            mixed,
         }
     }
 
@@ -124,6 +167,7 @@ impl Classified {
             decomposed: Decomposed::WHOLE,
             core: BTreeSet::new(),
             delivering: BTreeSet::new(),
+            mixed: BTreeSet::new(),
         }
     }
 
@@ -135,6 +179,27 @@ impl Classified {
     #[must_use]
     pub fn delivers_at(&self, shard: ShardId) -> bool {
         self.delivering.contains(&shard)
+    }
+
+    /// Whether `shard` runs an outbound leg beside an inbound or core one,
+    /// and so runs this transaction as two members: an issuing one at its
+    /// commit, and a delivering one once the core's output has crossed
+    /// back to it.
+    #[must_use]
+    pub fn mixed_at(&self, shard: ShardId) -> bool {
+        self.mixed.contains(&shard)
+    }
+
+    /// The side `shard`'s first member runs: its delivery where it only
+    /// delivers, and everything that issues otherwise. A mixed shard's
+    /// delivering member is registered by the issuing one's admission.
+    #[must_use]
+    pub fn first_side_at(&self, shard: ShardId) -> Side {
+        if self.delivers_at(shard) {
+            Side::Delivering
+        } else {
+            Side::Issuing
+        }
     }
 
     /// Whether the legs run where their state lives.
@@ -155,8 +220,13 @@ impl Classified {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Runs {
     /// The transaction as classified at commit — whole, or the legs
-    /// this shard's placement gives it.
-    Shape(Classified),
+    /// this shard's placement gives it on `side`.
+    Shape {
+        /// The classification the committing block froze.
+        classified: Classified,
+        /// Which of this shard's legs the member runs.
+        side: Side,
+    },
     /// No node at all: the crossings an inbound leg here issued, taken
     /// back on the evidence a committed record carries.
     Reclaim {
@@ -204,6 +274,13 @@ pub fn core_shards(legs: &[LegShape], trie: &ShardTrie) -> BTreeSet<ShardId> {
 /// decided once.
 #[must_use]
 pub fn delivering_shards(legs: &[LegShape], trie: &ShardTrie) -> BTreeSet<ShardId> {
+    let (delivers, settles) = delivery_sides(legs, trie);
+    delivers.difference(&settles).copied().collect()
+}
+
+/// The shards running an outbound leg, and the shards running an inbound
+/// or core one. A shard in both runs the transaction as two members.
+fn delivery_sides(legs: &[LegShape], trie: &ShardTrie) -> (BTreeSet<ShardId>, BTreeSet<ShardId>) {
     let star = star_of(legs, trie);
     let mut delivers = BTreeSet::new();
     let mut settles = BTreeSet::new();
@@ -219,7 +296,7 @@ pub fn delivering_shards(legs: &[LegShape], trie: &ShardTrie) -> BTreeSet<ShardI
             }
         }
     }
-    delivers.difference(&settles).copied().collect()
+    (delivers, settles)
 }
 
 /// Whether this transaction's legs run where their state lives.
@@ -261,6 +338,10 @@ pub struct CrossingEdge {
     pub output: u32,
     /// The record cell, under the producing node's target.
     pub record: SubstateKey,
+    /// Whether an outbound leg consumes it — a delivery's arrival, which
+    /// the delivering member of each claiming shard waits on rather than
+    /// the issuing one.
+    pub delivers: bool,
 }
 
 /// The value edges that cross under `decomposed`.
@@ -294,6 +375,7 @@ pub fn crossings_of(
                 node: crossing.node,
                 output: crossing.output,
                 record: crossing.record,
+                delivers: star.role(consumer) == LegRole::Outbound,
             })
         })
         .collect()
@@ -383,12 +465,13 @@ pub fn plan_for_shard(
     decomposed: Decomposed,
     trie: &ShardTrie,
     local: ShardId,
+    side: Side,
 ) -> Result<ShardPlan, PlanDefect> {
     if !decomposed.holds() {
         return Ok(ShardPlan::whole());
     }
     let star = Star::of(legs, trie);
-    let runs_here = |node: u32| star.running(node).contains(&local);
+    let runs_here = |node: u32| star.running(node).contains(&local) && side.runs(star.role(node));
     let mut plan = LegPlan::whole();
     let mut participant = false;
     for node in 0..star.len() {
@@ -448,10 +531,19 @@ pub fn plan_for_shard(
         if runs_here(consumer) {
             continue;
         }
-        let origin = crossing.origin.ok_or(PlanDefect::NoOrigin {
-            node: crossing.node,
-            output: crossing.output,
-        })?;
+        // Only an inbound leg's crossing is ever reclaimed, so only an
+        // inbound leg's departure has to name the cell a reclaim credits.
+        // A core's departure — minted, or drawn from several cells —
+        // names none, and nobody takes it back.
+        let origin = match (star.role(crossing.node), crossing.origin) {
+            (LegRole::Inbound, None) => {
+                return Err(PlanDefect::NoOrigin {
+                    node: crossing.node,
+                    output: crossing.output,
+                });
+            }
+            (_, origin) => origin,
+        };
         let record = CrossingSite::record(
             &ProtocolHasher,
             producer.target,
@@ -744,8 +836,16 @@ mod tests {
     #[test]
     fn a_whole_transaction_plans_the_whole_shape() {
         let legs = transfer();
-        let plan = plan_for_shard(&legs, &[], &[], Decomposed::WHOLE, &trie(), low())
-            .expect("a whole plan needs nothing");
+        let plan = plan_for_shard(
+            &legs,
+            &[],
+            &[],
+            Decomposed::WHOLE,
+            &trie(),
+            low(),
+            Side::Issuing,
+        )
+        .expect("a whole plan needs nothing");
         assert!(plan.legs.is_whole());
         assert!(plan.scope.covers(owner(0x22, true)));
         assert!(
@@ -773,14 +873,22 @@ mod tests {
         assert_eq!(edges[0].to, BTreeSet::from([high()]));
         assert_eq!(core_shards(&legs, &trie()), BTreeSet::from([low()]));
 
-        let sender = plan_for_shard(&legs, &crossings, &[], divided, &trie(), low())
-            .expect("the sender's legs need no arrival");
+        let sender = plan_for_shard(
+            &legs,
+            &crossings,
+            &[],
+            divided,
+            &trie(),
+            low(),
+            Side::Issuing,
+        )
+        .expect("the sender's legs need no arrival");
         assert!(sender.legs.runs(0) && sender.legs.runs(1) && !sender.legs.runs(2));
         assert_eq!(
             sender
                 .legs
                 .departing(1, 0)
-                .map(|departure| departure.origin),
+                .and_then(|departure| departure.origin),
             Some(cell(owner(0x11, false), 1)),
         );
         assert!(sender.scope.covers(owner(0x11, false)));
@@ -793,6 +901,7 @@ mod tests {
             divided,
             &trie(),
             high(),
+            Side::Delivering,
         )
         .expect("the recipient's leg has its arrival");
         assert!(!recipient.legs.runs(0) && !recipient.legs.runs(1) && recipient.legs.runs(2));
@@ -817,19 +926,37 @@ mod tests {
         let divided = decomposed(&legs);
         assert_eq!(core_shards(&legs, &trie()), BTreeSet::from([high()]));
 
-        let caller = plan_for_shard(
+        // The caller runs the transaction as two members: its issuing one
+        // signs in and withdraws, waiting on nothing, and its delivering
+        // one banks the venue's output once that has crossed back.
+        let issuing = plan_for_shard(
+            &legs,
+            &crossings,
+            &[],
+            divided,
+            &trie(),
+            low(),
+            Side::Issuing,
+        )
+        .expect("the caller's issuing legs take no arrival");
+        assert!(issuing.legs.runs(0) && issuing.legs.runs(1));
+        assert!(!issuing.legs.runs(2) && !issuing.legs.runs(3));
+        assert!(issuing.legs.departing(1, 0).is_some());
+        assert!(issuing.legs.arrival(2, 0).is_none());
+        let delivering = plan_for_shard(
             &legs,
             &crossings,
             &[arrival(2, 0, 90)],
             divided,
             &trie(),
             low(),
+            Side::Delivering,
         )
-        .expect("the caller's legs have their arrival");
-        assert!(caller.legs.runs(0) && caller.legs.runs(1) && !caller.legs.runs(2));
-        assert!(caller.legs.runs(3));
-        assert!(caller.legs.departing(1, 0).is_some());
-        assert!(caller.legs.arrival(2, 0).is_some());
+        .expect("the caller's delivering leg has its arrival");
+        assert!(delivering.legs.runs(3));
+        assert!(!delivering.legs.runs(0) && !delivering.legs.runs(1) && !delivering.legs.runs(2));
+        assert!(delivering.legs.arrival(2, 0).is_some());
+        assert!(delivering.legs.departing(1, 0).is_none());
 
         let venue = plan_for_shard(
             &legs,
@@ -838,6 +965,7 @@ mod tests {
             divided,
             &trie(),
             high(),
+            Side::Issuing,
         )
         .expect("the venue has its arrival");
         assert!(venue.legs.runs(2));
@@ -856,7 +984,16 @@ mod tests {
         let crossings = vec![crossing(&legs, 1, 0, true)];
         let divided = decomposed(&legs);
         assert_eq!(
-            plan_for_shard(&legs, &crossings, &[], divided, &trie(), high()).err(),
+            plan_for_shard(
+                &legs,
+                &crossings,
+                &[],
+                divided,
+                &trie(),
+                high(),
+                Side::Delivering
+            )
+            .err(),
             Some(PlanDefect::MissingArrival { node: 1, output: 0 }),
         );
     }
@@ -865,12 +1002,45 @@ mod tests {
     /// nowhere for its value to leave from, and the plan says so rather
     /// than inventing a cell.
     #[test]
+    fn a_core_departure_names_no_origin() {
+        let legs = swap();
+        let crossings = vec![crossing(&legs, 1, 0, true), crossing(&legs, 2, 0, false)];
+        let divided = decomposed(&legs);
+        let venue = plan_for_shard(
+            &legs,
+            &crossings,
+            &[arrival(1, 0, 100)],
+            divided,
+            &trie(),
+            high(),
+            Side::Issuing,
+        )
+        .expect("a core issues what it minted");
+        assert_eq!(
+            venue.legs.departing(2, 0).map(|departure| departure.origin),
+            Some(None),
+            "and its record names no cell to credit"
+        );
+    }
+
+    /// An inbound leg's departure is the reclaimable kind, and one with
+    /// no origin is a defect rather than a record nothing can credit.
+    #[test]
     fn a_departure_without_an_origin_is_a_defect() {
         let legs = transfer();
         let crossings = vec![crossing(&legs, 1, 0, false)];
         let divided = decomposed(&legs);
         assert_eq!(
-            plan_for_shard(&legs, &crossings, &[], divided, &trie(), low()).err(),
+            plan_for_shard(
+                &legs,
+                &crossings,
+                &[],
+                divided,
+                &trie(),
+                low(),
+                Side::Issuing
+            )
+            .err(),
             Some(PlanDefect::NoOrigin { node: 1, output: 0 }),
         );
     }
@@ -894,7 +1064,8 @@ mod tests {
                 &[],
                 divided_deeper,
                 &elsewhere,
-                ShardId::leaf(2, 1)
+                ShardId::leaf(2, 1),
+                Side::Issuing
             )
             .err(),
             Some(PlanDefect::NotAParticipant),
@@ -910,7 +1081,8 @@ mod tests {
                 &[arrival(2, 0, 90)],
                 divided,
                 &trie(),
-                low()
+                low(),
+                Side::Issuing
             )
             .err(),
             Some(PlanDefect::NoSuchNode { node: 9 }),

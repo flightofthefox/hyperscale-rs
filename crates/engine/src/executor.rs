@@ -49,7 +49,7 @@ use hyperscale_vm_types::{
 
 use crate::backend::EngineBackend;
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
-use crate::legs::{Decomposed, Runs, ShardPlan, plan_for_shard, reclaim_for_shard};
+use crate::legs::{Decomposed, Runs, ShardPlan, Side, plan_for_shard, reclaim_for_shard};
 use crate::records::BatchRecords;
 use crate::sharding::writes_root;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
@@ -492,6 +492,7 @@ impl Executor {
         records: &BatchRecords,
         decomposed: Decomposed,
         arrivals: &[EscrowedValue],
+        side: Side,
     ) -> Result<PreparedTx, String> {
         let mut entry = Self::prepare(tx, records)?;
         entry.plan = plan_for_shard(
@@ -501,6 +502,7 @@ impl Executor {
             decomposed,
             ctx.shard_trie,
             ctx.local_shard,
+            side,
         )
         .map_err(|defect| format!("no plan for this shard: {defect}"))?;
         declare_crossing_cells(&mut entry.declaration, &entry.plan.legs)?;
@@ -530,6 +532,11 @@ impl Executor {
                 .cell(reclaim.record)
                 .and_then(|bytes| CrossingCell::from_bytes(&bytes))
                 .ok_or_else(|| format!("reclaim of edge ({node}, {output}) reads no record"))?;
+            let origin = record.origin.ok_or_else(|| {
+                format!(
+                    "reclaim of edge ({node}, {output}) reads a record naming no cell to credit"
+                )
+            })?;
             for (effect, holds) in [
                 (
                     Effect {
@@ -547,7 +554,7 @@ impl Executor {
                 ),
                 (
                     Effect {
-                        target: EffectTarget::Point(record.origin),
+                        target: EffectTarget::Point(origin),
                         mode: Mode::Delta { moves: Moves::Both },
                     },
                     Some(record.resource),
@@ -1235,10 +1242,12 @@ impl Executor {
                         .map_err(|defect| format!("no reclaim for this shard: {defect}"))
                         .and_then(|plan| Self::prepare_reclaim(plan, snapshot))
                 }
-                Some((Runs::Shape(classified), arrivals)) => {
-                    Self::prepare_shape(ctx, tx, &records, classified.decomposed(), arrivals)
+                Some((Runs::Shape { classified, side }, arrivals)) => {
+                    Self::prepare_shape(ctx, tx, &records, classified.decomposed(), arrivals, *side)
                 }
-                None => Self::prepare_shape(ctx, tx, &records, Decomposed::WHOLE, &[]),
+                None => {
+                    Self::prepare_shape(ctx, tx, &records, Decomposed::WHOLE, &[], Side::Issuing)
+                }
             };
             match planned {
                 Ok(entry) => {
@@ -1362,16 +1371,26 @@ impl Executor {
                 if ctx.shard_trie.shard_for_prefix(vault.owner) != ctx.local_shard {
                     return None;
                 }
-                // The reclaim of a leg this shard already charged — the
-                // leg ran, and its own certificate burned the price inside
-                // its writes — takes an escrow back and burns nothing, so
-                // the price is levied exactly once. The reclaim of a leg
-                // that never ran is the one receipt of this shard's that
-                // can still carry it.
-                if matches!(
-                    shapes.get(&tx.hash()).map(|shape| &shape.runs),
-                    Some(Runs::Reclaim { charged: true })
-                ) {
+                // A second execution of a transaction this shard already
+                // charged burns nothing, so the price is levied exactly
+                // once: the reclaim of a leg that ran, whose own
+                // certificate burned it inside its writes, and the
+                // delivering member of a mixed shard, whose issuing member
+                // did. The reclaim of a leg that never ran is the one
+                // receipt of this shard's that can still carry it.
+                let already_charged = match shapes.get(&tx.hash()).map(|shape| &shape.runs) {
+                    Some(Runs::Reclaim { charged }) => *charged,
+                    Some(Runs::Shape {
+                        classified,
+                        side: Side::Delivering,
+                    }) => classified.mixed_at(ctx.local_shard),
+                    Some(Runs::Shape {
+                        side: Side::Issuing,
+                        ..
+                    })
+                    | None => false,
+                };
+                if already_charged {
                     return None;
                 }
                 Some((

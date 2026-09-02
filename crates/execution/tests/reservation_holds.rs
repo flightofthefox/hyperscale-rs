@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::ExecutedTx;
-use hyperscale_engine::legs::{Classified, Runs};
+use hyperscale_engine::legs::{Classified, Runs, Side};
 use hyperscale_execution::action_handlers::accumulate_tick_output;
 use hyperscale_storage::TickOutput;
 use hyperscale_types::{
@@ -134,7 +134,10 @@ fn request_for(tx: &Arc<Verified<Transaction>>) -> CrossShardExecutionRequest {
         clock: WeightedTimestamp::from_millis(1_000),
         reaches_beyond: true,
         abortable: true,
-        runs: Runs::Shape(Classified::whole()),
+        runs: Runs::Shape {
+            classified: Classified::whole(),
+            side: Side::Issuing,
+        },
         arrivals: Vec::new(),
     }
 }

@@ -19,12 +19,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use hyperscale_engine::legs::{Classified, crossings_of};
+use hyperscale_engine::legs::{Classified, Side, crossings_of};
 use hyperscale_types::{
     Provisions, RETENTION_HORIZON, ShardId, ShardTrie, SubstateEntry, SubstateKey, TxHash,
     Verified, WeightedTimestamp,
 };
-use hyperscale_vm_types::{Crossing, LegShape};
+use hyperscale_vm_types::{AddressClass, Crossing, LegShape};
 
 /// One thing a cross-shard member waits for before it can run.
 ///
@@ -71,20 +71,41 @@ pub fn divided_requirements(
     classified: &Classified,
     trie: &ShardTrie,
     local: ShardId,
+    side: Side,
 ) -> BTreeSet<Requirement> {
     let mut requirements: BTreeSet<Requirement> = BTreeSet::new();
     let core = classified.core();
-    if core.contains(&local) {
+    if side == Side::Issuing && core.contains(&local) {
         requirements.extend(
             core.iter()
                 .filter(|&&shard| shard != local)
                 .map(|&shard| Requirement::CommittedState(shard)),
         );
     }
+    // Every member admits the whole manifest, and admission resolves a
+    // component call against the target's own record — a declared read
+    // of its leaf, provisioned by the shard holding it. So a member waits
+    // for the commit-time bundle of every remote shard holding a
+    // component the transaction calls, which is where the records it
+    // cannot read itself arrive. A principal has no record to read, so a
+    // transaction reaching only accounts waits on nobody here.
+    requirements.extend(
+        legs.iter()
+            .filter(|leg| leg.target.class() == AddressClass::Component)
+            .map(|leg| trie.shard_for_prefix(leg.target))
+            .filter(|&shard| shard != local)
+            .map(Requirement::CommittedState),
+    );
+    // A member waits only on the arrivals its own side's legs consume:
+    // the issuing side on what feeds its core share, the delivering side
+    // on what the core returned. An inbound leg consumes nothing that
+    // crosses, so a shard's issuing member on the far side of a core
+    // waits on nothing at all — which is what lets the core's arrival
+    // exist in the first place.
     requirements.extend(
         crossings_of(legs, crossings, classified.decomposed(), trie)
             .into_iter()
-            .filter(|edge| edge.to.contains(&local))
+            .filter(|edge| edge.to.contains(&local) && edge.delivers == (side == Side::Delivering))
             .map(|edge| Requirement::Crossing {
                 source: edge.from,
                 key: edge.record,
@@ -542,20 +563,17 @@ mod tests {
         }
     }
 
-    /// A divided member files its scope minus itself and the crossings
-    /// it consumes: a leg member files no committed state, a member of a
-    /// two-shard core files exactly one, and a consumer of an edge its
-    /// shard does not produce files that crossing.
+    /// A divided member files its scope minus itself, the records of the
+    /// remote components it calls, and the crossings its side consumes.
+    /// Every fixture target is a component, so each member here waits for
+    /// the record of every remote node — a leg reaching only accounts
+    /// would file none.
     #[test]
     fn a_divided_member_files_its_scope_minus_itself() {
         use hyperscale_engine::legs::Placement;
 
         let trie = ShardTrie::uniform(2);
-        let (low, high, third) = (
-            ShardId::leaf(2, 0),
-            ShardId::leaf(2, 1),
-            ShardId::leaf(2, 2),
-        );
+        let (low, high) = (ShardId::leaf(2, 0), ShardId::leaf(2, 1));
         let leaving = BTreeSet::new();
 
         // A swap: sign-in, withdraw and deposit on the low shard, the
@@ -565,28 +583,59 @@ mod tests {
         let classified = Classified::freeze(&swap, Placement::new(&trie, &leaving));
         assert!(classified.decomposed().holds());
 
-        let caller = divided_requirements(&swap, &crossings, &classified, &trie, low);
+        // The caller's issuing member waits on the venue's record and no
+        // crossing: its withdraw is what the venue waits for. Its
+        // delivering member waits on the venue's output as well.
+        assert!(classified.mixed_at(low));
+        let issuing =
+            divided_requirements(&swap, &crossings, &classified, &trie, low, Side::Issuing);
         assert_eq!(
-            caller,
-            BTreeSet::from([Requirement::Crossing {
-                source: high,
-                key: crossings[1].record,
-            }]),
-            "the caller's legs wait on the venue's output and no committed state",
+            issuing,
+            BTreeSet::from([Requirement::CommittedState(high)]),
+            "the caller's issuing member waits on the venue's record and no crossing",
         );
-        let venue = divided_requirements(&swap, &crossings, &classified, &trie, high);
+        let delivering =
+            divided_requirements(&swap, &crossings, &classified, &trie, low, Side::Delivering);
+        assert_eq!(
+            delivering,
+            BTreeSet::from([
+                Requirement::CommittedState(high),
+                Requirement::Crossing {
+                    source: high,
+                    key: crossings[1].record,
+                },
+            ]),
+            "the caller's delivering member waits on the venue's output",
+        );
+        let venue =
+            divided_requirements(&swap, &crossings, &classified, &trie, high, Side::Issuing);
         assert_eq!(
             venue,
-            BTreeSet::from([Requirement::Crossing {
-                source: low,
-                key: crossings[0].record,
-            }]),
-            "a single-shard core waits on its arrival alone",
+            BTreeSet::from([
+                Requirement::CommittedState(low),
+                Requirement::Crossing {
+                    source: low,
+                    key: crossings[0].record,
+                },
+            ]),
+            "a single-shard core waits on its arrival and its caller's records",
         );
+    }
 
-        // Two core nodes on two shards fed by an inbound leg on a third:
-        // each core member files the other's committed state, and both
-        // claim the inbound crossing, since neither runs its producer.
+    /// Two core nodes on two shards fed by an inbound leg on a third:
+    /// each core member files the other's committed state, and both
+    /// claim the inbound crossing, since neither runs its producer.
+    #[test]
+    fn a_multi_shard_core_files_its_peers_and_its_arrival() {
+        use hyperscale_engine::legs::Placement;
+
+        let trie = ShardTrie::uniform(2);
+        let (low, high, third) = (
+            ShardId::leaf(2, 0),
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 2),
+        );
+        let leaving = BTreeSet::new();
         let route = fixtures::route();
         let crossings = vec![record_of(&route, 0), record_of(&route, 1)];
         let classified = Classified::freeze(&route, Placement::new(&trie, &leaving));
@@ -597,17 +646,28 @@ mod tests {
             key: crossings[0].record,
         };
         assert_eq!(
-            divided_requirements(&route, &crossings, &classified, &trie, high),
-            BTreeSet::from([Requirement::CommittedState(third), arrival]),
+            divided_requirements(&route, &crossings, &classified, &trie, high, Side::Issuing),
+            BTreeSet::from([
+                Requirement::CommittedState(third),
+                Requirement::CommittedState(low),
+                arrival,
+            ]),
         );
         assert_eq!(
-            divided_requirements(&route, &crossings, &classified, &trie, third),
-            BTreeSet::from([Requirement::CommittedState(high), arrival]),
+            divided_requirements(&route, &crossings, &classified, &trie, third, Side::Issuing),
+            BTreeSet::from([
+                Requirement::CommittedState(high),
+                Requirement::CommittedState(low),
+                arrival,
+            ]),
         );
         assert_eq!(
-            divided_requirements(&route, &crossings, &classified, &trie, low),
-            BTreeSet::new(),
-            "the inbound leg waits on nothing",
+            divided_requirements(&route, &crossings, &classified, &trie, low, Side::Issuing),
+            BTreeSet::from([
+                Requirement::CommittedState(high),
+                Requirement::CommittedState(third),
+            ]),
+            "the inbound leg waits on nothing but the records of the venues it calls",
         );
     }
 

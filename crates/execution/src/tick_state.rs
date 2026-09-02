@@ -37,7 +37,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_engine::legs::Classified;
+use hyperscale_engine::legs::{Classified, Side};
 use hyperscale_types::{
     BlockHash, BlockHeight, EscrowedValue, ExecutionCertificate, ExecutionOutcome, Finalization,
     GlobalReceiptRoot, MAX_FINALIZATION_DELAY, Settles, ShardId, StoredReceipt, TickHalf, TickId,
@@ -101,7 +101,12 @@ impl Membership {
     /// The membership of a member of `participating`, frozen as
     /// `classified`, on `local`.
     #[must_use]
-    pub fn of(classified: &Classified, local: ShardId, participating: BTreeSet<ShardId>) -> Self {
+    pub fn of(
+        classified: &Classified,
+        local: ShardId,
+        participating: BTreeSet<ShardId>,
+        side: Side,
+    ) -> Self {
         let in_core = classified.core().contains(&local);
         let awaited = if !classified.decomposed().holds() {
             participating.clone()
@@ -118,7 +123,7 @@ impl Membership {
             awaited,
             reach: participating,
             decides: !classified.decomposed().holds() || in_core,
-            delivers: classified.decomposed().holds() && classified.delivers_at(local),
+            delivers: classified.decomposed().holds() && side == Side::Delivering,
         }
     }
 
@@ -1496,7 +1501,7 @@ mod tests {
         let swap = Classified::freeze(&swap(), Placement::new(&trie, &leaving));
         assert!(swap.decomposed().holds());
         let participating = BTreeSet::from([low, high]);
-        let caller = Membership::of(&swap, low, participating.clone());
+        let caller = Membership::of(&swap, low, participating.clone(), Side::Issuing);
         assert_eq!(
             caller.awaited(),
             &BTreeSet::from([low]),
@@ -1504,7 +1509,7 @@ mod tests {
         );
         assert_eq!(caller.reach(), &participating);
         assert!(!caller.decides(), "and its core decides the transaction");
-        let venue = Membership::of(&swap, high, participating.clone());
+        let venue = Membership::of(&swap, high, participating.clone(), Side::Issuing);
         assert_eq!(
             venue.awaited(),
             &BTreeSet::from([high]),
@@ -1515,17 +1520,22 @@ mod tests {
 
         let route = Classified::freeze(&route(), Placement::new(&trie, &leaving));
         let participating = BTreeSet::from([low, high, third]);
-        let core_member = Membership::of(&route, high, participating.clone());
+        let core_member = Membership::of(&route, high, participating.clone(), Side::Issuing);
         assert_eq!(
             core_member.awaited(),
             &BTreeSet::from([high, third]),
             "a core member awaits the core set"
         );
         assert_eq!(core_member.reach(), &participating);
-        let feeder = Membership::of(&route, low, participating.clone());
+        let feeder = Membership::of(&route, low, participating.clone(), Side::Issuing);
         assert_eq!(feeder.awaited(), &BTreeSet::from([low]));
 
-        let whole = Membership::of(&Classified::whole(), low, participating.clone());
+        let whole = Membership::of(
+            &Classified::whole(),
+            low,
+            participating.clone(),
+            Side::Issuing,
+        );
         assert_eq!(whole, Membership::whole(participating));
     }
 
@@ -1570,14 +1580,19 @@ mod tests {
         );
         let participating = BTreeSet::from([sender, recipient]);
         let delivery = tx(1);
-        let membership = Membership::of(&transfer, recipient, participating.clone());
+        let membership = Membership::of(
+            &transfer,
+            recipient,
+            participating.clone(),
+            Side::Delivering,
+        );
         assert!(membership.delivers());
         assert!(!membership.decides());
         tick.admit(delivery, membership, 10, Admission::Executes);
         let issuer = tx(2);
         tick.admit(
             issuer,
-            Membership::of(&swap, leaf(0), participating),
+            Membership::of(&swap, leaf(0), participating, Side::Issuing),
             10,
             Admission::Executes,
         );
@@ -1622,7 +1637,12 @@ mod tests {
         );
         tick.admit(
             leg,
-            Membership::of(&classified, local, BTreeSet::from([local, venue])),
+            Membership::of(
+                &classified,
+                local,
+                BTreeSet::from([local, venue]),
+                Side::Issuing,
+            ),
             10,
             Admission::Executes,
         );

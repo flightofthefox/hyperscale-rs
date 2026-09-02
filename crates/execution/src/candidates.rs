@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
-use hyperscale_engine::legs::{Classified, Runs, crossings_of};
+use hyperscale_engine::legs::{Classified, Runs, Side, crossings_of};
 use hyperscale_types::{
     EscrowedValue, ShardId, ShardTrie, SubstateKey, Transaction, TxHash, Verified,
     WeightedTimestamp,
@@ -47,6 +47,8 @@ struct Candidate {
     engagement_deadline: Option<WeightedTimestamp>,
     /// The classification its committing block froze.
     classified: Classified,
+    /// Which of this shard's legs the member runs.
+    side: Side,
 }
 
 impl Candidate {
@@ -82,6 +84,7 @@ fn arrivals_for(
     provisioning: &ProvisioningTracker,
     trie: &ShardTrie,
     local: ShardId,
+    side: Side,
 ) -> Vec<EscrowedValue> {
     if !classified.decomposed().holds() {
         return Vec::new();
@@ -96,7 +99,7 @@ fn arrivals_for(
         .collect();
     edges
         .into_iter()
-        .filter(|edge| edge.to.contains(&local))
+        .filter(|edge| edge.to.contains(&local) && edge.delivers == (side == Side::Delivering))
         .filter_map(|edge| {
             let record = CrossingCell::from_bytes(cells.get(&edge.record)?)?;
             Some(EscrowedValue {
@@ -132,6 +135,15 @@ pub struct Admitted {
     pub admission: Admission,
 }
 
+impl Admitted {
+    /// Every shard the member's transaction reaches — what a second
+    /// member of it on this shard is registered as participating with.
+    #[must_use]
+    pub fn membership_reach(&self) -> BTreeSet<ShardId> {
+        self.membership.reach().clone()
+    }
+}
+
 impl TickCandidates {
     /// An empty pool for `local_shard`.
     #[must_use]
@@ -154,6 +166,7 @@ impl TickCandidates {
         committed_ts: WeightedTimestamp,
         classified: Classified,
     ) {
+        let side = classified.first_side_at(self.local_shard);
         self.candidates.entry(tx.hash()).or_insert(Candidate {
             tx,
             participating,
@@ -161,6 +174,31 @@ impl TickCandidates {
             engagement_pending: BTreeSet::new(),
             engagement_deadline: None,
             classified,
+            side,
+        });
+    }
+
+    /// Record the delivering member of a transaction whose issuing member
+    /// a tick has just taken: this shard runs outbound legs beside the
+    /// inbound ones, and they wait on what the core returns.
+    ///
+    /// Waits on no engagement — the issuing member settled that — and
+    /// runs under the same committing block's clock.
+    pub fn register_delivery(
+        &mut self,
+        tx: Arc<Verified<Transaction>>,
+        participating: BTreeSet<ShardId>,
+        committed_ts: WeightedTimestamp,
+        classified: Classified,
+    ) {
+        self.candidates.entry(tx.hash()).or_insert(Candidate {
+            tx,
+            participating,
+            committed_ts,
+            engagement_pending: BTreeSet::new(),
+            engagement_deadline: None,
+            classified,
+            side: Side::Delivering,
         });
     }
 
@@ -238,6 +276,7 @@ impl TickCandidates {
                 &candidate.classified,
                 local,
                 candidate.participating.clone(),
+                candidate.side,
             );
             // A member whose effects a counterpart's verdict can still
             // discard: its writes stay provisional, and its declaration
@@ -265,6 +304,7 @@ impl TickCandidates {
                 provisioning,
                 trie,
                 local,
+                candidate.side,
             );
             // A remote-payer leg executes under the anchor its payer
             // bundle carried; every other member under its own committing
@@ -285,7 +325,10 @@ impl TickCandidates {
                     clock: anchor.map_or(candidate.committed_ts, |a| a.clock),
                     reaches_beyond,
                     abortable,
-                    runs: Runs::Shape(candidate.classified.clone()),
+                    runs: Runs::Shape {
+                        classified: candidate.classified.clone(),
+                        side: candidate.side,
+                    },
                     arrivals,
                 },
                 membership,

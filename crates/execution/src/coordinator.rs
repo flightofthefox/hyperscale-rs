@@ -37,7 +37,9 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::{Classified, Placement, Runs, crossings_of, decomposition_enabled};
+use hyperscale_engine::legs::{
+    Classified, Placement, Runs, Side, crossings_of, decomposition_enabled,
+};
 use hyperscale_engine::{TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_unresolvable_tx};
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
@@ -56,7 +58,7 @@ use hyperscale_types::{
 };
 use tracing::instrument;
 
-use crate::candidates::TickCandidates;
+use crate::candidates::{Admitted, TickCandidates};
 use crate::early_arrivals::{EARLY_VOTE_RETENTION, EarlyArrivalBuffer};
 use crate::exec_cert_store::ExecCertStore;
 use crate::expected_certs::ExpectedCertTracker;
@@ -678,6 +680,7 @@ impl ExecutionCoordinator {
                         classified,
                         classification.shard_trie(),
                         local_shard,
+                        classified.first_side_at(local_shard),
                     ),
                 );
                 continue;
@@ -1016,6 +1019,103 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Seat one composed member in the tick: its reservation, its
+    /// crossing targets, its tick assignment, and — for a mixed shard's
+    /// issuing member — the delivering member it makes composable.
+    fn admit_member(
+        &mut self,
+        tick_id: TickId,
+        trie: &ShardTrie,
+        member: Admitted,
+        state: &mut TickState,
+        ticked: &mut TickedBatch,
+        requests: &mut Vec<CrossShardExecutionRequest>,
+    ) {
+        let local_shard = self.local_shard;
+        // A mixed shard's delivering member is the second this shard
+        // runs of the transaction: the issuing one returned the
+        // reservation its block took and settled the price, so this
+        // one reserves nothing and issues nothing.
+        let second_member = matches!(
+            &member.request.runs,
+            Runs::Shape { classified, side: Side::Delivering } if classified.mixed_at(local_shard)
+        );
+        let reach = member.membership_reach();
+        state.admit(
+            member.request.tx_hash,
+            member.membership,
+            if second_member {
+                0
+            } else {
+                member.request.transaction.work()
+            },
+            member.admission,
+        );
+        // Where this member's crossings land, off the frozen
+        // classification: the shards its outcome promises a bundle
+        // to, if it issues anything. Only an issuing member issues;
+        // a delivery and a reclaim promise nobody a bundle.
+        let targets: BTreeSet<ShardId> = match &member.request.runs {
+            Runs::Shape {
+                classified,
+                side: Side::Issuing,
+            } => crossings_of(
+                member.request.transaction.legs(),
+                member.request.transaction.crossings(),
+                classified.decomposed(),
+                trie,
+            )
+            .into_iter()
+            .filter(|edge| edge.from == local_shard)
+            .flat_map(|edge| edge.to)
+            .collect(),
+            Runs::Shape {
+                side: Side::Delivering,
+                ..
+            }
+            | Runs::Reclaim { .. } => BTreeSet::new(),
+        };
+        state.record_crossing_targets(member.request.tx_hash, targets);
+        self.ticks.assign_tx(member.request.tx_hash, tick_id);
+        self.unresolved.certify(member.request.tx_hash);
+        // A shard with legs on both sides of the core runs them as two
+        // members: the issuing one just admitted, and a delivering one
+        // that waits on what the core returns. Registered here, at the
+        // issuing admission, so every replica composes it from the
+        // same commit; it joins a later tick once its arrival lands.
+        if let Runs::Shape {
+            classified,
+            side: Side::Issuing,
+        } = &member.request.runs
+            && classified.mixed_at(local_shard)
+        {
+            self.provisioning.record_required(
+                member.request.tx_hash,
+                divided_requirements(
+                    member.request.transaction.legs(),
+                    member.request.transaction.crossings(),
+                    classified,
+                    trie,
+                    local_shard,
+                    Side::Delivering,
+                ),
+            );
+            self.candidates.register_delivery(
+                Arc::clone(&member.request.transaction),
+                reach,
+                member.request.clock,
+                classified.clone(),
+            );
+        }
+        if member.request.abortable {
+            ticked.legs.insert(member.request.tx_hash);
+            ticked
+                .provisional_claims
+                .extend(member.request.transaction.routing().declared_modes.clone());
+        }
+        requests.push(member.request);
+    }
+
     fn compose_tick(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -1037,40 +1137,19 @@ impl ExecutionCoordinator {
 
         let mut state = TickState::new(tick_id, block.hash, block.ts);
         let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());
-        let mut provisional_claims: Vec<(DeclaredKey, Mode)> = Vec::new();
-        let mut legs: BTreeSet<TxHash> = BTreeSet::new();
+        let mut ticked = TickedBatch {
+            provisional_claims: Vec::new(),
+            legs: BTreeSet::new(),
+        };
         for member in admitted {
-            state.admit(
-                member.request.tx_hash,
-                member.membership,
-                member.request.transaction.work(),
-                member.admission,
+            self.admit_member(
+                tick_id,
+                trie,
+                member,
+                &mut state,
+                &mut ticked,
+                &mut requests,
             );
-            // Where this member's crossings land, off the frozen
-            // classification: the shards its outcome promises a bundle
-            // to, if it issues anything. A reclaim issues nothing.
-            let targets: BTreeSet<ShardId> = match &member.request.runs {
-                Runs::Shape(classified) => crossings_of(
-                    member.request.transaction.legs(),
-                    member.request.transaction.crossings(),
-                    classified.decomposed(),
-                    trie,
-                )
-                .into_iter()
-                .filter(|edge| edge.from == local_shard)
-                .flat_map(|edge| edge.to)
-                .collect(),
-                Runs::Reclaim { .. } => BTreeSet::new(),
-            };
-            state.record_crossing_targets(member.request.tx_hash, targets);
-            self.ticks.assign_tx(member.request.tx_hash, tick_id);
-            self.unresolved.certify(member.request.tx_hash);
-            if member.request.abortable {
-                legs.insert(member.request.tx_hash);
-                provisional_claims
-                    .extend(member.request.transaction.routing().declared_modes.clone());
-            }
-            requests.push(member.request);
         }
 
         self.admit_abandoned(topology_schedule, tick_id, &mut state);
@@ -1097,13 +1176,7 @@ impl ExecutionCoordinator {
         // else claims no cell and settles nothing, so the chain never
         // hears of it.
         if !requests.is_empty() {
-            self.ticked.insert(
-                tick_id,
-                TickedBatch {
-                    provisional_claims,
-                    legs,
-                },
-            );
+            self.ticked.insert(tick_id, ticked);
         }
 
         // Only the tick leader creates a `VoteTracker` for aggregation.
@@ -3879,7 +3952,13 @@ impl ExecutionCoordinator {
         }
         for &tx_hash in &tx_hashes {
             self.ticks.remove_assignment(tx_hash);
-            self.provisioning.remove_tx(tx_hash);
+            // What the transaction was provisioned with belongs to every
+            // member this shard runs of it: a mixed shard's delivering
+            // member is still waiting on its arrival when the issuing
+            // one's finalization commits, and drops it with its own.
+            if !self.candidates.contains(tx_hash) {
+                self.provisioning.remove_tx(tx_hash);
+            }
         }
         // Drain pending-tx sets on fulfilled-cert tombstones referencing
         // any of these txs. When the EC's last referenced tx terminates,
