@@ -14,6 +14,7 @@ use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, TickBatchContext, TickEnvironment, genesis_writes,
 };
 use hyperscale_hbor::{from_slice, to_vec};
+use hyperscale_storage::test_helpers::block_settling;
 use hyperscale_storage::{BoundaryStore, GenesisCommit, SubstateStore, Substates};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_transactions::{Client, Terms};
@@ -164,7 +165,7 @@ fn run_tick(
         receipts.push(StoredReceipt::from(tx));
     }
     let after = storage
-        .follow_block_writes(BlockHeight::new(height), &receipts)
+        .follow_block_writes(&block_settling(BlockHeight::new(height), receipts))
         .expect("committed receipts apply");
     assert_ne!(before, after, "a settling tick moves the state root");
     executed

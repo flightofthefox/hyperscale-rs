@@ -20,12 +20,9 @@ use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeK
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
     AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, SubstateStore, Substates, WitnessSeed,
-    entry_from_leaf, filter_writes_to_prefix, merge_writes_from_receipts, package_of_cell,
-    sweepable_expiry,
+    entry_from_leaf, followed_block_writes, package_of_cell, sweepable_expiry,
 };
-use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf,
-};
+use hyperscale_types::{Block, BlockHeight, ChainOrigin, StateRoot, SubstateKey, SubstateLeaf};
 use hyperscale_vm_types::{Address, CollectionId, SweepBucket};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{ColumnFamily, DB, Options, WriteBatch};
@@ -617,11 +614,8 @@ impl BoundaryStore for RocksDbShardStorage {
         self.finalize_staged(height, &witnesses, IMPORT_BATCH_BYTES, None)
     }
 
-    fn follow_block_writes(
-        &self,
-        height: BlockHeight,
-        receipts: &[StoredReceipt],
-    ) -> Result<StateRoot, String> {
+    fn follow_block_writes(&self, block: &Block) -> Result<StateRoot, String> {
+        let height = block.height();
         let _commit_guard = self
             .commit_lock
             .lock()
@@ -639,8 +633,7 @@ impl BoundaryStore for RocksDbShardStorage {
         // of it. A follow that skips a height resolves its movements
         // against a baseline missing what the gap left, and fails against
         // the child roots rather than committing quietly.
-        let merged = merge_writes_from_receipts(receipts, &self.snapshot());
-        let filtered = filter_writes_to_prefix(&merged, &self.root_path);
+        let filtered = followed_block_writes(self, &self.snapshot(), block, &self.root_path);
         if filtered.is_empty() {
             return Ok(base_root);
         }

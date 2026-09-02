@@ -21,8 +21,8 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, DeclaredRange, ExecutionCertificate,
     Finalization, FinalizationHash, Hash, PreparedCommit, Provisions, QuorumCertificate,
-    SafeVoteRegisters, SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey,
-    SubstateLeaf, SweepFrontier, TickId, Transaction, TxHash, ValidatorId, Verifiable, Verified,
+    SafeVoteRegisters, SettledWrites, ShardWitnessPayload, StateRoot, SubstateKey, SubstateLeaf,
+    SweepFrontier, TickId, Transaction, TxHash, ValidatorId, Verifiable, Verified,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -206,12 +206,8 @@ impl BoundaryStore for SharedStorage {
         self.0.finalize_boundary_import(height, witnesses)
     }
 
-    fn follow_block_writes(
-        &self,
-        height: BlockHeight,
-        receipts: &[StoredReceipt],
-    ) -> Result<StateRoot, String> {
-        self.0.follow_block_writes(height, receipts)
+    fn follow_block_writes(&self, block: &Block) -> Result<StateRoot, String> {
+        self.0.follow_block_writes(block)
     }
 
     fn adopt_genesis(

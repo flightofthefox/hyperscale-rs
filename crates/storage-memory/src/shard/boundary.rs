@@ -13,11 +13,10 @@ use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
     AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, SubstateStore, Substates,
-    WitnessSeed, entry_from_leaf, filter_writes_to_prefix, merge_writes_from_receipts,
-    package_of_cell, sweepable_expiry,
+    WitnessSeed, entry_from_leaf, followed_block_writes, package_of_cell, sweepable_expiry,
 };
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, EntryKey, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf,
+    Block, BlockHeight, ChainOrigin, EntryKey, StateRoot, SubstateKey, SubstateLeaf,
 };
 use hyperscale_vm_types::{Address, CollectionId, SweepBucket};
 
@@ -236,17 +235,15 @@ impl BoundaryStore for SimShardStorage {
         Ok(root)
     }
 
-    fn follow_block_writes(
-        &self,
-        height: BlockHeight,
-        receipts: &[StoredReceipt],
-    ) -> Result<StateRoot, String> {
+    fn follow_block_writes(&self, block: &Block) -> Result<StateRoot, String> {
+        let height = block.height();
+        let prefix = read_or_recover(&self.state).tree_store.root_path();
         // Anchored at this store's own tip, which the check above holds
         // only to being behind the followed block rather than one short
         // of it. A follow that skips a height resolves its movements
         // against a baseline missing what the gap left, and fails against
         // the child roots rather than committing quietly.
-        let merged = merge_writes_from_receipts(receipts, &self.snapshot());
+        let filtered = followed_block_writes(self, &self.snapshot(), block, &prefix);
         let mut state = write_or_recover(&self.state);
         if height <= state.current_block_height {
             return Err(format!(
@@ -254,7 +251,6 @@ impl BoundaryStore for SimShardStorage {
                 state.current_block_height,
             ));
         }
-        let filtered = filter_writes_to_prefix(&merged, &state.tree_store.root_path());
         if filtered.is_empty() {
             return Ok(state.current_root_hash);
         }
@@ -280,15 +276,19 @@ impl BoundaryStore for SimShardStorage {
 #[cfg(test)]
 mod tests {
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
-    use hyperscale_storage::SubstateStore;
     use hyperscale_storage::test_helpers::{
-        make_settled_writes, make_state_writes, test_boundary_import_roundtrip,
+        block_settling, make_settled_writes, make_state_writes, test_boundary_import_roundtrip,
         test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
     };
-    use hyperscale_types::test_utils::test_key;
+    use hyperscale_storage::{SubstateStore, Substates, committed_tx_cell_key};
+    use hyperscale_types::test_utils::{
+        install_stub_protocol_statics, stub_sweepable_cell, test_key, test_transaction,
+    };
     use hyperscale_types::{
-        ConsensusReceipt, GlobalReceiptHash, Hash, SettledWrites, ShardId, SplitChildRoots,
-        SubstateKey, TxHash, shard_prefix_path,
+        AddressClass, Block, BlockHeader, BlockHeaderParts, BlockHeight, ConsensusReceipt,
+        GlobalReceiptHash, Hash, SettledWrites, ShardId, SplitChildRoots, StateWrites,
+        StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, Transaction, TxHash, Verifiable,
+        WitnessSources, shard_prefix_path,
     };
 
     use super::*;
@@ -455,8 +455,9 @@ mod tests {
 
             let left_before = left_store.state_root();
             let right_before = right_store.state_root();
-            let left_after = left_store.follow_block_writes(height, &receipts).unwrap();
-            let right_after = right_store.follow_block_writes(height, &receipts).unwrap();
+            let block = block_settling(height, receipts.to_vec());
+            let left_after = left_store.follow_block_writes(&block).unwrap();
+            let right_after = right_store.follow_block_writes(&block).unwrap();
 
             // Exactly the routed side's root moves; the other side's
             // follow is a no-op.
@@ -497,20 +498,133 @@ mod tests {
         }
     }
 
+    /// A live block at `height` whose header names `frontier` as its
+    /// sweep, carrying `txs` and one tick settling `receipts`.
+    fn followed_block(
+        height: u64,
+        frontier: SweepFrontier,
+        txs: Vec<Transaction>,
+        receipts: Vec<StoredReceipt>,
+    ) -> Block {
+        let Block::Live { certificates, .. } = block_settling(BlockHeight::new(height), receipts)
+        else {
+            unreachable!("the fixture builds a live block");
+        };
+        Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(height),
+                sweep_frontier: frontier,
+                ..Default::default()
+            }),
+            transactions: Arc::new(
+                txs.into_iter()
+                    .map(|tx| Arc::new(Verifiable::from(tx)))
+                    .collect(),
+            ),
+            certificates,
+            provisions: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        }
+    }
+
+    /// A followed block is applied as the chain applied it, not as its
+    /// receipts alone say: the committed cell of a transaction it carries
+    /// lands on the child whose half holds it, and nowhere else.
+    #[test]
+    fn a_followed_block_writes_its_committed_cells_on_their_half() {
+        let (left, right) = ShardId::ROOT.children();
+        let left_store = SimShardStorage::new(shard_prefix_path(left));
+        let right_store = SimShardStorage::new(shard_prefix_path(right));
+
+        let tx = test_transaction(1);
+        let cell = committed_tx_cell_key(
+            ShardId::ROOT,
+            tx.hash(),
+            tx.validity_range().end_timestamp_exclusive,
+        );
+        let (routed, other) = if cell.to_bytes()[0] >> 7 == 0 {
+            (&left_store, &right_store)
+        } else {
+            (&right_store, &left_store)
+        };
+        let carrying = followed_block(1, SweepFrontier::ZERO, vec![tx], Vec::new());
+        let other_before = other.state_root();
+        routed.follow_block_writes(&carrying).unwrap();
+        other.follow_block_writes(&carrying).unwrap();
+        assert!(
+            routed.cell(cell).is_some(),
+            "the committed cell lands on its half"
+        );
+        assert_eq!(
+            other.state_root(),
+            other_before,
+            "the other half is untouched"
+        );
+    }
+
+    /// A followed block sweeps what its header names: a frontier past an
+    /// expired cell's bucket retires it, one short of it leaves it.
+    #[test]
+    fn a_followed_block_applies_the_sweep_its_header_names() {
+        install_stub_protocol_statics();
+        let (left, _) = ShardId::ROOT.children();
+        let store = SimShardStorage::new(shard_prefix_path(left));
+
+        let (local, value) = stub_sweepable_cell(5_000, 0x11);
+        let sweepable = SubstateKey {
+            owner: Address::new([0x01; 31], AddressClass::Component),
+            local,
+        };
+        let mut writes = StateWrites::default();
+        writes.cells.insert(sweepable, Some(value));
+        let receipt = StoredReceipt::synced(
+            TxHash::from(Hash::from_bytes(b"sweepable")),
+            Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                writes,
+                beacon_witness_events: Vec::new(),
+                events: Vec::new(),
+            }),
+        );
+        store
+            .follow_block_writes(&followed_block(
+                1,
+                SweepFrontier::ZERO,
+                Vec::new(),
+                vec![receipt],
+            ))
+            .unwrap();
+        assert!(store.cell(sweepable).is_some());
+
+        let bucket = SweepFrontier::of_leaf(sweepable).bucket();
+        let short = SweepFrontier::start_of(bucket);
+        store
+            .follow_block_writes(&followed_block(2, short, Vec::new(), Vec::new()))
+            .unwrap();
+        assert!(
+            store.cell(sweepable).is_some(),
+            "a frontier short of the cell leaves it"
+        );
+
+        let past = SweepFrontier::start_of(SweepBucket(bucket.0 + 1));
+        store
+            .follow_block_writes(&followed_block(3, past, Vec::new(), Vec::new()))
+            .unwrap();
+        assert!(
+            store.cell(sweepable).is_none(),
+            "the sweep the header names retires it"
+        );
+    }
+
     /// A follow must advance the store's version; replaying a height the
     /// store already applied is rejected.
     #[test]
     fn follow_rejects_a_non_advancing_height() {
         let store = SimShardStorage::new(shard_prefix_path(child_of(1)));
         let (_, receipt) = follow_receipt(1);
-        let receipts = [receipt];
-        store
-            .follow_block_writes(BlockHeight::new(5), &receipts)
-            .unwrap();
-        assert!(
-            store
-                .follow_block_writes(BlockHeight::new(5), &receipts)
-                .is_err(),
-        );
+        let block = block_settling(BlockHeight::new(5), vec![receipt]);
+        store.follow_block_writes(&block).unwrap();
+        assert!(store.follow_block_writes(&block).is_err());
     }
 }

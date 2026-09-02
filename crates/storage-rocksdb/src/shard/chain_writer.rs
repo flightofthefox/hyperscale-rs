@@ -47,10 +47,10 @@ impl ShardChainWriter for RocksDbShardStorage {
         // JmtSnapshot directly, avoiding put_at_version which would fail
         // if the parent's tree nodes aren't in the store yet (e.g.,
         // proposer just exited sync and BlockPersisted hasn't fired).
-        // A block's sweep is a write like any other, so a block that
-        // removes something is not one of these however few receipts it
-        // carries.
-        if receipts.is_empty() && removals.is_empty() {
+        // A block's sweep and its committed cells are writes like any
+        // other, so a block that removes or creates something is not one
+        // of these however few receipts it carries.
+        if receipts.is_empty() && creations.is_empty() && removals.is_empty() {
             let jmt_snapshot = Arc::new(noop_jmt_snapshot(
                 &SnapshotTreeStore::new(&self.db, self.root_path.clone()),
                 parent.pending,

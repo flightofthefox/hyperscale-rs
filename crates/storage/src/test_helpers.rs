@@ -24,9 +24,9 @@ use hyperscale_types::{
     ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, Randomness,
     RatifyCert, RatifyRound, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor,
     ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
-    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, TickHalf,
-    TickId, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp, WitnessSources, WorkInFlight,
+    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint,
+    TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources, WorkInFlight,
     compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
 };
 
@@ -34,8 +34,9 @@ use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
     Anchored, BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, JmtSnapshot,
-    RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore,
-    Substates, SweepIndex, VersionedStore, WitnessSeed, sweep_for_block,
+    ParentAnchor, RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
+    SubstateStore, Substates, SweepIndex, VersionedStore, WitnessSeed, committed_tx_cell_key,
+    committed_tx_cells, sweep_for_block,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -581,6 +582,23 @@ pub fn commit_block_with_updates(
     );
     let block = push_certificate(make_test_block(height), finalized);
     storage.commit_block(&make_test_certified(block), &[], &empty_witness())
+}
+
+/// A block at `height` whose one tick settles `receipts` and which
+/// carries no transactions — what a follow applies when only receipts
+/// move state.
+#[must_use]
+pub fn block_settling(height: BlockHeight, receipts: Vec<StoredReceipt>) -> Block {
+    let finalized = Arc::new(
+        Finalization::new(
+            TickId::new(ShardId::ROOT, height),
+            TickHalf::Determined,
+            vec![],
+            receipts,
+        )
+        .into(),
+    );
+    push_certificate(make_test_block(height), finalized)
 }
 
 const fn empty_witness() -> BeaconWitnessCommit {
@@ -1358,6 +1376,68 @@ fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Bl
         },
         sealed @ Block::Sealed { .. } => sealed,
     }
+}
+
+/// Shared prepare-path test: a block that carries a transaction and no
+/// certificates still writes its committed cell.
+///
+/// The prepare path treats a block with nothing to write as a no-op
+/// whose root is its parent's, and a block carrying only transactions
+/// has no receipts. Its committed cells are writes all the same — the
+/// prober asking whether this shard committed the transaction reads
+/// them off the root — so the root moves, the cell is served under it,
+/// and the direct path reaches the same root.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_prepared_commit_writes_committed_cells<S>(prepared: &Arc<S>, direct: &S)
+where
+    S: ShardChainReader + ShardChainWriter + SubstateStore,
+{
+    let tx = test_transaction(1);
+    let cell = committed_tx_cell_key(
+        ShardId::ROOT,
+        tx.hash(),
+        tx.validity_range().end_timestamp_exclusive,
+    );
+    let block = with_transactions(
+        make_test_block(BlockHeight::new(1)),
+        vec![Arc::new(Verifiable::from(tx))],
+    );
+    let creations = committed_tx_cells(
+        block.header().shard_id(),
+        block.transactions().iter().map(|tx| tx.as_unverified()),
+    );
+
+    let parent_root = prepared.state_root();
+    let (spec_root, _snapshot, commit) = prepared.prepare_block_commit(
+        ParentAnchor {
+            state_root: parent_root,
+            height: BlockHeight::GENESIS,
+            state: &prepared.snapshot(),
+            pending: &[],
+            base_reads: None,
+        },
+        &[],
+        &creations,
+        &[],
+        BlockHeight::new(1),
+    );
+    let certified = make_test_certified(block);
+    let committed_root = commit(SyncHint::FlushNow, &certified, &empty_witness());
+    assert_ne!(spec_root, parent_root, "a committed cell moves the root");
+    assert_eq!(committed_root, spec_root);
+    assert!(
+        matches!(
+            prepared.get_substate_at_height(cell, BlockHeight::new(1)),
+            Some(Some(_))
+        ),
+        "the prepared commit serves the committed cell under its root",
+    );
+
+    let direct_root = direct.commit_block(&certified, &[], &empty_witness());
+    assert_eq!(direct_root, spec_root, "both paths reach one root");
 }
 
 /// Commit a block at `height` carrying one provision bundle, and return

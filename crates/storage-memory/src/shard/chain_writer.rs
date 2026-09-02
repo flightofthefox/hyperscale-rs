@@ -43,9 +43,10 @@ impl ShardChainWriter for SimShardStorage {
         // Nothing to write → state root is unchanged. Build a no-op
         // JmtSnapshot directly, avoiding put_at_version which would fail
         // if the parent's tree nodes aren't in the store yet. A block's
-        // sweep is a write like any other, so a block that removes
-        // something is not one of these however few receipts it carries.
-        if receipts.is_empty() && removals.is_empty() {
+        // sweep and its committed cells are writes like any other, so a
+        // block that removes or creates something is not one of these
+        // however few receipts it carries.
+        if receipts.is_empty() && creations.is_empty() && removals.is_empty() {
             let s = read_or_recover(&self.state);
             let snapshot = Arc::new(noop_jmt_snapshot(
                 &s.tree_store,

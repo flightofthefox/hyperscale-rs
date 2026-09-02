@@ -8,9 +8,10 @@ use hyperscale_storage::test_helpers::{
     make_test_finalization, make_test_qc, make_test_receipt, state_key,
     test_committed_bundle_outlives_sealing, test_ec_storage_batch as helpers_test_ec_storage_batch,
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
-    test_entries_commit_serve_and_history, test_recovery_carries_the_tip_drain_total,
-    test_registers_recover_their_justification, test_retained_bundle_drops_below_the_history_floor,
-    test_sweep_index_tracks_the_leaves, test_sweep_stops_at_the_ceiling_or_the_cap,
+    test_entries_commit_serve_and_history, test_prepared_commit_writes_committed_cells,
+    test_recovery_carries_the_tip_drain_total, test_registers_recover_their_justification,
+    test_retained_bundle_drops_below_the_history_floor, test_sweep_index_tracks_the_leaves,
+    test_sweep_stops_at_the_ceiling_or_the_cap,
     test_tx_index_answers_with_the_local_shards_certificate,
     test_undischarged_record_holds_the_floor, test_unresolved_fold,
     test_widest_tick_copy_holds_the_slot,
@@ -677,6 +678,16 @@ fn test_commit_block_empty_certs() {
     let block = make_test_block(BlockHeight::new(1));
     storage.commit_block(&make_test_certified(block), &[], &no_witness());
     assert_eq!(storage.jmt_height(), BlockHeight::new(1));
+}
+
+#[test]
+fn a_prepared_commit_writes_its_committed_cells() {
+    let dir_prepared = TempDir::new().unwrap();
+    let dir_direct = TempDir::new().unwrap();
+    let prepared =
+        Arc::new(RocksDbShardStorage::open(dir_prepared.path(), NibblePath::empty()).unwrap());
+    let direct = RocksDbShardStorage::open(dir_direct.path(), NibblePath::empty()).unwrap();
+    test_prepared_commit_writes_committed_cells(&prepared, &direct);
 }
 
 #[test]

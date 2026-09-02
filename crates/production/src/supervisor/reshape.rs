@@ -30,7 +30,7 @@ use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{GetRemoteHeadersRequest, GetStateRangeRequest};
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, PredecessorTerminal, ReshapeSeat, ShardAnchor, ShardId,
-    StateRoot, StoredReceipt, SubstateLeaf, ValidatorId,
+    StateRoot, SubstateLeaf, ValidatorId,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -217,11 +217,7 @@ impl ShardSupervisor {
             ReshapeRequest::FinalizeImport { shard, height } => {
                 self.reshape_finalize(shard, height);
             }
-            ReshapeRequest::ApplyFollow {
-                shard,
-                height,
-                receipts,
-            } => self.reshape_apply(shard, height, receipts),
+            ReshapeRequest::ApplyFollow { shard, block } => self.reshape_apply(shard, block),
             ReshapeRequest::BroadcastReady {
                 validator,
                 child,
@@ -576,7 +572,7 @@ impl ShardSupervisor {
 
     /// Apply a followed parent block's writes into a reshape duty's store
     /// off the loop, answering with [`ReshapeIo::Applied`].
-    fn reshape_apply(&self, shard: ShardId, height: BlockHeight, receipts: Vec<StoredReceipt>) {
+    fn reshape_apply(&self, shard: ShardId, block: Arc<Block>) {
         let Some(storage) = self
             .reshape_stores
             .get(&shard)
@@ -586,15 +582,14 @@ impl ShardSupervisor {
             return;
         };
         let events = self.events_tx.clone();
-        self.tokio_handle.spawn_blocking(move || {
-            match storage.follow_block_writes(height, &receipts) {
+        self.tokio_handle
+            .spawn_blocking(move || match storage.follow_block_writes(&block) {
                 Ok(root) => {
                     let _ =
                         events.send(SupervisorEvent::Reshape(ReshapeIo::Applied { shard, root }));
                 }
                 Err(error) => warn!(shard = ?shard, %error, "Reshape follow apply failed"),
-            }
-        });
+            });
     }
 
     /// Sign `validator`'s ready signal attesting the sync of `child`,

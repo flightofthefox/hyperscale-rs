@@ -29,6 +29,8 @@
 //! witness-history variant never appears — the pending child's
 //! accumulator starts empty).
 
+use std::sync::Arc;
+
 use hyperscale_types::network::request::{
     GetBlockRequest, GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST,
 };
@@ -37,7 +39,7 @@ use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ChainOrigin, CommitProof,
     MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, PredecessorTerminal, QuorumCertificate,
     ReadySignal, ResolvedCommittee, ShardAnchor, ShardId, SignError, Signer, StateRoot,
-    StoredReceipt, ValidatorId, WeightedTimestamp, ready_signal_window, shard_prefix_path,
+    ValidatorId, WeightedTimestamp, ready_signal_window, shard_prefix_path,
 };
 
 use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
@@ -389,8 +391,7 @@ pub struct ObserverTail {
 }
 
 struct PendingFollow {
-    height: BlockHeight,
-    receipts: Vec<StoredReceipt>,
+    block: Arc<Block>,
     /// The block's `split_child_roots` slot for this child, when the
     /// header carried the pair — the applied root must reproduce it.
     expected_root: Option<StateRoot>,
@@ -608,14 +609,6 @@ impl ObserverTail {
             return TailOutcome::Rejected("elided or mispaired block body");
         };
         let header = certified.block().header();
-        // Only what the ticks decided reaches the followed store, the
-        // same projection the chain writers apply.
-        let receipts: Vec<StoredReceipt> = certified
-            .block()
-            .certificates()
-            .iter()
-            .flat_map(|fw| fw.settling_receipts())
-            .collect();
         let expected_root = header.split_child_roots().map(|pair| {
             if self.child.path() & 1 == 0 {
                 pair.left
@@ -623,15 +616,13 @@ impl ObserverTail {
                 pair.right
             }
         });
-        let height = header.height();
         let outcome = self.absorb_header(header, certified.qc());
         if outcome != TailOutcome::Accepted {
             return outcome;
         }
         if !self.recognition_only {
             self.pending = Some(PendingFollow {
-                height,
-                receipts,
+                block: Arc::new(certified.block().clone()),
                 expected_root,
             });
         }
@@ -713,17 +704,16 @@ impl ObserverTail {
         self.in_flight = false;
     }
 
-    /// The accepted block's application, ready for
-    /// `BoundaryStore::follow_block_writes` on the observer's store.
-    /// `Some` once per accepted block; the driver answers with the
-    /// resulting root via [`Self::on_applied`].
-    pub fn take_apply(&mut self) -> Option<(BlockHeight, Vec<StoredReceipt>)> {
+    /// The accepted block, ready for `BoundaryStore::follow_block_writes`
+    /// on the observer's store. `Some` once per accepted block; the driver
+    /// answers with the resulting root via [`Self::on_applied`].
+    pub fn take_apply(&mut self) -> Option<Arc<Block>> {
         if self.apply_in_flight {
             return None;
         }
-        let pending = self.pending.as_mut()?;
+        let pending = self.pending.as_ref()?;
         self.apply_in_flight = true;
-        Some((pending.height, std::mem::take(&mut pending.receipts)))
+        Some(Arc::clone(&pending.block))
     }
 
     /// Record the applied root, checking it against the header's
@@ -750,10 +740,10 @@ impl ObserverTail {
         {
             return Err(format!(
                 "followed store diverged at height {}: applied root {root:?} ≠ carried {expected:?}",
-                pending.height,
+                pending.block.height(),
             ));
         }
-        self.applied = Some(pending.height);
+        self.applied = Some(pending.block.height());
         Ok(())
     }
 
@@ -1360,10 +1350,10 @@ mod tests {
             tail.on_response(&response(&terminal, 9_999)),
             TailOutcome::Accepted
         );
-        let (height, _) = tail
+        let block = tail
             .take_apply()
             .expect("the terminal is pending application");
-        assert_eq!(height, BlockHeight::new(2));
+        assert_eq!(block.height(), BlockHeight::new(2));
         // The terminal carries the pair, so the applied root must reproduce
         // this child's half.
         tail.on_applied(StateRoot::from_raw(Hash::from_bytes(b"left subtree")))
@@ -1379,10 +1369,10 @@ mod tests {
             "the successor is accepted but not yet applied",
         );
 
-        let (height, _) = tail
+        let block = tail
             .take_apply()
             .expect("the coast block is pending application");
-        assert_eq!(height, BlockHeight::new(3));
+        assert_eq!(block.height(), BlockHeight::new(3));
         tail.on_applied(StateRoot::from_raw(Hash::from_bytes(b"left subtree")))
             .expect("a coast block moves no state under the prefix");
         assert!(

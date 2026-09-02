@@ -546,6 +546,13 @@ fn test_prepare_then_commit_fast_path() {
 }
 
 #[test]
+fn a_prepared_commit_writes_its_committed_cells() {
+    let prepared = Arc::new(SimShardStorage::default());
+    let direct = SimShardStorage::default();
+    test_helpers::test_prepared_commit_writes_committed_cells(&prepared, &direct);
+}
+
+#[test]
 fn test_prepare_commit_state_root_matches() {
     let storage = Arc::new(SimShardStorage::default());
     let block = make_test_block(BlockHeight::new(1));

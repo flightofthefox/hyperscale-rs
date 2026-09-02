@@ -806,7 +806,7 @@ mod tests {
     fn followed_children_partition_and_recompose_the_root() {
         use std::sync::Arc;
 
-        use hyperscale_storage::test_helpers::{make_state_writes, seeded_owner};
+        use hyperscale_storage::test_helpers::{block_settling, make_state_writes, seeded_owner};
         use hyperscale_types::{ConsensusReceipt, GlobalReceiptHash, Hash, StoredReceipt, TxHash};
 
         let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
@@ -828,11 +828,11 @@ mod tests {
                     events: Vec::new(),
                 }),
             )];
-            let height = BlockHeight::new(u64::from(seed));
+            let block = block_settling(BlockHeight::new(u64::from(seed)), receipts.to_vec());
             roots = (
-                whole.follow_block_writes(height, &receipts).unwrap(),
-                left.follow_block_writes(height, &receipts).unwrap(),
-                right.follow_block_writes(height, &receipts).unwrap(),
+                whole.follow_block_writes(&block).unwrap(),
+                left.follow_block_writes(&block).unwrap(),
+                right.follow_block_writes(&block).unwrap(),
             );
             // The leaf key is the owner prefix by identity, so the side a
             // write lands on is that prefix's leading bit.

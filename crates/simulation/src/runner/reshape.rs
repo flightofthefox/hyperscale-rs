@@ -151,16 +151,12 @@ impl SimulationRunner {
                     .expect("reshape boundary import into the opened store");
                 Some(ReshapeEvent::Imported { shard, root })
             }
-            ReshapeRequest::ApplyFollow {
-                shard,
-                height,
-                receipts,
-            } => {
+            ReshapeRequest::ApplyFollow { shard, block } => {
                 let root = self
                     .reshape_stores
                     .get(&(host, shard))?
                     .storage
-                    .follow_block_writes(height, &receipts)
+                    .follow_block_writes(&block)
                     .expect("reshape follow apply into the opened store");
                 Some(ReshapeEvent::Applied { shard, root })
             }

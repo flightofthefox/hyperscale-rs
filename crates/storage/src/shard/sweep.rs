@@ -10,14 +10,17 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use hyperscale_jmt::NibblePath;
 use hyperscale_types::{
-    MAX_SWEEP_PER_BLOCK, SettledWrites, ShardId, ShardTrie, SubstateKey, SweepFrontier,
-    Transaction, TxHash, WeightedTimestamp, protocol_statics, protocol_statics_installed,
+    Block, MAX_SWEEP_PER_BLOCK, SettledWrites, ShardId, ShardTrie, StoredReceipt, SubstateKey,
+    SweepBucket, SweepFrontier, Transaction, TxHash, WeightedTimestamp, protocol_statics,
+    protocol_statics_installed,
 };
 use hyperscale_vm_effects::{CommittedTxCell, ProtocolHasher, committed_tx_key};
 use hyperscale_vm_types::NULLIFIER_GRACE_MS;
 
 use crate::tree::JmtSnapshot;
+use crate::{Anchored, filter_writes_to_prefix, merge_writes_from_receipts};
 
 /// When a committed cell stops being needed, or `None` for every cell a
 /// sweep does not reach.
@@ -223,6 +226,60 @@ pub fn with_sweep(
         );
     }
     SettledWrites::from_parts(cells, entries)
+}
+
+/// The cells a followed block removed: everything sweepable strictly
+/// after `parent_frontier` and at or below `frontier`, the position the
+/// block's header claims its sweep landed on.
+///
+/// A follower holds a prefix of the chain's tree and no cap of its own:
+/// it removes exactly what the header's interval names, whether that
+/// interval ended at a ceiling or on the last cell a capped walk took.
+#[must_use]
+pub fn sweep_through(
+    store: &(impl SweepIndex + ?Sized),
+    parent_frontier: SweepFrontier,
+    frontier: SweepFrontier,
+) -> Vec<SubstateKey> {
+    if parent_frontier >= frontier {
+        return Vec::new();
+    }
+    let past = SweepFrontier::start_of(SweepBucket(frontier.bucket().0.saturating_add(1)));
+    store
+        .sweep_candidates(parent_frontier, past, usize::MAX)
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| SweepFrontier::of_leaf(*key) <= frontier)
+        .collect()
+}
+
+/// What a followed block writes under `prefix`, composed as the chain
+/// composed it: the receipts its ticks settled, the committed cell of
+/// every transaction it carries, and the sweep its header names.
+///
+/// The removals read `store` as it stands before the block, from the
+/// bottom of the sweep order: a follower mirrors the chain's state, so
+/// every live cell at or below the header's frontier is one the block
+/// removed, and one the block created sits far above it.
+#[must_use]
+pub fn followed_block_writes(
+    store: &(impl SweepIndex + ?Sized),
+    prior: &dyn Anchored,
+    block: &Block,
+    prefix: &NibblePath,
+) -> SettledWrites {
+    let settling: Vec<StoredReceipt> = block
+        .certificates()
+        .iter()
+        .flat_map(|fw| fw.settling_receipts())
+        .collect();
+    let merged = merge_writes_from_receipts(&settling, prior);
+    let creations = committed_tx_cells(
+        block.header().shard_id(),
+        block.transactions().iter().map(|tx| tx.as_unverified()),
+    );
+    let removals = sweep_through(store, SweepFrontier::ZERO, block.header().sweep_frontier());
+    filter_writes_to_prefix(&with_sweep(merged, &creations, &removals), prefix)
 }
 
 /// The committed-transaction cells a block of `local_shard` creates: one

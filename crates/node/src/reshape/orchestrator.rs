@@ -20,6 +20,7 @@
 //! projection and sequenced to the shared adopt and seat tail.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_storage::ImportProgress;
@@ -31,8 +32,8 @@ use hyperscale_types::network::response::{
 };
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, LocalTimestamp, NetworkDefinition,
-    PredecessorTerminal, QuorumCertificate, ShardAnchor, ShardId, StateRoot, StoredReceipt,
-    SubstateLeaf, ValidatorId, Verifier, WeightedTimestamp,
+    PredecessorTerminal, QuorumCertificate, ShardAnchor, ShardId, StateRoot, SubstateLeaf,
+    ValidatorId, Verifier, WeightedTimestamp,
 };
 
 use crate::bootstrap::{BootstrapRequest, ShardBootstrap, StateRangeOutcome};
@@ -142,10 +143,9 @@ pub enum ReshapeRequest {
     ApplyFollow {
         /// The duty's store shard.
         shard: ShardId,
-        /// The followed block's height.
-        height: BlockHeight,
-        /// The block's certified receipts.
-        receipts: Vec<StoredReceipt>,
+        /// The followed block, whole: its settled receipts, the
+        /// transactions it committed, and the sweep its header names.
+        block: Arc<Block>,
     },
     /// Sign a ready signal for `validator` attesting the sync of `child`,
     /// anchored at `anchor`, and notify `recipients` — the target committee
@@ -1224,11 +1224,10 @@ impl ReshapeOrchestrator {
                         kind: FetchKind::Block { request },
                     });
                 }
-                if let Some((height, receipts)) = tail.take_apply() {
+                if let Some(block) = tail.take_apply() {
                     out.push(ReshapeRequest::ApplyFollow {
                         shard: child,
-                        height,
-                        receipts,
+                        block,
                     });
                 }
             }
