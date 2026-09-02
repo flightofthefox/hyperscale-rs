@@ -280,9 +280,10 @@ pub fn select_transactions(
 /// every leg here a delivery.
 ///
 /// Computed against the block's own anchor by the proposer selecting
-/// and by every voter checking, so the set is one set. Empty until the
-/// cut-over, when nothing is frozen divided, and empty when the anchor's
-/// window is not retained — a block there is refused on other grounds.
+/// and by every voter checking, so the set is one set. Empty under the
+/// `whole-shape` build, where nothing is frozen divided, and empty when
+/// the anchor's window is not retained — a block there is refused on
+/// other grounds.
 #[must_use]
 pub fn late_deliveries<T: Deref<Target = Transaction>>(
     txs: &[Arc<T>],

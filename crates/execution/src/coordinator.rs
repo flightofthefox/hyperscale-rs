@@ -779,7 +779,7 @@ impl ExecutionCoordinator {
             .into_iter()
             .map(|(tx, participating)| CommittedMember {
                 // Frozen honestly, and carried only where the build runs
-                // divided shapes: until the cut-over every member is the
+                // divided shapes: under `whole-shape` every member is the
                 // whole shape, and nothing reads a core set for one.
                 classified: if decomposition_enabled() {
                     Classified::freeze(tx.legs(), placement)
