@@ -77,7 +77,6 @@ impl Derivation for ReservingStatics {
         ];
         declared_modes.sort_unstable();
         Ok(Derived {
-            sweepable_writes: 0,
             // This stub derives no tree; the envelope's window stands.
             effective_window: vm.validity_window(),
             routing: Routing {
@@ -97,7 +96,7 @@ impl Derivation for ReservingStatics {
             footprint: 4,
             legs: Vec::new(),
             crossings: Vec::new(),
-            kernel_cells: Vec::new(),
+            nullifiers: Vec::new(),
             packages: Vec::new(),
         })
     }

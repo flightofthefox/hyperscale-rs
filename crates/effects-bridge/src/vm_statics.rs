@@ -485,14 +485,13 @@ impl BridgeStatics {
             // A publish carries no tree, so nothing narrows the window
             // its composer signed and nothing binds a subintent.
             effective_window: vm.validity_window(),
-            sweepable_writes: 0,
             work,
             footprint,
             // No manifest, so nothing to divide, nothing crossing, and no
-            // cell the kernel writes of its own accord.
+            // subintent bound.
             legs: Vec::new(),
             crossings: Vec::new(),
-            kernel_cells: Vec::new(),
+            nullifiers: Vec::new(),
             signer,
             routing: Routing {
                 read_prefixes: Vec::new(),
@@ -521,7 +520,6 @@ impl BridgeStatics {
 struct Division {
     legs: Vec<LegShape>,
     crossings: Vec<Crossing>,
-    kernel_cells: Vec<SubstateKey>,
 }
 
 /// Divide an admitted tree.
@@ -533,13 +531,14 @@ struct Division {
 ///
 /// Keys are made of what each node's own signer signed — the intent, the
 /// node's index within it, and that intent's expiry — so two compositions
-/// of one subintent derive the same cells for its nodes, and nothing
+/// of one subintent derive the same record for its nodes, and nothing
 /// here consults placement.
 ///
-/// The record and the reclaim claim sit under the producing node's
-/// target, the claim under the consuming node's. Walked from the
-/// consumer side because that is where an edge is named, and admission
-/// has already refused an edge with two consumers.
+/// The record sits under the producing node's target; the claim beside
+/// it, under the consuming node's, is the engine's to derive where the
+/// edge turns out to cross. Walked from the consumer side because that
+/// is where an edge is named, and admission has already refused an edge
+/// with two consumers.
 fn divide(
     tree: &EnvelopeTree,
     admitted: &AdmittedTree,
@@ -555,11 +554,6 @@ fn divide(
         DerivationError::Unresolved(target.into_iter().collect())
     })?;
     let mut crossings = Vec::new();
-    let mut kernel_cells: Vec<SubstateKey> = admitted
-        .subintents
-        .iter()
-        .map(|record| record.nullifier)
-        .collect();
     for consumer in &legs {
         for edge in &consumer.edges {
             let Some(producer) = legs.get(edge.source as usize) else {
@@ -568,21 +562,15 @@ fn divide(
                     edge.source
                 )));
             };
-            let site = |owner: Address, claim: bool| {
-                let (hasher, intent, local, expiry) = (
-                    &ProtocolHasher,
-                    producer.intent,
-                    producer.local,
-                    producer.expiry_ms,
-                );
-                if claim {
-                    CrossingSite::claim(hasher, owner, intent, local, edge.output, expiry)
-                } else {
-                    CrossingSite::record(hasher, owner, intent, local, edge.output, expiry)
-                }
-                .key()
-            };
-            let record = site(producer.target, false);
+            let record = CrossingSite::record(
+                &ProtocolHasher,
+                producer.target,
+                producer.intent,
+                producer.local,
+                edge.output,
+                producer.expiry_ms,
+            )
+            .key();
             crossings.push(Crossing {
                 node: edge.source,
                 output: edge.output,
@@ -594,17 +582,10 @@ fn divide(
                     .find(|frame| frame.node == edge.source)
                     .and_then(reserved_origin),
             });
-            kernel_cells.push(record);
-            kernel_cells.push(site(consumer.target, true));
-            kernel_cells.push(site(producer.target, true));
         }
     }
     crossings.sort_unstable_by_key(|crossing| (crossing.node, crossing.output));
-    Ok(Division {
-        legs,
-        crossings,
-        kernel_cells,
-    })
+    Ok(Division { legs, crossings })
 }
 
 /// The one cell a frame reserves, where it reserves exactly one — the
@@ -733,18 +714,18 @@ impl Derivation for BridgeStatics {
             .values()
             .fold(0u64, |total, set| total.saturating_add(footprint(set)));
         let work = declared_work(declared_footprint, vm.gas_limit, vm.signature_work());
-        let Division {
-            legs,
-            crossings,
-            kernel_cells,
-        } = divide(&tree, &admitted, &chain)?;
+        let Division { legs, crossings } = divide(&tree, &admitted, &chain)?;
         Ok(Derived {
             effective_window,
             work,
             footprint: declared_footprint,
             legs,
             crossings,
-            kernel_cells,
+            nullifiers: admitted
+                .subintents
+                .iter()
+                .map(|record| record.nullifier)
+                .collect(),
             signer,
             routing: Routing {
                 read_prefixes: prefixes(&read_keys),
@@ -760,10 +741,6 @@ impl Derivation for BridgeStatics {
                 .iter()
                 .map(|record| record.subintent.0.0)
                 .collect(),
-            // One nullifier per bound subintent, and nothing else this
-            // derivation produces is a family a sweep retires.
-            sweepable_writes: u32::try_from(admitted.subintents.len())
-                .expect("bounded by MAX_SUBINTENTS"),
             fee_vault_local: vault_key(vm.fee_payer, *XRD).local.0,
             auth_cell_local: auth_key(vm.fee_payer).local.0,
             packages,
@@ -1022,10 +999,8 @@ mod tests {
 
     /// A transfer divides into a sign-in, a withdraw and a deposit. Its
     /// one value edge is one crossing, whose record sits under the
-    /// sender and names the vault the withdraw reserved; and the kernel
-    /// writes three cells for it — the record, the recipient's claim,
-    /// and the sender's reclaim claim — with no nullifier, since nothing
-    /// is bound.
+    /// sender and names the vault the withdraw reserved; and it binds
+    /// nothing, so it files no nullifier.
     #[test]
     fn a_transfer_derives_one_crossing_per_value_edge() {
         let tree = single_intent_tree(vec![
@@ -1055,16 +1030,10 @@ mod tests {
             "and names the cell the withdraw reserved"
         );
 
-        let distinct: BTreeSet<SubstateKey> = derived.kernel_cells.iter().copied().collect();
-        assert_eq!(derived.kernel_cells.len(), 3);
-        assert_eq!(distinct.len(), 3, "three cells, none aliasing another");
-        assert!(distinct.contains(&crossing.record));
-        let under_recipient = derived
-            .kernel_cells
-            .iter()
-            .filter(|cell| cell.owner == bob_addr().address())
-            .count();
-        assert_eq!(under_recipient, 1, "the claim, under the consumer");
+        assert!(
+            derived.nullifiers.is_empty(),
+            "nothing bound, nothing spent"
+        );
 
         // The footprint is the term of the price the declaration fixes,
         // carried whole beside the sum it feeds.
@@ -1117,7 +1086,7 @@ mod tests {
             "the root's record moves with the root's window"
         );
         assert_eq!(
-            one.kernel_cells[0], other.kernel_cells[0],
+            one.nullifiers[0], other.nullifiers[0],
             "and so is his nullifier"
         );
     }

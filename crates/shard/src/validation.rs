@@ -509,13 +509,20 @@ pub fn validate_packages_usable(
 ///
 /// Counted off the derivations, which is where the answer is: what makes
 /// a write sweepable is the family it belongs to, and nothing about a
-/// routed key says which family it is — plus the committed-transaction
+/// routed key says which family it is — and counted for this shard,
+/// since a cell lands only on the shard owning its prefix and that is
+/// the shard whose sweep retires it — plus the committed-transaction
 /// cell the chain itself writes for every transaction the block
-/// carries. Deterministic over block content, since every replica
-/// derives the same transactions the same way.
-pub fn validate_sweepable_creation(block: &Block) -> Result<(), String> {
+/// carries. Deterministic over block content and the window's trie,
+/// since every replica derives the same transactions the same way.
+pub fn validate_sweepable_creation(
+    topology_snapshot: &TopologySnapshot,
+    local_shard: ShardId,
+    block: &Block,
+) -> Result<(), String> {
+    let trie = topology_snapshot.shard_trie();
     let created = block.transactions().iter().fold(0usize, |total, tx| {
-        total.saturating_add(tx.sweepable_writes() as usize + 1)
+        total.saturating_add(tx.sweepable_writes_on(trie, local_shard) + 1)
     });
     if !sweep_admits_block(created) {
         return Err(format!(
@@ -587,7 +594,7 @@ pub fn validate_block_for_vote(
     validate_no_duplicate_provisions(block, qc_chain_provision_hashes, dedup_index)?;
     validate_provisions_not_fenced(topology_snapshot, block)?;
     validate_packages_usable(topology_snapshot, block)?;
-    validate_sweepable_creation(block)?;
+    validate_sweepable_creation(topology_snapshot, local_shard, block)?;
     validate_engagement(topology_snapshot, local_shard, block, dedup_index)?;
     validate_abandonment_records_well_formed(block)?;
     Ok(())
@@ -1208,7 +1215,8 @@ mod tests {
     #[test]
     fn a_block_may_create_sweepable_cells_up_to_the_cap() {
         // Each fully composed transaction creates its subintents'
-        // nullifiers and the one committed cell the chain writes for it.
+        // nullifiers, all on this one shard, and the one committed cell
+        // the chain writes for it.
         let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / (MAX_SUBINTENTS + 1);
         let mut txs: Vec<Arc<Verifiable<Transaction>>> = (0..full)
             .map(|i| {
@@ -1220,7 +1228,8 @@ mod tests {
             })
             .collect();
         let at_cap = block_with_transactions(BlockHeight::new(3), txs.clone());
-        assert!(validate_sweepable_creation(&at_cap).is_ok());
+        let topo = topology_snapshot();
+        assert!(validate_sweepable_creation(&topo, local_shard(), &at_cap).is_ok());
 
         txs.push(Arc::new(Verifiable::from(
             test_utils::stub_transaction_binding(
@@ -1230,13 +1239,14 @@ mod tests {
             ),
         )));
         let over = block_with_transactions(BlockHeight::new(3), txs);
-        let err = validate_sweepable_creation(&over).expect_err("past the cap is refused");
+        let err = validate_sweepable_creation(&topo, local_shard(), &over)
+            .expect_err("past the cap is refused");
         assert!(err.contains("sweepable cells"), "{err}");
 
         // A block that binds nothing creates nothing, whatever else it
         // carries — the common case must not pay for this rule.
         let plain = block_with_transactions(BlockHeight::new(3), vec![tx(1)]);
-        assert!(validate_sweepable_creation(&plain).is_ok());
+        assert!(validate_sweepable_creation(&topo, local_shard(), &plain).is_ok());
     }
 
     /// A block carrying records, rooted the way the header claims.

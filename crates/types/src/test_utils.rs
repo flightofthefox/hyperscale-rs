@@ -921,12 +921,6 @@ impl Derivation for StubVmStatics {
             .map(|bytes| Hash::from_hash_bytes(bytes))
             .collect();
         Ok(Derived {
-            // One per bound signature, which is what a real derivation
-            // counts: a subintent's signature and its nullifier come in
-            // a pair. Every fixture that binds none derives zero, so a
-            // test opts in by binding.
-            sweepable_writes: u32::try_from(vm.subintent_sigs.len())
-                .expect("a stub binds far fewer than u32 subintents"),
             // A stub derives no tree, so the envelope's own window is
             // the whole of it.
             effective_window: vm.validity_window(),
@@ -972,11 +966,24 @@ impl Derivation for StubVmStatics {
                 vm.signature_work(),
             ),
             footprint: (read_prefixes.len() + write_prefixes.len()) as u64,
-            // A stub derives no manifest, so it has no legs to divide and
-            // writes no cell of its own.
+            // A stub derives no manifest, so it has no legs to divide.
             legs: Vec::new(),
             crossings: Vec::new(),
-            kernel_cells: Vec::new(),
+            // One per bound signature, which is what a real derivation
+            // files: a subintent's signature and its nullifier come in a
+            // pair. Under the payer, since the stub cannot derive the
+            // signer's address from a key. Every fixture that binds none
+            // creates nothing, so a test opts in by binding.
+            nullifiers: (0..vm.subintent_sigs.len())
+                .map(|bound| {
+                    let mut local = [0xAF; 16];
+                    local[..8].copy_from_slice(&(bound as u64).to_le_bytes());
+                    SubstateKey {
+                        owner: vm.fee_payer.address(),
+                        local: LocalKey(local),
+                    }
+                })
+                .collect(),
         })
     }
 }

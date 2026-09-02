@@ -240,17 +240,6 @@ pub struct Derived {
     pub signer: PrincipalAddr,
     /// One declaration hash per bound subintent, in tree order.
     pub subintent_hashes: Vec<[u8; 32]>,
-    /// How many cells this transaction creates that a sweep will later
-    /// have to retire.
-    ///
-    /// Counted rather than inferred from the routed sets, because what
-    /// makes a write sweepable is the family it belongs to and only the
-    /// derivation knows that. A block sums this over its transactions
-    /// and is refused past
-    /// [`MAX_SWEEPABLE_CREATED_PER_BLOCK`](crate::MAX_SWEEPABLE_CREATED_PER_BLOCK),
-    /// which is what keeps the sweep's own cap a bound on the resident
-    /// population rather than only on a block's work.
-    pub sweepable_writes: u32,
     /// The local half of the fee payer's native-resource vault cell —
     /// the substate the payer shard's reservation check reads and the
     /// fee settlement debits. The owner half is the envelope's
@@ -301,18 +290,18 @@ pub struct Derived {
     /// is a placement fact read at an anchor, while the declaration is
     /// fixed when the envelope is composed.
     pub crossings: Vec<Crossing>,
-    /// The cells the kernel writes of its own accord: a nullifier per
-    /// subintent and, per value edge, the record under the producing
-    /// node's target, the claim under the consuming node's, and the
-    /// reclaim claim under the producer's again — three per edge, the
-    /// last on the abort path, where an omission halts a shard rather
-    /// than refusing a batch.
+    /// The nullifier cell of every bound subintent, in tree order, each
+    /// under its own signer.
     ///
-    /// Keyed by the signing intent and the node's index within it, under
-    /// that intent's own expiry, so two compositions of one subintent
-    /// name the same cells and a composer moving the interleave moves
-    /// none of them.
-    pub kernel_cells: Vec<SubstateKey>,
+    /// One of the cells the kernel writes of its own accord; the others
+    /// — the record and claim of every value edge that crosses — are
+    /// read off `legs` and `crossings` at a placement, since which edges
+    /// cross is a fact of the anchor while this list is fixed when the
+    /// envelope is composed. Together they are what
+    /// [`Transaction::sweepable_writes_on`](crate::Transaction::sweepable_writes_on)
+    /// counts for a shard against
+    /// [`MAX_SWEEPABLE_CREATED_PER_BLOCK`](crate::MAX_SWEEPABLE_CREATED_PER_BLOCK).
+    pub nullifiers: Vec<SubstateKey>,
 }
 
 /// Why a derivation did not answer.

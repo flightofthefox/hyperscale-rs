@@ -2044,6 +2044,7 @@ impl ShardCoordinator {
                 late_deliveries: &late,
             },
             topology_schedule.head(),
+            self.local_shard,
         )
     }
 

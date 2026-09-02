@@ -21,8 +21,8 @@ use thiserror::Error;
 use crate::transaction::vm::{Derivation, ProtocolVerifier, SchemeVerifier};
 use crate::{
     DeclaredKey, DerivationError, Derived, EnvelopeExt, Hash, LocalKey, MAX_TX_BYTES_LEN,
-    NetworkId, PrincipalAddr, Routing, ShardTrie, SubstateKey, TimestampRange, TransactionEnvelope,
-    TxHash, Verified, Verify, protocol_statics,
+    NetworkId, PrincipalAddr, Routing, ShardId, ShardTrie, SubstateKey, TimestampRange,
+    TransactionEnvelope, TxHash, Verified, Verify, protocol_statics,
 };
 
 /// What a transaction is verified against: the network its envelope has
@@ -229,20 +229,60 @@ impl Transaction {
     ///
     /// As [`Self::work`], on a transaction that was never derived.
     #[must_use]
-    pub fn kernel_cells(&self) -> &[SubstateKey] {
-        &self.derived().kernel_cells
+    pub fn nullifiers(&self) -> &[SubstateKey] {
+        &self.derived().nullifiers
     }
 
-    /// How many cells this transaction creates that a sweep will later
-    /// have to retire — what a block sums to stay under
+    /// How many cells this transaction's execution on `shard` creates
+    /// that a sweep will later have to retire, under `trie`'s placement:
+    /// its nullifiers under signers the shard holds, and, for every
+    /// value edge whose ends the trie places on different shards, the
+    /// record where the shard holds the producer and the claim where it
+    /// holds the consumer.
+    ///
+    /// An edge inside one shard passes its value directly and writes
+    /// neither. So does one inside a core spanning two shards, and that
+    /// one is counted anyway: the count reads placement alone and never
+    /// the classification, so it over-flags a core's internal edge
+    /// rather than depending on a window's answer. What a block sums,
+    /// beside the committed cell it writes for the transaction itself,
+    /// to stay under
     /// [`MAX_SWEEPABLE_CREATED_PER_BLOCK`](crate::MAX_SWEEPABLE_CREATED_PER_BLOCK).
     ///
     /// # Panics
     ///
     /// As [`Self::work`], on a transaction that was never derived.
     #[must_use]
-    pub fn sweepable_writes(&self) -> u32 {
-        self.derived().sweepable_writes
+    pub fn sweepable_writes_on(&self, trie: &ShardTrie, shard: ShardId) -> usize {
+        let derived = self.derived();
+        let placed = |target| trie.shard_for_prefix(target);
+        let nullifiers = derived
+            .nullifiers
+            .iter()
+            .filter(|cell| placed(cell.owner) == shard)
+            .count();
+        let escrow: usize = derived
+            .legs
+            .iter()
+            .flat_map(|consumer| {
+                consumer
+                    .edges
+                    .iter()
+                    .map(move |edge| (edge.source, consumer.target))
+            })
+            .map(|(source, consumer)| {
+                let Some(producer) = derived.legs.get(source as usize) else {
+                    return 0;
+                };
+                let (from, to) = (placed(producer.target), placed(consumer));
+                if from == to {
+                    0
+                } else {
+                    usize::from(from == shard) + usize::from(to == shard)
+                }
+            })
+            .sum();
+        nullifiers + escrow
     }
 
     /// Half-open `WeightedTimestamp` range during which this tx may be
@@ -634,9 +674,11 @@ impl Verified<Transaction> {
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::{
-        DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
+        DecodeError, Hash32, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
-    use hyperscale_vm_types::{Address, AddressClass, Mode, Moves};
+    use hyperscale_vm_types::{
+        Address, AddressClass, LegRole, Mode, Moves, SubintentHash, ValueEdge,
+    };
 
     use super::*;
     use crate::test_utils::{test_prefix, test_validity_range};
@@ -662,7 +704,6 @@ mod tests {
                 Vec::new()
             };
             Ok(Derived {
-                sweepable_writes: 0,
                 // A stub derives no tree, so the envelope's own window
                 // is the whole of it.
                 effective_window: vm.validity_window(),
@@ -695,7 +736,7 @@ mod tests {
                 footprint: 0,
                 legs: Vec::new(),
                 crossings: Vec::new(),
-                kernel_cells: Vec::new(),
+                nullifiers: Vec::new(),
                 packages: Vec::new(),
             })
         }
@@ -737,6 +778,64 @@ mod tests {
             network,
             derivation: &StubStatics,
         }
+    }
+
+    /// A transaction's share of the sweep budget is read at a placement:
+    /// a nullifier follows its signer, an edge across two shards costs
+    /// the producer's shard its record and the consumer's its claim, and
+    /// the same edge inside one shard costs nothing, since the value
+    /// passes directly.
+    #[test]
+    fn sweepable_writes_are_counted_where_the_placement_puts_them() {
+        let tx = fixture(b"tree");
+        let base = StubStatics.derive(tx.body()).expect("the stub derives");
+        let sender = Address::new([0x00; 31], AddressClass::Component);
+        let recipient = Address::new([0xFF; 31], AddressClass::Component);
+        let leg = |target, edges| LegShape {
+            target,
+            role: LegRole::Inbound,
+            edges,
+            presents: Vec::new(),
+            declares: Vec::new(),
+            intent: SubintentHash(Hash32([0x5A; 32])),
+            local: 0,
+            expiry_ms: 0,
+        };
+        let edge = ValueEdge {
+            source: 0,
+            output: 0,
+            non_fungible: false,
+        };
+        let _ = tx.derived.set(Derived {
+            legs: vec![leg(sender, Vec::new()), leg(recipient, vec![edge])],
+            nullifiers: vec![SubstateKey {
+                owner: sender,
+                local: LocalKey([1; 16]),
+            }],
+            ..base
+        });
+
+        let split = ShardTrie::from_leaves([ShardId::leaf(1, 0), ShardId::leaf(1, 1)]);
+        let (from, to) = (
+            split.shard_for_prefix(sender),
+            split.shard_for_prefix(recipient),
+        );
+        assert_ne!(from, to, "the ends must sit apart for the edge to cross");
+        assert_eq!(
+            tx.sweepable_writes_on(&split, from),
+            2,
+            "the nullifier and the record"
+        );
+        assert_eq!(tx.sweepable_writes_on(&split, to), 1, "the claim");
+
+        let whole = ShardTrie::uniform_from_count(1);
+        let only = whole.shard_for_prefix(sender);
+        assert_eq!(whole.shard_for_prefix(recipient), only);
+        assert_eq!(
+            tx.sweepable_writes_on(&whole, only),
+            1,
+            "the nullifier alone: an edge inside one shard writes no escrow"
+        );
     }
 
     #[test]

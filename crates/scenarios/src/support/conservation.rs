@@ -18,7 +18,7 @@ use hyperscale_types::{
     Address, ResourceAddr, SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash,
 };
 
-use super::query::{declared_price, held, held_at, owning_shard};
+use super::query::{assert_a_full_block_fits, declared_price, held, held_at, owning_shard};
 use super::tx::{recipient, sender};
 use super::{Budget, Cluster};
 
@@ -113,6 +113,7 @@ impl World {
     ) {
         let _ = c.run_until(budget, |c| self.settles(c, charges.burned(c)));
         self.assert_settled(c, charges.burned(c), context);
+        charges.assert_each_fits_a_full_block(c);
     }
 
     /// Assert [`settles`](Self::settles), naming both sides.
@@ -200,6 +201,21 @@ impl Charges {
             .filter(|(hash, _)| self.is_charged(c, **hash))
             .map(|(_, tx)| declared_price(c, tx))
             .sum()
+    }
+
+    /// Assert that a full block of every charged transaction's shape fits
+    /// the per-block cap on sweepable creation — the corpus pin the cap
+    /// is sized against, read here because a charged transaction is one
+    /// the price has already been derived for.
+    ///
+    /// # Panics
+    ///
+    /// As [`assert_a_full_block_fits`].
+    pub fn assert_each_fits_a_full_block<C: Cluster + ?Sized>(&self, c: &C) {
+        self.owed
+            .iter()
+            .filter(|(hash, _)| self.is_charged(c, **hash))
+            .for_each(|(_, tx)| assert_a_full_block_fits(c, tx));
     }
 
     /// Whether a receipt for `hash` has committed: a decision either way,

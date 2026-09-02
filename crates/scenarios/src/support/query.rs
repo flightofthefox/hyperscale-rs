@@ -12,9 +12,10 @@ use hyperscale_engine::genesis::vault_key;
 use hyperscale_engine::{XRD, publish_work};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
-    Address, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, PendingReshape, ResourceAddr,
-    ShardId, ShardTrie, Stake, StakePool, StakePoolId, StateRoot, SubstateKey, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
+    Address, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, MAX_SWEEPABLE_CREATED_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, PendingReshape, ResourceAddr, ShardId, ShardTrie, Stake, StakePool,
+    StakePoolId, StateRoot, SubstateKey, Transaction, TransactionDecision, TransactionStatus,
+    TxHash, ValidatorId, ValidatorStatus, sweep_admits_block,
 };
 
 use super::Cluster;
@@ -44,6 +45,50 @@ pub fn declared_price<C: Cluster + ?Sized>(c: &C, tx: &Transaction) -> u128 {
     }
     tx.price_under(c.derivation().as_ref())
         .expect("a scenario fixture derives")
+}
+
+/// Assert that a full block of transactions shaped like `tx` fits the
+/// per-block cap on sweepable creation, on whichever live shard `tx`
+/// creates most on.
+///
+/// The cap is sized so a full block of any corpus shape stays
+/// admissible; this reads that off the shape the corpus actually
+/// produces rather than the arithmetic the constant's doc recites. The
+/// count is linear in a block's transactions, so one transaction's share
+/// taken a block's worth of times is exactly what a full block sums to.
+///
+/// Read where the price is, once the verdict is in: a call into an
+/// instance on a shard the derivation host does not serve derives only
+/// once a provision has carried the record over, so nothing here can be
+/// asked of a transaction before it ran.
+///
+/// # Panics
+///
+/// Panics if the transaction does not derive, or if a full block of it
+/// would be refused.
+pub fn assert_a_full_block_fits<C: Cluster + ?Sized>(c: &C, tx: &Transaction) {
+    tx.try_derived(c.derivation().as_ref())
+        .expect("a scenario fixture derives");
+    let live = live_shards(c);
+    let (trie, shards) = if live.is_empty() {
+        (ShardTrie::uniform_from_count(1), vec![ShardId::ROOT])
+    } else {
+        (
+            ShardTrie::from_leaves(live.iter().copied()),
+            live.iter().copied().collect(),
+        )
+    };
+    let busiest = shards
+        .iter()
+        .map(|shard| tx.sweepable_writes_on(&trie, *shard))
+        .max()
+        .unwrap_or(0);
+    let full_block = MAX_TXS_PER_BLOCK * (busiest + 1);
+    assert!(
+        sweep_admits_block(full_block),
+        "a full block of this shape creates {full_block} sweepable cells on its busiest \
+         shard, past the cap of {MAX_SWEEPABLE_CREATED_PER_BLOCK}",
+    );
 }
 
 /// Every shard this cluster currently serves, ascending.

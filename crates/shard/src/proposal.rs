@@ -198,7 +198,9 @@ pub fn select_transactions(
     dedup_index: &CommitDedupIndex,
     windows: &AdmissionWindows<'_>,
     topology_snapshot: &TopologySnapshot,
+    local_shard: ShardId,
 ) -> Vec<Arc<Verified<Transaction>>> {
+    let trie = topology_snapshot.shard_trie();
     let AdmissionWindows {
         validity_anchor,
         chain_origin_wt,
@@ -247,9 +249,9 @@ pub fn select_transactions(
                 unrunnable += 1;
                 return false;
             }
-            // What the transaction's execution creates, and the committed
-            // cell the chain writes for it.
-            let with_this = sweepable.saturating_add(tx.sweepable_writes() as usize + 1);
+            // What the transaction's execution creates on this shard, and
+            // the committed cell the chain writes for it.
+            let with_this = sweepable.saturating_add(tx.sweepable_writes_on(trie, local_shard) + 1);
             if !sweep_admits_block(with_this) {
                 oversweeping += 1;
                 return false;
@@ -1106,6 +1108,7 @@ mod tests {
                 late_deliveries: &HashSet::new(),
             },
             &window_listing_no_packages(),
+            ShardId::ROOT,
         );
         assert!(
             refused.is_empty(),
@@ -1123,6 +1126,7 @@ mod tests {
                 late_deliveries: &HashSet::new(),
             },
             &window_listing_no_packages(),
+            ShardId::ROOT,
         );
         assert_eq!(
             admitted.len(),
@@ -1154,6 +1158,7 @@ mod tests {
                 late_deliveries: &HashSet::new(),
             },
             &window_listing_no_packages(),
+            ShardId::ROOT,
         );
 
         assert_eq!(selected.len(), 1, "only the in-range tx should survive");
@@ -1178,6 +1183,7 @@ mod tests {
                 late_deliveries: &HashSet::new(),
             },
             &window_listing_no_packages(),
+            ShardId::ROOT,
         );
 
         assert!(
@@ -1207,6 +1213,7 @@ mod tests {
                 late_deliveries: &HashSet::new(),
             },
             &window_listing_no_packages(),
+            ShardId::ROOT,
         );
 
         assert!(selected.is_empty(), "malformed range should be filtered");
@@ -1226,7 +1233,8 @@ mod tests {
         // by one that can. Skipping rather than stopping is what keeps a
         // large composition from starving the small ones behind it.
         // Each fully composed transaction creates its subintents'
-        // nullifiers and the committed cell the chain writes for it.
+        // nullifiers, all on this one shard, and the committed cell the
+        // chain writes for it.
         let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / (MAX_SUBINTENTS + 1);
         let mut txs: Vec<Arc<Verified<Transaction>>> = (0..full)
             .map(|i| {
@@ -1252,6 +1260,7 @@ mod tests {
                 late_deliveries: &HashSet::new(),
             },
             &window_listing_no_packages(),
+            ShardId::ROOT,
         );
 
         assert_eq!(
@@ -1281,6 +1290,7 @@ mod tests {
                 late_deliveries: &HashSet::new(),
             },
             &window_listing_no_packages(),
+            ShardId::ROOT,
         );
 
         assert!(
@@ -1313,6 +1323,7 @@ mod tests {
                     late_deliveries: &late,
                 },
                 &window_listing_no_packages(),
+                ShardId::ROOT,
             )
             .iter()
             .map(|tx| tx.hash())
@@ -1352,6 +1363,7 @@ mod tests {
                 late_deliveries: &HashSet::new(),
             },
             &window_listing_no_packages(),
+            ShardId::ROOT,
         );
 
         assert_eq!(selected.len(), 1, "anchor == start_inclusive must be kept");
@@ -1378,6 +1390,7 @@ mod tests {
                 late_deliveries: &HashSet::new(),
             },
             &window_listing_no_packages(),
+            ShardId::ROOT,
         );
         assert!(selected.is_empty());
     }
@@ -1409,6 +1422,7 @@ mod tests {
                 late_deliveries: &HashSet::new(),
             },
             &window_listing(&[listed]),
+            ShardId::ROOT,
         );
 
         assert_eq!(
@@ -1434,6 +1448,7 @@ mod tests {
                 late_deliveries: &HashSet::new(),
             },
             &window_listing(&[listed]),
+            ShardId::ROOT,
         );
         assert!(
             selected.is_empty(),
