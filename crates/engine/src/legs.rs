@@ -532,18 +532,16 @@ pub fn plan_for_shard(
             continue;
         }
         // Only an inbound leg's crossing is ever reclaimed, so only an
-        // inbound leg's departure has to name the cell a reclaim credits.
-        // A core's departure — minted, or drawn from several cells —
-        // names none, and nobody takes it back.
-        let origin = match (star.role(crossing.node), crossing.origin) {
-            (LegRole::Inbound, None) => {
-                return Err(PlanDefect::NoOrigin {
-                    node: crossing.node,
-                    output: crossing.output,
-                });
-            }
-            (_, origin) => origin,
-        };
+        // inbound leg's crossing has to name the cell a reclaim credits —
+        // and it has to name one now, before anything is issued that
+        // could not be taken back. A core's crossing — minted, or drawn
+        // from several cells — names none, and nobody takes it back.
+        if star.role(crossing.node) == LegRole::Inbound && crossing.origin.is_none() {
+            return Err(PlanDefect::NoOrigin {
+                node: crossing.node,
+                output: crossing.output,
+            });
+        }
         let record = CrossingSite::record(
             &ProtocolHasher,
             producer.target,
@@ -552,7 +550,7 @@ pub fn plan_for_shard(
             crossing.output,
             producer.expiry_ms,
         );
-        plan.departs(crossing.node, crossing.output, record, origin)?;
+        plan.departs(crossing.node, crossing.output, record)?;
     }
     Ok(ShardPlan {
         legs: plan,
@@ -594,6 +592,10 @@ pub fn reclaim_for_shard(
         if star.running(consumer).contains(&local) {
             continue;
         }
+        let origin = crossing.origin.ok_or(PlanDefect::NoOrigin {
+            node: crossing.node,
+            output: crossing.output,
+        })?;
         let claim = CrossingSite::claim(
             &ProtocolHasher,
             producer.target,
@@ -608,6 +610,7 @@ pub fn reclaim_for_shard(
             Reclaim {
                 record: crossing.record,
                 claim,
+                origin,
             },
         )?;
         reclaimed = true;
@@ -884,13 +887,7 @@ mod tests {
         )
         .expect("the sender's legs need no arrival");
         assert!(sender.legs.runs(0) && sender.legs.runs(1) && !sender.legs.runs(2));
-        assert_eq!(
-            sender
-                .legs
-                .departing(1, 0)
-                .and_then(|departure| departure.origin),
-            Some(cell(owner(0x11, false), 1)),
-        );
+        assert!(sender.legs.departing(1, 0).is_some());
         assert!(sender.scope.covers(owner(0x11, false)));
         assert!(!sender.scope.covers(owner(0x22, true)));
 
@@ -1002,7 +999,7 @@ mod tests {
     /// nowhere for its value to leave from, and the plan says so rather
     /// than inventing a cell.
     #[test]
-    fn a_core_departure_names_no_origin() {
+    fn a_core_departure_needs_no_origin() {
         let legs = swap();
         let crossings = vec![crossing(&legs, 1, 0, true), crossing(&legs, 2, 0, false)];
         let divided = decomposed(&legs);
@@ -1016,11 +1013,7 @@ mod tests {
             Side::Issuing,
         )
         .expect("a core issues what it minted");
-        assert_eq!(
-            venue.legs.departing(2, 0).map(|departure| departure.origin),
-            Some(None),
-            "and its record names no cell to credit"
-        );
+        assert!(venue.legs.departing(2, 0).is_some());
     }
 
     /// An inbound leg's departure is the reclaimable kind, and one with
