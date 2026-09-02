@@ -27,6 +27,7 @@ use tracing::{debug, trace, warn};
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::chain_view::ChainView;
 use crate::pending::{PendingBlock, PendingBlocks};
+use crate::proposal::late_deliveries;
 
 /// Discriminant for the verification pipeline's per-root bookkeeping
 /// (in-flight set, verified set, parametric helpers). The corresponding
@@ -1214,6 +1215,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         block: &Block,
+        late_deliveries: HashSet<TxHash>,
     ) -> Vec<Action> {
         debug!(
             ?block_hash,
@@ -1227,6 +1229,7 @@ impl VerificationPipeline {
             expected_root: block.header().transaction_root(),
             transactions: block.transactions().clone(),
             validity_anchor: block.header().parent_qc().weighted_timestamp(),
+            late_deliveries,
         }]
     }
 
@@ -1896,7 +1899,13 @@ impl VerificationPipeline {
             VerificationKind::TransactionRoot,
             block.transaction_count() > 0,
         ) {
-            actions.extend(self.initiate_transaction_root_verification(block_hash, block));
+            let late = late_deliveries(
+                block.transactions(),
+                schedule,
+                h.parent_qc().weighted_timestamp(),
+                local_shard,
+            );
+            actions.extend(self.initiate_transaction_root_verification(block_hash, block, late));
         }
 
         if self.needs_root(

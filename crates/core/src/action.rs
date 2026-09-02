@@ -1,6 +1,6 @@
 //! Action types for the deterministic state machine.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -838,6 +838,9 @@ pub enum Action {
         /// one-block lag (this block's own QC may carry a slightly later
         /// timestamp) is bounded by `MAX_VALIDITY_RANGE`.
         validity_anchor: WeightedTimestamp,
+        /// Transactions this shard only delivers for, admissible past
+        /// their validity end to the delivery window's close.
+        late_deliveries: HashSet<TxHash>,
     },
 
     /// Verify a block's provisions root.

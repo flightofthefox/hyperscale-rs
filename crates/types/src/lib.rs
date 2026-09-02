@@ -216,7 +216,7 @@ pub use time::timeouts::{
     EPOCH_DURATION, MAX_FINALIZATION_DELAY, MAX_PROGRESS_WAIT, RATIFY_ROUND_TIMEOUT,
     REMOTE_HEADER_RETENTION, RETENTION_HORIZON, SKIP_TIMEOUT, VIEW_CHANGE_TIMEOUT,
     VIEW_CHANGE_TIMEOUT_INCREMENT, VIEW_CHANGE_TIMEOUT_MAX, absence_licenses_reclaim,
-    reclaim_probe_anchor,
+    delivery_admissible, delivery_window_close, reclaim_probe_anchor,
 };
 pub use time::timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
 pub use topology::awaiting::AwaitingTopologyBuffer;

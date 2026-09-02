@@ -818,13 +818,21 @@ impl ExecutionCoordinator {
             };
             // A leg is what this shard runs of a member frozen divided
             // with it outside the core set. Marked here, beside the
-            // freeze, so a replay marks the same entries.
+            // freeze, so a replay marks the same entries. A shard that
+            // only delivers holds no leg entry — nothing to reclaim, no
+            // core whose refusal is its own — and runs on the delivery
+            // window's clock instead.
             if classified.decomposed().holds() && !classified.core().contains(&local_shard) {
-                self.unresolved.mark_leg(
-                    tx.hash(),
-                    Arc::clone(&verified),
-                    classified.core().clone(),
-                );
+                if classified.delivers_at(local_shard) {
+                    self.unresolved
+                        .mark_delivery(tx.hash(), tx.validity_range().end_timestamp_exclusive);
+                } else {
+                    self.unresolved.mark_leg(
+                        tx.hash(),
+                        Arc::clone(&verified),
+                        classified.core().clone(),
+                    );
+                }
             }
             self.candidates
                 .register(verified, participating, ts, classified);

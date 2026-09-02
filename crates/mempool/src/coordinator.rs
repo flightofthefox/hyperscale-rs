@@ -44,6 +44,7 @@ use hyperscale_types::{
     BlockHeight, CertifiedBlock, CompletedRecovery, ForkFence, LocalTimestamp, MAX_DRAIN_WORK,
     MAX_GAS_LIMIT, MessageClass, RETENTION_HORIZON, ShardId, TopologySnapshot, Transaction,
     TransactionDecision, TransactionStatus, TxHash, Verified, WeightedTimestamp,
+    delivery_window_close,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -131,6 +132,11 @@ struct PoolEntry {
     /// for the slow-tx finalization log lives in the `io_loop`'s
     /// `tx_phase_times` side cache.
     admitted_at: LocalTimestamp,
+    /// The last instant this shard could still include the transaction:
+    /// its validity end, or the delivery window's close where this shard
+    /// may only be delivering for it. What the pool, the tombstone and
+    /// the body are retained to.
+    admissible_until: WeightedTimestamp,
 }
 
 /// Mempool state machine.
@@ -293,13 +299,16 @@ impl MempoolCoordinator {
             return None;
         }
 
-        // Reject if past `validity_range.end_timestamp_exclusive`. Same
-        // expression the proposer/validator apply, enforced at the admission
-        // boundary so expired txs never enter the pool.
-        if tx.validity_range().end_timestamp_exclusive <= self.current_ts {
+        // Reject once nothing here could include it: past its validity
+        // end, or past the delivery window where this shard may only be
+        // delivering. The proposer applies the exact rule; this is the
+        // admission boundary that keeps dead entries out of the pool.
+        let cross_shard = topology_snapshot.is_cross_shard_transaction(tx);
+        let admissible_until = self.admissible_until(topology_snapshot, tx, cross_shard);
+        if admissible_until <= self.current_ts {
             tracing::debug!(
                 tx_hash = ?hash,
-                end_ms = tx.validity_range().end_timestamp_exclusive.as_millis(),
+                until_ms = admissible_until.as_millis(),
                 now_ms = self.current_ts.as_millis(),
                 "Rejecting expired transaction"
             );
@@ -337,7 +346,6 @@ impl MempoolCoordinator {
             return None;
         }
 
-        let cross_shard = topology_snapshot.is_cross_shard_transaction(tx);
         // A cross-shard transaction at a non-payer shard enters
         // contention only once its engagement evidence exists.
         if let Some(payer_shard) = self.engagement_park_target(topology_snapshot, tx, cross_shard) {
@@ -352,6 +360,7 @@ impl MempoolCoordinator {
                 cross_shard,
                 submitted_locally,
                 admitted_at: now,
+                admissible_until,
             },
         );
         // Tx is in the pool — any pending cross-shard expectation is satisfied,
@@ -528,9 +537,8 @@ impl MempoolCoordinator {
 
         // Tombstone the hash so it can't be re-admitted. Body stays in
         // `tx_store` so peers can still fetch by hash; both expire on the
-        // same `end_timestamp_exclusive` via `prune_tombstones`.
-        self.tombstones
-            .tombstone(tx_hash, entry.tx.validity_range().end_timestamp_exclusive);
+        // same instant via `prune_tombstones`.
+        self.tombstones.tombstone(tx_hash, entry.admissible_until);
     }
 
     /// Check if a transaction hash is tombstoned (reached terminal state).
@@ -550,8 +558,7 @@ impl MempoolCoordinator {
     /// chain locked; skipping them is sound because a terminated chain's
     fn abort_one(&mut self, tx_hash: TxHash) -> Option<Action> {
         let entry = self.pool.remove(&tx_hash)?;
-        self.tombstones
-            .tombstone(tx_hash, entry.tx.validity_range().end_timestamp_exclusive);
+        self.tombstones.tombstone(tx_hash, entry.admissible_until);
         record_transaction_aborted();
         Some(Action::EmitTransactionStatus {
             tx_hash,
@@ -641,6 +648,8 @@ impl MempoolCoordinator {
                 Ok(v) => Arc::new(v),
                 Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
             };
+            let cross_shard = topology_snapshot.is_cross_shard_transaction(tx);
+            let admissible_until = self.admissible_until(topology_snapshot, tx, cross_shard);
             self.pool.entry(hash).or_insert_with(|| {
                 tracing::debug!(
                     tx_hash = ?hash,
@@ -649,9 +658,10 @@ impl MempoolCoordinator {
                 );
                 self.tx_store.insert(Arc::clone(&verified));
                 PoolEntry {
+                    admissible_until,
                     tx: verified,
                     status: TransactionStatus::Pending, // Will be updated by execution
-                    cross_shard: topology_snapshot.is_cross_shard_transaction(tx),
+                    cross_shard,
                     submitted_locally: false, // Fetched for block processing
                     // Block-committed entries skip the dwell path entirely
                     // (next loop transitions them straight to Committed +
@@ -833,6 +843,34 @@ impl MempoolCoordinator {
     /// currently-locked and already-claimed nodes.
     /// The payer shard a cross-shard transaction must show engagement
     /// evidence from before entering contention, or `None` when the
+    /// The last instant this shard could still include `tx`.
+    ///
+    /// Its validity end, except where this shard may only be delivering
+    /// for it — cross-shard, with the payer's vault elsewhere — which is
+    /// admissible to the delivery window's close. The payer's shard is
+    /// always in the core, so a shard holding the vault never delivers
+    /// alone; the converse is a possibility, not a classification, and
+    /// the proposer's exact rule is what decides inclusion. What this
+    /// widens is retention: the body and the tombstone are held while a
+    /// delivery could still be composed from them.
+    fn admissible_until(
+        &self,
+        topology_snapshot: &TopologySnapshot,
+        tx: &Transaction,
+        cross_shard: bool,
+    ) -> WeightedTimestamp {
+        let validity_end = tx.validity_range().end_timestamp_exclusive;
+        let payer_here = topology_snapshot
+            .shard_trie()
+            .shard_for_prefix(tx.body().fee_payer)
+            == self.local_shard;
+        if cross_shard && !payer_here {
+            delivery_window_close(validity_end)
+        } else {
+            validity_end
+        }
+    }
+
     /// transaction is immediately ready: not VM, not cross-shard, this
     /// shard is the payer's, or the evidence already arrived.
     fn engagement_park_target(
@@ -1084,7 +1122,7 @@ impl MempoolCoordinator {
         count
     }
 
-    /// Drop `Pending` pool entries whose `end_timestamp_exclusive <= current_ts`.
+    /// Drop `Pending` pool entries nothing here can include any more.
     ///
     /// Pending txs hold no state locks (locks are taken on `Committed` /
     /// `Executed`), so removal is safe without going through the
@@ -1104,7 +1142,7 @@ impl MempoolCoordinator {
             .pool
             .iter()
             .filter(|(_, entry)| matches!(entry.status, TransactionStatus::Pending))
-            .filter(|(_, entry)| entry.tx.validity_range().end_timestamp_exclusive <= now)
+            .filter(|(_, entry)| entry.admissible_until <= now)
             .map(|(hash, _)| *hash)
             .collect();
         for hash in &expired {
@@ -1137,7 +1175,7 @@ impl MempoolCoordinator {
         self.pool
             .values()
             .filter(|entry| matches!(entry.status, TransactionStatus::Pending))
-            .filter(|entry| entry.tx.validity_range().end_timestamp_exclusive > now)
+            .filter(|entry| entry.admissible_until > now)
             .map(|entry| Arc::new((**entry.tx).clone()))
             .collect()
     }
@@ -2520,6 +2558,53 @@ mod tests {
             2,
             "the fixed charge is what makes the budget count them"
         );
+    }
+
+    /// A cross-shard transaction whose payer's vault is elsewhere may be
+    /// a delivery here, so it is admitted and held to the delivery
+    /// window's close; one whose payer is here, or that never leaves
+    /// this shard, ends at its validity end.
+    #[test]
+    fn a_possible_delivery_is_held_to_the_windows_close() {
+        use hyperscale_types::TimestampRange;
+
+        let topology = TestCommittee::new(4, 42).topology_snapshot(2);
+        let local = ShardId::leaf(1, 0);
+        let mut mempool = MempoolCoordinator::new(local);
+        let end = WeightedTimestamp::from_millis(60_000);
+        let range = TimestampRange::new(WeightedTimestamp::ZERO, end);
+        // A clear top bit routes to leaf(1, 0); a set one to leaf(1, 1).
+        let local_owner = test_principal(0x02);
+        let remote_owner = test_principal(0x82);
+        install_stub_protocol_statics();
+        let stub = |payer: PrincipalAddr, owners: &[Address]| {
+            Arc::new(verified(stub_transaction(payer, owners, 1_000, range)))
+        };
+        let delivery = stub(
+            remote_owner,
+            &[local_owner.address(), remote_owner.address()],
+        );
+        let payer_here = stub(
+            local_owner,
+            &[local_owner.address(), remote_owner.address()],
+        );
+
+        set_current_ts(&mut mempool, end);
+        for tx in [&delivery, &payer_here] {
+            mempool.on_transaction_gossip(&topology, Arc::clone(tx), false, LocalTimestamp::ZERO);
+        }
+        assert!(
+            mempool.status(&delivery.hash()).is_some(),
+            "a possible delivery is admitted past its validity end"
+        );
+        assert!(
+            mempool.status(&payer_here.hash()).is_none(),
+            "the payer's shard is in the core, so its window is the transaction's"
+        );
+
+        set_current_ts(&mut mempool, delivery_window_close(end));
+        assert_eq!(mempool.cleanup_expired_pending(), 1, "the close sweeps it");
+        assert!(mempool.status(&delivery.hash()).is_none());
     }
 
     #[test]

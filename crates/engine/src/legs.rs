@@ -96,6 +96,7 @@ impl Decomposed {
 pub struct Classified {
     decomposed: Decomposed,
     core: BTreeSet<ShardId>,
+    delivering: BTreeSet<ShardId>,
 }
 
 impl Classified {
@@ -107,9 +108,15 @@ impl Classified {
     /// that freezes — so this answers honestly wherever it is asked.
     #[must_use]
     pub fn freeze(legs: &[LegShape], placement: Placement<'_>) -> Self {
+        let decomposed = decomposes(legs, placement);
         Self {
-            decomposed: decomposes(legs, placement),
+            decomposed,
             core: core_shards(legs, placement.trie()),
+            delivering: if decomposed.holds() {
+                delivering_shards(legs, placement.trie())
+            } else {
+                BTreeSet::new()
+            },
         }
     }
 
@@ -119,7 +126,18 @@ impl Classified {
         Self {
             decomposed: Decomposed::WHOLE,
             core: BTreeSet::new(),
+            delivering: BTreeSet::new(),
         }
+    }
+
+    /// Whether `shard` only delivers for this transaction: it sits
+    /// outside the core and every leg it runs is a delivery, so nothing
+    /// it does bears a verdict or issues a crossing. Such a member is
+    /// admissible past the transaction's validity end, since the record
+    /// cell it claims is bounded by its own sweep and not by the window.
+    #[must_use]
+    pub fn delivers_at(&self, shard: ShardId) -> bool {
+        self.delivering.contains(&shard)
     }
 
     /// Whether the legs run where their state lives.
@@ -169,6 +187,35 @@ pub fn core_shards(legs: &[LegShape], trie: &ShardTrie) -> BTreeSet<ShardId> {
         .iter()
         .map(|shard| ShardId::from_heap_index(shard.0))
         .collect()
+}
+
+/// The shards outside the core that only deliver.
+///
+/// Every leg there is an outbound leg or an attesting one that stayed
+/// home beside it, and at least one delivers. A shard with an inbound
+/// leg issues a crossing under the transaction's window and is not
+/// among them, and a core shard bears the verdict.
+///
+/// Read off [`star_of`]'s settled roles, so the attesting demotion is
+/// decided once.
+#[must_use]
+pub fn delivering_shards(legs: &[LegShape], trie: &ShardTrie) -> BTreeSet<ShardId> {
+    let star = star_of(legs, trie);
+    let mut delivers = BTreeSet::new();
+    let mut settles = BTreeSet::new();
+    for (leg, role) in legs.iter().zip(&star.roles) {
+        let shard = trie.shard_for_prefix(leg.target);
+        match role {
+            LegRole::Outbound => {
+                delivers.insert(shard);
+            }
+            LegRole::Attesting => {}
+            LegRole::Inbound | LegRole::Core => {
+                settles.insert(shard);
+            }
+        }
+    }
+    delivers.difference(&settles).copied().collect()
 }
 
 /// Whether this transaction's legs run where their state lives.

@@ -14,16 +14,18 @@
 //! emit — full content, empty fallback, empty sync — so a single
 //! build-and-dispatch helper can drive them uniformly.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::ops::Deref;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
+use hyperscale_engine::legs::{Classified, Placement, decomposition_enabled};
 use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash,
     LocalTimestamp, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger,
-    RevealChain, Round, ShardId, TopologySchedule, TopologySnapshot, Transaction, TxHash,
-    Unsettleable, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    sweep_admits_block,
+    RevealChain, Round, ScheduleLookup, ShardId, TopologySchedule, TopologySnapshot, Transaction,
+    TxHash, Unsettleable, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    delivery_admissible, sweep_admits_block,
 };
 use tracing::debug;
 
@@ -149,6 +151,25 @@ impl ProposalTracker {
 // Payload selection
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// The clocks a proposal admits transactions against: the block's own
+/// anchor, the chain's origin with the pre-cut answers a transaction
+/// opening before it needs, and the late deliveries the anchor admits
+/// past their validity end.
+#[derive(Clone, Copy)]
+pub struct AdmissionWindows<'a> {
+    /// The parent QC's weighted timestamp — the block's validity anchor.
+    pub validity_anchor: WeightedTimestamp,
+    /// Where this chain began; a transaction opening before it belongs
+    /// to a predecessor.
+    pub chain_origin_wt: WeightedTimestamp,
+    /// The predecessors' answers for transactions opening before the
+    /// origin.
+    pub precut: &'a Precut,
+    /// Transactions this shard only delivers for, admissible past their
+    /// validity end to the delivery window's close.
+    pub late_deliveries: &'a HashSet<TxHash>,
+}
+
 /// Filter ready transactions for proposal inclusion. Drops, in this order:
 ///
 /// 1. Txs already in the QC chain (ancestors in the two-chain window) or the
@@ -175,11 +196,15 @@ pub fn select_transactions(
     ready_txs: &[Arc<Verified<Transaction>>],
     qc_chain_tx_hashes: &HashSet<TxHash>,
     dedup_index: &CommitDedupIndex,
-    validity_anchor: WeightedTimestamp,
-    chain_origin_wt: WeightedTimestamp,
-    precut: &Precut,
+    windows: &AdmissionWindows<'_>,
     topology_snapshot: &TopologySnapshot,
 ) -> Vec<Arc<Verified<Transaction>>> {
+    let AdmissionWindows {
+        validity_anchor,
+        chain_origin_wt,
+        precut,
+        late_deliveries,
+    } = *windows;
     let before = ready_txs.len();
     let mut deduped = 0;
     let mut expired = 0;
@@ -195,9 +220,13 @@ pub fn select_transactions(
                 deduped += 1;
                 return false;
             }
-            if !tx.validity_range().is_well_formed(validity_anchor)
-                || !tx.validity_range().contains(validity_anchor)
-            {
+            // A delivery is admissible to its record's window, not the
+            // transaction's — the same rule the voters' root check reads.
+            let range = tx.validity_range();
+            let admitted = range.contains(validity_anchor)
+                || (late_deliveries.contains(&h)
+                    && delivery_admissible(validity_anchor, range.end_timestamp_exclusive));
+            if !range.is_well_formed(validity_anchor) || !admitted {
                 expired += 1;
                 return false;
             }
@@ -243,6 +272,41 @@ pub fn select_transactions(
         );
     }
     filtered
+}
+
+/// The transactions among `txs`, past their validity end at `anchor`,
+/// that `local_shard` only delivers for: frozen divided against the
+/// placement of `anchor`'s window with this shard outside the core and
+/// every leg here a delivery.
+///
+/// Computed against the block's own anchor by the proposer selecting
+/// and by every voter checking, so the set is one set. Empty until the
+/// cut-over, when nothing is frozen divided, and empty when the anchor's
+/// window is not retained — a block there is refused on other grounds.
+#[must_use]
+pub fn late_deliveries<T: Deref<Target = Transaction>>(
+    txs: &[Arc<T>],
+    topology_schedule: &TopologySchedule,
+    anchor: WeightedTimestamp,
+    local_shard: ShardId,
+) -> HashSet<TxHash> {
+    if !decomposition_enabled() {
+        return HashSet::new();
+    }
+    let ScheduleLookup::Committee(snapshot) = topology_schedule.lookup(anchor) else {
+        return HashSet::new();
+    };
+    let trie = snapshot.shard_trie();
+    let leaving: BTreeSet<ShardId> = trie
+        .leaves()
+        .filter(|shard| topology_schedule.termination_scheduled(*shard, anchor))
+        .collect();
+    let placement = Placement::new(trie, &leaving);
+    txs.iter()
+        .filter(|tx| anchor >= tx.validity_range().end_timestamp_exclusive)
+        .filter(|tx| Classified::freeze(tx.legs(), placement).delivers_at(local_shard))
+        .map(|tx| tx.hash())
+        .collect()
 }
 
 /// Select finalizations for inclusion: drop those whose tick or whose
@@ -671,6 +735,7 @@ mod tests {
         CommittedTxsRoot, Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_SUBINTENTS,
         MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
         PredecessorTerminal, TimestampRange, TransactionDecision, UnsettledTx, ValidatorSet,
+        delivery_window_close,
     };
 
     use super::*;
@@ -1051,9 +1116,12 @@ mod tests {
             &txs,
             &HashSet::new(),
             &empty_dedup_index(),
-            anchor,
-            cut,
-            &refuses_precut(),
+            &AdmissionWindows {
+                validity_anchor: anchor,
+                chain_origin_wt: cut,
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
             &window_listing_no_packages(),
         );
         assert!(
@@ -1065,9 +1133,12 @@ mod tests {
             &txs,
             &HashSet::new(),
             &empty_dedup_index(),
-            anchor,
-            cut,
-            &admits_precut(hash),
+            &AdmissionWindows {
+                validity_anchor: anchor,
+                chain_origin_wt: cut,
+                precut: &admits_precut(hash),
+                late_deliveries: &HashSet::new(),
+            },
             &window_listing_no_packages(),
         );
         assert_eq!(
@@ -1093,9 +1164,12 @@ mod tests {
             &txs,
             &HashSet::new(),
             &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
+            &AdmissionWindows {
+                validity_anchor: anchor,
+                chain_origin_wt: WeightedTimestamp::ZERO,
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
             &window_listing_no_packages(),
         );
 
@@ -1114,9 +1188,12 @@ mod tests {
             &txs,
             &HashSet::new(),
             &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
+            &AdmissionWindows {
+                validity_anchor: anchor,
+                chain_origin_wt: WeightedTimestamp::ZERO,
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
             &window_listing_no_packages(),
         );
 
@@ -1140,9 +1217,12 @@ mod tests {
             &txs,
             &HashSet::new(),
             &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
+            &AdmissionWindows {
+                validity_anchor: anchor,
+                chain_origin_wt: WeightedTimestamp::ZERO,
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
             &window_listing_no_packages(),
         );
 
@@ -1182,9 +1262,12 @@ mod tests {
             &txs,
             &HashSet::new(),
             &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
+            &AdmissionWindows {
+                validity_anchor: anchor,
+                chain_origin_wt: WeightedTimestamp::ZERO,
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
             &window_listing_no_packages(),
         );
 
@@ -1208,15 +1291,63 @@ mod tests {
             &txs,
             &HashSet::new(),
             &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
+            &AdmissionWindows {
+                validity_anchor: anchor,
+                chain_origin_wt: WeightedTimestamp::ZERO,
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
             &window_listing_no_packages(),
         );
 
         assert!(
             selected.is_empty(),
             "anchor == end_exclusive must be excluded (half-open)"
+        );
+    }
+
+    /// A transaction named a late delivery is offered past its validity
+    /// end while the delivery window is open, and dropped at the close;
+    /// one not named is dropped at the validity end as before.
+    #[test]
+    fn select_transactions_offers_a_late_delivery_to_the_windows_close() {
+        let end = ts(1_000);
+        let range = TimestampRange::new(ts(500), end);
+        let delivery = tx_with_range(7, range);
+        let other = tx_with_range(8, range);
+        let late: HashSet<TxHash> = std::iter::once(delivery.hash()).collect();
+        let txs = vec![delivery.clone(), other];
+
+        let select = |anchor: WeightedTimestamp| -> Vec<TxHash> {
+            select_transactions(
+                &txs,
+                &HashSet::new(),
+                &empty_dedup_index(),
+                &AdmissionWindows {
+                    validity_anchor: anchor,
+                    chain_origin_wt: WeightedTimestamp::ZERO,
+                    precut: &refuses_precut(),
+                    late_deliveries: &late,
+                },
+                &window_listing_no_packages(),
+            )
+            .iter()
+            .map(|tx| tx.hash())
+            .collect()
+        };
+        assert_eq!(
+            select(end),
+            vec![delivery.hash()],
+            "at the end only the delivery"
+        );
+        assert_eq!(
+            select(delivery_window_close(end).minus(Duration::from_millis(1))),
+            vec![delivery.hash()],
+            "and to the last moment of its window"
+        );
+        assert!(
+            select(delivery_window_close(end)).is_empty(),
+            "the close drops it"
         );
     }
 
@@ -1231,9 +1362,12 @@ mod tests {
             &txs,
             &HashSet::new(),
             &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
+            &AdmissionWindows {
+                validity_anchor: anchor,
+                chain_origin_wt: WeightedTimestamp::ZERO,
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
             &window_listing_no_packages(),
         );
 
@@ -1254,9 +1388,12 @@ mod tests {
             &[tx],
             &chain,
             &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
+            &AdmissionWindows {
+                validity_anchor: anchor,
+                chain_origin_wt: WeightedTimestamp::ZERO,
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
             &window_listing_no_packages(),
         );
         assert!(selected.is_empty());
@@ -1282,9 +1419,12 @@ mod tests {
             &[Arc::clone(&runnable), held],
             &HashSet::new(),
             &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
+            &AdmissionWindows {
+                validity_anchor: anchor,
+                chain_origin_wt: WeightedTimestamp::ZERO,
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
             &window_listing(&[listed]),
         );
 
@@ -1304,9 +1444,12 @@ mod tests {
             &[tx_running(3, &[listed, unlisted])],
             &HashSet::new(),
             &empty_dedup_index(),
-            ts(1_000),
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
+            &AdmissionWindows {
+                validity_anchor: ts(1_000),
+                chain_origin_wt: WeightedTimestamp::ZERO,
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
             &window_listing(&[listed]),
         );
         assert!(

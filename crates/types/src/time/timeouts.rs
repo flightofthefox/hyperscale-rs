@@ -96,6 +96,30 @@ pub fn absence_licenses_reclaim(
     probe_wt >= reclaim_probe_anchor(validity_end)
 }
 
+/// The moment past which a delivery of a transaction's outbound value
+/// is no longer admissible: its validity end plus [`MAX_VALIDITY_RANGE`].
+///
+/// A delivery bears no verdict, so the transaction's deadline does not
+/// bound it: the record cell it claims is durable, consumed once, and
+/// swept a [`RETENTION_HORIZON`] past the validity end. What bounds the
+/// delivery is that sweep, and this sits [`MAX_FINALIZATION_DELAY`]
+/// short of it — the same budget the core's admission leaves before the
+/// probe anchor — so a delivery admitted at the last moment still finds
+/// the cell it claims. Derived from signed content, so every shard
+/// names the same instant.
+#[must_use]
+pub fn delivery_window_close(validity_end: WeightedTimestamp) -> WeightedTimestamp {
+    validity_end.plus(MAX_VALIDITY_RANGE)
+}
+
+/// Whether a delivery may still be admitted at `anchor`: past the
+/// validity end, since inside it the transaction is admissible as
+/// itself, and short of the window's close.
+#[must_use]
+pub fn delivery_admissible(anchor: WeightedTimestamp, validity_end: WeightedTimestamp) -> bool {
+    anchor >= validity_end && anchor < delivery_window_close(validity_end)
+}
+
 /// A nullifier's life and every other tx-derived artifact's are the same
 /// bound, asserted rather than assumed: the VM keys and values a
 /// nullifier by an expiry it computes from its own constant, and this is
@@ -199,8 +223,37 @@ pub const RATIFY_ROUND_TIMEOUT: Duration = Duration::from_secs(15);
 mod tests {
     use std::time::Duration;
 
-    use super::{MAX_FINALIZATION_DELAY, absence_licenses_reclaim, reclaim_probe_anchor};
-    use crate::WeightedTimestamp;
+    use super::{
+        MAX_FINALIZATION_DELAY, RETENTION_HORIZON, absence_licenses_reclaim, delivery_admissible,
+        delivery_window_close, reclaim_probe_anchor,
+    };
+    use crate::{MAX_VALIDITY_RANGE, WeightedTimestamp};
+
+    /// A delivery is admissible from the validity end to the window's
+    /// close, half-open at both ends the way the window itself is, and
+    /// the close sits one finalization delay short of the record's sweep.
+    #[test]
+    fn the_delivery_window_opens_at_the_validity_end_and_closes_short_of_the_sweep() {
+        let validity_end = WeightedTimestamp::from_millis(60_000);
+        let close = delivery_window_close(validity_end);
+        assert_eq!(close, validity_end.plus(MAX_VALIDITY_RANGE));
+        assert_eq!(
+            validity_end.plus(RETENTION_HORIZON).elapsed_since(close),
+            MAX_FINALIZATION_DELAY,
+            "the sweep is a full delay past the close"
+        );
+
+        assert!(!delivery_admissible(
+            validity_end.minus(Duration::from_millis(1)),
+            validity_end
+        ));
+        assert!(delivery_admissible(validity_end, validity_end));
+        assert!(delivery_admissible(
+            close.minus(Duration::from_millis(1)),
+            validity_end
+        ));
+        assert!(!delivery_admissible(close, validity_end));
+    }
 
     /// The anchor is a boundary, and a reclaim is licensed on one side
     /// of it and not the other — one millisecond either way.

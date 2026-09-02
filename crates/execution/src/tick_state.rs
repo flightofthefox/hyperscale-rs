@@ -85,12 +85,16 @@ pub struct Divergence {
 /// transaction: it does unless the member is a leg, whose transaction
 /// its core decides. Not a third awaited case — a leg and a single-shard
 /// core await the same set — but the one fact the wire cannot derive
-/// from that set.
+/// from that set. And whether the member only **delivers**: a leg that
+/// failed is the transaction's end on its shard, since it could not
+/// issue, but a delivery that failed decides nothing either way — the
+/// value it claims stays in its cell for a later claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Membership {
     awaited: BTreeSet<ShardId>,
     reach: BTreeSet<ShardId>,
     decides: bool,
+    delivers: bool,
 }
 
 impl Membership {
@@ -114,6 +118,7 @@ impl Membership {
             awaited,
             reach: participating,
             decides: !classified.decomposed().holds() || in_core,
+            delivers: classified.decomposed().holds() && classified.delivers_at(local),
         }
     }
 
@@ -125,6 +130,7 @@ impl Membership {
             awaited: participating.clone(),
             reach: participating,
             decides: true,
+            delivers: false,
         }
     }
 
@@ -133,6 +139,13 @@ impl Membership {
     #[must_use]
     pub const fn decides(&self) -> bool {
         self.decides
+    }
+
+    /// Whether this shard only delivers for the transaction, so that no
+    /// outcome of its own — a failure included — bears the verdict.
+    #[must_use]
+    pub const fn delivers(&self) -> bool {
+        self.delivers
     }
 
     /// The shards whose certificates settlement waits on, this one
@@ -718,9 +731,13 @@ impl TickState {
                     .filter(|&shard| shard != local);
                 // Whether this certificate decides the transaction. A
                 // leg's success decides nothing — its core does — but
-                // a leg that failed is the transaction's end here.
-                let decides = self.membership.get(tx_hash).is_none_or(Membership::decides)
-                    || !matches!(outcome, ExecutionOutcome::Succeeded { .. });
+                // a leg that failed is the transaction's end here, unless
+                // it only delivered: a failed delivery leaves the value
+                // in its cell for a later claim and decides nothing.
+                let membership = self.membership.get(tx_hash);
+                let decides = membership.is_none_or(Membership::decides)
+                    || (!membership.is_some_and(Membership::delivers)
+                        && !matches!(outcome, ExecutionOutcome::Succeeded { .. }));
                 let charge = self
                     .fee_receipts
                     .get(tx_hash)
@@ -1510,6 +1527,75 @@ mod tests {
 
         let whole = Membership::of(&Classified::whole(), low, participating.clone());
         assert_eq!(whole, Membership::whole(participating));
+    }
+
+    /// A shard outside the core whose every leg is a delivery is frozen
+    /// as delivering; one that also issues is not, and neither is the
+    /// core. A delivering member decides nothing whichever way it went —
+    /// its failure leaves the value in the cell — where a leg that
+    /// failed to issue is the transaction's end on its shard.
+    #[test]
+    fn a_delivering_member_never_decides() {
+        use hyperscale_engine::legs::Placement;
+        use hyperscale_types::BlockHeight;
+        use hyperscale_vm_types::LegRole;
+
+        use crate::fixtures::{leaf, leg, swap, trie};
+
+        let trie = trie();
+        let leaving = BTreeSet::new();
+        let placement = Placement::new(&trie, &leaving);
+        let (sender, recipient) = (leaf(0), leaf(1));
+
+        let transfer = Classified::freeze(
+            &[
+                leg(0, LegRole::Core, &[]),
+                leg(1, LegRole::Outbound, &[(0, 0)]),
+            ],
+            placement,
+        );
+        assert!(transfer.decomposed().holds());
+        assert!(transfer.delivers_at(recipient));
+        assert!(!transfer.delivers_at(sender), "the core bears the verdict");
+        let swap = Classified::freeze(&swap(), placement);
+        assert!(
+            !swap.delivers_at(leaf(0)),
+            "a shard that also issues runs on the transaction's window"
+        );
+
+        let mut tick = TickState::new(
+            TickId::new(recipient, BlockHeight::new(1)),
+            BlockHash::ZERO,
+            WeightedTimestamp::from_millis(1_000),
+        );
+        let participating = BTreeSet::from([sender, recipient]);
+        let delivery = tx(1);
+        let membership = Membership::of(&transfer, recipient, participating.clone());
+        assert!(membership.delivers());
+        assert!(!membership.decides());
+        tick.admit(delivery, membership, 10, Admission::Executes);
+        let issuer = tx(2);
+        tick.admit(
+            issuer,
+            Membership::of(&swap, leaf(0), participating),
+            10,
+            Admission::Executes,
+        );
+        tick.record_execution_result(delivery, ExecutionOutcome::Failed);
+        tick.record_execution_result(issuer, ExecutionOutcome::Failed);
+        let (_, _, outcomes) = tick.build_vote_data().expect("both settle alone");
+        let decides = |hash: TxHash| {
+            outcomes
+                .iter()
+                .find(|outcome| outcome.tx_hash() == hash)
+                .expect("attested")
+                .decides()
+        };
+        assert!(!decides(delivery), "a failed delivery decides nothing");
+        assert!(
+            decides(issuer),
+            "a failed issue is the transaction's end here"
+        );
     }
 
     /// A leg awaiting nobody but itself settles in the determined half on

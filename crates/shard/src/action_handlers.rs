@@ -591,11 +591,13 @@ where
             expected_root,
             transactions,
             validity_anchor,
+            late_deliveries,
         } => {
             let start = Stopwatch::start();
             let tx_ctx = TransactionRootContext {
                 transactions: &transactions,
                 validity_anchor,
+                late_deliveries: &late_deliveries,
             };
             let result = expected_root.verify(&tx_ctx);
             record_signature_verification_latency(
@@ -1344,6 +1346,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::test_utils::{
@@ -1351,7 +1354,7 @@ mod tests {
     };
     use hyperscale_types::{
         CertificateRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Signer,
-        StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError,
+        StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError, delivery_window_close,
     };
 
     use super::*;
@@ -1799,6 +1802,7 @@ mod tests {
         let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
         let anchor = WeightedTimestamp::ZERO;
         let ctx = TransactionRootContext {
+            late_deliveries: &HashSet::new(),
             transactions: &txs,
             validity_anchor: anchor,
         };
@@ -1832,6 +1836,7 @@ mod tests {
         let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
 
         let ctx = TransactionRootContext {
+            late_deliveries: &HashSet::new(),
             transactions: &txs,
             validity_anchor: anchor,
         };
@@ -1852,10 +1857,53 @@ mod tests {
         let txs2 = vec![tx2];
         let root2 = Verified::<TransactionRoot>::compute(&txs2).into_inner();
         let ctx2 = TransactionRootContext {
+            late_deliveries: &HashSet::new(),
             transactions: &txs2,
             validity_anchor: anchor,
         };
         assert!(root2.verify(&ctx2).is_ok());
+    }
+
+    /// An expired transaction the block's late-delivery set names passes
+    /// the root check while the delivery window is open and fails at its
+    /// close; one the set does not name fails at the validity end.
+    #[test]
+    fn verify_transaction_root_admits_a_late_delivery_to_the_windows_close() {
+        use std::time::Duration;
+
+        let end = WeightedTimestamp::from_millis(1_000);
+        let range = TimestampRange::new(WeightedTimestamp::ZERO, end);
+        install_stub_protocol_statics();
+        let tx = Arc::new(Verifiable::from(stub_transaction(
+            test_principal(4),
+            &[test_prefix(4)],
+            1_000,
+            range,
+        )));
+        let late: HashSet<TxHash> = std::iter::once(tx.hash()).collect();
+        let txs = vec![tx];
+        let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
+        let verify = |anchor: WeightedTimestamp, late: &HashSet<TxHash>| {
+            root.verify(&TransactionRootContext {
+                late_deliveries: late,
+                transactions: &txs,
+                validity_anchor: anchor,
+            })
+            .is_ok()
+        };
+        assert!(verify(end, &late), "admitted at the validity end");
+        assert!(
+            verify(
+                delivery_window_close(end).minus(Duration::from_millis(1)),
+                &late
+            ),
+            "and to the last moment of the window"
+        );
+        assert!(
+            !verify(delivery_window_close(end), &late),
+            "refused at the close"
+        );
+        assert!(!verify(end, &HashSet::new()), "and refused unnamed");
     }
 
     #[test]
@@ -1879,6 +1927,7 @@ mod tests {
         let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
 
         let ctx = TransactionRootContext {
+            late_deliveries: &HashSet::new(),
             transactions: &txs,
             validity_anchor: anchor,
         };

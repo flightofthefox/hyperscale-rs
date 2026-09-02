@@ -1646,8 +1646,10 @@ impl ShardCoordinatorSim {
                 expected_root,
                 transactions,
                 validity_anchor,
+                late_deliveries,
             } => {
                 let tx_ctx = TransactionRootContext {
+                    late_deliveries: &late_deliveries,
                     transactions: &transactions,
                     validity_anchor,
                 };

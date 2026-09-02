@@ -118,9 +118,9 @@ use crate::lookups::{committee_public_keys, vote_recipients};
 use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
 use crate::precut::{Precut, PrecutStatus, PrecutVerdict};
 use crate::proposal::{
-    ProposalKind, ProposalTracker, TakeResult, assemble_build_action, dispatch_or_defer,
-    filter_engaged_transactions, select_abandonment_records, select_finalizations,
-    select_provisions, select_transactions,
+    AdmissionWindows, ProposalKind, ProposalTracker, TakeResult, assemble_build_action,
+    dispatch_or_defer, filter_engaged_transactions, late_deliveries, select_abandonment_records,
+    select_finalizations, select_provisions, select_transactions,
 };
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::timeout_keeper::TimeoutKeeper;
@@ -2035,6 +2035,38 @@ impl ShardCoordinator {
         (finalizations, abandonment_records)
     }
 
+    /// The transactions a block anchored at `validity_anchor` may carry:
+    /// the ready set less what the QC chain already holds, inside its
+    /// window — or, for a transaction this shard only delivers for,
+    /// inside the delivery window — and answered where it opened before
+    /// the chain did.
+    fn select_block_transactions(
+        &self,
+        topology_schedule: &TopologySchedule,
+        ready_txs: &[Arc<Verified<Transaction>>],
+        qc_chain_tx_hashes: &HashSet<TxHash>,
+        validity_anchor: WeightedTimestamp,
+    ) -> Vec<Arc<Verified<Transaction>>> {
+        let late = late_deliveries(
+            ready_txs,
+            topology_schedule,
+            validity_anchor,
+            self.local_shard,
+        );
+        select_transactions(
+            ready_txs,
+            qc_chain_tx_hashes,
+            &self.dedup_index,
+            &AdmissionWindows {
+                validity_anchor,
+                chain_origin_wt: self.chain_origin.anchor_wt,
+                precut: &self.precut,
+                late_deliveries: &late,
+            },
+            topology_schedule.head(),
+        )
+    }
+
     /// Try to build and broadcast a new block proposal.
     ///
     /// This is the unified proposal entry point, called from:
@@ -2150,14 +2182,11 @@ impl ShardCoordinator {
         // this block. The one-block lag (this block's own QC may carry a
         // slightly later timestamp) is bounded by MAX_VALIDITY_RANGE.
         let validity_anchor = parent_qc.weighted_timestamp();
-        let transactions = select_transactions(
+        let transactions = self.select_block_transactions(
+            topology_schedule,
             ready_txs,
             &qc_chain_tx_hashes,
-            &self.dedup_index,
             validity_anchor,
-            self.chain_origin.anchor_wt,
-            &self.precut,
-            topology_schedule.head(),
         );
         let (finalizations, abandonment_records) = self.select_resolutions(
             topology_schedule,

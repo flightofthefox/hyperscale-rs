@@ -24,6 +24,7 @@ use std::sync::Arc;
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, Finalization, MAX_VALIDITY_RANGE, ShardId, ShardTrie,
     Transaction, TxHash, Unsettleable, UnsettledTx, Verifiable, Verified, WeightedTimestamp,
+    delivery_window_close,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -247,6 +248,21 @@ impl UnresolvedTxs {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
             owed.leg = true;
             self.legs.insert(tx_hash, Leg { body, core });
+        }
+    }
+
+    /// Record that this shard only delivers for `tx_hash`: it runs a leg
+    /// outside the core that bears no verdict and issues nothing.
+    ///
+    /// Not a leg entry — there is nothing to reclaim and no core whose
+    /// refusal is its own — but an ordinary one on a later clock: the
+    /// delivery window's close rather than the transaction's deadline.
+    /// A delivery never run by then is abandoned there like any other
+    /// unresolved entry, returning its reservation; one that ran is
+    /// released by its own finalization.
+    pub fn mark_delivery(&mut self, tx_hash: TxHash, validity_end: WeightedTimestamp) {
+        if let Some(owed) = self.owed.get_mut(&tx_hash) {
+            owed.deadline = delivery_window_close(validity_end);
         }
     }
 
@@ -1345,6 +1361,48 @@ mod tests {
         assert!(
             ledger.unstamped_departures().is_empty(),
             "a stamp for a departure not held invents nothing"
+        );
+    }
+
+    /// A delivery-only entry runs on the delivery window's clock: not
+    /// abandoned at the transaction's deadline, abandoned at the window's
+    /// close if it never ran, released by its own finalization if it did,
+    /// and never a leg — nothing to reclaim, nothing to probe.
+    #[test]
+    fn a_delivery_entry_lives_to_the_windows_close() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(4, 60_000);
+        commit(&mut ledger, &tx);
+        ledger.mark_delivery(tx.hash(), ms(60_000));
+        let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
+        let close = delivery_window_close(ms(60_000));
+
+        assert!(
+            ledger.past_deadline(deadline).is_empty(),
+            "the transaction's deadline abandons no delivery"
+        );
+        assert!(
+            ledger.probeable(close).is_empty(),
+            "and nothing probes for it"
+        );
+        let abandonable = ledger.past_deadline(close);
+        assert_eq!(
+            abandonable.len(),
+            1,
+            "the window's close abandons one never run"
+        );
+        assert_eq!(abandonable[0].tx_hash, tx.hash());
+
+        let mut delivered = UnresolvedTxs::default();
+        commit(&mut delivered, &tx);
+        delivered.mark_delivery(tx.hash(), ms(60_000));
+        delivered.certify(tx.hash());
+        let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Accept);
+        delivered.release_resolved(&[Arc::new(Verifiable::from(own))]);
+        assert_eq!(
+            delivered.len(),
+            0,
+            "a delivery's own finalization releases it"
         );
     }
 
