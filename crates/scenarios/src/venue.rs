@@ -28,6 +28,7 @@ use hyperscale_types::{
 use hyperscale_vm_effects::{InstanceMeta, Value, child_key};
 use hyperscale_vm_fixtures::amm;
 
+use crate::support::conservation::{Charges, World};
 use crate::support::query::{declared_price, held, held_at, vault_balance};
 use crate::support::tx::{
     GENESIS_POOL_ID, account_routing_to_n, build_add_liquidity_tx, build_instantiate_tx,
@@ -231,11 +232,54 @@ pub fn accepted<C: Cluster>(c: &mut C, tx: Transaction, context: &str) {
     );
 }
 
-/// Submit `tx` and hold the run to a verdict, whichever way it went.
-fn terminal<C: Cluster>(c: &mut C, tx: Transaction, budget: Budget) -> Option<TransactionStatus> {
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+/// Submit `tx`, owing its price to `charges`, and hold the run to a
+/// verdict, whichever way it went.
+fn terminal<C: Cluster>(
+    c: &mut C,
+    charges: &mut Charges,
+    tx: Transaction,
+    budget: Budget,
+) -> Option<TransactionStatus> {
+    let hash = charges.submit(c, tx);
     await_tx_terminal(c, hash, budget)
+}
+
+/// Everything that can hold each side of the venue's pair: the callers
+/// and the venue's own reserves. The provider stocked and holds nothing
+/// a swap can reach.
+fn venue_worlds<C: Cluster>(
+    c: &C,
+    venue: &StockedVenue,
+    callers: impl IntoIterator<Item = PrincipalAddr>,
+) -> (World, World) {
+    let holders: Vec<_> = callers.into_iter().map(PrincipalAddr::address).collect();
+    let xrd = World::open(
+        c,
+        *XRD,
+        holders.iter().copied(),
+        [reserve_cell(&venue.meta, *XRD)],
+    );
+    let units = World::open(
+        c,
+        venue.unit,
+        holders,
+        [reserve_cell(&venue.meta, venue.unit)],
+    );
+    (xrd, units)
+}
+
+/// Assert both sides of the venue's pair conserved across `charges`: the
+/// XRD the callers and the venue hold between them fell by exactly the
+/// prices burned, and the units moved between them and nowhere else.
+fn assert_pair_conserved<C: Cluster>(
+    c: &mut C,
+    (xrd, units): &(World, World),
+    charges: &Charges,
+    budget: Budget,
+    context: &str,
+) {
+    xrd.assert_settles_within(c, charges, budget, context);
+    units.assert_settles_within(c, &Charges::default(), budget, context);
 }
 
 /// A swap the venue accepts charges its caller its input and one price,
@@ -282,8 +326,10 @@ pub fn a_swap_charges_its_caller_its_input_and_one_price<C: Cluster>(c: &mut C, 
         stocked > 0,
         "the venue has to be holding something to price against"
     );
+    let worlds = venue_worlds(c, &venue, [caller]);
+    let mut charges = Charges::default();
 
-    let status = terminal(c, swap, budget);
+    let status = terminal(c, &mut charges, swap, budget);
     assert!(
         matches!(
             status,
@@ -316,6 +362,7 @@ pub fn a_swap_charges_its_caller_its_input_and_one_price<C: Cluster>(c: &mut C, 
         stocked + SWAP_INPUT,
         "the venue claims exactly what the caller paid in",
     );
+    assert_pair_conserved(c, &worlds, &charges, budget, "an accepted swap");
 }
 
 /// A swap the venue refuses gives its caller back what its leg took, and
@@ -368,6 +415,8 @@ pub fn a_swap_the_venue_refuses_gives_its_caller_back_its_leg<C: Cluster>(
         stocked > 0,
         "the venue has to be holding something to price against"
     );
+    let worlds = venue_worlds(c, &venue, [caller]);
+    let mut charges = Charges::default();
 
     // The caller's own leg certifies first and reports the swap accepted
     // on its chain, which is a claim about the leg and not the verdict;
@@ -380,7 +429,7 @@ pub fn a_swap_the_venue_refuses_gives_its_caller_back_its_leg<C: Cluster>(
     // the success it displaced would have. Asserting the difference
     // rather than an inequality against the input is what makes this
     // separate a reclaim from a price that happens to exceed it.
-    let _ = terminal(c, refused, budget);
+    let _ = terminal(c, &mut charges, refused, budget);
     let back = c.run_until(budget, |c| {
         funded.saturating_sub(vault_balance(c, SWAPPER_SHARD, caller)) == price
     });
@@ -409,7 +458,7 @@ pub fn a_swap_the_venue_refuses_gives_its_caller_back_its_leg<C: Cluster>(
         0,
         validity_around(c.now()),
     );
-    let status = terminal(c, again, budget);
+    let status = terminal(c, &mut charges, again, budget);
     assert!(
         matches!(
             status,
@@ -417,6 +466,13 @@ pub fn a_swap_the_venue_refuses_gives_its_caller_back_its_leg<C: Cluster>(
         ),
         "a refused swap must leave its caller funded and its venue \
          priceable; status = {status:?}",
+    );
+    assert_pair_conserved(
+        c,
+        &worlds,
+        &charges,
+        budget,
+        "a refused swap and the swap after it",
     );
 }
 
@@ -470,8 +526,10 @@ pub fn a_swap_refused_at_its_inbound_leg_never_reaches_the_venue<C: Cluster>(
         stocked > 0,
         "the venue has to be holding something to price against"
     );
+    let worlds = venue_worlds(c, &venue, [caller]);
+    let mut charges = Charges::default();
 
-    let status = terminal(c, overdrawn, budget);
+    let status = terminal(c, &mut charges, overdrawn, budget);
     assert!(
         matches!(
             status,
@@ -480,12 +538,12 @@ pub fn a_swap_refused_at_its_inbound_leg_never_reaches_the_venue<C: Cluster>(
         "an overdrawn withdraw refuses on the caller's own shard; status = {status:?}",
     );
 
-    let charged = c.run_until(budget, |c| {
+    let paid = c.run_until(budget, |c| {
         funded.saturating_sub(vault_balance(c, SWAPPER_SHARD, caller)) == price
     });
     let kept = vault_balance(c, SWAPPER_SHARD, caller);
     assert!(
-        charged,
+        paid,
         "a leg refused before it issued still pays the price: {funded} before, \
          {kept} after, price {price}",
     );
@@ -499,6 +557,7 @@ pub fn a_swap_refused_at_its_inbound_leg_never_reaches_the_venue<C: Cluster>(
         stocked,
         "the venue never ran, so it holds exactly what it held",
     );
+    assert_pair_conserved(c, &worlds, &charges, budget, "a swap refused at its leg");
 }
 
 /// What one hot-venue run observed.
@@ -549,6 +608,8 @@ pub fn hot_venue_clears_swaps_on<C: Cluster>(
     let mut taken = Vec::new();
     let venue = stand_up_venue(c, venue_shard, &mut taken);
     let swappers = swappers_on(caller_shards, &mut taken);
+    let worlds = venue_worlds(c, &venue, swappers.iter().map(|(_, account)| *account));
+    let mut charges = Charges::default();
 
     // Every swapper at once: the venue's cells are what they contend
     // for, so what the run measures is how fast that queue drains.
@@ -564,11 +625,12 @@ pub fn hot_venue_clears_swaps_on<C: Cluster>(
             0,
             validity_around(c.now()),
         );
-        submissions.push(tx.hash());
-        c.submit(Arc::new(tx));
+        submissions.push(charges.submit(c, tx));
     }
 
-    settle_swaps(c, &submissions, start, budget)
+    let report = settle_swaps(c, &submissions, start, budget);
+    assert_pair_conserved(c, &worlds, &charges, budget, "a hot venue's queue");
+    report
 }
 
 /// Drive until every swap is terminal, recording each one's first

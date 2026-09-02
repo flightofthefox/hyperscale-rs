@@ -1,0 +1,228 @@
+//! Two-sided conservation: what a scenario's world held before, what it
+//! holds after, and the prices that account for the difference.
+//!
+//! The characteristic failure of an escrow design is value stranded —
+//! issued, never claimed, never reclaimed — which is a shrink, and a
+//! one-sided "never grows" read passes it. So a [`World`] is opened over
+//! everything a scenario's transactions can reach and asserted equal on
+//! both sides, with the one legitimate sink accounted for explicitly: every
+//! transaction a receipt committed for burned its declared price, once,
+//! whatever the verdict was. [`Charges`] keeps that sum.
+
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use hyperscale_engine::XRD;
+use hyperscale_types::{
+    Address, ResourceAddr, SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash,
+};
+
+use super::query::{declared_price, held, held_at, owning_shard};
+use super::tx::{recipient, sender};
+use super::{Budget, Cluster};
+
+/// The world a [`build_probe_transfer_tx`](super::tx::build_probe_transfer_tx)
+/// train reaches: the first genesis-funded sender and recipient, in XRD.
+pub fn probe_world<C: Cluster + ?Sized>(c: &C) -> World {
+    World::open(c, *XRD, [sender(0).1.address(), recipient(0).address()], [])
+}
+
+/// Everything a scenario's transactions can reach that holds one
+/// resource, and what it summed to when the scenario opened it.
+pub struct World {
+    resource: ResourceAddr,
+    holders: Vec<Address>,
+    cells: Vec<SubstateKey>,
+    before: u128,
+}
+
+impl World {
+    /// Open the ledger over `holders`' vaults of `resource` and over
+    /// `cells` — value a component keeps in its own state, which no
+    /// address reaches.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the world holds nothing, since a conservation check over
+    /// a world that started empty passes for free.
+    pub fn open<C: Cluster + ?Sized>(
+        c: &C,
+        resource: ResourceAddr,
+        holders: impl IntoIterator<Item = Address>,
+        cells: impl IntoIterator<Item = SubstateKey>,
+    ) -> Self {
+        let mut world = Self {
+            resource,
+            holders: holders.into_iter().collect(),
+            cells: cells.into_iter().collect(),
+            before: 0,
+        };
+        world.before = world.held(c);
+        assert!(
+            world.before > 0,
+            "the conservation check has to be reading something, or it holds \
+             trivially at zero",
+        );
+        world
+    }
+
+    /// What the world summed to when it was opened.
+    #[must_use]
+    pub const fn before(&self) -> u128 {
+        self.before
+    }
+
+    /// What the world sums to now.
+    #[must_use]
+    pub fn held<C: Cluster + ?Sized>(&self, c: &C) -> u128 {
+        let vaults = self
+            .holders
+            .iter()
+            .fold(0u128, |sum, owner| sum + held(c, *owner, self.resource));
+        self.cells
+            .iter()
+            .fold(vaults, |sum, cell| sum + held_at(c, *cell))
+    }
+
+    /// Whether what the world holds now, plus what `burned` accounts for,
+    /// is exactly what it held when opened.
+    ///
+    /// A predicate rather than an assertion so a scenario can drive to it:
+    /// a delivery lands a hop after its verdict, and the world balances
+    /// only once it has.
+    #[must_use]
+    pub fn settles<C: Cluster + ?Sized>(&self, c: &C, burned: u128) -> bool {
+        self.held(c) + burned == self.before
+    }
+
+    /// Drive until the world settles against what `charges` burned, then
+    /// assert it: a delivery lands a hop after its verdict and a burn a
+    /// block after its status, so the equality is reached rather than
+    /// read at an instant.
+    ///
+    /// # Panics
+    ///
+    /// As [`assert_settled`](Self::assert_settled).
+    pub fn assert_settles_within<C: Cluster>(
+        &self,
+        c: &mut C,
+        charges: &Charges,
+        budget: Budget,
+        context: &str,
+    ) {
+        let _ = c.run_until(budget, |c| self.settles(c, charges.burned(c)));
+        self.assert_settled(c, charges.burned(c), context);
+    }
+
+    /// Assert [`settles`](Self::settles), naming both sides.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the world grew — value from nowhere — or shrank by more
+    /// than the burn — value stranded.
+    pub fn assert_settled<C: Cluster + ?Sized>(&self, c: &C, burned: u128, context: &str) {
+        let after = self.held(c);
+        assert_eq!(
+            after + burned,
+            self.before,
+            "{context}: the world held {} before and {after} after, with {burned} \
+             burned — {}",
+            self.before,
+            if after + burned > self.before {
+                "value came from nowhere"
+            } else {
+                "value was stranded"
+            },
+        );
+    }
+}
+
+/// The prices a scenario's submissions owe.
+///
+/// One declared price per transaction, charged if and only if a receipt
+/// for it committed: a success burns it inside its writes, a refusal or
+/// an abandonment settles it apart on a committed finalization, and one
+/// the network never resolved owes nothing. The last is not only the
+/// transaction nobody included: a payer's deadline speaks an abort on
+/// its own, and where no certificate ever follows — the payer's shard
+/// terminating with the transaction in flight — the abort commits no
+/// receipt and burns nothing, while a counterpart that abandons it on a
+/// record of its own settles no fee either, since only the shard holding
+/// the vault does. So an abort counts only once the chain owning the
+/// payer's prefix carries its finalization.
+///
+/// The figure is the sender's declaration, derived from signed content,
+/// and read once the verdict is in — a call into a package the chain has
+/// yet to register prices only once it has. Keyed by hash, so a
+/// transaction resubmitted — a replay probe — is owed once, as it is
+/// charged once.
+#[derive(Default)]
+pub struct Charges {
+    owed: BTreeMap<TxHash, Arc<Transaction>>,
+    /// Aborts a chain has been seen to carry a finalization for. A
+    /// committed finalization never uncommits, so the walk that found it
+    /// is not repeated.
+    finalized_aborts: RefCell<BTreeSet<TxHash>>,
+}
+
+impl Charges {
+    /// Record `tx` without submitting it.
+    pub fn record(&mut self, tx: &Arc<Transaction>) -> TxHash {
+        let hash = tx.hash();
+        self.owed.insert(hash, Arc::clone(tx));
+        hash
+    }
+
+    /// Record `tx` and submit it.
+    pub fn submit<C: Cluster + ?Sized>(&mut self, c: &mut C, tx: Transaction) -> TxHash {
+        let tx = Arc::new(tx);
+        let hash = self.record(&tx);
+        c.submit(tx);
+        hash
+    }
+
+    /// How many of the recorded transactions have been charged.
+    #[must_use]
+    pub fn charged<C: Cluster + ?Sized>(&self, c: &C) -> usize {
+        self.owed
+            .keys()
+            .filter(|hash| self.is_charged(c, **hash))
+            .count()
+    }
+
+    /// What the recorded transactions that were charged burned between
+    /// them.
+    #[must_use]
+    pub fn burned<C: Cluster + ?Sized>(&self, c: &C) -> u128 {
+        self.owed
+            .iter()
+            .filter(|(hash, _)| self.is_charged(c, **hash))
+            .map(|(_, tx)| declared_price(c, tx))
+            .sum()
+    }
+
+    /// Whether a receipt for `hash` has committed: a decision either way,
+    /// or an abort the payer's own chain finalized.
+    fn is_charged<C: Cluster + ?Sized>(&self, c: &C, hash: TxHash) -> bool {
+        match c.tx_status(hash) {
+            Some(TransactionStatus::Completed(TransactionDecision::Aborted)) => {
+                if self.finalized_aborts.borrow().contains(&hash) {
+                    return true;
+                }
+                let payer = self.owed[&hash]
+                    .try_body()
+                    .expect("a scenario fixture decodes")
+                    .fee_payer
+                    .address();
+                let finalized = c.chain_fate(owning_shard(c, payer), hash).1.is_some();
+                if finalized {
+                    self.finalized_aborts.borrow_mut().insert(hash);
+                }
+                finalized
+            }
+            Some(TransactionStatus::Completed(_)) => true,
+            Some(TransactionStatus::Pending | TransactionStatus::Committed(_)) | None => false,
+        }
+    }
+}

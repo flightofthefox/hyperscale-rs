@@ -2496,6 +2496,7 @@ dependencies = [
  "hyperscale-vm-effects",
  "hyperscale-vm-fixtures",
  "hyperscale-vm-manifest-builder",
+ "hyperscale-vm-sdk",
  "hyperscale-vm-stdlib",
  "hyperscale-vm-types",
 ]

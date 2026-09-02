@@ -8,12 +8,12 @@
 
 use std::collections::BTreeSet;
 
-use hyperscale_engine::XRD;
 use hyperscale_engine::genesis::vault_key;
+use hyperscale_engine::{XRD, publish_work};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
     Address, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, PendingReshape, ResourceAddr,
-    ShardId, Stake, StakePool, StakePoolId, StateRoot, SubstateKey, Transaction,
+    ShardId, ShardTrie, Stake, StakePool, StakePoolId, StateRoot, SubstateKey, Transaction,
     TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
 };
 
@@ -29,13 +29,19 @@ const MAX_SEARCHED_DEPTH: u32 = 3;
 /// every refusal a sender can reach, so a scenario asserting what a
 /// vault moved reads it once and compares against it either way.
 /// Borrowed from the cluster's own derivation, because a transaction a
-/// scenario assembled has been derived by nobody.
+/// scenario assembled has been derived by nobody. A publish is priced by
+/// its artifact's length and held to its ceiling rather than by the call
+/// rule.
 ///
 /// # Panics
 ///
 /// Panics if the transaction does not derive, which for a scenario
 /// fixture means it was built wrong.
 pub fn declared_price<C: Cluster + ?Sized>(c: &C, tx: &Transaction) -> u128 {
+    let body = tx.try_body().expect("a scenario fixture decodes");
+    if let Some(artifact) = body.artifact() {
+        return u128::from(publish_work(artifact)).min(body.max_fee);
+    }
     tx.price_under(c.derivation().as_ref())
         .expect("a scenario fixture derives")
 }
@@ -55,10 +61,11 @@ pub fn served_shards<C: Cluster + ?Sized>(c: &C) -> Vec<ShardId> {
 
 /// What `owner` holds of `resource`, wherever its prefix currently sits.
 ///
-/// Searched rather than routed, because a scenario that reshapes moves
+/// Routed rather than searched, because a scenario that reshapes moves
 /// the answer: the cell keeps its key across a split — the key is the
 /// owner's prefix and a local half, neither of which a reshape rewrites
-/// — but the shard serving it changes.
+/// — but the shard serving it changes, and a shard that has handed its
+/// prefix on still answers for it, at the state it froze at.
 #[must_use]
 pub fn held<C: Cluster + ?Sized>(c: &C, owner: Address, resource: ResourceAddr) -> u128 {
     held_at(c, vault_key(owner, resource))
@@ -73,26 +80,27 @@ pub fn held<C: Cluster + ?Sized>(c: &C, owner: Address, resource: ResourceAddr) 
 /// package is what knows.
 #[must_use]
 pub fn held_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> u128 {
-    served_shards(c)
-        .into_iter()
-        .find_map(|shard| c.substate(shard, cell.owner, cell.local.0))
+    let shard = owning_shard(c, cell.owner);
+    c.substate(shard, cell.owner, cell.local.0)
         .map_or(0, |bytes| {
             <[u8; 16]>::try_from(bytes.as_slice()).map_or(0, u128::from_le_bytes)
         })
 }
 
-/// What `owners` hold of `resource` between them.
+/// The live shard whose prefix `owner` falls under.
 ///
-/// Accounts only. Value a component keeps in its own state — a pool's
-/// reserves — is not reachable from an address, so a scenario holding a
-/// component to conservation adds those cells itself through
-/// [`held_at`]. A sum that omits them is not wrong, but it is blind to
-/// exactly the half a cross-shard route moves.
+/// The beacon's live leaf partition is the authority: a split's parent
+/// and a merge's children keep serving their frozen stores after the
+/// cut, and a search over everything served would read whichever of
+/// them answered first. Before the beacon has folded anything the root
+/// is the one shard there is.
 #[must_use]
-pub fn total_held<C: Cluster + ?Sized>(c: &C, owners: &[Address], resource: ResourceAddr) -> u128 {
-    owners.iter().fold(0u128, |sum, owner| {
-        sum.saturating_add(held(c, *owner, resource))
-    })
+pub fn owning_shard<C: Cluster + ?Sized>(c: &C, owner: Address) -> ShardId {
+    let live = live_shards(c);
+    if live.is_empty() {
+        return ShardId::ROOT;
+    }
+    ShardTrie::from_leaves(live).shard_for_prefix(owner)
 }
 
 /// Walk `store`'s committed chain from height 1 for `tx`'s fate.
@@ -253,7 +261,7 @@ pub fn committee_size<C: Cluster>(c: &C, shard: ShardId) -> Option<usize> {
 /// The set of shards the beacon currently seats a committee for — the live leaf
 /// partition.
 #[must_use]
-pub fn live_shards<C: Cluster>(c: &C) -> BTreeSet<ShardId> {
+pub fn live_shards<C: Cluster + ?Sized>(c: &C) -> BTreeSet<ShardId> {
     c.beacon_state()
         .map(|state| state.shard_committees.keys().copied().collect())
         .unwrap_or_default()

@@ -8,7 +8,6 @@
 //! shape whose settlement waits on a certificate from across a shard
 //! boundary — a transfer never does, its recipient claims a bundle.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::XRD;
@@ -17,7 +16,8 @@ use hyperscale_types::{
     TxHash,
 };
 
-use crate::support::query::{declared_price, held_at, total_held, vault_balance};
+use crate::support::conservation::{Charges, World};
+use crate::support::query::{declared_price, held_at, vault_balance};
 use crate::support::tx::{build_route_tx, validity_around};
 use crate::support::{Budget, Cluster, FaultableCluster, epochs};
 use crate::venue::{
@@ -131,8 +131,42 @@ pub fn a_route_settles_when_its_venues_certificates_are_dropped<C: FaultableClus
     );
 }
 
+/// Everything that can hold each side of the pair in a route scenario:
+/// the traders and the two venues themselves. The providers stocked and
+/// hold nothing a route can reach.
+fn route_worlds<C: Cluster>(
+    c: &C,
+    first: &StockedVenue,
+    second: &StockedVenue,
+    traders: &[(Ed25519PrivateKey, PrincipalAddr)],
+) -> (World, World) {
+    let holders: Vec<Address> = traders
+        .iter()
+        .map(|(_, account)| account.address())
+        .collect();
+    let xrd = World::open(
+        c,
+        *XRD,
+        holders.iter().copied(),
+        [
+            reserve_cell(&first.meta, *XRD),
+            reserve_cell(&second.meta, *XRD),
+        ],
+    );
+    let units = World::open(
+        c,
+        first.unit,
+        holders,
+        [
+            reserve_cell(&first.meta, first.unit),
+            reserve_cell(&second.meta, second.unit),
+        ],
+    );
+    (xrd, units)
+}
+
 /// Drive every trader's route through both venues and hold the run to
-/// every route accepting, under a one-sided conservation read.
+/// every route accepting, with both sides of the pair conserved.
 fn drive_routes<C: Cluster>(
     c: &mut C,
     first: &StockedVenue,
@@ -140,27 +174,10 @@ fn drive_routes<C: Cluster>(
     traders: &[(Ed25519PrivateKey, PrincipalAddr)],
     budget: Budget,
 ) -> RouteReport {
-    // Everything that can hold XRD in this scenario: the traders and the
-    // two venues themselves. The providers stocked and hold nothing the
-    // routes can reach.
-    let holders: Vec<Address> = traders
-        .iter()
-        .map(|(_, account)| account.address())
-        .collect();
-    let (first_cell, second_cell) = (
-        reserve_cell(&first.meta, *XRD),
-        reserve_cell(&second.meta, *XRD),
-    );
-    let world =
-        |c: &C| total_held(c, &holders, *XRD) + held_at(c, first_cell) + held_at(c, second_cell);
-    let before = world(c);
-    assert!(
-        before > 0,
-        "the conservation check has to be reading something, or it holds \
-         trivially at zero",
-    );
+    let (xrd, units) = route_worlds(c, first, second, traders);
 
     let start = c.now();
+    let mut charges = Charges::default();
     let mut submissions: Vec<TxHash> = Vec::with_capacity(traders.len());
     for (key, account) in traders {
         let tx = build_route_tx(
@@ -172,8 +189,7 @@ fn drive_routes<C: Cluster>(
             0,
             validity_around(c.now()),
         );
-        submissions.push(tx.hash());
-        c.submit(Arc::new(tx));
+        submissions.push(charges.submit(c, tx));
     }
 
     let all = c.run_until(budget, |c| {
@@ -194,17 +210,13 @@ fn drive_routes<C: Cluster>(
         );
     }
 
-    // Nothing here mints, and the fee burns — so what the scenario holds
-    // between it can only fall. One-sided rather than pinned to a
-    // figure: that needs the burns accounted, where this needs nothing
-    // and still catches value appearing from nowhere, which is the
-    // failure a route settling across two shards could have.
-    let after = world(c);
-    assert!(
-        after <= before,
-        "a settled route cannot leave more XRD in the world than it found: \
-         {before} before, {after} after",
-    );
+    // Nothing here mints: the XRD the traders paid in is what the venues
+    // now hold less the prices burned, and the units the first venue
+    // paid out are what the second took back. Driven rather than read,
+    // since the deposit that banks each trader's output lands a hop
+    // after the second venue's verdict.
+    xrd.assert_settles_within(c, &charges, budget, "routes through two venues");
+    units.assert_settles_within(c, &Charges::default(), budget, "routes through two venues");
 
     RouteReport {
         submitted: submissions.len(),
@@ -247,11 +259,12 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
 ) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
-    let (trader_key, trader) = traders(&mut taken).remove(0);
+    let cast = traders(&mut taken);
+    let (trader_key, trader) = (&cast[0].0, cast[0].1);
 
     // A floor no pool this size can pay, held by the hop that runs last.
     let refused = build_route_tx(
-        &trader_key,
+        trader_key,
         trader,
         (&first.meta, &second.meta),
         *XRD,
@@ -259,7 +272,6 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
         REFUSED_FLOOR,
         validity_around(c.now()),
     );
-    let refused_hash = refused.hash();
     let price = declared_price(c, &refused);
     let funded = vault_balance(c, TRADER_SHARD, trader);
     let (first_cell, second_cell) = (
@@ -272,7 +284,9 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
         "both venues have to be holding something, or the reserve check \
          holds trivially at zero: {first_before} and {second_before}",
     );
-    c.submit(Arc::new(refused));
+    let (xrd, units) = route_worlds(c, &first, &second, &cast[..1]);
+    let mut charges = Charges::default();
+    let refused_hash = charges.submit(c, refused);
     let settled = c.run_until(budget, |c| {
         c.tx_status(refused_hash).is_some_and(|s| s.is_final())
     });
@@ -336,7 +350,7 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
     // above, and it is the one that says the route after this is not
     // running against a wedged pool.
     let again = build_route_tx(
-        &trader_key,
+        trader_key,
         trader,
         (&first.meta, &second.meta),
         *XRD,
@@ -344,8 +358,7 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
         0,
         validity_around(c.now()),
     );
-    let again_hash = again.hash();
-    c.submit(Arc::new(again));
+    let again_hash = charges.submit(c, again);
     let settled = c.run_until(budget, |c| {
         c.tx_status(again_hash).is_some_and(|s| s.is_final())
     });
@@ -358,5 +371,21 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
         ),
         "a refused route must leave its trader funded and its venues \
          priceable; status = {status:?}",
+    );
+
+    // Across the refusal and the route after it, the pair is conserved:
+    // the trader and the venues hold between them what they started
+    // with, less the two prices.
+    xrd.assert_settles_within(
+        c,
+        &charges,
+        budget,
+        "a refused route and the route after it",
+    );
+    units.assert_settles_within(
+        c,
+        &Charges::default(),
+        budget,
+        "a refused route and the route after it",
     );
 }

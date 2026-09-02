@@ -79,8 +79,8 @@ pub use straddler::{
     surviving_sibling_split_seats_full_committees,
 };
 pub use support::{
-    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, epochs, grow_to, query, tx,
-    vote_reshape_threshold, wait,
+    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, conservation, epochs, grow_to,
+    query, tx, vote_reshape_threshold, wait,
 };
 pub use transactions::livelock_resolves_promptly;
 pub use venue::{

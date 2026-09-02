@@ -856,6 +856,7 @@ pub fn build_fee_receipt(
 ///
 /// One unit per byte is a placeholder until measured baselines set the
 /// real rate, like every other number in the fee model.
+#[must_use]
 pub const fn publish_work(artifact: &[u8]) -> u64 {
     artifact.len() as u64
 }

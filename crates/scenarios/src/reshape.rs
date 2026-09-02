@@ -8,6 +8,7 @@ use hyperscale_types::{
     BlockHeight, MAX_VALIDITY_RANGE, ShardId, TimestampRange, Transaction, WeightedTimestamp,
 };
 
+use crate::support::conservation::{Charges, probe_world};
 use crate::support::query::{
     committee_size, epoch_duration_ms, live_shards, scheduled_terminal_epoch,
 };
@@ -176,12 +177,14 @@ pub fn split_boundary_refuses_a_replay(c: &mut impl Cluster) {
     let root = ShardId::ROOT;
     let (left, right) = root.children();
 
-    let spacing = measure_probe_spacing(c, root);
+    let world = probe_world(c);
+    let mut charges = Charges::default();
+    let spacing = measure_probe_spacing(c, &mut charges, root);
     assert!(
         await_split_admitted(c, root, epochs(8)),
         "beacon did not admit the root split within budget"
     );
-    let probes = run_probe_train(c, root, spacing, |c| {
+    let probes = run_probe_train(c, &mut charges, root, spacing, |c| {
         [left, right].iter().all(|&child| shard_live(c, child))
     });
     let replay = pick_replay(c, root, &probes);
@@ -196,6 +199,10 @@ pub fn split_boundary_refuses_a_replay(c: &mut impl Cluster) {
             "child {child} committed {replayed}, which its parent had already committed",
         );
     }
+    // A refused replay charges nothing twice: the train's payer is out
+    // one price per probe the parent committed, and the recipient holds
+    // every payment.
+    world.assert_settles_within(c, &charges, epochs(8), "a probe train and its replay");
 }
 
 /// How many blocks `shard` should commit between consecutive probes.
@@ -204,8 +211,8 @@ pub fn split_boundary_refuses_a_replay(c: &mut impl Cluster) {
 /// the harness, so the train's spacing is measured rather than assumed.
 /// One probe supplies the activity; callers absorb the measurement epoch
 /// into the wait for the reshape admission that follows it.
-fn measure_probe_spacing(c: &mut impl Cluster, shard: ShardId) -> u64 {
-    c.submit(Arc::new(build_probe_transfer_tx(validity_around(c.now()))));
+fn measure_probe_spacing(c: &mut impl Cluster, charges: &mut Charges, shard: ShardId) -> u64 {
+    charges.submit(c, build_probe_transfer_tx(validity_around(c.now())));
     let before = committed_height(c, shard);
     c.run_until(epochs(1), |_| false);
     let blocks_per_epoch = committed_height(c, shard).saturating_sub(before);
@@ -229,6 +236,7 @@ fn measure_probe_spacing(c: &mut impl Cluster, shard: ShardId) -> u64 {
 /// chain before the handover it is meant to detect.
 fn run_probe_train<C: Cluster>(
     c: &mut C,
+    charges: &mut Charges,
     terminating: ShardId,
     spacing: u64,
     handed_over: impl Fn(&C) -> bool,
@@ -237,6 +245,7 @@ fn run_probe_train<C: Cluster>(
     let mut probes: Vec<Arc<Transaction>> = Vec::new();
     while probes.len() < MAX_REPLAY_PROBES as usize && !live(c) {
         let probe = Arc::new(build_probe_transfer_tx(validity_around(c.now())));
+        charges.record(&probe);
         probes.push(Arc::clone(&probe));
         c.submit(probe);
         let from = committed_height(c, terminating);
@@ -364,17 +373,19 @@ pub fn split_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
     let root = ShardId::ROOT;
     let (left, right) = root.children();
 
-    let spacing = measure_probe_spacing(c, root);
+    let world = probe_world(c);
+    let mut charges = Charges::default();
+    let spacing = measure_probe_spacing(c, &mut charges, root);
     assert!(
         await_split_admitted(c, root, epochs(8)),
         "beacon did not admit the root split within budget"
     );
-    let probes = run_probe_train(c, root, spacing, |c| {
+    let probes = run_probe_train(c, &mut charges, root, spacing, |c| {
         [left, right].iter().all(|&child| shard_live(c, child))
     });
     let replay = pick_replay(c, root, &probes);
     let stranded = build_precut_probe(c, left);
-    let (replayed, stranded_hash) = (replay.hash(), stranded.hash());
+    let (replayed, stranded_hash) = (replay.hash(), charges.record(&stranded));
 
     c.submit(replay);
     c.submit(stranded);
@@ -392,6 +403,12 @@ pub fn split_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
             "child {child} committed {replayed}, which its parent had already committed",
         );
     }
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a probe train, a replay and a stranded probe",
+    );
 }
 
 /// `shard`'s committed height as a plain number, zero before it commits.
@@ -484,8 +501,10 @@ pub fn split_boundary_hands_back_what_it_never_included(c: &mut impl Cluster) {
         "the split's cut was not scheduled within budget",
     );
 
+    let world = probe_world(c);
+    let mut charges = Charges::default();
     let probe = build_post_cut_probe(c, root);
-    let hash = probe.hash();
+    let hash = charges.record(&probe);
     c.submit(probe);
 
     assert!(
@@ -507,6 +526,7 @@ pub fn split_boundary_hands_back_what_it_never_included(c: &mut impl Cluster) {
         "{hash} was admitted to the parent's pool and never included, so the handback \
          must carry it to a successor — nothing else can, and nothing resubmitted it",
     );
+    world.assert_settles_within(c, &charges, epochs(8), "a handed-back probe");
 }
 
 /// A probe whose validity window opens after `parent`'s scheduled cut, so
@@ -568,19 +588,21 @@ pub fn merge_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
     // The probes all share a payer, so they land on one child; the
     // reformed parent succeeds both regardless, and the sibling that
     // never saw them is the second answer it has to collect.
-    let payer_child = probe_payer_shard(c, root);
-    let spacing = measure_probe_spacing(c, payer_child);
+    let world = probe_world(c);
+    let mut charges = Charges::default();
+    let payer_child = probe_payer_shard(c, &mut charges, root);
+    let spacing = measure_probe_spacing(c, &mut charges, payer_child);
     // The reformed parent reclaims a shard id its own predecessor held,
     // so serving is no signal. Its height line continues from the taller
     // child, so passing the child it succeeds is: nothing the departed
     // root chain froze at can reach there.
-    let probes = run_probe_train(c, payer_child, spacing, |c| {
+    let probes = run_probe_train(c, &mut charges, payer_child, spacing, |c| {
         c.serves_shard(root) && committed_height(c, root) > committed_height(c, payer_child)
     });
 
     let replay = pick_replay(c, payer_child, &probes);
     let stranded = build_precut_probe(c, root);
-    let (replayed, stranded_hash) = (replay.hash(), stranded.hash());
+    let (replayed, stranded_hash) = (replay.hash(), charges.record(&stranded));
 
     c.submit(replay);
     c.submit(stranded);
@@ -593,6 +615,7 @@ pub fn merge_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
         c.chain_fate(root, replayed).0.is_none(),
         "the merged parent committed {replayed}, which one of its children had already committed",
     );
+    world.assert_settles_within(c, &charges, epochs(8), "a probe train across a merge");
 }
 
 /// Which of `parent`'s children the probe payer's account sits under.
@@ -603,10 +626,10 @@ pub fn merge_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
 /// # Panics
 ///
 /// Panics if neither child commits a probe within budget.
-fn probe_payer_shard(c: &mut impl Cluster, parent: ShardId) -> ShardId {
+fn probe_payer_shard(c: &mut impl Cluster, charges: &mut Charges, parent: ShardId) -> ShardId {
     let (left, right) = parent.children();
     let probe = Arc::new(build_probe_transfer_tx(validity_around(c.now())));
-    let hash = probe.hash();
+    let hash = charges.record(&probe);
     c.submit(probe);
     assert!(
         c.run_until(epochs(4), |c| [left, right]

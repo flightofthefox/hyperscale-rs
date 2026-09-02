@@ -20,6 +20,7 @@ hyperscale-vm-effects.workspace = true
 hyperscale-vm-types.workspace = true
 hyperscale-vm-fixtures.workspace = true
 hyperscale-vm-manifest-builder.workspace = true
+hyperscale-vm-sdk.workspace = true
 hyperscale-vm-stdlib.workspace = true
 hyperscale-mempool.workspace = true
 hyperscale-storage = { workspace = true }

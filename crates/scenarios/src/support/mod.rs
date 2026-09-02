@@ -3,12 +3,14 @@
 //! This is the stable surface a scenario is written against: the [`Cluster`]
 //! trait both harnesses implement, the portable [`ScenarioConfig`], the
 //! [`Budget`] unit, the read combinators in [`query`], the await combinators in
-//! [`wait`], the transaction builders in [`tx`], and the [`grow_to`] step that
-//! reaches a multi-shard starting topology.
+//! [`wait`], the transaction builders in [`tx`], the conservation ledger in
+//! [`conservation`], and the [`grow_to`] step that reaches a multi-shard
+//! starting topology.
 
 mod budget;
 mod cluster;
 mod config;
+pub mod conservation;
 pub mod faultable;
 mod grow;
 pub mod query;

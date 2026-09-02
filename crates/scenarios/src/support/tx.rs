@@ -22,18 +22,20 @@ use hyperscale_types::{
     AccountSigner, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
     EnvelopeExt, Epoch, MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR,
     MlDsa65PrivateKey, NetworkId, NetworkParams, PrincipalAddr, ResourceAddr, SchemeId, ShardId,
-    ShardTrie, StakePoolId, StakePoolSeat, TimestampRange, Transaction, TransactionBody,
-    TransactionEnvelope, ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
+    ShardTrie, StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction,
+    TransactionBody, TransactionEnvelope, ValidatorId, WeightedTimestamp,
+    ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
     Composed, Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader,
-    ManifestGraph, ResourceKind, Totality, Value, issued_resource, package_hash,
+    ManifestGraph, ResourceKind, SlotId, Totality, Value, child_key, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{amm, amm_package_hash, lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::signing::{self, sign_subintent};
 use hyperscale_vm_manifest_builder::{
     EnvelopeBuilder, GraphBuilder, IntentBuilder, TypedBuilder, TypedError,
 };
+use hyperscale_vm_sdk::client::VaultField;
 use hyperscale_vm_stdlib::{STAKING_COMPONENT, account, account_artifact, instantiate, staking};
 use hyperscale_vm_types::Address;
 
@@ -1974,6 +1976,19 @@ pub const SECOND_POOL_ID: StakePoolId = StakePoolId::new(7778);
 /// a founding validator. Nothing else about the pool changes — its stake
 /// and its membership are still genesis's.
 pub const GENESIS_POOL_ID: StakePoolId = StakePoolId::new(0);
+
+/// The cell a stake pool keeps its delegations in: the pool's declared
+/// vault of the resource it is configured to hold, under the pool's own
+/// address.
+#[must_use]
+pub fn pool_vault_cell(pool: ComponentAddr) -> SubstateKey {
+    child_key(
+        &ProtocolHasher,
+        pool.address(),
+        SlotId(staking::Pool::SLOT),
+        &[Value::Address(XRD.address()).canonical_bytes()],
+    )
+}
 
 /// Where genesis seats the pool with `id` — derived from the record, so
 /// a scenario names a pool the way genesis places it.

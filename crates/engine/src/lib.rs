@@ -39,7 +39,7 @@ pub mod sharding;
 
 pub use batch::{TickBatchContext, TickEnvironment, TickTxInput};
 pub use executor::{
-    Executor, artifact_package, build_fee_receipt, instance_of_record, protocol_hash,
+    Executor, artifact_package, build_fee_receipt, instance_of_record, protocol_hash, publish_work,
 };
 pub use genesis::{
     GenesisConfig, World, XRD, genesis_package_facts, genesis_world, genesis_writes,

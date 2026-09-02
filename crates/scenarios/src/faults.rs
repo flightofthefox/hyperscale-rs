@@ -1,8 +1,8 @@
 //! Portable network-fault scenarios.
 
 use std::fmt::Write;
-use std::sync::Arc;
 
+use hyperscale_engine::XRD;
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, Epoch, HALT_THRESHOLD_EPOCHS, MAX_VALIDITY_RANGE,
     PrincipalAddr, ShardId, StateRoot, TransactionDecision, TransactionStatus, TxHash,
@@ -11,6 +11,7 @@ use hyperscale_types::{
 
 use crate::reshape::split_lifecycle;
 use crate::straddler::{STRADDLER_PAYMENT, chain_settled, submit_straddler};
+use crate::support::conservation::{Charges, World, probe_world};
 use crate::support::faultable::FaultableCluster;
 use crate::support::query::{beacon_epoch, vault_balance};
 use crate::support::tx::{
@@ -35,10 +36,11 @@ use crate::support::{Cluster, epochs};
 pub fn gossip_drop_engages_fetch_fallback(c: &mut impl FaultableCluster) {
     let fetch_before = c.metric("fetch_items_sent", Some("transaction"));
     let dropped = c.drop_type("transaction.gossip");
+    let world = probe_world(c);
+    let mut charges = Charges::default();
 
     let transfer = build_probe_transfer_tx(validity_around(c.now()));
-    let hash = transfer.hash();
-    c.submit(Arc::new(transfer));
+    let hash = charges.submit(c, transfer);
 
     let status = await_tx_terminal(c, hash, epochs(8));
     assert!(
@@ -48,6 +50,7 @@ pub fn gossip_drop_engages_fetch_fallback(c: &mut impl FaultableCluster) {
         ),
         "the transfer must still accept via the fetch fallback; status = {status:?}"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a probe under a gossip drop");
     assert!(
         dropped.fired() >= 1,
         "the transaction.gossip drop rule must fire",
@@ -117,10 +120,11 @@ pub fn isolated_validator_still_settles(c: &mut impl FaultableCluster) {
         "consensus must commit a block before isolating a validator",
     );
     c.isolate(3);
+    let world = probe_world(c);
+    let mut charges = Charges::default();
 
     let transfer = build_probe_transfer_tx(validity_around(c.now()));
-    let hash = transfer.hash();
-    c.submit(Arc::new(transfer));
+    let hash = charges.submit(c, transfer);
 
     let status = await_tx_terminal(c, hash, epochs(6));
     assert!(
@@ -129,6 +133,12 @@ pub fn isolated_validator_still_settles(c: &mut impl FaultableCluster) {
             Some(TransactionStatus::Completed(TransactionDecision::Accept))
         ),
         "the transfer must complete despite an isolated validator; status = {status:?}",
+    );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "a probe beside an isolated validator",
     );
 }
 
@@ -216,13 +226,26 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     let setup = halt_straddler_setup();
     split_lifecycle(c);
 
+    // Every account a probe pays from or delivers to, in every batch and
+    // after the recovery. The ballast holds the band and never spends.
+    let world = World::open(
+        c,
+        *XRD,
+        setup
+            .straddlers
+            .iter()
+            .chain(&setup.post_recovery)
+            .flat_map(|(_, from, to)| [from.address(), to.address()]),
+        [],
+    );
+    let mut charges = Charges::default();
     let mut probes: Vec<Probe> = Vec::new();
 
     // Settling batch: finalized on both children before any fault
     // installs, so each chain records its half — the payer's verdict and
     // the recipient's delivery.
     for leg in &setup.straddlers[..HALT_STRADDLER_BATCH] {
-        probes.push(submit_probe(c, leg));
+        probes.push(submit_probe(c, &mut charges, leg));
     }
     assert!(
         c.run_until(epochs(12), |c| {
@@ -239,7 +262,7 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     // per-batch assertion; each lands in whichever bucket it raced into.
     let halt = freeze_shard(c, halted, survivor, |c| {
         for leg in &setup.straddlers[HALT_STRADDLER_BATCH..2 * HALT_STRADDLER_BATCH] {
-            probes.push(submit_probe(c, leg));
+            probes.push(submit_probe(c, &mut charges, leg));
         }
     });
 
@@ -248,7 +271,7 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     // alone — but its delivery has nowhere to land; a halted-paid probe
     // never commits anywhere.
     for leg in &setup.straddlers[2 * HALT_STRADDLER_BATCH..] {
-        probes.push(submit_probe(c, leg));
+        probes.push(submit_probe(c, &mut charges, leg));
     }
 
     // The survivor's verdict waits on no one: a probe it pays for accepts
@@ -305,7 +328,7 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
 
     await_halt_recovery(c, &halt);
 
-    assert_deliveries_agree(c, halted, survivor, &probes, &at_freeze);
+    let stranded = assert_deliveries_agree(c, halted, survivor, &probes, &at_freeze);
 
     // The recovered shard's cross-shard rail serves again: a fresh
     // transfer per direction settles on both chains and credits its
@@ -318,7 +341,7 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     let revived: Vec<Probe> = setup
         .post_recovery
         .iter()
-        .map(|leg| submit_probe(c, leg))
+        .map(|leg| submit_probe(c, &mut charges, leg))
         .collect();
     assert!(
         c.run_until(epochs(40), |c| {
@@ -330,6 +353,38 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
         }),
         "a post-recovery transfer per direction must settle on both chains \
          and credit its recipient once",
+    );
+
+    assert_conserved_less_the_strand(c, &world, &charges, stranded);
+}
+
+/// Two-sided conservation, less what the halt stranded: a survivor-paid
+/// delivery whose window closed while the recipient was frozen debited
+/// its payer, issued its record cell, and is never claimed or reclaimed.
+/// The doomed batch's survivor-paid pair is stranded by construction, so
+/// the figure is never zero, and it is what a delivery outliving its
+/// window would recover.
+fn assert_conserved_less_the_strand<C: Cluster>(
+    c: &mut C,
+    world: &World,
+    charges: &Charges,
+    stranded: u128,
+) {
+    assert!(
+        stranded >= 2 * STRADDLER_PAYMENT,
+        "the doomed batch's survivor-paid deliveries are stranded by construction; \
+         stranded = {stranded}",
+    );
+    let balanced = c.run_until(epochs(8), |c| {
+        world.held(c) + charges.burned(c) + stranded == world.before()
+    });
+    assert!(
+        balanced,
+        "a halt and its recovery: the world held {} before and {} after, with {} burned \
+         and {stranded} stranded across the halt",
+        world.before(),
+        world.held(c),
+        charges.burned(c),
     );
 }
 
@@ -355,12 +410,13 @@ struct Probe {
 /// Submit one straddler leg, recording what the assertions read back.
 fn submit_probe<C: Cluster>(
     c: &mut C,
+    charges: &mut Charges,
     (key, from, to): &(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr),
 ) -> Probe {
     // The same window the submission builds against the same clock, so
     // this is the transaction's own range rather than an estimate of it.
     let window = validity_around(c.now());
-    let hash = submit_straddler(c, key, *from, *to);
+    let hash = submit_straddler(c, charges, key, *from, *to);
     Probe {
         hash,
         payer_shard: account_shard(*from, 2),
@@ -383,6 +439,9 @@ fn credited_once<C: Cluster>(c: &C, probe: &Probe) -> bool {
 /// paid for committed nowhere. A survivor-paid probe whose delivery
 /// window is still open lands on the recovered shard.
 ///
+/// Returns what the halt stranded: the payments of every survivor-paid
+/// probe that accepted and whose delivery never landed.
+///
 /// `at_freeze` is the halted chain's own view taken before the recovery:
 /// a commit or an accept in either that snapshot or the post-recovery
 /// walk counts, since the snapshot covers heights a fresh member never
@@ -393,7 +452,7 @@ fn assert_deliveries_agree<C: Cluster>(
     survivor: ShardId,
     probes: &[Probe],
     at_freeze: &[ChainFate],
-) {
+) -> u128 {
     let fate_on = |c: &C, shard: ShardId, idx: usize, hash: TxHash| {
         let now = c.chain_fate(shard, hash);
         if shard == halted {
@@ -474,27 +533,30 @@ fn assert_deliveries_agree<C: Cluster>(
         })
         .map(|(_, p)| p)
         .collect();
-    eprintln!(
-        "PROBE now={now:?} owed={} closes={:?}{report}",
-        owed.len(),
-        probes.iter().map(|p| p.delivery_closes).collect::<Vec<_>>()
-    );
     let landed = c.run_until(epochs(10), |c| {
         owed.iter()
             .all(|p| c.chain_fate(halted, p.hash).0.is_some() && credited_once(c, p))
     });
-    eprintln!(
-        "PROBE landed={landed} owed_after={:?}",
-        owed.iter()
-            .map(|p| (c.chain_fate(halted, p.hash), credited_once(c, p)))
-            .collect::<Vec<_>>()
-    );
     assert!(
         landed,
         "a delivery whose window is open must land on the recovered shard and \
          credit once; owed = {:?}",
         owed.iter().map(|p| p.hash).collect::<Vec<_>>(),
     );
+
+    let stranded = probes
+        .iter()
+        .enumerate()
+        .filter(|(idx, p)| {
+            p.payer_shard == survivor
+                && matches!(
+                    fate_on(c, survivor, *idx, p.hash).1,
+                    Some((_, TransactionDecision::Accept))
+                )
+                && fate_on(c, halted, *idx, p.hash).0.is_none()
+        })
+        .count();
+    u128::try_from(stranded).expect("a handful of probes") * STRADDLER_PAYMENT
 }
 
 /// A staged shard freeze: the fault rules are installed and the shard has
@@ -930,6 +992,8 @@ pub fn inter_shard_partition_strands_ticks_until_it_heals(c: &mut impl Faultable
     );
 
     let cast = cross_shard_fault_cast();
+    let world = fault_family_world(c);
+    let mut charges = Charges::default();
 
     let left_before = c
         .committed_height(left)
@@ -941,22 +1005,21 @@ pub fn inter_shard_partition_strands_ticks_until_it_heals(c: &mut impl Faultable
         .inner();
 
     // A cross-shard transfer in flight as the cut lands.
-    let before = submit_crossing(c);
+    let before = submit_crossing(c, &mut charges);
 
     // Sever every inter-shard edge (both directions), intra-shard edges intact.
     c.partition(&left_hosts, &right_hosts);
 
     // A second cross-shard transfer submitted under the severance, sourced on
     // the far side so each shard pays for one stranded delivery.
-    let during = submit_crossing_between(c, &cast.right, (left, cast.left.1));
+    let during = submit_crossing_between(c, &mut charges, &cast.right, (left, cast.left.1));
 
     // A single-shard control per child, on accounts disjoint from the crossing
     // pair — these must settle purely intra-shard while the cross-shard
     // deliveries are stranded.
     for (index, (key, from, to)) in cast.controls.iter().enumerate() {
         let control = build_transfer_tx(key, *from, *to, 100, validity_around(c.now()));
-        let hash = control.hash();
-        c.submit(Arc::new(control));
+        let hash = charges.submit(c, control);
         let status = await_tx_terminal(c, hash, epochs(2));
         assert!(
             matches!(
@@ -1029,7 +1092,7 @@ pub fn inter_shard_partition_strands_ticks_until_it_heals(c: &mut impl Faultable
     );
 
     // A fresh cross-shard transfer settles normally on the healed network.
-    let fresh = submit_crossing(c);
+    let fresh = submit_crossing(c, &mut charges);
     let fresh_status = await_tx_terminal(c, fresh.hash, epochs(10));
     assert!(
         matches!(
@@ -1040,6 +1103,11 @@ pub fn inter_shard_partition_strands_ticks_until_it_heals(c: &mut impl Faultable
          status = {fresh_status:?}",
     );
     await_crossed(c, &fresh, "post-heal");
+
+    // Stranded, not lost: every delivery the cut held back landed on the
+    // heal, and the one transfer no shard ever included cost nobody
+    // anything.
+    world.assert_settles_within(c, &charges, epochs(8), "a severance and its heal");
 }
 
 /// The child that pays for `crossing`: the one it does not deliver to.
@@ -1247,17 +1315,30 @@ fn await_crossed<C: Cluster>(c: &mut C, crossing: &Crossing, context: &str) {
     );
 }
 
+/// Everything the cross-shard fault family's transfers can reach: the
+/// crossing pair and the controls' accounts, on both children.
+fn fault_family_world<C: Cluster>(c: &C) -> World {
+    let cast = cross_shard_fault_cast();
+    let mut holders = vec![cast.left.1.address(), cast.right.1.address()];
+    for (_, payer, recipient) in &cast.controls {
+        holders.push(payer.address());
+        holders.push(recipient.address());
+    }
+    World::open(c, *XRD, holders, [])
+}
+
 /// Submit the family's crossing: the left child's funded account pays the
 /// right child's.
-fn submit_crossing<C: Cluster>(c: &mut C) -> Crossing {
+fn submit_crossing<C: Cluster>(c: &mut C, charges: &mut Charges) -> Crossing {
     let cast = cross_shard_fault_cast();
     let (_, right) = ShardId::ROOT.children();
-    submit_crossing_between(c, &cast.left, (right, cast.right.1))
+    submit_crossing_between(c, charges, &cast.left, (right, cast.right.1))
 }
 
 /// Submit a crossing from `payer` into `recipient`'s account on its shard.
 fn submit_crossing_between<C: Cluster>(
     c: &mut C,
+    charges: &mut Charges,
     payer: &(Ed25519PrivateKey, PrincipalAddr),
     recipient: (ShardId, PrincipalAddr),
 ) -> Crossing {
@@ -1270,8 +1351,7 @@ fn submit_crossing_between<C: Cluster>(
         CROSSING_PAYMENT,
         validity_around(c.now()),
     );
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
     Crossing {
         hash,
         recipient_shard,
@@ -1307,8 +1387,10 @@ fn cross_shard_broadcast_drop(
     // runs as normal machinery in a grown cluster, not only as a fallback).
     let fetch_before = c.metric("fetch_items_sent", Some(fetch_kind));
     let dropped = c.drop_type(broadcast);
+    let world = fault_family_world(c);
+    let mut charges = Charges::default();
 
-    let crossing = submit_crossing(c);
+    let crossing = submit_crossing(c, &mut charges);
 
     let status = await_tx_terminal(c, crossing.hash, epochs(10));
     assert!(
@@ -1319,6 +1401,7 @@ fn cross_shard_broadcast_drop(
         "the cross-shard transfer must settle despite the dropped {broadcast}; status = {status:?}",
     );
     await_crossed(c, &crossing, broadcast);
+    world.assert_settles_within(c, &charges, epochs(8), broadcast);
     assert!(dropped.fired() >= 1, "the {broadcast} drop must fire");
     assert!(
         c.metric("fetch_items_sent", Some(fetch_kind)) > fetch_before,
@@ -1360,8 +1443,10 @@ pub fn cross_shard_exec_cert_drop_is_inert(c: &mut impl FaultableCluster) {
     split_lifecycle(c);
     let fetch_before = c.metric("fetch_items_sent", Some("exec_cert"));
     let _dropped = c.drop_type("execution.cert.batch");
+    let world = fault_family_world(c);
+    let mut charges = Charges::default();
 
-    let crossing = submit_crossing(c);
+    let crossing = submit_crossing(c, &mut charges);
 
     let status = await_tx_terminal(c, crossing.hash, epochs(10));
     assert!(
@@ -1372,6 +1457,7 @@ pub fn cross_shard_exec_cert_drop_is_inert(c: &mut impl FaultableCluster) {
         "the transfer must settle with execution.cert.batch dropped; status = {status:?}",
     );
     await_crossed(c, &crossing, "execution.cert.batch");
+    world.assert_settles_within(c, &charges, epochs(8), "execution.cert.batch");
     assert_eq!(
         c.metric("fetch_items_sent", Some("exec_cert")),
         fetch_before,
@@ -1402,8 +1488,10 @@ pub fn cross_shard_compound_drop_fetch_fallback(c: &mut impl FaultableCluster) {
     let exec_cert_before = c.metric("fetch_items_sent", Some("exec_cert"));
     let provisions_dropped = c.drop_type("provisions.broadcast");
     let _exec_cert_dropped = c.drop_type("execution.cert.batch");
+    let world = fault_family_world(c);
+    let mut charges = Charges::default();
 
-    let crossing = submit_crossing(c);
+    let crossing = submit_crossing(c, &mut charges);
 
     let status = await_tx_terminal(c, crossing.hash, epochs(12));
     assert!(
@@ -1414,6 +1502,7 @@ pub fn cross_shard_compound_drop_fetch_fallback(c: &mut impl FaultableCluster) {
         "the transfer must settle despite both channels dropped; status = {status:?}",
     );
     await_crossed(c, &crossing, "compound-drop");
+    world.assert_settles_within(c, &charges, epochs(8), "compound-drop");
     assert!(
         provisions_dropped.fired() >= 1,
         "the provisions.broadcast drop must fire",
@@ -1487,8 +1576,10 @@ pub fn cross_shard_provisions_fetch_with_request_loss(c: &mut impl FaultableClus
     let fetch_before = c.metric("fetch_items_sent", Some("provision"));
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let request_dropped = c.drop_type_with_probability("provision.request", 0.5);
+    let world = fault_family_world(c);
+    let mut charges = Charges::default();
 
-    let crossing = submit_crossing(c);
+    let crossing = submit_crossing(c, &mut charges);
 
     let status = await_tx_terminal(c, crossing.hash, epochs(12));
     assert!(
@@ -1499,6 +1590,7 @@ pub fn cross_shard_provisions_fetch_with_request_loss(c: &mut impl FaultableClus
         "the transfer must settle despite 50% provision.request loss; status = {status:?}",
     );
     await_crossed(c, &crossing, "request-loss");
+    world.assert_settles_within(c, &charges, epochs(8), "request-loss");
     assert!(
         broadcast_dropped.fired() >= 1,
         "the provisions.broadcast drop must fire",
@@ -1544,8 +1636,10 @@ pub fn cross_shard_provisions_recovers_after_transient_outage(c: &mut impl Fault
     let (payer_shard, _) = ShardId::ROOT.children();
     let fetch_before = c.metric("fetch_items_sent", Some("provision"));
     let dropped = c.drop_type("provisions.broadcast");
+    let world = fault_family_world(c);
+    let mut charges = Charges::default();
 
-    let crossing = submit_crossing(c);
+    let crossing = submit_crossing(c, &mut charges);
 
     // Let the outage bite the crossing bundle: the payer's chain finalizes
     // the transfer and the bundle its finalizing block sends is dropped
@@ -1573,6 +1667,7 @@ pub fn cross_shard_provisions_recovers_after_transient_outage(c: &mut impl Fault
          outage; status = {status:?}",
     );
     await_crossed(c, &crossing, "transient-outage");
+    world.assert_settles_within(c, &charges, epochs(8), "transient-outage");
     assert!(
         c.metric("fetch_items_sent", Some("provision")) > fetch_before,
         "the provision fetch fallback must bridge the outage (before={fetch_before})",

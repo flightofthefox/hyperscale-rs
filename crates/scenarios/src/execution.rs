@@ -30,8 +30,9 @@ use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_types::{NULLIFIER_GRACE_MS, SEAL_MATURITY_EPOCHS};
 
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
+use crate::support::conservation::{Charges, World};
 use crate::support::faultable::FaultableCluster;
-use crate::support::query::{beacon_epoch, vault_balance};
+use crate::support::query::{beacon_epoch, declared_price, vault_balance};
 use crate::support::tx::{
     GENESIS_POOL_ID, OVERDRAW_AMOUNT, account_shard, build_close_tx, build_composed_tx,
     build_draw_tx, build_instance_instantiate_tx, build_instantiate_tx, build_publish_tx,
@@ -78,6 +79,13 @@ pub fn nullifier_race_admits_exactly_one(c: &mut impl Cluster) {
         vault_balance(c, shard, second),
         vault_balance(c, shard, requester),
     ];
+    let world = World::open(
+        c,
+        *XRD,
+        [first.address(), second.address(), requester.address()],
+        [],
+    );
+    let mut charges = Charges::default();
 
     let request = payment_request(requester, REQUEST);
     let window = validity_around(c.now());
@@ -85,12 +93,8 @@ pub fn nullifier_race_admits_exactly_one(c: &mut impl Cluster) {
     let mut prices = Vec::new();
     for (composer, from) in [(&first_key, first), (&second_key, second)] {
         let tx = build_composed_tx(composer, from, &requester_key, &request, REQUEST, window);
-        prices.push(
-            tx.price_under(c.derivation().as_ref())
-                .expect("a scenario transaction derives"),
-        );
-        hashes.push(tx.hash());
-        c.submit(Arc::new(tx));
+        prices.push(declared_price(c, &tx));
+        hashes.push(charges.submit(c, tx));
     }
 
     let verdicts: Vec<Option<TransactionStatus>> = hashes
@@ -144,6 +148,7 @@ pub fn nullifier_race_admits_exactly_one(c: &mut impl Cluster) {
         loser_spent, prices[0],
         "a lost race settles the declared price, not the ceiling"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a nullifier race");
 }
 
 /// Submit one transfer between genesis-funded accounts and assert
@@ -161,9 +166,10 @@ pub fn single_transfer(c: &mut impl Cluster) {
     let (payer, from) = sender(0);
     let to = recipient(0);
     let before = c.committed_state_root(ShardId::ROOT);
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
     let transfer = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
-    let hash = transfer.hash();
-    c.submit(Arc::new(transfer));
+    let hash = charges.submit(c, transfer);
 
     let status = await_tx_terminal(c, hash, epochs(8));
     assert!(
@@ -173,6 +179,7 @@ pub fn single_transfer(c: &mut impl Cluster) {
         ),
         "VM transfer did not accept within budget; status = {status:?}"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a transfer");
     assert!(
         await_height(c, ShardId::ROOT, 1, epochs(2)),
         "root shard did not advance past genesis"
@@ -206,9 +213,10 @@ pub fn abort_converges(c: &mut impl Cluster) {
     let (payer, from) = sender(0);
     let to = recipient(0);
 
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
     let over = build_transfer_tx(&payer, from, to, 1_000_000, validity_around(c.now()));
-    let over_hash = over.hash();
-    c.submit(Arc::new(over));
+    let over_hash = charges.submit(c, over);
     let status = await_tx_terminal(c, over_hash, epochs(8));
     assert!(
         matches!(
@@ -219,8 +227,7 @@ pub fn abort_converges(c: &mut impl Cluster) {
     );
 
     let fine = build_transfer_tx(&payer, from, to, 50, validity_around(c.now()));
-    let fine_hash = fine.hash();
-    c.submit(Arc::new(fine));
+    let fine_hash = charges.submit(c, fine);
     let status = await_tx_terminal(c, fine_hash, epochs(8));
     assert!(
         matches!(
@@ -229,6 +236,7 @@ pub fn abort_converges(c: &mut impl Cluster) {
         ),
         "a covered VM transfer must accept after an abort; status = {status:?}"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "an abort and the transfer after it");
 }
 
 /// A dependent transfer reads its own block's attested baseline.
@@ -251,11 +259,18 @@ pub fn reads_the_committed_baseline(c: &mut impl Cluster) {
     let (bob_key, bob) = sender(1);
     let carol = recipient(0);
 
+    let world = World::open(
+        c,
+        *XRD,
+        [alice.address(), bob.address(), carol.address()],
+        [],
+    );
+    let mut charges = Charges::default();
+
     // Bob holds 10_000 at genesis; after Alice's 5_000 deposit he can
     // cover 12_000.
     let first = build_transfer_tx(&alice_key, alice, bob, 5_000, validity_around(c.now()));
-    let first_hash = first.hash();
-    c.submit(Arc::new(first));
+    let first_hash = charges.submit(c, first);
     let status = await_tx_terminal(c, first_hash, epochs(10));
     assert!(
         matches!(
@@ -266,8 +281,7 @@ pub fn reads_the_committed_baseline(c: &mut impl Cluster) {
     );
 
     let second = build_transfer_tx(&bob_key, bob, carol, 12_000, validity_around(c.now()));
-    let second_hash = second.hash();
-    c.submit(Arc::new(second));
+    let second_hash = charges.submit(c, second);
     let status = await_tx_terminal(c, second_hash, epochs(10));
     assert!(
         matches!(
@@ -288,6 +302,12 @@ pub fn reads_the_committed_baseline(c: &mut impl Cluster) {
         "the dependent transfer must commit after its funding \
          ({second_committed:?} vs {first_committed:?})"
     );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "a funded transfer and its dependent",
+    );
 }
 
 /// Zipf-skewed VM payments: `senders` transfers into `recipients` payees
@@ -305,6 +325,15 @@ pub fn zipf_payments(
 ) -> ContentionReport {
     let cdf = zipf_cdf(recipients as usize, skew);
     let mut rng = Lcg(0x5eed_c0de ^ u64::from(senders) << 8 ^ u64::from(recipients));
+    let world = World::open(
+        c,
+        *XRD,
+        (0..senders)
+            .map(|index| sender(index).1.address())
+            .chain((0..recipients).map(|rank| recipient(rank).address())),
+        [],
+    );
+    let mut charges = Charges::default();
     let mut submissions = Vec::with_capacity(senders as usize);
     for index in 0..senders {
         let (payer, from) = sender(index);
@@ -313,9 +342,11 @@ pub fn zipf_payments(
         let to = recipient(u8::try_from(rank).expect("recipient rank fits"));
         let tx = build_transfer_tx(&payer, from, to, PAYMENT, validity_around(c.now()));
         submissions.push((tx.hash(), c.now()));
-        c.submit(Arc::new(tx));
+        charges.submit(c, tx);
     }
-    settle_and_report(c, &submissions, epochs(10))
+    let report = settle_and_report(c, &submissions, epochs(10));
+    world.assert_settles_within(c, &charges, epochs(4), "Zipf-skewed payments");
+    report
 }
 
 /// One hot VM recipient, composed rather than serialized.
@@ -337,12 +368,21 @@ pub fn zipf_payments(
 pub fn hot_recipient(c: &mut impl Cluster, senders: u8) -> (ContentionReport, u64) {
     let hot = recipient(0);
     let before = vault_balance(c, ShardId::ROOT, hot);
+    let world = World::open(
+        c,
+        *XRD,
+        (0..senders)
+            .map(|index| sender(index).1.address())
+            .chain([hot.address()]),
+        [],
+    );
+    let mut charges = Charges::default();
     let mut submissions = Vec::with_capacity(senders as usize);
     for index in 0..senders {
         let (payer, from) = sender(index);
         let tx = build_transfer_tx(&payer, from, hot, PAYMENT, validity_around(c.now()));
         submissions.push((tx.hash(), c.now()));
-        c.submit(Arc::new(tx));
+        charges.submit(c, tx);
     }
     let report = settle_and_report(c, &submissions, epochs(16));
 
@@ -366,6 +406,7 @@ pub fn hot_recipient(c: &mut impl Cluster, senders: u8) -> (ContentionReport, u6
         settled * PAYMENT,
         "the hot vault must hold every accepted payment: {settled} settled",
     );
+    world.assert_settles_within(c, &charges, epochs(4), "payments into one hot vault");
     (report, span)
 }
 
@@ -387,9 +428,10 @@ pub fn hot_recipient(c: &mut impl Cluster, senders: u8) -> (ContentionReport, u6
 /// shard's chain never commits it.
 pub fn cross_shard_transfer(c: &mut impl Cluster) {
     let (payer, from, to) = cross_shard_cast();
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
 
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
@@ -417,6 +459,7 @@ pub fn cross_shard_transfer(c: &mut impl Cluster) {
         c.chain_fate(recipient_shard, hash).0,
         vault_balance(c, recipient_shard, to),
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a cross-shard transfer");
 }
 
 /// A payer cannot spend one balance twice across two ticks.
@@ -455,6 +498,13 @@ pub fn a_payer_cannot_spend_one_balance_twice(c: &mut impl Cluster) {
         "the pair has to be jointly uncoverable to measure anything: \
          holding {payer_before}",
     );
+    let world = World::open(
+        c,
+        *XRD,
+        [from.address(), first_to.address(), second_to.address()],
+        [],
+    );
+    let mut charges = Charges::default();
 
     let first = build_transfer_tx(
         &payer,
@@ -463,8 +513,7 @@ pub fn a_payer_cannot_spend_one_balance_twice(c: &mut impl Cluster) {
         OVERDRAW_AMOUNT,
         validity_around(c.now()),
     );
-    let first_hash = first.hash();
-    c.submit(Arc::new(first));
+    let first_hash = charges.submit(c, first);
     assert!(
         c.run_until(epochs(16), |c| c
             .chain_fate(payer_shard, first_hash)
@@ -480,8 +529,7 @@ pub fn a_payer_cannot_spend_one_balance_twice(c: &mut impl Cluster) {
         OVERDRAW_AMOUNT,
         validity_around(c.now()),
     );
-    let second_hash = second.hash();
-    c.submit(Arc::new(second));
+    let second_hash = charges.submit(c, second);
 
     let verdicts: Vec<Option<TransactionStatus>> = [first_hash, second_hash]
         .iter()
@@ -501,16 +549,18 @@ pub fn a_payer_cannot_spend_one_balance_twice(c: &mut impl Cluster) {
         "only one withdrawal is covered, so only one may pass; verdicts = {verdicts:?}"
     );
 
-    // Both settlements have to persist before either vault is read.
-    c.run_until(epochs(4), |_| false);
+    // Both settlements have to persist before either vault is read: the
+    // payer gave up one payment and two prices, and the recipients banked
+    // one payment between them — a refused withdrawal credited nobody.
+    world.assert_settles_within(c, &charges, epochs(8), "two withdrawals over one balance");
     let paid = payer_before.saturating_sub(vault_balance(c, payer_shard, from));
     let banked = (vault_balance(c, recipient_shard, first_to)
         + vault_balance(c, recipient_shard, second_to))
     .saturating_sub(banked_before);
-    assert!(
-        paid >= banked,
+    assert_eq!(
+        banked, OVERDRAW_AMOUNT,
         "the payer gave up {paid} out of {payer_before} and the recipients \
-         banked {banked}: a refused withdrawal still credited its recipient"
+         banked {banked}: exactly one withdrawal was covered"
     );
 }
 
@@ -542,6 +592,13 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
     let recipient_shard = ShardId::leaf(1, 1);
     let (remote_payer, remote_from, local_payer, local_from, to) = shared_recipient_cast();
     let before = vault_balance(c, recipient_shard, to);
+    let world = World::open(
+        c,
+        *XRD,
+        [remote_from.address(), local_from.address(), to.address()],
+        [],
+    );
+    let mut charges = Charges::default();
 
     let crossing = build_transfer_tx(
         &remote_payer,
@@ -550,8 +607,7 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
         CROSSING,
         validity_around(c.now()),
     );
-    let crossing_hash = crossing.hash();
-    c.submit(Arc::new(crossing));
+    let crossing_hash = charges.submit(c, crossing);
 
     // The recipient's shard has the leg in a tick from the moment it
     // commits it; the tick cannot settle for several blocks yet, so the
@@ -572,8 +628,7 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
         LOCAL,
         validity_around(c.now()),
     );
-    let local_hash = local.hash();
-    c.submit(Arc::new(local));
+    let local_hash = charges.submit(c, local);
 
     for (hash, label) in [(crossing_hash, "crossing"), (local_hash, "local payment")] {
         let status = await_tx_terminal(c, hash, epochs(16));
@@ -598,6 +653,12 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
         "the shared vault must hold both credits: expected {expected}, holding {}",
         vault_balance(c, recipient_shard, to)
     );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "a crossing and a later local credit",
+    );
 }
 
 /// A multi-shard transaction's events land only on their emitters' home
@@ -616,9 +677,10 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
 /// on the other.
 pub fn events_land_on_their_emitters_home_shard(c: &mut impl Cluster) {
     let (payer, from, to) = cross_shard_cast();
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
 
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
@@ -654,6 +716,7 @@ pub fn events_land_on_their_emitters_home_shard(c: &mut impl Cluster) {
         vec![to],
         "the recipient shard stores its own emission and nothing else"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a transfer whose events split");
 }
 
 /// Both shards' attested load reaches the beacon, including the
@@ -684,9 +747,10 @@ pub fn attested_load_reaches_the_beacon(c: &mut impl Cluster) {
     let right = ShardId::leaf(1, 1);
 
     let (payer, from, to) = cross_shard_cast();
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
         matches!(
@@ -695,6 +759,7 @@ pub fn attested_load_reaches_the_beacon(c: &mut impl Cluster) {
         ),
         "cross-shard VM transfer did not accept; status = {status:?}"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a transfer whose load is attested");
 
     // Wait for both shards to fold a crossing carrying a non-zero mark.
     let both_attested = |c: &_| {
@@ -761,10 +826,11 @@ pub fn a_failed_attempt_still_attests_work(c: &mut impl Cluster) {
         "the beacon never folded a crossing for the shard"
     );
     let before = recorded_gas(c, shard).expect("a folded crossing");
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
 
     let over = build_transfer_tx(&payer, from, to, 1_000_000, validity_around(c.now()));
-    let over_hash = over.hash();
-    c.submit(Arc::new(over));
+    let over_hash = charges.submit(c, over);
     let status = await_tx_terminal(c, over_hash, epochs(8));
     assert!(
         matches!(
@@ -773,6 +839,7 @@ pub fn a_failed_attempt_still_attests_work(c: &mut impl Cluster) {
         ),
         "an uncovered VM withdrawal must reject deterministically; status = {status:?}"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a failed attempt");
 
     // The attempt applied nothing and still attests work: a failed
     // verdict produces no receipt, so the attestation must ride the
@@ -1023,9 +1090,10 @@ pub fn sealed_rounds_settle_on_the_seed_they_committed_to<C: Cluster>(c: &mut C)
 /// shard's chain ever includes it.
 pub fn insolvent_payer_engages_nothing(c: &mut impl Cluster) {
     let (payer, from, to) = cross_shard_cast();
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer, from, to, 5, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
 
     // Both chains keep advancing while the transaction goes nowhere.
     assert!(
@@ -1051,6 +1119,7 @@ pub fn insolvent_payer_engages_nothing(c: &mut impl Cluster) {
         counterpart_inclusion.is_none(),
         "the counterpart must not engage an insolvent payer's transaction"
     );
+    world.assert_settled(c, charges.burned(c), "an insolvent payer's transaction");
 }
 
 /// A payer whose rule does not admit the signer engages nothing
@@ -1072,9 +1141,15 @@ pub fn insolvent_payer_engages_nothing(c: &mut impl Cluster) {
 /// shard's chain ever includes it.
 pub fn unbound_payer_engages_nothing(c: &mut impl Cluster) {
     let (signer, from, to, victim) = unbound_payer_cast();
+    let world = World::open(
+        c,
+        *XRD,
+        [from.address(), to.address(), victim.address()],
+        [],
+    );
+    let mut charges = Charges::default();
     let tx = build_unbound_payer_tx(&signer, from, to, victim, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
 
     // Both chains keep advancing while the transaction goes nowhere.
     assert!(
@@ -1100,6 +1175,8 @@ pub fn unbound_payer_engages_nothing(c: &mut impl Cluster) {
         counterpart_inclusion.is_none(),
         "the counterpart must not engage an unbound payer's transaction"
     );
+    // Nothing moved, the named account's vault included.
+    world.assert_settled(c, charges.burned(c), "an unbound payer's transaction");
 }
 
 /// The same refusal when the payer's shard holds nothing else of the
@@ -1119,9 +1196,15 @@ pub fn unbound_payer_engages_nothing(c: &mut impl Cluster) {
 /// shard's chain ever includes it.
 pub fn unbound_remote_payer_engages_nothing(c: &mut impl Cluster) {
     let (signer, from, to, victim) = unbound_remote_payer_cast();
+    let world = World::open(
+        c,
+        *XRD,
+        [from.address(), to.address(), victim.address()],
+        [],
+    );
+    let mut charges = Charges::default();
     let tx = build_unbound_payer_tx(&signer, from, to, victim, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
 
     // Both chains keep advancing while the transaction goes nowhere.
     assert!(
@@ -1146,6 +1229,12 @@ pub fn unbound_remote_payer_engages_nothing(c: &mut impl Cluster) {
     assert!(
         manifest_inclusion.is_none(),
         "the manifest shard must not engage without the payer's reservation"
+    );
+    // Nothing moved, the remote victim's vault included.
+    world.assert_settled(
+        c,
+        charges.burned(c),
+        "an unbound remote payer's transaction",
     );
 }
 
@@ -1186,11 +1275,13 @@ pub fn securify_retires_the_key_at_the_payer_shard(c: &mut impl Cluster) {
         "the identity this account migrates to must be post-quantum"
     );
 
+    let world = World::open(c, *XRD, [owner.address(), to.address()], []);
+    let mut charges = Charges::default();
+
     // Baseline: the founding key pays for its own account and settles
     // cross-shard.
     let tx = build_transfer_tx(&owner_key, owner, to, 100, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
         matches!(
@@ -1203,8 +1294,7 @@ pub fn securify_retires_the_key_at_the_payer_shard(c: &mut impl Cluster) {
     // The one-way transition: the account's stored rule becomes the
     // holder's identity.
     let tx = build_securify_tx(&owner_key, owner, holder, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
         matches!(
@@ -1218,8 +1308,7 @@ pub fn securify_retires_the_key_at_the_payer_shard(c: &mut impl Cluster) {
     // identity is exactly what the stored rule no longer admits: no
     // proposer selects its transfer, and it never commits anywhere.
     let tx = build_transfer_tx(&owner_key, owner, to, 7, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
     let payer_height = c
         .committed_height(payer_shard)
         .map_or(0, BlockHeight::inner);
@@ -1246,8 +1335,7 @@ pub fn securify_retires_the_key_at_the_payer_shard(c: &mut impl Cluster) {
     // The installed rule's key signs in as the account it governs and
     // pays from it, from another shard's identity entirely.
     let tx = build_transfer_paid_by(&holder_key, owner, to, 9, owner, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
         matches!(
@@ -1266,6 +1354,12 @@ pub fn securify_retires_the_key_at_the_payer_shard(c: &mut impl Cluster) {
             == 10 + 100 + 9),
         "the recipient's balance must carry the settled transfers alone; balance = {}",
         vault_balance(c, counterpart, to)
+    );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "a securify and the transfers around it",
     );
 }
 
@@ -1304,9 +1398,10 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
         "genesis must seed a post-quantum address like any other"
     );
 
+    let world = World::open(c, *XRD, [payer.address(), to.address()], []);
+    let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer_key, payer, to, 100, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
         matches!(
@@ -1333,6 +1428,7 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
         remaining < 10_000 - 100,
         "the payer must have settled a fee beyond the transfer; balance = {remaining}"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a post-quantum account's transfer");
 }
 
 /// A leg whose core never engages refuses at the deadline.
@@ -1370,6 +1466,10 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
         "the delegator has to sit off the pool's shard for its stake to be a leg",
     );
     let before = vault_balance(c, payer_shard, payer);
+    // The delegator and the pool: the stake never leaves the one, and
+    // the other never sees it.
+    let world = World::open(c, *XRD, [payer.address(), pool.address()], []);
+    let mut charges = Charges::default();
 
     // Both channels the bundle travels. The fetch rule names the
     // *request* type: the fault engine tags a request and its response
@@ -1378,11 +1478,8 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
     let fetch_dropped = c.drop_type("provision.request");
 
     let tx = build_stake_tx(&payer_key, payer, pool, STAKE, validity_around(c.now()));
-    let hash = tx.hash();
-    let price = tx
-        .price_under(c.derivation().as_ref())
-        .expect("a scenario transaction derives");
-    c.submit(Arc::new(tx));
+    let price = declared_price(c, &tx);
+    let hash = charges.submit(c, tx);
 
     assert!(
         c.run_until(epochs(8), |c| c.chain_fate(payer_shard, hash).0.is_some()),
@@ -1444,6 +1541,7 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
         "the refusal must charge exactly the declared price: \
          before = {before}, after = {after}, price = {price}",
     );
+    world.assert_settled(c, charges.burned(c), "a leg refused at its deadline");
 }
 
 /// What the deadline scenario stakes: well under its funding, so the
@@ -1475,12 +1573,11 @@ pub fn failure_charges_its_payer(c: &mut impl Cluster) {
     let to = recipient(0);
 
     let before = vault_balance(c, shard, from);
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
     let over = build_transfer_tx(&payer, from, to, 1_000_000, validity_around(c.now()));
-    let price = over
-        .price_under(c.derivation().as_ref())
-        .expect("a scenario transaction derives");
-    let over_hash = over.hash();
-    c.submit(Arc::new(over));
+    let price = declared_price(c, &over);
+    let over_hash = charges.submit(c, over);
     let status = await_tx_terminal(c, over_hash, epochs(8));
     assert!(
         matches!(
@@ -1500,8 +1597,7 @@ pub fn failure_charges_its_payer(c: &mut impl Cluster) {
 
     // The charge is the only thing that moved: the payer can still spend.
     let fine = build_transfer_tx(&payer, from, to, 50, validity_around(c.now()));
-    let fine_hash = fine.hash();
-    c.submit(Arc::new(fine));
+    let fine_hash = charges.submit(c, fine);
     let status = await_tx_terminal(c, fine_hash, epochs(8));
     assert!(
         matches!(
@@ -1510,6 +1606,7 @@ pub fn failure_charges_its_payer(c: &mut impl Cluster) {
         ),
         "a covered VM transfer must accept after a charged failure; status = {status:?}"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a charged failure and a transfer");
 }
 
 /// Many withdrawals in one validity window, all drawing on one vault.
@@ -1537,8 +1634,9 @@ pub fn withdrawals_compose_over_one_vault(c: &mut impl Cluster, count: u8) -> u6
     let shard = ShardId::ROOT;
     let (payer, from) = sender(0);
     let to = recipient(0);
-    let payer_before = vault_balance(c, shard, from);
     let recipient_before = vault_balance(c, shard, to);
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
 
     let amount_for = |index: u8| -> u128 { 1 + u128::from(index) };
     let mut submissions = Vec::with_capacity(count as usize);
@@ -1551,7 +1649,7 @@ pub fn withdrawals_compose_over_one_vault(c: &mut impl Cluster, count: u8) -> u6
             validity_around(c.now()),
         );
         submissions.push((tx.hash(), c.now()));
-        c.submit(Arc::new(tx));
+        charges.submit(c, tx);
     }
     settle_and_report(c, &submissions, epochs(16));
 
@@ -1562,10 +1660,12 @@ pub fn withdrawals_compose_over_one_vault(c: &mut impl Cluster, count: u8) -> u6
         "the recipient must hold every withdrawal — a shared baseline would \
          leave only the last one",
     );
-    let spent = payer_before - vault_balance(c, shard, from);
-    assert!(
-        spent >= moved,
-        "the payer settled every withdrawal it moved: spent = {spent}, moved = {moved}",
+    // The payer settled every withdrawal it moved, and one price each.
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "withdrawals composed over one vault",
     );
 
     // How tightly the set packed. One block per withdrawal is the
@@ -1631,6 +1731,8 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
         expiry_ms,
     );
 
+    let world = World::open(c, *XRD, [composer.address(), requester.address()], []);
+    let mut charges = Charges::default();
     let tx = build_composed_tx(
         &composer_key,
         composer,
@@ -1639,8 +1741,7 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
         REQUEST,
         window,
     );
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
     assert!(
         matches!(
             await_tx_terminal(c, hash, epochs(4)),
@@ -1648,6 +1749,7 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
         ),
         "the composition fills the request"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a filled request");
     assert!(
         c.substate(shard, nullifier.owner, nullifier.local.0)
             .is_some(),
@@ -1793,7 +1895,9 @@ pub fn preview_reports_resource_changes(c: &mut impl Cluster) {
     );
 
     // The same envelope for real: the report was the truth about it.
-    c.submit(Arc::new(candidate));
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
+    charges.submit(c, candidate);
     let status = await_tx_terminal(c, hash, epochs(8));
     assert!(
         matches!(
@@ -1812,6 +1916,7 @@ pub fn preview_reports_resource_changes(c: &mut impl Cluster) {
         recipient.after,
         "the commit landed on the figure the preview named for the recipient"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a previewed transfer");
 }
 
 /// A published package runs only once the chain says it may — and when
@@ -1857,9 +1962,10 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     let registered = Hash::from(package.0);
     let cell = package_key(*publisher, package);
 
+    let world = World::open(c, *XRD, [publisher.address()], []);
+    let mut charges = Charges::default();
     let publish = build_publish_tx(key, artifact.clone(), validity_around(c.now()));
-    let publish_hash = publish.hash();
-    c.submit(Arc::new(publish));
+    let publish_hash = charges.submit(c, publish);
     let status = await_tx_terminal(c, publish_hash, epochs(24));
     assert!(
         matches!(
@@ -1882,8 +1988,7 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     // not list it.
     let unregistered =
         build_instance_instantiate_tx(key, &artifact, UNREGISTERED_SALT, validity_around(c.now()));
-    let unregistered_hash = unregistered.hash();
-    c.submit(Arc::new(unregistered));
+    let unregistered_hash = charges.submit(c, unregistered);
     c.run_until(epochs(8), |c| {
         c.tx_status(unregistered_hash).is_some_and(|s| s.is_final())
             || c.beacon_state()
@@ -1907,8 +2012,7 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     // the whole of the guarantee, since a transaction committed here
     // could be handed to a node whose fetch had not landed.
     let early = build_instance_instantiate_tx(key, &artifact, EARLY_SALT, validity_around(c.now()));
-    let early_hash = early.hash();
-    c.submit(Arc::new(early));
+    let early_hash = charges.submit(c, early);
     c.run_until(epochs(8), |c| {
         c.tx_status(early_hash).is_some_and(|s| s.is_final())
             || c.beacon_state().is_some_and(|state| {
@@ -1928,8 +2032,7 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     // the code reached the nodes that never committed the publish —
     // every shard the transaction touches runs the whole of it.
     let late = build_instance_instantiate_tx(key, &artifact, LATE_SALT, validity_around(c.now()));
-    let late_hash = late.hash();
-    c.submit(Arc::new(late));
+    let late_hash = charges.submit(c, late);
     let status = await_tx_terminal(c, late_hash, epochs(24));
     assert!(
         matches!(
@@ -1937,6 +2040,12 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
             Some(TransactionStatus::Completed(TransactionDecision::Accept))
         ),
         "a matured package's call did not settle; status = {status:?}"
+    );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "a publish and the calls that waited on it",
     );
 }
 
@@ -1971,6 +2080,13 @@ pub fn deploy_storm_rides_out(c: &mut impl Cluster) {
         .collect();
 
     let validity = validity_around(c.now());
+    let world = World::open(
+        c,
+        *XRD,
+        publishers.iter().map(|(_, publisher)| publisher.address()),
+        [],
+    );
+    let mut charges = Charges::default();
     let mut submitted: Vec<(TxHash, ShardId)> = Vec::new();
     let mut cells: Vec<(ShardId, Address, [u8; 16])> = Vec::new();
     for (index, (key, publisher)) in (0u16..).zip(publishers.iter()) {
@@ -1981,9 +2097,8 @@ pub fn deploy_storm_rides_out(c: &mut impl Cluster) {
             let cell = package_key(*publisher, package_hash(&ProtocolHasher, &artifact));
             let tx = build_publish_tx(key, artifact, validity);
             let shard = shards[usize::from(index)];
-            submitted.push((tx.hash(), shard));
             cells.push((shard, cell.owner, cell.local.0));
-            c.submit(Arc::new(tx));
+            submitted.push((charges.submit(c, tx), shard));
         }
     }
     assert_eq!(
@@ -2035,4 +2150,5 @@ pub fn deploy_storm_rides_out(c: &mut impl Cluster) {
             "{shard:?} did not advance through the storm: {height:?} -> {after:?}"
         );
     }
+    world.assert_settles_within(c, &charges, epochs(4), "a deploy storm");
 }

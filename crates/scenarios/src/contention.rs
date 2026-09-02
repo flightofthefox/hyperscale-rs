@@ -10,12 +10,13 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_engine::XRD;
 use hyperscale_types::{PrincipalAddr, ShardId, TransactionDecision, TransactionStatus, TxHash};
 
 use crate::reshape::split_lifecycle;
+use crate::support::conservation::{Charges, World};
 use crate::support::tx::{
     accounts_routing_to, build_fan_out_tx, build_transfer_tx, participant_sweep_accounts,
     validity_around,
@@ -174,11 +175,22 @@ pub fn cross_shard_fraction(
     let local_recipients = accounts_routing_to(left, 2, total, &mut taken);
     let cross_recipients = accounts_routing_to(right, 2, total, &mut taken);
 
-    let recipients = cross_recipients
+    let recipients: Vec<PrincipalAddr> = cross_recipients
         .iter()
         .take(cross_count)
         .chain(local_recipients.iter().take(total - cross_count))
-        .map(|(_, account)| *account);
+        .map(|(_, account)| *account)
+        .collect();
+    let world = World::open(
+        c,
+        *XRD,
+        senders
+            .iter()
+            .map(|(_, account)| account.address())
+            .chain(recipients.iter().map(|account| account.address())),
+        [],
+    );
+    let mut charges = Charges::default();
     let mut submissions = Vec::with_capacity(total);
     for ((payer, from), to) in senders.iter().zip(recipients) {
         let tx = build_transfer_tx(
@@ -189,9 +201,11 @@ pub fn cross_shard_fraction(
             validity_around(c.now()),
         );
         submissions.push((tx.hash(), c.now()));
-        c.submit(Arc::new(tx));
+        charges.submit(c, tx);
     }
-    settle_and_report(c, &submissions, epochs(12))
+    let report = settle_and_report(c, &submissions, epochs(12));
+    world.assert_settles_within(c, &charges, epochs(8), "a cross-shard mix of payments");
+    report
 }
 
 /// Cross-shard fan-outs at `2..=max_participants` participating shards.
@@ -221,6 +235,13 @@ pub fn participant_count_sweep(
     // the first leaf, then one payee per leaf in leaf order.
     let accounts = participant_sweep_accounts(num_shards);
     let (payer, from) = (&accounts[0].0, accounts[0].1);
+    let world = World::open(
+        c,
+        *XRD,
+        accounts.iter().map(|(_, account)| account.address()),
+        [],
+    );
+    let mut charges = Charges::default();
 
     let mut latencies = Vec::new();
     for participants in 2..=max_participants {
@@ -235,9 +256,10 @@ pub fn participant_count_sweep(
             validity_around(c.now()),
         );
         let submissions = [(tx.hash(), c.now())];
-        c.submit(Arc::new(tx));
+        charges.submit(c, tx);
         let report = settle_and_report(c, &submissions, epochs(10));
         latencies.push((participants, report.latency_p50));
     }
+    world.assert_settles_within(c, &charges, epochs(8), "a sweep of fan-outs");
     latencies
 }

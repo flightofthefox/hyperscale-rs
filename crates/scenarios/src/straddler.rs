@@ -9,12 +9,14 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
+use hyperscale_engine::XRD;
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, Epoch, PrincipalAddr, ShardId, TransactionDecision,
     TransactionStatus, TxHash,
 };
 
 use crate::reshape::split_lifecycle;
+use crate::support::conservation::{Charges, World};
 use crate::support::query::{
     anchored_genesis_height, beacon_epoch, committee_size, split_admitted, vault_balance,
 };
@@ -105,8 +107,9 @@ fn straddler_split_bytes() -> u64 {
 /// Panics if the grow or split misses its budget, or the settled-transaction fence is
 /// breached (a one-sided application, a mismatch, or a hung straddler).
 pub fn split_straddler_atomic(c: &mut impl Cluster) {
-    let (probes, splitter, terminal_b) = split_straddler_run(c, |_| {});
-    assert_fence_held(c, splitter, terminal_b, &probes);
+    let run = split_straddler_run(c, |_| {});
+    assert_fence_held(c, run.splitter, run.terminal_b, &run.probes);
+    run.assert_conserved(c);
 }
 
 /// Verify a split straddler settles atomically when the terminating splitter is
@@ -129,14 +132,15 @@ pub fn split_straddler_atomic(c: &mut impl Cluster) {
 /// Panics if the choreography misses its budget or any straddler resolves
 /// one-sided (the survivor applies one the splitter never settled).
 pub fn split_straddler_ec_partition_atomic(c: &mut impl FaultableCluster) {
-    let (probes, splitter, terminal_b) = split_straddler_run(c, |c| {
+    let run = split_straddler_run(c, |c| {
         let _ = isolate_ec_intake(c, STRADDLER_SPLITTER, STRADDLER_SURVIVOR);
     });
-    let one_sided = straddler_one_sided_count(c, splitter, terminal_b, &probes);
+    let one_sided = straddler_one_sided_count(c, run.splitter, run.terminal_b, &run.probes);
     assert_eq!(
         one_sided, 0,
         "the survivor applied {one_sided} straddler(s) one-sided the splitter never settled",
     );
+    run.assert_conserved(c);
 }
 
 /// Grow the root into the splitter/survivor pair and vote the reshape
@@ -184,6 +188,51 @@ pub fn arm_splitter_termination<C: Cluster>(c: &mut C) {
     );
 }
 
+/// What a straddler choreography leaves for its caller to judge: the
+/// probes, the shard that terminated and its terminal block, and the
+/// conservation ledger the run was opened over.
+pub struct StraddlerRun {
+    /// The probe hashes, in submission order.
+    pub probes: Vec<TxHash>,
+    /// The shard that terminated.
+    pub splitter: ShardId,
+    /// Its terminal block height.
+    pub terminal_b: BlockHeight,
+    world: World,
+    charges: Charges,
+}
+
+impl StraddlerRun {
+    /// Assert every straddler's payer and recipient hold between them what
+    /// they started with, less the prices: a straddler the fence abandoned
+    /// moved nothing and still paid, and one it settled moved its payment
+    /// exactly once.
+    pub fn assert_conserved<C: Cluster>(&self, c: &mut C) {
+        self.world.assert_settles_within(
+            c,
+            &self.charges,
+            epochs(8),
+            "straddlers across a terminal",
+        );
+    }
+}
+
+/// Everything a setup's straddlers can reach: each leg's payer and
+/// recipient. The ballast holds the byte skew and never spends.
+fn straddler_world<C: Cluster>(
+    c: &C,
+    straddlers: &[(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)],
+) -> World {
+    World::open(
+        c,
+        *XRD,
+        straddlers
+            .iter()
+            .flat_map(|(_, from, to)| [from.address(), to.address()]),
+        [],
+    )
+}
+
 /// The split-straddler choreography, minus the terminal assertion.
 ///
 /// Grows, votes the threshold down, submits settling then straddling ticks,
@@ -201,13 +250,15 @@ pub fn arm_splitter_termination<C: Cluster>(c: &mut C) {
 pub fn split_straddler_run<C: Cluster>(
     c: &mut C,
     mut before_settling: impl FnMut(&mut C),
-) -> (Vec<TxHash>, ShardId, BlockHeight) {
+) -> StraddlerRun {
     let splitter = STRADDLER_SPLITTER;
     let (child_left, child_right) = splitter.children();
     let setup = split_straddler_setup();
 
     arm_splitter_termination(c);
 
+    let world = straddler_world(c, &setup.straddlers);
+    let mut charges = Charges::default();
     let mut probes: Vec<TxHash> = Vec::new();
 
     // Fault-injection seam: committees are stable and the splitter is still
@@ -219,7 +270,7 @@ pub fn split_straddler_run<C: Cluster>(
     // it finalizes them before its terminal cut — they settle atomically.
     let half = setup.straddlers.len() / 2;
     for (key, from, to) in setup.straddlers.iter().take(half) {
-        probes.push(submit_straddler(c, key, *from, *to));
+        probes.push(submit_straddler(c, &mut charges, key, *from, *to));
     }
 
     // Advance until the gate drains the splitter from `pending_reshapes`: the
@@ -234,7 +285,7 @@ pub fn split_straddler_run<C: Cluster>(
     // still the active leaf, so the survivor provisions to it, but its empty
     // coast blocks settle nothing, leaving them in flight when it terminates.
     for (key, from, to) in setup.straddlers.iter().skip(half) {
-        probes.push(submit_straddler(c, key, *from, *to));
+        probes.push(submit_straddler(c, &mut charges, key, *from, *to));
     }
 
     // The split executes: both children seat and commit past genesis.
@@ -263,7 +314,13 @@ pub fn split_straddler_run<C: Cluster>(
         );
     }
 
-    (probes, splitter, terminal_b)
+    StraddlerRun {
+        probes,
+        splitter,
+        terminal_b,
+        world,
+        charges,
+    }
 }
 
 /// Submit the encumbered payer's second transaction beside an unencumbered
@@ -279,6 +336,7 @@ pub fn split_straddler_run<C: Cluster>(
 /// Panics if the control never commits or the encumbered probe does.
 fn assert_payer_is_blocked<C: FaultableCluster>(
     c: &mut C,
+    charges: &mut Charges,
     splitter: ShardId,
     setup: &SplitStraddlerSetup,
 ) {
@@ -290,8 +348,7 @@ fn assert_payer_is_blocked<C: FaultableCluster>(
         STRADDLER_PAYMENT,
         validity_around(c.now()),
     );
-    let blocked_hash = blocked.hash();
-    c.submit(Arc::new(blocked));
+    let blocked_hash = charges.submit(c, blocked);
 
     let (control_key, control_payer) = &setup.control;
     let control = build_transfer_tx(
@@ -301,8 +358,7 @@ fn assert_payer_is_blocked<C: FaultableCluster>(
         STRADDLER_PAYMENT,
         validity_around(c.now()),
     );
-    let control_hash = control.hash();
-    c.submit(Arc::new(control));
+    let control_hash = charges.submit(c, control);
 
     assert!(
         c.run_until(epochs(6), |c| c
@@ -317,6 +373,24 @@ fn assert_payer_is_blocked<C: FaultableCluster>(
         "the splitter must refuse the payer while its first transaction still \
          holds that payer's vault",
     );
+}
+
+/// The terminating payer, its recipient, the control and the recipient
+/// the successor is asked to pay: everything a transfer in
+/// [`split_terminating_payer_releases_its_reservation`] reaches.
+fn terminating_payer_world<C: Cluster>(c: &C, setup: &SplitStraddlerSetup) -> World {
+    let (_, payer, recipient) = &setup.terminating;
+    World::open(
+        c,
+        *XRD,
+        [
+            payer.address(),
+            recipient.address(),
+            setup.control.1.address(),
+            setup.successor_recipient.address(),
+        ],
+        [],
+    )
 }
 
 /// Verify a payer whose shard terminates mid-flight is not stranded by it.
@@ -378,6 +452,9 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
     // survivor's half, so no tick of its can finalize.
     let _ = isolate_ec_intake(c, splitter, survivor);
 
+    let world = terminating_payer_world(c, &setup);
+    let mut charges = Charges::default();
+
     let held = build_transfer_tx(
         payer_key,
         *payer,
@@ -385,8 +462,7 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
         STRADDLER_PAYMENT,
         validity_around(c.now()),
     );
-    let held_hash = held.hash();
-    c.submit(Arc::new(held));
+    let held_hash = charges.submit(c, held);
 
     // The reservation engages when the splitter commits the transaction —
     // before the split executes, so the shard that dies is the one holding it.
@@ -405,7 +481,7 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
          not an on-chain hold",
     );
 
-    assert_payer_is_blocked(c, splitter, &setup);
+    assert_payer_is_blocked(c, &mut charges, splitter, &setup);
 
     // The payer's deadline arrives and it speaks its abort. No certificate
     // follows it: the counterpart engaged, so finalization needs a certificate
@@ -470,8 +546,7 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
         STRADDLER_PAYMENT,
         validity_around(c.now()),
     );
-    let released_hash = released.hash();
-    c.submit(Arc::new(released));
+    let released_hash = charges.submit(c, released);
     let status = await_tx_terminal(c, released_hash, epochs(10));
     assert!(
         matches!(
@@ -490,6 +565,16 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
         c.run_until(epochs(8), |c| vault_balance(c, successor, *payer)
             < TERMINATING_PAYER_FUNDING),
         "the released transaction must actually have spent from the payer's vault",
+    );
+
+    // The abort moved nothing and charged nothing, the blocked probe was
+    // never included, and the control and the release each moved their
+    // payment once and paid once.
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a terminating payer's abort and the successor's release",
     );
 }
 
@@ -541,8 +626,10 @@ pub fn split_surviving_counterpart_releases_its_reservation(c: &mut impl Faultab
         .committed_work_in_flight(survivor)
         .expect("the survivor must serve a committed tip before the straddler");
 
+    let world = straddler_world(c, &setup.straddlers[..1]);
+    let mut charges = Charges::default();
     let (key, from, to) = &setup.straddlers[0];
-    let (hash, reserved) = submit_straddler_reserving(c, key, *from, *to);
+    let (hash, reserved) = submit_straddler_reserving(c, &mut charges, key, *from, *to);
 
     // Both while both are live: the splitter's coast blocks commit nothing,
     // so a straddler landing later would leave the survivor with no tick at
@@ -613,6 +700,9 @@ pub fn split_surviving_counterpart_releases_its_reservation(c: &mut impl Faultab
          baseline = {baseline}, engaged = {engaged}, still owing = {:?}",
         c.committed_work_in_flight(survivor),
     );
+
+    // Abandoned, so nothing moved — and the price was still paid.
+    world.assert_settles_within(c, &charges, epochs(8), "an abandoned straddler");
 }
 
 /// Verify a straddler the departing splitter settled applies on both sides,
@@ -661,8 +751,10 @@ pub fn split_survivor_recovers_a_settlement_it_never_received(c: &mut impl Fault
         .committed_work_in_flight(survivor)
         .expect("the survivor must serve a committed tip before the straddler");
 
+    let world = straddler_world(c, &setup.straddlers[..1]);
+    let mut charges = Charges::default();
     let (key, from, to) = &setup.straddlers[0];
-    let hash = submit_straddler(c, key, *from, *to);
+    let hash = submit_straddler(c, &mut charges, key, *from, *to);
 
     assert!(
         c.run_until(epochs(12), |c| c.chain_fate(survivor, hash).0.is_some()
@@ -711,6 +803,14 @@ pub fn split_survivor_recovers_a_settlement_it_never_received(c: &mut impl Fault
         "the survivor's drain must return to its baseline once the straddler \
          resolves; baseline = {baseline}, still owing = {:?}",
         c.committed_work_in_flight(survivor),
+    );
+
+    // Settled on both sides: the payment landed once and the price once.
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a straddler settled off the tail chain",
     );
 }
 
@@ -819,19 +919,22 @@ pub fn merge_straddler_atomic(c: &mut impl Cluster) {
         "the grown four-shard topology must seat every quarter",
     );
 
+    let world = straddler_world(c, &setup.straddlers);
+    let mut charges = Charges::default();
     let mut probes: Vec<TxHash> = Vec::new();
     let half = setup.straddlers.len() / 2;
 
     // Settling ticks: submitted while `leaf(2, 0)` still commits real blocks, so
-    // their cross-shard 2PC can finalize at or below its terminal block and land
-    // in the attested settled set. Submitted before the keeper pairing arms the
-    // gate, then awaited to finalize on `leaf(2, 0)` so settlement can't lose the
-    // race to the cut — a settler only needs to finalize before the terminal.
+    // their cross-shard settlement can finalize at or below its terminal block
+    // and land in the attested settled set. Submitted before the keeper
+    // pairing arms the gate, then awaited to finalize on `leaf(2, 0)` so
+    // settlement can't lose the race to the cut — a settler only needs to
+    // finalize before the terminal.
     let settling: Vec<TxHash> = setup
         .straddlers
         .iter()
         .take(half)
-        .map(|(key, from, to)| submit_straddler(c, key, *from, *to))
+        .map(|(key, from, to)| submit_straddler(c, &mut charges, key, *from, *to))
         .collect();
     probes.extend_from_slice(&settling);
     assert!(
@@ -853,7 +956,7 @@ pub fn merge_straddler_atomic(c: &mut impl Cluster) {
     // coasting to its terminal — the survivor still provisions to it, but its
     // coast blocks settle nothing, leaving them in flight when it terminates.
     for (key, from, to) in setup.straddlers.iter().skip(half) {
-        probes.push(submit_straddler(c, key, *from, *to));
+        probes.push(submit_straddler(c, &mut charges, key, *from, *to));
     }
 
     // Drive the merge to fire: the keepers' ready signals collapse the children
@@ -898,6 +1001,7 @@ pub fn merge_straddler_atomic(c: &mut impl Cluster) {
     }
 
     assert_fence_held(c, merge_left, terminal_b, &probes);
+    world.assert_settles_within(c, &charges, epochs(8), "straddlers across a merge");
 }
 
 /// Whether the merge into `parent` has executed: the reformed parent is seated
@@ -934,11 +1038,12 @@ pub const STRADDLER_PAYMENT: u128 = 100;
 /// signed content — hash dedup would otherwise read them as one transaction.
 pub fn submit_straddler<C: Cluster>(
     c: &mut C,
+    charges: &mut Charges,
     key: &Ed25519PrivateKey,
     from: PrincipalAddr,
     to: PrincipalAddr,
 ) -> TxHash {
-    submit_straddler_reserving(c, key, from, to).0
+    submit_straddler_reserving(c, charges, key, from, to).0
 }
 
 /// [`submit_straddler`], also reporting what the transaction reserves
@@ -949,6 +1054,7 @@ pub fn submit_straddler<C: Cluster>(
 /// than inferring it from a level other traffic also moves.
 fn submit_straddler_reserving<C: Cluster>(
     c: &mut C,
+    charges: &mut Charges,
     key: &Ed25519PrivateKey,
     from: PrincipalAddr,
     to: PrincipalAddr,
@@ -956,8 +1062,8 @@ fn submit_straddler_reserving<C: Cluster>(
     let tx = build_transfer_tx(key, from, to, STRADDLER_PAYMENT, validity_around(c.now()));
     tx.try_derived(c.derivation().as_ref())
         .expect("a scenario transfer derives");
-    let (hash, work) = (tx.hash(), tx.work());
-    c.submit(Arc::new(tx));
+    let work = tx.work();
+    let hash = charges.submit(c, tx);
     (hash, work)
 }
 

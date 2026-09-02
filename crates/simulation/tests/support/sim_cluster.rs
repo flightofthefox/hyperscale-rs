@@ -449,10 +449,16 @@ impl Cluster for SimCluster {
     }
 
     fn substate(&self, shard: ShardId, owner: Address, local: [u8; 16]) -> Option<Vec<u8>> {
+        // The furthest-along store among the live committee's hosts. A
+        // shard id can be hosted twice on one host across a reshape — a
+        // merged parent reclaims its predecessor's id, a recovered shard
+        // reseats members that hold the frozen store — and only the live
+        // one has committed past the cut.
         let store = self
             .live_committee_hosts(shard)
             .into_iter()
-            .find_map(|host| self.runner.hosts_shard(host, shard))?;
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .max_by_key(|store| store.jmt_height())?;
         let height = store.jmt_height();
         let key = SubstateKey {
             owner,
