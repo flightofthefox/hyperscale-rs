@@ -853,7 +853,7 @@ const fn stub_cell(owner: Address) -> DeclaredKey {
 }
 
 /// A stub charge for a record fixture: a vault under `seed`'s own
-/// prefix, at a nominal floor.
+/// prefix, at a nominal price.
 ///
 /// The consensus fixtures that carry one are about what a record names
 /// and how it validates, never about what the burn comes to — so the
@@ -865,7 +865,7 @@ pub const fn stub_abort_charge(seed: u8) -> AbortCharge {
             owner: Address::new([seed; 31], AddressClass::Component),
             local: LocalKey([seed; 16]),
         },
-        floor: 13,
+        amount: 13,
     }
 }
 

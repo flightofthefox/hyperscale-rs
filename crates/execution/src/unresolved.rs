@@ -831,7 +831,7 @@ mod tests {
         }
     }
 
-    /// What abandoning `tx` states: its reservation and its floor.
+    /// What abandoning `tx` states: its reservation and its price.
     fn abandons(tx: &Arc<Verifiable<Transaction>>) -> Abandonable {
         Abandonable {
             tx_hash: tx.hash(),

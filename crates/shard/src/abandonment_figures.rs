@@ -117,13 +117,13 @@ mod tests {
                     owner: Address::new([seed; 31], AddressClass::Component),
                     local: LocalKey([seed; 16]),
                 },
-                floor: 3,
+                amount: 3,
             },
         }
     }
 
     /// A holder checks every figure: the same entry is exact, and one
-    /// naming another vault, another floor, another reservation or
+    /// naming another vault, another amount, another reservation or
     /// another deadline is wrong.
     #[test]
     fn a_holder_checks_every_figure() {
@@ -144,7 +144,7 @@ mod tests {
         assert_eq!(
             held.check(&UnsettledTx {
                 charge: AbortCharge {
-                    floor: 4,
+                    amount: 4,
                     ..figures(1).charge
                 },
                 ..figures(1)

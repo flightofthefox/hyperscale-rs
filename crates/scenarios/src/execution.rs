@@ -82,10 +82,13 @@ pub fn nullifier_race_admits_exactly_one(c: &mut impl Cluster) {
     let request = payment_request(requester, REQUEST);
     let window = validity_around(c.now());
     let mut hashes = Vec::new();
-    let mut floors = Vec::new();
+    let mut prices = Vec::new();
     for (composer, from) in [(&first_key, first), (&second_key, second)] {
         let tx = build_composed_tx(composer, from, &requester_key, &request, REQUEST, window);
-        floors.push(tx.body().abort_floor());
+        prices.push(
+            tx.price_under(c.derivation().as_ref())
+                .expect("a scenario transaction derives"),
+        );
         hashes.push(tx.hash());
         c.submit(Arc::new(tx));
     }
@@ -116,8 +119,8 @@ pub fn nullifier_race_admits_exactly_one(c: &mut impl Cluster) {
         "the request must be filled exactly once"
     );
 
-    // The winner paid the payment and its fee; the loser paid the class
-    // floor and nothing more.
+    // The winner paid the payment and its fee; the loser paid the
+    // declared price and nothing more.
     let won = matches!(
         verdicts[0],
         Some(TransactionStatus::Completed(TransactionDecision::Accept))
@@ -138,8 +141,8 @@ pub fn nullifier_race_admits_exactly_one(c: &mut impl Cluster) {
         "the winner paid the request plus a fee; spent = {winner_spent}"
     );
     assert_eq!(
-        loser_spent, floors[0],
-        "a lost race settles the class floor, not the ceiling"
+        loser_spent, prices[0],
+        "a lost race settles the declared price, not the ceiling"
     );
 }
 
@@ -1322,8 +1325,8 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
     );
 }
 
-/// A payer whose counterpart never engages settles the abort floor and
-/// nothing else.
+/// A payer whose counterpart never engages settles the declared price
+/// and nothing else.
 ///
 /// Cutting both channels the payer's bundle travels — the gossip
 /// broadcast and the fetch that backs it up — makes the counterpart's
@@ -1333,16 +1336,16 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
 /// waits. It speaks once: with no engagement echo and the window closed,
 /// its single statement is the abort. The transaction's effects are
 /// discarded, so the recipient is never credited and the transferred
-/// amount never leaves; what leaves is the class floor, settled through
-/// the fee receipt the abort names.
+/// amount never leaves; what leaves is the declared price, settled
+/// through the fee receipt the abort names.
 ///
 /// # Panics
 ///
 /// Panics if the harness cannot read the payer's vault, the payer never
 /// commits, the bundle is never suppressed, the transaction fails to
 /// reach a terminal abort, the counterpart engages, or the payer's
-/// balance moves by anything other than the floor.
-pub fn abort_floor_settles_on_deadline(c: &mut impl FaultableCluster) {
+/// balance moves by anything other than the price.
+pub fn abort_charges_the_price_on_deadline(c: &mut impl FaultableCluster) {
     let payer_shard = ShardId::leaf(1, 0);
     let counterpart = ShardId::leaf(1, 1);
     let (payer, from, to) = cross_shard_cast();
@@ -1356,7 +1359,9 @@ pub fn abort_floor_settles_on_deadline(c: &mut impl FaultableCluster) {
 
     let tx = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
     let hash = tx.hash();
-    let floor = tx.body().abort_floor();
+    let price = tx
+        .price_under(c.derivation().as_ref())
+        .expect("a scenario transaction derives");
     c.submit(Arc::new(tx));
 
     assert!(
@@ -1383,7 +1388,7 @@ pub fn abort_floor_settles_on_deadline(c: &mut impl FaultableCluster) {
         "the counterpart must never have engaged the transaction",
     );
 
-    // The floor left the payer's vault; the transfer did not.
+    // The price left the payer's vault; the transfer did not.
     //
     // A terminal status is reported the moment this shard decides the
     // abort, which is a block or more before the finalization carrying its
@@ -1397,26 +1402,25 @@ pub fn abort_floor_settles_on_deadline(c: &mut impl FaultableCluster) {
     let after = vault_balance(c, payer_shard, from);
     assert_eq!(
         before.saturating_sub(after),
-        floor,
-        "the abort must burn exactly the class floor: before = {before}, after = {after}",
+        price,
+        "the abort must burn exactly the declared price: before = {before}, after = {after}",
     );
 }
 
-/// A transaction that fails still pays, and what it pays depends on whose
-/// fault the failure was.
+/// A transaction that fails still pays, and what it pays is the one
+/// declared price.
 ///
 /// Failing must never be the cheaper way to buy execution. An uncovered
 /// withdrawal loses a deterministic race it could not have foreseen — the
-/// sender declared honestly and another transaction got there first — so
-/// it settles the class floor, not the ceiling. What matters is that it
-/// settles something: an attempt that cost nothing would make trapping
-/// strictly cheaper than succeeding for identical work.
+/// sender declared honestly and another transaction got there first — and
+/// it settles the price like every other attempt: the network routed,
+/// provisioned and ran a batch for it either way.
 ///
 /// # Panics
 ///
 /// Panics if the uncovered withdrawal does not reject, if the covered
 /// transfer that follows does not accept, or if the rejected attempt
-/// moves the payer's vault by anything other than the floor.
+/// moves the payer's vault by anything other than the price.
 pub fn failure_charges_its_payer(c: &mut impl Cluster) {
     let shard = ShardId::ROOT;
     let (payer, from) = sender(0);
@@ -1424,7 +1428,9 @@ pub fn failure_charges_its_payer(c: &mut impl Cluster) {
 
     let before = vault_balance(c, shard, from);
     let over = build_transfer_tx(&payer, from, to, 1_000_000, validity_around(c.now()));
-    let floor = over.body().abort_floor();
+    let price = over
+        .price_under(c.derivation().as_ref())
+        .expect("a scenario transaction derives");
     let over_hash = over.hash();
     c.submit(Arc::new(over));
     let status = await_tx_terminal(c, over_hash, epochs(8));
@@ -1439,9 +1445,9 @@ pub fn failure_charges_its_payer(c: &mut impl Cluster) {
     let after = vault_balance(c, shard, from);
     assert_eq!(
         before.saturating_sub(after),
-        floor,
-        "a rejected attempt must settle exactly the class floor: \
-         before = {before}, after = {after}, floor = {floor}"
+        price,
+        "a rejected attempt must settle exactly the declared price: \
+         before = {before}, after = {after}, price = {price}"
     );
 
     // The charge is the only thing that moved: the payer can still spend.

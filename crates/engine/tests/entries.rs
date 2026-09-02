@@ -231,7 +231,7 @@ fn custody_opens_for_the_holder_and_refuses_the_rest() {
     );
 
     // Withdrawing an instance the holdings do not contain traps in the
-    // guest — the sender's own defect, priced as one.
+    // guest — the sender's own defect, and priced like every attempt.
     let executed = run_tick(&executor, &storage, 3, signed_nf_transfer(BOB, ALICE, &[9]));
     assert!(
         matches!(&executed[0].consensus, ConsensusReceipt::Failed),

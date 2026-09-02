@@ -25,12 +25,13 @@ use hyperscale_scenarios::{
     Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig,
     a_failed_attempt_still_attests_work, a_native_post_quantum_account_pays_its_own_way,
     a_payer_cannot_spend_one_balance_twice, a_published_package_matures_before_it_runs,
-    a_spent_nullifier_is_swept_once_unreachable, abort_converges, abort_floor_settles_on_deadline,
-    attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
-    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
-    cross_shard_credit_survives_a_later_local_credit, cross_shard_exec_cert_drop_fetch_fallback,
-    cross_shard_fraction, cross_shard_header_fetch_fallback,
-    cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
+    a_spent_nullifier_is_swept_once_unreachable, abort_charges_the_price_on_deadline,
+    abort_converges, attested_load_reaches_the_beacon,
+    beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
+    cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
+    cross_shard_exec_cert_drop_fetch_fallback, cross_shard_fraction,
+    cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
+    cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
     delegation_folds_into_beacon_state, deploy_storm_rides_out, epochs,
@@ -326,10 +327,10 @@ fn sealed_rounds_settle_on_the_seed_they_committed_to_sim() {
 }
 
 #[test]
-fn abort_floor_settles_on_deadline_sim() {
+fn abort_charges_the_price_on_deadline_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
-    cluster.run_faultable(abort_floor_settles_on_deadline);
+    cluster.run_faultable(abort_charges_the_price_on_deadline);
 }
 
 #[test]

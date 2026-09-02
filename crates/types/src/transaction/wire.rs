@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 
 use blake3::Hasher;
 use hyperscale_hbor::{Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
-use hyperscale_vm_types::{Crossing, LegShape};
+use hyperscale_vm_types::{Crossing, LegShape, price_attos};
 use thiserror::Error;
 
 use crate::transaction::vm::{Derivation, ProtocolVerifier, SchemeVerifier};
@@ -176,6 +176,31 @@ impl Transaction {
     #[must_use]
     pub fn footprint(&self) -> u64 {
         self.derived().footprint
+    }
+
+    /// What this transaction is charged, in attos: its declared work at
+    /// the protocol's rate. One figure whatever the outcome and wherever
+    /// it runs — a participant measuring only its own legs bills the
+    /// same as one that ran the whole — and never more than the signed
+    /// ceiling, which admission holds it to.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn price(&self) -> u128 {
+        price_attos(self.work())
+    }
+
+    /// [`Self::price`] for an envelope that may not have been derived
+    /// yet — what a composer quotes before submitting, deriving under
+    /// `derivation` where nothing has.
+    ///
+    /// # Errors
+    ///
+    /// [`DerivationError`], where the envelope derives to nothing.
+    pub fn price_under(&self, derivation: &dyn Derivation) -> Result<u128, DerivationError> {
+        Ok(price_attos(self.try_derived(derivation)?.work))
     }
 
     /// Each manifest node's placement-free shape, in node order.
@@ -502,6 +527,17 @@ pub enum TransactionVerifyError {
     /// Static derivation refused the envelope.
     #[error(transparent)]
     Derivation(#[from] DerivationError),
+    /// The signed ceiling is below the declared price. The drain reserves
+    /// the whole declaration either way, so a ceiling short of it would
+    /// charge least for exactly the transactions that cost most; the
+    /// ceiling is a hold size the price must fit.
+    #[error("fee ceiling {max_fee} is below the declared price {price}")]
+    CeilingBelowPrice {
+        /// The ceiling the sender signed.
+        max_fee: u128,
+        /// The price the declaration derives to.
+        price: u128,
+    },
 }
 
 /// Construction asserts: the body decodes, the envelope names this
@@ -543,6 +579,17 @@ impl Verify<TransactionContext<'_>> for Transaction {
         // signer-address binding; the signatures themselves verify here,
         // over the derived declaration hashes.
         let derived = self.try_derived(ctx.derivation)?;
+        // A publish is priced by its artifact and capped at the ceiling;
+        // only a call declares a price the ceiling has to cover.
+        if vm.artifact().is_none() {
+            let price = price_attos(derived.work);
+            if price > vm.max_fee {
+                return Err(TransactionVerifyError::CeilingBelowPrice {
+                    max_fee: vm.max_fee,
+                    price,
+                });
+            }
+        }
         for (index, (sig, subintent)) in vm
             .subintent_sigs
             .iter()

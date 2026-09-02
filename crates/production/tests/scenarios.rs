@@ -17,7 +17,7 @@ use hyperscale_scenarios::tx::{
     reshape_lifecycle_accounts, split_straddler_setup,
 };
 use hyperscale_scenarios::{
-    ScenarioConfig, abort_converges, abort_floor_settles_on_deadline,
+    ScenarioConfig, abort_charges_the_price_on_deadline, abort_converges,
     beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
     cross_shard_exec_cert_drop_fetch_fallback, cross_shard_fraction,
     cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
@@ -244,14 +244,14 @@ const fn cross_shard_config() -> ScenarioConfig {
 #[test]
 #[serial]
 #[ignore = "real-QUIC production scenario; run with -- --ignored"]
-fn abort_floor_settles_on_deadline_prod() {
+fn abort_charges_the_price_on_deadline_prod() {
     let mut cluster = ProdCluster::start_with_grown_accounts(
         &cross_shard_config(),
         42,
         EPOCH_MS,
         cross_shard_genesis_accounts(),
     );
-    cluster.run_faultable(abort_floor_settles_on_deadline);
+    cluster.run_faultable(abort_charges_the_price_on_deadline);
 }
 
 #[test]

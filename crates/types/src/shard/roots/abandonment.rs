@@ -45,7 +45,7 @@ fn record_leaf(record: &AbandonmentRecord) -> Hash {
         bytes.extend_from_slice(&entry.deadline.as_millis().to_le_bytes());
         bytes.extend_from_slice(&entry.declared_work.to_le_bytes());
         bytes.extend_from_slice(&entry.charge.vault.to_bytes());
-        bytes.extend_from_slice(&entry.charge.floor.to_le_bytes());
+        bytes.extend_from_slice(&entry.charge.amount.to_le_bytes());
     }
     Hash::from_bytes(&bytes)
 }
@@ -112,7 +112,7 @@ mod tests {
                     owner: Address::new([seed; 31], AddressClass::Component),
                     local: LocalKey([seed; 16]),
                 },
-                floor: 11,
+                amount: 11,
             },
         }
     }
@@ -184,7 +184,7 @@ mod tests {
             root,
             restated(UnsettledTx {
                 charge: AbortCharge {
-                    floor: 12,
+                    amount: 12,
                     ..tx(1).charge
                 },
                 ..tx(1)

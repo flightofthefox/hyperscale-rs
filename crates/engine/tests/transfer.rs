@@ -68,12 +68,9 @@ const HEADER: IntentHeader = IntentHeader {
 const ALICE_SEED: u8 = 41;
 const BOB_SEED: u8 = 42;
 
-/// The ceiling the plain transfer cases name, and — being under what a
-/// transfer costs — the fee they are charged exactly.
-///
-/// Small enough to stay legible in the balance assertions, which matters
-/// now that a withdrawal's own account is also the one paying: the payer
-/// is the signer, and the signer is whoever the withdrawing node names.
+/// The ceiling the plain transfer cases sign: above what a transfer
+/// prices, so admission would hold and the burn is the declared price
+/// rather than the clamp.
 const TRANSFER_FEE: u128 = 100;
 
 fn alice() -> PrincipalAddr {
@@ -317,6 +314,13 @@ fn world_accounts() -> Vec<(PrincipalAddr, u128)> {
         (fee_payer(31), 1_000),
         (fee_payer(32), 1_000),
     ]
+}
+
+/// What `tx` is charged, derived under the executor's own derivation:
+/// the figure a test pins a balance against.
+fn price_of(executor: &Executor, tx: &Transaction) -> u128 {
+    tx.price_under(executor.derivation().as_ref())
+        .expect("a test transaction derives")
 }
 
 fn execute(executor: &Executor, transactions: &[Arc<Verified<Transaction>>]) -> Vec<ExecutedTx> {
@@ -703,7 +707,7 @@ fn a_transfer_folds_to_identity_keyed_absolute_updates() {
         bob(),
         100,
     )));
-    let executed = execute(&executor, &[tx]);
+    let executed = execute(&executor, &[Arc::clone(&tx)]);
     assert_eq!(executed.len(), 1);
     let ConsensusReceipt::Succeeded {
         writes: database_updates,
@@ -714,12 +718,12 @@ fn a_transfer_folds_to_identity_keyed_absolute_updates() {
         panic!("transfer must succeed: {:?}", executed[0].consensus);
     };
     assert_ne!(receipt_hash.as_raw(), &Hash::ZERO);
-    // Withdraw settled 100 off the sender and the fee another 100 —
-    // the sender signs, so the sender pays. Deposit credited the
+    // Withdraw settled 100 off the sender and the declared price on
+    // top — the sender signs, so the sender pays. Deposit credited the
     // recipient. Absolute values, identity-keyed.
     assert_eq!(
         vault_cell(&settled(database_updates, &world_accounts()), alice()),
-        Some(encode_amount(1_000 - 100 - TRANSFER_FEE).to_vec())
+        Some(encode_amount(1_000 - 100 - price_of(&executor, &tx)).to_vec())
     );
     assert_eq!(
         vault_cell(&settled(database_updates, &world_accounts()), bob()),
@@ -736,7 +740,7 @@ fn an_uncovered_withdrawal_aborts_and_the_batch_carries_on() {
         alice(),
         500,
     )));
-    let floor = over.body().abort_floor();
+    let price = price_of(&executor, &over);
     let fine = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
         ALICE_SEED,
         alice(),
@@ -757,7 +761,7 @@ fn an_uncovered_withdrawal_aborts_and_the_batch_carries_on() {
     // receipt's writes merged in hash order, later receipts winning per
     // cell. Whichever side of the failure the transfer's hash lands on,
     // the committed end state carries both its movement and the
-    // failure's floor debit.
+    // failure's price debit.
     let mut store = MapDb::genesis(&[(alice(), 1_000), (bob(), 50)]);
     let mut ordered: Vec<&ExecutedTx> = executed.iter().collect();
     ordered.sort_by_key(|e| e.tx_hash);
@@ -771,18 +775,18 @@ fn an_uncovered_withdrawal_aborts_and_the_batch_carries_on() {
     }
     assert_eq!(
         store.cell(vault_key(alice(), *XRD)),
-        Some(encode_amount(1_000 - 25 - TRANSFER_FEE).to_vec())
+        Some(encode_amount(1_000 - 25 - price_of(&executor, &fine)).to_vec())
     );
     assert_eq!(
         store.cell(vault_key(bob(), *XRD)),
-        Some(encode_amount(75 - floor).to_vec()),
-        "the credit lands and the failure's floor stays charged"
+        Some(encode_amount(75 - price).to_vec()),
+        "the credit lands and the failure's price stays charged"
     );
 }
 
 /// A charged failure's debit survives a sibling folded after it.
 ///
-/// Each records what it moved on the vault — the failure its floor, the
+/// Each records what it moved on the vault — the failure its price, the
 /// credit its amount — so settling both leaves the vault holding the
 /// sum. Neither receipt has to know about the other, which is what a
 /// movement buys: an absolute would have had to carry the sibling's
@@ -796,7 +800,7 @@ fn a_failed_charge_survives_a_later_sibling_credit() {
         alice(),
         500,
     )));
-    let floor = failed.body().abort_floor();
+    let price = price_of(&executor, &failed);
     // Receipts fold and commit hash-ascending, and only a credit landing
     // after the failure can revert its debit — so pick a transfer amount
     // whose hash does.
@@ -824,13 +828,13 @@ fn a_failed_charge_survives_a_later_sibling_credit() {
         .fee_receipt
         .as_ref()
         .and_then(|receipt| receipt.writes())
-        .expect("a charged failure settles its floor");
+        .expect("a charged failure settles its price");
     db.apply(charge);
     db.apply(writes);
     assert_eq!(
         db.cell(vault_key(bob(), *XRD)),
-        Some(encode_amount(50 + amount - floor).to_vec()),
-        "a later sibling's credit must compose with the charged floor, not revert it"
+        Some(encode_amount(50 + amount - price).to_vec()),
+        "a later sibling's credit must compose with the charged price, not revert it"
     );
 }
 
@@ -857,10 +861,9 @@ fn serial_and_parallel_scheduling_produce_identical_receipts() {
     }
 }
 
-/// A completed transfer burns its attested actual — fuel, capped at the
-/// signed ceiling — from the payer's vault as part of the receipt's own
-/// writes, so the burn rides the attested `writes_root` and the
-/// sync-replayable work items.
+/// A completed transfer burns its declared price from the payer's vault
+/// as part of the receipt's own writes, so the burn rides the attested
+/// `writes_root` and the sync-replayable work items.
 /// An attempt that applies nothing still attests the declaration it made,
 /// and a completed one attests strictly more.
 ///
@@ -919,8 +922,8 @@ fn a_completed_transfer_burns_the_fee_ceiling_from_its_payer() {
     let payer = fee_payer(7);
     let accounts = [(payer, 1_000), (bob(), 50)];
     let executor = executor(ExecutionMode::Serial);
-    // A transfer's fuel far exceeds the tiny ceiling, so the burn is
-    // exactly `max_fee` — the cap working.
+    // A ceiling below the declared price is refused at admission; one
+    // that bypassed it burns the ceiling — the backstop clamp working.
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
         signed_transfer_with_fee(7, payer, bob(), 100, 10),
     ));
@@ -951,8 +954,8 @@ fn a_completed_transfer_burns_the_fee_ceiling_from_its_payer() {
 #[test]
 fn a_call_that_never_touches_its_payers_vault_still_pays() {
     let executor = executor(ExecutionMode::Serial);
-    // A draw's fuel far exceeds the tiny ceiling, so the burn is
-    // exactly `max_fee`.
+    // A ceiling below the declared price, bypassing admission, burns
+    // exactly the ceiling.
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
         signed_settle_with_fee(ALICE_SEED, 10, ROUND),
     ));
@@ -1058,17 +1061,17 @@ fn shared_payer_burns_accumulate_across_a_batch() {
 
 /// A missed edge bound is an infeasibility, not a defect: the sender
 /// declared what it would accept and the world moved between signing and
-/// execution, so nothing but the class floor leaves its vault.
+/// execution, and it settles the one declared price like every attempt.
 #[test]
-fn a_missed_edge_bound_charges_its_payer_the_floor() {
+fn a_missed_edge_bound_charges_its_payer_the_price() {
     let payer = fee_payer(23);
     let funded = 1_000;
     let accounts = [(payer, funded), (bob(), 50)];
     let executor = executor(ExecutionMode::Serial);
     // The withdrawal is covered and the guest is honest — it returns the
-    // 100 it reserved. What fails is the recipient's signed floor.
+    // 100 it reserved. What fails is the recipient's signed price.
     let tx = signed_transfer_under_bound(23, payer, bob(), 100, 150, 1_000);
-    let floor = tx.body().abort_floor();
+    let price = price_of(&executor, &tx);
     let executed = execute_on(
         &accounts,
         &executor,
@@ -1092,8 +1095,8 @@ fn a_missed_edge_bound_charges_its_payer_the_floor() {
     };
     assert_eq!(
         vault_cell(&settled(database_updates, &accounts), payer),
-        Some(encode_amount(funded - floor).to_vec()),
-        "the floor and nothing else"
+        Some(encode_amount(funded - price).to_vec()),
+        "the price and nothing else"
     );
     assert_eq!(
         vault_cell(&settled(database_updates, &accounts), bob()),
@@ -2059,7 +2062,10 @@ fn a_preview_reports_the_resource_changes_a_transfer_would_make() {
     let report = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
 
     assert_eq!(report.outcome, PreviewOutcome::Completed);
-    assert_eq!(report.fee, PREVIEW_CEILING, "a transfer's fuel exceeds it");
+    assert_eq!(
+        report.fee, PREVIEW_CEILING,
+        "a ceiling below the price is the burn"
+    );
     assert_eq!(report.changes.len(), 2, "two vaults move: {report:?}");
 
     let sender = change_for(&report, payer);
@@ -2153,32 +2159,32 @@ fn free_credit_reports_the_fee_without_charging_it() {
 }
 
 /// An uncovered withdrawal previews as the abort it would be, priced at
-/// the class floor: the sender lost a deterministic race rather than
-/// making a mistake, so nothing but the floor leaves its vault.
+/// the one declared price: the sender lost a deterministic race, and an
+/// attempt settles the price whatever refused it.
 #[test]
-fn a_preview_prices_an_abort_at_its_class_floor() {
+fn a_preview_prices_an_abort_at_the_declared_price() {
     let payer = fee_payer(7);
     let accounts = [(payer, 1_000), (bob(), 50)];
     let executor = executor(ExecutionMode::Serial);
-    let tx = signed_transfer_with_fee(7, payer, bob(), 5_000, PREVIEW_CEILING);
+    let tx = signed_transfer_with_fee(7, payer, bob(), 5_000, TRANSFER_FEE);
     let report = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
 
     let PreviewOutcome::Aborted { reason } = &report.outcome else {
         panic!("an uncovered withdrawal must abort: {:?}", report.outcome);
     };
     assert!(reason.contains("infeasible"), "reason = {reason}");
-    assert_eq!(report.fee, PREVIEW_CEILING / 10, "the abort floor");
+    assert_eq!(report.fee, price_of(&executor, &tx), "the declared price");
     assert_eq!(
         report.changes,
         vec![ResourceChange {
             key: vault_key(payer, *XRD),
             before: 1_000,
-            after: 1_000 - PREVIEW_CEILING / 10,
+            after: 1_000 - report.fee,
             credit: 0,
             debit: 0,
             settled: 0,
         }],
-        "an abort moves nothing but the floor"
+        "an abort moves nothing but the price"
     );
 }
 

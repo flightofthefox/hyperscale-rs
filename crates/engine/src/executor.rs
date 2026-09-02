@@ -685,10 +685,12 @@ pub fn abort_reason(outcome: &Outcome) -> String {
     }
 }
 
-fn vm_metadata(fuel: u64, error: Option<String>) -> ExecutionMetadata {
+/// The node-local metadata of one execution: what it was charged, and
+/// why it aborted if it did.
+fn vm_metadata(charged: u128, error: Option<String>) -> ExecutionMetadata {
     ExecutionMetadata::new(
         FeeSummary {
-            total_execution_cost: Some(u128::from(fuel) * Stake::ATTOS_PER_WHOLE),
+            total_execution_cost: Some(charged * Stake::ATTOS_PER_WHOLE),
             total_royalty_cost: None,
             total_storage_cost: None,
             total_tipping_cost: None,
@@ -697,20 +699,22 @@ fn vm_metadata(fuel: u64, error: Option<String>) -> ExecutionMetadata {
         error,
     )
 }
-/// Debit the payer's vault by what this transaction burned.
+/// Debit the payer's vault by `amount`, held to the signed ceiling.
 ///
 /// A movement, like every other debit, which is what makes the burn
 /// compose with whatever else reaches the vault instead of having to be
 /// re-derived into each sibling's absolute. There is nothing cumulative
 /// to track and nothing to re-stamp: two transactions burning against
 /// one vault each record their own debit and settlement adds them.
-fn apply_fee_burn(writes: &mut StateWrites, fee: Option<PayerFee>, fuel: u64) {
+///
+/// The clamp is a cap for a publish, priced by its artifact, and a
+/// backstop for a call, whose declared price admission already held the
+/// ceiling to.
+fn apply_fee_burn(writes: &mut StateWrites, fee: Option<PayerFee>, amount: u128) {
     let Some(payer) = fee else {
         return;
     };
-    // The attested actual — fuel, until real pricing lands — capped at
-    // the signed ceiling.
-    let burn = u128::from(fuel).min(payer.max_fee);
+    let burn = amount.min(payer.max_fee);
     if burn == 0 {
         return;
     }
@@ -738,90 +742,43 @@ fn apply_fee_burn(writes: &mut StateWrites, fee: Option<PayerFee>, fuel: u64) {
 #[derive(Clone, Copy)]
 pub struct PayerFee {
     pub vault: SubstateKey,
-    /// The signed ceiling a success burns up to, and what the sender's
-    /// own defect costs.
+    /// The signed ceiling: the hold the price has to fit, and the most
+    /// any burn reaches.
     pub max_fee: u128,
-    /// The class floor: what an attempt owes when nothing it did was its
-    /// sender's fault.
-    pub floor: u128,
+    /// The declared price — what every attempt owes, whatever refused
+    /// it, derived from signed content before anything runs.
+    pub price: u128,
     /// Whether a tick can abort this transaction after it executed —
     /// true for a cross-shard leg, which is the one shape whose effects
     /// are discarded after the engine completed them.
     pub abortable: bool,
 }
 
-/// What an attempt that applied no effects owes, by why it applied none.
+/// Whether an attempt's charge settles through a receipt of its own
+/// rather than inside its writes.
 ///
-/// Charging nothing is not an option: a transaction that consumed its
-/// limit and then trapped would cost its sender less than the same work
-/// succeeding, which is the inversion that makes failure the cheaper way
-/// to buy execution.
-///
-/// The consumed work itself cannot price this. Fuel at a trap is not
-/// agreed between the runtimes — one flushes its in-register counter
-/// while the other charges every executed operator — so a charge derived
-/// from it would differ across replicas on the same transaction. Both
-/// amounts below are functions of signed content alone.
-pub const fn charge_for(outcome: &Outcome, payer: PayerFee) -> Option<u128> {
+/// One price whatever the outcome. A completed run burns it inside the
+/// writes the receipt carries; only where a tick can still discard those
+/// writes is the same figure also built apart, so the abort that
+/// discards them settles it. Every attempt that applied no effects has
+/// no writes to carry the burn, and settles it apart — a lost race, a
+/// declared refusal, the sender's own defect and the kernel's alike:
+/// the network routed, provisioned and ran a batch for it either way,
+/// and a schedule that discounted any of them is one an adversary picks
+/// the cheap entry from.
+const fn settled_apart(outcome: &Outcome, payer: PayerFee) -> bool {
     match outcome {
-        // Completed here means the engine applied the effects. Only a
-        // tick can still discard them, and only for a cross-shard leg —
-        // that receipt is built in reserve and settles the floor if the
-        // abort comes.
-        Outcome::Completed { .. } => {
-            if payer.abortable {
-                Some(payer.floor)
-            } else {
-                None
-            }
-        }
-        // The sender's own defect, and the only class worth grinding: it
-        // pays the ceiling it declared. Not the work consumed — that is
-        // unknowable — but the sender chose the bound, and anything less
-        // leaves failure discounted against success.
-        Outcome::UserError { .. } => Some(payer.max_fee),
-        // A lost deterministic race. The sender did nothing wrong and
-        // could not have avoided it, so it pays only the floor covering
-        // the declaration work its attempt really did consume.
-        //
-        // A signed edge bound the produced amount missed is the same
-        // class: the sender declared what it would accept and the world
-        // moved between signing and execution. So is a spent subintent —
-        // a conflict tiebreak or a stale declaration, neither of which a
-        // composer can see at signing time. And so is an unauthorized
-        // call: a stored rule can change between signing and execution,
-        // so presented authority a target no longer admits is a stale
-        // declaration, not a defect. A write whose presence requirement
-        // the committed leaf no longer meets joins them on the same
-        // reading: a leaf somebody else created or removed is the same
-        // event as a rule they changed.
-        //
-        // A declared refusal joins them and is the one that need not
-        // stay: the export returned, so unlike every other abort here
-        // its consumed work is agreed between the runtimes and already
-        // attested on the receipt, which is what a refundable execution
-        // charge would settle against. Until one exists it pays the
-        // floor, and the discount a package could engineer by burning
-        // its budget before declining is bounded by that transaction's
-        // own gas.
-        // A discarded baseline is the same lost race one step removed:
-        // a group-mate flipped at apply and this execution read writes
-        // that never committed. Nothing the sender signed caused it.
-        // A crossing another party already took, or one this execution
-        // already issued, joins them on the nullifier's reading: the
-        // cell is committed state no composer could have read at
-        // signing time.
-        Outcome::Infeasible { .. }
+        Outcome::Completed { .. } => payer.abortable,
+        Outcome::UserError { .. }
+        | Outcome::Infeasible { .. }
         | Outcome::ConstraintUnmet { .. }
         | Outcome::NullifierSpent { .. }
         | Outcome::EscrowAlreadyClaimed { .. }
         | Outcome::EscrowAlreadyIssued { .. }
         | Outcome::ConditionUnmet { .. }
         | Outcome::BaselineDiscarded { .. }
-        | Outcome::Declined { .. } => Some(payer.floor),
-        // The kernel's own defect. `materialize_abort` refuses to price
-        // it to the sender, and the burn agrees.
-        Outcome::ProtocolError { .. } => None,
+        | Outcome::Declined { .. }
+        | Outcome::ProtocolError { .. } => true,
     }
 }
 
@@ -842,16 +799,16 @@ struct FoldState {
 }
 
 /// Build the receipt an abort of this transaction settles: the payer's
-/// vault debited by the class floor, and nothing else.
+/// vault debited by the declared price, and nothing else.
 ///
 /// A debit rather than a value, so it neither reads nor depends on what
 /// the vault held when the transaction ran. An abort discards this
-/// transaction's own effects, and the floor lands on whatever its
+/// transaction's own effects, and the price lands on whatever its
 /// siblings left — which is what a movement means and what an absolute
 /// computed here could not have expressed without re-deriving their
 /// burns.
 ///
-/// Shared with the abandonment path, which settles the same floor for a
+/// Shared with the abandonment path, which settles the same price for a
 /// transaction that never reached the engine: both are the same charge
 /// on the same vault, and two builders would be two receipt hashes for
 /// one verdict.
@@ -861,11 +818,11 @@ pub fn build_fee_receipt(
     shard_trie: &ShardTrie,
     tx_hash: TxHash,
     vault: SubstateKey,
-    floor: u128,
+    amount: u128,
 ) -> ConsensusReceipt {
     let writes = StateWrites {
         cells: BTreeMap::new(),
-        movements: BTreeMap::from([(vault, Movement::debit(*XRD, floor))]),
+        movements: BTreeMap::from([(vault, Movement::debit(*XRD, amount))]),
         entries: BTreeMap::new(),
     };
     let receipt_hash = GlobalReceipt::new(
@@ -875,7 +832,7 @@ pub fn build_fee_receipt(
         writes_root(&writes),
     )
     .receipt_hash();
-    // No gas: this receipt settles a floor, it does not report execution.
+    // No gas: this receipt settles a price, it does not report execution.
     // The transaction whose abort it settles consumed real work, but that
     // work is unattested — a failed outcome carries no gas either — so an
     // abort contributes nothing to its shard's emission weight. Pricing
@@ -883,7 +840,7 @@ pub fn build_fee_receipt(
     let cached = CachedOutput::succeeded(
         writes,
         receipt_hash,
-        vm_metadata(0, None),
+        vm_metadata(amount, None),
         0,
         Vec::new(),
         Vec::new(),
@@ -920,6 +877,7 @@ fn assemble_published_tx(
 ) -> ExecutedTx {
     let tx_hash = vm_tx;
     let work = publish_work(artifact);
+    let charged = fee.map_or(0, |payer| u128::from(work).min(payer.max_fee));
 
     // Admission reached the whole verdict from these same bytes, so a
     // refusal here means the transaction bypassed admission — the same
@@ -938,7 +896,7 @@ fn assemble_published_tx(
                     .cells
                     .insert(package_key(publisher, package), Some(artifact.to_vec()));
             }
-            apply_fee_burn(&mut writes, fee, work);
+            apply_fee_burn(&mut writes, fee, u128::from(work));
             let receipt_hash = GlobalReceipt::new(
                 true,
                 EventRoot::ZERO,
@@ -961,14 +919,14 @@ fn assemble_published_tx(
             CachedOutput::succeeded(
                 writes,
                 receipt_hash,
-                vm_metadata(work, None),
+                vm_metadata(charged, None),
                 work,
                 Vec::new(),
                 witnesses,
                 Vec::new(),
             )
         },
-        |reason| CachedOutput::failed(vm_metadata(work, Some(reason.clone()))),
+        |reason| CachedOutput::failed(vm_metadata(charged, Some(reason.clone()))),
     );
     // A refused artifact is the sender's own defect — they chose what to
     // publish — so it pays the ceiling, exactly as a trap does. Charging
@@ -1084,16 +1042,18 @@ fn assemble_executed_tx(
         legs,
     } = kernel;
     let tx_hash = vm_tx;
-    let fee_receipt = fee.and_then(|payer| {
-        let amount = charge_for(&receipt.outcome, payer)?;
-        Some(build_fee_receipt(
-            ctx.local_shard,
-            ctx.shard_trie,
-            tx_hash,
-            payer.vault,
-            amount,
-        ))
-    });
+    let charged = fee.map_or(0, |payer| payer.price.min(payer.max_fee));
+    let fee_receipt = fee
+        .filter(|payer| settled_apart(&receipt.outcome, *payer))
+        .map(|payer| {
+            build_fee_receipt(
+                ctx.local_shard,
+                ctx.shard_trie,
+                tx_hash,
+                payer.vault,
+                payer.price.min(payer.max_fee),
+            )
+        });
     let cached = if matches!(receipt.outcome, Outcome::Completed { .. }) {
         // What the receipt carries: exclusive writes as absolutes,
         // everything commutative as the movement it was. Unresolved,
@@ -1119,7 +1079,7 @@ fn assemble_executed_tx(
         for (key, change) in resolved.entries() {
             fold.running_entries.insert(*key, change.clone());
         }
-        apply_fee_burn(&mut writes, fee, receipt.fuel);
+        apply_fee_burn(&mut writes, fee, fee.map_or(0, |payer| payer.price));
         // The kernel's record is the wire record — one shared type, so
         // there is nothing to convert.
         let events: Vec<Event> = receipt.events.clone();
@@ -1181,17 +1141,14 @@ fn assemble_executed_tx(
         CachedOutput::succeeded(
             writes,
             receipt_hash,
-            vm_metadata(receipt.fuel, None),
+            vm_metadata(charged, None),
             receipt.fuel,
             events,
             witnesses,
             escrowed,
         )
     } else {
-        CachedOutput::failed(vm_metadata(
-            receipt.fuel,
-            Some(abort_reason(&receipt.outcome)),
-        ))
+        CachedOutput::failed(vm_metadata(charged, Some(abort_reason(&receipt.outcome))))
     };
     let mut executed = project_to_shard(&cached, tx_hash, ctx.local_shard, ctx.shard_trie);
     executed.fee_receipt = fee_receipt;
@@ -1405,12 +1362,22 @@ impl Executor {
                 if ctx.shard_trie.shard_for_prefix(vault.owner) != ctx.local_shard {
                     return None;
                 }
+                // A reclaim is a second execution of a transaction this
+                // shard already charged when its leg ran: it takes an
+                // escrow back and burns nothing, so the price is levied
+                // exactly once by construction.
+                if matches!(
+                    shapes.get(&tx.hash()).map(|shape| &shape.runs),
+                    Some(Runs::Reclaim)
+                ) {
+                    return None;
+                }
                 Some((
                     tx.hash(),
                     PayerFee {
                         vault,
                         max_fee: vm.max_fee,
-                        floor: vm.abort_floor(),
+                        price: tx.price(),
                         abortable: shapes.get(&tx.hash()).is_some_and(|shape| shape.abortable),
                     },
                 ))
@@ -1603,135 +1570,61 @@ mod tests {
 
     use super::*;
 
-    /// A declared refusal is priced as the lost race it is, not as the
-    /// defect it is not.
-    ///
-    /// The whole point of the class is that an author who declares a
-    /// failure ends up better off than one who traps into the same
-    /// outcome; pricing both at the ceiling would leave the fee schedule
-    /// arguing against the ergonomics.
+    /// One price, whatever refused it. A completed run carries the burn
+    /// in its own writes and settles it apart only where a tick can
+    /// still discard them; every attempt that applied no effects — a
+    /// lost race, a declared refusal, the sender's own defect, the
+    /// kernel's — settles the same price apart, so no failure is the
+    /// cheaper way to buy execution and no class is anyone's to place.
     #[test]
-    fn a_decline_pays_the_floor_and_a_trap_pays_the_ceiling() {
-        let payer = PayerFee {
+    fn every_attempt_settles_the_one_declared_price() {
+        let payer = |abortable: bool| PayerFee {
             vault: SubstateKey {
                 owner: Address::new([1; 31], AddressClass::Component),
                 local: LocalKey([0; 16]),
             },
-            floor: 7,
             max_fee: 1_000,
-            abortable: false,
+            price: 7,
+            abortable,
         };
-        assert_eq!(
-            charge_for(&Outcome::Declined { node: 0, code: 3 }, payer),
-            Some(payer.floor)
-        );
-        assert_eq!(
-            charge_for(
-                &Outcome::UserError {
-                    reason: AbortReason::Unreachable
-                },
-                payer
-            ),
-            Some(payer.max_fee)
-        );
-    }
-
-    /// A presence requirement the committed leaf no longer meets is the
-    /// same lost race a changed rule is, and pays the same floor.
-    ///
-    /// The protocol cannot tell a sender who declared wrongly from one
-    /// somebody raced to the leaf — the two leave identical state — so
-    /// pricing the ambiguity at the ceiling would charge every honest
-    /// loser to reach the careless caller, and would make any leaf a
-    /// third party can create a lever for spending somebody else's
-    /// declared maximum.
-    #[test]
-    fn an_unmet_presence_pays_the_floor_a_changed_rule_pays() {
-        let payer = PayerFee {
-            vault: SubstateKey {
-                owner: Address::new([1; 31], AddressClass::Component),
-                local: LocalKey([0; 16]),
-            },
-            floor: 7,
-            max_fee: 1_000,
-            abortable: false,
+        let completed = Outcome::Completed {
+            answers: Vec::new(),
         };
+        assert!(
+            !settled_apart(&completed, payer(false)),
+            "a completed run burns inside its writes"
+        );
+        assert!(
+            settled_apart(&completed, payer(true)),
+            "unless a tick can still discard them"
+        );
         let leaf = EffectTarget::Point(SubstateKey {
             owner: Address::new([2; 31], AddressClass::Component),
             local: LocalKey([9; 16]),
         });
-        // A declared condition is the same precondition-on-committed-state
-        // class, in both of the shapes it is judged in.
-        assert_eq!(
-            charge_for(
-                &Outcome::ConditionUnmet {
-                    condition: UnmetCondition::Holds {
-                        target: leaf,
-                        required: Presence::Present,
-                        node: None,
-                    },
-                },
-                payer
-            ),
-            Some(payer.floor),
-        );
-        assert_eq!(
-            charge_for(
-                &Outcome::ConditionUnmet {
-                    condition: UnmetCondition::Satisfies { node: 0 },
-                },
-                payer
-            ),
-            Some(payer.floor),
-        );
-    }
-
-    /// A transaction that lost value costs its sender nothing.
-    ///
-    /// Every other abort here is priced, because charging nothing makes
-    /// failure the cheaper way to buy execution. This one is the
-    /// exception and has to be: the outcome names the kernel, not the
-    /// sender, so a sender charged for it would be paying for a defect.
-    /// What keeps the exception from being a free-execution lever is that
-    /// nothing a package can express reaches it — value moves only
-    /// through buckets, every bucket names what it carries, and a
-    /// declaration calling one cell two resources is refused before any
-    /// body runs.
-    #[test]
-    fn a_kernel_defect_is_priced_to_nobody() {
-        let payer = PayerFee {
-            vault: SubstateKey {
-                owner: Address::new([1; 31], AddressClass::Component),
-                local: LocalKey([0; 16]),
+        for outcome in [
+            Outcome::Declined { node: 0, code: 3 },
+            Outcome::UserError {
+                reason: AbortReason::Unreachable,
             },
-            floor: 7,
-            max_fee: 1_000,
-            abortable: false,
-        };
-        assert_eq!(
-            charge_for(
-                &Outcome::ProtocolError {
-                    reason: AbortReason::ValueNotConserved
+            Outcome::ConditionUnmet {
+                condition: UnmetCondition::Holds {
+                    target: leaf,
+                    required: Presence::Present,
+                    node: None,
                 },
-                payer
-            ),
-            None,
-        );
-        // The sole exception: every abort a sender can reach is priced,
-        // whichever end of the schedule it lands on.
-        assert!(
-            charge_for(&Outcome::Declined { node: 0, code: 3 }, payer).is_some(),
-            "a declared refusal pays"
-        );
-        assert!(
-            charge_for(
-                &Outcome::UserError {
-                    reason: AbortReason::Unreachable
-                },
-                payer
-            )
-            .is_some(),
-            "and so does a trap"
-        );
+            },
+            Outcome::ConditionUnmet {
+                condition: UnmetCondition::Satisfies { node: 0 },
+            },
+            Outcome::ProtocolError {
+                reason: AbortReason::ValueNotConserved,
+            },
+        ] {
+            assert!(
+                settled_apart(&outcome, payer(false)),
+                "{outcome:?} settles the price apart"
+            );
+        }
     }
 }

@@ -44,16 +44,15 @@ use crate::{
 /// What an abort of one transaction burns, and out of whose vault.
 ///
 /// Both are functions of signed content — the vault the fee payer's
-/// address derives, the floor its declared class fixes — so the receipt
-/// settling an abort is the same receipt on every replica whether or not
-/// the transaction ever reached an engine.
+/// address derives, the amount its declaration prices to — so the
+/// receipt settling an abort is the same receipt on every replica
+/// whether or not the transaction ever reached an engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
 pub struct AbortCharge {
     /// The fee payer's vault, which the burn debits.
     pub vault: SubstateKey,
-    /// The class floor: what an attempt owes when nothing it did was its
-    /// sender's fault.
-    pub floor: u128,
+    /// The declared price: what every attempt owes, whatever refused it.
+    pub amount: u128,
 }
 
 /// One transaction a counterpart can never settle, with what abandoning
@@ -84,7 +83,7 @@ impl UnsettledTx {
     /// them and a voter checking the restatement compute one value: the
     /// deadline is the validity end plus [`MAX_FINALIZATION_DELAY`], the
     /// reservation is the declared work, and the charge is the fee vault
-    /// at the abort floor.
+    /// at the declared price.
     ///
     /// # Panics
     ///
@@ -100,7 +99,7 @@ impl UnsettledTx {
             declared_work: tx.work(),
             charge: AbortCharge {
                 vault: tx.fee_vault(),
-                floor: tx.body().abort_floor(),
+                amount: tx.price(),
             },
         }
     }
@@ -327,7 +326,7 @@ mod tests {
                     owner: Address::new([seed; 31], AddressClass::Component),
                     local: LocalKey([seed; 16]),
                 },
-                floor: u128::from(seed) * 3,
+                amount: u128::from(seed) * 3,
             },
         }
     }

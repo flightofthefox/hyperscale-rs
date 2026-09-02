@@ -962,7 +962,8 @@ impl ExecutionCoordinator {
             // vault settles it — the same question the engine asks of the
             // payers it prices.
             if trie.shard_for_prefix(charge.vault.owner) == local_shard {
-                let fee = build_fee_receipt(local_shard, trie, tx_hash, charge.vault, charge.floor);
+                let fee =
+                    build_fee_receipt(local_shard, trie, tx_hash, charge.vault, charge.amount);
                 state.record_fee_receipt(StoredReceipt::synced(tx_hash, Arc::new(fee)));
             }
             self.candidates.remove(tx_hash);
@@ -6973,7 +6974,7 @@ mod tests {
             state.counterpart_trie(&schedule),
             tx.hash(),
             tx.fee_vault(),
-            tx.body().abort_floor(),
+            tx.price(),
         );
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
@@ -7671,7 +7672,7 @@ mod tests {
     /// abandonment deadline, and the commits between that tick's
     /// composition and its certificate would otherwise abandon the member
     /// it is about to speak for — discarding the tick that carries the
-    /// charge. `abort_floor_settles_on_deadline` is the scenario.
+    /// charge. `abort_charges_the_price_on_deadline` is the scenario.
     #[test]
     fn a_tick_that_has_not_attested_withholds_the_abort() {
         let schedule = make_test_topology();
@@ -7846,7 +7847,7 @@ mod tests {
                             owner: Address::new([9; 31], AddressClass::Component),
                             local: LocalKey([9; 16]),
                         },
-                        floor: 5,
+                        amount: 5,
                     },
                 }],
             )]);
@@ -8060,7 +8061,7 @@ mod tests {
     /// counterpart's fate. It is about to attest the transaction itself,
     /// and that verdict can carry a charge an abandonment cannot — a
     /// payer's leg joins a tick at its engagement deadline, which *is* its
-    /// abandonment deadline. `abort_floor_settles_on_deadline` is the
+    /// abandonment deadline. `abort_charges_the_price_on_deadline` is the
     /// scenario.
     #[test]
     fn the_tick_composing_now_keeps_the_member_it_just_took() {

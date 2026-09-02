@@ -1683,7 +1683,7 @@ pub fn test_undischarged_record_holds_the_floor(
             declared_work: stranded.work(),
             charge: AbortCharge {
                 vault: stranded.fee_vault(),
-                floor: stranded.body().abort_floor(),
+                amount: stranded.price(),
             },
         }],
     );
