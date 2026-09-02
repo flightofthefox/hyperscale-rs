@@ -23,7 +23,7 @@ use hyperscale_scenarios::tx::{
     unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
-    Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig,
+    Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
     a_failed_attempt_still_attests_work, a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_published_package_matures_before_it_runs,
@@ -43,7 +43,8 @@ use hyperscale_scenarios::{
     events_land_on_their_emitters_home_shard, failure_charges_its_payer,
     gossip_drop_engages_fetch_fallback, grow_reaches_four_shard_topology,
     grow_reaches_two_shard_topology, halted_shard_recovers_by_committee_redraw,
-    halted_shard_straddler_atomic, hot_recipient, insolvent_payer_engages_nothing,
+    halted_shard_straddler_atomic, hot_recipient, hot_venue_clears_swaps,
+    hot_venue_clears_swaps_on, insolvent_payer_engages_nothing,
     inter_shard_partition_strands_ticks_until_it_heals, isolated_validator_still_settles,
     livelock_resolves_promptly, liveness_baseline, merge_boundary_admits_an_uncommitted_precut_tx,
     merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
@@ -64,6 +65,7 @@ use hyperscale_scenarios::{
     split_terminating_payer_releases_its_reservation, split_train_genesis_accounts,
     stake_withdraw_drops_effective_stake, surviving_sibling_split_seats_full_committees,
     unbound_payer_engages_nothing, unbound_remote_payer_engages_nothing, venue_genesis_accounts,
+    venue_genesis_accounts_on, wide_swapper_shards,
     withdrawal_ejects_a_validator_that_a_deposit_reactivates, withdrawals_compose_over_one_vault,
     zipf_payments,
 };
@@ -355,6 +357,45 @@ fn route_cluster() -> SimCluster {
         &route_genesis_accounts(),
         GenesisPackages::with_fixtures(),
     )
+}
+
+/// A venue on one quarter of a four-shard world and its callers spread
+/// over the other three.
+fn wide_venue_cluster() -> SimCluster {
+    SimCluster::with_grown_packages(
+        &ScenarioConfig {
+            num_shards: 4,
+            pool_surplus: 14,
+            ..cross_shard_config()
+        },
+        42,
+        &venue_genesis_accounts_on(WIDE_VENUE_SHARD, &wide_swapper_shards()),
+        GenesisPackages::with_fixtures(),
+    )
+}
+
+/// The fan-in bar: a venue priced from three caller shards clears its
+/// queue no slower than one priced from a single caller shard. A venue's
+/// cost is the hold on its own cells, not a round trip per caller, and
+/// this is the property a regression eats first.
+#[test]
+fn a_hot_venue_clears_swaps_no_slower_fanned_in_sim() {
+    let mut narrow = venue_cluster();
+    let single = hot_venue_clears_swaps(&mut narrow, epochs(40));
+    let mut wide = wide_venue_cluster();
+    let fanned = hot_venue_clears_swaps_on(
+        &mut wide,
+        WIDE_VENUE_SHARD,
+        &wide_swapper_shards(),
+        epochs(40),
+    );
+    assert!(
+        fanned.elapsed <= single.elapsed,
+        "fan-in from three caller shards must be no worse than from one: \
+         {:?} against {:?}",
+        fanned.elapsed,
+        single.elapsed,
+    );
 }
 
 #[test]

@@ -37,9 +37,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::{
-    Classified, Placement, Runs, Side, crossings_of, decomposition_enabled,
-};
+use hyperscale_engine::legs::{Classified, Placement, Runs, Side, crossings_of};
 use hyperscale_engine::{TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_unresolvable_tx};
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
@@ -781,14 +779,7 @@ impl ExecutionCoordinator {
         let members: Vec<CommittedMember> = members
             .into_iter()
             .map(|(tx, participating)| CommittedMember {
-                // Frozen honestly, and carried only where the build runs
-                // divided shapes: under `whole-shape` every member is the
-                // whole shape, and nothing reads a core set for one.
-                classified: if decomposition_enabled() {
-                    Classified::freeze(tx.legs(), placement)
-                } else {
-                    Classified::whole()
-                },
+                classified: Classified::freeze(tx.legs(), placement),
                 tx,
                 participating,
             })

@@ -21,19 +21,6 @@ use hyperscale_vm_types::{Crossing, LegRole, LegShape, ProtocolHasher, SubstateK
 
 use crate::sharding::TrieShardResolver;
 
-/// Whether a transaction the classifier says decomposes is run leg by
-/// leg.
-///
-/// A build-time fact, not a strategy threaded through the pipeline:
-/// every replica of every shard answers alike, so the frozen
-/// classification is the same answer everywhere. Off only under the
-/// `whole-shape` feature — the comparison build the decomposition
-/// scenarios are held against.
-#[must_use]
-pub const fn decomposition_enabled() -> bool {
-    !cfg!(feature = "whole-shape")
-}
-
 /// The trie and the departing set, read together.
 ///
 /// A caller taking one at this anchor and the other at another would
@@ -136,10 +123,6 @@ impl Side {
 impl Classified {
     /// Freeze `legs` against `placement`: the classifier's own answer,
     /// and the core set beside it.
-    ///
-    /// Whether a build runs divided shapes at all is
-    /// [`decomposition_enabled`]'s question, asked by the coordinator
-    /// that freezes — so this answers honestly wherever it is asked.
     #[must_use]
     pub fn freeze(legs: &[LegShape], placement: Placement<'_>) -> Self {
         let decomposed = decomposes(legs, placement);

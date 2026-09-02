@@ -19,7 +19,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
-use hyperscale_engine::legs::{Classified, Placement, decomposition_enabled};
+use hyperscale_engine::legs::{Classified, Placement};
 use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash,
     LocalTimestamp, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger,
@@ -280,10 +280,9 @@ pub fn select_transactions(
 /// every leg here a delivery.
 ///
 /// Computed against the block's own anchor by the proposer selecting
-/// and by every voter checking, so the set is one set. Empty under the
-/// `whole-shape` build, where nothing is frozen divided, and empty when
-/// the anchor's window is not retained — a block there is refused on
-/// other grounds.
+/// and by every voter checking, so the set is one set. Empty when the
+/// anchor's window is not retained — a block there is refused on other
+/// grounds.
 #[must_use]
 pub fn late_deliveries<T: Deref<Target = Transaction>>(
     txs: &[Arc<T>],
@@ -291,9 +290,6 @@ pub fn late_deliveries<T: Deref<Target = Transaction>>(
     anchor: WeightedTimestamp,
     local_shard: ShardId,
 ) -> HashSet<TxHash> {
-    if !decomposition_enabled() {
-        return HashSet::new();
-    }
     let ScheduleLookup::Committee(snapshot) = topology_schedule.lookup(anchor) else {
         return HashSet::new();
     };
