@@ -390,7 +390,9 @@ pub fn pool_transfer_moves_operatorship(c: &mut impl Cluster) {
     // The buyer operates, across shards, and both chains carry it. An
     // inert ballot: the disarmed threshold it votes for is the one the
     // cluster already runs under, so the vote proves custody and moves
-    // no parameter.
+    // no parameter. The buyer's shard runs the leg presenting the badge
+    // and the pool's shard is the core, so the two commit a hop apart
+    // and the second is waited for.
     let vote = build_reshape_threshold_vote_tx(
         &buyer_key,
         u64::MAX,
@@ -399,11 +401,13 @@ pub fn pool_transfer_moves_operatorship(c: &mut impl Cluster) {
     );
     let vote_hash = vote.hash();
     submit_committed(c, vote);
-    let (left, _) = c.chain_fate(ShardId::leaf(1, 0), vote_hash);
-    let (right, _) = c.chain_fate(ShardId::leaf(1, 1), vote_hash);
+    let (left, right) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
     assert!(
-        left.is_some() && right.is_some(),
-        "a cross-shard custody vote must commit on both legs",
+        c.run_until(epochs(6), |c| c.chain_fate(left, vote_hash).0.is_some()
+            && c.chain_fate(right, vote_hash).0.is_some()),
+        "a cross-shard custody vote must commit on both legs: left={:?}, right={:?}",
+        c.chain_fate(left, vote_hash).0,
+        c.chain_fate(right, vote_hash).0,
     );
 
     // The seller no longer holds the badge, and the gate says so.
