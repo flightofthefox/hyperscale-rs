@@ -610,8 +610,13 @@ impl BlockCommitCoordinator {
         let block_hash = commit.certified.block().hash();
         let height = commit.certified.block().height();
 
-        // Skip blocks already persisted by the sync path.
-        if height <= self.persisted_height {
+        // Skip blocks at or below the store's write frontier: persisted by
+        // the sync path, or handed to the store by an earlier flush whose
+        // `BlockPersisted` has not come back yet. Every hosted vnode in
+        // the shard commits the same block, and the first one's flush
+        // empties `pending` before the next one's `CommitBlock` arrives,
+        // so `pending` alone cannot dedup them.
+        if height <= self.flushed_height.max(self.persisted_height) {
             return AccumulateDecision::Skip;
         }
 
@@ -1054,6 +1059,40 @@ mod tests {
                 AccumulateDecision::Skip
             ));
         }
+        assert_eq!(coord.pending_len(), 0);
+    }
+
+    #[test]
+    fn accumulate_skips_block_already_flushed_but_not_yet_persisted() {
+        let committee = TestCommittee::new(4, 1);
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
+        let sink = empty_sink();
+        let (tx, _rx) = unbounded();
+        let dispatch = SyncDispatch::new();
+
+        enqueue(
+            &mut coord,
+            &committee,
+            BlockHeight::new(1),
+            CommitSource::Aggregator,
+            Arc::clone(&sink),
+        );
+        coord.flush(&tx, &dispatch);
+        assert_eq!(committed_heights(&sink), vec![1]);
+        assert_eq!(coord.persisted_height().inner(), 0);
+
+        // A second hosted vnode commits the same block after the first
+        // one's flush emptied `pending` and before `BlockPersisted` lands.
+        let (dup, _) = make_commit(
+            &committee,
+            BlockHeight::new(1),
+            CommitSource::Aggregator,
+            Arc::clone(&sink),
+        );
+        assert!(matches!(
+            coord.accumulate(dup, now()),
+            AccumulateDecision::Skip
+        ));
         assert_eq!(coord.pending_len(), 0);
     }
 
