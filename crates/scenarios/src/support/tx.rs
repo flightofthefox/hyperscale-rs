@@ -416,19 +416,21 @@ pub fn fixture_flash_bytes() -> u64 {
         .sum()
 }
 
-/// The genesis funding and transfers for a train into the splitter across
-/// its split's admission.
-pub struct SplitTrainSetup {
+/// The genesis funding and transfers for a train into a shard across its
+/// reshape.
+pub struct TrainSetup {
     /// Genesis accounts: the byte skew plus every leg's payer and recipient.
     pub accounts: Vec<(PrincipalAddr, u128)>,
-    /// One transfer per leg, survivor payer into splitter recipient, each
-    /// from its own payer so the train never waits on a reservation.
+    /// One transfer per leg, a surviving shard's payer into the
+    /// terminating shard's recipient, each from its own payer so the
+    /// train never waits on a reservation.
     pub legs: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
 }
 
-/// Build the split-train genesis funding and its `count` legs.
+/// Build the split-train genesis funding and its `count` legs: survivor
+/// payers into splitter recipients over the split-straddler byte skew.
 #[must_use]
-pub fn split_train_setup(count: usize) -> SplitTrainSetup {
+pub fn split_train_setup(count: usize) -> TrainSetup {
     let mut accounts = split_ballast_accounts();
     let mut taken = Vec::new();
     let legs = (0..count)
@@ -442,7 +444,28 @@ pub fn split_train_setup(count: usize) -> SplitTrainSetup {
             )
         })
         .collect();
-    SplitTrainSetup { accounts, legs }
+    TrainSetup { accounts, legs }
+}
+
+/// Build the merge-train genesis funding and its `count` legs: survivor
+/// payers into merge-left recipients over the merge-straddler byte skew.
+#[must_use]
+pub fn merge_train_setup(count: usize) -> TrainSetup {
+    let mut accounts = Vec::new();
+    merge_survivor_ballast(&mut accounts);
+    let mut taken = Vec::new();
+    let legs = (0..count)
+        .map(|_| {
+            transfer_leg(
+                MERGE_STRADDLER_SURVIVOR,
+                MERGE_STRADDLER_LEFT,
+                4,
+                &mut taken,
+                &mut accounts,
+            )
+        })
+        .collect();
+    TrainSetup { accounts, legs }
 }
 
 /// Build the split-straddler genesis funding and straddler transfers.
@@ -491,6 +514,25 @@ pub fn split_straddler_setup() -> SplitStraddlerSetup {
     }
 }
 
+/// Lift the surviving quarters (`leaf(2, 2)` and `leaf(2, 3)`) above
+/// `merge_bytes`, so neither emits an unpairable merge against the other
+/// and churns the schedule, while the lighter pair stays under it.
+fn merge_survivor_ballast(accounts: &mut Vec<(PrincipalAddr, u128)>) {
+    let num_shards = 4;
+    ballast(
+        MERGE_STRADDLER_SURVIVOR,
+        num_shards,
+        MERGE_SURVIVOR_BULK,
+        accounts,
+    );
+    ballast(
+        ShardId::leaf(2, 3),
+        num_shards,
+        MERGE_SURVIVOR_BULK,
+        accounts,
+    );
+}
+
 /// Build the merge-straddler genesis funding and straddler transfers.
 ///
 /// Across the four-shard topology the surviving quarters (`leaf(2, 2)`/`leaf(2,
@@ -503,21 +545,7 @@ pub fn split_straddler_setup() -> SplitStraddlerSetup {
 pub fn merge_straddler_setup() -> MergeStraddlerSetup {
     let num_shards = 4;
     let mut accounts = Vec::new();
-
-    // Lift the surviving quarters above `merge_bytes` so neither emits an
-    // unpairable merge against the other and churns the schedule.
-    ballast(
-        MERGE_STRADDLER_SURVIVOR,
-        num_shards,
-        MERGE_SURVIVOR_BULK,
-        &mut accounts,
-    );
-    ballast(
-        ShardId::leaf(2, 3),
-        num_shards,
-        MERGE_SURVIVOR_BULK,
-        &mut accounts,
-    );
+    merge_survivor_ballast(&mut accounts);
 
     let mut taken = Vec::new();
     let straddlers = (0..MERGE_STRADDLER_COUNT)

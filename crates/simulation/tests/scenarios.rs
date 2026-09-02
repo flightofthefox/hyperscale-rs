@@ -32,7 +32,8 @@ use hyperscale_scenarios::{
     a_spent_nullifier_is_swept_once_unreachable, a_swap_charges_its_caller_its_input_and_one_price,
     a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,
     a_swap_the_venue_refuses_gives_its_caller_back_its_leg,
-    a_train_into_a_splitter_strands_nothing, abort_converges, attested_load_reaches_the_beacon,
+    a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
+    abort_converges, attested_load_reaches_the_beacon,
     beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
     cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
     cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
@@ -48,7 +49,7 @@ use hyperscale_scenarios::{
     inter_shard_partition_strands_ticks_until_it_heals, isolated_validator_still_settles,
     livelock_resolves_promptly, liveness_baseline, merge_boundary_admits_an_uncommitted_precut_tx,
     merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
-    minority_fragment_rejoins_after_partition, multi_vnode_progress,
+    merge_train_genesis_accounts, minority_fragment_rejoins_after_partition, multi_vnode_progress,
     nullifier_race_admits_exactly_one, participant_count_sweep, partition_halts_and_heals,
     partition_heals_at_exact_quorum, pool_capacity_caps_registrations,
     pool_transfer_moves_operatorship, preview_reports_resource_changes,
@@ -1230,6 +1231,16 @@ fn merge_straddler_atomic_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&merge_straddler_config(), 11, &setup.accounts);
     merge_straddler_atomic(&mut cluster);
+}
+
+#[test]
+fn a_train_into_a_merging_shard_strands_nothing_sim() {
+    let mut cluster = SimCluster::with_grown_accounts(
+        &merge_straddler_config(),
+        11,
+        &merge_train_genesis_accounts(),
+    );
+    a_train_into_a_merging_shard_strands_nothing(&mut cluster);
 }
 
 /// Multi-vnode config: two vnodes per host (same-shard multi-vnode hosting), the

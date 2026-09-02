@@ -72,8 +72,9 @@ pub use route::{
     route_genesis_accounts,
 };
 pub use route_reshape::{
-    SPLIT_TRAIN, a_departing_venue_clears_swaps_and_carries_on,
-    a_train_into_a_splitter_strands_nothing, departing_venue_ballast, departing_venue_split_bytes,
+    MERGE_TRAIN, SPLIT_TRAIN, a_departing_venue_clears_swaps_and_carries_on,
+    a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
+    departing_venue_ballast, departing_venue_split_bytes, merge_train_genesis_accounts,
     split_train_genesis_accounts,
 };
 pub use straddler::{

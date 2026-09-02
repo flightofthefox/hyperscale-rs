@@ -3,18 +3,20 @@
 //!
 //! A shard scheduled to leave refuses to decompose anything reaching it —
 //! a record written for a shard with no round left would have nowhere to
-//! be claimed — so from a split's admission to its cut every shape
-//! touching the splitter runs whole, and after the cut its cells sit
-//! under a child and shapes divide again. What these scenarios pin is
-//! that both halves of that rule settle and that the seam between them
-//! strands nothing: the classification is taken once per shard at its
-//! own commit, and a transfer whose payer committed just before the
-//! admission fold and whose delivery lands just after is the shape that
-//! would read one answer on one side and the other on the other.
+//! be claimed — so from a split's admission or a merge's pairing to its
+//! cut every shape touching the leaving shard runs whole, and after the
+//! cut its cells sit under a successor and shapes divide again. What
+//! these scenarios pin is that both halves of that rule settle and that
+//! the seam between them strands nothing: the classification is taken
+//! once per shard at its own commit, and a transfer whose payer committed
+//! just before the admission fold and whose delivery lands just after is
+//! the shape that would read one answer on one side and the other on the
+//! other.
 
 use hyperscale_engine::XRD;
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, PrincipalAddr, TransactionDecision, TransactionStatus, TxHash,
+    BlockHeight, Ed25519PrivateKey, PrincipalAddr, ShardId, TransactionDecision, TransactionStatus,
+    TxHash,
 };
 
 use crate::reshape::split_lifecycle;
@@ -23,10 +25,13 @@ use crate::straddler::{
     vote_splitter_down_to,
 };
 use crate::support::conservation::{Charges, World};
-use crate::support::query::{anchored_genesis_height, held, held_at, split_admitted};
+use crate::support::query::{
+    anchored_genesis_height, held, held_at, merge_keeper_count, split_admitted,
+};
 use crate::support::tx::{
-    STRADDLER_SPLITTER, STRADDLER_SURVIVOR, build_swap_tx, build_transfer_tx, fixture_flash_bytes,
-    split_ballast_accounts_over, split_train_setup, validity_around,
+    MERGE_STRADDLER_LEFT, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, build_swap_tx, build_transfer_tx,
+    fixture_flash_bytes, merge_train_setup, split_ballast_accounts_over, split_train_setup,
+    validity_around,
 };
 use crate::support::wait::{await_anchor_seeded, await_serves, await_tx_terminal};
 use crate::support::{Budget, Cluster, epochs};
@@ -37,30 +42,37 @@ use crate::venue::{SWAP_INPUT, StockedVenue, reserve_cell, stand_up_venue, swapp
 /// per epoch with several to spare past it, one payer each.
 pub const SPLIT_TRAIN: usize = 48;
 
+/// The most transfers the train carries into the merging shard: enough
+/// to reach the pairing from the grow at a few submissions per epoch
+/// with several to spare past the gate, one payer each.
+pub const MERGE_TRAIN: usize = 32;
+
 /// Submissions per epoch: slow enough that the funded train outlasts a
-/// vote's lead and the admission it leads to, with transfers on both
+/// reshape's lead and the admission it leads to, with transfers on both
 /// sides of the fold.
 const TRAIN_PER_EPOCH: u64 = 2;
 
-/// Transfers the train keeps sending once the splitter's gate has
-/// drained: enough to reach its coast, where it includes nothing.
+/// Transfers the train keeps sending once the reshape's gate has
+/// drained: enough to reach the leaving shard's coast, where it includes
+/// nothing.
 const PAST_THE_GATE: usize = 6;
 
-/// Where the splitter stood when a transfer into it was submitted.
+/// Where the leaving shard stood when a transfer into it was submitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    /// No split admitted: the transfer divides and its delivery lands.
+    /// No reshape pending: the transfer divides and its delivery lands.
     Live,
-    /// The split admitted and pending: the splitter is departing, so the
-    /// transfer runs whole on both shards and still settles.
+    /// The reshape admitted and pending — a split admitted, a merge
+    /// paired: the shard is departing, so the transfer runs whole on both
+    /// shards and still settles.
     Departing,
-    /// The gate drained: the split no longer pends, the splitter still
+    /// The gate drained: the reshape no longer pends, the shard still
     /// includes for a while, then coasts on empty blocks to its terminal.
     /// A transfer it included settles; one it never included is either
     /// refused at the payer's deadline, crediting nobody, or — where the
-    /// payer read the splitter as no longer departing and divided it —
-    /// accepted on the payer's chain and delivered by the splitter's
-    /// child once the cut has landed the recipient's prefix there.
+    /// payer read the shard as no longer departing and divided it —
+    /// accepted on the payer's chain and delivered by the shard's
+    /// successor once the cut has landed the recipient's prefix there.
     Draining,
 }
 
@@ -84,6 +96,12 @@ pub fn departing_venue_split_bytes() -> u64 {
 #[must_use]
 pub fn split_train_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
     split_train_setup(SPLIT_TRAIN).accounts
+}
+
+/// Genesis funding for [`a_train_into_a_merging_shard_strands_nothing`].
+#[must_use]
+pub fn merge_train_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    merge_train_setup(MERGE_TRAIN).accounts
 }
 
 /// A venue whose shard is leaving keeps clearing swaps, and clears them
@@ -224,41 +242,126 @@ pub fn a_train_into_a_splitter_strands_nothing<C: Cluster>(c: &mut C) {
     let splitter = STRADDLER_SPLITTER;
     let setup = split_train_setup(SPLIT_TRAIN);
     split_lifecycle(c);
-    let world = World::open(
-        c,
-        *XRD,
-        setup
-            .legs
-            .iter()
-            .flat_map(|(_, from, to)| [from.address(), to.address()]),
-        [],
-    );
+    let world = train_world(c, &setup.legs);
     let mut charges = Charges::default();
 
+    let sent = drive_train(
+        c,
+        splitter,
+        &setup.legs,
+        &mut charges,
+        |c| split_admitted(c, splitter),
+        |c| cast_splitter_vote(c, straddler_split_bytes()),
+    );
+
+    let children = <[ShardId; 2]>::from(splitter.children());
+    assert_train_fates(c, splitter, &children, &sent);
+    world.assert_settles_within(c, &charges, epochs(8), "a train across a split's admission");
+}
+
+/// A train of transfers into a shard across its merge's pairing strands
+/// nothing: each reaches the fate its phase owes it, and the train's
+/// accounts are conserved throughout.
+///
+/// [`a_train_into_a_splitter_strands_nothing`] across the other reshape.
+/// The payers sit on the surviving quarter and the recipients on the
+/// merge-left child, which the grown topology's byte skew pairs with its
+/// sibling from the grow alone. A transfer every few blocks from before
+/// the pairing until the merging child has coasted, so the train holds
+/// every [`Phase`]: transfers divided before the pairing fold, ones run
+/// whole while the merge pended, and ones the coasting child never
+/// included, which the merged parent delivers once the cut has landed
+/// the recipient's prefix there. Requires the [`merge_train_setup`]
+/// funding on a config grown to four shards.
+///
+/// # Panics
+///
+/// Panics if the grown topology does not seat every quarter, if the
+/// train misses any phase or never reaches the coast, if a transfer's
+/// credit disagrees with its verdict, or if the train's accounts are not
+/// conserved.
+pub fn a_train_into_a_merging_shard_strands_nothing<C: Cluster>(c: &mut C) {
+    let merging = MERGE_STRADDLER_LEFT;
+    let parent = merging.parent().expect("a depth-2 leaf has a parent");
+    let setup = merge_train_setup(MERGE_TRAIN);
+    assert!(
+        (0..4).all(|path| await_serves(c, ShardId::leaf(2, path), epochs(4))),
+        "the grown four-shard topology must seat every quarter",
+    );
+    let world = train_world(c, &setup.legs);
+    let mut charges = Charges::default();
+
+    let sent = drive_train(
+        c,
+        merging,
+        &setup.legs,
+        &mut charges,
+        |c| merge_keeper_count(c, parent).is_some(),
+        |_| {},
+    );
+
+    assert_train_fates(c, merging, &[parent], &sent);
+    world.assert_settles_within(c, &charges, epochs(8), "a train across a merge's pairing");
+}
+
+/// Everything a train can reach: each leg's payer and recipient. The
+/// ballast holds the byte skew and never spends.
+fn train_world<C: Cluster>(
+    c: &C,
+    legs: &[(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)],
+) -> World {
+    World::open(
+        c,
+        *XRD,
+        legs.iter()
+            .flat_map(|(_, from, to)| [from.address(), to.address()]),
+        [],
+    )
+}
+
+/// Send `legs` into `terminating` one every few blocks until its reshape
+/// has drained and several more have gone after it, recording the phase
+/// each went in. `pending` reads whether the reshape is admitted and
+/// pending; `arm` runs once the cadence is measured, before the second
+/// leg — where a scenario casts the vote that starts its reshape.
+///
+/// # Panics
+///
+/// Panics if the train ends without a transfer sent in every [`Phase`].
+fn drive_train<C: Cluster>(
+    c: &mut C,
+    terminating: ShardId,
+    legs: &[(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)],
+    charges: &mut Charges,
+    pending: impl Fn(&C) -> bool,
+    arm: impl FnOnce(&mut C),
+) -> Vec<(TxHash, PrincipalAddr, Phase)> {
     // Block cadence is activity-driven, so the spacing is measured off
     // the first leg rather than assumed.
-    let mut legs = setup.legs.iter();
+    let mut legs = legs.iter();
     let mut sent: Vec<(TxHash, PrincipalAddr, Phase)> = Vec::new();
     let mut admitted_once = false;
-    let height = |c: &C| c.committed_height(splitter).map_or(0, BlockHeight::inner);
+    let height = |c: &C| {
+        c.committed_height(terminating)
+            .map_or(0, BlockHeight::inner)
+    };
     let before = height(c);
     send_leg(
         c,
         legs.next().expect("a funded leg"),
-        &mut charges,
+        charges,
         &mut sent,
         &mut admitted_once,
+        &pending,
     );
     c.run_until(epochs(1), |_| false);
     let spacing = (height(c).saturating_sub(before) / TRAIN_PER_EPOCH).max(1);
 
-    cast_splitter_vote(c, straddler_split_bytes());
+    arm(c);
 
-    // A transfer every `spacing` blocks until the splitter's gate has
-    // drained and several more have gone after it.
     let mut draining = 0;
     for leg in legs {
-        if send_leg(c, leg, &mut charges, &mut sent, &mut admitted_once) == Phase::Draining {
+        if send_leg(c, leg, charges, &mut sent, &mut admitted_once, &pending) == Phase::Draining {
             draining += 1;
             if draining >= PAST_THE_GATE {
                 break;
@@ -273,23 +376,45 @@ pub fn a_train_into_a_splitter_strands_nothing<C: Cluster>(c: &mut C) {
             "the train has to hold a transfer sent {phase:?}, or that phase's fate goes unread",
         );
     }
+    sent
+}
 
-    // Every transfer's fate, once the splitter has reached its terminal
-    // and nothing more can be included: whether the splitter took it is
-    // what decides between settling and refusal.
-    let (left, right) = splitter.children();
-    assert!(
-        await_serves(c, left, epochs(28)) && await_serves(c, right, epochs(28)),
-        "both splitter children must be served within budget",
-    );
+/// Every transfer's fate, once `terminating` has reached its terminal and
+/// nothing more can be included: whether it took the transfer is what
+/// decides between settling and refusal, and a recipient is credited
+/// exactly when its payer's transfer was accepted.
+///
+/// # Panics
+///
+/// Panics if a successor is not served within budget, if a transfer sent
+/// before the drain was never included, if any transfer reaches a fate
+/// its phase does not allow, if a credit disagrees with a verdict, or if
+/// the train never reached the coast.
+fn assert_train_fates<C: Cluster>(
+    c: &mut C,
+    terminating: ShardId,
+    successors: &[ShardId],
+    sent: &[(TxHash, PrincipalAddr, Phase)],
+) {
+    for &successor in successors {
+        assert!(
+            await_serves(c, successor, epochs(28)),
+            "successor {successor} must be served within budget",
+        );
+    }
     let mut never_included = 0;
-    for (hash, to, phase) in &sent {
-        let included = c.chain_fate(splitter, *hash).0.is_some();
+    for (hash, to, phase) in sent {
+        let included = c.chain_fate(terminating, *hash).0.is_some();
         assert!(
             included || *phase == Phase::Draining,
-            "a transfer sent {phase:?} must be included by the splitter",
+            "a transfer sent {phase:?} must be included by the leaving shard",
         );
         never_included += usize::from(!included);
+        let taken = if included {
+            "included"
+        } else {
+            "never included"
+        };
         let status = await_tx_terminal(c, *hash, epochs(12));
         let credited = match status {
             Some(TransactionStatus::Completed(TransactionDecision::Accept)) => {
@@ -297,36 +422,25 @@ pub fn a_train_into_a_splitter_strands_nothing<C: Cluster>(c: &mut C) {
             }
             Some(TransactionStatus::Completed(TransactionDecision::Aborted)) if !included => 10,
             other => panic!(
-                "a transfer sent {phase:?} and {} by the splitter reached {other:?}",
-                if included {
-                    "included"
-                } else {
-                    "never included"
-                },
+                "a transfer sent {phase:?} and {taken} by the leaving shard reached {other:?}",
             ),
         };
         assert!(
             c.run_until(epochs(8), |c| held(c, to.address(), *XRD) == credited),
-            "a recipient of a transfer sent {phase:?} and {} by the splitter must hold \
-             {credited}; holds {}",
-            if included {
-                "included"
-            } else {
-                "never included"
-            },
+            "a recipient of a transfer sent {phase:?} and {taken} by the leaving shard must \
+             hold {credited}; holds {}",
             held(c, to.address(), *XRD),
         );
     }
     assert!(
         never_included > 0,
-        "the train has to reach the splitter's coast, or nothing here crosses the cut",
+        "the train has to reach the leaving shard's coast, or nothing here crosses the cut",
     );
-    world.assert_settles_within(c, &charges, epochs(8), "a train across a split's admission");
 }
 
-/// Submit one of the train's legs, recording the splitter's phase when it
-/// went. The split shows as admitted while it pends and clears when the
-/// gate drains, so a shard once admitted and no longer pending is
+/// Submit one of the train's legs, recording the leaving shard's phase
+/// when it went. The reshape shows as pending from its admission until
+/// the gate drains, so a shard once admitted and no longer pending is
 /// draining.
 fn send_leg<C: Cluster>(
     c: &mut C,
@@ -334,8 +448,9 @@ fn send_leg<C: Cluster>(
     charges: &mut Charges,
     sent: &mut Vec<(TxHash, PrincipalAddr, Phase)>,
     admitted_once: &mut bool,
+    pending: impl Fn(&C) -> bool,
 ) -> Phase {
-    let pending = split_admitted(c, STRADDLER_SPLITTER);
+    let pending = pending(c);
     *admitted_once |= pending;
     let phase = match (pending, *admitted_once) {
         (true, _) => Phase::Departing,
