@@ -133,6 +133,12 @@ pub struct TxOutcome {
     /// single-shard core both await nobody and both may escrow, and only
     /// the classification the certifying shard froze tells them apart.
     decides: bool,
+    /// Whether the transaction reaches a shard other than the attesting
+    /// one — what makes a counterpart able to ask about this verdict,
+    /// whatever certificates the finalization carrying it collected. A
+    /// member that answers to nobody leaves no other trace of the shards
+    /// that will ask.
+    reaches_beyond: bool,
 }
 
 impl TxOutcome {
@@ -155,6 +161,7 @@ impl TxOutcome {
             escrowed: Vec::new(),
             crossing_targets: Vec::new(),
             decides: true,
+            reaches_beyond: false,
         }
     }
 
@@ -206,6 +213,21 @@ impl TxOutcome {
         self
     }
 
+    /// State whether the transaction reaches a shard other than the
+    /// attesting one.
+    #[must_use]
+    pub const fn reaching_beyond(mut self, reaches_beyond: bool) -> Self {
+        self.reaches_beyond = reaches_beyond;
+        self
+    }
+
+    /// Whether the transaction reaches a shard other than the attesting
+    /// one — whether any counterpart could ask about this verdict.
+    #[must_use]
+    pub const fn reaches_beyond(&self) -> bool {
+        self.reaches_beyond
+    }
+
     /// Whether this outcome bears the verdict on the transaction for the
     /// certifying shard — what lets its finalization resolve the hash.
     #[must_use]
@@ -239,6 +261,7 @@ impl TxOutcome {
             escrowed: Vec::new(),
             crossing_targets: Vec::new(),
             decides: true,
+            reaches_beyond: false,
         }
     }
 

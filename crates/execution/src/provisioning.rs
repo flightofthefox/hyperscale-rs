@@ -570,17 +570,14 @@ mod tests {
     /// would file none.
     #[test]
     fn a_divided_member_files_its_scope_minus_itself() {
-        use hyperscale_engine::legs::Placement;
-
         let trie = ShardTrie::uniform(2);
         let (low, high) = (ShardId::leaf(2, 0), ShardId::leaf(2, 1));
-        let leaving = BTreeSet::new();
 
         // A swap: sign-in, withdraw and deposit on the low shard, the
         // venue on the high one. The core is the venue alone.
         let swap = fixtures::swap();
         let crossings = vec![record_of(&swap, 1), record_of(&swap, 2)];
-        let classified = Classified::freeze(&swap, Placement::new(&trie, &leaving));
+        let classified = Classified::freeze(&swap, &trie, &BTreeSet::new());
         assert!(classified.decomposed().holds());
 
         // The caller's issuing member waits on the venue's record and no
@@ -627,18 +624,15 @@ mod tests {
     /// claim the inbound crossing, since neither runs its producer.
     #[test]
     fn a_multi_shard_core_files_its_peers_and_its_arrival() {
-        use hyperscale_engine::legs::Placement;
-
         let trie = ShardTrie::uniform(2);
         let (low, high, third) = (
             ShardId::leaf(2, 0),
             ShardId::leaf(2, 1),
             ShardId::leaf(2, 2),
         );
-        let leaving = BTreeSet::new();
         let route = fixtures::route();
         let crossings = vec![record_of(&route, 0), record_of(&route, 1)];
-        let classified = Classified::freeze(&route, Placement::new(&trie, &leaving));
+        let classified = Classified::freeze(&route, &trie, &BTreeSet::new());
         assert!(classified.decomposed().holds());
         assert_eq!(classified.core(), &BTreeSet::from([high, third]));
         let arrival = Requirement::Crossing {

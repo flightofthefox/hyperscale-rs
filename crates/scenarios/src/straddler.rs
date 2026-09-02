@@ -6,6 +6,7 @@
 //! when the terminating shard settled it by its terminal block — never one-sided,
 //! and never holding a permanent lock on the ones it didn't.
 
+use std::cell::Cell;
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -18,7 +19,8 @@ use hyperscale_types::{
 use crate::reshape::split_lifecycle;
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
-    anchored_genesis_height, beacon_epoch, committee_size, split_admitted, vault_balance,
+    anchored_genesis_height, beacon_epoch, committee_size, scheduled_terminal_epoch,
+    split_admitted, vault_balance,
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, STRADDLER_SPLITTER,
@@ -201,6 +203,49 @@ pub fn vote_splitter_down_to<C: Cluster>(c: &mut C, split_bytes: u64) {
     );
 }
 
+/// Blocks the splitter commits under its final window before a scenario
+/// submits into it: enough that what it commits next anchors inside the
+/// window whatever its clock lags the beacon's by.
+const FINAL_WINDOW_LEAD: u64 = 3;
+
+/// Wait for the splitter's final window: its cut stamped, the beacon in
+/// the window it leaves at the end of, and a few of its blocks committed
+/// under that window's anchor.
+///
+/// A shape reaching a shard in its final window runs whole, so a
+/// straddler submitted here is the tick these scenarios hold open across
+/// the terminal; submitted earlier it divides, and each shard's verdict
+/// is its own to reach.
+///
+/// # Panics
+///
+/// Panics if the cut is not stamped, the window not entered, or the
+/// splitter's lead not committed within budget.
+fn await_final_window<C: Cluster>(c: &mut C, splitter: ShardId) {
+    let terminal = Cell::new(None);
+    assert!(
+        c.run_until(epochs(12), |c| {
+            let stamped = scheduled_terminal_epoch(c, splitter);
+            if stamped.is_some() {
+                terminal.set(stamped);
+            }
+            stamped.is_some()
+        }),
+        "the split's cut was not scheduled within budget",
+    );
+    let terminal = terminal.get().expect("the cut is stamped");
+    assert!(
+        await_beacon_epoch(c, terminal.inner(), epochs(8)),
+        "the splitter's final window did not open within budget",
+    );
+    let height = |c: &C| c.committed_height(splitter).map_or(0, BlockHeight::inner);
+    let from = height(c);
+    assert!(
+        c.run_until(epochs(1), |c| height(c) >= from + FINAL_WINDOW_LEAD),
+        "the splitter must still commit under its final window",
+    );
+}
+
 /// Cast the vote that takes the threshold to `split_bytes`, below the
 /// splitter's bytes, without waiting for the admission it leads to.
 ///
@@ -379,7 +424,7 @@ fn assert_payer_is_blocked<C: FaultableCluster>(
     charges: &mut Charges,
     splitter: ShardId,
     setup: &SplitStraddlerSetup,
-) {
+) -> TxHash {
     let (payer_key, payer, _) = &setup.terminating;
     let blocked = build_transfer_tx(
         payer_key,
@@ -413,6 +458,7 @@ fn assert_payer_is_blocked<C: FaultableCluster>(
         "the splitter must refuse the payer while its first transaction still \
          holds that payer's vault",
     );
+    blocked_hash
 }
 
 /// The terminating payer, its recipient, the control and the recipient
@@ -443,7 +489,10 @@ fn terminating_payer_world<C: Cluster>(c: &C, setup: &SplitStraddlerSetup) -> Wo
 ///
 /// [`isolate_ec_intake`] cuts every path by which the splitter obtains the
 /// survivor's execution certificate, which is what keeps that state standing.
-/// The payer's deadline still arrives and it still speaks its abort, so the
+/// The transfer is submitted in the splitter's final window, the one place
+/// a shape reaching it still runs whole — earlier it would divide, and the
+/// payer's verdict would be its own to reach with nothing to wait on. The
+/// payer's deadline still arrives and it still speaks its abort, so the
 /// transaction goes terminal — but a tick with an engaged counterpart needs
 /// that counterpart's certificate to finalize, and both the reservation's
 /// release and the settlement that would clear the lock key on a *finalized
@@ -458,11 +507,13 @@ fn terminating_payer_world<C: Cluster>(c: &C, setup: &SplitStraddlerSetup) -> Wo
 /// payer's two transactions contend on one cell either way. Both are per-shard
 /// state, and the claim here is about all of it at once.
 ///
-/// Then the shard terminates and the same shape is admitted by the successor.
-/// Neither the ledger nor the lock set is carried across: both are projections
-/// of a shard's own committed chain, and the successor's chain begins at its
-/// seeded genesis. The release is by construction rather than by an explicit
-/// sweep, which is what this pins.
+/// Then the shard terminates and the refused shape is admitted by the
+/// successor: the probe it refused is handed back at the cut with its window
+/// still open, and the successor includes it. Neither the ledger nor the lock
+/// set is carried across: both are projections of a shard's own committed
+/// chain, and the successor's chain begins at its seeded genesis. The release
+/// is by construction rather than by an explicit sweep, which is what this
+/// pins.
 ///
 /// The payer is funded above one fee ceiling and below two, so an inherited
 /// reservation would refuse the successor's probe on its own.
@@ -476,8 +527,8 @@ fn terminating_payer_world<C: Cluster>(c: &C, setup: &SplitStraddlerSetup) -> Wo
 /// Panics if the splitter never commits the transaction, the control is
 /// refused, the encumbered probe is admitted anyway, the transaction never goes
 /// terminal or finalizes despite the cut, the split misses its budget, the
-/// transaction applies on either chain, the payer's vault moves, or the
-/// successor refuses the payer's next transaction.
+/// transaction applies on either chain, or the successor refuses the probe
+/// its predecessor refused.
 pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCluster) {
     let splitter = STRADDLER_SPLITTER;
     let survivor = STRADDLER_SURVIVOR;
@@ -491,6 +542,10 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
     // it will execute its own leg and speak its own verdict, and never hold the
     // survivor's half, so no tick of its can finalize.
     let _ = isolate_ec_intake(c, splitter, survivor);
+
+    // Into the final window, where the shape runs whole and the splitter's
+    // tick really does wait on the survivor's certificate.
+    await_final_window(c, splitter);
 
     let world = terminating_payer_world(c, &setup);
     let mut charges = Charges::default();
@@ -521,7 +576,7 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
          not an on-chain hold",
     );
 
-    assert_payer_is_blocked(c, &mut charges, splitter, &setup);
+    let blocked_hash = assert_payer_is_blocked(c, &mut charges, splitter, &setup);
 
     // The payer's deadline arrives and it speaks its abort. No certificate
     // follows it: the counterpart engaged, so finalization needs a certificate
@@ -565,29 +620,14 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
             "the {label} applied a transaction its counterpart never settled; fate = {fate:?}",
         );
     }
-    // Nothing moved. The transfer aborted with no certificate behind it, so it
-    // settled no fee receipt, and a receipt is the only thing that moves state;
-    // the refused probe was never included anywhere at all.
-    assert_eq!(
-        vault_balance(c, successor, *payer),
-        TERMINATING_PAYER_FUNDING,
-        "the payer's vault must carry across the split untouched",
-    );
 
-    // The release: the same shape the predecessor refused is admitted by the
-    // successor. Its ledger is a projection of its own committed chain, which
-    // begins at the seeded genesis, so there is no hold left to count against
-    // the payer — the reservation died with the shard that held it, without
-    // anything having to sweep it.
-    let released = build_transfer_tx(
-        payer_key,
-        *payer,
-        setup.successor_recipient,
-        STRADDLER_PAYMENT,
-        validity_around(c.now()),
-    );
-    let released_hash = charges.submit(c, released);
-    let status = await_tx_terminal(c, released_hash, epochs(10));
+    // The release: the shape the predecessor refused is admitted by the
+    // successor — the very probe it refused, handed back at the cut with
+    // its window still open. The successor's ledger is a projection of its
+    // own committed chain, which begins at the seeded genesis, so there is
+    // no hold left to count against the payer — the reservation died with
+    // the shard that held it, without anything having to sweep it.
+    let status = await_tx_terminal(c, blocked_hash, epochs(10));
     assert!(
         matches!(
             status,
@@ -595,6 +635,10 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
         ),
         "the successor must admit what its predecessor refused — no shard's \
          in-flight state outlives the shard; status = {status:?}",
+    );
+    assert!(
+        c.chain_fate(successor, blocked_hash).1.is_some(),
+        "the release must land on the successor, not on the chain that refused it",
     );
     // A terminal status is reported when this shard decides the outcome,
     // which is before the finalization carrying its writes commits — so
@@ -607,9 +651,8 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
         "the released transaction must actually have spent from the payer's vault",
     );
 
-    // The abort moved nothing and charged nothing, the blocked probe was
-    // never included, and the control and the release each moved their
-    // payment once and paid once.
+    // The abort moved nothing and charged nothing, and the control and the
+    // release each moved their payment once and paid once.
     world.assert_settles_within(
         c,
         &charges,
@@ -632,6 +675,9 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
 /// straddler stranded rather than merely fenced: neither side holds the
 /// other's certificate, the splitter reaches its terminal having settled
 /// nothing, and abandoning is the only outcome the straddler can reach.
+/// The straddler is submitted in the splitter's final window, where a
+/// shape reaching it runs whole; earlier it would divide, and the payer's
+/// verdict would wait on nobody.
 /// Cutting one direction only is
 /// [`split_survivor_recovers_a_settlement_it_never_received`].
 ///
@@ -661,6 +707,10 @@ pub fn split_surviving_counterpart_releases_its_reservation(c: &mut impl Faultab
     // read off a shard that never composed a tick for it.
     let _ = isolate_ec_intake(c, survivor, splitter);
     let _ = isolate_ec_intake(c, splitter, survivor);
+
+    // Into the final window, where the shape runs whole and the survivor's
+    // tick really does wait on the splitter's certificate.
+    await_final_window(c, splitter);
 
     let baseline = c
         .committed_work_in_flight(survivor)
@@ -752,7 +802,8 @@ pub fn split_surviving_counterpart_releases_its_reservation(c: &mut impl Faultab
 /// [`isolate_ec_intake`] cuts only the survivor's intake, so the splitter
 /// holds both certificates and settles, applying its half, while the
 /// survivor holds only its own and cannot apply until the splitter's
-/// reaches it.
+/// reaches it. Submitted in the splitter's final window, where the shape
+/// runs whole and the two halves are one tick's.
 ///
 /// What that leaves the survivor is a transaction its counterpart's settled
 /// set names as settled — so no record covers it, the fence refuses any
@@ -786,6 +837,10 @@ pub fn split_survivor_recovers_a_settlement_it_never_received(c: &mut impl Fault
     // certificate and so can settle; the survivor never receives the
     // splitter's and so cannot.
     let _ = isolate_ec_intake(c, survivor, splitter);
+
+    // Into the final window, where the shape runs whole and the survivor's
+    // half really does wait on the splitter's certificate.
+    await_final_window(c, splitter);
 
     let baseline = c
         .committed_work_in_flight(survivor)

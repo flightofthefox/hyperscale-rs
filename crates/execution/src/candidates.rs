@@ -564,14 +564,11 @@ mod tests {
     /// participant.
     #[test]
     fn a_divided_member_joins_on_its_classified_membership() {
-        use hyperscale_engine::legs::Placement;
-
         use crate::fixtures::{leaf, swap, trie};
 
         let trie = trie();
-        let leaving = BTreeSet::new();
         let (local, venue) = (leaf(0), leaf(1));
-        let classified = Classified::freeze(&swap(), Placement::new(&trie, &leaving));
+        let classified = Classified::freeze(&swap(), &trie, &BTreeSet::new());
         assert!(classified.decomposed().holds());
 
         let mut candidates = TickCandidates::new(local);
@@ -608,12 +605,9 @@ mod tests {
     /// queue in one tick rather than one member per tick.
     #[test]
     fn a_member_nothing_can_retract_takes_no_provisional_claim() {
-        use hyperscale_engine::legs::Placement;
-
         use crate::fixtures::{leaf, swap, trie};
 
         let trie = trie();
-        let leaving = BTreeSet::new();
         let (caller, venue) = (leaf(0), leaf(1));
         let participating = BTreeSet::from([caller, venue]);
         // Two transactions distinct by hash, both writing one pool cell.
@@ -640,7 +634,7 @@ mod tests {
         assert!(admitted[0].request.abortable);
         assert_eq!(whole.len(), 1, "and the other waits on its fate");
 
-        let classified = Classified::freeze(&swap(), Placement::new(&trie, &leaving));
+        let classified = Classified::freeze(&swap(), &trie, &BTreeSet::new());
         assert_eq!(classified.core(), &BTreeSet::from([venue]));
         let mut divided = TickCandidates::new(venue);
         for seed in [1, 2] {

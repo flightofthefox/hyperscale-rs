@@ -1,17 +1,18 @@
 //! A divided shape meeting a reshape: the shard a leg or a core sits on
 //! leaving the trie while the shape is in flight.
 //!
-//! A shard scheduled to leave refuses to decompose anything reaching it —
-//! a record written for a shard with no round left would have nowhere to
-//! be claimed — so from a split's admission or a merge's pairing to its
-//! cut every shape touching the leaving shard runs whole, and after the
-//! cut its cells sit under a successor and shapes divide again. What
-//! these scenarios pin is that both halves of that rule settle and that
-//! the seam between them strands nothing: the classification is taken
-//! once per shard at its own commit, and a transfer whose payer committed
-//! just before the admission fold and whose delivery lands just after is
-//! the shape that would read one answer on one side and the other on the
-//! other.
+//! A shard scheduled to leave divides like any other until its final
+//! window: a record cell follows its prefix to the successor, and a
+//! claim or a delivery is a pull on whoever holds the prefix when it is
+//! made. In the window it leaves at the end of, shapes reaching it run
+//! whole, so what it never includes aborts at the deadline rather than
+//! waiting on a successor that may seat after the delivery window
+//! closes. What these scenarios pin is that nothing in flight across the
+//! cut is stranded by it — a transfer the leaving shard included settles
+//! there, one it never included is delivered by its successor or refused
+//! at the payer's deadline, and a call into a component on the leaving
+//! shard keeps clearing from admission through the cut and from the
+//! successor after it.
 
 use hyperscale_engine::XRD;
 use hyperscale_types::{
@@ -63,16 +64,16 @@ enum Phase {
     /// No reshape pending: the transfer divides and its delivery lands.
     Live,
     /// The reshape admitted and pending — a split admitted, a merge
-    /// paired: the shard is departing, so the transfer runs whole on both
-    /// shards and still settles.
+    /// paired: the shard is departing, still including, and the transfer
+    /// divides and settles as it would anywhere.
     Departing,
     /// The gate drained: the reshape no longer pends, the shard still
     /// includes for a while, then coasts on empty blocks to its terminal.
     /// A transfer it included settles; one it never included is either
-    /// refused at the payer's deadline, crediting nobody, or — where the
-    /// payer read the shard as no longer departing and divided it —
-    /// accepted on the payer's chain and delivered by the shard's
-    /// successor once the cut has landed the recipient's prefix there.
+    /// refused at the payer's deadline, crediting nobody — the shape a
+    /// shard's final window keeps whole — or accepted on the payer's
+    /// chain and delivered by the shard's successor once the cut has
+    /// landed the recipient's prefix there.
     Draining,
 }
 
@@ -108,12 +109,12 @@ pub fn merge_train_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// from its child once it has left.
 ///
 /// The venue sits on the splitter and its callers on the survivor. With
-/// the split admitted the venue's shard is departing, so every swap
-/// reaching it runs whole and still settles: the callers pay their input
-/// and one price, the venue claims the inputs. Then the cut: the venue's
-/// cells land under a child, the reserve reads there at exactly what the
-/// swaps left in it, and a swap after the cut divides against the child
-/// and settles like any other.
+/// the split admitted the venue's shard is departing, and every swap
+/// reaching it divides and settles as it would anywhere: the callers pay
+/// their input and one price, the venue claims the inputs. Then the cut:
+/// the venue's cells land under a child, the reserve reads there at
+/// exactly what the swaps left in it, and a swap after the cut divides
+/// against the child and settles like any other.
 ///
 /// # Panics
 ///

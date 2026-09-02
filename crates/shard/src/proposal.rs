@@ -19,7 +19,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
-use hyperscale_engine::legs::{Classified, Placement};
+use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash,
     LocalTimestamp, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger,
@@ -294,14 +294,13 @@ pub fn late_deliveries<T: Deref<Target = Transaction>>(
         return HashSet::new();
     };
     let trie = snapshot.shard_trie();
-    let leaving: BTreeSet<ShardId> = trie
+    let final_window: BTreeSet<ShardId> = trie
         .leaves()
-        .filter(|shard| topology_schedule.termination_scheduled(*shard, anchor))
+        .filter(|shard| topology_schedule.terminates_at_next_boundary(*shard, anchor) == Some(true))
         .collect();
-    let placement = Placement::new(trie, &leaving);
     txs.iter()
         .filter(|tx| anchor >= tx.validity_range().end_timestamp_exclusive)
-        .filter(|tx| Classified::freeze(tx.legs(), placement).delivers_at(local_shard))
+        .filter(|tx| Classified::freeze(tx.legs(), trie, &final_window).delivers_at(local_shard))
         .map(|tx| tx.hash())
         .collect()
 }

@@ -12,19 +12,20 @@ use hyperscale_core::ProtocolEvent;
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_node::shard::{HostEvent, ShardScopedInput};
 use hyperscale_scenarios::tx::{
-    CROSS_FRACTION_SENDERS, badge_buyer, cross_fraction_genesis_accounts,
-    cross_shard_fault_genesis_accounts, cross_shard_genesis_accounts, genesis_accounts,
-    halt_straddler_setup, insolvent_genesis_accounts, livelock_genesis_accounts,
-    merge_straddler_setup, native_pq_genesis_accounts, nullifier_race_genesis_accounts,
-    overdraw_genesis_accounts, participant_sweep_genesis_accounts, probe_train_genesis_accounts,
-    remote_delegator, reshape_lifecycle_accounts, securify_genesis_accounts,
-    shared_recipient_genesis_accounts, split_straddler_setup, staking_genesis_accounts,
-    stdlib_flash_bytes, storm_genesis_accounts, unbound_genesis_accounts,
-    unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
+    CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, badge_buyer,
+    cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
+    cross_shard_genesis_accounts, genesis_accounts, halt_straddler_setup,
+    insolvent_genesis_accounts, livelock_genesis_accounts, merge_straddler_setup,
+    native_pq_genesis_accounts, nullifier_race_genesis_accounts, overdraw_genesis_accounts,
+    participant_sweep_genesis_accounts, probe_train_genesis_accounts, remote_delegator,
+    reshape_lifecycle_accounts, securify_genesis_accounts, shared_recipient_genesis_accounts,
+    split_straddler_setup, staking_genesis_accounts, stdlib_flash_bytes, storm_genesis_accounts,
+    unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
     Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
-    a_failed_attempt_still_attests_work, a_leg_whose_core_never_answers_refuses_at_the_deadline,
+    a_departing_venue_clears_swaps_and_carries_on, a_failed_attempt_still_attests_work,
+    a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_published_package_matures_before_it_runs,
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
@@ -40,12 +41,12 @@ use hyperscale_scenarios::{
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
-    delegation_folds_into_beacon_state, deploy_storm_rides_out, epochs,
-    events_land_on_their_emitters_home_shard, failure_charges_its_payer,
-    gossip_drop_engages_fetch_fallback, grow_reaches_four_shard_topology,
-    grow_reaches_two_shard_topology, halted_shard_recovers_by_committee_redraw,
-    halted_shard_straddler_atomic, hot_recipient, hot_venue_clears_swaps,
-    hot_venue_clears_swaps_on, insolvent_payer_engages_nothing,
+    delegation_folds_into_beacon_state, departing_venue_ballast, departing_venue_split_bytes,
+    deploy_storm_rides_out, epochs, events_land_on_their_emitters_home_shard,
+    failure_charges_its_payer, gossip_drop_engages_fetch_fallback,
+    grow_reaches_four_shard_topology, grow_reaches_two_shard_topology,
+    halted_shard_recovers_by_committee_redraw, halted_shard_straddler_atomic, hot_recipient,
+    hot_venue_clears_swaps, hot_venue_clears_swaps_on, insolvent_payer_engages_nothing,
     inter_shard_partition_strands_ticks_until_it_heals, isolated_validator_still_settles,
     livelock_resolves_promptly, liveness_baseline, merge_boundary_admits_an_uncommitted_precut_tx,
     merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
@@ -1108,6 +1109,38 @@ fn straddler_config() -> ScenarioConfig {
         split_bytes: stdlib_flash_bytes() + 30_000,
         latency: Duration::from_millis(150),
     }
+}
+
+/// Single-shard genesis born running the fixture packages, with the grow
+/// trigger armed on the fixture flash's scale — above each child of the
+/// ballasted root and below the root itself — and two cohorts of pool
+/// surplus: one grows ROOT to the two siblings, the other splits the
+/// venue's shard after the vote.
+fn departing_venue_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 8,
+        num_shards: 1,
+        split_bytes: departing_venue_split_bytes(),
+        latency: Duration::from_millis(150),
+    }
+}
+
+#[test]
+fn a_departing_venue_clears_swaps_and_carries_on_sim() {
+    let mut accounts = departing_venue_ballast();
+    accounts.extend(venue_genesis_accounts_on(
+        STRADDLER_SPLITTER,
+        &[STRADDLER_SURVIVOR],
+    ));
+    let mut cluster = SimCluster::with_packages(
+        &departing_venue_config(),
+        11,
+        &accounts,
+        GenesisPackages::with_fixtures(),
+    );
+    a_departing_venue_clears_swaps_and_carries_on(&mut cluster, epochs(12));
 }
 
 #[test]

@@ -768,6 +768,7 @@ impl TickState {
                 .escrowing(escrowed)
                 .crossing_to(targets)
                 .deciding(decides)
+                .reaching_beyond(membership.is_some_and(|m| m.reach().iter().any(|&s| s != local)))
             })
             .collect();
 
@@ -1490,15 +1491,12 @@ mod tests {
     /// whatever the case.
     #[test]
     fn membership_follows_the_two_case_rule() {
-        use hyperscale_engine::legs::Placement;
-
         use crate::fixtures::{leaf, route, swap, trie};
 
         let trie = trie();
-        let leaving = BTreeSet::new();
         let (low, high, third) = (leaf(0), leaf(1), leaf(2));
 
-        let swap = Classified::freeze(&swap(), Placement::new(&trie, &leaving));
+        let swap = Classified::freeze(&swap(), &trie, &BTreeSet::new());
         assert!(swap.decomposed().holds());
         let participating = BTreeSet::from([low, high]);
         let caller = Membership::of(&swap, low, participating.clone(), Side::Issuing);
@@ -1518,7 +1516,7 @@ mod tests {
         assert_eq!(venue.reach(), &participating);
         assert!(venue.decides(), "and decides");
 
-        let route = Classified::freeze(&route(), Placement::new(&trie, &leaving));
+        let route = Classified::freeze(&route(), &trie, &BTreeSet::new());
         let participating = BTreeSet::from([low, high, third]);
         let core_member = Membership::of(&route, high, participating.clone(), Side::Issuing);
         assert_eq!(
@@ -1546,15 +1544,13 @@ mod tests {
     /// failed to issue is the transaction's end on its shard.
     #[test]
     fn a_delivering_member_never_decides() {
-        use hyperscale_engine::legs::Placement;
         use hyperscale_types::BlockHeight;
         use hyperscale_vm_types::LegRole;
 
         use crate::fixtures::{leaf, leg, swap, trie};
 
         let trie = trie();
-        let leaving = BTreeSet::new();
-        let placement = Placement::new(&trie, &leaving);
+        let placement = &trie;
         let (sender, recipient) = (leaf(0), leaf(1));
 
         let transfer = Classified::freeze(
@@ -1563,11 +1559,12 @@ mod tests {
                 leg(1, LegRole::Outbound, &[(0, 0)]),
             ],
             placement,
+            &BTreeSet::new(),
         );
         assert!(transfer.decomposed().holds());
         assert!(transfer.delivers_at(recipient));
         assert!(!transfer.delivers_at(sender), "the core bears the verdict");
-        let swap = Classified::freeze(&swap(), placement);
+        let swap = Classified::freeze(&swap(), placement, &BTreeSet::new());
         assert!(
             !swap.delivers_at(leaf(0)),
             "a shard that also issues runs on the transaction's window"
@@ -1620,15 +1617,13 @@ mod tests {
     /// finalization: its verdict is not the leg's to apply.
     #[test]
     fn a_leg_certifies_alone_and_is_still_routed_to_its_reach() {
-        use hyperscale_engine::legs::Placement;
         use hyperscale_types::BlockHeight;
 
         use crate::fixtures::{leaf, swap, trie};
 
         let trie = trie();
-        let leaving = BTreeSet::new();
         let (local, venue) = (leaf(0), leaf(1));
-        let classified = Classified::freeze(&swap(), Placement::new(&trie, &leaving));
+        let classified = Classified::freeze(&swap(), &trie, &BTreeSet::new());
         let leg = tx(1);
         let mut tick = TickState::new(
             TickId::new(local, BlockHeight::new(1)),

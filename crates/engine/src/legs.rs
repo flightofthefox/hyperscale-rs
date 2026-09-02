@@ -21,30 +21,6 @@ use hyperscale_vm_types::{Crossing, LegRole, LegShape, ProtocolHasher, SubstateK
 
 use crate::sharding::TrieShardResolver;
 
-/// The trie and the departing set, read together.
-///
-/// A caller taking one at this anchor and the other at another would
-/// divide against one placement and wait against another.
-#[derive(Clone, Copy, Debug)]
-pub struct Placement<'a> {
-    trie: &'a ShardTrie,
-    leaving: &'a BTreeSet<ShardId>,
-}
-
-impl<'a> Placement<'a> {
-    /// One placement: the shard partition and the shards leaving it.
-    #[must_use]
-    pub const fn new(trie: &'a ShardTrie, leaving: &'a BTreeSet<ShardId>) -> Self {
-        Self { trie, leaving }
-    }
-
-    /// The partition this placement divides against.
-    #[must_use]
-    pub const fn trie(&self) -> &'a ShardTrie {
-        self.trie
-    }
-}
-
 /// Whether a transaction's legs run where their state lives.
 ///
 /// Frozen onto the transaction when its block commits and carried from
@@ -124,10 +100,10 @@ impl Classified {
     /// Freeze `legs` against `placement`: the classifier's own answer,
     /// and the core set beside it.
     #[must_use]
-    pub fn freeze(legs: &[LegShape], placement: Placement<'_>) -> Self {
-        let decomposed = decomposes(legs, placement);
+    pub fn freeze(legs: &[LegShape], trie: &ShardTrie, final_window: &BTreeSet<ShardId>) -> Self {
+        let decomposed = decomposes(legs, trie, final_window);
         let (delivering, mixed) = if decomposed.holds() {
-            let (delivers, settles) = delivery_sides(legs, placement.trie());
+            let (delivers, settles) = delivery_sides(legs, trie);
             (
                 delivers.difference(&settles).copied().collect(),
                 delivers.intersection(&settles).copied().collect(),
@@ -137,7 +113,7 @@ impl Classified {
         };
         Self {
             decomposed,
-            core: core_shards(legs, placement.trie()),
+            core: core_shards(legs, trie),
             delivering,
             mixed,
         }
@@ -286,22 +262,26 @@ fn delivery_sides(legs: &[LegShape], trie: &ShardTrie) -> (BTreeSet<ShardId>, BT
 ///
 /// Two conjuncts, and running whole is always correct, so an unsure
 /// answer takes it. The classifier's verdict is the first. The second is
-/// that no leg target sits on a departing shard: a record is written by
-/// the issuing shard's verdict and read a round later, and a shard
-/// leaving the trie has no round left, so the transaction would settle
-/// on the issuer's certificate while the claim it is owed had nowhere to
-/// be made.
+/// that no leg target sits on a shard in `final_window` — the window it
+/// leaves the trie at the end of. A shard merely scheduled to leave
+/// later divides like any other: a record cell follows its prefix to the
+/// successor, and a claim or a delivery is a pull on whoever holds the
+/// prefix when it is made. In its final window it does not, because the
+/// delivery window a divided transfer's crossing waits in can close
+/// before the successor is seated to deliver it, and a delivery's
+/// crossing is never reclaimed — whereas a whole shape the shard never
+/// includes aborts at its deadline and credits nobody.
 #[must_use]
-pub fn decomposes(legs: &[LegShape], placement: Placement<'_>) -> Decomposed {
-    let resolver = TrieShardResolver {
-        trie: placement.trie,
-    };
+pub fn decomposes(
+    legs: &[LegShape],
+    trie: &ShardTrie,
+    final_window: &BTreeSet<ShardId>,
+) -> Decomposed {
+    let resolver = TrieShardResolver { trie };
     let star = star_at(legs, &resolver);
-    let nobody_leaving = legs.iter().all(|leg| {
-        !placement
-            .leaving
-            .contains(&placement.trie.shard_for_prefix(leg.target))
-    });
+    let nobody_leaving = legs
+        .iter()
+        .all(|leg| !final_window.contains(&trie.shard_for_prefix(leg.target)));
     Decomposed(star.decomposes(legs, &resolver) && nobody_leaving)
 }
 
@@ -812,8 +792,7 @@ mod tests {
     }
 
     fn decomposed(legs: &[LegShape]) -> Decomposed {
-        let leaving = BTreeSet::new();
-        let verdict = decomposes(legs, Placement::new(&trie(), &leaving));
+        let verdict = decomposes(legs, &trie(), &BTreeSet::new());
         assert!(verdict.holds(), "the fixture has to decompose");
         verdict
     }
@@ -1028,8 +1007,7 @@ mod tests {
         let legs = swap();
         let divided = decomposed(&legs);
         let elsewhere = ShardTrie::uniform(2);
-        let leaving = BTreeSet::new();
-        let divided_deeper = decomposes(&legs, Placement::new(&elsewhere, &leaving));
+        let divided_deeper = decomposes(&legs, &elsewhere, &BTreeSet::new());
         assert!(divided_deeper.holds());
         // Under a four-leaf trie the low owners sit at path 0 and the
         // venue at path 2, so leaf 1 runs nothing.
@@ -1065,16 +1043,16 @@ mod tests {
         );
     }
 
-    /// A shape reaching a departing shard does not decompose: running
-    /// whole is always correct, and a record written for a shard with no
-    /// round left would have nowhere to be claimed.
+    /// A shape reaching a shard in its final window does not decompose:
+    /// running whole is always correct, and a crossing issued to a shard
+    /// that may include nothing more could wait out its delivery window
+    /// before the successor is seated.
     #[test]
-    fn a_shape_reaching_a_departing_shard_runs_whole() {
+    fn a_shape_reaching_a_shard_in_its_final_window_runs_whole() {
         let legs = transfer();
-        let leaving = BTreeSet::from([high()]);
-        assert!(!decomposes(&legs, Placement::new(&trie(), &leaving)).holds());
-        let nobody = BTreeSet::new();
-        assert!(decomposes(&legs, Placement::new(&trie(), &nobody)).holds());
+        let final_window = BTreeSet::from([high()]);
+        assert!(!decomposes(&legs, &trie(), &final_window).holds());
+        assert!(decomposes(&legs, &trie(), &BTreeSet::new()).holds());
     }
 
     /// The sender takes back exactly what its inbound leg issued, under

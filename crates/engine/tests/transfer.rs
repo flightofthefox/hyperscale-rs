@@ -13,8 +13,7 @@ use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
 };
 use hyperscale_engine::legs::{
-    Classified, Placement, PlanDefect, Runs, Side, core_shards, crossings_of, decomposes,
-    plan_for_shard,
+    Classified, PlanDefect, Runs, Side, core_shards, crossings_of, decomposes, plan_for_shard,
 };
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
@@ -1231,8 +1230,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
-    let leaving = BTreeSet::new();
-    let divided = decomposes(tx.legs(), Placement::new(&trie, &leaving));
+    let divided = decomposes(tx.legs(), &trie, &BTreeSet::new());
     assert!(divided.holds(), "a transfer decomposes");
     assert_eq!(core_shards(tx.legs(), &trie), BTreeSet::from([near_shard]));
 
@@ -1308,9 +1306,8 @@ fn a_transfer_executes_divided_on_both_shards() {
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
-    let leaving = BTreeSet::new();
-    let divided = decomposes(tx.legs(), Placement::new(&trie, &leaving));
-    let classified = Classified::freeze(tx.legs(), Placement::new(&trie, &leaving));
+    let divided = decomposes(tx.legs(), &trie, &BTreeSet::new());
+    let classified = Classified::freeze(tx.legs(), &trie, &BTreeSet::new());
     assert!(divided.holds());
     let edge = crossings_of(tx.legs(), tx.crossings(), divided, &trie).remove(0);
 
@@ -1404,8 +1401,7 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
-    let leaving = BTreeSet::new();
-    let classified = Classified::freeze(tx.legs(), Placement::new(&trie, &leaving));
+    let classified = Classified::freeze(tx.legs(), &trie, &BTreeSet::new());
     assert!(classified.decomposed().holds());
     let edge = crossings_of(tx.legs(), tx.crossings(), classified.decomposed(), &trie).remove(0);
 

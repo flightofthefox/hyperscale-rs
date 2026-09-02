@@ -1788,9 +1788,9 @@ mod tests {
         assert!(chain.latest_qc().is_none());
     }
 
-    /// A cross-shard tick keyed on `ShardId::ROOT` — the only kind whose
-    /// transactions land in the settled set, since `local_settled_tx_hashes`
-    /// drops single-shard (`is_zero`) ticks.
+    /// A tick keyed on `ShardId::ROOT`, the shard whose settled set these
+    /// tests read; `local_settled_tx_hashes` names only that shard's own
+    /// verdicts.
     fn tick(n: u64) -> TickId {
         TickId::new(ShardId::ROOT, BlockHeight::new(n))
     }

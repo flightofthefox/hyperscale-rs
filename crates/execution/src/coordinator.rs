@@ -37,7 +37,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::{Classified, Placement, Runs, Side, crossings_of};
+use hyperscale_engine::legs::{Classified, Runs, Side, crossings_of};
 use hyperscale_engine::{TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_unresolvable_tx};
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
@@ -762,14 +762,13 @@ impl ExecutionCoordinator {
         let local_shard = self.local_shard;
         let members = assign_participants(classification, transactions);
         // One placement at one anchor: the trie this block committed
-        // under and the shards leaving it, read together, and the answer
-        // frozen onto each transaction from here.
+        // under and the shards in their final window, read together, and
+        // the answer frozen onto each transaction from here.
         let trie = classification.shard_trie();
-        let leaving: BTreeSet<ShardId> = trie
+        let final_window: BTreeSet<ShardId> = trie
             .leaves()
-            .filter(|shard| topology_schedule.termination_scheduled(*shard, ts))
+            .filter(|shard| topology_schedule.terminates_at_next_boundary(*shard, ts) == Some(true))
             .collect();
-        let placement = Placement::new(trie, &leaving);
         // The ledger takes the transactions themselves. What it needs of
         // them — when they expire, what they reserved, what they reach
         // outside this shard — is theirs and this shard's, so a rebuild
@@ -779,7 +778,7 @@ impl ExecutionCoordinator {
         let members: Vec<CommittedMember> = members
             .into_iter()
             .map(|(tx, participating)| CommittedMember {
-                classified: Classified::freeze(tx.legs(), placement),
+                classified: Classified::freeze(tx.legs(), trie, &final_window),
                 tx,
                 participating,
             })
