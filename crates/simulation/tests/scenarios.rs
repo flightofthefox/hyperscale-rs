@@ -80,6 +80,7 @@ use hyperscale_types::{
     ShardId, Timeout,
 };
 use support::SimCluster;
+use support::sim_cluster::SLICE;
 
 /// Baseline single-shard config: resharding disarmed, four-validator committee.
 const fn liveness_config() -> ScenarioConfig {
@@ -392,8 +393,14 @@ fn a_hot_venue_clears_swaps_no_slower_fanned_in_sim() {
         &wide_swapper_shards(),
         epochs(40),
     );
+    // Both readings sit on the harness's polling grid, so each is its
+    // queue's latency rounded up to a slice. That grants one slice of
+    // resolution; the second is the baseline's own jitter — the
+    // single-caller queue alone reads two slices apart under the two
+    // epoch clocks while the fanned-in queue reads the same on both, so
+    // a bar tighter than that fails on the clock rather than on fan-in.
     assert!(
-        fanned.elapsed <= single.elapsed,
+        fanned.elapsed <= single.elapsed + 2 * SLICE,
         "fan-in from three caller shards must be no worse than from one: \
          {:?} against {:?}",
         fanned.elapsed,

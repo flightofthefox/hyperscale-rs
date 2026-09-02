@@ -32,8 +32,9 @@ use hyperscale_types::{
 };
 
 /// The clock slice `run_until` advances per poll, matching the runner's own
-/// internal predicate loop.
-const SLICE: Duration = Duration::from_secs(1);
+/// internal predicate loop — and so the resolution of anything a scenario
+/// reads off the clock between polls.
+pub const SLICE: Duration = Duration::from_secs(1);
 
 /// How many epochs the beacon tip may lag wall-clock before the harness
 /// fails the scenario at the park itself, instead of at whatever distant
