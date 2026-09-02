@@ -379,10 +379,9 @@ impl BeaconCoordinator {
         // The head and the latest epoch's active committee are the same
         // snapshot; derive it once and let the schedule share the handle.
         // Seed every other loaded state's active committee under its own epoch
-        // and its lookahead under the next, skipping anything that targets
-        // `latest_epoch` so the shared head stays in place. Consecutive states
-        // agree on that boundary entry (one's lookahead is the next's active),
-        // so the skip drops only a redundant re-derivation.
+        // and its lookahead under the next, oldest first so each window's
+        // projection is kept as the fold before it published it, then
+        // reinstate the head so the latest epoch shares its handle.
         let head = Arc::new(latest.derive_topology_snapshot(network.clone()));
         let mut topology_schedule =
             TopologySchedule::new(epoch_duration_ms, latest_epoch, Arc::clone(&head));
@@ -393,14 +392,12 @@ impl BeaconCoordinator {
                     Arc::new(state.derive_topology_snapshot(network.clone())),
                 );
             }
-            let lookahead = state.current_epoch.next();
-            if lookahead != latest_epoch {
-                topology_schedule.insert(
-                    lookahead,
-                    Arc::new(state.derive_next_topology_snapshot(network.clone())),
-                );
-            }
+            topology_schedule.insert_lookahead(
+                state.current_epoch.next(),
+                Arc::new(state.derive_next_topology_snapshot(network.clone())),
+            );
         }
+        topology_schedule.insert(latest_epoch, Arc::clone(&head));
         // The tip epoch's signer sets come from the state *before* its
         // fold when the loaded history carries one; the live state
         // stands in otherwise (see the field docs).
@@ -2062,7 +2059,7 @@ impl BeaconCoordinator {
         let epoch = self.state.current_epoch;
         self.topology_schedule.set_head(Arc::clone(&head));
         self.topology_schedule.insert(epoch, head);
-        self.topology_schedule.insert(
+        self.topology_schedule.insert_lookahead(
             epoch.next(),
             Arc::new(
                 self.state

@@ -2490,7 +2490,7 @@ mod tests {
         let active = Arc::new(state.derive_topology_snapshot(net()));
         let lookahead = Arc::new(state.derive_next_topology_snapshot(net()));
         let mut schedule = TopologySchedule::new(1000, Epoch::new(5), active);
-        schedule.insert(Epoch::new(6), lookahead);
+        schedule.insert_lookahead(Epoch::new(6), lookahead);
         let routing = schedule.routing_committees();
 
         let route = |shard| -> BTreeSet<ValidatorId> {
