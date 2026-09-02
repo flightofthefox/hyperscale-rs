@@ -29,9 +29,9 @@ mod witnesses;
 
 pub use contention::{ContentionReport, cross_shard_fraction, participant_count_sweep};
 pub use execution::{
-    a_failed_attempt_still_attests_work, a_native_post_quantum_account_pays_its_own_way,
-    a_payer_cannot_spend_one_balance_twice, a_published_package_matures_before_it_runs,
-    a_spent_nullifier_is_swept_once_unreachable, abort_charges_the_price_on_deadline,
+    a_failed_attempt_still_attests_work, a_leg_whose_core_never_answers_refuses_at_the_deadline,
+    a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
+    a_published_package_matures_before_it_runs, a_spent_nullifier_is_swept_once_unreachable,
     abort_converges, attested_load_reaches_the_beacon,
     cross_shard_credit_survives_a_later_local_credit, cross_shard_transfer, deploy_storm_rides_out,
     events_land_on_their_emitters_home_shard, failure_charges_its_payer, hot_recipient,

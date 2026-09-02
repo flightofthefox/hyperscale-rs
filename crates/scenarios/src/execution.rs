@@ -33,13 +33,13 @@ use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::faultable::FaultableCluster;
 use crate::support::query::{beacon_epoch, vault_balance};
 use crate::support::tx::{
-    OVERDRAW_AMOUNT, build_close_tx, build_composed_tx, build_draw_tx,
-    build_instance_instantiate_tx, build_instantiate_tx, build_publish_tx, build_securify_tx,
-    build_transfer_paid_by, build_transfer_tx, build_unbound_payer_tx, cross_shard_cast,
-    cross_shard_keys, lottery_on, native_pq_cast, nullifier_race_cast, overdraw_cast,
-    payment_request, payment_request_for, recipient, securify_cast, sender, shared_recipient_cast,
-    storm_artifact, storm_publishers, unbound_payer_cast, unbound_remote_payer_cast,
-    validity_around,
+    GENESIS_POOL_ID, OVERDRAW_AMOUNT, account_shard, build_close_tx, build_composed_tx,
+    build_draw_tx, build_instance_instantiate_tx, build_instantiate_tx, build_publish_tx,
+    build_securify_tx, build_stake_tx, build_transfer_paid_by, build_transfer_tx,
+    build_unbound_payer_tx, cross_shard_cast, cross_shard_keys, lottery_on, native_pq_cast,
+    nullifier_race_cast, overdraw_cast, payment_request, payment_request_for, pool_at, recipient,
+    remote_delegator, securify_cast, sender, shared_recipient_cast, storm_artifact,
+    storm_publishers, unbound_payer_cast, unbound_remote_payer_cast, validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_height, await_tx_terminal};
 use crate::support::{Cluster, epochs};
@@ -1335,31 +1335,41 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
     );
 }
 
-/// A payer whose counterpart never engages settles the declared price
-/// and nothing else.
+/// A leg whose core never engages refuses at the deadline.
 ///
-/// Cutting both channels the payer's bundle travels — the gossip
-/// broadcast and the fetch that backs it up — makes the counterpart's
-/// absence structural: engagement demands that evidence, so the
-/// transaction can never enter a block there. The payer's own leg is
-/// dependency-free, so it commits, reserves, and executes at once, then
-/// waits. It speaks once: with no engagement echo and the window closed,
-/// its single statement is the abort. The transaction's effects are
-/// discarded, so the recipient is never credited and the transferred
-/// amount never leaves; what leaves is the declared price, settled
-/// through the fee receipt the abort names.
+/// The payer has to sit on a leg with its core elsewhere. A transfer's
+/// payer is its own core and answers alone, so cutting its bundle away
+/// from the recipient costs it nothing; a stake into a pool on another
+/// shard is the shape that waits. The delegator's shard runs the inbound
+/// leg — the withdrawal, issued as a crossing — and the pool's shard is
+/// the core that takes the funds and hands back units, whose verdict the
+/// leg waits on.
+///
+/// Cutting both channels the leg's bundle travels — the broadcast and the
+/// fetch that backs it up — makes the core's absence structural:
+/// engagement demands that evidence, so the transaction can never enter a
+/// block there. The leg itself is dependency-free, so it commits, reserves
+/// and runs at once, then waits, its writes held apart from the vault.
+/// With no verdict back and the window closed, its single statement is a
+/// refusal, and the vault reads as if the stake had never been asked for.
 ///
 /// # Panics
 ///
-/// Panics if the harness cannot read the payer's vault, the payer never
-/// commits, the bundle is never suppressed, the transaction fails to
-/// reach a terminal abort, the counterpart engages, or the payer's
-/// balance moves by anything other than the price.
-pub fn abort_charges_the_price_on_deadline(c: &mut impl FaultableCluster) {
-    let payer_shard = ShardId::leaf(1, 0);
-    let counterpart = ShardId::leaf(1, 1);
-    let (payer, from, to) = cross_shard_cast();
-    let before = vault_balance(c, payer_shard, from);
+/// Panics if the harness cannot read the delegator's vault, the
+/// delegator's shard never commits the stake, the leg decides without
+/// waiting, the bundle is never suppressed, the stake fails to reach a
+/// terminal refusal, the core engages, or the vault ends anywhere but
+/// within the declared price of where it started.
+pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl FaultableCluster) {
+    let (payer_key, payer) = remote_delegator();
+    let pool = pool_at(GENESIS_POOL_ID);
+    let payer_shard = account_shard(payer, 2);
+    let core = account_shard(pool, 2);
+    assert_ne!(
+        payer_shard, core,
+        "the delegator has to sit off the pool's shard for its stake to be a leg",
+    );
+    let before = vault_balance(c, payer_shard, payer);
 
     // Both channels the bundle travels. The fetch rule names the
     // *request* type: the fault engine tags a request and its response
@@ -1367,7 +1377,7 @@ pub fn abort_charges_the_price_on_deadline(c: &mut impl FaultableCluster) {
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let fetch_dropped = c.drop_type("provision.request");
 
-    let tx = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
+    let tx = build_stake_tx(&payer_key, payer, pool, STAKE, validity_around(c.now()));
     let hash = tx.hash();
     let price = tx
         .price_under(c.derivation().as_ref())
@@ -1376,46 +1386,54 @@ pub fn abort_charges_the_price_on_deadline(c: &mut impl FaultableCluster) {
 
     assert!(
         c.run_until(epochs(8), |c| c.chain_fate(payer_shard, hash).0.is_some()),
-        "the payer shard must commit and reserve for the transaction"
+        "the delegator's shard must commit and reserve for the stake"
+    );
+    // The leg waits on its core rather than deciding on its own: a
+    // verdict this early would be the leg refusing the stake itself,
+    // which is a different scenario from a core that never answers.
+    assert!(
+        !c.run_until(epochs(3), |c| c
+            .tx_status(hash)
+            .is_some_and(|s| s.is_final())),
+        "the leg must wait on its core; status = {:?}",
+        c.tx_status(hash),
     );
 
     let verdict = await_tx_terminal(c, hash, epochs(90));
     assert!(
         matches!(
             verdict,
-            Some(TransactionStatus::Completed(TransactionDecision::Aborted))
+            Some(TransactionStatus::Completed(TransactionDecision::Reject))
         ),
-        "an unechoed cross-shard VM transaction must abort at the deadline; \
+        "a leg whose core never answers must refuse at the deadline; \
          verdict = {verdict:?}",
     );
     assert!(
         broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
         "both bundle channels must actually have been exercised and cut"
     );
-    let (counterpart_inclusion, _) = c.chain_fate(counterpart, hash);
+    let (core_inclusion, _) = c.chain_fate(core, hash);
     assert!(
-        counterpart_inclusion.is_none(),
-        "the counterpart must never have engaged the transaction",
+        core_inclusion.is_none(),
+        "the core must never have engaged the stake",
     );
 
-    // The price left the payer's vault; the transfer did not.
-    //
-    // A terminal status is reported the moment this shard decides the
-    // abort, which is a block or more before the finalization carrying its
-    // fee receipt commits — so the charge has to be waited for rather than
-    // read at the instant the status flips. Waiting on the balance moving
-    // at all keeps the amount itself unasserted until below.
+    // The stake never left. A terminal status is reported the moment
+    // this shard decides, a block or more before the refusal's receipt
+    // commits, so the vault is given that long to settle. At most the
+    // declared price stays gone.
+    c.run_until(epochs(4), |_| false);
+    let after = vault_balance(c, payer_shard, payer);
     assert!(
-        c.run_until(epochs(8), |c| vault_balance(c, payer_shard, from) != before),
-        "the abort's charge must reach committed state"
-    );
-    let after = vault_balance(c, payer_shard, from);
-    assert_eq!(
-        before.saturating_sub(after),
-        price,
-        "the abort must burn exactly the declared price: before = {before}, after = {after}",
+        (before - price..=before).contains(&after),
+        "the refusal must leave the vault within the price of where it started: \
+         before = {before}, after = {after}, price = {price}",
     );
 }
+
+/// What the deadline scenario stakes: well under its funding, so the
+/// vault's reading is legible against the price.
+const STAKE: u128 = 1_000;
 
 /// A transaction that fails still pays, and what it pays is the one
 /// declared price.

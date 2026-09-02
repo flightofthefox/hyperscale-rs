@@ -12,12 +12,12 @@ use std::time::Duration;
 
 use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
-    cross_shard_genesis_accounts, genesis_accounts, halt_straddler_setup,
-    livelock_genesis_accounts, merge_straddler_setup, participant_sweep_genesis_accounts,
-    reshape_lifecycle_accounts, split_straddler_setup,
+    genesis_accounts, halt_straddler_setup, livelock_genesis_accounts, merge_straddler_setup,
+    participant_sweep_genesis_accounts, remote_delegator, reshape_lifecycle_accounts,
+    split_straddler_setup,
 };
 use hyperscale_scenarios::{
-    ScenarioConfig, abort_charges_the_price_on_deadline, abort_converges,
+    ScenarioConfig, a_leg_whose_core_never_answers_refuses_at_the_deadline, abort_converges,
     beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
     cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
@@ -243,14 +243,14 @@ const fn cross_shard_config() -> ScenarioConfig {
 #[test]
 #[serial]
 #[ignore = "real-QUIC production scenario; run with -- --ignored"]
-fn abort_charges_the_price_on_deadline_prod() {
+fn a_leg_whose_core_never_answers_refuses_at_the_deadline_prod() {
     let mut cluster = ProdCluster::start_with_grown_accounts(
         &cross_shard_config(),
         42,
         EPOCH_MS,
-        cross_shard_genesis_accounts(),
+        vec![(remote_delegator().1, 1_000_000)],
     );
-    cluster.run_faultable(abort_charges_the_price_on_deadline);
+    cluster.run_faultable(a_leg_whose_core_never_answers_refuses_at_the_deadline);
 }
 
 #[test]

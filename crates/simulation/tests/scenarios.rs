@@ -17,15 +17,16 @@ use hyperscale_scenarios::tx::{
     halt_straddler_setup, insolvent_genesis_accounts, livelock_genesis_accounts,
     merge_straddler_setup, native_pq_genesis_accounts, nullifier_race_genesis_accounts,
     overdraw_genesis_accounts, participant_sweep_genesis_accounts, probe_train_genesis_accounts,
-    reshape_lifecycle_accounts, securify_genesis_accounts, shared_recipient_genesis_accounts,
-    split_straddler_setup, staking_genesis_accounts, stdlib_flash_bytes, storm_genesis_accounts,
-    unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
+    remote_delegator, reshape_lifecycle_accounts, securify_genesis_accounts,
+    shared_recipient_genesis_accounts, split_straddler_setup, staking_genesis_accounts,
+    stdlib_flash_bytes, storm_genesis_accounts, unbound_genesis_accounts,
+    unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
     Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig,
-    a_failed_attempt_still_attests_work, a_native_post_quantum_account_pays_its_own_way,
-    a_payer_cannot_spend_one_balance_twice, a_published_package_matures_before_it_runs,
-    a_spent_nullifier_is_swept_once_unreachable, abort_charges_the_price_on_deadline,
+    a_failed_attempt_still_attests_work, a_leg_whose_core_never_answers_refuses_at_the_deadline,
+    a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
+    a_published_package_matures_before_it_runs, a_spent_nullifier_is_swept_once_unreachable,
     abort_converges, attested_load_reaches_the_beacon,
     beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
     cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
@@ -326,10 +327,13 @@ fn sealed_rounds_settle_on_the_seed_they_committed_to_sim() {
 }
 
 #[test]
-fn abort_charges_the_price_on_deadline_sim() {
-    let mut cluster =
-        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
-    cluster.run_faultable(abort_charges_the_price_on_deadline);
+fn a_leg_whose_core_never_answers_refuses_at_the_deadline_sim() {
+    let mut cluster = SimCluster::with_grown_accounts(
+        &cross_shard_config(),
+        42,
+        &[(remote_delegator().1, 1_000_000)],
+    );
+    cluster.run_faultable(a_leg_whose_core_never_answers_refuses_at_the_deadline);
 }
 
 #[test]

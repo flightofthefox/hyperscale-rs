@@ -1502,15 +1502,35 @@ pub fn world_pools() -> Vec<StakePoolSeat> {
 /// on the pool's.
 #[must_use]
 pub fn badge_buyer() -> (Ed25519PrivateKey, PrincipalAddr) {
+    off_genesis_pool_shard(0)
+}
+
+/// A delegator whose stake into the genesis pool crosses shards.
+///
+/// An account on the shard the genesis pool does not live on, so its
+/// withdrawal is an inbound leg and the pool — which takes the funds and
+/// hands back units — is a core elsewhere. The one shape among the
+/// scenario builders where the payer's shard waits on another's verdict.
+#[must_use]
+pub fn remote_delegator() -> (Ed25519PrivateKey, PrincipalAddr) {
+    off_genesis_pool_shard(1)
+}
+
+/// The `index`th account grinded onto the shard the genesis pool does
+/// not live on.
+fn off_genesis_pool_shard(index: usize) -> (Ed25519PrivateKey, PrincipalAddr) {
     let trie = ShardTrie::uniform_from_count(2);
     let pool_shard = trie.shard_for_prefix(pool_at(GENESIS_POOL_ID));
-    let buyer_shard = if pool_shard == ShardId::leaf(1, 0) {
+    let shard = if pool_shard == ShardId::leaf(1, 0) {
         ShardId::leaf(1, 1)
     } else {
         ShardId::leaf(1, 0)
     };
     let mut taken = Vec::new();
-    account_routing_to(buyer_shard, &mut taken)
+    (0..=index)
+        .map(|_| account_routing_to(shard, &mut taken))
+        .last()
+        .expect("at least one account is grinded")
 }
 
 /// Sell the genesis pool: withdraw its owner badge from the seller's
