@@ -1424,11 +1424,15 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
         "the escrow debited the vault"
     );
 
-    let reclaimed = run(&store, Runs::Reclaim, false);
+    let reclaimed = run(&store, Runs::Reclaim { charged: true }, false);
     let ConsensusReceipt::Succeeded { writes, .. } = &reclaimed.consensus else {
         panic!("the reclaim must succeed: {:?}", reclaimed.metadata);
     };
     assert!(reclaimed.escrowed.is_empty(), "a reclaim issues nothing");
+    assert!(
+        reclaimed.fee_receipt.is_none(),
+        "the leg's own certificate settled the price; the reclaim owes none"
+    );
     store.apply(writes);
     assert_eq!(
         store.cell(vault_key(alice(), *XRD)),
@@ -1438,6 +1442,73 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
     assert!(
         store.cell(edge.record).is_some(),
         "the record stays: it says the value was issued"
+    );
+}
+
+/// The reclaim of a leg that never ran finds no record to reclaim from,
+/// and is refused before the kernel runs. The refusal is the sender's
+/// terminal on this shard and the one receipt left to carry the price:
+/// it settles the charge apart, debiting exactly the declared price and
+/// nothing else. The same reclaim of a leg that ran owes nothing.
+#[test]
+fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let near_shard = trie.shard_for_prefix(alice());
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 1_000),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let price = tx.price();
+    assert!(price > 0, "a priced fixture, or the charge proves nothing");
+
+    let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+    let run = |store: &MapDb, charged: bool| {
+        let ctx = TickBatchContext {
+            local_shard: near_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            transaction: &tx,
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            reaches_beyond: false,
+            abortable: false,
+            runs: Runs::Reclaim { charged },
+            arrivals: &[],
+        };
+        executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
+    };
+
+    let owed = run(&store, false);
+    assert!(
+        !matches!(owed.consensus, ConsensusReceipt::Succeeded { .. }),
+        "with no record to read, the reclaim is refused: {:?}",
+        owed.metadata
+    );
+    let charge = owed
+        .fee_receipt
+        .as_ref()
+        .and_then(ConsensusReceipt::writes)
+        .expect("the refusal settles the price apart");
+    store.apply(charge);
+    assert_eq!(
+        store.cell(vault_key(alice(), *XRD)),
+        Some(encode_amount(1_000 - price).to_vec()),
+        "exactly the declared price leaves the vault"
+    );
+
+    let paid = run(&store, true);
+    assert!(
+        !matches!(paid.consensus, ConsensusReceipt::Succeeded { .. }),
+        "the same refusal for a leg that ran"
+    );
+    assert!(
+        paid.fee_receipt.is_none(),
+        "owes nothing more: its own certificate settled the price"
     );
 }
 

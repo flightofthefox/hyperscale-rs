@@ -1431,15 +1431,17 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
         "the core must never have engaged the stake",
     );
 
-    // The stake never left. A terminal status is reported the moment
-    // this shard decides, a block or more before the refusal's receipt
-    // commits, so the vault is given that long to settle. At most the
-    // declared price stays gone.
+    // The stake never left, and the price did: the leg never ran, so the
+    // reclaim that refuses it at the deadline is the receipt that carries
+    // the charge. A terminal status is reported the moment this shard
+    // decides, a block or more before that receipt commits, so the vault
+    // is given that long to settle.
     c.run_until(epochs(4), |_| false);
     let after = vault_balance(c, payer_shard, payer);
-    assert!(
-        (before - price..=before).contains(&after),
-        "the refusal must leave the vault within the price of where it started: \
+    assert_eq!(
+        after,
+        before - price,
+        "the refusal must charge exactly the declared price: \
          before = {before}, after = {after}, price = {price}",
     );
 }

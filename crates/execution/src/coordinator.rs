@@ -991,7 +991,7 @@ impl ExecutionCoordinator {
         requests: &mut Vec<CrossShardExecutionRequest>,
     ) {
         let local_shard = self.local_shard;
-        for (tx_hash, transaction) in self.unresolved.reclaimable() {
+        for (tx_hash, transaction, charged) in self.unresolved.reclaimable() {
             if self.ticks.tick_assignment(tx_hash).is_some() {
                 continue;
             }
@@ -1010,7 +1010,7 @@ impl ExecutionCoordinator {
                 clock: tick_ts,
                 reaches_beyond: false,
                 abortable: false,
-                runs: Runs::Reclaim,
+                runs: Runs::Reclaim { charged },
                 arrivals: Vec::new(),
             });
         }
@@ -1060,7 +1060,7 @@ impl ExecutionCoordinator {
                 .filter(|edge| edge.from == local_shard)
                 .flat_map(|edge| edge.to)
                 .collect(),
-                Runs::Reclaim => BTreeSet::new(),
+                Runs::Reclaim { .. } => BTreeSet::new(),
             };
             state.record_crossing_targets(member.request.tx_hash, targets);
             self.ticks.assign_tx(member.request.tx_hash, tick_id);
@@ -7353,7 +7353,11 @@ mod tests {
                 _ => None,
             })
             .expect("the reclaim is dispatched to the engine");
-        assert_eq!(request.runs, Runs::Reclaim);
+        assert_eq!(
+            request.runs,
+            Runs::Reclaim { charged: true },
+            "the leg ran here, so its own certificate settled the price"
+        );
         assert!(!request.abortable, "nothing retracts a reclaim");
         assert!(
             state.unresolved.reclaimable().is_empty(),

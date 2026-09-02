@@ -328,12 +328,20 @@ impl UnresolvedTxs {
     /// so every replica at the same frontier composes the same reclaims.
     /// Never a clock reading: a record is the only thing that puts an
     /// entry here, and a record carries evidence.
+    ///
+    /// Each carries whether a tick of this shard's certified the leg —
+    /// a leg that ran settled its price inside its own certificate, and
+    /// one that never ran (held for a bundle that never came) owes it on
+    /// the reclaim's.
     #[must_use]
-    pub fn reclaimable(&self) -> Vec<(TxHash, Arc<Verified<Transaction>>)> {
+    pub fn reclaimable(&self) -> Vec<(TxHash, Arc<Verified<Transaction>>, bool)> {
         self.owed
             .iter()
             .filter(|(_, owed)| owed.leg && !owed.reclaim_admitted && owed.unsettled_by.is_some())
-            .filter_map(|(tx_hash, _)| Some((*tx_hash, Arc::clone(&self.legs.get(tx_hash)?.body))))
+            .filter_map(|(tx_hash, owed)| {
+                let body = Arc::clone(&self.legs.get(tx_hash)?.body);
+                Some((*tx_hash, body, owed.certified))
+            })
             .collect()
     }
 

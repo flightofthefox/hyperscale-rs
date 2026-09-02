@@ -159,7 +159,14 @@ pub enum Runs {
     Shape(Classified),
     /// No node at all: the crossings an inbound leg here issued, taken
     /// back on the evidence a committed record carries.
-    Reclaim,
+    Reclaim {
+        /// Whether this shard's own certificate of the leg settled the
+        /// price already. A leg that ran is determined, and burned it
+        /// inside its writes at its own finalization; one that never ran
+        /// — held for a bundle that never came — owes it still, and the
+        /// reclaim's receipt is the one of this shard's left to carry it.
+        charged: bool,
+    },
 }
 
 /// The star `legs` implies under `trie` — the anchored half of the

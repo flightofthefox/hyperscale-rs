@@ -1230,7 +1230,7 @@ impl Executor {
                 .get(&vm_tx)
                 .map(|shape| (&shape.runs, shape.arrivals.as_slice()))
             {
-                Some((Runs::Reclaim, _)) => {
+                Some((Runs::Reclaim { .. }, _)) => {
                     reclaim_for_shard(tx.legs(), tx.crossings(), ctx.shard_trie, ctx.local_shard)
                         .map_err(|defect| format!("no reclaim for this shard: {defect}"))
                         .and_then(|plan| Self::prepare_reclaim(plan, snapshot))
@@ -1362,13 +1362,15 @@ impl Executor {
                 if ctx.shard_trie.shard_for_prefix(vault.owner) != ctx.local_shard {
                     return None;
                 }
-                // A reclaim is a second execution of a transaction this
-                // shard already charged when its leg ran: it takes an
-                // escrow back and burns nothing, so the price is levied
-                // exactly once by construction.
+                // The reclaim of a leg this shard already charged — the
+                // leg ran, and its own certificate burned the price inside
+                // its writes — takes an escrow back and burns nothing, so
+                // the price is levied exactly once. The reclaim of a leg
+                // that never ran is the one receipt of this shard's that
+                // can still carry it.
                 if matches!(
                     shapes.get(&tx.hash()).map(|shape| &shape.runs),
-                    Some(Runs::Reclaim)
+                    Some(Runs::Reclaim { charged: true })
                 ) {
                     return None;
                 }
@@ -1472,8 +1474,27 @@ impl Executor {
                         .get(&tx.hash())
                         .cloned()
                         .unwrap_or_else(|| "missing batch receipt".to_string());
-                    let cached = CachedOutput::failed(vm_metadata(0, Some(reason)));
-                    project_to_shard(&cached, tx.hash(), ctx.local_shard, ctx.shard_trie)
+                    // Refused before the kernel ran — a plan that cannot
+                    // be built, a derivation this node refuses, a reclaim
+                    // with nothing to reclaim — is an attempt like any
+                    // other: the network committed it, reserved for it
+                    // and dispatched it, and it settles the same price
+                    // apart, as every attempt that applied no effects does.
+                    let fee = fee_by_tx.get(&vm_tx).copied();
+                    let charged = fee.map_or(0, |payer| payer.price.min(payer.max_fee));
+                    let cached = CachedOutput::failed(vm_metadata(charged, Some(reason)));
+                    let mut executed =
+                        project_to_shard(&cached, tx.hash(), ctx.local_shard, ctx.shard_trie);
+                    executed.fee_receipt = fee.map(|payer| {
+                        build_fee_receipt(
+                            ctx.local_shard,
+                            ctx.shard_trie,
+                            vm_tx,
+                            payer.vault,
+                            charged,
+                        )
+                    });
+                    executed
                 })
             })
             .collect()
