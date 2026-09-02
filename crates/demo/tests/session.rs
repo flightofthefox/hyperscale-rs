@@ -293,7 +293,7 @@ fn run_past_split(seed: u64, count: usize) -> Vec<TraceEvent> {
 }
 
 #[test]
-fn a_cross_shard_transfer_is_provisioned_and_certified_in_both_directions() {
+fn a_cross_shard_transfer_is_provisioned_one_way_and_certified_on_each_side() {
     let events = run_past_split(42, 6);
 
     // Which shards provisioned state to which, per transaction.
@@ -354,24 +354,26 @@ fn a_cross_shard_transfer_is_provisioned_and_certified_in_both_directions() {
             2,
             "tx {tx} spans exactly two shards, saw {pairs:?}",
         );
-        // Both sides provisioned: each shard read the other's state, which
-        // is what makes the settlement atomic rather than two local runs.
-        let reversed: BTreeSet<(String, String)> =
-            pairs.iter().map(|(a, b)| (b.clone(), a.clone())).collect();
+        // One direction: the payer's shard settles the transfer alone and
+        // the recipient's takes delivery of what it committed. Nothing
+        // travels back.
         assert_eq!(
-            *pairs, reversed,
-            "provisions must be reported in both directions for tx {tx}",
+            pairs.len(),
+            1,
+            "a transfer is provisioned payer to recipient and no other way, saw {pairs:?}",
         );
 
-        // Every participating shard signed a certificate covering it.
+        // Each side signed a certificate for its own half.
         let signers = certified.get(tx).expect("a provisioned tx is certified");
         assert_eq!(
             signers.iter().collect::<BTreeSet<_>>(),
             shards,
-            "tx {tx} needs a certificate from each participant",
+            "tx {tx} needs a certificate from each side",
         );
 
-        // And both sides committed the tick, each naming both participants.
+        // And each side committed a tick of its own, naming itself alone:
+        // the payer's verdict waits on no one, and the delivery is the
+        // recipient's own block's business.
         let commits = finalized.get(tx).expect("a certified tx is finalized");
         assert_eq!(
             commits.iter().map(|(s, _)| s).collect::<BTreeSet<_>>(),
@@ -380,9 +382,9 @@ fn a_cross_shard_transfer_is_provisioned_and_certified_in_both_directions() {
         );
         for (shard, participants) in commits {
             assert_eq!(
-                participants.iter().collect::<BTreeSet<_>>(),
-                shards,
-                "the tick {shard} committed must name both participants",
+                participants,
+                &vec![shard.clone()],
+                "the tick {shard} committed must name itself alone",
             );
         }
     }
