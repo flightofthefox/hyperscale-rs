@@ -86,8 +86,15 @@ const fn vote_activate_lead(fold_budget_ms: u64, epoch_ms: u64) -> u64 {
 /// margins that hold as the stdlib grows, and the derived merge floor (an
 /// eighth of it) stays below every live leaf, including the splitter's
 /// own children once it splits.
-fn straddler_split_bytes() -> u64 {
-    stdlib_flash_bytes() + 12_000
+pub fn straddler_split_bytes() -> u64 {
+    split_bytes_over(stdlib_flash_bytes())
+}
+
+/// The voted-down threshold for a pair whose survivor holds a genesis
+/// flash of `flash` bytes beside its ballast, and whose splitter's
+/// ballast leads the flash by a fixed margin.
+pub const fn split_bytes_over(flash: u64) -> u64 {
+    flash + 12_000
 }
 
 /// Verify a split straddler settles atomically across the reshape boundary.
@@ -155,12 +162,54 @@ pub fn split_straddler_ec_partition_atomic(c: &mut impl FaultableCluster) {
 /// Panics if the grow misses its budget, the splitter fails to admit a split,
 /// or the survivor admits one.
 pub fn arm_splitter_termination<C: Cluster>(c: &mut C) {
+    split_lifecycle(c);
+    vote_splitter_down(c);
+}
+
+/// Vote the reshape threshold down on an already grown pair so only the
+/// heavier splitter crosses it, and await its admission.
+///
+/// The second half of [`arm_splitter_termination`], for a cluster that
+/// reached the pair some other way — a grow the harness drove itself, as
+/// one born running a package does.
+///
+/// # Panics
+///
+/// Panics if either shard is unserved, the splitter fails to admit a
+/// split, or the survivor admits one.
+pub fn vote_splitter_down<C: Cluster>(c: &mut C) {
+    vote_splitter_down_to(c, straddler_split_bytes());
+}
+
+/// [`vote_splitter_down`] to an explicit threshold, for a pair whose byte
+/// bands a scenario sized itself.
+///
+/// # Panics
+///
+/// As [`vote_splitter_down`].
+pub fn vote_splitter_down_to<C: Cluster>(c: &mut C, split_bytes: u64) {
     let splitter = STRADDLER_SPLITTER;
     let survivor = STRADDLER_SURVIVOR;
-
-    split_lifecycle(c);
+    cast_splitter_vote(c, split_bytes);
     assert!(
-        c.serves_shard(splitter) && c.serves_shard(survivor),
+        await_split_admitted(c, splitter, epochs(20)),
+        "only the over-threshold splitter must admit a split",
+    );
+    assert!(
+        !split_admitted(c, survivor),
+        "the under-threshold survivor must not split",
+    );
+}
+
+/// Cast the vote that takes the threshold to `split_bytes`, below the
+/// splitter's bytes, without waiting for the admission it leads to.
+///
+/// # Panics
+///
+/// Panics if either shard of the pair is unserved.
+pub fn cast_splitter_vote<C: Cluster>(c: &mut C, split_bytes: u64) {
+    assert!(
+        c.serves_shard(STRADDLER_SPLITTER) && c.serves_shard(STRADDLER_SURVIVOR),
         "the grow must seat both the splitter and the survivor",
     );
 
@@ -172,20 +221,11 @@ pub fn arm_splitter_termination<C: Cluster>(c: &mut C) {
         .epoch_duration_ms;
     let vote = build_reshape_threshold_vote_tx(
         &pool_operator().0,
-        straddler_split_bytes(),
+        split_bytes,
         Epoch::new(current.inner() + vote_activate_lead(c.vote_fold_budget_ms(), epoch_ms)),
         validity_around(c.now()),
     );
     c.submit(Arc::new(vote));
-
-    assert!(
-        await_split_admitted(c, splitter, epochs(20)),
-        "only the over-threshold splitter must admit a split",
-    );
-    assert!(
-        !split_admitted(c, survivor),
-        "the under-threshold survivor must not split",
-    );
 }
 
 /// What a straddler choreography leaves for its caller to judge: the

@@ -112,7 +112,7 @@ pub fn grind_onto(shard: ShardId, taken: &mut Vec<u8>) -> (Ed25519PrivateKey, Pr
 
 /// The accounts that swap, dealt round-robin across the caller shards so
 /// the venue's fan-in is as wide as the world it is given.
-fn swappers_on(
+pub fn swappers_on(
     caller_shards: &[ShardId],
     taken: &mut Vec<u8>,
 ) -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {

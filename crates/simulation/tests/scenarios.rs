@@ -31,11 +31,11 @@ use hyperscale_scenarios::{
     a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
     a_spent_nullifier_is_swept_once_unreachable, a_swap_charges_its_caller_its_input_and_one_price,
     a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,
-    a_swap_the_venue_refuses_gives_its_caller_back_its_leg, abort_converges,
-    attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
-    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
-    cross_shard_credit_survives_a_later_local_credit, cross_shard_exec_cert_drop_is_inert,
-    cross_shard_fraction, cross_shard_header_fetch_fallback,
+    a_swap_the_venue_refuses_gives_its_caller_back_its_leg,
+    a_train_into_a_splitter_strands_nothing, abort_converges, attested_load_reaches_the_beacon,
+    beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
+    cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
+    cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
@@ -61,9 +61,9 @@ use hyperscale_scenarios::{
     split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
     split_surviving_counterpart_releases_its_reservation,
     split_survivor_recovers_a_settlement_it_never_received,
-    split_terminating_payer_releases_its_reservation, stake_withdraw_drops_effective_stake,
-    surviving_sibling_split_seats_full_committees, unbound_payer_engages_nothing,
-    unbound_remote_payer_engages_nothing, venue_genesis_accounts,
+    split_terminating_payer_releases_its_reservation, split_train_genesis_accounts,
+    stake_withdraw_drops_effective_stake, surviving_sibling_split_seats_full_committees,
+    unbound_payer_engages_nothing, unbound_remote_payer_engages_nothing, venue_genesis_accounts,
     withdrawal_ejects_a_validator_that_a_deposit_reactivates, withdrawals_compose_over_one_vault,
     zipf_payments,
 };
@@ -1066,6 +1066,13 @@ fn straddler_config() -> ScenarioConfig {
         split_bytes: stdlib_flash_bytes() + 30_000,
         latency: Duration::from_millis(150),
     }
+}
+
+#[test]
+fn a_train_into_a_splitter_strands_nothing_sim() {
+    let mut cluster =
+        SimCluster::with_accounts(&straddler_config(), 11, &split_train_genesis_accounts());
+    a_train_into_a_splitter_strands_nothing(&mut cluster);
 }
 
 #[test]

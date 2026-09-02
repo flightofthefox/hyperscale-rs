@@ -24,6 +24,7 @@ mod liveness;
 mod multi_vnode;
 mod reshape;
 mod route;
+mod route_reshape;
 mod straddler;
 mod transactions;
 mod venue;
@@ -69,6 +70,11 @@ pub use route::{
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
     a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
     route_genesis_accounts,
+};
+pub use route_reshape::{
+    SPLIT_TRAIN, a_departing_venue_clears_swaps_and_carries_on,
+    a_train_into_a_splitter_strands_nothing, departing_venue_ballast, departing_venue_split_bytes,
+    split_train_genesis_accounts,
 };
 pub use straddler::{
     isolate_ec_intake, merge_straddler_atomic, split_straddler_atomic,

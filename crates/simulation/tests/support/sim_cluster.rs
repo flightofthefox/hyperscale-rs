@@ -104,6 +104,26 @@ impl SimCluster {
     /// [`Self::with_dedicated_pool_hosts`] with funded accounts — the
     /// straddler and halt-recovery scenarios, whose legs are transfers
     /// over a byte skew the genesis ballast shapes.
+    /// [`Self::with_accounts`] over a network born running `packages`,
+    /// with the config's reshape trigger armed from genesis — the shape a
+    /// scenario that reaches a fixture and drives its own split wants.
+    #[must_use]
+    pub fn with_packages(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+        packages: GenesisPackages,
+    ) -> Self {
+        Self::build_full(&BuildArgs {
+            config,
+            seed,
+            dedicated_pool_hosts: false,
+            accounts,
+            execution_mode: ExecutionMode::Serial,
+            packages,
+        })
+    }
+
     #[must_use]
     pub fn with_accounts_and_dedicated_pool_hosts(
         config: &ScenarioConfig,

@@ -89,18 +89,6 @@ const BALLAST_CELL_BYTES: u64 = 16;
 /// splitter with fixed margins on both sides.
 const SPLITTER_BALLAST_LEAD: u64 = 24_000;
 
-/// Ballast accounts funded into the splitter, so it clears the voted-down
-/// threshold while the survivor — ballasted at [`STRADDLER_SURVIVOR_BULK`]
-/// — stays under it.
-///
-/// Derived so the ordering holds wherever the flash lands: the splitter
-/// clears the threshold on its ballast alone, and the survivor stays
-/// under it even holding the whole flash beside its own ballast.
-fn straddler_bulk() -> usize {
-    usize::try_from((stdlib_flash_bytes() + SPLITTER_BALLAST_LEAD) / BALLAST_CELL_BYTES)
-        .expect("ballast count fits usize")
-}
-
 /// Ballast accounts funded into the survivor: enough to clear the derived
 /// merge floor with margin, and short of the splitter's by enough that
 /// only the splitter crosses the voted-down split threshold even when the
@@ -386,6 +374,77 @@ const CONTENTION_SENDER_BASE: u8 = 120;
 /// sender seed.
 const CONTENTION_RECIPIENT_BASE: u8 = 200;
 
+/// The byte skew alone: the splitter ballasted over the voted-down
+/// threshold and the survivor under it, for a scenario that brings its
+/// own cast to the pair.
+#[must_use]
+pub fn split_ballast_accounts() -> Vec<(PrincipalAddr, u128)> {
+    split_ballast_accounts_over(stdlib_flash_bytes())
+}
+
+/// [`split_ballast_accounts`] for a network whose genesis flash is
+/// `flash` bytes — the fixture packages beside the protocol's, on a
+/// network born running them.
+///
+/// # Panics
+///
+/// Panics if the ballast count does not fit `usize`.
+#[must_use]
+pub fn split_ballast_accounts_over(flash: u64) -> Vec<(PrincipalAddr, u128)> {
+    let mut accounts = Vec::new();
+    let bulk = usize::try_from((flash + SPLITTER_BALLAST_LEAD) / BALLAST_CELL_BYTES)
+        .expect("ballast count fits usize");
+    ballast(STRADDLER_SPLITTER, 2, bulk, &mut accounts);
+    ballast(
+        STRADDLER_SURVIVOR,
+        2,
+        STRADDLER_SURVIVOR_BULK,
+        &mut accounts,
+    );
+    accounts
+}
+
+/// The genesis flash of a network born running the fixture packages
+/// beside the protocol's: every artifact, written whole under the
+/// publisher's single prefix.
+#[must_use]
+pub fn fixture_flash_bytes() -> u64 {
+    GenesisPackages::with_fixtures()
+        .artifacts()
+        .iter()
+        .map(|artifact| artifact.len() as u64)
+        .sum()
+}
+
+/// The genesis funding and transfers for a train into the splitter across
+/// its split's admission.
+pub struct SplitTrainSetup {
+    /// Genesis accounts: the byte skew plus every leg's payer and recipient.
+    pub accounts: Vec<(PrincipalAddr, u128)>,
+    /// One transfer per leg, survivor payer into splitter recipient, each
+    /// from its own payer so the train never waits on a reservation.
+    pub legs: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
+}
+
+/// Build the split-train genesis funding and its `count` legs.
+#[must_use]
+pub fn split_train_setup(count: usize) -> SplitTrainSetup {
+    let mut accounts = split_ballast_accounts();
+    let mut taken = Vec::new();
+    let legs = (0..count)
+        .map(|_| {
+            transfer_leg(
+                STRADDLER_SURVIVOR,
+                STRADDLER_SPLITTER,
+                2,
+                &mut taken,
+                &mut accounts,
+            )
+        })
+        .collect();
+    SplitTrainSetup { accounts, legs }
+}
+
 /// Build the split-straddler genesis funding and straddler transfers.
 ///
 /// The splitter (`leaf(1, 0)`) is ballasted over the voted-down threshold,
@@ -396,14 +455,7 @@ const CONTENTION_RECIPIENT_BASE: u8 = 200;
 /// recipient.
 #[must_use]
 pub fn split_straddler_setup() -> SplitStraddlerSetup {
-    let mut accounts = Vec::new();
-    ballast(STRADDLER_SPLITTER, 2, straddler_bulk(), &mut accounts);
-    ballast(
-        STRADDLER_SURVIVOR,
-        2,
-        STRADDLER_SURVIVOR_BULK,
-        &mut accounts,
-    );
+    let mut accounts = split_ballast_accounts();
     let mut taken = Vec::new();
     let straddlers = (0..STRADDLER_COUNT)
         .map(|_| {
