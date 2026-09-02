@@ -29,9 +29,8 @@ use hyperscale_scenarios::{
     abort_converges, attested_load_reaches_the_beacon,
     beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
     cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
-    cross_shard_exec_cert_drop_fetch_fallback, cross_shard_fraction,
-    cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
-    cross_shard_provisions_fetch_with_request_loss,
+    cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
+    cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
     delegation_folds_into_beacon_state, deploy_storm_rides_out, epochs,
@@ -479,14 +478,14 @@ fn cross_shard_provisions_drop_fetch_fallback_sim() {
 }
 
 #[test]
-fn cross_shard_exec_cert_drop_fetch_fallback_sim() {
+fn cross_shard_exec_cert_drop_is_inert_sim() {
     let mut cluster = SimCluster::with_execution_mode(
         &split_config(),
         11,
         &cross_shard_fault_genesis_accounts(),
         ExecutionMode::Serial,
     );
-    cluster.run_faultable(cross_shard_exec_cert_drop_fetch_fallback);
+    cluster.run_faultable(cross_shard_exec_cert_drop_is_inert);
 }
 
 #[test]

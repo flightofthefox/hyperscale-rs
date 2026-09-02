@@ -9,16 +9,14 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
-use hyperscale_engine::XRD;
-use hyperscale_engine::genesis::vault_key;
 use hyperscale_types::{
-    Address, BlockHeight, Ed25519PrivateKey, Epoch, PrincipalAddr, ShardId, TransactionDecision,
+    BlockHeight, Ed25519PrivateKey, Epoch, PrincipalAddr, ShardId, TransactionDecision,
     TransactionStatus, TxHash,
 };
 
 use crate::reshape::split_lifecycle;
 use crate::support::query::{
-    anchored_genesis_height, beacon_epoch, committee_size, split_admitted,
+    anchored_genesis_height, beacon_epoch, committee_size, split_admitted, vault_balance,
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, STRADDLER_SPLITTER,
@@ -615,16 +613,6 @@ pub fn split_surviving_counterpart_releases_its_reservation(c: &mut impl Faultab
          baseline = {baseline}, engaged = {engaged}, still owing = {:?}",
         c.committed_work_in_flight(survivor),
     );
-}
-
-/// The committed native-vault balance `owner` holds on `shard`.
-fn vault_balance<C: Cluster>(c: &C, shard: ShardId, owner: impl Into<Address>) -> u128 {
-    let vault = vault_key(owner, *XRD);
-    c.substate(shard, vault.owner, vault.local.0)
-        .map_or(0, |bytes| {
-            let cell: [u8; 16] = bytes.as_slice().try_into().expect("an amount cell");
-            u128::from_le_bytes(cell)
-        })
 }
 
 /// Verify a straddler the departing splitter settled applies on both sides,

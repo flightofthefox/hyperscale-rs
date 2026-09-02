@@ -19,9 +19,8 @@ use hyperscale_scenarios::tx::{
 use hyperscale_scenarios::{
     ScenarioConfig, abort_charges_the_price_on_deadline, abort_converges,
     beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
-    cross_shard_exec_cert_drop_fetch_fallback, cross_shard_fraction,
-    cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
-    cross_shard_provisions_fetch_with_request_loss,
+    cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
+    cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, delegation_folds_into_beacon_state,
     gossip_drop_engages_fetch_fallback, grow_reaches_four_shard_topology,
@@ -284,14 +283,14 @@ fn cross_shard_provisions_drop_fetch_fallback_prod() {
 #[test]
 #[serial]
 #[ignore = "real-QUIC production scenario; run with -- --ignored"]
-fn cross_shard_exec_cert_drop_fetch_fallback_prod() {
+fn cross_shard_exec_cert_drop_is_inert_prod() {
     let mut cluster = ProdCluster::start_with_accounts(
         &split_config(),
         11,
         EPOCH_MS,
         cross_shard_fault_genesis_accounts(),
     );
-    cluster.run_faultable(cross_shard_exec_cert_drop_fetch_fallback);
+    cluster.run_faultable(cross_shard_exec_cert_drop_is_inert);
 }
 
 #[test]

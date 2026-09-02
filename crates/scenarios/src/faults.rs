@@ -4,14 +4,14 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BlockHeight, Epoch, HALT_THRESHOLD_EPOCHS, PrincipalAddr, ShardId, StateRoot,
-    TransactionDecision, TransactionStatus, TxHash,
+    BlockHeight, Ed25519PrivateKey, Epoch, HALT_THRESHOLD_EPOCHS, PrincipalAddr, ShardId,
+    StateRoot, TransactionDecision, TransactionStatus, TxHash,
 };
 
 use crate::reshape::split_lifecycle;
 use crate::straddler::{chain_settled, submit_straddler};
 use crate::support::faultable::FaultableCluster;
-use crate::support::query::beacon_epoch;
+use crate::support::query::{beacon_epoch, vault_balance};
 use crate::support::tx::{
     HALT_STRADDLER_BATCH, account_shard, build_probe_transfer_tx, build_transfer_tx,
     cross_shard_fault_cast, halt_straddler_setup, validity_around,
@@ -824,7 +824,7 @@ pub fn inter_shard_partition_strands_ticks_until_it_heals(c: &mut impl Faultable
         .inner();
 
     // A cross-shard transfer in flight as the cut lands.
-    let before_hash = submit_crossing(c);
+    let before_hash = submit_crossing(c).hash;
 
     // Sever every inter-shard edge (both directions), intra-shard edges intact.
     c.partition(&left_hosts, &right_hosts);
@@ -923,8 +923,8 @@ pub fn inter_shard_partition_strands_ticks_until_it_heals(c: &mut impl Faultable
     );
 
     // A fresh cross-shard transfer settles normally on the healed network.
-    let fresh_hash = submit_crossing(c);
-    let fresh_status = await_tx_terminal(c, fresh_hash, epochs(10));
+    let fresh = submit_crossing(c);
+    let fresh_status = await_tx_terminal(c, fresh.hash, epochs(10));
     assert!(
         matches!(
             fresh_status,
@@ -1084,47 +1084,92 @@ const CROSSING_PAYMENT: u128 = 500;
 /// built at the same clock over the same pair would be one transaction under
 /// hash dedup, which is the replay protection working rather than a builder
 /// limitation.
-/// Assert `hash` really crossed the split: both children committed it.
+/// A cross-shard transfer in flight, with what its recipient held when it
+/// was submitted.
 ///
-/// Without this a scenario in this family passes on a transfer that never
-/// left one shard — the DA fetch engages for any dropped gossip, and the
+/// The credit is asserted as a delta off that reading: the vault is
+/// cluster-wide state, and what it holds is whatever earlier crossings
+/// left there.
+struct Crossing {
+    hash: TxHash,
+    recipient_shard: ShardId,
+    recipient: PrincipalAddr,
+    held_before: u128,
+}
+
+/// Wait for `crossing` to land on the recipient's chain and credit its
+/// vault.
+///
+/// A divided transfer accepts on its payer's chain alone; the recipient's
+/// shard commits the delivery in a block of its own, a hop behind, and
+/// credits the vault when it does. Read the moment the payer's status
+/// flips, the recipient shows nothing yet — and a scenario in this family
+/// that never read the recipient at all would pass on a payment that never
+/// left one shard: the DA fetch engages for any dropped gossip, and the
 /// remote-header channel runs as ordinary machinery in a grown cluster, so
 /// neither counter alone distinguishes a crossing from a local payment.
-fn assert_crossed<C: Cluster>(c: &C, hash: TxHash, context: &str) {
+fn await_crossed<C: Cluster>(c: &mut C, crossing: &Crossing, context: &str) {
     let (left, right) = ShardId::ROOT.children();
+    let credited = crossing.held_before + CROSSING_PAYMENT;
+    let landed = c.run_until(epochs(8), |c| {
+        c.chain_fate(left, crossing.hash).0.is_some()
+            && c.chain_fate(right, crossing.hash).0.is_some()
+            && vault_balance(c, crossing.recipient_shard, crossing.recipient) == credited
+    });
     assert!(
-        c.chain_fate(left, hash).0.is_some() && c.chain_fate(right, hash).0.is_some(),
-        "the {context} transfer never crossed the split: left={:?}, right={:?}",
-        c.chain_fate(left, hash).0,
-        c.chain_fate(right, hash).0,
+        landed,
+        "the {context} transfer never crossed the split: left={:?}, right={:?}, \
+         recipient holds {} against {credited} expected",
+        c.chain_fate(left, crossing.hash).0,
+        c.chain_fate(right, crossing.hash).0,
+        vault_balance(c, crossing.recipient_shard, crossing.recipient),
     );
 }
 
-fn submit_crossing<C: Cluster>(c: &mut C) -> TxHash {
+/// Submit the family's crossing: the left child's funded account pays the
+/// right child's.
+fn submit_crossing<C: Cluster>(c: &mut C) -> Crossing {
     let cast = cross_shard_fault_cast();
+    let (_, right) = ShardId::ROOT.children();
+    submit_crossing_between(c, &cast.left, (right, cast.right.1))
+}
+
+/// Submit a crossing from `payer` into `recipient`'s account on its shard.
+fn submit_crossing_between<C: Cluster>(
+    c: &mut C,
+    payer: &(Ed25519PrivateKey, PrincipalAddr),
+    recipient: (ShardId, PrincipalAddr),
+) -> Crossing {
+    let (recipient_shard, recipient) = recipient;
+    let held_before = vault_balance(c, recipient_shard, recipient);
     let tx = build_transfer_tx(
-        &cast.left.0,
-        cast.left.1,
-        cast.right.1,
+        &payer.0,
+        payer.1,
+        recipient,
         CROSSING_PAYMENT,
         validity_around(c.now()),
     );
     let hash = tx.hash();
     c.submit(Arc::new(tx));
-    hash
+    Crossing {
+        hash,
+        recipient_shard,
+        recipient,
+        held_before,
+    }
 }
 
 /// Grow to two shards, drop the `broadcast` message type, then run a cross-shard
 /// transfer that must recover via the `fetch_kind` fetch fallback.
 ///
-/// Works for any broadcast the cross-shard flow relies on — a unicast
-/// cross-shard delivery (`provisions.broadcast`, `execution.cert.batch`) suppressed at the
-/// sender's gate, or a gossip broadcast (`transaction.gossip`, `block.committed`)
-/// suppressed by the receiver's inbound filter. The transfer runs from the
-/// left child's funded account into the right child's, both seeded at genesis.
-/// Faults install after the split settles, so the grow rides its own broadcasts
-/// cleanly. Asserts the transfer accepts, the drop fired, the fetch engaged, and
-/// nothing aborted.
+/// Works for any broadcast the cross-shard flow relies on — the unicast
+/// bundle delivery (`provisions.broadcast`) suppressed at the sender's gate,
+/// or a gossip broadcast (`transaction.gossip`, `block.committed`) suppressed
+/// by the receiver's inbound filter. The transfer runs from the left child's
+/// funded account into the right child's, both seeded at genesis. Faults
+/// install after the split settles, so the grow rides its own broadcasts
+/// cleanly. Asserts the transfer accepts and lands, the drop fired, the fetch
+/// engaged, and nothing aborted.
 ///
 /// The provisions leg is the sharpest of these on the engine: a payer's
 /// bundle is the evidence its counterpart engages against, so suppressing the
@@ -1142,9 +1187,9 @@ fn cross_shard_broadcast_drop(
     let fetch_before = c.metric("fetch_items_sent", Some(fetch_kind));
     let dropped = c.drop_type(broadcast);
 
-    let hash = submit_crossing(c);
+    let crossing = submit_crossing(c);
 
-    let status = await_tx_terminal(c, hash, epochs(10));
+    let status = await_tx_terminal(c, crossing.hash, epochs(10));
     assert!(
         matches!(
             status,
@@ -1152,7 +1197,7 @@ fn cross_shard_broadcast_drop(
         ),
         "the cross-shard transfer must settle despite the dropped {broadcast}; status = {status:?}",
     );
-    assert_crossed(c, hash, broadcast);
+    await_crossed(c, &crossing, broadcast);
     assert!(dropped.fired() >= 1, "the {broadcast} drop must fire");
     assert!(
         c.metric("fetch_items_sent", Some(fetch_kind)) > fetch_before,
@@ -1176,41 +1221,70 @@ pub fn cross_shard_provisions_drop_fetch_fallback(c: &mut impl FaultableCluster)
     cross_shard_broadcast_drop(c, "provisions.broadcast", "provision");
 }
 
-/// Dropping `execution.cert.batch` still settles a cross-shard transfer — the
-/// destination shard fetches the execution certificates rather than receiving
-/// them.
+/// Dropping `execution.cert.batch` changes nothing for a divided transfer.
+///
+/// Nothing waits on a certificate from across the split, so the exec-cert
+/// fetch never engages and the transfer lands and credits as it would with
+/// the channel open. The payer's chain settles the transfer on its own verdict, and the
+/// recipient commits the delivery off the payer's committed bundle, never
+/// off a certificate. A certificate is waited for only where a route sends
+/// one shard's verdict to another — a leg with its core elsewhere — and a
+/// transfer has no such edge.
 ///
 /// # Panics
 ///
-/// Panics if the transfer does not settle, the drop never fires, the exec-cert
-/// fetch never engages, or anything aborts.
-pub fn cross_shard_exec_cert_drop_fetch_fallback(c: &mut impl FaultableCluster) {
-    cross_shard_broadcast_drop(c, "execution.cert.batch", "exec_cert");
+/// Panics if the transfer does not settle and land, the exec-cert fetch
+/// engages, or anything aborts.
+pub fn cross_shard_exec_cert_drop_is_inert(c: &mut impl FaultableCluster) {
+    split_lifecycle(c);
+    let fetch_before = c.metric("fetch_items_sent", Some("exec_cert"));
+    let _dropped = c.drop_type("execution.cert.batch");
+
+    let crossing = submit_crossing(c);
+
+    let status = await_tx_terminal(c, crossing.hash, epochs(10));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the transfer must settle with execution.cert.batch dropped; status = {status:?}",
+    );
+    await_crossed(c, &crossing, "execution.cert.batch");
+    assert_eq!(
+        c.metric("fetch_items_sent", Some("exec_cert")),
+        fetch_before,
+        "no shard waits on a certificate for a divided transfer, so the \
+         exec-cert fetch has nothing to bridge",
+    );
+    assert_eq!(
+        c.metric("transactions_aborted", None),
+        0,
+        "the cross-shard transfer must not abort",
+    );
 }
 
 /// Dropping BOTH `provisions.broadcast` and `execution.cert.batch` at once
 /// still settles a cross-shard transfer.
 ///
-/// The two fallback fetches are gated on different timeouts and different fetch
-/// instances, so this proves they compose without deadlock when both primary
-/// cross-shard channels fail together: each shard fetches its provisions and
-/// its execution certificates, and the tick finalizes within its timeout
-/// rather than aborting.
+/// The provision fetch bridges the bundle, and the certificate channel has
+/// nothing a divided transfer waits on.
 ///
 /// # Panics
 ///
-/// Panics if the transfer does not settle, either drop never fires, either
-/// fetch never engages, or anything aborts.
+/// Panics if the transfer does not settle and land, the bundle drop never
+/// fires, the provision fetch never engages, the exec-cert fetch engages,
+/// or anything aborts.
 pub fn cross_shard_compound_drop_fetch_fallback(c: &mut impl FaultableCluster) {
     split_lifecycle(c);
     let provision_before = c.metric("fetch_items_sent", Some("provision"));
     let exec_cert_before = c.metric("fetch_items_sent", Some("exec_cert"));
     let provisions_dropped = c.drop_type("provisions.broadcast");
-    let exec_cert_dropped = c.drop_type("execution.cert.batch");
+    let _exec_cert_dropped = c.drop_type("execution.cert.batch");
 
-    let hash = submit_crossing(c);
+    let crossing = submit_crossing(c);
 
-    let status = await_tx_terminal(c, hash, epochs(12));
+    let status = await_tx_terminal(c, crossing.hash, epochs(12));
     assert!(
         matches!(
             status,
@@ -1218,22 +1292,19 @@ pub fn cross_shard_compound_drop_fetch_fallback(c: &mut impl FaultableCluster) {
         ),
         "the transfer must settle despite both channels dropped; status = {status:?}",
     );
-    assert_crossed(c, hash, "compound-drop");
+    await_crossed(c, &crossing, "compound-drop");
     assert!(
         provisions_dropped.fired() >= 1,
         "the provisions.broadcast drop must fire",
     );
     assert!(
-        exec_cert_dropped.fired() >= 1,
-        "the execution.cert.batch drop must fire",
-    );
-    assert!(
         c.metric("fetch_items_sent", Some("provision")) > provision_before,
         "the provision fetch fallback must engage (before={provision_before})",
     );
-    assert!(
-        c.metric("fetch_items_sent", Some("exec_cert")) > exec_cert_before,
-        "the exec-cert fetch fallback must engage (before={exec_cert_before})",
+    assert_eq!(
+        c.metric("fetch_items_sent", Some("exec_cert")),
+        exec_cert_before,
+        "the exec-cert fetch has nothing to bridge for a divided transfer",
     );
     assert_eq!(
         c.metric("transactions_aborted", None),
@@ -1296,9 +1367,9 @@ pub fn cross_shard_provisions_fetch_with_request_loss(c: &mut impl FaultableClus
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let request_dropped = c.drop_type_with_probability("provision.request", 0.5);
 
-    let hash = submit_crossing(c);
+    let crossing = submit_crossing(c);
 
-    let status = await_tx_terminal(c, hash, epochs(12));
+    let status = await_tx_terminal(c, crossing.hash, epochs(12));
     assert!(
         matches!(
             status,
@@ -1306,7 +1377,7 @@ pub fn cross_shard_provisions_fetch_with_request_loss(c: &mut impl FaultableClus
         ),
         "the transfer must settle despite 50% provision.request loss; status = {status:?}",
     );
-    assert_crossed(c, hash, "request-loss");
+    await_crossed(c, &crossing, "request-loss");
     assert!(
         broadcast_dropped.fired() >= 1,
         "the provisions.broadcast drop must fire",
@@ -1327,13 +1398,16 @@ pub fn cross_shard_provisions_fetch_with_request_loss(c: &mut impl FaultableClus
 /// A transient `provisions.broadcast` outage recovers even when the fault lifts
 /// mid-flight.
 ///
-/// Drop the broadcast, submit a cross-shard transfer, and wait until the outage
-/// actually bites — the source shard's one-shot provision broadcast is
-/// suppressed. Then lift the fault and confirm the transfer still settles via
-/// the provision fetch fallback with nothing aborting. The dropped broadcast is
-/// not re-emitted on lift, so the destination shard recovers by fetch either
-/// way; the point is that removing a live drop rule mid-recovery is safe — the
-/// fetch bridge completes and no tick wedges.
+/// Drop the broadcast, submit a cross-shard transfer, and hold the outage
+/// until it has bitten the bundle that matters: the payer's chain sends one
+/// bundle when it commits the transfer and another, carrying the crossing
+/// the recipient's delivery rides, when it commits the finalization. Only
+/// the second withholds the delivery, so the fault holds until the payer's
+/// chain has finalized. Then lift it and confirm the delivery still lands
+/// via the provision fetch fallback with nothing aborting. A dropped
+/// bundle is not re-emitted on lift, so the recipient recovers by fetch
+/// either way; the point is that removing a live drop rule mid-recovery is
+/// safe — the fetch bridge completes and no tick wedges.
 ///
 /// One transfer, not two: both accounts of the crossing pair are declared
 /// writes of every transfer between them, so a second overlapping cross-shard
@@ -1341,25 +1415,34 @@ pub fn cross_shard_provisions_fetch_with_request_loss(c: &mut impl FaultableClus
 ///
 /// # Panics
 ///
-/// Panics if the transfer fails to settle, the outage never fired, the
-/// provision fetch never engaged, or anything aborts.
+/// Panics if the payer's chain fails to finalize the transfer, the outage
+/// never fired, the transfer fails to land, the provision fetch never
+/// engaged, or anything aborts.
 pub fn cross_shard_provisions_recovers_after_transient_outage(c: &mut impl FaultableCluster) {
     split_lifecycle(c);
+    let (payer_shard, _) = ShardId::ROOT.children();
     let fetch_before = c.metric("fetch_items_sent", Some("provision"));
     let dropped = c.drop_type("provisions.broadcast");
 
-    let hash = submit_crossing(c);
+    let crossing = submit_crossing(c);
 
-    // Let the outage bite: the source shard's provision broadcast is dropped
+    // Let the outage bite the crossing bundle: the payer's chain finalizes
+    // the transfer and the bundle its finalizing block sends is dropped
     // before we lift the fault, so the recovery genuinely spans a removal.
-    let bit = c.run_until(epochs(8), |_| dropped.fired() >= 1);
+    let finalized = c.run_until(epochs(8), |c| {
+        c.chain_fate(payer_shard, crossing.hash).1.is_some()
+    });
     assert!(
-        bit,
+        finalized,
+        "the payer's chain must finalize the transfer before the outage lifts",
+    );
+    assert!(
+        dropped.fired() >= 1,
         "the provisions.broadcast drop must fire before the outage lifts",
     );
     c.clear_drops();
 
-    let status = await_tx_terminal(c, hash, epochs(10));
+    let status = await_tx_terminal(c, crossing.hash, epochs(10));
     assert!(
         matches!(
             status,
@@ -1368,7 +1451,7 @@ pub fn cross_shard_provisions_recovers_after_transient_outage(c: &mut impl Fault
         "the transfer must settle via the provision fetch despite the transient \
          outage; status = {status:?}",
     );
-    assert_crossed(c, hash, "transient-outage");
+    await_crossed(c, &crossing, "transient-outage");
     assert!(
         c.metric("fetch_items_sent", Some("provision")) > fetch_before,
         "the provision fetch fallback must bridge the outage (before={fetch_before})",

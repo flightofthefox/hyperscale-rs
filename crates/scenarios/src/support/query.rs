@@ -8,10 +8,12 @@
 
 use std::collections::BTreeSet;
 
+use hyperscale_engine::XRD;
+use hyperscale_engine::genesis::vault_key;
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
-    BlockHash, BlockHeight, ConsensusPublicKey, Epoch, PendingReshape, ShardId, Stake, StakePool,
-    StakePoolId, StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
+    Address, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, PendingReshape, ShardId, Stake,
+    StakePool, StakePoolId, StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
     ValidatorStatus,
 };
 
@@ -51,6 +53,22 @@ pub fn chain_fate(
         height = height.next();
     }
     (committed, finalized)
+}
+
+/// The committed balance of `owner`'s native vault on `shard`, read through
+/// the harness's client-proven snapshot seam.
+///
+/// # Panics
+///
+/// Panics if the cell holds anything but an amount.
+#[must_use]
+pub fn vault_balance<C: Cluster>(c: &C, shard: ShardId, owner: impl Into<Address>) -> u128 {
+    let vault = vault_key(owner, *XRD);
+    c.substate(shard, vault.owner, vault.local.0)
+        .map_or(0, |bytes| {
+            let cell: [u8; 16] = bytes.as_slice().try_into().expect("an amount cell");
+            u128::from_le_bytes(cell)
+        })
 }
 
 /// Rank a transaction status so a cluster-wide view takes the most advanced

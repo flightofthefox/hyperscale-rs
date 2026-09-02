@@ -43,7 +43,7 @@ pub use execution::{
 };
 pub use faults::{
     beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
-    cross_shard_compound_drop_fetch_fallback, cross_shard_exec_cert_drop_fetch_fallback,
+    cross_shard_compound_drop_fetch_fallback, cross_shard_exec_cert_drop_is_inert,
     cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
     cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,

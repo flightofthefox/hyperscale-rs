@@ -31,7 +31,7 @@ use hyperscale_vm_types::{NULLIFIER_GRACE_MS, SEAL_MATURITY_EPOCHS};
 
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::faultable::FaultableCluster;
-use crate::support::query::beacon_epoch;
+use crate::support::query::{beacon_epoch, vault_balance};
 use crate::support::tx::{
     OVERDRAW_AMOUNT, build_close_tx, build_composed_tx, build_draw_tx,
     build_instance_instantiate_tx, build_instantiate_tx, build_publish_tx, build_securify_tx,
@@ -399,13 +399,23 @@ pub fn cross_shard_transfer(c: &mut impl Cluster) {
         ),
         "cross-shard VM transfer did not accept; status = {status:?}"
     );
-    // Atomic settlement: both legs' chains carry the transaction.
-    let (left, _) = c.chain_fate(ShardId::leaf(1, 0), hash);
-    let (right, _) = c.chain_fate(ShardId::leaf(1, 1), hash);
-    assert!(left.is_some(), "payer shard never committed the transfer");
+    // The payer's chain settled it alone; the recipient's chain commits
+    // the delivery a hop behind and credits the vault when it does.
+    let payer_shard = ShardId::leaf(1, 0);
+    let recipient_shard = ShardId::leaf(1, 1);
     assert!(
-        right.is_some(),
-        "recipient shard never committed the transfer"
+        c.chain_fate(payer_shard, hash).0.is_some(),
+        "payer shard never committed the transfer"
+    );
+    assert!(
+        c.run_until(epochs(6), |c| c
+            .chain_fate(recipient_shard, hash)
+            .0
+            .is_some()
+            && vault_balance(c, recipient_shard, to) == 10 + 100),
+        "recipient shard never committed and credited the delivery; committed = {:?}, holds {}",
+        c.chain_fate(recipient_shard, hash).0,
+        vault_balance(c, recipient_shard, to),
     );
 }
 
@@ -1539,17 +1549,6 @@ pub fn withdrawals_compose_over_one_vault(c: &mut impl Cluster, count: u8) -> u6
         heights.len(),
     );
     heights.len() as u64
-}
-
-/// The committed balance of a account's native vault, read through the
-/// harness's client-proven snapshot seam.
-fn vault_balance(c: &impl Cluster, shard: ShardId, owner: impl Into<Address>) -> u128 {
-    let vault = vault_key(owner, *XRD);
-    c.substate(shard, vault.owner, vault.local.0)
-        .map_or(0, |bytes| {
-            let cell: [u8; 16] = bytes.as_slice().try_into().expect("an amount cell");
-            u128::from_le_bytes(cell)
-        })
 }
 
 /// A spent nullifier outlives every chain that could read it, and no
