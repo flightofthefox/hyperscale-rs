@@ -24,8 +24,8 @@ use hyperscale_scenarios::tx::{
 };
 use hyperscale_scenarios::{
     Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
-    a_departing_venue_clears_swaps_and_carries_on, a_failed_attempt_still_attests_work,
-    a_leg_whose_core_never_answers_refuses_at_the_deadline,
+    a_delivery_cut_off_past_its_window_is_reclaimed, a_departing_venue_clears_swaps_and_carries_on,
+    a_failed_attempt_still_attests_work, a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_published_package_matures_before_it_runs,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
@@ -467,6 +467,13 @@ fn a_route_cut_off_across_its_deadline_is_not_reclaimed_sim() {
 fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took_sim() {
     let mut cluster = route_cluster();
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took(&mut cluster, epochs(40));
+}
+
+#[test]
+fn a_delivery_cut_off_past_its_window_is_reclaimed_sim() {
+    let mut cluster =
+        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
+    cluster.run_faultable(a_delivery_cut_off_past_its_window_is_reclaimed);
 }
 
 #[test]

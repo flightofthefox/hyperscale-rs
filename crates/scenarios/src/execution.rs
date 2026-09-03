@@ -23,7 +23,7 @@ use hyperscale_engine::{
 use hyperscale_hbor::from_slice;
 use hyperscale_types::{
     AccountSigner, Address, BlockHeight, Epoch, Hash, SWEEP_BUCKET_MS, SchemeId, SeedLookup,
-    ShardId, TransactionDecision, TransactionStatus, TxHash,
+    ShardId, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, lapse_probe_anchor,
 };
 use hyperscale_vm_effects::{InstanceMeta, nullifier_key, package_hash};
 use hyperscale_vm_fixtures::lottery;
@@ -1542,6 +1542,97 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
          before = {before}, after = {after}, price = {price}",
     );
     world.assert_settled(c, charges.burned(c), "a leg refused at its deadline");
+}
+
+/// A delivery cut off past its window is reclaimed by its payer.
+///
+/// A transfer's payer settles alone: its leg pays, issues the crossing
+/// and accepts, and the recipient's shard delivers a hop behind by
+/// claiming the crossing off the bundle the payer's shard provisions.
+/// Cutting both channels that bundle travels leaves the recipient with
+/// nothing to claim from, and once the delivery window closes nothing
+/// can admit the delivery at all — the payer is debited and the crossing
+/// sits issued with no claimant. What licenses the payer to take it back
+/// is a proof, never the clock: absence of the recipient's claim cell
+/// from its committed state at a block past the lapse, the window's
+/// close plus the finalization delay. The recipient's chain keeps
+/// committing and its headers keep flowing, since only provisions are
+/// cut, so the proof is reachable while the crossing still stands.
+///
+/// # Panics
+///
+/// Panics if the payer's leg does not accept, if the bundle channels
+/// are never exercised, if the delivery lands despite the cut, if the
+/// payment is not back in the payer's vault within the reclaim's room,
+/// or if the world does not conserve.
+pub fn a_delivery_cut_off_past_its_window_is_reclaimed<C: FaultableCluster>(c: &mut C) {
+    let (payer_key, from, to) = cross_shard_cast();
+    let payer_shard = ShardId::leaf(1, 0);
+    let recipient_shard = ShardId::leaf(1, 1);
+    let before = vault_balance(c, payer_shard, from);
+    let recipient_before = vault_balance(c, recipient_shard, to);
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
+
+    let broadcast_dropped = c.drop_type("provisions.broadcast");
+    let fetch_dropped = c.drop_type("provision.request");
+
+    let validity = validity_around(c.now());
+    let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
+    let price = declared_price(c, &tx);
+    let hash = charges.submit(c, tx);
+
+    let verdict = await_tx_terminal(c, hash, epochs(8));
+    assert!(
+        matches!(
+            verdict,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the payer's leg settles alone and accepts; verdict = {verdict:?}",
+    );
+    assert!(
+        c.run_until(epochs(4), |c| vault_balance(c, payer_shard, from)
+            == before - 100 - price),
+        "the leg pays the payment and the price",
+    );
+
+    // Past the lapse, with the cut standing the whole way: the window
+    // closed on a delivery that never had a bundle to claim from.
+    let lapse = lapse_probe_anchor(validity.end_timestamp_exclusive);
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    assert!(
+        c.run_until(epochs(12), |c| clock(c) >= lapse),
+        "the cut must stand past the lapse",
+    );
+    assert!(
+        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
+        "both bundle channels must actually have been exercised and cut"
+    );
+    assert!(
+        c.chain_fate(recipient_shard, hash).0.is_none(),
+        "the delivery must never have landed while its bundle was cut off",
+    );
+
+    // The reclaim: the recipient's chain passes the lapse, the payer's
+    // shard proves the claim cell absent there, and the payment comes
+    // back. The price stays paid — the leg ran and burned it.
+    assert!(
+        c.run_until(epochs(10), |c| vault_balance(c, payer_shard, from)
+            == before - price),
+        "the payer must get its payment back once the lapse is proved; holds {}",
+        vault_balance(c, payer_shard, from),
+    );
+    assert!(
+        c.chain_fate(recipient_shard, hash).0.is_none(),
+        "the reclaim must not be answered by a late delivery",
+    );
+    assert_eq!(
+        vault_balance(c, recipient_shard, to),
+        recipient_before,
+        "the recipient was never credited",
+    );
+    c.clear_drops();
+    world.assert_settles_within(c, &charges, epochs(4), "a delivery cut off past its window");
 }
 
 /// What the deadline scenario stakes: well under its funding, so the

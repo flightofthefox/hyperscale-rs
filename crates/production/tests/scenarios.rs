@@ -12,12 +12,13 @@ use std::time::Duration;
 
 use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
-    genesis_accounts, halt_straddler_setup, livelock_genesis_accounts, merge_straddler_setup,
-    participant_sweep_genesis_accounts, remote_delegator, reshape_lifecycle_accounts,
-    split_straddler_setup,
+    cross_shard_genesis_accounts, genesis_accounts, halt_straddler_setup,
+    livelock_genesis_accounts, merge_straddler_setup, participant_sweep_genesis_accounts,
+    remote_delegator, reshape_lifecycle_accounts, split_straddler_setup,
 };
 use hyperscale_scenarios::{
-    ScenarioConfig, a_leg_whose_core_never_answers_refuses_at_the_deadline, abort_converges,
+    ScenarioConfig, a_delivery_cut_off_past_its_window_is_reclaimed,
+    a_leg_whose_core_never_answers_refuses_at_the_deadline, abort_converges,
     beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
     cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
@@ -238,6 +239,19 @@ const fn cross_shard_config() -> ScenarioConfig {
         split_bytes: u64::MAX,
         latency: Duration::from_millis(60),
     }
+}
+
+#[test]
+#[serial]
+#[ignore = "real-QUIC production scenario; run with -- --ignored"]
+fn a_delivery_cut_off_past_its_window_is_reclaimed_prod() {
+    let mut cluster = ProdCluster::start_with_grown_accounts(
+        &cross_shard_config(),
+        42,
+        EPOCH_MS,
+        cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(a_delivery_cut_off_past_its_window_is_reclaimed);
 }
 
 #[test]

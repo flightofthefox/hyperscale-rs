@@ -845,6 +845,21 @@ impl ExecutionCoordinator {
                         ),
                     );
                 }
+            } else if classified.decomposed().holds() {
+                // A core member's verdict is its own, but what it issues
+                // to deliveries elsewhere outlives it: kept for the
+                // reclaim of whatever those deliveries never claim.
+                self.unresolved.mark_issuer(
+                    tx.hash(),
+                    Arc::clone(&verified),
+                    delivered_claims(
+                        tx.legs(),
+                        tx.crossings(),
+                        classified.decomposed(),
+                        trie,
+                        local_shard,
+                    ),
+                );
             }
             self.candidates
                 .register(verified, participating, ts, classified);

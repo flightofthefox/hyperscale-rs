@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, Finalization, MAX_VALIDITY_RANGE, ShardId, ShardTrie,
-    SubstateKey, Transaction, TxHash, Unsettleable, UnsettledTx, Verifiable, Verified,
-    WeightedTimestamp, delivery_window_close,
+    SubstateKey, Transaction, TransactionDecision, TxHash, Unsettleable, UnsettledTx, Verifiable,
+    Verified, WeightedTimestamp, delivery_window_close,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -78,15 +78,9 @@ struct Owed {
     /// certificate outlives the tick, and a shard that could not say
     /// whether it had issued one would have to assume it had.
     certified: bool,
-    /// Whether this shard ran only a leg of the transaction: it froze
-    /// divided with this shard outside the core set.
-    ///
-    /// A leg's tick attests it and its certificate settles alone, so the
-    /// entry is never abandoned and its own finalization bears no verdict
-    /// on the transaction. What the entry is for is the reclaim: it holds
-    /// the terms a reclaim states, and it lives — on the transaction's
-    /// own clock — exactly as long as the record cell it would take back.
-    leg: bool,
+    /// What this shard's part in the transaction is, which decides what
+    /// the entry waits on and what ends it.
+    kind: Kind,
     /// Whether a tick of this shard's has admitted the reclaim of a leg
     /// entry, so the finalization naming the hash next is the
     /// reclaim's. Meaningless off a leg entry.
@@ -145,14 +139,51 @@ pub struct Unanswerable {
     pub covered_by_record: bool,
 }
 
-/// What a leg entry keeps for the reclaim and the refusal mirror.
+/// What this shard's part in a transaction is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// This shard's verdict is the transaction's, or a share of it: the
+    /// entry is abandonable at its deadline and released by that verdict.
+    Whole,
+    /// This shard ran only a leg of the transaction: it froze divided
+    /// with this shard outside the core set.
+    ///
+    /// A leg's tick attests it and its certificate settles alone, so the
+    /// entry is never abandoned and its own finalization bears no verdict
+    /// on the transaction. What the entry is for is the reclaim: it holds
+    /// the terms a reclaim states, and it lives — on the transaction's
+    /// own clock — exactly as long as the record cell it would take back.
+    Leg,
+    /// This shard's own verdict already resolved the transaction and the
+    /// entry stays for the reclaim alone: it issued crossings that
+    /// deliveries elsewhere still owe a claim for. Held as a leg entry
+    /// from then on — never abandoned, probed past the deadline,
+    /// released by the reclaim — but named by no departure record: a
+    /// departed deliverer's successor still delivers, and only the lapse
+    /// says a delivery never will.
+    Remainder,
+}
+
+impl Kind {
+    /// Whether the entry bears no verdict of its own and is held for a
+    /// reclaim: a leg's, or a resolved issuer's remainder.
+    const fn is_leg(self) -> bool {
+        matches!(self, Self::Leg | Self::Remainder)
+    }
+}
+
+/// What an entry that may be reclaimed keeps beside its account: a leg
+/// entry's, for the reclaim and the refusal mirror, or an issuer's, for
+/// the reclaim of what its deliveries never claimed.
 #[derive(Debug, Clone)]
-struct Leg {
+struct Kept {
     body: Arc<Verified<Transaction>>,
+    /// Whose refusal is the transaction's. Empty for an issuer in the
+    /// core, whose verdict is its own.
     core: BTreeSet<ShardId>,
     /// The claim cells deliveries elsewhere write for the crossings this
-    /// leg issued, each under its delivering shard — what a lapse probe
-    /// asks about once the delivery window has closed.
+    /// shard issued, each under its delivering shard — what a lapse
+    /// probe asks about once the delivery window has closed.
     deliveries: Vec<(ShardId, SubstateKey)>,
 }
 
@@ -185,12 +216,13 @@ pub struct Probeable {
 #[derive(Debug, Default)]
 pub struct UnresolvedTxs {
     owed: BTreeMap<TxHash, Owed>,
-    /// What a leg entry keeps beside its account: the body, for the
-    /// reclaim, which derives from the transaction's legs and crossings
-    /// after the candidate pool let the body go; and the core set, which
-    /// says whose refusal is the transaction's. Bounded by the entries'
-    /// own horizon, and dropped with them.
-    legs: HashMap<TxHash, Leg>,
+    /// What a leg entry or an issuer keeps beside its account: the body,
+    /// for the reclaim, which derives from the transaction's legs and
+    /// crossings after the candidate pool let the body go; the core set,
+    /// which says whose refusal is the transaction's; and the claim
+    /// cells its deliveries owe. Bounded by the entries' own horizon,
+    /// and dropped with them.
+    kept: HashMap<TxHash, Kept>,
     /// Where each departed participant's chain ended, for the entries
     /// whose fate only that shard's settled set can decide. Held against
     /// the schedule window that proves the terminal, which is retained on
@@ -235,7 +267,7 @@ impl UnresolvedTxs {
                     .filter(|prefix| !ShardTrie::shard_owns_prefix(local_shard, *prefix))
                     .collect(),
                 certified: false,
-                leg: false,
+                kind: Kind::Whole,
                 reclaim_admitted: false,
                 unsettled_by: None,
             };
@@ -257,16 +289,41 @@ impl UnresolvedTxs {
         deliveries: Vec<(ShardId, SubstateKey)>,
     ) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
-            owed.leg = true;
-            self.legs.insert(
+            owed.kind = Kind::Leg;
+            self.kept.insert(
                 tx_hash,
-                Leg {
+                Kept {
                     body,
                     core,
                     deliveries,
                 },
             );
         }
+    }
+
+    /// Record that this shard issues crossings of `tx_hash` that
+    /// deliveries elsewhere consume, on a member whose verdict is its own
+    /// — one in the core. Nothing changes until that verdict commits:
+    /// the entry is abandonable and released like any other, and if it
+    /// accepted, [`Self::release_resolved`] keeps it on as a remainder
+    /// for the reclaim of whatever its deliveries never claim.
+    pub fn mark_issuer(
+        &mut self,
+        tx_hash: TxHash,
+        body: Arc<Verified<Transaction>>,
+        deliveries: Vec<(ShardId, SubstateKey)>,
+    ) {
+        if deliveries.is_empty() || !self.owed.contains_key(&tx_hash) {
+            return;
+        }
+        self.kept.insert(
+            tx_hash,
+            Kept {
+                body,
+                core: BTreeSet::new(),
+                deliveries,
+            },
+        );
     }
 
     /// Record that this shard only delivers for `tx_hash`: it runs a leg
@@ -288,7 +345,7 @@ impl UnresolvedTxs {
     /// `None` for anything but a leg entry this ledger holds.
     #[must_use]
     pub fn leg_core(&self, tx_hash: TxHash) -> Option<&BTreeSet<ShardId>> {
-        self.legs.get(&tx_hash).map(|leg| &leg.core)
+        self.kept.get(&tx_hash).map(|leg| &leg.core)
     }
 
     /// The figures a record naming a leg entry restates, for one no
@@ -298,7 +355,7 @@ impl UnresolvedTxs {
     pub fn unsettled_leg_figures(&self, tx_hash: TxHash) -> Option<UnsettledTx> {
         self.owed
             .get(&tx_hash)
-            .filter(|owed| owed.leg && owed.unsettled_by.is_none())
+            .filter(|owed| owed.kind.is_leg() && owed.unsettled_by.is_none())
             .map(|owed| UnsettledTx {
                 tx_hash,
                 deadline: owed.deadline,
@@ -322,9 +379,11 @@ impl UnresolvedTxs {
     pub fn probeable(&self, now: WeightedTimestamp) -> Vec<Probeable> {
         self.owed
             .iter()
-            .filter(|(_, owed)| owed.leg && owed.unsettled_by.is_none() && now >= owed.deadline)
+            .filter(|(_, owed)| {
+                owed.kind.is_leg() && owed.unsettled_by.is_none() && now >= owed.deadline
+            })
             .filter_map(|(tx_hash, owed)| {
-                let leg = self.legs.get(tx_hash)?;
+                let leg = self.kept.get(tx_hash)?;
                 Some(Probeable {
                     tx_hash: *tx_hash,
                     deadline: owed.deadline,
@@ -359,9 +418,11 @@ impl UnresolvedTxs {
     pub fn reclaimable(&self) -> Vec<(TxHash, Arc<Verified<Transaction>>, bool)> {
         self.owed
             .iter()
-            .filter(|(_, owed)| owed.leg && !owed.reclaim_admitted && owed.unsettled_by.is_some())
+            .filter(|(_, owed)| {
+                owed.kind.is_leg() && !owed.reclaim_admitted && owed.unsettled_by.is_some()
+            })
             .filter_map(|(tx_hash, owed)| {
-                let body = Arc::clone(&self.legs.get(tx_hash)?.body);
+                let body = Arc::clone(&self.kept.get(tx_hash)?.body);
                 Some((*tx_hash, body, owed.certified))
             })
             .collect()
@@ -448,7 +509,11 @@ impl UnresolvedTxs {
                         // that way has no body to reclaim with, so it
                         // waits out its horizon rather than abandoning
                         // what the record licenses a reclaim of.
-                        leg: !matches!(verdict.evidence(), Unsettleable::Departed { .. }),
+                        kind: if matches!(verdict.evidence(), Unsettleable::Departed { .. }) {
+                            Kind::Whole
+                        } else {
+                            Kind::Leg
+                        },
                         reclaim_admitted: false,
                         unsettled_by: Some(verdict.shard()),
                     },
@@ -465,14 +530,20 @@ impl UnresolvedTxs {
     /// Only certified ones: a transaction no certificate of ours covers
     /// is decided by its own deadline and needs no record to speak for
     /// it. Only ones committed before the cut, since a shard that had
-    /// already gone was never party to what came after. And only ones no
-    /// record covers yet, so a departure is answered once.
+    /// already gone was never party to what came after. Only ones no
+    /// record covers yet, so a departure is answered once. And never a
+    /// remainder: its verdict is in, and a departed deliverer's
+    /// successor still delivers what it was owed — only the lapse says a
+    /// delivery never will.
     #[must_use]
     pub fn outstanding_with(&self, shard: ShardId, cut: WeightedTimestamp) -> Vec<UnsettledTx> {
         self.owed
             .iter()
             .filter(|(_, owed)| {
-                owed.certified && owed.unsettled_by.is_none() && cut > owed.committed_ts
+                owed.certified
+                    && owed.kind != Kind::Remainder
+                    && owed.unsettled_by.is_none()
+                    && cut > owed.committed_ts
             })
             .filter(|(_, owed)| {
                 owed.remote_prefixes
@@ -615,14 +686,28 @@ impl UnresolvedTxs {
     /// its own horizon.
     pub fn release_resolved(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
         for finalization in finalizations {
-            for tx_hash in finalization.tx_hashes() {
-                let bears_verdict = self
-                    .owed
-                    .get(&tx_hash)
-                    .is_some_and(|owed| !owed.leg || owed.reclaim_admitted);
-                if bears_verdict {
+            for (tx_hash, decision) in finalization.tx_decisions() {
+                let Some(owed) = self.owed.get_mut(&tx_hash) else {
+                    continue;
+                };
+                if owed.kind.is_leg() && !owed.reclaim_admitted {
+                    continue;
+                }
+                // An issuer that accepted has crossings out that its
+                // deliveries owe a claim for: its verdict resolves the
+                // transaction, and the entry stays on as a leg entry for
+                // the reclaim alone. One that refused issued nothing.
+                let issued = owed.kind == Kind::Whole
+                    && decision == TransactionDecision::Accept
+                    && self
+                        .kept
+                        .get(&tx_hash)
+                        .is_some_and(|kept| !kept.deliveries.is_empty());
+                if issued {
+                    owed.kind = Kind::Remainder;
+                } else {
                     self.owed.remove(&tx_hash);
-                    self.legs.remove(&tx_hash);
+                    self.kept.remove(&tx_hash);
                 }
             }
         }
@@ -657,7 +742,7 @@ impl UnresolvedTxs {
     pub fn past_deadline(&self, now: WeightedTimestamp) -> Vec<Abandonable> {
         self.owed
             .iter()
-            .filter(|(_, owed)| !owed.leg)
+            .filter(|(_, owed)| !owed.kind.is_leg())
             .filter(|(_, owed)| {
                 now >= owed.deadline
                     && (owed.unsettled_by.is_some() || now < owed.deadline.plus(MAX_VALIDITY_RANGE))
@@ -719,7 +804,7 @@ impl UnresolvedTxs {
         let kept: BTreeMap<TxHash, Owed> = std::mem::take(&mut self.owed)
             .into_iter()
             .filter(|(tx_hash, owed)| {
-                if owed.leg {
+                if owed.kind.is_leg() {
                     return owed.deadline.plus(MAX_VALIDITY_RANGE * 2) > now;
                 }
                 if let Some(shard) = owed.unsettled_by {
@@ -760,7 +845,7 @@ impl UnresolvedTxs {
             .collect();
         self.owed = kept;
         let owed = &self.owed;
-        self.legs.retain(|tx_hash, _| owed.contains_key(tx_hash));
+        self.kept.retain(|tx_hash, _| owed.contains_key(tx_hash));
 
         // A terminal is what tells a prefix's owner apart from its
         // successor, so one still covering a live entry stays: dropping
@@ -799,7 +884,7 @@ mod tests {
     };
     use hyperscale_types::{
         BlockHeight, EPOCH_DURATION, EpochWindows, LocalKey, MAX_FINALIZATION_DELAY,
-        TimestampRange, TransactionDecision, UnsettledTx, Verified, WeightedTimestamp,
+        TimestampRange, UnsettledTx, Verified, WeightedTimestamp,
     };
 
     use super::*;
@@ -1537,6 +1622,67 @@ mod tests {
         );
     }
 
+    /// An issuer in the core is released by its own verdict like any
+    /// entry — unless it accepted with deliveries owed, when it stays on
+    /// as a remainder: never abandoned, named by no departure, probed
+    /// past the deadline for its claims, reclaimed on a lapse record,
+    /// and released by the reclaim's finalization.
+    #[test]
+    fn an_issuer_that_accepted_stays_on_as_a_remainder_for_its_deliveries() {
+        let claim = SubstateKey {
+            owner: test_prefix(AWAY),
+            local: LocalKey([0xC2; 16]),
+        };
+        let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
+        let resolved = |decision| {
+            let tx = tx(8, 60_000);
+            let mut ledger = UnresolvedTxs::default();
+            commit(&mut ledger, &tx);
+            ledger.mark_issuer(tx.hash(), body(&tx), vec![(PARTNER, claim)]);
+            ledger.certify(tx.hash());
+            let finalization = make_finalization(BlockHeight::new(1), tx.hash(), decision);
+            ledger.release_resolved(&[Arc::new(Verifiable::from(finalization))]);
+            (ledger, tx)
+        };
+
+        let (ledger, _) = resolved(TransactionDecision::Reject);
+        assert_eq!(ledger.len(), 0, "a refusal issued nothing to reclaim");
+
+        let (mut ledger, tx) = resolved(TransactionDecision::Accept);
+        assert_eq!(ledger.len(), 1, "an acceptance stays for the reclaim");
+        assert!(ledger.past_deadline(deadline).is_empty(), "never abandoned");
+        assert!(
+            ledger.outstanding_with(PARTNER, ms(70_000)).is_empty(),
+            "named by no departure: the successor still delivers"
+        );
+        assert_eq!(
+            ledger.probeable(deadline),
+            vec![Probeable {
+                tx_hash: tx.hash(),
+                deadline,
+                validity_end: ms(60_000),
+                core: BTreeSet::new(),
+                deliveries: vec![(PARTNER, claim)],
+            }],
+        );
+        ledger.record_abandonment_records(&[AbandonmentRecord::lapsed(
+            PARTNER,
+            deadline.plus(MAX_VALIDITY_RANGE),
+            [names(&tx)],
+        )]);
+        let reclaims = ledger.reclaimable();
+        assert_eq!(reclaims.len(), 1);
+        assert!(
+            reclaims[0].2,
+            "the issuer ran, so its reclaim is charged nothing"
+        );
+        ledger.admit_reclaim(tx.hash());
+        let finalization =
+            make_finalization(BlockHeight::new(2), tx.hash(), TransactionDecision::Accept);
+        ledger.release_resolved(&[Arc::new(Verifiable::from(finalization))]);
+        assert_eq!(ledger.len(), 0, "the reclaim's finalization releases it");
+    }
+
     /// A leg's own finalization bears no verdict on the transaction, so
     /// it releases nothing, and the entry is never abandoned — not at its
     /// deadline, and not when a committed record names it.
@@ -1611,7 +1757,7 @@ mod tests {
             make_finalization(BlockHeight::new(9), tx.hash(), TransactionDecision::Accept);
         ledger.release_resolved(&[Arc::new(Verifiable::from(reclaim))]);
         assert_eq!(ledger.len(), 0, "the reclaim's finalization releases it");
-        assert!(ledger.legs.is_empty(), "and the body goes with it");
+        assert!(ledger.kept.is_empty(), "and the body goes with it");
     }
 
     /// A refusal names only legs, so a replica meeting one for a

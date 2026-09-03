@@ -360,10 +360,18 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
 
 /// Two-sided conservation, less what the halt stranded: a survivor-paid
 /// delivery whose window closed while the recipient was frozen debited
-/// its payer, issued its record cell, and is never claimed or reclaimed.
-/// The doomed batch's survivor-paid pair is stranded by construction, so
-/// the figure is never zero, and it is what a delivery outliving its
-/// window would recover.
+/// its payer and issued its record cell, and nothing claims it. Its
+/// payer could reclaim it on a proof that the claim never landed, taken
+/// against the recipient's chain past the lapse — but the record it
+/// would take back lives an escrow grace past the window, and a halt
+/// this long ends only after that grace, so the proof comes to a cell
+/// already swept and the strand stands. The doomed batch's survivor-paid
+/// pair is stranded that way by construction, so the figure is never
+/// zero; what a recipient cut off but recovering inside the grace gives
+/// back is [`a_delivery_cut_off_past_its_window_is_reclaimed`]'s to
+/// show.
+///
+/// [`a_delivery_cut_off_past_its_window_is_reclaimed`]: crate::execution::a_delivery_cut_off_past_its_window_is_reclaimed
 fn assert_conserved_less_the_strand<C: Cluster>(
     c: &mut C,
     world: &World,
@@ -517,7 +525,9 @@ fn assert_deliveries_agree<C: Cluster>(
 
     // Whatever the survivor accepted and the recovered shard has not yet
     // delivered lands now, if its window is still open; a delivery whose
-    // window closed while the shard was frozen is owed nothing here.
+    // window closed while the shard was frozen is owed nothing here, and
+    // its payer's reclaim reaches nothing either, the halt having
+    // outlasted the record's grace.
     let now = WeightedTimestamp::ZERO.plus(c.now());
     let owed: Vec<&Probe> = probes
         .iter()
