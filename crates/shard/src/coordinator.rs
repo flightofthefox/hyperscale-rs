@@ -99,7 +99,8 @@ use hyperscale_types::{
     QuorumCertificate, RecoveryCause, Refusal, Round, SafeVoteRegisters, StateRoot,
     StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, Transaction,
     TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier,
-    Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
+    Verify, VoteCount, absence_licenses_reclaim, derive_leaves, lapse_licenses_reclaim,
+    missed_proposals_since_prev_commit, ready_leaf_payload, validity_end_of,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -1135,29 +1136,40 @@ impl ShardCoordinator {
                 }
             }
             // An absence is checked against this validator's own proof.
-            // The record's anchor has to sit at or past every name's
-            // deadline, which is the probe anchor — before it the core
-            // may still commit, so a probe there licenses nothing. The
-            // mirror need not be at the record's anchor: absence past
-            // the deadline is the same fact at every anchor, and two
-            // honest validators probe at whichever of the core's headers
-            // reached them first. A voter holding no proof defers.
-            // A lapse is the same check against a later floor: the
-            // name's deadline plus one validity range, which is where a
-            // delivery admitted under the window's close has committed
-            // its claim or never will. Derived from the deadline the
-            // record restates, so the voter needs no body to find it.
+            // The record's anchor has to sit inside every name's absence
+            // window — at or past the deadline, which is the probe
+            // anchor, since before it the core may still commit; and
+            // short of the committed cell's sweep, since past it the
+            // cell is gone whatever the core did. The mirror need not be
+            // at the record's anchor: absence is the same fact at every
+            // anchor in the window, and two honest validators probe at
+            // whichever of the core's headers reached them first. A
+            // voter holding no proof defers. A lapse is the same check
+            // against the later window a delivery's claim cell has.
+            // Both windows derive from the deadline the record restates,
+            // so the voter needs no body to find them.
             Unsettleable::Unclaimed { probed_wt } => {
                 for entry in verdict.unsettled() {
-                    if !self.absence_stands(verdict, entry, probed_wt, entry.deadline, block_hash) {
+                    if !self.absence_stands(
+                        verdict,
+                        entry,
+                        probed_wt,
+                        absence_licenses_reclaim,
+                        block_hash,
+                    ) {
                         return false;
                     }
                 }
             }
             Unsettleable::Lapsed { probed_wt } => {
                 for entry in verdict.unsettled() {
-                    let lapse = entry.deadline.plus(MAX_VALIDITY_RANGE);
-                    if !self.absence_stands(verdict, entry, probed_wt, lapse, block_hash) {
+                    if !self.absence_stands(
+                        verdict,
+                        entry,
+                        probed_wt,
+                        lapse_licenses_reclaim,
+                        block_hash,
+                    ) {
                         return false;
                     }
                 }
@@ -1167,36 +1179,37 @@ impl ShardCoordinator {
     }
 
     /// Whether one name's absence stands for this validator: the record's
-    /// anchor sits at or past `floor`, and this validator's own proof
-    /// against the record's shard does too. The mirror need not be at
-    /// the record's anchor — absence past the floor is the same fact at
-    /// every anchor, and two honest validators probe at whichever of the
-    /// shard's headers reached them first. A voter holding no proof
-    /// defers.
+    /// anchor is one `licenses` accepts for the name's validity end, and
+    /// this validator's own proof against the record's shard is too. The
+    /// mirror need not be at the record's anchor — absence is the same
+    /// fact at every anchor inside the window, and two honest validators
+    /// probe at whichever of the shard's headers reached them first. A
+    /// voter holding no proof defers.
     fn absence_stands(
         &self,
         verdict: &AbandonmentRecord,
         entry: &UnsettledTx,
         probed_wt: WeightedTimestamp,
-        floor: WeightedTimestamp,
+        licenses: fn(WeightedTimestamp, WeightedTimestamp) -> bool,
         block_hash: BlockHash,
     ) -> bool {
-        if probed_wt < floor {
+        let validity_end = validity_end_of(entry.deadline);
+        if !licenses(probed_wt, validity_end) {
             warn!(
                 validator = ?self.me,
                 block_hash = ?block_hash,
                 shard = ?verdict.shard(),
                 tx_hash = ?entry.tx_hash,
                 probed = ?probed_wt,
-                ?floor,
-                "Abandonment record probes an absence before its floor — not voting"
+                deadline = ?entry.deadline,
+                "Abandonment record probes an absence outside its window — not voting"
             );
             return false;
         }
         let proved = self
             .absences
             .get(&(entry.tx_hash, verdict.shard()))
-            .is_some_and(|absence| absence.probed_wt >= floor);
+            .is_some_and(|absence| licenses(absence.probed_wt, validity_end));
         if !proved {
             trace!(
                 validator = ?self.me,
@@ -7038,7 +7051,8 @@ mod tests {
         NetworkDefinition, NetworkParams, SettledTxsRoot, ShardAnchor, ShardId, Signer,
         SignerBitfield, TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot,
         Transaction, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
-        WeightedTimestamp, WitnessSources, abandonment_root_from_records, test_utils,
+        WeightedTimestamp, WitnessSources, abandonment_root_from_records, reclaim_probe_anchor,
+        test_utils,
     };
 
     use super::*;
@@ -11475,7 +11489,7 @@ mod tests {
     fn figures_of(tx: &[u8]) -> UnsettledTx {
         UnsettledTx {
             tx_hash: TxHash::from(Hash::from_bytes(tx)),
-            deadline: WeightedTimestamp::from_millis(1_200),
+            deadline: reclaim_probe_anchor(WeightedTimestamp::from_millis(60_000)),
             declared_work: 5,
             charge: stub_abort_charge(5),
         }
@@ -11735,6 +11749,17 @@ mod tests {
             ),
             "a record probed before the deadline is refused whatever the mirror holds"
         );
+        let sweep = deadline.plus(MAX_VALIDITY_RANGE);
+        assert!(
+            matching.fence_abandonment_records(&sched, &record(sweep), BlockHash::ZERO),
+            "a record probed where the committed cell may be swept is refused"
+        );
+        let mut late = fence_coordinator();
+        late.record_absence(ShardId::ROOT, tx_hash, mirror(sweep));
+        assert!(
+            late.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
+            "a mirror taken past the sweep proves nothing and defers"
+        );
 
         let absent = fence_coordinator();
         assert!(
@@ -11779,6 +11804,14 @@ mod tests {
         assert!(
             matching.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
             "a lapse record anchored at the deadline is refused whatever the mirror holds"
+        );
+        assert!(
+            matching.fence_abandonment_records(
+                &sched,
+                &record(lapse.plus(MAX_VALIDITY_RANGE)),
+                BlockHash::ZERO
+            ),
+            "a lapse record anchored where the claim cell may be swept is refused"
         );
 
         let mut short = fence_coordinator();

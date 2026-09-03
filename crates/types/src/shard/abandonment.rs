@@ -174,29 +174,34 @@ pub enum Unsettleable {
         /// The weighted timestamp of the refusing certificate's anchor.
         refused_wt: WeightedTimestamp,
     },
-    /// The core did not commit it, as of one of its blocks past the
-    /// deadline. A non-inclusion proof of the transaction's committed
-    /// cell against that block's state root is the proof, and the fact
-    /// it proves is anchor-independent past the deadline: the core's
-    /// admission rule fences it at the validity end, so absent at one
-    /// block past the deadline is absent at every later one.
+    /// The core did not commit it, as of one of its blocks inside the
+    /// absence window. A non-inclusion proof of the transaction's
+    /// committed cell against that block's state root is the proof, and
+    /// the fact it proves is the same at every anchor in the window: the
+    /// core's admission rule fences it at the validity end, so absent
+    /// at one block past the deadline is absent at every later one —
+    /// until the cell's own sweep, past which the cell is gone whether
+    /// or not the core committed and the proof says nothing.
     Unclaimed {
         /// The weighted timestamp of the block the absence was proved
-        /// against. At or past every named transaction's deadline, or
-        /// the proof says nothing.
+        /// against. At or past every named transaction's deadline and
+        /// short of its committed cell's sweep, or the proof says
+        /// nothing.
         probed_wt: WeightedTimestamp,
     },
     /// The delivery never claimed it, as of one of the delivering
-    /// shard's blocks past the lapse — the delivery window's close plus
-    /// the finalization delay. A non-inclusion proof of the crossing's
-    /// claim cell against that block's state root is the proof, and the
-    /// fact is anchor-independent past the lapse: the window fences the
-    /// delivery's admission at its close, so a claim absent at one block
-    /// past the lapse is absent at every later one.
+    /// shard's blocks inside the lapse window — from the delivery
+    /// window's close plus the finalization delay to the claim cell's
+    /// sweep. A non-inclusion proof of the crossing's claim cell against
+    /// that block's state root is the proof, and the fact is the same at
+    /// every anchor in the window: the delivery's admission is fenced at
+    /// the close, so a claim absent at one block past the lapse is
+    /// absent at every later one the cell still exists at.
     Lapsed {
         /// The weighted timestamp of the block the absence was proved
         /// against. At or past every named transaction's lapse — its
-        /// deadline plus one validity range — or the proof says nothing.
+        /// deadline plus one validity range — and short of the claim
+        /// cell's sweep, or the proof says nothing.
         probed_wt: WeightedTimestamp,
     },
 }
@@ -258,7 +263,8 @@ pub struct Refusal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Absence {
     /// The weighted timestamp of the block the absence was proved
-    /// against — at or past `floor`.
+    /// against — at or past `floor`, and short of the probed cell's
+    /// sweep, one validity range on.
     pub probed_wt: WeightedTimestamp,
     /// The anchor the proof has to sit at or past: the transaction's
     /// deadline for a core's committed cell, its lapse — the deadline

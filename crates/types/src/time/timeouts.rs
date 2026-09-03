@@ -80,20 +80,42 @@ pub fn reclaim_probe_anchor(validity_end: WeightedTimestamp) -> WeightedTimestam
     validity_end.plus(MAX_FINALIZATION_DELAY)
 }
 
+/// The validity end a transaction's deadline was derived from: the
+/// inverse of [`reclaim_probe_anchor`], for a voter holding a name's
+/// deadline and no body.
+#[must_use]
+pub fn validity_end_of(deadline: WeightedTimestamp) -> WeightedTimestamp {
+    deadline.minus(MAX_FINALIZATION_DELAY)
+}
+
+/// The core-shard anchor from which a transaction's committed cell may
+/// have been swept: its validity end plus [`RETENTION_HORIZON`].
+///
+/// That is the cell's own grace. A proof against a block at or past it
+/// comes to a cell that may be gone, and its absence says nothing.
+#[must_use]
+pub fn absence_probe_ceiling(validity_end: WeightedTimestamp) -> WeightedTimestamp {
+    validity_end.plus(RETENTION_HORIZON)
+}
+
 /// Whether an absence proof taken against a core-shard block at
 /// `probe_wt` licenses reclaiming a transaction's escrow.
 ///
-/// Absence at or past the anchor says the core did not commit it and,
-/// by its own admission rule, never can. Absence before the anchor says
-/// nothing: a core block admitted at `validity_end - 1ms` may still be
-/// on its way. Misreading this by one term is a double spend, so the
-/// inequality is stated once, here, rather than at each consumer.
+/// A half-open window. Absence at or past the anchor says the core did
+/// not commit it and, by its own admission rule, never can; absence
+/// before the anchor says nothing, since a core block admitted at
+/// `validity_end - 1ms` may still be on its way. And absence at or past
+/// the cell's own sweep says nothing either: the committed cell is
+/// retired on time, so a proof there is a true proof of a cell that was
+/// present. Misreading either end by one term is a double spend, so
+/// both inequalities are stated once, here, rather than at each
+/// consumer.
 #[must_use]
 pub fn absence_licenses_reclaim(
     probe_wt: WeightedTimestamp,
     validity_end: WeightedTimestamp,
 ) -> bool {
-    probe_wt >= reclaim_probe_anchor(validity_end)
+    probe_wt >= reclaim_probe_anchor(validity_end) && probe_wt < absence_probe_ceiling(validity_end)
 }
 
 /// The moment past which a delivery of a transaction's outbound value
@@ -135,20 +157,35 @@ pub fn lapse_probe_anchor(validity_end: WeightedTimestamp) -> WeightedTimestamp 
     delivery_window_close(validity_end).plus(MAX_FINALIZATION_DELAY)
 }
 
+/// The delivering-shard anchor from which a crossing's claim cell may
+/// have been swept: the transaction's validity end plus the escrow
+/// families' grace.
+///
+/// The cell's own expiry is keyed to the producing intent's window,
+/// which is never earlier than the transaction's, so this is at or
+/// before the earliest sweep.
+#[must_use]
+pub fn lapse_probe_ceiling(validity_end: WeightedTimestamp) -> WeightedTimestamp {
+    validity_end
+        .plus(RETENTION_HORIZON)
+        .plus(MAX_VALIDITY_RANGE)
+}
+
 /// Whether an absence proof of a crossing's claim cell, taken against a
 /// delivering-shard block at `probe_wt`, licenses reclaiming the
 /// crossing.
 ///
-/// Absence at or past the anchor says the delivery never claimed it
-/// and, the window having closed, never can; absence before it says
-/// nothing, since a delivery admitted at the last moment may still be
-/// committing. The inequality is stated once, here, as the core's is.
+/// A half-open window, as the core's is. Absence at or past the anchor
+/// says the delivery never claimed it and, the window having closed,
+/// never can; absence before it says nothing, since a delivery admitted
+/// at the last moment may still be committing; absence at or past the
+/// claim cell's sweep says nothing, since the cell is retired on time.
 #[must_use]
 pub fn lapse_licenses_reclaim(
     probe_wt: WeightedTimestamp,
     validity_end: WeightedTimestamp,
 ) -> bool {
-    probe_wt >= lapse_probe_anchor(validity_end)
+    probe_wt >= lapse_probe_anchor(validity_end) && probe_wt < lapse_probe_ceiling(validity_end)
 }
 
 /// A nullifier's life and every other tx-derived artifact's are the same
@@ -171,6 +208,16 @@ const _: () = assert!(
 const _: () = assert!(
     (RETENTION_HORIZON.as_secs() + MAX_VALIDITY_RANGE.as_secs()) * 1_000 == ESCROW_GRACE_MS,
     "an escrow cell's grace is the retention horizon plus a reclaim's room",
+);
+
+/// Each absence window is open: the cell a probe asks about outlives
+/// the earliest anchor a probe may take against it, by the whole of a
+/// validity range, so there is always a header to prove an absence at.
+/// A window that closed before it opened would license nothing and
+/// strand every escrow whose core fell silent.
+const _: () = assert!(
+    MAX_FINALIZATION_DELAY.as_secs() + MAX_VALIDITY_RANGE.as_secs() == RETENTION_HORIZON.as_secs(),
+    "the committed cell outlives the absence anchor by one validity range",
 );
 
 /// The horizon must not outlive the epoch that produced what it retains.
@@ -264,9 +311,12 @@ pub const RATIFY_ROUND_TIMEOUT: Duration = Duration::from_secs(15);
 mod tests {
     use std::time::Duration;
 
+    use hyperscale_vm_types::ESCROW_GRACE_MS;
+
     use super::{
-        MAX_FINALIZATION_DELAY, RETENTION_HORIZON, absence_licenses_reclaim, delivery_admissible,
-        delivery_window_close, lapse_licenses_reclaim, lapse_probe_anchor, reclaim_probe_anchor,
+        MAX_FINALIZATION_DELAY, RETENTION_HORIZON, absence_licenses_reclaim, absence_probe_ceiling,
+        delivery_admissible, delivery_window_close, lapse_licenses_reclaim, lapse_probe_anchor,
+        lapse_probe_ceiling, reclaim_probe_anchor, validity_end_of,
     };
     use crate::{MAX_VALIDITY_RANGE, WeightedTimestamp};
 
@@ -313,6 +363,48 @@ mod tests {
             anchor.plus(Duration::from_millis(1)),
             validity_end
         ));
+        assert_eq!(validity_end_of(anchor), validity_end);
+    }
+
+    /// The window closes where the committed cell may be swept: a proof
+    /// there is a true proof of a cell that was present, so it licenses
+    /// nothing. The lapse window closes at the escrow families' grace,
+    /// the claim cell's own sweep, and both close a validity range past
+    /// where they open.
+    #[test]
+    fn an_absence_licenses_nothing_once_the_cell_it_asks_about_may_be_swept() {
+        let validity_end = WeightedTimestamp::from_millis(60_000);
+        let ceiling = absence_probe_ceiling(validity_end);
+        assert_eq!(ceiling, validity_end.plus(RETENTION_HORIZON));
+        assert_eq!(
+            ceiling.elapsed_since(reclaim_probe_anchor(validity_end)),
+            MAX_VALIDITY_RANGE,
+        );
+        assert!(absence_licenses_reclaim(
+            ceiling.minus(Duration::from_millis(1)),
+            validity_end
+        ));
+        assert!(!absence_licenses_reclaim(ceiling, validity_end));
+        assert!(!absence_licenses_reclaim(
+            ceiling.plus(Duration::from_secs(60)),
+            validity_end
+        ));
+
+        let lapse_ceiling = lapse_probe_ceiling(validity_end);
+        assert_eq!(
+            lapse_ceiling,
+            validity_end.plus(Duration::from_millis(ESCROW_GRACE_MS)),
+            "the claim cell's grace, keyed to a window never earlier than this one",
+        );
+        assert_eq!(
+            lapse_ceiling.elapsed_since(lapse_probe_anchor(validity_end)),
+            MAX_VALIDITY_RANGE,
+        );
+        assert!(lapse_licenses_reclaim(
+            lapse_ceiling.minus(Duration::from_millis(1)),
+            validity_end
+        ));
+        assert!(!lapse_licenses_reclaim(lapse_ceiling, validity_end));
     }
 
     /// A probe at the validity end itself licenses nothing: a core block
