@@ -186,6 +186,19 @@ pub enum Unsettleable {
         /// the proof says nothing.
         probed_wt: WeightedTimestamp,
     },
+    /// The delivery never claimed it, as of one of the delivering
+    /// shard's blocks past the lapse — the delivery window's close plus
+    /// the finalization delay. A non-inclusion proof of the crossing's
+    /// claim cell against that block's state root is the proof, and the
+    /// fact is anchor-independent past the lapse: the window fences the
+    /// delivery's admission at its close, so a claim absent at one block
+    /// past the lapse is absent at every later one.
+    Lapsed {
+        /// The weighted timestamp of the block the absence was proved
+        /// against. At or past every named transaction's lapse — its
+        /// deadline plus one validity range — or the proof says nothing.
+        probed_wt: WeightedTimestamp,
+    },
 }
 
 impl Unsettleable {
@@ -195,7 +208,7 @@ impl Unsettleable {
         match self {
             Self::Departed { terminal_wt } => *terminal_wt,
             Self::Refused { refused_wt } => *refused_wt,
-            Self::Unclaimed { probed_wt } => *probed_wt,
+            Self::Unclaimed { probed_wt } | Self::Lapsed { probed_wt } => *probed_wt,
         }
     }
 
@@ -209,6 +222,7 @@ impl Unsettleable {
             Self::Departed { .. } => 0,
             Self::Refused { .. } => 1,
             Self::Unclaimed { .. } => 2,
+            Self::Lapsed { .. } => 3,
         }
     }
 }
@@ -228,23 +242,28 @@ pub struct Refusal {
     pub deadline: WeightedTimestamp,
 }
 
-/// A core shard's failure to commit a transaction a leg here issued
-/// for, as proved off its commit-proven state at a block past the
-/// transaction's deadline.
+/// A counterpart's failure to take a transaction a leg here issued for,
+/// as proved off its commit-proven state.
 ///
-/// What an `Unclaimed` record restates and what a voter checks it
-/// against. The anchor is the voter's own probe, which need not be the
-/// proposer's: absence past the deadline is the same fact at every
-/// anchor, so a voter holding a proof at any block past the deadline
-/// holds the evidence the record claims. The deadline is the clock the
-/// mirror lives on, as a refusal's is.
+/// Proved at a block past the anchor the question is meaningful at: a
+/// core's committed cell past the transaction's deadline, or a
+/// delivery's claim cell past its lapse.
+///
+/// What an `Unclaimed` or a `Lapsed` record restates and what a voter
+/// checks it against. The anchor is the voter's own probe, which need
+/// not be the proposer's: absence past the floor is the same fact at
+/// every anchor, so a voter holding a proof at any block past it holds
+/// the evidence the record claims. The floor is the clock the mirror
+/// lives on, as a refusal's deadline is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Absence {
     /// The weighted timestamp of the block the absence was proved
-    /// against — at or past the transaction's deadline.
+    /// against — at or past `floor`.
     pub probed_wt: WeightedTimestamp,
-    /// The transaction's deadline, as the leg's ledger holds it.
-    pub deadline: WeightedTimestamp,
+    /// The anchor the proof has to sit at or past: the transaction's
+    /// deadline for a core's committed cell, its lapse — the deadline
+    /// plus one validity range — for a delivery's claim cell.
+    pub floor: WeightedTimestamp,
 }
 
 /// One counterpart's unsettleable remainder, as this chain sees it.
@@ -311,6 +330,17 @@ impl AbandonmentRecord {
         unsettled: impl IntoIterator<Item = UnsettledTx>,
     ) -> Self {
         Self::new(shard, Unsettleable::Unclaimed { probed_wt }, unsettled)
+    }
+
+    /// A record over what `shard`, delivering, had not claimed as of its
+    /// block at `probed_wt`, past the lapse.
+    #[must_use]
+    pub fn lapsed(
+        shard: ShardId,
+        probed_wt: WeightedTimestamp,
+        unsettled: impl IntoIterator<Item = UnsettledTx>,
+    ) -> Self {
+        Self::new(shard, Unsettleable::Lapsed { probed_wt }, unsettled)
     }
 
     /// The counterpart shard.
@@ -517,6 +547,7 @@ mod tests {
             Unsettleable::Departed { terminal_wt: wt() },
             Unsettleable::Refused { refused_wt: wt() },
             Unsettleable::Unclaimed { probed_wt: wt() },
+            Unsettleable::Lapsed { probed_wt: wt() },
         ];
         let mut bytes: Vec<u8> = arms.iter().map(Unsettleable::discriminant).collect();
         bytes.dedup();

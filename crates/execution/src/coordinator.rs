@@ -2347,7 +2347,7 @@ impl ExecutionCoordinator {
                     Inclusion::Absent => {
                         let absence = Absence {
                             probed_wt,
-                            deadline,
+                            floor: deadline,
                         };
                         *probe = Probe::Absent(absence);
                         actions.push(Action::Continuation(ProtocolEvent::AbsenceObserved {
@@ -7645,7 +7645,7 @@ mod tests {
             absences_observed(&answered, tx_hash),
             vec![Absence {
                 probed_wt: deadline,
-                deadline
+                floor: deadline
             }],
             "the absence reaches the vote fence"
         );

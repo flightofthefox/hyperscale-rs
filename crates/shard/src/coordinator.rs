@@ -20,7 +20,7 @@ use hyperscale_types::{
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK,
     PrincipalAddr, ProposerTimestamp, ProvisionHash, ReadySignal, ReshapeThresholds,
     ReshapeTrigger, Restatement, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
-    SplitAtBoundary, StoredReceipt, SubstateKey, TxClaim, TxOutcome, Unsettleable,
+    SplitAtBoundary, StoredReceipt, SubstateKey, TxClaim, TxOutcome, Unsettleable, UnsettledTx,
     WeightedTimestamp, WorkInFlight, derive_reshape_trigger, ready_signal_window,
     settled_set_verdict,
 };
@@ -897,8 +897,11 @@ impl ShardCoordinator {
         // record, past which nothing is offered against it.
         self.refusals
             .retain(|_, refusal| now < refusal.deadline.plus(MAX_VALIDITY_RANGE));
+        // An absence lives as long as the entry it licenses a reclaim of
+        // lives past its floor: the same room, measured from the
+        // deadline for a core's and from the lapse for a delivery's.
         self.absences
-            .retain(|_, absence| now < absence.deadline.plus(MAX_VALIDITY_RANGE));
+            .retain(|_, absence| now < absence.floor.plus(MAX_VALIDITY_RANGE));
     }
 
     /// The settled-transaction set this validator has acquired for a terminated
@@ -1139,38 +1142,71 @@ impl ShardCoordinator {
             // the deadline is the same fact at every anchor, and two
             // honest validators probe at whichever of the core's headers
             // reached them first. A voter holding no proof defers.
+            // A lapse is the same check against a later floor: the
+            // name's deadline plus one validity range, which is where a
+            // delivery admitted under the window's close has committed
+            // its claim or never will. Derived from the deadline the
+            // record restates, so the voter needs no body to find it.
             Unsettleable::Unclaimed { probed_wt } => {
                 for entry in verdict.unsettled() {
-                    if probed_wt < entry.deadline {
-                        warn!(
-                            validator = ?self.me,
-                            block_hash = ?block_hash,
-                            shard = ?verdict.shard(),
-                            tx_hash = ?entry.tx_hash,
-                            probed = ?probed_wt,
-                            deadline = ?entry.deadline,
-                            "Abandonment record probes an absence before the deadline — \
-                             not voting"
-                        );
-                        return false;
-                    }
-                    let proved = self
-                        .absences
-                        .get(&(entry.tx_hash, verdict.shard()))
-                        .is_some_and(|absence| absence.probed_wt >= entry.deadline);
-                    if !proved {
-                        trace!(
-                            validator = ?self.me,
-                            block_hash = ?block_hash,
-                            shard = ?verdict.shard(),
-                            tx_hash = ?entry.tx_hash,
-                            "Abandonment record restates an absence this validator has not \
-                             proved; deferring"
-                        );
+                    if !self.absence_stands(verdict, entry, probed_wt, entry.deadline, block_hash) {
                         return false;
                     }
                 }
             }
+            Unsettleable::Lapsed { probed_wt } => {
+                for entry in verdict.unsettled() {
+                    let lapse = entry.deadline.plus(MAX_VALIDITY_RANGE);
+                    if !self.absence_stands(verdict, entry, probed_wt, lapse, block_hash) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether one name's absence stands for this validator: the record's
+    /// anchor sits at or past `floor`, and this validator's own proof
+    /// against the record's shard does too. The mirror need not be at
+    /// the record's anchor — absence past the floor is the same fact at
+    /// every anchor, and two honest validators probe at whichever of the
+    /// shard's headers reached them first. A voter holding no proof
+    /// defers.
+    fn absence_stands(
+        &self,
+        verdict: &AbandonmentRecord,
+        entry: &UnsettledTx,
+        probed_wt: WeightedTimestamp,
+        floor: WeightedTimestamp,
+        block_hash: BlockHash,
+    ) -> bool {
+        if probed_wt < floor {
+            warn!(
+                validator = ?self.me,
+                block_hash = ?block_hash,
+                shard = ?verdict.shard(),
+                tx_hash = ?entry.tx_hash,
+                probed = ?probed_wt,
+                ?floor,
+                "Abandonment record probes an absence before its floor — not voting"
+            );
+            return false;
+        }
+        let proved = self
+            .absences
+            .get(&(entry.tx_hash, verdict.shard()))
+            .is_some_and(|absence| absence.probed_wt >= floor);
+        if !proved {
+            trace!(
+                validator = ?self.me,
+                block_hash = ?block_hash,
+                shard = ?verdict.shard(),
+                tx_hash = ?entry.tx_hash,
+                "Abandonment record restates an absence this validator has not proved; \
+                 deferring"
+            );
+            return false;
         }
         true
     }
@@ -11664,7 +11700,7 @@ mod tests {
         let tx_hash = figures_of(b"tx").tx_hash;
         let mirror = |probed_wt: WeightedTimestamp| Absence {
             probed_wt,
-            deadline,
+            floor: deadline,
         };
         let record = |probed_wt: WeightedTimestamp| {
             block_with_records(
@@ -11704,6 +11740,59 @@ mod tests {
         assert!(
             absent.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
             "no proof defers it"
+        );
+    }
+
+    /// A lapse record is the same check against a later floor: the
+    /// name's deadline plus one validity range. A proof at the lapse
+    /// passes a record at the lapse, a record anchored at the deadline
+    /// is refused whatever the mirror holds, and a mirror short of the
+    /// lapse defers — the proof it holds is a core's answer, not a
+    /// delivery's.
+    #[test]
+    fn a_lapse_record_is_held_to_the_deadline_plus_a_validity_range() {
+        let sched = make_terminating_schedule(4);
+        let deadline = figures_of(b"tx").deadline;
+        let lapse = deadline.plus(MAX_VALIDITY_RANGE);
+        let tx_hash = figures_of(b"tx").tx_hash;
+        let mirror = |probed_wt: WeightedTimestamp| Absence {
+            probed_wt,
+            floor: lapse,
+        };
+        let record = |probed_wt: WeightedTimestamp| {
+            block_with_records(
+                AFTER_CUT_MS,
+                vec![AbandonmentRecord::lapsed(
+                    ShardId::ROOT,
+                    probed_wt,
+                    [figures_of(b"tx")],
+                )],
+            )
+        };
+
+        let mut matching = fence_coordinator();
+        matching.record_absence(ShardId::ROOT, tx_hash, mirror(lapse));
+        assert!(
+            !matching.fence_abandonment_records(&sched, &record(lapse), BlockHash::ZERO),
+            "a proof at the lapse passes a record at the lapse"
+        );
+        assert!(
+            matching.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
+            "a lapse record anchored at the deadline is refused whatever the mirror holds"
+        );
+
+        let mut short = fence_coordinator();
+        short.record_absence(
+            ShardId::ROOT,
+            tx_hash,
+            Absence {
+                probed_wt: deadline,
+                floor: deadline,
+            },
+        );
+        assert!(
+            short.fence_abandonment_records(&sched, &record(lapse), BlockHash::ZERO),
+            "a proof short of the lapse defers it"
         );
     }
 

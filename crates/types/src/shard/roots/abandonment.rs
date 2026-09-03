@@ -218,9 +218,11 @@ mod tests {
             Unsettleable::Unclaimed { probed_wt: moment },
             [tx(1)],
         );
+        let lapsed = AbandonmentRecord::lapsed(ShardId::ROOT, moment, [tx(1)]);
         assert_ne!(root_of(&departed), root_of(&refused));
         assert_ne!(root_of(&refused), root_of(&unclaimed));
         assert_ne!(root_of(&departed), root_of(&unclaimed));
+        assert_ne!(root_of(&unclaimed), root_of(&lapsed));
     }
 
     /// Verification is the recomputation, so a claimed root the records do

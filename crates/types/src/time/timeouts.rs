@@ -121,6 +121,36 @@ pub fn delivery_admissible(anchor: WeightedTimestamp, validity_end: WeightedTime
     anchor >= validity_end && anchor < delivery_window_close(validity_end)
 }
 
+/// The earliest delivering-shard anchor at which a crossing's claim
+/// cell being absent means the crossing lapsed: the delivery window's
+/// close plus [`MAX_FINALIZATION_DELAY`].
+///
+/// A delivery admitted inside the window has committed its claim by
+/// then, or never will — the same propagation budget the core's
+/// admission leaves before [`reclaim_probe_anchor`], and for the same
+/// reason. It is one [`MAX_VALIDITY_RANGE`] past that anchor, which is
+/// how a voter holding a name's deadline derives it without the body.
+#[must_use]
+pub fn lapse_probe_anchor(validity_end: WeightedTimestamp) -> WeightedTimestamp {
+    delivery_window_close(validity_end).plus(MAX_FINALIZATION_DELAY)
+}
+
+/// Whether an absence proof of a crossing's claim cell, taken against a
+/// delivering-shard block at `probe_wt`, licenses reclaiming the
+/// crossing.
+///
+/// Absence at or past the anchor says the delivery never claimed it
+/// and, the window having closed, never can; absence before it says
+/// nothing, since a delivery admitted at the last moment may still be
+/// committing. The inequality is stated once, here, as the core's is.
+#[must_use]
+pub fn lapse_licenses_reclaim(
+    probe_wt: WeightedTimestamp,
+    validity_end: WeightedTimestamp,
+) -> bool {
+    probe_wt >= lapse_probe_anchor(validity_end)
+}
+
 /// A nullifier's life and every other tx-derived artifact's are the same
 /// bound, asserted rather than assumed: the VM keys and values a
 /// nullifier by an expiry it computes from its own constant, and this is
@@ -236,7 +266,7 @@ mod tests {
 
     use super::{
         MAX_FINALIZATION_DELAY, RETENTION_HORIZON, absence_licenses_reclaim, delivery_admissible,
-        delivery_window_close, reclaim_probe_anchor,
+        delivery_window_close, lapse_licenses_reclaim, lapse_probe_anchor, reclaim_probe_anchor,
     };
     use crate::{MAX_VALIDITY_RANGE, WeightedTimestamp};
 
@@ -298,6 +328,39 @@ mod tests {
             reclaim_probe_anchor(validity_end).elapsed_since(latest_core_admission)
                 > MAX_FINALIZATION_DELAY,
             "the anchor sits a full delay past the last block the core could admit",
+        );
+    }
+
+    /// The lapse anchor sits one validity range past the reclaim probe's:
+    /// the window's close plus the same propagation budget the core's
+    /// admission leaves, so a delivery admitted at the last moment has
+    /// committed its claim by it or never will. Absence licenses a
+    /// reclaim at the anchor and past it, and never a millisecond short.
+    #[test]
+    fn a_lapse_is_proved_no_earlier_than_the_close_plus_the_finalization_delay() {
+        let validity_end = WeightedTimestamp::from_millis(300_000);
+        let anchor = lapse_probe_anchor(validity_end);
+        assert_eq!(
+            anchor,
+            reclaim_probe_anchor(validity_end).plus(MAX_VALIDITY_RANGE),
+            "one validity range past the core's probe anchor",
+        );
+        assert_eq!(
+            anchor,
+            delivery_window_close(validity_end).plus(MAX_FINALIZATION_DELAY)
+        );
+        assert!(!lapse_licenses_reclaim(
+            anchor.minus(Duration::from_millis(1)),
+            validity_end
+        ));
+        assert!(lapse_licenses_reclaim(anchor, validity_end));
+        assert!(lapse_licenses_reclaim(
+            anchor.plus(Duration::from_secs(1)),
+            validity_end
+        ));
+        assert!(
+            !lapse_licenses_reclaim(delivery_window_close(validity_end), validity_end),
+            "the close itself is not the lapse: a claim admitted under it may still commit",
         );
     }
 }
