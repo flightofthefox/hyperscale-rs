@@ -16,20 +16,24 @@
 use std::sync::{Arc, RwLock};
 
 use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
-use hyperscale_storage::AdoptSource;
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::Jmt;
-use hyperscale_types::{Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified};
+use hyperscale_storage::{AdoptSource, key_under_prefix};
+use hyperscale_types::{
+    Block, CertifiedBlock, ChainOrigin, Hash, LocalKey, StateRoot, SubstateKey, Verified,
+};
 
 use super::core::{SimImportStaging, SimShardStorage};
-use super::state::ConsensusState;
+use super::state::{ConsensusState, SharedState};
 
 impl SimShardStorage {
     /// The simulation's checkpoint hard-link: a deep copy of this
     /// store's substate and tree state, re-rooted at `child_prefix`,
     /// with fresh consensus state. The sibling half rides along as dead
     /// weight outside the child's prefix, exactly as in the hard-linked
-    /// production checkpoint.
+    /// production checkpoint — never read owner-scoped, and dropped from
+    /// the one index that enumerates the whole shard when the clone is
+    /// adopted.
     #[must_use]
     pub fn clone_for_split_child(&self, child_prefix: NibblePath) -> Self {
         let mut shared = read_or_recover(&self.state).clone();
@@ -153,6 +157,7 @@ impl SimShardStorage {
                     ));
                 }
                 install_adoption(&mut shared, origin, node, root)?;
+                drop_foreign_sweep_rows(&mut shared);
                 root
             }
         };
@@ -185,11 +190,37 @@ impl SimShardStorage {
     }
 }
 
+/// Drop the sweep-index rows of owners outside this store's prefix — the
+/// sibling half a split clone carries as dead weight.
+///
+/// Every other index over the cells is read owner-scoped, and a
+/// transaction on a child names only owners the child holds; the sweep
+/// enumerates the whole shard, so a foreign row would put the sibling's
+/// cells into the child's removals and move its root against a replica
+/// that snap-synced the same child, whose index holds only what it
+/// imported. Rows are keyed by owner, which makes the drop exact: an
+/// owner is wholly one child's or the other's, and the counts of what
+/// remains are untouched. The `RocksDB` backend prunes the same rows at
+/// the same point.
+fn drop_foreign_sweep_rows(shared: &mut SharedState) {
+    let prefix = shared.tree_store.root_path();
+    if prefix.is_empty() {
+        return;
+    }
+    shared.sweep_index.retain(|&(_, owner), _| {
+        let leaf = SubstateKey {
+            owner,
+            local: LocalKey([0; 16]),
+        };
+        key_under_prefix(&leaf.to_bytes(), &prefix)
+    });
+}
+
 /// Shared adoption tail: copy the child root node (when the side is
 /// non-empty) to the genesis version, seed the substate byte total, and
 /// move the tip to the genesis.
 fn install_adoption(
-    shared: &mut super::state::SharedState,
+    shared: &mut SharedState,
     origin: ChainOrigin,
     child_node: Option<Arc<Node>>,
     child_root: StateRoot,
@@ -214,10 +245,12 @@ fn install_adoption(
 mod tests {
     use hyperscale_jmt::{Blake3Hasher, Hasher, KEY_BYTES};
     use hyperscale_storage::test_helpers::import_boundary_state;
-    use hyperscale_storage::{AdoptSource, WitnessSeed};
+    use hyperscale_storage::{AdoptSource, SweepIndex, WitnessSeed};
+    use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
     use hyperscale_types::{
-        AddressClass, Block, BlockHash, BlockHeight, ChainOrigin, Hash, ShardId, StateRoot,
-        SubstateKey, SubstateLeaf, ValidatorId, WeightedTimestamp,
+        Address, AddressClass, Block, BlockHash, BlockHeight, ChainOrigin, Hash, SWEEP_BUCKET_MS,
+        ShardId, StateRoot, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, ValidatorId,
+        WeightedTimestamp,
     };
 
     use super::*;
@@ -387,6 +420,56 @@ mod tests {
     /// root and their counts partition the leaves. Adoption is idempotent:
     /// a re-run returns the recorded root rather than failing on the
     /// parent slot the first run consumed.
+    /// A cloned child sweeps only its own cells.
+    ///
+    /// The clone carries the sibling's leaves, so without the adoption
+    /// prune the child's walk would find them — and a replica that
+    /// snap-synced the same child would not, which is a fork between two
+    /// storage histories of one chain.
+    #[test]
+    fn a_cloned_child_does_not_sweep_its_siblings_cells() {
+        install_stub_protocol_statics();
+        let expiry = 3 * SWEEP_BUCKET_MS;
+        let (local, value) = stub_sweepable_cell(expiry, 0x77);
+        let sweepable = |side: u8| SubstateLeaf {
+            key: SubstateKey {
+                owner: Address::new(
+                    [if side == 0 { 0x00 } else { 0x80 }; 31],
+                    AddressClass::Native,
+                ),
+                local,
+            },
+            value: value.clone(),
+        };
+        let parent = SimShardStorage::default();
+        import_boundary_state(
+            &parent,
+            BlockHeight::new(9),
+            &[sweepable(0), sweepable(1)],
+            WitnessSeed::default(),
+        )
+        .unwrap();
+        let all = SweepFrontier::start_of(SweepBucket(u32::MAX));
+        assert_eq!(
+            parent.sweep_candidates(SweepFrontier::ZERO, all, 10).len(),
+            2,
+            "the parent holds both sides"
+        );
+
+        for side in [0u8, 1u8] {
+            let child = parent.clone_for_split_child(child_path(side));
+            let genesis = split_genesis(child_of(side), child_subtree_root(&parent, side));
+            child
+                .adopt_genesis(origin_at_10(), &genesis, AdoptSource::ParentSubtree)
+                .unwrap();
+            assert_eq!(
+                child.sweep_candidates(SweepFrontier::ZERO, all, 10),
+                vec![(sweepable(side).key, expiry)],
+                "child {side} sweeps its own cell and not its sibling's"
+            );
+        }
+    }
+
     #[test]
     fn split_adoption_partitions_and_is_idempotent() {
         let (parent, parent_root) = split_parent();
