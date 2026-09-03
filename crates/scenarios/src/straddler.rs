@@ -748,15 +748,9 @@ pub fn a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed<C: Faultable
         !split_admitted(c, splitter),
         "the leg has to be committed before the split is admitted, or the shape runs whole",
     );
-    assert!(
-        await_split_admitted(c, splitter, epochs(20)),
-        "only the over-threshold splitter must admit a split",
-    );
-    assert!(
-        !split_admitted(c, survivor),
-        "the under-threshold survivor must not split",
-    );
-
+    // Read before the admission is awaited: on a clock whose epochs
+    // outlast the lapse the reclaim lands inside that wait, and the
+    // payment would be back before it was seen to leave.
     let verdict = await_tx_terminal(c, hash, epochs(8));
     assert!(
         matches!(
@@ -769,6 +763,14 @@ pub fn a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed<C: Faultable
         c.run_until(epochs(4), |c| vault_balance(c, survivor, *payer)
             == before - STRADDLER_PAYMENT - price),
         "the leg pays the payment and the price",
+    );
+    assert!(
+        await_split_admitted(c, splitter, epochs(20)),
+        "only the over-threshold splitter must admit a split",
+    );
+    assert!(
+        !split_admitted(c, survivor),
+        "the under-threshold survivor must not split",
     );
 
     // The splitter terminates and its children seat with its cells, the
