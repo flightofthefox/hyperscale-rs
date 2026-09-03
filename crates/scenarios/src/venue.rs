@@ -101,7 +101,22 @@ pub fn venue_genesis_accounts_on(
             .into_iter()
             .map(|(_, account)| (account, SWAPPER_FUNDING)),
     );
+    // One caller on the venue's own shard, ground after the swappers so
+    // their sequence is what it always was.
+    accounts.push((grind_onto(venue_shard, &mut taken).1, SWAPPER_FUNDING));
     accounts
+}
+
+/// The caller [`venue_genesis_accounts_on`] funds on the venue's own
+/// shard, ground in the same order.
+fn caller_on_the_venues_shard(
+    venue_shard: ShardId,
+    caller_shards: &[ShardId],
+) -> (Ed25519PrivateKey, PrincipalAddr) {
+    let mut taken = Vec::new();
+    let _ = grind_onto(venue_shard, &mut taken);
+    let _ = swappers_on(caller_shards, &mut taken);
+    grind_onto(venue_shard, &mut taken)
 }
 
 /// An account on `shard`, whatever depth the world's partition has: the
@@ -363,6 +378,96 @@ pub fn a_swap_charges_its_caller_its_input_and_one_price<C: Cluster>(c: &mut C, 
         "the venue claims exactly what the caller paid in",
     );
     assert_pair_conserved(c, &worlds, &charges, budget, "an accepted swap");
+}
+
+/// A swap by a caller on the venue's own shard runs whole: the withdraw
+/// has its home in the core set, so it is folded into the core member
+/// and passed its value directly, and the swap crosses nothing.
+///
+/// What that pins is the fold end to end. The swap accepts, the caller
+/// is out its input and one price and holds the output at the venue's
+/// verdict — no delivery hop, since nothing crossed — the venue's reserve
+/// rises by the input, and the record cell the caller's withdraw would
+/// have written as a leg is absent: an outbound leg on a core shard
+/// would otherwise depart the core's own input into a record nobody
+/// could claim or take back.
+///
+/// # Panics
+///
+/// Panics if the venue misses its budget standing up, if the swap does
+/// not accept, if the caller is charged anything but its input and one
+/// price or is not holding the output at the verdict, if the venue's
+/// reserve moved by anything but the input, if a record cell was
+/// written, or if either side of the pair is not conserved.
+pub fn a_swap_by_a_caller_on_the_venues_shard_runs_whole<C: Cluster>(c: &mut C, budget: Budget) {
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(c, VENUE_SHARD, &mut taken);
+    let (caller_key, caller) = caller_on_the_venues_shard(VENUE_SHARD, &[SWAPPER_SHARD]);
+
+    let swap = build_swap_tx(
+        &caller_key,
+        caller,
+        &venue.meta,
+        *XRD,
+        SWAP_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let price = declared_price(c, &swap);
+    let records: Vec<SubstateKey> = swap
+        .try_derived(c.derivation().as_ref())
+        .expect("a scenario fixture derives")
+        .crossings
+        .iter()
+        .map(|crossing| crossing.record)
+        .collect();
+    assert!(
+        !records.is_empty(),
+        "the shape has value edges whatever the placement: the record is derived, and \
+         whether it is written is the fold's answer"
+    );
+    let funded = vault_balance(c, VENUE_SHARD, caller);
+    let reserve = reserve_cell(&venue.meta, *XRD);
+    let stocked = held_at(c, reserve);
+    assert!(
+        stocked > 0,
+        "the venue has to be holding something to price against"
+    );
+    let worlds = venue_worlds(c, &venue, [caller]);
+    let mut charges = Charges::default();
+
+    let status = terminal(c, &mut charges, swap, budget);
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "a swap on the venue's own shard must accept; status = {status:?}",
+    );
+    assert!(
+        held(c, caller.address(), venue.unit) > 0,
+        "the output is the caller's at the verdict: nothing crossed, so nothing is delivered"
+    );
+    let kept = vault_balance(c, VENUE_SHARD, caller);
+    assert_eq!(
+        funded.saturating_sub(kept),
+        SWAP_INPUT + price,
+        "a swap costs its caller its input and one price: {funded} before, {kept} after, \
+         input {SWAP_INPUT}, price {price}",
+    );
+    assert_eq!(
+        held_at(c, reserve),
+        stocked + SWAP_INPUT,
+        "the venue claims exactly what the caller paid in",
+    );
+    for record in records {
+        assert!(
+            c.substate(VENUE_SHARD, record.owner, record.local.0)
+                .is_none(),
+            "a withdraw folded into the core writes no record: {record:?}",
+        );
+    }
+    assert_pair_conserved(c, &worlds, &charges, budget, "a swap on the venue's shard");
 }
 
 /// A swap the venue refuses gives its caller back what its leg took, and

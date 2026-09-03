@@ -93,6 +93,7 @@ pub use support::{
 pub use transactions::livelock_resolves_promptly;
 pub use venue::{
     SWAP_INPUT, SWAPPER_SHARD, SWAPPERS, VENUE_SHARD, VenueReport, WIDE_VENUE_SHARD,
+    a_swap_by_a_caller_on_the_venues_shard_runs_whole,
     a_swap_charges_its_caller_its_input_and_one_price,
     a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,
     a_swap_the_venue_refuses_gives_its_caller_back_its_leg, hot_venue_clears_swaps,

@@ -34,7 +34,8 @@ use hyperscale_scenarios::{
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
     a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
-    a_spent_nullifier_is_swept_once_unreachable, a_swap_charges_its_caller_its_input_and_one_price,
+    a_spent_nullifier_is_swept_once_unreachable, a_swap_by_a_caller_on_the_venues_shard_runs_whole,
+    a_swap_charges_its_caller_its_input_and_one_price,
     a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,
     a_swap_the_venue_refuses_gives_its_caller_back_its_leg,
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
@@ -413,6 +414,12 @@ fn a_hot_venue_clears_swaps_no_slower_fanned_in_sim() {
 fn a_swap_charges_its_caller_its_input_and_one_price_sim() {
     let mut cluster = venue_cluster();
     a_swap_charges_its_caller_its_input_and_one_price(&mut cluster, epochs(40));
+}
+
+#[test]
+fn a_swap_by_a_caller_on_the_venues_shard_runs_whole_sim() {
+    let mut cluster = venue_cluster();
+    a_swap_by_a_caller_on_the_venues_shard_runs_whole(&mut cluster, epochs(40));
 }
 
 #[test]
