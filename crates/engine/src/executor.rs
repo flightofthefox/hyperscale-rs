@@ -516,8 +516,8 @@ impl Executor {
 
     /// The entry a reclaim runs: no call, no nullifier, and a declaration
     /// of its own over exactly the cells a reclaim touches — each record
-    /// read, each claim written, each origin credited in the resource the
-    /// record names.
+    /// read and deleted, each claim written, each origin credited in the
+    /// resource the record names.
     ///
     /// A reclaim derives from the cell, not the manifest, so it carries
     /// none of the transaction's declaration: no node is invoked, so no
@@ -544,7 +544,7 @@ impl Executor {
                 (
                     Effect {
                         target: EffectTarget::Point(reclaim.record),
-                        mode: Mode::Read,
+                        mode: Mode::Write { moves: Moves::Both },
                     },
                     None,
                 ),

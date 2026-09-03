@@ -1392,8 +1392,8 @@ fn a_transfer_executes_divided_on_both_shards() {
 /// A refused transfer's escrow comes back. The sender's shard runs the
 /// reclaim — no node, no nullifier, a declaration of its own over the
 /// record, the claim and the origin — and the vault is back at its
-/// pre-escrow balance exactly, read off the cell; the record stays,
-/// saying only that the value was issued.
+/// pre-escrow balance exactly, read off the cell; the record goes with
+/// it, since the value it held is back where it left.
 #[test]
 fn a_reclaim_restores_the_senders_vault_exactly() {
     let executor = executor(ExecutionMode::Serial);
@@ -1469,8 +1469,8 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
         "and the reclaim restores it exactly"
     );
     assert!(
-        store.cell(edge.record).is_some(),
-        "the record stays: it says the value was issued"
+        store.cell(edge.record).is_none(),
+        "the record goes with the value it held"
     );
 }
 
