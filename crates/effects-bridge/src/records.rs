@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arc_swap::ArcSwap;
 use hyperscale_hbor::from_slice as hbor_from_slice;
 use hyperscale_vm_effects::{
-    ChainRecords, CommittedTxCell, Hasher, InstanceMeta, InstanceRegistry, Issuance, MetadataCache,
-    NullifierCell, PackageHash, PackageMetadata, ResourceMeta, Value, committed_tx_key,
-    nullifier_key, package_hash,
+    ChainRecords, ClaimCell, CommittedTxCell, CrossingCell, Hasher, InstanceMeta, InstanceRegistry,
+    Issuance, MetadataCache, NullifierCell, PackageHash, PackageMetadata, ResourceMeta, Value,
+    committed_tx_key, escrow_claim_key, escrow_record_key, nullifier_key, package_hash,
 };
 use hyperscale_vm_types::{
     Address, CallTarget, ComponentAddr, LocalKey, ResourceAddr, SubstateKey, SweepBucket,
@@ -67,16 +67,22 @@ const WASM_PREAMBLE: &[u8] = b"\0asm";
 /// cannot claim a life its declaration does not name — the key a false
 /// expiry produces is not the key the declaration covers.
 ///
-/// One family today. Each arm is its own derivation, so arms cannot
-/// overlap and the order they are tried in does not decide the answer.
+/// Four families: the nullifier, the committed-transaction cell, and the
+/// escrow record and claim. Each arm is its own derivation, so arms
+/// cannot overlap and the order they are tried in does not decide the
+/// answer — a value that decodes under two layouts re-derives at most
+/// one family's key.
 ///
-/// Three tests, cheapest first, because this runs over every cell of
-/// every commit. The decode rejects on width alone; the bucket check
-/// costs nothing and is the statement that the two halves of the key
-/// agree; only then is a hash worth taking.
+/// Three tests per arm, cheapest first, because this runs over every
+/// cell of every commit. The decode rejects on width alone; the bucket
+/// check costs nothing and is the statement that the two halves of the
+/// key agree; only then is a hash worth taking.
 #[must_use]
 pub fn sweepable_cell(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u64> {
-    nullifier_expiry(owner, local, value).or_else(|| committed_tx_expiry(owner, local, value))
+    nullifier_expiry(owner, local, value)
+        .or_else(|| committed_tx_expiry(owner, local, value))
+        .or_else(|| escrow_record_expiry(owner, local, value))
+        .or_else(|| escrow_claim_expiry(owner, local, value))
 }
 
 /// The expiry a nullifier cell carries, or `None` for every other cell.
@@ -99,6 +105,44 @@ fn committed_tx_expiry(owner: Address, local: [u8; 16], value: &[u8]) -> Option<
         return None;
     }
     let key = committed_tx_key(&ProtocolHasher, owner, cell.tx, cell.expiry_ms);
+    (key.local.0 == local).then_some(cell.expiry_ms)
+}
+
+/// The expiry an escrow record cell carries, or `None` for every other
+/// cell. The value names the edge and the intent's expiry, and the key
+/// re-derives from them under the record's own slot.
+fn escrow_record_expiry(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u64> {
+    let cell: CrossingCell = hbor_from_slice(value).ok()?;
+    if SweepBucket::claimed_by(LocalKey(local)) != SweepBucket::of(cell.expiry_ms) {
+        return None;
+    }
+    let key = escrow_record_key(
+        &ProtocolHasher,
+        owner,
+        cell.intent,
+        cell.local,
+        cell.output,
+        cell.expiry_ms,
+    );
+    (key.local.0 == local).then_some(cell.expiry_ms)
+}
+
+/// The expiry an escrow claim cell carries, or `None` for every other
+/// cell. The same edge under the claim's slot, and the claim a reclaim
+/// writes under the producer's own target is judged the same way.
+fn escrow_claim_expiry(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u64> {
+    let cell: ClaimCell = hbor_from_slice(value).ok()?;
+    if SweepBucket::claimed_by(LocalKey(local)) != SweepBucket::of(cell.expiry_ms) {
+        return None;
+    }
+    let key = escrow_claim_key(
+        &ProtocolHasher,
+        owner,
+        cell.intent,
+        cell.local,
+        cell.output,
+        cell.expiry_ms,
+    );
     (key.local.0 == local).then_some(cell.expiry_ms)
 }
 
@@ -887,6 +931,59 @@ mod tests {
         let other_owner = Address::new([0x5B; 31], AddressClass::Native);
         assert_eq!(
             sweepable_cell(other_owner, key.local.0, &cell.to_bytes()),
+            None
+        );
+    }
+
+    /// An escrow record and the claim on it are judged sweepable off
+    /// their own leaves, at the producing intent's validity end plus the
+    /// escrow grace — the record's own expiry, which the reclaim of a
+    /// lapsed crossing needs room under — and at no other local, under
+    /// no other owner, and never under each other's slot.
+    #[test]
+    fn an_escrow_record_and_its_claim_are_judged_off_their_leaves() {
+        use hyperscale_vm_effects::{CrossingSite, IntentHeader, escrow_expiry_ms};
+        use hyperscale_vm_types::{
+            AddressClass, ESCROW_GRACE_MS, NetworkId, SubintentHash, TxHash,
+        };
+
+        let header = IntentHeader {
+            network: NetworkId(0),
+            validity_start_ms: 0,
+            validity_end_ms: 300_000,
+            discriminator: 0,
+        };
+        let expiry_ms = escrow_expiry_ms(&header);
+        assert_eq!(expiry_ms, 300_000 + ESCROW_GRACE_MS);
+
+        let producer = Address::new([0x5A; 31], AddressClass::Component);
+        let taker = Address::new([0x5C; 31], AddressClass::Component);
+        let intent = SubintentHash(Hash32([0xB0; 32]));
+        let record_site = CrossingSite::record(&ProtocolHasher, producer, intent, 1, 0, expiry_ms);
+        let claim_site = CrossingSite::claim(&ProtocolHasher, taker, intent, 1, 0, expiry_ms);
+        let record = record_site.crossing(ResourceAddr::new([0xE0; 31]), 500);
+        let claim = claim_site.claimed_by(TxHash(Hash32([0xC0; 32])));
+
+        for (site, owner, value) in [
+            (record_site, producer, record.to_bytes()),
+            (claim_site, taker, claim.to_bytes()),
+        ] {
+            let local = site.key().local.0;
+            assert_eq!(sweepable_cell(owner, local, &value), Some(expiry_ms));
+            let mut elsewhere = local;
+            elsewhere[15] ^= 1;
+            assert_eq!(sweepable_cell(owner, elsewhere, &value), None);
+            let other_owner = Address::new([0x5B; 31], AddressClass::Component);
+            assert_eq!(sweepable_cell(other_owner, local, &value), None);
+        }
+        // A record's bytes at a claim's local, or a claim's at a record's:
+        // the slots differ, so neither family answers for the other.
+        assert_eq!(
+            sweepable_cell(producer, claim_site.key().local.0, &record.to_bytes()),
+            None
+        );
+        assert_eq!(
+            sweepable_cell(taker, record_site.key().local.0, &claim.to_bytes()),
             None
         );
     }
