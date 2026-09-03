@@ -13,7 +13,7 @@ use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
 };
 use hyperscale_engine::legs::{
-    Classified, PlanDefect, Runs, Side, core_shards, crossings_of, decomposes, plan_for_shard,
+    Classified, PlanDefect, Runs, Side, core_shards, crossings_of, plan_for_shard,
 };
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
@@ -1236,11 +1236,11 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
-    let divided = decomposes(tx.legs(), &trie);
-    assert!(divided.holds(), "a transfer decomposes");
+    let divided = Classified::freeze(tx.legs(), &trie);
+    assert!(divided.decomposed().holds(), "a transfer decomposes");
     assert_eq!(core_shards(tx.legs(), &trie), BTreeSet::from([near_shard]));
 
-    let edges = crossings_of(tx.legs(), tx.crossings(), divided, &trie);
+    let edges = crossings_of(tx.legs(), tx.crossings(), &divided);
     assert_eq!(edges.len(), 1, "one value edge crosses");
     let edge = &edges[0];
     assert_eq!(edge.from, near_shard);
@@ -1250,8 +1250,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
         tx.legs(),
         tx.crossings(),
         &[],
-        divided,
-        &trie,
+        &divided,
         near_shard,
         Side::Issuing,
     )
@@ -1274,8 +1273,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
         tx.legs(),
         tx.crossings(),
         std::slice::from_ref(&arrived),
-        divided,
-        &trie,
+        &divided,
         far_shard,
         Side::Delivering,
     )
@@ -1289,8 +1287,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
             tx.legs(),
             tx.crossings(),
             &[],
-            divided,
-            &trie,
+            &divided,
             far_shard,
             Side::Delivering
         ),
@@ -1312,10 +1309,9 @@ fn a_transfer_executes_divided_on_both_shards() {
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
-    let divided = decomposes(tx.legs(), &trie);
     let classified = Classified::freeze(tx.legs(), &trie);
-    assert!(divided.holds());
-    let edge = crossings_of(tx.legs(), tx.crossings(), divided, &trie).remove(0);
+    assert!(classified.decomposed().holds());
+    let edge = crossings_of(tx.legs(), tx.crossings(), &classified).remove(0);
 
     let run = |local_shard: ShardId, arrivals: &[EscrowedValue]| {
         let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
@@ -1409,7 +1405,7 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
     derived_through(&executor, std::slice::from_ref(&tx));
     let classified = Classified::freeze(tx.legs(), &trie);
     assert!(classified.decomposed().holds());
-    let edge = crossings_of(tx.legs(), tx.crossings(), classified.decomposed(), &trie).remove(0);
+    let edge = crossings_of(tx.legs(), tx.crossings(), &classified).remove(0);
 
     let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
     let run = |store: &MapDb, runs: Runs, reaches_beyond: bool| {
@@ -1435,7 +1431,7 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
     let sent = run(
         &store,
         Runs::Shape {
-            classified,
+            classified: classified.clone(),
             side: Side::Issuing,
         },
         true,
@@ -1450,7 +1446,14 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
         "the escrow debited the vault"
     );
 
-    let reclaimed = run(&store, Runs::Reclaim { charged: true }, false);
+    let reclaimed = run(
+        &store,
+        Runs::Reclaim {
+            classified,
+            charged: true,
+        },
+        false,
+    );
     let ConsensusReceipt::Succeeded { writes, .. } = &reclaimed.consensus else {
         panic!("the reclaim must succeed: {:?}", reclaimed.metadata);
     };
@@ -1503,7 +1506,10 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
             clock: WeightedTimestamp::from_millis(1_000),
             reaches_beyond: false,
             abortable: false,
-            runs: Runs::Reclaim { charged },
+            runs: Runs::Reclaim {
+                classified: Classified::freeze(tx.legs(), &trie),
+                charged,
+            },
             arrivals: &[],
         };
         executor.execute_tick_batch(&ctx, store, &[input]).remove(0)

@@ -49,7 +49,7 @@ use hyperscale_vm_types::{
 
 use crate::backend::EngineBackend;
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
-use crate::legs::{Decomposed, Runs, ShardPlan, Side, plan_for_shard, reclaim_for_shard};
+use crate::legs::{Classified, Runs, ShardPlan, Side, plan_for_shard, reclaim_for_shard};
 use crate::records::BatchRecords;
 use crate::sharding::writes_root;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
@@ -490,7 +490,7 @@ impl Executor {
         ctx: &TickBatchContext<'_>,
         tx: &Transaction,
         records: &BatchRecords,
-        decomposed: Decomposed,
+        classified: &Classified,
         arrivals: &[EscrowedValue],
         side: Side,
     ) -> Result<PreparedTx, String> {
@@ -499,12 +499,17 @@ impl Executor {
             tx.legs(),
             tx.crossings(),
             arrivals,
-            decomposed,
-            ctx.shard_trie,
+            classified,
             ctx.local_shard,
             side,
         )
         .map_err(|defect| format!("no plan for this shard: {defect}"))?;
+        // The second member a shard runs of one transaction commits no
+        // nullifier: the issuing one did, and a second spend of the same
+        // cell would refuse this one before it ran.
+        if classified.second_member(ctx.local_shard, side) {
+            entry.nullifiers.clear();
+        }
         declare_crossing_cells(&mut entry.declaration, &entry.plan.legs)?;
         Ok(entry)
     }
@@ -1231,16 +1236,16 @@ impl Executor {
                 .get(&vm_tx)
                 .map(|shape| (&shape.runs, shape.arrivals.as_slice()))
             {
-                Some((Runs::Reclaim { .. }, _)) => {
-                    reclaim_for_shard(tx.legs(), tx.crossings(), ctx.shard_trie, ctx.local_shard)
+                Some((Runs::Reclaim { classified, .. }, _)) => {
+                    reclaim_for_shard(tx.legs(), tx.crossings(), classified, ctx.local_shard)
                         .map_err(|defect| format!("no reclaim for this shard: {defect}"))
                         .and_then(|plan| Self::prepare_reclaim(plan, snapshot))
                 }
                 Some((Runs::Shape { classified, side }, arrivals)) => {
-                    Self::prepare_shape(ctx, tx, &records, classified.decomposed(), arrivals, *side)
+                    Self::prepare_shape(ctx, tx, &records, classified, arrivals, *side)
                 }
                 None => {
-                    Self::prepare_shape(ctx, tx, &records, Decomposed::WHOLE, &[], Side::Issuing)
+                    Self::prepare_shape(ctx, tx, &records, &Classified::whole(), &[], Side::Issuing)
                 }
             };
             match planned {
@@ -1339,16 +1344,11 @@ impl Executor {
                 // did. The reclaim of a leg that never ran is the one
                 // receipt of this shard's that can still carry it.
                 let already_charged = match shapes.get(&tx.hash()).map(|shape| &shape.runs) {
-                    Some(Runs::Reclaim { charged }) => *charged,
-                    Some(Runs::Shape {
-                        classified,
-                        side: Side::Delivering,
-                    }) => classified.mixed_at(ctx.local_shard),
-                    Some(Runs::Shape {
-                        side: Side::Issuing,
-                        ..
-                    })
-                    | None => false,
+                    Some(Runs::Reclaim { charged, .. }) => *charged,
+                    Some(Runs::Shape { classified, side }) => {
+                        classified.second_member(ctx.local_shard, *side)
+                    }
+                    None => false,
                 };
                 if already_charged {
                     return None;

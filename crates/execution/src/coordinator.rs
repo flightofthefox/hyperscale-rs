@@ -70,7 +70,7 @@ use crate::provisional::ProvisionalCells;
 use crate::provisioning::{ProvisioningTracker, Requirement, divided_requirements};
 use crate::tick_state::{Admission, Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
-use crate::unresolved::{Abandonable, Unanswerable, UnresolvedTxs};
+use crate::unresolved::{Abandonable, Reclaimable, Unanswerable, UnresolvedTxs};
 use crate::vote_tracker::VoteTracker;
 
 /// One payer-side engagement wait: the transaction, the counterpart
@@ -688,7 +688,6 @@ impl ExecutionCoordinator {
                         tx.legs(),
                         tx.crossings(),
                         classified,
-                        classification.shard_trie(),
                         local_shard,
                         classified.first_side_at(local_shard),
                     ),
@@ -829,14 +828,8 @@ impl ExecutionCoordinator {
                     self.unresolved.mark_leg(
                         tx.hash(),
                         Arc::clone(&verified),
-                        classified.core().clone(),
-                        delivered_claims(
-                            tx.legs(),
-                            tx.crossings(),
-                            classified.decomposed(),
-                            trie,
-                            local_shard,
-                        ),
+                        classified.clone(),
+                        delivered_claims(tx.legs(), tx.crossings(), &classified, local_shard),
                     );
                 }
             } else if classified.decomposed().holds() {
@@ -846,13 +839,8 @@ impl ExecutionCoordinator {
                 self.unresolved.mark_issuer(
                     tx.hash(),
                     Arc::clone(&verified),
-                    delivered_claims(
-                        tx.legs(),
-                        tx.crossings(),
-                        classified.decomposed(),
-                        trie,
-                        local_shard,
-                    ),
+                    classified.clone(),
+                    delivered_claims(tx.legs(), tx.crossings(), &classified, local_shard),
                 );
             }
             self.candidates
@@ -1012,7 +1000,13 @@ impl ExecutionCoordinator {
         requests: &mut Vec<CrossShardExecutionRequest>,
     ) {
         let local_shard = self.local_shard;
-        for (tx_hash, transaction, charged) in self.unresolved.reclaimable() {
+        for Reclaimable {
+            tx_hash,
+            body: transaction,
+            classified,
+            charged,
+        } in self.unresolved.reclaimable()
+        {
             if self.ticks.tick_assignment(tx_hash).is_some() {
                 continue;
             }
@@ -1031,7 +1025,10 @@ impl ExecutionCoordinator {
                 clock: tick_ts,
                 reaches_beyond: false,
                 abortable: false,
-                runs: Runs::Reclaim { charged },
+                runs: Runs::Reclaim {
+                    classified,
+                    charged,
+                },
                 arrivals: Vec::new(),
             });
         }
@@ -1043,7 +1040,6 @@ impl ExecutionCoordinator {
     fn admit_member(
         &mut self,
         tick_id: TickId,
-        trie: &ShardTrie,
         member: Admitted,
         state: &mut TickState,
         ticked: &mut TickedBatch,
@@ -1056,7 +1052,7 @@ impl ExecutionCoordinator {
         // one reserves nothing and issues nothing.
         let second_member = matches!(
             &member.request.runs,
-            Runs::Shape { classified, side: Side::Delivering } if classified.mixed_at(local_shard)
+            Runs::Shape { classified, side } if classified.second_member(local_shard, *side)
         );
         let reach = member.membership_reach();
         state.admit(
@@ -1080,8 +1076,7 @@ impl ExecutionCoordinator {
             } => crossings_of(
                 member.request.transaction.legs(),
                 member.request.transaction.crossings(),
-                classified.decomposed(),
-                trie,
+                classified,
             )
             .into_iter()
             .filter(|edge| edge.from == local_shard)
@@ -1113,7 +1108,6 @@ impl ExecutionCoordinator {
                     member.request.transaction.legs(),
                     member.request.transaction.crossings(),
                     classified,
-                    trie,
                     local_shard,
                     Side::Delivering,
                 ),
@@ -1146,12 +1140,9 @@ impl ExecutionCoordinator {
     ) {
         let local_shard = self.local_shard;
         let tick_id = TickId::new(local_shard, block.height);
-        let trie = self
-            .classification_committee(topology_schedule, self.committed_committee_anchor_wt)
-            .shard_trie();
         let admitted = self
             .candidates
-            .compose(&self.provisioning, held, self.committed_ts, trie);
+            .compose(&self.provisioning, held, self.committed_ts);
 
         let mut state = TickState::new(tick_id, block.hash, block.ts);
         let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());
@@ -1160,14 +1151,7 @@ impl ExecutionCoordinator {
             legs: BTreeSet::new(),
         };
         for member in admitted {
-            self.admit_member(
-                tick_id,
-                trie,
-                member,
-                &mut state,
-                &mut ticked,
-                &mut requests,
-            );
+            self.admit_member(tick_id, member, &mut state, &mut ticked, &mut requests);
         }
 
         self.admit_abandoned(topology_schedule, tick_id, &mut state);
@@ -2286,10 +2270,13 @@ impl ExecutionCoordinator {
     /// the lapse, the delivery window's close plus the finalization
     /// delay, since a delivery admitted under the close has claimed by
     /// then or never will. Each is asked against the lowest
-    /// commit-proven header of that shard at or past its floor, so
+    /// commit-proven header of that shard inside its window — at or
+    /// past its floor and short of the probed cell's own sweep, since a
+    /// proof against a swept cell is a true proof of nothing — so
     /// validators reaching the same headers probe at the same anchor. A
     /// shard whose header has not reached here yet is asked when it
-    /// does.
+    /// does, and one whose every held header is past the window is not
+    /// asked at all: the entry then waits out its horizon.
     ///
     /// A delivering shard that departs at a reshape may leave no header
     /// past the lapse at all, so the claim cell is asked about wherever
@@ -7452,7 +7439,7 @@ mod tests {
         state.unresolved.mark_leg(
             tx_hash,
             Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            BTreeSet::from([PEER]),
+            leg_classified(),
             Vec::new(),
         );
         state.unresolved.certify(tx_hash);
@@ -7492,9 +7479,8 @@ mod tests {
                 _ => None,
             })
             .expect("the reclaim is dispatched to the engine");
-        assert_eq!(
-            request.runs,
-            Runs::Reclaim { charged: true },
+        assert!(
+            matches!(request.runs, Runs::Reclaim { charged: true, .. }),
             "the leg ran here, so its own certificate settled the price"
         );
         assert!(!request.abortable, "nothing retracts a reclaim");
@@ -7524,7 +7510,7 @@ mod tests {
         state.unresolved.mark_leg(
             tx_hash,
             Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            BTreeSet::from([PEER]),
+            leg_classified(),
             Vec::new(),
         );
         state.unresolved.certify(tx_hash);
@@ -7582,7 +7568,7 @@ mod tests {
         accepting.unresolved.mark_leg(
             tx_hash,
             Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            BTreeSet::from([PEER]),
+            leg_classified(),
             Vec::new(),
         );
         let actions = accepting.handle_attestation(
@@ -7612,7 +7598,7 @@ mod tests {
         state.unresolved.mark_leg(
             transaction.hash(),
             Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            BTreeSet::from([PEER]),
+            leg_classified(),
             Vec::new(),
         );
         state.unresolved.certify(transaction.hash());
@@ -7685,7 +7671,7 @@ mod tests {
         state.unresolved.mark_leg(
             tx_hash,
             Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            BTreeSet::new(),
+            delivery_classified(),
             vec![(PEER, claim)],
         );
         state.unresolved.certify(tx_hash);
@@ -7769,7 +7755,7 @@ mod tests {
         state.unresolved.mark_leg(
             tx_hash,
             Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            BTreeSet::new(),
+            delivery_classified(),
             vec![(PEER, claim)],
         );
         state.unresolved.certify(tx_hash);
@@ -8090,6 +8076,36 @@ mod tests {
     /// This shard, and the peer holding the other half of a straddler.
     const HOME: ShardId = ShardId::leaf(1, 0);
     const PEER: ShardId = ShardId::leaf(1, 1);
+
+    /// A shape frozen divided with an inbound leg on `HOME` feeding a
+    /// core on `PEER`.
+    fn leg_classified() -> Classified {
+        use hyperscale_vm_types::LegRole;
+
+        use crate::fixtures::leg;
+        let legs = [
+            leg(0, LegRole::Inbound, &[]),
+            leg(2, LegRole::Core, &[(0, 0)]),
+        ];
+        let classified = Classified::freeze(&legs, &ShardTrie::uniform(1));
+        assert_eq!(classified.core(), &BTreeSet::from([PEER]));
+        classified
+    }
+
+    /// A shape frozen divided with its core on a leaf no held header
+    /// names, so only the leg's deliveries are ever probed.
+    fn delivery_classified() -> Classified {
+        use hyperscale_vm_types::LegRole;
+
+        use crate::fixtures::leg;
+        let legs = [
+            leg(0, LegRole::Inbound, &[]),
+            leg(3, LegRole::Core, &[(0, 0)]),
+        ];
+        let classified = Classified::freeze(&legs, &ShardTrie::uniform(2));
+        assert_eq!(classified.core(), &BTreeSet::from([ShardId::leaf(2, 3)]));
+        classified
+    }
 
     /// [`HOME`] and [`PEER`] both live, both crewed — the topology a
     /// straddler between them composes and votes under.

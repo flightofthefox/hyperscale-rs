@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::{Classified, Side, crossings_of};
 use hyperscale_types::{
-    Provisions, RETENTION_HORIZON, ShardId, ShardTrie, SubstateEntry, SubstateKey, TxHash,
-    Verified, WeightedTimestamp,
+    Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, SubstateKey, TxHash, Verified,
+    WeightedTimestamp,
 };
 use hyperscale_vm_types::{AddressClass, Crossing, LegShape};
 
@@ -69,12 +69,12 @@ pub fn divided_requirements(
     legs: &[LegShape],
     crossings: &[Crossing],
     classified: &Classified,
-    trie: &ShardTrie,
     local: ShardId,
     side: Side,
 ) -> BTreeSet<Requirement> {
     let mut requirements: BTreeSet<Requirement> = BTreeSet::new();
     let core = classified.core();
+    let trie = classified.trie();
     if side == Side::Issuing && core.contains(&local) {
         requirements.extend(
             core.iter()
@@ -103,7 +103,7 @@ pub fn divided_requirements(
     // waits on nothing at all — which is what lets the core's arrival
     // exist in the first place.
     requirements.extend(
-        crossings_of(legs, crossings, classified.decomposed(), trie)
+        crossings_of(legs, crossings, classified)
             .into_iter()
             .filter(|edge| edge.to.contains(&local) && edge.delivers == (side == Side::Delivering))
             .map(|edge| Requirement::Crossing {
@@ -374,7 +374,7 @@ impl ProvisioningTracker {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry};
+    use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, ShardTrie};
 
     use super::*;
     use crate::fixtures;
@@ -584,15 +584,14 @@ mod tests {
         // crossing: its withdraw is what the venue waits for. Its
         // delivering member waits on the venue's output as well.
         assert!(classified.mixed_at(low));
-        let issuing =
-            divided_requirements(&swap, &crossings, &classified, &trie, low, Side::Issuing);
+        let issuing = divided_requirements(&swap, &crossings, &classified, low, Side::Issuing);
         assert_eq!(
             issuing,
             BTreeSet::from([Requirement::CommittedState(high)]),
             "the caller's issuing member waits on the venue's record and no crossing",
         );
         let delivering =
-            divided_requirements(&swap, &crossings, &classified, &trie, low, Side::Delivering);
+            divided_requirements(&swap, &crossings, &classified, low, Side::Delivering);
         assert_eq!(
             delivering,
             BTreeSet::from([
@@ -604,8 +603,7 @@ mod tests {
             ]),
             "the caller's delivering member waits on the venue's output",
         );
-        let venue =
-            divided_requirements(&swap, &crossings, &classified, &trie, high, Side::Issuing);
+        let venue = divided_requirements(&swap, &crossings, &classified, high, Side::Issuing);
         assert_eq!(
             venue,
             BTreeSet::from([
@@ -640,7 +638,7 @@ mod tests {
             key: crossings[0].record,
         };
         assert_eq!(
-            divided_requirements(&route, &crossings, &classified, &trie, high, Side::Issuing),
+            divided_requirements(&route, &crossings, &classified, high, Side::Issuing),
             BTreeSet::from([
                 Requirement::CommittedState(third),
                 Requirement::CommittedState(low),
@@ -648,7 +646,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            divided_requirements(&route, &crossings, &classified, &trie, third, Side::Issuing),
+            divided_requirements(&route, &crossings, &classified, third, Side::Issuing),
             BTreeSet::from([
                 Requirement::CommittedState(high),
                 Requirement::CommittedState(low),
@@ -656,7 +654,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            divided_requirements(&route, &crossings, &classified, &trie, low, Side::Issuing),
+            divided_requirements(&route, &crossings, &classified, low, Side::Issuing),
             BTreeSet::from([
                 Requirement::CommittedState(high),
                 Requirement::CommittedState(third),

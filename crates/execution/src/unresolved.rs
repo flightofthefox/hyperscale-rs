@@ -21,6 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, Finalization, MAX_VALIDITY_RANGE, ShardId, ShardTrie,
     SubstateKey, Transaction, TransactionDecision, TxHash, Unsettleable, UnsettledTx, Verifiable,
@@ -178,6 +179,9 @@ impl Kind {
 #[derive(Debug, Clone)]
 struct Kept {
     body: Arc<Verified<Transaction>>,
+    /// The classification the committing block froze, which a reclaim
+    /// reads its edges and its scope from.
+    classified: Classified,
     /// Whose refusal is the transaction's. Empty for an issuer in the
     /// core, whose verdict is its own.
     core: BTreeSet<ShardId>,
@@ -188,6 +192,20 @@ struct Kept {
     /// departed deliverer's successor; the prober resolves that off the
     /// trie, since the ledger holds no topology.
     deliveries: Vec<(ShardId, SubstateKey)>,
+}
+
+/// A leg entry a committed record has licensed the reclaim of, with what
+/// the reclaim is composed from.
+#[derive(Debug, Clone)]
+pub struct Reclaimable {
+    /// The transaction.
+    pub tx_hash: TxHash,
+    /// Its body, which the reclaim's edges derive from.
+    pub body: Arc<Verified<Transaction>>,
+    /// The classification its committing block froze.
+    pub classified: Classified,
+    /// Whether this shard's own certificate of the leg settled the price.
+    pub charged: bool,
 }
 
 /// A leg entry whose counterparts have been silent past the
@@ -289,15 +307,17 @@ impl UnresolvedTxs {
         &mut self,
         tx_hash: TxHash,
         body: Arc<Verified<Transaction>>,
-        core: BTreeSet<ShardId>,
+        classified: Classified,
         deliveries: Vec<(ShardId, SubstateKey)>,
     ) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
             owed.kind = Kind::Leg;
+            let core = classified.core().clone();
             self.kept.insert(
                 tx_hash,
                 Kept {
                     body,
+                    classified,
                     core,
                     deliveries,
                 },
@@ -315,6 +335,7 @@ impl UnresolvedTxs {
         &mut self,
         tx_hash: TxHash,
         body: Arc<Verified<Transaction>>,
+        classified: Classified,
         deliveries: Vec<(ShardId, SubstateKey)>,
     ) {
         if deliveries.is_empty() || !self.owed.contains_key(&tx_hash) {
@@ -324,6 +345,7 @@ impl UnresolvedTxs {
             tx_hash,
             Kept {
                 body,
+                classified,
                 core: BTreeSet::new(),
                 deliveries,
             },
@@ -419,15 +441,20 @@ impl UnresolvedTxs {
     /// one that never ran (held for a bundle that never came) owes it on
     /// the reclaim's.
     #[must_use]
-    pub fn reclaimable(&self) -> Vec<(TxHash, Arc<Verified<Transaction>>, bool)> {
+    pub fn reclaimable(&self) -> Vec<Reclaimable> {
         self.owed
             .iter()
             .filter(|(_, owed)| {
                 owed.kind.is_leg() && !owed.reclaim_admitted && owed.unsettled_by.is_some()
             })
             .filter_map(|(tx_hash, owed)| {
-                let body = Arc::clone(&self.kept.get(tx_hash)?.body);
-                Some((*tx_hash, body, owed.certified))
+                let kept = self.kept.get(tx_hash)?;
+                Some(Reclaimable {
+                    tx_hash: *tx_hash,
+                    body: Arc::clone(&kept.body),
+                    classified: kept.classified.clone(),
+                    charged: owed.certified,
+                })
             })
             .collect()
     }
@@ -901,6 +928,22 @@ mod tests {
 
     /// The depth-1 shard owning every `AWAY`-topped prefix.
     const PARTNER: ShardId = ShardId::leaf(1, 1);
+
+    /// A shape frozen divided with an inbound leg on `LOCAL` feeding a
+    /// core on `PARTNER`.
+    fn classified() -> Classified {
+        use hyperscale_types::ShardTrie;
+        use hyperscale_vm_types::LegRole;
+
+        use crate::fixtures::leg;
+        let legs = [
+            leg(0, LegRole::Inbound, &[]),
+            leg(2, LegRole::Core, &[(0, 0)]),
+        ];
+        let classified = Classified::freeze(&legs, &ShardTrie::uniform(1));
+        assert_eq!(classified.core(), &BTreeSet::from([PARTNER]));
+        classified
+    }
 
     /// A transaction paying from `payer` and touching `also`, both given
     /// as the byte an address repeats.
@@ -1537,12 +1580,7 @@ mod tests {
         let whole = tx(5, 60_000);
         commit(&mut ledger, &leg);
         commit(&mut ledger, &whole);
-        ledger.mark_leg(
-            leg.hash(),
-            body(&leg),
-            BTreeSet::from([PARTNER]),
-            Vec::new(),
-        );
+        ledger.mark_leg(leg.hash(), body(&leg), classified(), Vec::new());
         ledger.certify(leg.hash());
         ledger.certify(whole.hash());
 
@@ -1594,12 +1632,7 @@ mod tests {
             owner: test_prefix(AWAY),
             local: LocalKey([0xC1; 16]),
         };
-        ledger.mark_leg(
-            leg.hash(),
-            body(&leg),
-            BTreeSet::new(),
-            vec![(PARTNER, claim)],
-        );
+        ledger.mark_leg(leg.hash(), body(&leg), classified(), vec![(PARTNER, claim)]);
         ledger.certify(leg.hash());
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
@@ -1609,7 +1642,7 @@ mod tests {
                 tx_hash: leg.hash(),
                 deadline,
                 validity_end: ms(60_000),
-                core: BTreeSet::new(),
+                core: BTreeSet::from([PARTNER]),
                 deliveries: vec![(PARTNER, claim)],
             }],
         );
@@ -1642,7 +1675,7 @@ mod tests {
             let tx = tx(8, 60_000);
             let mut ledger = UnresolvedTxs::default();
             commit(&mut ledger, &tx);
-            ledger.mark_issuer(tx.hash(), body(&tx), vec![(PARTNER, claim)]);
+            ledger.mark_issuer(tx.hash(), body(&tx), classified(), vec![(PARTNER, claim)]);
             ledger.certify(tx.hash());
             let finalization = make_finalization(BlockHeight::new(1), tx.hash(), decision);
             ledger.release_resolved(&[Arc::new(Verifiable::from(finalization))]);
@@ -1677,7 +1710,7 @@ mod tests {
         let reclaims = ledger.reclaimable();
         assert_eq!(reclaims.len(), 1);
         assert!(
-            reclaims[0].2,
+            reclaims[0].charged,
             "the issuer ran, so its reclaim is charged nothing"
         );
         ledger.admit_reclaim(tx.hash());
@@ -1695,7 +1728,7 @@ mod tests {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(4, 60_000);
         commit(&mut ledger, &tx);
-        ledger.mark_leg(tx.hash(), body(&tx), BTreeSet::from([PARTNER]), Vec::new());
+        ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new());
         ledger.certify(tx.hash());
 
         let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Accept);
@@ -1730,7 +1763,7 @@ mod tests {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(6, 60_000);
         commit(&mut ledger, &tx);
-        ledger.mark_leg(tx.hash(), body(&tx), BTreeSet::from([PARTNER]), Vec::new());
+        ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new());
         ledger.certify(tx.hash());
         assert!(
             ledger.reclaimable().is_empty(),
@@ -1748,9 +1781,9 @@ mod tests {
             1,
             "a committed record licenses the reclaim"
         );
-        assert_eq!(reclaimable[0].0, tx.hash());
+        assert_eq!(reclaimable[0].tx_hash, tx.hash());
         assert_eq!(
-            reclaimable[0].1.hash(),
+            reclaimable[0].body.hash(),
             tx.hash(),
             "with the body the reclaim derives from"
         );
@@ -1805,7 +1838,7 @@ mod tests {
             let mut ledger = UnresolvedTxs::default();
             let tx = tx(5, 60_000);
             commit(&mut ledger, &tx);
-            ledger.mark_leg(tx.hash(), body(&tx), BTreeSet::from([PARTNER]), Vec::new());
+            ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new());
             ledger.certify(tx.hash());
             if covered {
                 ledger.record_abandonment_records(&[AbandonmentRecord::departed(
