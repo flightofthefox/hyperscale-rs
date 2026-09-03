@@ -2398,7 +2398,22 @@ impl ExecutionCoordinator {
                     continue;
                 }
                 match inclusion {
-                    Inclusion::Present => *probe = Probe::Committed,
+                    Inclusion::Present => {
+                        *probe = Probe::Committed;
+                        // The core took it, and its certificate says how:
+                        // a refusal there is mirrored on arrival and
+                        // licenses the reclaim, a success leaves nothing
+                        // to reclaim. Its broadcast may have missed this
+                        // shard, so it is fetched rather than waited for.
+                        if probed == Probed::Core {
+                            actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
+                                source_shard: shard,
+                                tx_hash,
+                                preferred: None,
+                                class: None,
+                            }));
+                        }
+                    }
                     Inclusion::Absent => {
                         let absence = Absence { probed_wt, floor };
                         *probe = Probe::Absent(absence, probed);
@@ -7942,6 +7957,14 @@ mod tests {
         assert!(
             absences_observed(&answered, tx_hash).is_empty(),
             "a core that committed it is not absent"
+        );
+        assert!(
+            answered.iter().any(|action| matches!(
+                action,
+                Action::Fetch(FetchRequest::ExecutionCerts { source_shard, tx_hash: fetched, .. })
+                    if *source_shard == PEER && *fetched == tx_hash
+            )),
+            "and its certificate is fetched, since a refusal there licenses the reclaim"
         );
         assert!(state.pending_abandonment_records().is_empty());
         assert!(
