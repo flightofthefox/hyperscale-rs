@@ -2269,14 +2269,15 @@ impl ExecutionCoordinator {
     /// delivering shard is asked about the crossing's claim cell past
     /// the lapse, the delivery window's close plus the finalization
     /// delay, since a delivery admitted under the close has claimed by
-    /// then or never will. Each is asked against the lowest
-    /// commit-proven header of that shard inside its window — at or
-    /// past its floor and short of the probed cell's own sweep, since a
-    /// proof against a swept cell is a true proof of nothing — so
-    /// validators reaching the same headers probe at the same anchor. A
-    /// shard whose header has not reached here yet is asked when it
-    /// does, and one whose every held header is past the window is not
-    /// asked at all: the entry then waits out its horizon.
+    /// then or never will. Each is asked against the newest commit-proven
+    /// header of that shard inside its window — at or past its floor and
+    /// short of the probed cell's own sweep, since a proof against a
+    /// swept cell is a true proof of nothing — which is the header the
+    /// shard is likeliest to still serve, a proof being taken from a
+    /// bounded history behind its tip. A shard whose header has not
+    /// reached here yet is asked when it does, and one whose every held
+    /// header is past the window is not asked at all: the entry then
+    /// waits out its horizon.
     ///
     /// A delivering shard that departs at a reshape may leave no header
     /// past the lapse at all, so the claim cell is asked about wherever
@@ -2315,13 +2316,13 @@ impl ExecutionCoordinator {
                     })
             });
             for (shard, key, floor, probed) in core.into_iter().chain(deliveries) {
-                if self.probes.contains_key(&(entry.tx_hash, shard)) {
-                    continue;
-                }
                 let licenses = |ts: WeightedTimestamp| match probed {
                     Probed::Core => absence_licenses_reclaim(ts, entry.validity_end),
                     Probed::Delivery => lapse_licenses_reclaim(ts, entry.validity_end),
                 };
+                // The newest licensed header held: the one the shard is
+                // likeliest to still serve, since a proof is taken from
+                // a bounded history behind its tip.
                 let Some((height, source)) = self
                     .proven_remote
                     .iter()
@@ -2329,10 +2330,13 @@ impl ExecutionCoordinator {
                         *source_shard == shard && licenses(source.ts)
                     })
                     .map(|((_, height), source)| (*height, *source))
-                    .min_by_key(|(height, _)| *height)
+                    .max_by_key(|(height, _)| *height)
                 else {
                     continue;
                 };
+                if self.probes.contains_key(&(entry.tx_hash, shard)) {
+                    continue;
+                }
                 let anchor = StateAnchor {
                     shard,
                     height,
@@ -7725,28 +7729,29 @@ mod tests {
             );
         }
         state.committed_ts = deadline;
+        let later = lapse.plus(Duration::from_secs(1));
         let anchor = StateAnchor {
             shard: PEER,
-            height: BlockHeight::new(4),
-            state_root: root(b"at"),
+            height: BlockHeight::new(5),
+            state_root: root(b"later"),
         };
         assert_eq!(
             state_proof_fetches(&state.probe_silent_counterparts(&schedule)),
             vec![(anchor, vec![claim])],
-            "the lowest header at or past the lapse is the anchor, and the claim cell the key"
+            "the newest header inside the lapse window is the anchor, and the claim cell the key"
         );
 
         let answered = state.on_state_proof_verified(anchor, &[(claim, Inclusion::Absent)]);
         assert_eq!(
             absences_observed(&answered, tx_hash),
             vec![Absence {
-                probed_wt: lapse,
+                probed_wt: later,
                 floor: lapse
             }],
         );
         assert_eq!(
             state.pending_abandonment_records(),
-            vec![AbandonmentRecord::lapsed(PEER, lapse, [figures])],
+            vec![AbandonmentRecord::lapsed(PEER, later, [figures])],
             "offered as a lapse, under the anchor it was proved at"
         );
     }
@@ -7812,29 +7817,30 @@ mod tests {
             );
         }
         state.committed_ts = deadline;
+        let later = lapse.plus(Duration::from_secs(1));
         let anchor = StateAnchor {
             shard: successor,
-            height: BlockHeight::new(4),
-            state_root: root(b"at"),
+            height: BlockHeight::new(5),
+            state_root: root(b"later"),
         };
         assert_eq!(
             state_proof_fetches(&state.probe_silent_counterparts(&schedule)),
             vec![(anchor, vec![claim])],
-            "the successor's lowest header at or past the lapse is the anchor, and the claim \
-             cell the key; the departed peer, with no header, is not asked"
+            "the successor's newest header inside the lapse window is the anchor, and the \
+             claim cell the key; the departed peer, with no header, is not asked"
         );
 
         let answered = state.on_state_proof_verified(anchor, &[(claim, Inclusion::Absent)]);
         assert_eq!(
             absences_observed_at(&answered, successor, tx_hash),
             vec![Absence {
-                probed_wt: lapse,
+                probed_wt: later,
                 floor: lapse
             }],
         );
         assert_eq!(
             state.pending_abandonment_records(),
-            vec![AbandonmentRecord::lapsed(successor, lapse, [figures])],
+            vec![AbandonmentRecord::lapsed(successor, later, [figures])],
             "offered as a lapse under the successor's name"
         );
 
@@ -7858,11 +7864,19 @@ mod tests {
         );
     }
 
-    /// past the deadline and never against one short of it. An absence
-    /// reaches the vote fence and is offered under the anchor it was
-    /// proved at; an answer at another anchor is nobody's.
-    #[test]
-    fn a_silent_core_is_probed_past_the_deadline_and_its_absence_offered() {
+    /// A leg whose core has fallen silent: the core's three headers held,
+    /// none asked about while the committed clock was short of the
+    /// deadline, and the clock now at it.
+    struct SilentCore {
+        schedule: TopologySchedule,
+        state: ExecutionCoordinator,
+        tx_hash: TxHash,
+        key: SubstateKey,
+        figures: UnsettledTx,
+        deadline: WeightedTimestamp,
+    }
+
+    fn silent_core() -> SilentCore {
         let schedule = two_shard_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
@@ -7877,9 +7891,6 @@ mod tests {
         );
         let root = |tag: &[u8]| StateRoot::from_raw(Hash::from_bytes(tag));
         let mut state = leg_state(&transaction);
-
-        // Three of the core's headers, none of them asked about while
-        // the committed clock is short of the deadline.
         let held: [(u64, WeightedTimestamp, &[u8]); 3] = [
             (3, deadline.minus(Duration::from_millis(1)), b"short"),
             (5, deadline.plus(Duration::from_secs(1)), b"later"),
@@ -7899,26 +7910,49 @@ mod tests {
             );
         }
         state.committed_ts = deadline;
-        let anchor = StateAnchor {
+        SilentCore {
+            schedule,
+            state,
+            tx_hash,
+            key,
+            figures,
+            deadline,
+        }
+    }
+
+    #[test]
+    fn a_silent_core_is_probed_past_the_deadline_and_its_absence_offered() {
+        let SilentCore {
+            schedule,
+            mut state,
+            tx_hash,
+            key,
+            figures,
+            deadline,
+        } = silent_core();
+        let root = |tag: &[u8]| StateRoot::from_raw(Hash::from_bytes(tag));
+        let later = deadline.plus(Duration::from_secs(1));
+        let earlier = StateAnchor {
             shard: PEER,
             height: BlockHeight::new(4),
             state_root: root(b"at"),
         };
+        let anchor = StateAnchor {
+            shard: PEER,
+            height: BlockHeight::new(5),
+            state_root: root(b"later"),
+        };
         assert_eq!(
             state_proof_fetches(&state.probe_silent_counterparts(&schedule)),
             vec![(anchor, vec![key])],
-            "the lowest header at or past the deadline is the anchor"
+            "the newest header inside the window is the anchor"
         );
         assert!(
             state_proof_fetches(&state.probe_silent_counterparts(&schedule)).is_empty(),
-            "a probe in flight is not re-issued"
+            "a probe in flight is not re-issued while nothing newer is held"
         );
 
-        let elsewhere = StateAnchor {
-            height: BlockHeight::new(5),
-            state_root: root(b"later"),
-            ..anchor
-        };
+        let elsewhere = earlier;
         let answered = state.on_state_proof_verified(elsewhere, &[(key, Inclusion::Absent)]);
         assert!(
             absences_observed(&answered, tx_hash).is_empty(),
@@ -7928,14 +7962,14 @@ mod tests {
         assert_eq!(
             absences_observed(&answered, tx_hash),
             vec![Absence {
-                probed_wt: deadline,
+                probed_wt: later,
                 floor: deadline
             }],
             "the absence reaches the vote fence"
         );
         assert_eq!(
             state.pending_abandonment_records(),
-            vec![AbandonmentRecord::unclaimed(PEER, deadline, [figures])],
+            vec![AbandonmentRecord::unclaimed(PEER, later, [figures])],
             "and a record is offered under the anchor it was proved at"
         );
         let again = state.on_state_proof_verified(anchor, &[(key, Inclusion::Absent)]);
