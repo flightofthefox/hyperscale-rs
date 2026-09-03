@@ -322,11 +322,37 @@ pub(crate) fn check_claim_grid<const ARITY_BITS: u8>(
         if claim.depth_bits < root_depth_bits {
             return Err(ProofError::Malformed("claim depth above the proof root"));
         }
+        // A mismatch leaf is the leaf the walk for `key` actually reached:
+        // it sits on the claimed path and holds some other key. Without
+        // both checks an inclusion proof rewritten as a mismatch over the
+        // same leaf reconstructs the same root and reads as an absence.
+        if let ClaimTermination::LeafMismatch { stored_key, .. } = &claim.termination {
+            if *stored_key == claim.key {
+                return Err(ProofError::Malformed("mismatch leaf holds the claimed key"));
+            }
+            if !prefix_agrees(stored_key, &claim.key, claim.depth_bits) {
+                return Err(ProofError::Malformed("mismatch leaf off the claimed path"));
+            }
+        }
     }
     if root_depth_bits > MAX_DEPTH_BITS || !root_depth_bits.is_multiple_of(u16::from(ARITY_BITS)) {
         return Err(ProofError::Malformed("root depth off the arity grid"));
     }
     Ok(())
+}
+
+/// Whether `a` and `b` agree on their first `bits` bits.
+fn prefix_agrees(a: &Key, b: &Key, bits: u16) -> bool {
+    let whole = usize::from(bits / 8);
+    if a[..whole] != b[..whole] {
+        return false;
+    }
+    let rest = bits % 8;
+    if rest == 0 {
+        return true;
+    }
+    let mask = 0xFFu8 << (8 - rest);
+    (a[whole] ^ b[whole]) & mask == 0
 }
 
 /// Resolve a co-terminal claim group: when every claim pinpoints
@@ -1026,6 +1052,45 @@ mod tests {
         }
         let err = Jmt::verify(&proof, root_hash, &[(k(1), Some(v(10)))]).unwrap_err();
         assert!(matches!(err, ProofError::RootMismatch));
+    }
+
+    /// An inclusion proof rewritten as a mismatch over the same leaf
+    /// hashes to the same root; the grid check is what refuses it.
+    #[test]
+    fn verify_rejects_a_mismatch_claim_holding_the_claimed_key() {
+        let (store, root, root_hash) =
+            build_store(&[(k(1), v(10)), (k(2), v(20)), (k(3), v(30)), (k(4), v(40))]);
+        let mut proof = Jmt::prove(&store, &root, &[k(1)]).unwrap();
+        let claim = &mut proof.claims[0];
+        claim.termination = ClaimTermination::LeafMismatch {
+            stored_key: claim.key,
+            stored_value_hash: claim.value_hash.take().unwrap(),
+        };
+        let err = Jmt::verify(&proof, root_hash, &[(k(1), None)]).unwrap_err();
+        assert!(matches!(err, ProofError::Malformed(_)), "{err:?}");
+    }
+
+    /// A mismatch leaf must sit on the claimed path: a stored key that
+    /// diverges above the claim's depth is not the leaf the walk reached.
+    #[test]
+    fn verify_rejects_a_mismatch_leaf_off_the_claimed_path() {
+        let entries: Vec<(Key, ValueHash)> = (0u8..4).map(|i| (k(i), v(i))).collect();
+        let (store, root, root_hash) = build_store(&entries);
+        let mut x = k(0);
+        x[31] = 1;
+        let mut proof = Jmt::prove(&store, &root, &[x]).unwrap();
+        let claim = &mut proof.claims[0];
+        assert!(claim.depth_bits > 0);
+        if let ClaimTermination::LeafMismatch { stored_key, .. } = &mut claim.termination {
+            stored_key[0] ^= 0x80;
+        } else {
+            panic!("the claim should be a LeafMismatch");
+        }
+        let err = Jmt::verify(&proof, root_hash, &[(x, None)]).unwrap_err();
+        assert!(matches!(err, ProofError::Malformed(_)), "{err:?}");
+        assert!(prefix_agrees(&k(0), &k(1), 0));
+        assert!(!prefix_agrees(&[0x80; KEY_BYTES], &[0x00; KEY_BYTES], 1));
+        assert!(prefix_agrees(&[0x81; KEY_BYTES], &[0x80; KEY_BYTES], 7));
     }
 
     #[test]
