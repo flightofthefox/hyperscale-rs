@@ -409,9 +409,9 @@ pub struct ExecutionCoordinator {
     /// the fold is what decides, and it overwrites what it reaches.
     seed_entries: Vec<(LegEntry, Transaction)>,
 
-    /// The transactions the store has a row for, as this coordinator
-    /// last left it: what says which rows a commit released.
-    persisted: BTreeSet<TxHash>,
+    /// The rows the store holds, as this coordinator last wrote them:
+    /// what says which rows a commit changed and which it released.
+    persisted: BTreeMap<TxHash, LegEntry>,
 
     /// Tick fates known but not yet emittable, each with the tick that
     /// carries its entries. Drained whenever a tick completes or a block
@@ -671,7 +671,7 @@ impl ExecutionCoordinator {
             persisted: recovered
                 .leg_entries
                 .iter()
-                .map(|(entry, _)| entry.tx_hash)
+                .map(|(entry, _)| (entry.tx_hash, entry.clone()))
                 .collect(),
             pending_tick_resolutions: Vec::new(),
             candidates: TickCandidates::new(local_shard),
@@ -2729,21 +2729,30 @@ impl ExecutionCoordinator {
             .collect()
     }
 
-    /// Write down what this commit left the ledger holding.
+    /// Write down what this commit changed about what the ledger holds.
     ///
-    /// Emitted every commit rather than on a change, because what a
+    /// The ledger's answer is read whole every commit, since what a
     /// commit changed is spread across the fold above it and reading it
-    /// back out would be a second answer to the same question. The
-    /// entries are few — one per leg this shard still owes a record for
-    /// — and the write is what carries them past the window the replay
-    /// reaches.
+    /// back out would be a second answer to the same question. What is
+    /// written is the difference against the rows this coordinator last
+    /// wrote: a leg entry's account moves only when it is certified,
+    /// charged or named by a record, so a shard with legs outstanding
+    /// and nothing happening to them writes nothing.
     fn persist_leg_entries(&mut self) -> Vec<Action> {
-        let held: Vec<TxHash> = self.persisted.iter().copied().collect();
-        let (entries, released) = self.unresolved.persistable(&held);
+        let held: Vec<TxHash> = self.persisted.keys().copied().collect();
+        let (rows, released) = self.unresolved.persistable(&held);
+        let entries: Vec<LegEntry> = rows
+            .iter()
+            .filter(|entry| self.persisted.get(&entry.tx_hash) != Some(entry))
+            .cloned()
+            .collect();
         if entries.is_empty() && released.is_empty() {
             return Vec::new();
         }
-        self.persisted = entries.iter().map(|entry| entry.tx_hash).collect();
+        self.persisted = rows
+            .into_iter()
+            .map(|entry| (entry.tx_hash, entry))
+            .collect();
         vec![Action::PersistLegEntries { entries, released }]
     }
 
@@ -8264,6 +8273,63 @@ mod tests {
             state.pending_abandonment_records(),
             vec![AbandonmentRecord::lapsed(PEER, later, [figures])],
             "offered as a lapse, under the anchor it was proved at"
+        );
+    }
+
+    /// The write is a difference, not the set: a commit that changed
+    /// nothing about a leg entry writes nothing, one that changed it
+    /// writes only it, and a release names the row to drop.
+    #[test]
+    fn a_leg_entry_is_written_only_when_it_changes() {
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let figures = UnsettledTx::for_transaction(&transaction);
+        let mut state = leg_state(&transaction);
+
+        let written = |actions: &[Action]| -> Option<(Vec<TxHash>, Vec<TxHash>)> {
+            actions.iter().find_map(|action| match action {
+                Action::PersistLegEntries { entries, released } => Some((
+                    entries.iter().map(|entry| entry.tx_hash).collect(),
+                    released.clone(),
+                )),
+                _ => None,
+            })
+        };
+
+        assert_eq!(
+            written(&state.persist_leg_entries()),
+            Some((vec![tx_hash], Vec::new())),
+            "the entry is written down once"
+        );
+        assert!(
+            written(&state.persist_leg_entries()).is_none(),
+            "and not again while nothing about it moves"
+        );
+
+        // A record names it, which moves the account.
+        state
+            .unresolved
+            .record_abandonment_records(&[AbandonmentRecord::unclaimed(
+                PEER,
+                figures.deadline,
+                [figures],
+            )]);
+        assert_eq!(
+            written(&state.persist_leg_entries()),
+            Some((vec![tx_hash], Vec::new())),
+            "a moved account is written again"
+        );
+
+        let reclaimed: Arc<Verifiable<Finalization>> = Arc::new(Verifiable::from(
+            helpers_make_finalization(BlockHeight::new(3), tx_hash, TransactionDecision::Aborted),
+        ));
+        state.unresolved.release_resolved(&[reclaimed]);
+        assert_eq!(
+            written(&state.persist_leg_entries()),
+            Some((Vec::new(), vec![tx_hash])),
+            "and a released entry names the row to drop"
         );
     }
 

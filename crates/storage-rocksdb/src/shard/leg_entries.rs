@@ -2,7 +2,7 @@
 
 use hyperscale_storage::LegEntryStore;
 use hyperscale_types::{Hash, LegEntry, TxHash};
-use rocksdb::{WriteBatch, WriteOptions};
+use rocksdb::WriteBatch;
 
 use super::column_families::{CfHandles, LegEntriesCf};
 use super::core::RocksDbShardStorage;
@@ -27,15 +27,16 @@ impl LegEntryStore for RocksDbShardStorage {
                 entry,
             );
         }
-        // Synced, as the vote registers are: the store is what carries an
-        // entry past the window the replay reaches, so a row that reached
-        // only the page cache is a row a crash can lose after the block
-        // that would rebuild it has aged out.
-        let mut opts = WriteOptions::default();
-        opts.set_sync(true);
+        // Unsynced, and durable on the next block's commit: the WAL is
+        // one log, so a block flush's fsync covers every write that
+        // reached it first. A row lost before that fsync is lost with
+        // the block that caused it, and a restart's fold rebuilds both
+        // — which is the same reason this needs no atomicity with the
+        // block. A vote register cannot say that, which is why it syncs
+        // and this does not.
         self.db
-            .write_opt(batch, &opts)
-            .expect("persist_leg_entries: synced write failed");
+            .write(batch)
+            .expect("persist_leg_entries: write failed");
     }
 
     fn leg_entries(&self) -> Vec<LegEntry> {
