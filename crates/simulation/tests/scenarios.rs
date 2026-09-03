@@ -24,6 +24,7 @@ use hyperscale_scenarios::tx::{
 };
 use hyperscale_scenarios::{
     Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
+    a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed,
     a_delivery_cut_off_past_its_window_is_reclaimed, a_departing_venue_clears_swaps_and_carries_on,
     a_failed_attempt_still_attests_work, a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
@@ -1214,6 +1215,13 @@ fn split_straddler_ec_partition_atomic_at_seed(seed: u64) {
         &setup.accounts,
     );
     split_straddler_ec_partition_atomic(&mut cluster);
+}
+
+#[test]
+fn a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed_sim() {
+    let setup = split_straddler_setup();
+    let mut cluster = SimCluster::with_accounts(&straddler_config(), 11, &setup.accounts);
+    cluster.run_faultable(a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed);
 }
 
 #[test]

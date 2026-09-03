@@ -13,14 +13,14 @@ use std::sync::Arc;
 use hyperscale_engine::XRD;
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, Epoch, PrincipalAddr, ShardId, TransactionDecision,
-    TransactionStatus, TxHash,
+    TransactionStatus, TxHash, WeightedTimestamp, lapse_probe_anchor,
 };
 
 use crate::reshape::split_lifecycle;
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
-    anchored_genesis_height, beacon_epoch, committee_size, scheduled_terminal_epoch,
-    split_admitted, vault_balance,
+    anchored_genesis_height, beacon_epoch, committee_size, declared_price, held,
+    scheduled_terminal_epoch, split_admitted, vault_balance,
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, STRADDLER_SPLITTER,
@@ -677,6 +677,150 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
         &charges,
         epochs(8),
         "a terminating payer's abort and the successor's release",
+    );
+}
+
+/// A delivery cut off across its deliverer's split is reclaimed on the
+/// successor's proof.
+///
+/// The cut-off delivery's shape with the delivering shard leaving part
+/// way: the survivor's payer pays and issues the crossing while the
+/// splitter is live, both channels the bundle travels are cut so no
+/// chain ever claims it, and the splitter is voted down and terminates.
+/// A departed chain supplies no header past the lapse, so the claim
+/// cell is proved absent where its prefix sits by then — on the child
+/// that inherited the recipient — and the payment comes back on that
+/// proof. On a clock whose epochs outlast the lapse the splitter's own
+/// header past it answers first; the reclaim lands either way.
+///
+/// # Panics
+///
+/// Panics if the survivor does not commit the leg before the vote, if
+/// the leg does not accept alone, if the bundle channels are never
+/// exercised, if the delivery lands on any chain, if the children are
+/// not served within budget, if the payment is not back within the
+/// reclaim's room, or if the world does not conserve.
+pub fn a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed<C: FaultableCluster>(
+    c: &mut C,
+) {
+    let splitter = STRADDLER_SPLITTER;
+    let survivor = STRADDLER_SURVIVOR;
+    let setup = split_straddler_setup();
+    let (payer_key, payer, recipient) = &setup.straddlers[0];
+
+    split_lifecycle(c);
+    let world = World::open(c, *XRD, [payer.address(), recipient.address()], []);
+    let mut charges = Charges::default();
+    let before = vault_balance(c, survivor, *payer);
+    let recipient_before = held(c, recipient.address(), *XRD);
+
+    // The vote goes in first, since it activates epochs later and the
+    // split is admitted only after that; the leg goes in at the
+    // activation epoch, under the cut, while the splitter is still live
+    // and its split not yet pending, so the shape divides — the leg pays
+    // on the survivor and the delivery is the splitter's. As late as
+    // that so the lapse falls past the cut, which is what puts the proof
+    // on the successor; a shape reaching a shard whose split is pending
+    // would run whole instead.
+    let cast_at = beacon_epoch(c).expect("post-grow beacon epoch");
+    let epoch_ms = c
+        .beacon_state()
+        .expect("post-grow beacon state")
+        .chain_config
+        .epoch_duration_ms;
+    cast_splitter_vote(c, straddler_split_bytes());
+    let activation = cast_at.inner() + vote_activate_lead(c.vote_fold_budget_ms(), epoch_ms);
+    assert!(
+        await_beacon_epoch(c, activation, epochs(8)),
+        "the vote's activation epoch must open within budget",
+    );
+    let broadcast_dropped = c.drop_type("provisions.broadcast");
+    let fetch_dropped = c.drop_type("provision.request");
+    let validity = validity_around(c.now());
+    let tx = build_transfer_tx(payer_key, *payer, *recipient, STRADDLER_PAYMENT, validity);
+    let price = declared_price(c, &tx);
+    let hash = charges.submit(c, tx);
+    assert!(
+        c.run_until(epochs(2), |c| c.chain_fate(survivor, hash).0.is_some()),
+        "the survivor must commit the leg while the splitter is live",
+    );
+    assert!(
+        !split_admitted(c, splitter),
+        "the leg has to be committed before the split is admitted, or the shape runs whole",
+    );
+    assert!(
+        await_split_admitted(c, splitter, epochs(20)),
+        "only the over-threshold splitter must admit a split",
+    );
+    assert!(
+        !split_admitted(c, survivor),
+        "the under-threshold survivor must not split",
+    );
+
+    let verdict = await_tx_terminal(c, hash, epochs(8));
+    assert!(
+        matches!(
+            verdict,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the payer's leg settles alone and accepts; verdict = {verdict:?}",
+    );
+    assert!(
+        c.run_until(epochs(4), |c| vault_balance(c, survivor, *payer)
+            == before - STRADDLER_PAYMENT - price),
+        "the leg pays the payment and the price",
+    );
+
+    // The splitter terminates and its children seat with its cells, the
+    // recipient's among them.
+    let (child_left, child_right) = splitter.children();
+    assert!(
+        await_serves(c, child_left, epochs(28)) && await_serves(c, child_right, epochs(28)),
+        "both splitter children must be served within budget",
+    );
+
+    // Past the lapse, with the cut standing the whole way: no chain that
+    // ever held the recipient had a bundle to claim from.
+    let lapse = lapse_probe_anchor(validity.end_timestamp_exclusive);
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    assert!(
+        c.run_until(epochs(12), |c| clock(c) >= lapse),
+        "the cut must stand past the lapse",
+    );
+    assert!(
+        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
+        "both bundle channels must actually have been exercised and cut"
+    );
+    for shard in [splitter, child_left, child_right] {
+        let fate = c.chain_fate(shard, hash).1.map(|(_, decision)| decision);
+        assert!(
+            fate != Some(TransactionDecision::Accept),
+            "the delivery must never have landed while its bundle was cut off; {shard} reached \
+             {fate:?}",
+        );
+    }
+
+    // The reclaim: the successor's chain passes the lapse, the survivor
+    // proves the claim cell absent there, and the payment comes back.
+    // The price stays paid — the leg ran and burned it.
+    assert!(
+        c.run_until(epochs(10), |c| vault_balance(c, survivor, *payer)
+            == before - price),
+        "the payer must get its payment back once the lapse is proved on the successor; \
+         holds {}",
+        vault_balance(c, survivor, *payer),
+    );
+    assert_eq!(
+        held(c, recipient.address(), *XRD),
+        recipient_before,
+        "the recipient was never credited",
+    );
+    c.clear_drops();
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "a delivery cut off across its deliverer's split",
     );
 }
 

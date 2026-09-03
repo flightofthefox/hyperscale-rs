@@ -17,7 +17,8 @@ use hyperscale_scenarios::tx::{
     remote_delegator, reshape_lifecycle_accounts, split_straddler_setup,
 };
 use hyperscale_scenarios::{
-    ScenarioConfig, a_delivery_cut_off_past_its_window_is_reclaimed,
+    ScenarioConfig, a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed,
+    a_delivery_cut_off_past_its_window_is_reclaimed,
     a_leg_whose_core_never_answers_refuses_at_the_deadline, abort_converges,
     beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
     cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
@@ -441,6 +442,16 @@ fn split_straddler_atomic_prod() {
     let mut cluster =
         ProdCluster::start_with_accounts(&straddler_config(), 11, EPOCH_MS, setup.accounts);
     split_straddler_atomic(&mut cluster);
+}
+
+#[test]
+#[serial]
+#[ignore = "real-QUIC production scenario; run with -- --ignored"]
+fn a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed_prod() {
+    let setup = split_straddler_setup();
+    let mut cluster =
+        ProdCluster::start_with_accounts(&straddler_config(), 11, EPOCH_MS, setup.accounts);
+    cluster.run_faultable(a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed);
 }
 
 #[test]

@@ -2274,7 +2274,7 @@ impl ExecutionCoordinator {
         }
         // A counterpart's header past a leg's deadline is what a probe
         // of its committed set, or of its claim cell, waits on.
-        actions.extend(self.probe_silent_counterparts());
+        actions.extend(self.probe_silent_counterparts(topology_schedule));
         actions
     }
 
@@ -2297,9 +2297,20 @@ impl ExecutionCoordinator {
     /// shard whose header has not reached here yet is asked when it
     /// does.
     ///
+    /// A delivering shard that departs at a reshape may leave no header
+    /// past the lapse at all, so the claim cell is asked about wherever
+    /// its prefix sits: on the shard that was to deliver it and on the
+    /// shard the trie names for its owner now, which is the successor
+    /// holding the departed chain's cells. Both are asked rather than
+    /// the trie's answer alone, because the vote fence checks a record
+    /// against the voter's own proof of the shard it names, and two
+    /// validators straddling the cut would otherwise prove different
+    /// shards and never both vote one record.
+    ///
     /// The cell is named from signed content and the counterpart shard
     /// alone, so nothing but the header and the proof is fetched.
-    fn probe_silent_counterparts(&mut self) -> Vec<Action> {
+    fn probe_silent_counterparts(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        let trie = self.counterpart_trie(topology_schedule);
         let mut wanted: BTreeMap<StateAnchor, Vec<SubstateKey>> = BTreeMap::new();
         for entry in self.unresolved.probeable(self.committed_ts) {
             let core = entry.core.iter().next().map(|&shard| {
@@ -2310,13 +2321,17 @@ impl ExecutionCoordinator {
                     Probed::Core,
                 )
             });
-            let deliveries = entry.deliveries.iter().map(|&(shard, claim)| {
-                (
-                    shard,
-                    claim,
-                    lapse_probe_anchor(entry.validity_end),
-                    Probed::Delivery,
-                )
+            let deliveries = entry.deliveries.iter().flat_map(|&(delivered_by, claim)| {
+                BTreeSet::from([delivered_by, trie.shard_for_prefix(claim.owner)])
+                    .into_iter()
+                    .map(move |shard| {
+                        (
+                            shard,
+                            claim,
+                            lapse_probe_anchor(entry.validity_end),
+                            Probed::Delivery,
+                        )
+                    })
             });
             for (shard, key, floor, probed) in core.into_iter().chain(deliveries) {
                 if self.probes.contains_key(&(entry.tx_hash, shard)) {
@@ -2669,7 +2684,7 @@ impl ExecutionCoordinator {
         self.release_unanswerable(&unanswerable);
         // The committed clock is what opens a leg's deadline, so the
         // cores gone silent past it are asked here.
-        actions.extend(self.probe_silent_counterparts());
+        actions.extend(self.probe_silent_counterparts(topology_schedule));
 
         // Timeout checks + pruning run every block, not just commits that
         // carry txs.
@@ -7626,6 +7641,12 @@ mod tests {
     /// The absences of `tx_hash` at [`PEER`] handed to the fence among
     /// `actions`.
     fn absences_observed(actions: &[Action], tx_hash: TxHash) -> Vec<Absence> {
+        absences_observed_at(actions, PEER, tx_hash)
+    }
+
+    /// The absences of `tx_hash` at `at` handed to the fence among
+    /// `actions`.
+    fn absences_observed_at(actions: &[Action], at: ShardId, tx_hash: TxHash) -> Vec<Absence> {
         actions
             .iter()
             .filter_map(|action| match action {
@@ -7633,7 +7654,7 @@ mod tests {
                     shard,
                     tx_hash: named,
                     absence,
-                }) if *shard == PEER && *named == tx_hash => Some(*absence),
+                }) if *shard == at && *named == tx_hash => Some(*absence),
                 _ => None,
             })
             .collect()
@@ -7696,7 +7717,7 @@ mod tests {
             state_root: root(b"at"),
         };
         assert_eq!(
-            state_proof_fetches(&state.probe_silent_counterparts()),
+            state_proof_fetches(&state.probe_silent_counterparts(&schedule)),
             vec![(anchor, vec![claim])],
             "the lowest header at or past the lapse is the anchor, and the claim cell the key"
         );
@@ -7713,6 +7734,113 @@ mod tests {
             state.pending_abandonment_records(),
             vec![AbandonmentRecord::lapsed(PEER, lapse, [figures])],
             "offered as a lapse, under the anchor it was proved at"
+        );
+    }
+
+    /// A delivering shard that departed at a reshape leaves no header
+    /// past the lapse, so its claim cell is asked about on the successor
+    /// the trie names for the cell's owner — the child holding the
+    /// departed chain's cells — and the absence proved there is offered
+    /// as a lapse under the successor's name. A header of the departed
+    /// shard past the lapse, should one exist, is asked as well, so
+    /// every validator proves whichever shard a record names.
+    #[test]
+    fn a_delivery_whose_deliverer_departed_is_probed_on_its_successor() {
+        let schedule = peer_terminating_schedule(60_000);
+        let (successor, _) = PEER.children();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let figures = UnsettledTx::for_transaction(&transaction);
+        let deadline = figures.deadline;
+        let lapse = deadline.plus(MAX_VALIDITY_RANGE);
+        // An owner under the peer's left child, as the trie cuts it.
+        let claim = SubstateKey {
+            owner: test_prefix(0x81),
+            local: LocalKey([0xC1; 16]),
+        };
+        assert_eq!(
+            schedule.head().shard_trie().shard_for_prefix(claim.owner),
+            successor,
+            "the fixture's claim sits under the departed peer's left child"
+        );
+        let root = |tag: &[u8]| StateRoot::from_raw(Hash::from_bytes(tag));
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        state.unresolved.register_committed(
+            HOME,
+            WeightedTimestamp::ZERO,
+            std::iter::once(&transaction),
+        );
+        state.unresolved.mark_leg(
+            tx_hash,
+            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+            BTreeSet::new(),
+            vec![(PEER, claim)],
+        );
+        state.unresolved.certify(tx_hash);
+        // The local chain has crossed the peer's cut: its committee is
+        // anchored in a window whose trie names the children.
+        state.committed_committee_anchor_wt = lapse;
+
+        let held: [(u64, WeightedTimestamp, &[u8]); 3] = [
+            (3, deadline, b"short"),
+            (5, lapse.plus(Duration::from_secs(1)), b"later"),
+            (4, lapse, b"at"),
+        ];
+        for (height, ts, tag) in held {
+            state.on_committed_remote_header(
+                &schedule,
+                successor,
+                BlockHeight::new(height),
+                ts,
+                root(tag),
+            );
+        }
+        state.committed_ts = deadline;
+        let anchor = StateAnchor {
+            shard: successor,
+            height: BlockHeight::new(4),
+            state_root: root(b"at"),
+        };
+        assert_eq!(
+            state_proof_fetches(&state.probe_silent_counterparts(&schedule)),
+            vec![(anchor, vec![claim])],
+            "the successor's lowest header at or past the lapse is the anchor, and the claim \
+             cell the key; the departed peer, with no header, is not asked"
+        );
+
+        let answered = state.on_state_proof_verified(anchor, &[(claim, Inclusion::Absent)]);
+        assert_eq!(
+            absences_observed_at(&answered, successor, tx_hash),
+            vec![Absence {
+                probed_wt: lapse,
+                floor: lapse
+            }],
+        );
+        assert_eq!(
+            state.pending_abandonment_records(),
+            vec![AbandonmentRecord::lapsed(successor, lapse, [figures])],
+            "offered as a lapse under the successor's name"
+        );
+
+        // A header of the departed peer past the lapse is asked as well.
+        let actions = state.on_committed_remote_header(
+            &schedule,
+            PEER,
+            BlockHeight::new(6),
+            lapse,
+            root(b"peer"),
+        );
+        let peer_anchor = StateAnchor {
+            shard: PEER,
+            height: BlockHeight::new(6),
+            state_root: root(b"peer"),
+        };
+        assert_eq!(
+            state_proof_fetches(&actions),
+            vec![(peer_anchor, vec![claim])],
+            "the shard that was to deliver is asked wherever it has a header past the lapse"
         );
     }
 
@@ -7763,12 +7891,12 @@ mod tests {
             state_root: root(b"at"),
         };
         assert_eq!(
-            state_proof_fetches(&state.probe_silent_counterparts()),
+            state_proof_fetches(&state.probe_silent_counterparts(&schedule)),
             vec![(anchor, vec![key])],
             "the lowest header at or past the deadline is the anchor"
         );
         assert!(
-            state_proof_fetches(&state.probe_silent_counterparts()).is_empty(),
+            state_proof_fetches(&state.probe_silent_counterparts(&schedule)).is_empty(),
             "a probe in flight is not re-issued"
         );
 
@@ -7837,7 +7965,7 @@ mod tests {
         );
         assert!(state.pending_abandonment_records().is_empty());
         assert!(
-            state_proof_fetches(&state.probe_silent_counterparts()).is_empty(),
+            state_proof_fetches(&state.probe_silent_counterparts(&schedule)).is_empty(),
             "and is not asked again"
         );
     }

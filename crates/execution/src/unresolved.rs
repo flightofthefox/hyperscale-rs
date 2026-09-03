@@ -182,8 +182,11 @@ struct Kept {
     /// core, whose verdict is its own.
     core: BTreeSet<ShardId>,
     /// The claim cells deliveries elsewhere write for the crossings this
-    /// shard issued, each under its delivering shard — what a lapse
-    /// probe asks about once the delivery window has closed.
+    /// shard issued, each under the shard that was to deliver it when
+    /// the transaction committed — what a lapse probe asks about once
+    /// the delivery window has closed. The cell follows its prefix to a
+    /// departed deliverer's successor; the prober resolves that off the
+    /// trie, since the ledger holds no topology.
     deliveries: Vec<(ShardId, SubstateKey)>,
 }
 
@@ -206,8 +209,9 @@ pub struct Probeable {
     /// counterparts are deliveries alone.
     pub core: BTreeSet<ShardId>,
     /// The claim cells deliveries elsewhere write for what this leg
-    /// issued, each under its delivering shard. Asked about past the
-    /// lapse, one probe per delivering shard.
+    /// issued, each under the shard that was to deliver it at commit.
+    /// Asked about past the lapse, there and on whatever shard holds
+    /// the cell's prefix by then.
     pub deliveries: Vec<(ShardId, SubstateKey)>,
 }
 
