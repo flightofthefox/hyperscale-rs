@@ -16,12 +16,13 @@ use crate::{
     BlockVoteMessage, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommitProof,
     ConsensusPublicKey, ConsensusSignature, DeclaredKey, Derivation, DerivationError, Derived,
     EnvelopeExt, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
-    NetworkDefinition, NetworkId, ProposerTimestamp, ProtocolStatics, QuorumCertificate, Round,
-    Routing, ShardForkProof, ShardId, SignerBitfield, SubintentSig, TickHalf, TickId,
-    TimestampRange, TopologySnapshot, Transaction, TransactionBody, TransactionDecision,
-    TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-    Verified, WeightedTimestamp, WitnessSources, compute_global_receipt_root, declared_work,
-    install_protocol_statics, protocol_statics_installed, signed_bytes,
+    MerkleInclusionProof, NetworkDefinition, NetworkId, ProposerTimestamp, ProtocolStatics,
+    QuorumCertificate, Round, Routing, ShardForkProof, ShardId, SignerBitfield, StateRoot,
+    SubintentSig, TickHalf, TickId, TimestampRange, TopologySnapshot, Transaction, TransactionBody,
+    TransactionDecision, TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo,
+    ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    compute_global_receipt_root, declared_work, install_protocol_statics,
+    protocol_statics_installed, signed_bytes,
 };
 
 /// Create a test transaction the [`StubVmStatics`] derivation routes to
@@ -1223,6 +1224,57 @@ pub fn stub_transaction_running(
     tx.try_derived(&StubVmStatics)
         .expect("the fixture builds a tree the stub derivation routes");
     tx
+}
+
+/// A one-version state tree holding `present`, and a proof over `asked`
+/// against it: the root the proof reconstructs, and the proof.
+///
+/// What a test hands a coordinator in place of a fetch: a key in
+/// `present` reads back present under the root, any other absent. The
+/// tree always holds one unrelated leaf besides, so a chain whose
+/// state is otherwise empty still has a root to prove against — a
+/// counterpart chain always holds something.
+///
+/// # Panics
+///
+/// If `asked` names the unrelated leaf, whose presence would be an
+/// answer the caller did not ask for.
+#[must_use]
+pub fn state_and_proof(
+    present: &[SubstateKey],
+    asked: &[SubstateKey],
+) -> (StateRoot, MerkleInclusionProof) {
+    use std::collections::BTreeMap;
+
+    use hyperscale_jmt::{Blake3Hasher, Key as JmtKey, LeafValue, MemoryStore, NodeKey, Tree};
+
+    use crate::state_key::jmt_value_hash;
+
+    let unrelated = test_key(0xEE);
+    assert!(
+        !asked.contains(&unrelated),
+        "the tree's unrelated leaf is not a key a test may ask about",
+    );
+    let mut store = MemoryStore::new();
+    let updates: BTreeMap<JmtKey, Option<LeafValue>> = present
+        .iter()
+        .chain(std::iter::once(&unrelated))
+        .map(|key| {
+            let value = key.to_bytes().to_vec();
+            (
+                key.to_bytes(),
+                Some(LeafValue::new(jmt_value_hash(&value), value.len() as u64)),
+            )
+        })
+        .collect();
+    let result = Tree::<Blake3Hasher, 1>::apply_updates(&store, None, 1, &updates)
+        .expect("a fresh tree takes its first version");
+    let root = StateRoot::from_raw(Hash::from_hash_bytes(&result.root_hash));
+    store.apply(&result);
+    let jmt_keys: Vec<JmtKey> = asked.iter().map(SubstateKey::to_bytes).collect();
+    let proof = Tree::<Blake3Hasher, 1>::prove(&store, &NodeKey::root(1), &jmt_keys)
+        .expect("every key proves against a held version");
+    (root, MerkleInclusionProof::new(proof.encode()))
 }
 
 #[cfg(test)]

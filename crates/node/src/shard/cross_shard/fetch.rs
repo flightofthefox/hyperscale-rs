@@ -503,24 +503,24 @@ impl FetchBinding for StateProofBinding {
                         );
                         return ResponseVerdict::Reject;
                     };
-                    let inclusions = match proof.inclusions(anchor.state_root, &keys) {
-                        Ok(inclusions) => inclusions,
-                        Err(error) => {
-                            tracing::warn!(
-                                shard = ?anchor.shard,
-                                height = anchor.height.inner(),
-                                %error,
-                                "Dropping state-proof response: unusable proof"
-                            );
-                            push_shard_input(
-                                &es,
-                                local_shard,
-                                ShardScopedInput::StateProofFetchFailed { ids: requested },
-                            );
-                            return ResponseVerdict::Reject;
-                        }
-                    };
-                    // Release the slots before delivering the answers, so
+                    // Checked here so an unusable proof rotates the peer
+                    // rather than reaching a block. What it says is read
+                    // off the block that carries it, by every replica.
+                    if let Err(error) = proof.inclusions(anchor.state_root, &keys) {
+                        tracing::warn!(
+                            shard = ?anchor.shard,
+                            height = anchor.height.inner(),
+                            %error,
+                            "Dropping state-proof response: unusable proof"
+                        );
+                        push_shard_input(
+                            &es,
+                            local_shard,
+                            ShardScopedInput::StateProofFetchFailed { ids: requested },
+                        );
+                        return ResponseVerdict::Reject;
+                    }
+                    // Release the slots before delivering the proof, so
                     // the freed capacity is available if handling the
                     // delivery re-drives this fetch.
                     push_shard_input(
@@ -533,8 +533,8 @@ impl FetchBinding for StateProofBinding {
                         local_shard,
                         ProtocolEvent::StateProofVerified {
                             anchor,
+                            keys,
                             proof,
-                            inclusions,
                         },
                     );
                     ResponseVerdict::Accept

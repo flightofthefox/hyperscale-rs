@@ -320,12 +320,11 @@ pub struct Refusal {
 /// delivery's claim cell past its lapse.
 ///
 /// What an `Unclaimed` or a `Lapsed` record restates and what a voter
-/// checks it against. The anchor is the voter's own probe, which need
-/// not be the proposer's: absence past the floor is the same fact at
-/// every anchor short of the probed cell's sweep, so a voter holding a
-/// proof at any block inside that window holds the evidence the record
-/// claims. The floor is the clock the mirror lives on, as a refusal's
-/// deadline is, and what says which cell the mirror asked about.
+/// checks it against: the proof the chain committed, folded by every
+/// replica at the same height, so the record's anchor is held to the
+/// mirror's exactly. The floor is the clock the mirror lives on, as a
+/// refusal's deadline is, and what says which cell the proof asked
+/// about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Absence {
     /// The weighted timestamp of the block the absence was proved
@@ -338,14 +337,13 @@ pub struct Absence {
     pub floor: WeightedTimestamp,
 }
 
-/// A consumer's claim of a crossing a leg here issued for, as this
-/// validator proved it present off the consumer's commit-proven state.
+/// A consumer's claim of a crossing a leg here issued for, as a state
+/// proof the chain committed proved it present off the consumer's
+/// commit-proven state.
 ///
-/// What a `Claimed` record restates and what a voter checks it against.
-/// The anchor is the voter's own probe, which need not be the
-/// proposer's: a claim committed is one fact at every anchor from its
-/// commit to the claim cell's own sweep, so a voter holding a proof at
-/// any block short of the sweep holds the evidence the record claims.
+/// What a `Claimed` record restates and what a voter checks it against:
+/// the committed proof, folded by every replica at the same height, so
+/// the record's anchor is held to the mirror's exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimProof {
     /// The weighted timestamp of the block the presence was proved

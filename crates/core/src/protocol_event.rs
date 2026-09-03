@@ -15,8 +15,8 @@ use hyperscale_types::{
     CertifiedBeaconBlockVerifyError, CertifiedBlock, CertifiedBlockHeader,
     CertifiedHeaderVerifyError, ClaimProof, Epoch, ExecutionCertificate,
     ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationVerifyError, Hash,
-    Inclusion, LeafIndex, LocalReceiptRoot, LocalReceiptRootVerifyError, MerkleInclusionProof,
-    PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
+    LeafIndex, LocalReceiptRoot, LocalReceiptRootVerifyError, MerkleInclusionProof, PcVote1,
+    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
     ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
     ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate, RatifyPhase,
     RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal, Refusal, Resolutions, Round,
@@ -832,12 +832,13 @@ pub enum ProtocolEvent {
         refusal: Refusal,
     },
 
-    /// The execution coordinator proved a core shard had not committed a
-    /// transaction a leg here issued for, off a state proof against one
-    /// of the core's commit-proven headers past the deadline. The shard
+    /// A state proof the chain committed proved a counterpart had not
+    /// taken a transaction a leg here issued for — a core's committed
+    /// cell absent past the deadline, a delivery's claim absent past the
+    /// lapse — folded by the execution coordinator at commit. The shard
     /// coordinator records it for the vote fence, which checks an
-    /// `Unclaimed` abandonment record against exactly this, and
-    /// re-drives the votes that deferred for want of it.
+    /// `Unclaimed` or `Lapsed` abandonment record against exactly this,
+    /// and re-drives the votes that deferred for want of it.
     AbsenceObserved {
         /// The core shard that did not commit it.
         shard: ShardId,
@@ -847,12 +848,11 @@ pub enum ProtocolEvent {
         absence: Absence,
     },
 
-    /// The execution coordinator proved a consumer had claimed a
-    /// crossing a leg here issued for, off a state proof against one of
-    /// the consumer's commit-proven headers. The shard coordinator
-    /// records it for the vote fence, which checks a `Claimed` record
-    /// against exactly this, and re-drives the votes that deferred for
-    /// want of it.
+    /// A state proof the chain committed proved a consumer had claimed
+    /// a crossing a leg here issued for, folded by the execution
+    /// coordinator at commit. The shard coordinator records it for the
+    /// vote fence, which checks a `Claimed` record against exactly this,
+    /// and re-drives the votes that deferred for want of it.
     ClaimObserved {
         /// The consuming shard whose claim was proved.
         shard: ShardId,
@@ -863,17 +863,17 @@ pub enum ProtocolEvent {
     },
 
     /// A state proof fetched against a commit-proven remote header
-    /// verified: each key asked is present or absent under the anchor's
-    /// root. Every answer here arrives already checked against that
-    /// root; the execution coordinator reads its probes off it, and
-    /// keeps the bytes to offer in a block it proposes.
+    /// verified: it reconstructs the anchor's root and claims every key
+    /// asked. The execution coordinator keeps the bytes to offer in a
+    /// block it proposes; nothing reads an answer off a fetch, since
+    /// the answer is the chain's once a block carries the proof.
     StateProofVerified {
         /// The state the proof was checked against.
         anchor: StateAnchor,
+        /// The keys the proof was asked about.
+        keys: Vec<SubstateKey>,
         /// The proof as fetched.
         proof: MerkleInclusionProof,
-        /// What the proof attests for each key asked.
-        inclusions: Vec<(SubstateKey, Inclusion)>,
     },
 
     /// The `io_loop`'s settled-set acquisition verified a past-terminal

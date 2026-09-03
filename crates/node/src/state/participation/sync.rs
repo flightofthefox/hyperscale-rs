@@ -113,11 +113,13 @@ impl ShardParticipation {
             // it and hands each absence on.
             ProtocolEvent::StateProofVerified {
                 anchor,
+                keys,
                 proof,
-                inclusions,
-            } => self
-                .execution_coordinator
-                .on_state_proof_verified(anchor, proof, &inclusions),
+            } => {
+                self.execution_coordinator
+                    .on_state_proof_verified(anchor, keys, proof);
+                Vec::new()
+            }
             // A predecessor answered which of the queried transactions it
             // committed. Record the answers, then re-drive the votes that
             // deferred for want of them and the proposal that was

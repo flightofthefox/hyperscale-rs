@@ -462,22 +462,21 @@ pub struct ShardCoordinator {
     /// this and nothing else: equality on the anchor, and a voter holding
     /// no mirror defers. Each lives to its transaction's horizon.
     refusals: HashMap<(TxHash, ShardId), Refusal>,
-    /// Core shards' proved absences of transactions legs here issued
-    /// for, as the execution coordinator proved them off commit-proven
-    /// headers past the deadline. An `Unclaimed` abandonment record is
-    /// checked against this and nothing else: a mirror at any anchor at
-    /// or past the name's deadline stands for it, since absence past the
-    /// deadline is one fact at every anchor, and a voter holding no
-    /// mirror defers. Each lives to its transaction's horizon.
+    /// Counterparts' proved absences of transactions legs here issued
+    /// for, as the execution coordinator folded them off the state
+    /// proofs the chain committed. An `Unclaimed` or `Lapsed`
+    /// abandonment record is checked against this and nothing else:
+    /// equality on the anchor, since every replica folds the same
+    /// committed proofs, and a voter that has not folded it defers.
+    /// Each lives to its transaction's horizon.
     absences: HashMap<(TxHash, ShardId), Absence>,
 
     /// The consumers' claims of crossings legs here issued for, as the
-    /// execution coordinator proved them present off commit-proven
-    /// headers. A `Claimed` record is checked against this and nothing
-    /// else: a mirror at any anchor short of the claim cell's sweep
-    /// stands for it, since a claim committed is one fact at every
-    /// anchor until then, and a voter holding no mirror defers. Each
-    /// lives to its transaction's horizon.
+    /// execution coordinator folded them off the state proofs the chain
+    /// committed. A `Claimed` record is checked against this and nothing
+    /// else: equality on the anchor, as an absence is, and a voter that
+    /// has not folded it defers. Each lives to its transaction's
+    /// horizon.
     presences: HashMap<(TxHash, ShardId), ClaimProof>,
 
     /// Commit-proven anchors of remote shards — the root and parent-QC
@@ -934,8 +933,9 @@ impl ShardCoordinator {
         self.refusals.entry((tx_hash, shard)).or_insert(refusal);
     }
 
-    /// Record a core shard's proved absence for the vote fence.
-    /// First-write-wins: one proof past the deadline is the whole fact.
+    /// Record a counterpart's proved absence for the vote fence.
+    /// First-write-wins, as the fold itself is: the first committed
+    /// proof to answer a cell is the answer every replica holds.
     pub fn record_absence(&mut self, shard: ShardId, tx_hash: TxHash, absence: Absence) {
         self.absences.entry((tx_hash, shard)).or_insert(absence);
     }
@@ -953,9 +953,8 @@ impl ShardCoordinator {
     }
 
     /// Mirror a consumer's claim of a crossing a leg here issued for,
-    /// proved present off the consumer's commit-proven state. First
-    /// proof wins: a claim is one fact at every anchor short of its
-    /// sweep, so nothing a later proof adds changes the verdict.
+    /// proved present by a state proof the chain committed. First proof
+    /// wins, as the fold itself is.
     pub fn record_presence(&mut self, shard: ShardId, tx_hash: TxHash, presence: ClaimProof) {
         self.presences.entry((tx_hash, shard)).or_insert(presence);
     }
@@ -1279,19 +1278,19 @@ impl ShardCoordinator {
                     }
                 }
             }
-            // An absence is checked against this validator's own proof.
-            // The record's anchor has to sit inside every name's absence
-            // window — at or past the deadline, which is the probe
-            // anchor, since before it the core may still commit; and
-            // short of the committed cell's sweep, since past it the
-            // cell is gone whatever the core did. The mirror need not be
-            // at the record's anchor: absence is the same fact at every
-            // anchor in the window, and two honest validators probe at
-            // whichever of the core's headers reached them first. A
-            // voter holding no proof defers. A lapse is the same check
-            // against the later window a delivery's claim cell has.
-            // Both windows derive from the deadline the record restates,
-            // so the voter needs no body to find them.
+            // An absence is checked against the proof the chain
+            // committed. The record's anchor has to sit inside every
+            // name's absence window — at or past the deadline, which is
+            // the probe anchor, since before it the core may still
+            // commit; and short of the committed cell's sweep, since
+            // past it the cell is gone whatever the core did. And it has
+            // to be the anchor this validator folded: every replica
+            // folds the same committed proofs in the same order, so an
+            // honest record restates the answer they all hold. A voter
+            // that has not folded it yet defers. A lapse is the same
+            // check against the later window a delivery's claim cell
+            // has. Both windows derive from the deadline the record
+            // restates, so the voter needs no body to find them.
             Unsettleable::Unclaimed { probed_wt } => {
                 for entry in verdict.unsettled() {
                     if !self.absence_stands(
@@ -1318,12 +1317,10 @@ impl ShardCoordinator {
                     }
                 }
             }
-            // A claim is checked against this validator's own proof of
-            // it. A claim committed is one fact at every anchor from its
-            // commit to the claim cell's sweep, so the record's anchor
-            // and the mirror's need only both sit short of the sweep;
-            // a mirror at any such anchor stands for the record, and no
-            // mirror defers.
+            // A claim is checked against the proof the chain committed:
+            // the record's anchor short of the claim cell's sweep, and
+            // the one this validator folded. A voter that has not folded
+            // it defers.
             Unsettleable::Claimed { probed_wt } => {
                 for entry in verdict.unsettled() {
                     if !self.presence_stands(verdict, entry, probed_wt, block_hash) {
@@ -1335,13 +1332,10 @@ impl ShardCoordinator {
         true
     }
 
-    /// Whether one name's absence stands for this validator: the record's
-    /// anchor is one `licenses` accepts for the name's validity end, and
-    /// this validator's own proof against the record's shard is too. The
-    /// mirror need not be at the record's anchor — absence is the same
-    /// fact at every anchor inside the window, and two honest validators
-    /// probe at whichever of the shard's headers reached them first. A
-    /// voter holding no proof defers.
+    /// Whether one name's absence stands for this validator: the
+    /// record's anchor is one `licenses` accepts for the name's validity
+    /// end, and it is the anchor this validator folded off the chain's
+    /// own proofs. A voter that has not folded it defers.
     fn absence_stands(
         &self,
         verdict: &AbandonmentRecord,
@@ -1371,7 +1365,7 @@ impl ShardCoordinator {
             .absences
             .get(&(entry.tx_hash, verdict.shard()))
             .is_some_and(|absence| {
-                absence.floor == floor(validity_end) && licenses(absence.probed_wt, validity_end)
+                absence.floor == floor(validity_end) && absence.probed_wt == probed_wt
             });
         if !proved {
             trace!(
@@ -1427,8 +1421,9 @@ impl ShardCoordinator {
     }
 
     /// Whether one name's claim, as a `Claimed` record restates it at
-    /// `probed_wt`, stands on this validator's own proof: both anchors
-    /// short of the claim cell's sweep, and a proof held at all.
+    /// `probed_wt`, stands on the proof the chain committed: the anchor
+    /// short of the claim cell's sweep, and the one this validator
+    /// folded.
     fn presence_stands(
         &self,
         verdict: &AbandonmentRecord,
@@ -1451,7 +1446,7 @@ impl ShardCoordinator {
         let proved = self
             .presences
             .get(&(entry.tx_hash, verdict.shard()))
-            .is_some_and(|presence| presence.probed_wt < sweep);
+            .is_some_and(|presence| presence.probed_wt == probed_wt);
         if !proved {
             trace!(
                 validator = ?self.me,
@@ -12140,10 +12135,12 @@ mod tests {
         );
     }
 
-    /// An absence record is checked against this validator's own proof:
-    /// a proof at any anchor past the name's deadline passes it, the
-    /// record's own anchor short of the deadline refuses it whatever the
-    /// mirror says, and no proof defers it.
+    /// An absence record is checked against the proof the chain
+    /// committed: the folded answer at the record's own anchor passes
+    /// it, an answer at another anchor defers it — every replica folds
+    /// the same proofs, so an honest record restates what they hold —
+    /// the record's own anchor short of the deadline refuses it whatever
+    /// the mirror says, and no answer defers it.
     #[test]
     fn an_absence_record_stands_or_falls_on_the_mirror() {
         let sched = make_terminating_schedule(4);
@@ -12171,12 +12168,12 @@ mod tests {
             "a proof at the deadline passes a record at the deadline"
         );
         assert!(
-            !matching.fence_abandonment_records(
+            matching.fence_abandonment_records(
                 &sched,
                 &record(deadline.plus(Duration::from_secs(5))),
                 BlockHash::ZERO
             ),
-            "and a record probed later, since the fact is the same at every anchor past it"
+            "a record at an anchor this validator has not folded defers"
         );
         assert!(
             matching.fence_abandonment_records(
@@ -12280,11 +12277,11 @@ mod tests {
         );
     }
 
-    /// A `Claimed` record is checked against this validator's own proof
-    /// of the claim: a proof at any anchor short of the claim cell's
-    /// sweep passes a record anchored anywhere short of it too, a
-    /// record anchored at or past the sweep is refused whatever the
-    /// mirror holds, and no proof defers.
+    /// A `Claimed` record is checked against the proof the chain
+    /// committed: the folded answer at the record's own anchor passes
+    /// it, one at another anchor defers it, a record anchored at or past
+    /// the claim cell's sweep is refused whatever the mirror holds, and
+    /// no answer defers.
     #[test]
     fn a_claimed_record_stands_or_falls_on_the_mirror() {
         let sched = make_terminating_schedule(4);
@@ -12314,12 +12311,12 @@ mod tests {
             "a proof at the deadline passes a record at the deadline"
         );
         assert!(
-            !matching.fence_abandonment_records(
+            matching.fence_abandonment_records(
                 &sched,
                 &record(sweep.minus(Duration::from_millis(1))),
                 BlockHash::ZERO
             ),
-            "and one anchored later: a claim is one fact at every anchor short of the sweep"
+            "a record at an anchor this validator has not folded defers"
         );
         assert!(
             matching.fence_abandonment_records(&sched, &record(sweep), BlockHash::ZERO),

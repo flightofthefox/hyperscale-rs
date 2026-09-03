@@ -480,11 +480,21 @@ impl UnresolvedTxs {
     /// replica at the same frontier asks about the same set.
     #[must_use]
     pub fn probeable(&self, now: WeightedTimestamp) -> Vec<Probeable> {
+        self.cells()
+            .into_iter()
+            .filter(|entry| now >= entry.deadline)
+            .collect()
+    }
+
+    /// Every leg entry no record has answered for, with the counterpart
+    /// cells its questions are asked of, whatever the clock: what a
+    /// proof the chain committed is read against, since the proof's
+    /// own anchor says whether the window was open.
+    #[must_use]
+    pub fn cells(&self) -> Vec<Probeable> {
         self.owed
             .iter()
-            .filter(|(_, owed)| {
-                owed.kind.is_leg() && owed.unsettled_by.is_none() && now >= owed.deadline
-            })
+            .filter(|(_, owed)| owed.kind.is_leg() && owed.unsettled_by.is_none())
             .filter_map(|(tx_hash, owed)| {
                 let leg = self.kept.get(tx_hash)?;
                 Some(Probeable {
