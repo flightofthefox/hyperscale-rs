@@ -18,7 +18,7 @@
 
 use std::time::Duration;
 
-use hyperscale_vm_types::NULLIFIER_GRACE_MS;
+use hyperscale_vm_types::{ESCROW_GRACE_MS, NULLIFIER_GRACE_MS};
 
 use crate::{MAX_VALIDITY_RANGE, WeightedTimestamp};
 
@@ -100,13 +100,14 @@ pub fn absence_licenses_reclaim(
 /// is no longer admissible: its validity end plus [`MAX_VALIDITY_RANGE`].
 ///
 /// A delivery bears no verdict, so the transaction's deadline does not
-/// bound it: the record cell it claims is durable, consumed once, and
-/// swept a [`RETENTION_HORIZON`] past the validity end. What bounds the
-/// delivery is that sweep, and this sits [`MAX_FINALIZATION_DELAY`]
-/// short of it — the same budget the core's admission leaves before the
-/// probe anchor — so a delivery admitted at the last moment still finds
-/// the cell it claims. Derived from signed content, so every shard
-/// names the same instant.
+/// bound it: the record cell it claims is durable and consumed once.
+/// What bounds the delivery is that a delivery admitted at the last
+/// moment has claimed by [`MAX_FINALIZATION_DELAY`] past this close or
+/// never will — the same budget the core's admission leaves before the
+/// probe anchor — which is where the crossing lapses and its issuer may
+/// prove it unclaimed; the record is swept a further
+/// [`MAX_VALIDITY_RANGE`] on, the room that reclaim needs. Derived from
+/// signed content, so every shard names the same instant.
 #[must_use]
 pub fn delivery_window_close(validity_end: WeightedTimestamp) -> WeightedTimestamp {
     validity_end.plus(MAX_VALIDITY_RANGE)
@@ -130,6 +131,16 @@ pub fn delivery_admissible(anchor: WeightedTimestamp, validity_end: WeightedTime
 const _: () = assert!(
     RETENTION_HORIZON.as_secs() * 1_000 == NULLIFIER_GRACE_MS,
     "a nullifier's grace is the protocol's retention horizon",
+);
+
+/// An escrow record outlives the nullifier by the room a lapsed
+/// crossing's reclaim needs: the lapse is proved no earlier than the
+/// retention horizon past the validity end, and the reclaim then has a
+/// validity range — the room every abandonment gets — to commit before
+/// the record it takes back is swept.
+const _: () = assert!(
+    (RETENTION_HORIZON.as_secs() + MAX_VALIDITY_RANGE.as_secs()) * 1_000 == ESCROW_GRACE_MS,
+    "an escrow cell's grace is the retention horizon plus a reclaim's room",
 );
 
 /// The horizon must not outlive the epoch that produced what it retains.
