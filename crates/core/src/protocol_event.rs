@@ -23,8 +23,8 @@ use hyperscale_types::{
     ShardWitnessPayload, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
     SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
     StateAnchor, StateRoot, StateRootVerifyError, StoredReceipt, SubstateKey, TickId, Timeout,
-    Transaction, TransactionRoot, TxHash, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp,
+    Transaction, TransactionRoot, TxHash, TxOutcome, TxResolution, TxRootVerifyError, ValidatorId,
+    Verifiable, Verified, WeightedTimestamp,
 };
 
 /// What one tick's batch produced.
@@ -727,6 +727,15 @@ pub enum ProtocolEvent {
     TransactionsAdmitted {
         /// Transactions newly admitted to mempool on this admission call.
         txs: Vec<Arc<Verified<Transaction>>>,
+    },
+
+    /// The execution coordinator settled what a core's certificates
+    /// mean for transactions legs here issued for — refused, or accepted
+    /// by every core shard — which its ledger alone can say. The mempool
+    /// applies each to its entry's status.
+    TransactionsResolved {
+        /// Each transaction with what was settled about it.
+        resolutions: Vec<(TxHash, TxResolution)>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

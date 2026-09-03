@@ -238,7 +238,12 @@ impl Charges {
                 finalized
             }
             Some(TransactionStatus::Completed(_)) => true,
-            Some(TransactionStatus::Pending | TransactionStatus::Committed(_)) | None => false,
+            Some(
+                TransactionStatus::Pending
+                | TransactionStatus::Committed(_)
+                | TransactionStatus::LegFinalized,
+            )
+            | None => false,
         }
     }
 }

@@ -1,11 +1,13 @@
 //! Transaction-flow dispatch arms.
 //!
-//! Three `ProtocolEvent` variants drive the transaction pipeline:
+//! Four `ProtocolEvent` variants drive the transaction pipeline:
 //! - `TransactionValidated` — gossip-delivered tx that passed async validation
 //!   → mempool admission;
 //! - `TransactionsReceived` — fetch-delivered batch → mempool admission;
 //! - `TransactionsAdmitted` — mempool emits this after admission; shard consensus's
-//!   pending-block subscriber consumes it and we latch a proposal-retry.
+//!   pending-block subscriber consumes it and we latch a proposal-retry;
+//! - `TransactionsResolved` — the execution coordinator settled what a core's
+//!   certificates mean for legs issued here → mempool status.
 //!
 //! Raw gossip arrivals enter `NodeHost` as `ShardScopedInput::TransactionGossipReceived`
 //! and never reach the state machine; the validated form does.
@@ -42,6 +44,9 @@ impl ShardParticipation {
                 actions.extend(self.scan_precut_queries());
                 self.shard_coordinator.queue_ready_proposal();
                 actions
+            }
+            ProtocolEvent::TransactionsResolved { resolutions } => {
+                self.mempool_coordinator.on_resolutions(&resolutions)
             }
             _ => unreachable!("non-transaction event routed to handle_transaction"),
         }

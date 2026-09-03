@@ -121,6 +121,7 @@ impl TransactionStatusResponse {
             "committed" => Some(TransactionStatus::Committed(BlockHeight::new(
                 self.committed_height.unwrap_or(0),
             ))),
+            "leg_finalized" => Some(TransactionStatus::LegFinalized),
             "completed" => Some(TransactionStatus::Completed(decision()?)),
             _ => None,
         }

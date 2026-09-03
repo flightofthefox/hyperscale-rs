@@ -115,7 +115,8 @@ const fn status_rank(status: &TransactionStatus) -> u8 {
     match status {
         TransactionStatus::Pending => 0,
         TransactionStatus::Committed(_) => 1,
-        TransactionStatus::Completed(_) => 2,
+        TransactionStatus::LegFinalized => 2,
+        TransactionStatus::Completed(_) => 3,
     }
 }
 
@@ -173,6 +174,7 @@ fn resolve_status(answers: &[TransactionStatus]) -> Option<Reported> {
         .max_by_key(|status| status_rank(status))
         .map(|status| match status {
             TransactionStatus::Committed(height) => ("committed", Some(height.inner())),
+            TransactionStatus::LegFinalized => ("leg finalized", None),
             _ => ("pending", None),
         })
 }

@@ -823,16 +823,27 @@ pub fn make_finalization(
 /// the outcome decides nothing, since the transaction's core decides it.
 #[must_use]
 pub fn make_leg_finalization(block_height: BlockHeight, tx_hash: TxHash) -> Finalization {
+    make_undecided_finalization(block_height, tx_hash, TransactionDecision::Accept)
+}
+
+/// A finalization at `block_height` whose outcome for `tx_hash` decides
+/// nothing whichever way it went: a leg's success, or a delivery's
+/// outcome either way.
+#[must_use]
+pub fn make_undecided_finalization(
+    block_height: BlockHeight,
+    tx_hash: TxHash,
+    decision: TransactionDecision,
+) -> Finalization {
+    let outcome = match decision {
+        TransactionDecision::Accept => ExecutionOutcome::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+        },
+        TransactionDecision::Reject => ExecutionOutcome::Failed,
+        TransactionDecision::Aborted => ExecutionOutcome::Aborted,
+    };
     let tick_id = TickId::new(ShardId::ROOT, block_height);
-    let outcomes = vec![
-        TxOutcome::new(
-            tx_hash,
-            ExecutionOutcome::Succeeded {
-                receipt_hash: GlobalReceiptHash::ZERO,
-            },
-        )
-        .deciding(false),
-    ];
+    let outcomes = vec![TxOutcome::new(tx_hash, outcome).deciding(false)];
     let ec = ExecutionCertificate::new(
         tick_id,
         WeightedTimestamp::from_millis(block_height.inner() + 1),

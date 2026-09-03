@@ -88,6 +88,8 @@ impl TxPhaseTimesCache {
                 entry.committed_at.get_or_insert(now);
                 None
             }
+            // A leg's own finalization: the terminal is still to come.
+            TransactionStatus::LegFinalized => None,
             TransactionStatus::Completed(_) => {
                 // Terminal — pull the entry so the caller can log.
                 self.entries.remove(&tx_hash)

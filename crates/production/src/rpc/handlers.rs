@@ -379,6 +379,7 @@ fn format_transaction_status(
         TransactionStatus::Committed(height) => {
             ("committed".to_string(), Some(height.inner()), None, None)
         }
+        TransactionStatus::LegFinalized => ("leg_finalized".to_string(), None, None, None),
         TransactionStatus::Completed(decision) => {
             let decision_str = match decision {
                 TransactionDecision::Accept => "accept",
@@ -516,6 +517,16 @@ mod tests {
             format_transaction_status(&TransactionStatus::Committed(BlockHeight::new(42)));
         assert_eq!(status, "committed");
         assert_eq!(height, Some(42));
+        assert!(decision.is_none());
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn test_format_leg_finalized() {
+        let (status, height, decision, error) =
+            format_transaction_status(&TransactionStatus::LegFinalized);
+        assert_eq!(status, "leg_finalized");
+        assert!(height.is_none());
         assert!(decision.is_none());
         assert!(error.is_none());
     }

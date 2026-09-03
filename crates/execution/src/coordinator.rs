@@ -50,7 +50,7 @@ use hyperscale_types::{
     Provisions, RETENTION_HORIZON, Refusal, ScheduleLookup, SettledSetVerdict, SettledTxSet,
     ShardId, ShardTrie, StateAnchor, StateRoot, StoredReceipt, SubstateKey, TickId,
     TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxHash,
-    TxOutcome, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
     absence_licenses_reclaim, derive_block_transactions, lapse_licenses_reclaim,
     lapse_probe_anchor, settled_set_verdict, tick_leader, tick_leader_at,
 };
@@ -447,6 +447,13 @@ pub struct ExecutionCoordinator {
     /// collected before it is drained. Each lives to its leg entry.
     refusals: BTreeMap<(TxHash, ShardId), Refusal>,
 
+    /// The core shards whose certificates accepted a transaction a leg
+    /// here issued for. A core shard's tick closes on every other core
+    /// shard's certificate, so one saying it succeeded is not the
+    /// transaction accepted: that is every core shard saying so, and
+    /// this is where the count is kept. Each lives to its leg entry.
+    accepted: BTreeMap<TxHash, BTreeSet<ShardId>>,
+
     /// What this shard has asked a silent counterpart about a
     /// transaction a leg here issued for, keyed like the refusals: a
     /// probe in flight, a counterpart that turned out to have taken it,
@@ -567,6 +574,7 @@ impl ExecutionCoordinator {
             unproven_ecs: AwaitingTopologyBuffer::new(),
             settled_sets: HashMap::new(),
             refusals: BTreeMap::new(),
+            accepted: BTreeMap::new(),
             probes: BTreeMap::new(),
             gated_finalized: BTreeMap::new(),
             me,
@@ -2665,7 +2673,7 @@ impl ExecutionCoordinator {
         }
         self.provisioning.advance_clock(self.committed_ts);
         self.gc_settled_sets(topology_schedule);
-        self.gc_refusals();
+        self.gc_mirrors();
         let mut actions = self.gc_probes();
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
@@ -3365,6 +3373,17 @@ impl ExecutionCoordinator {
         actions
     }
 
+    /// What a committed block's finalizations settle about the
+    /// transactions they name, for the mempool's status of each: the
+    /// ledger's reading, taken before the block releases the entries.
+    #[must_use]
+    pub fn resolutions_of(
+        &self,
+        finalizations: &[Arc<Verifiable<Finalization>>],
+    ) -> Vec<(TxHash, TxResolution)> {
+        self.unresolved.resolutions_of(finalizations)
+    }
+
     /// Register tx → tick assignments for a `Sealed` block without any of
     /// the execution-side state setup (`TickState`, vote tracker, conflict
     /// detector, required-provision tracking). The block's ticks are
@@ -3388,31 +3407,41 @@ impl ExecutionCoordinator {
     // Phase 5: Finalization
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Mirror what `ec` says a core refused of the transactions legs
-    /// here issued for, and hand each new refusal to the vote fence.
+    /// Mirror what `ec` says a core decided of the transactions legs
+    /// here issued for: each new refusal is handed to the vote fence,
+    /// and each verdict — a refusal, or a success once every core shard
+    /// has given one — to the mempool, whose terminal for a leg is the
+    /// core's verdict.
     ///
     /// Only a core's word counts: a leg elsewhere failing is its own
     /// outcome, not the transaction's verdict, and the leg entry names
-    /// its core. First-write-wins, since a core refuses once under one
-    /// certificate. The hand-off is a continuation emitted here rather
-    /// than a map the fence reads later, so a refusal is never collected
-    /// before it is drained.
-    fn mirror_refusals(&mut self, ec: &Arc<Verified<ExecutionCertificate>>) -> Vec<Action> {
+    /// whose word it takes. First write wins per shard: a certificate is
+    /// one per shard per transaction, so a second copy is a re-broadcast
+    /// of the same word.
+    fn mirror_verdicts(&mut self, ec: &Arc<Verified<ExecutionCertificate>>) -> Vec<Action> {
         let shard = ec.shard_id();
         if shard == self.local_shard {
             return Vec::new();
         }
         let mut actions = Vec::new();
+        let mut resolutions = Vec::new();
         for outcome in ec.tx_outcomes() {
-            if matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }) {
-                continue;
-            }
             let tx_hash = outcome.tx_hash();
-            if !self
+            let Some(core) = self
                 .unresolved
                 .leg_core(tx_hash)
-                .is_some_and(|core| core.contains(&shard))
-            {
+                .filter(|core| core.contains(&shard))
+            else {
+                continue;
+            };
+            if matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }) {
+                let accepted = self.accepted.entry(tx_hash).or_default();
+                if accepted.insert(shard) && accepted.len() == core.len() {
+                    resolutions.push((
+                        tx_hash,
+                        TxResolution::CoreDecided(TransactionDecision::Accept),
+                    ));
+                }
                 continue;
             }
             let Some(figures) = self.unresolved.unsettled_leg_figures(tx_hash) else {
@@ -3431,17 +3460,30 @@ impl ExecutionCoordinator {
                     tx_hash,
                     refusal,
                 }));
+                let decision = if outcome.is_aborted() {
+                    TransactionDecision::Aborted
+                } else {
+                    TransactionDecision::Reject
+                };
+                resolutions.push((tx_hash, TxResolution::CoreDecided(decision)));
             }
+        }
+        if !resolutions.is_empty() {
+            actions.push(Action::Continuation(ProtocolEvent::TransactionsResolved {
+                resolutions,
+            }));
         }
         actions
     }
 
-    /// Drop the mirrored refusals whose leg entries are gone — released
-    /// by the reclaim, or dropped at their horizon.
-    fn gc_refusals(&mut self) {
+    /// Drop the mirrored refusals and acceptances whose leg entries are
+    /// gone — released by the reclaim, or dropped at their horizon.
+    fn gc_mirrors(&mut self) {
         let unresolved = &self.unresolved;
         self.refusals
             .retain(|(tx_hash, _), _| unresolved.contains(*tx_hash));
+        self.accepted
+            .retain(|tx_hash, _| unresolved.contains(*tx_hash));
     }
 
     /// Handle a tick-level attestation (execution certificate) from any shard.
@@ -3464,7 +3506,7 @@ impl ExecutionCoordinator {
         // read before routing: the leg's tick settled long ago, so the
         // certificate routes nowhere, and the refusal is the one thing
         // in it this shard still has a use for.
-        let mut actions = self.mirror_refusals(ec);
+        let mut actions = self.mirror_verdicts(ec);
 
         let routing = self.ticks.classify_attestation(ec);
 
@@ -4252,8 +4294,8 @@ mod tests {
         EpochWindows, ExecutionOutcome, GlobalReceiptHash, Hash, LocalKey, MAX_FINALIZATION_DELAY,
         MAX_VALIDITY_RANGE, NetworkDefinition, QuorumCertificate, Randomness, RecoveryCause,
         SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateRoot,
-        StoredReceipt, SubstateKey, TickHalf, UnsettledTx, ValidatorInfo, ValidatorSet,
-        delivery_window_close,
+        StoredReceipt, SubstateKey, TickHalf, TransactionDecision, TxResolution, UnsettledTx,
+        ValidatorInfo, ValidatorSet, delivery_window_close,
     };
     use hyperscale_vm_types::Seeded;
 
@@ -7538,7 +7580,8 @@ mod tests {
     /// A core's refusal of a transaction a leg here issued for is
     /// mirrored off its certificate and handed to the vote fence, and a
     /// `Refused` record is offered from it under the certificate's own
-    /// anchor. A second copy adds nothing, and a success mirrors nothing.
+    /// anchor, and the mempool hears the verdict. A second copy adds
+    /// nothing.
     #[test]
     fn a_cores_refusal_of_a_leg_is_mirrored_and_offered() {
         let schedule = two_shard_topology();
@@ -7596,6 +7639,14 @@ mod tests {
             )],
             "and a record is offered under the certificate's anchor"
         );
+        assert_eq!(
+            resolved(&actions),
+            vec![(
+                tx_hash,
+                TxResolution::CoreDecided(TransactionDecision::Reject)
+            )],
+            "and the mempool hears the core's verdict"
+        );
         let again = state.handle_attestation(&schedule, &certificate(ExecutionOutcome::Failed));
         assert!(
             !again
@@ -7603,7 +7654,29 @@ mod tests {
                 .any(|action| matches!(action, Action::Continuation(_))),
             "a second copy adds nothing"
         );
+    }
 
+    /// A core's success is the transaction's verdict only once every
+    /// core shard has given one, and it is reported to the mempool once:
+    /// a second copy of the certificate adds nothing, and no refusal is
+    /// mirrored or offered.
+    #[test]
+    fn a_cores_success_of_a_leg_is_the_verdict_once_the_whole_core_has_spoken() {
+        let schedule = two_shard_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let certificate = |outcome: ExecutionOutcome| {
+            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+                TickId::new(PEER, BlockHeight::new(3)),
+                WeightedTimestamp::from_millis(7_000),
+                GlobalReceiptRoot::ZERO,
+                vec![TxOutcome::new(tx_hash, outcome)],
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            )))
+        };
         let mut accepting = make_test_state_for_shard(ValidatorId::new(0), HOME);
         accepting.unresolved.register_committed(
             HOME,
@@ -7623,12 +7696,44 @@ mod tests {
             }),
         );
         assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, Action::Continuation(_))),
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::Continuation(ProtocolEvent::RefusalObserved { .. })
+            )),
             "a success is not a refusal"
         );
         assert!(accepting.pending_abandonment_records().is_empty());
+        assert_eq!(
+            resolved(&actions),
+            vec![(
+                tx_hash,
+                TxResolution::CoreDecided(TransactionDecision::Accept)
+            )],
+            "the whole core accepted, which is the transaction's verdict"
+        );
+        let again = accepting.handle_attestation(
+            &schedule,
+            &certificate(ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            }),
+        );
+        assert!(
+            resolved(&again).is_empty(),
+            "the core's verdict is reported once"
+        );
+    }
+
+    /// The resolutions an attestation handed to the mempool.
+    fn resolved(actions: &[Action]) -> Vec<(TxHash, TxResolution)> {
+        actions
+            .iter()
+            .flat_map(|action| match action {
+                Action::Continuation(ProtocolEvent::TransactionsResolved { resolutions }) => {
+                    resolutions.clone()
+                }
+                _ => Vec::new(),
+            })
+            .collect()
     }
 
     /// A state on [`HOME`] holding `transaction` as a leg whose core is

@@ -62,6 +62,15 @@ impl NodeStateMachine {
             self.beacon_coordinator.current_topology_snapshot(),
             certified,
         ));
+        // What the block's finalizations settle about the transactions
+        // they name is the execution ledger's reading — a name that
+        // decides nothing is a leg finalizing here, a deciding success
+        // on a leg entry is the reclaim — taken before the same block
+        // releases the entries below.
+        let resolutions = s
+            .execution_coordinator
+            .resolutions_of(certified.block().certificates());
+        actions.extend(s.mempool_coordinator.on_resolutions(&resolutions));
         // Committed bundles are engagement evidence: promote any parked
         // cross-shard transaction whose payer bundle just committed.
         // Covers the case where another proposer paired the bundle

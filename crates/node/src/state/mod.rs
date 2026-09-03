@@ -452,7 +452,8 @@ impl StateMachine for NodeStateMachine {
             // ── Transactions ─────────────────────────────────────────────
             evt @ (ProtocolEvent::TransactionValidated { .. }
             | ProtocolEvent::TransactionsReceived { .. }
-            | ProtocolEvent::TransactionsAdmitted { .. }) => {
+            | ProtocolEvent::TransactionsAdmitted { .. }
+            | ProtocolEvent::TransactionsResolved { .. }) => {
                 self.with_shard(move |s, sched| s.handle_transaction(sched, evt))
             }
 

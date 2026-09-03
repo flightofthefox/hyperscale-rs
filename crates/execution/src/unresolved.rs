@@ -23,9 +23,9 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Address, Finalization, LEG_ENTRY_HORIZON, MAX_VALIDITY_RANGE,
-    ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision, TxHash, Unsettleable,
-    UnsettledTx, Verifiable, Verified, WeightedTimestamp, delivery_window_close,
+    AbandonmentRecord, AbortCharge, Address, Finalization, MAX_VALIDITY_RANGE, ShardId, ShardTrie,
+    SubstateKey, Transaction, TransactionDecision, TxHash, TxResolution, Unsettleable, UnsettledTx,
+    Verifiable, Verified, WeightedTimestamp, delivery_window_close, leg_entry_horizon,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -110,6 +110,10 @@ struct Owed {
     /// is a block carrying the abort — and the departure that covered it
     /// is the one clock both the entry and the record are stated in.
     unsettled_by: Option<ShardId>,
+    /// What that record established — a refusal, a departure, an
+    /// absence or a lapse — which is what the reclaim it licenses says
+    /// the transaction's fate was.
+    evidence: Option<Unsettleable>,
 }
 
 impl Owed {
@@ -324,6 +328,7 @@ impl UnresolvedTxs {
                 kind: Kind::Whole,
                 reclaim_admitted: false,
                 unsettled_by: None,
+                evidence: None,
             };
             self.owed.entry(tx.hash()).or_insert(owed);
         }
@@ -549,6 +554,7 @@ impl UnresolvedTxs {
             for entry in verdict.unsettled() {
                 if let Some(owed) = self.owed.get_mut(&entry.tx_hash) {
                     owed.unsettled_by = Some(verdict.shard());
+                    owed.evidence = Some(verdict.evidence());
                     continue;
                 }
                 reconstructed = reconstructed.saturating_add(1);
@@ -581,6 +587,7 @@ impl UnresolvedTxs {
                         },
                         reclaim_admitted: false,
                         unsettled_by: Some(verdict.shard()),
+                        evidence: Some(verdict.evidence()),
                     },
                 );
             }
@@ -759,6 +766,58 @@ impl UnresolvedTxs {
             .is_some_and(|owed| !owed.remote_prefixes.is_empty())
     }
 
+    /// What a committed block's finalizations settle about the
+    /// transactions they name, for the status each is reported under.
+    ///
+    /// A name that decides is the transaction's verdict — a whole
+    /// member's, or a failed leg's — except a deciding success on a leg
+    /// entry, which is the reclaim of what the leg issued: the
+    /// transaction did not happen, refused where the record that
+    /// licensed the reclaim was a refusal and aborted where the core
+    /// never took it. A lapse reclaim says nothing of the transaction,
+    /// since its core accepted, and the core's certificates report
+    /// that. A name that decides nothing is a leg finalizing here; a
+    /// delivery that succeeded claimed what an accepted core issued,
+    /// which is the verdict.
+    ///
+    /// Read before the same finalizations release the entries they
+    /// name, since what a name means is a property of the entry.
+    #[must_use]
+    pub fn resolutions_of(
+        &self,
+        finalizations: &[Arc<Verifiable<Finalization>>],
+    ) -> Vec<(TxHash, TxResolution)> {
+        let mut resolutions = Vec::new();
+        for finalization in finalizations {
+            let deciding: BTreeSet<TxHash> = finalization.deciding_tx_hashes().collect();
+            for (tx_hash, decision) in finalization.tx_decisions() {
+                let owed = self.owed.get(&tx_hash);
+                let accepted = decision == TransactionDecision::Accept;
+                let resolution = if !deciding.contains(&tx_hash) {
+                    if accepted && owed.is_some_and(|owed| owed.kind == Kind::Delivery) {
+                        TxResolution::Decided(TransactionDecision::Accept)
+                    } else {
+                        TxResolution::LegFinalized
+                    }
+                } else if accepted && owed.is_some_and(|owed| owed.kind.is_leg()) {
+                    match owed.and_then(|owed| owed.evidence) {
+                        Some(Unsettleable::Refused { .. }) => {
+                            TxResolution::Decided(TransactionDecision::Reject)
+                        }
+                        Some(Unsettleable::Departed { .. } | Unsettleable::Unclaimed { .. }) => {
+                            TxResolution::Decided(TransactionDecision::Aborted)
+                        }
+                        Some(Unsettleable::Lapsed { .. }) | None => continue,
+                    }
+                } else {
+                    TxResolution::Decided(decision)
+                };
+                resolutions.push((tx_hash, resolution));
+            }
+        }
+        resolutions
+    }
+
     /// Drop what a committed block's finalizations resolve. Every verdict
     /// arrives this way — accepted, refused, or aborted — so one release
     /// path covers them all.
@@ -896,7 +955,7 @@ impl UnresolvedTxs {
             .into_iter()
             .filter(|(tx_hash, owed)| {
                 if owed.kind.is_leg() {
-                    return owed.deadline.plus(LEG_ENTRY_HORIZON) > now;
+                    return leg_entry_horizon(owed.deadline) > now;
                 }
                 if let Some(shard) = owed.unsettled_by {
                     if self.departed.get(&shard).is_some_and(|departure| {
@@ -971,7 +1030,8 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_types::test_utils::{
-        make_finalization, make_leg_finalization, stub_transaction, test_prefix, test_principal,
+        make_finalization, make_leg_finalization, make_undecided_finalization, stub_transaction,
+        test_prefix, test_principal,
     };
     use hyperscale_types::{
         BlockHeight, EPOCH_DURATION, EpochWindows, LocalKey, MAX_FINALIZATION_DELAY,
@@ -1843,6 +1903,117 @@ mod tests {
         assert!(
             ledger.reclaimable()[0].charged,
             "the leg's committed finalization settled the price"
+        );
+    }
+
+    /// What a finalization's name means is a property of the entry it
+    /// names: a leg's own success is the leg finalizing, its failure the
+    /// verdict, and a deciding success on a leg entry the reclaim —
+    /// whose meaning is the record's: refused, or never taken.
+    #[test]
+    fn a_finalizations_name_resolves_by_the_entry_it_names() {
+        let fw = |ledger: &UnresolvedTxs, finalization: Finalization| {
+            ledger.resolutions_of(&[Arc::new(Verifiable::from(finalization))])
+        };
+        let h = BlockHeight::new(1);
+
+        let mut ledger = UnresolvedTxs::default();
+        let whole = tx(1, 60_000);
+        commit(&mut ledger, &whole);
+        assert_eq!(
+            fw(
+                &ledger,
+                make_finalization(h, whole.hash(), TransactionDecision::Reject)
+            ),
+            vec![(
+                whole.hash(),
+                TxResolution::Decided(TransactionDecision::Reject)
+            )],
+            "a whole member's verdict is the transaction's"
+        );
+
+        let leg = tx(2, 60_000);
+        commit(&mut ledger, &leg);
+        ledger.mark_leg(leg.hash(), body(&leg), classified(), Vec::new());
+        assert_eq!(
+            fw(&ledger, make_leg_finalization(h, leg.hash())),
+            vec![(leg.hash(), TxResolution::LegFinalized)],
+            "a leg's success is its own state"
+        );
+        assert_eq!(
+            fw(
+                &ledger,
+                make_finalization(h, leg.hash(), TransactionDecision::Reject)
+            ),
+            vec![(
+                leg.hash(),
+                TxResolution::Decided(TransactionDecision::Reject)
+            )],
+            "a leg's failure is the verdict"
+        );
+        let reclaim =
+            make_finalization(BlockHeight::new(9), leg.hash(), TransactionDecision::Accept);
+        assert!(
+            fw(&ledger, reclaim.clone()).is_empty(),
+            "a deciding success on a leg entry no record covers says nothing"
+        );
+        ledger.record_abandonment_records(&[AbandonmentRecord::refused(
+            PARTNER,
+            ms(70_000),
+            [names(&leg)],
+        )]);
+        assert_eq!(
+            fw(&ledger, reclaim.clone()),
+            vec![(
+                leg.hash(),
+                TxResolution::Decided(TransactionDecision::Reject)
+            )],
+            "the reclaim of a refused leg reports the refusal"
+        );
+        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+            PARTNER,
+            ms(1_000),
+            [names(&leg)],
+        )]);
+        assert_eq!(
+            fw(&ledger, reclaim.clone()),
+            vec![(
+                leg.hash(),
+                TxResolution::Decided(TransactionDecision::Aborted)
+            )],
+            "the reclaim of a leg its core never took reports an abort"
+        );
+        ledger.record_abandonment_records(&[AbandonmentRecord::lapsed(
+            PARTNER,
+            ms(200_000),
+            [names(&leg)],
+        )]);
+        assert!(
+            fw(&ledger, reclaim).is_empty(),
+            "a lapse reclaim says nothing: the core accepted, and its certificates say so"
+        );
+
+        let delivery = tx(3, 60_000);
+        commit(&mut ledger, &delivery);
+        ledger.mark_delivery(delivery.hash(), ms(60_000));
+        assert_eq!(
+            fw(
+                &ledger,
+                make_undecided_finalization(h, delivery.hash(), TransactionDecision::Accept)
+            ),
+            vec![(
+                delivery.hash(),
+                TxResolution::Decided(TransactionDecision::Accept)
+            )],
+            "a delivery that succeeded claimed what an accepted core issued"
+        );
+        assert_eq!(
+            fw(
+                &ledger,
+                make_undecided_finalization(h, delivery.hash(), TransactionDecision::Reject)
+            ),
+            vec![(delivery.hash(), TxResolution::LegFinalized)],
+            "a delivery that failed decides nothing, and the value waits for a later claim"
         );
     }
 

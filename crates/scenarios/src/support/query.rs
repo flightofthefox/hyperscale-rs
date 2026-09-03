@@ -207,7 +207,8 @@ pub const fn status_rank(status: &TransactionStatus) -> u8 {
     match status {
         TransactionStatus::Pending => 0,
         TransactionStatus::Committed(_) => 1,
-        TransactionStatus::Completed(_) => 2,
+        TransactionStatus::LegFinalized => 2,
+        TransactionStatus::Completed(_) => 3,
     }
 }
 

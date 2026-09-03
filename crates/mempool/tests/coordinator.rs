@@ -14,7 +14,7 @@ use hyperscale_types::test_utils::{
 };
 use hyperscale_types::{
     BlockHeight, Hash, LocalTimestamp, ShardId, TopologySnapshot, Transaction, TransactionDecision,
-    TransactionStatus, TxHash, ValidatorId, Verified,
+    TransactionStatus, TxHash, TxResolution, ValidatorId, Verified,
 };
 
 /// Test-only convenience: wrap any `Transaction` in a `Verified`
@@ -165,8 +165,8 @@ fn on_block_committed_with_finalization_tombstones_and_evicts() {
         LocalTimestamp::ZERO,
     );
 
-    // Single block that both includes the tx and carries the finalization
-    // completing it — drives Pending → Committed → Completed in one call.
+    // The block includes the tx, and what its finalization settles
+    // arrives from the execution ledger's reading of it.
     let fw = make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept);
     let block = make_live_block(
         ShardId::ROOT,
@@ -177,6 +177,7 @@ fn on_block_committed_with_finalization_tombstones_and_evicts() {
         vec![Arc::new(fw.into())],
     );
     coord.on_block_committed(&topology_snapshot, &certify(block, 1_000));
+    coord.on_resolutions(&[(tx_hash, TxResolution::Decided(TransactionDecision::Accept))]);
 
     // Terminal state: evicted from pool, tombstoned so gossip can't revive it.
     assert!(coord.status(&tx_hash).is_none());

@@ -88,6 +88,16 @@ pub fn reclaim_probe_anchor(validity_end: WeightedTimestamp) -> WeightedTimestam
 /// measured from the deadline rather than the validity end.
 pub const LEG_ENTRY_HORIZON: Duration = Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() * 2);
 
+/// The moment a leg entry, and everything a shard holds for its
+/// reclaim, goes: [`LEG_ENTRY_HORIZON`] past the transaction's deadline.
+///
+/// That is where the record cell the reclaim would take back is swept,
+/// and past it nothing can still decide the transaction on this shard.
+#[must_use]
+pub fn leg_entry_horizon(deadline: WeightedTimestamp) -> WeightedTimestamp {
+    deadline.plus(LEG_ENTRY_HORIZON)
+}
+
 const _: () = assert!(
     (MAX_FINALIZATION_DELAY.as_secs() + LEG_ENTRY_HORIZON.as_secs()) * 1_000 == ESCROW_GRACE_MS,
     "a leg entry dies where the record it would reclaim is swept",
