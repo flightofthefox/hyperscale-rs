@@ -17,7 +17,7 @@
 use hyperscale_engine::XRD;
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey, TransactionDecision,
-    TransactionStatus, TxHash, WorkInFlight,
+    TransactionStatus, TxHash, WeightedTimestamp, WorkInFlight, delivery_window_close,
 };
 
 use crate::reshape::split_lifecycle;
@@ -342,11 +342,12 @@ fn submit_departing_route<C: Cluster>(
     c: &mut C,
     route: &DepartingRoute,
     charges: &mut Charges,
-) -> (TxHash, WorkInFlight, u128) {
+) -> (TxHash, WorkInFlight, u128, WeightedTimestamp) {
     let (departing, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
     let baseline = c
         .committed_work_in_flight(survivor)
         .expect("the survivor must serve a committed tip before the route");
+    let validity = validity_around(c.now());
     let tx = build_route_tx(
         &route.key,
         route.trader,
@@ -354,7 +355,7 @@ fn submit_departing_route<C: Cluster>(
         *XRD,
         ROUTE_INPUT,
         0,
-        validity_around(c.now()),
+        validity,
     );
     let hash = charges.submit(c, tx);
     assert!(
@@ -375,7 +376,12 @@ fn submit_departing_route<C: Cluster>(
             < SWAPPER_FUNDING - ROUTE_INPUT),
         "the trader's leg must pay before the core is asked anything",
     );
-    (hash, baseline, held(c, route.trader.address(), *XRD))
+    (
+        hash,
+        baseline,
+        held(c, route.trader.address(), *XRD),
+        validity.end_timestamp_exclusive,
+    )
 }
 
 /// Wait for the departing venue's shard to terminate: both children
@@ -422,7 +428,7 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
     let _ = isolate_ec_intake(c, departing, survivor);
     let _ = isolate_ec_intake(c, survivor, departing);
     let mut charges = Charges::default();
-    let (hash, baseline, paid) = submit_departing_route(c, &route, &mut charges);
+    let (hash, baseline, paid, _) = submit_departing_route(c, &route, &mut charges);
 
     // The cut. The departing venue's cells land under a child, and its
     // settled set reaches the survivor.
@@ -501,7 +507,7 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
     let route = departing_route(c);
     let _ = isolate_ec_intake(c, survivor, departing);
     let mut charges = Charges::default();
-    let (hash, baseline, paid) = submit_departing_route(c, &route, &mut charges);
+    let (hash, baseline, paid, validity_end) = submit_departing_route(c, &route, &mut charges);
     assert!(
         c.run_until(epochs(12), |c| matches!(
             c.chain_fate(departing, hash).1,
@@ -531,9 +537,19 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
          against {baseline:?}",
         c.committed_work_in_flight(survivor),
     );
+    // The output is a delivery to the trader, admissible to the delivery
+    // window's close. On a clock whose epochs outrun that window the
+    // departure lands after it, and the output stays with the venue that
+    // issued it — reclaimed on the successor's proof that no delivery
+    // ever claimed it — while the trader keeps what it paid; on a clock
+    // the window outlasts, the trader banks it.
+    let banked = c.run_until(epochs(8), |c| held(c, route.trader.address(), *XRD) > paid);
+    let clock = WeightedTimestamp::ZERO.plus(c.now());
     assert!(
-        c.run_until(epochs(8), |c| held(c, route.trader.address(), *XRD) > paid),
-        "the route must bank its output for the trader",
+        banked || clock >= delivery_window_close(validity_end),
+        "the route must bank its output for the trader while its delivery window is open; \
+         holds {} against {paid}",
+        held(c, route.trader.address(), *XRD),
     );
     route
         .xrd
