@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use hyperscale_crypto::{Signer, Verifier};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+use hyperscale_hbor::Hash32;
 use hyperscale_vm_types::{
-    Address, AddressClass, LocalKey, Mode, Moves, PrincipalAddr, SWEEP_BUCKET_BYTES, SchemeId,
-    SubstateKey, SweepBucket,
+    Address, AddressClass, LegRole, LegShape, LocalKey, Mode, Moves, PrincipalAddr,
+    SWEEP_BUCKET_BYTES, SchemeId, SubintentHash, SubstateKey, SweepBucket, ValueEdge,
 };
 
 use crate::crypto::Ed25519PrivateKey;
@@ -1049,6 +1050,32 @@ pub fn stub_sweepable_cell(expiry_ms: u64, body: u8) -> (LocalKey, Vec<u8>) {
 pub fn install_stub_protocol_statics() {
     if !protocol_statics_installed() {
         install_protocol_statics(Box::new(StubVmStatics));
+    }
+}
+
+/// A manifest node's shape for the classifier: a leg at `target` in
+/// `role`, consuming `edges` as `(source node, output)`.
+///
+/// What a test hands [`Transaction::with_legs`] to give a stub
+/// transaction a shape the stub derivation cannot produce.
+#[must_use]
+pub fn leg_shape(target: Address, role: LegRole, edges: &[(u32, u32)]) -> LegShape {
+    LegShape {
+        target,
+        role,
+        edges: edges
+            .iter()
+            .map(|&(source, output)| ValueEdge {
+                source,
+                output,
+                non_fungible: false,
+            })
+            .collect(),
+        presents: Vec::new(),
+        declares: vec![target],
+        intent: SubintentHash(Hash32([7; 32])),
+        local: 0,
+        expiry_ms: 1_000,
     }
 }
 

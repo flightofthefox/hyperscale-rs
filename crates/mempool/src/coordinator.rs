@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
+use hyperscale_engine::legs::Classified;
 use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
 use hyperscale_types::{
     BlockHeight, CertifiedBlock, CompletedRecovery, ForkFence, LocalTimestamp, MAX_DRAIN_WORK,
@@ -887,14 +888,13 @@ impl MempoolCoordinator {
     /// evidence from before entering contention, or `None` when the
     /// The last instant this shard could still include `tx`.
     ///
-    /// Its validity end, except where this shard may only be delivering
-    /// for it — cross-shard, with the payer's vault elsewhere — which is
-    /// admissible to the delivery window's close. The payer's shard is
-    /// always in the core, so a shard holding the vault never delivers
-    /// alone; the converse is a possibility, not a classification, and
-    /// the proposer's exact rule is what decides inclusion. What this
-    /// widens is retention: the body and the tombstone are held while a
-    /// delivery could still be composed from them.
+    /// Its validity end, except where this shard only delivers for it —
+    /// frozen divided against the head trie with this shard outside the
+    /// core and every leg here a delivery — which is admissible to the
+    /// delivery window's close. The proposer reads the same predicate
+    /// against its block's own anchor, so what this widens is
+    /// retention: the body and the tombstone are held while a delivery
+    /// could still be composed from them, and for nothing else.
     fn admissible_until(
         &self,
         topology_snapshot: &TopologySnapshot,
@@ -902,11 +902,10 @@ impl MempoolCoordinator {
         cross_shard: bool,
     ) -> WeightedTimestamp {
         let validity_end = tx.validity_range().end_timestamp_exclusive;
-        let payer_here = topology_snapshot
-            .shard_trie()
-            .shard_for_prefix(tx.body().fee_payer)
-            == self.local_shard;
-        if cross_shard && !payer_here {
+        let delivers = cross_shard
+            && Classified::freeze(tx.legs(), topology_snapshot.shard_trie())
+                .delivers_at(self.local_shard);
+        if delivers {
             delivery_window_close(validity_end)
         } else {
             validity_end
@@ -2752,13 +2751,15 @@ mod tests {
         );
     }
 
-    /// A cross-shard transaction whose payer's vault is elsewhere may be
-    /// a delivery here, so it is admitted and held to the delivery
-    /// window's close; one whose payer is here, or that never leaves
-    /// this shard, ends at its validity end.
+    /// A transaction this shard only delivers for — frozen divided
+    /// with this shard outside the core and every leg here a delivery
+    /// — is held to the delivery window's close; one this shard issues
+    /// for, or runs whole, is held to its validity end whoever pays.
     #[test]
-    fn a_possible_delivery_is_held_to_the_windows_close() {
+    fn a_delivery_is_held_to_the_windows_close_and_nothing_else_is() {
         use hyperscale_types::TimestampRange;
+        use hyperscale_types::test_utils::{StubVmStatics, leg_shape};
+        use hyperscale_vm_types::LegRole;
 
         let topology = TestCommittee::new(4, 42).topology_snapshot(2);
         let local = ShardId::leaf(1, 0);
@@ -2769,29 +2770,58 @@ mod tests {
         let local_owner = test_principal(0x02);
         let remote_owner = test_principal(0x82);
         install_stub_protocol_statics();
-        let stub = |payer: PrincipalAddr, owners: &[Address]| {
-            Arc::new(verified(stub_transaction(payer, owners, 1_000, range)))
+        // The legs are derived facts and not body, so each shape gets a
+        // fee ceiling of its own to keep the three hashes apart.
+        let stub = |payer: PrincipalAddr, max_fee: u128, legs: Vec<_>| {
+            Arc::new(verified(
+                stub_transaction(
+                    payer,
+                    &[local_owner.address(), remote_owner.address()],
+                    max_fee,
+                    range,
+                )
+                .with_legs(&StubVmStatics, legs),
+            ))
         };
+        // A swap whose output lands here: the withdraw and the venue
+        // away, the deposit here consuming what the venue issued.
         let delivery = stub(
             remote_owner,
-            &[local_owner.address(), remote_owner.address()],
+            1_000,
+            vec![
+                leg_shape(remote_owner.address(), LegRole::Inbound, &[]),
+                leg_shape(remote_owner.address(), LegRole::Core, &[(0, 0)]),
+                leg_shape(local_owner.address(), LegRole::Outbound, &[(1, 0)]),
+            ],
         );
-        let payer_here = stub(
+        // The same swap the other way round: this shard issues for it.
+        let issuer = stub(
             local_owner,
-            &[local_owner.address(), remote_owner.address()],
+            2_000,
+            vec![
+                leg_shape(local_owner.address(), LegRole::Inbound, &[]),
+                leg_shape(remote_owner.address(), LegRole::Core, &[(0, 0)]),
+                leg_shape(remote_owner.address(), LegRole::Outbound, &[(1, 0)]),
+            ],
         );
+        // A shape with no legs, paid for elsewhere: whole, and no delivery.
+        let whole = stub(remote_owner, 3_000, Vec::new());
 
         set_current_ts(&mut mempool, end);
-        for tx in [&delivery, &payer_here] {
+        for tx in [&delivery, &issuer, &whole] {
             mempool.on_transaction_gossip(&topology, Arc::clone(tx), false, LocalTimestamp::ZERO);
         }
         assert!(
             mempool.status(&delivery.hash()).is_some(),
-            "a possible delivery is admitted past its validity end"
+            "a delivery is admitted past its validity end"
         );
         assert!(
-            mempool.status(&payer_here.hash()).is_none(),
-            "the payer's shard is in the core, so its window is the transaction's"
+            mempool.status(&issuer.hash()).is_none(),
+            "an issuer's window is the transaction's"
+        );
+        assert!(
+            mempool.status(&whole.hash()).is_none(),
+            "and so is a whole shape's, wherever its payer sits"
         );
 
         set_current_ts(&mut mempool, delivery_window_close(end));

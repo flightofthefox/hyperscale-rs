@@ -30,8 +30,8 @@ use hyperscale_storage::entry_from_leaf;
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EscrowedValue, Event,
     EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement,
-    PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, Stake, StakePoolSeat, StateWrites,
-    SubstateEntry, Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
+    PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
+    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
     install_protocol_statics,
 };
 use hyperscale_vm_effects::{
@@ -697,10 +697,12 @@ pub fn abort_reason(outcome: &Outcome) -> String {
 
 /// The node-local metadata of one execution: what it was charged, and
 /// why it aborted if it did.
+/// The receipt's own summary of what was charged, in attos — the unit
+/// the price and the ceiling are already in.
 fn vm_metadata(charged: u128, error: Option<String>) -> ExecutionMetadata {
     ExecutionMetadata::new(
         FeeSummary {
-            total_execution_cost: Some(charged * Stake::ATTOS_PER_WHOLE),
+            total_execution_cost: Some(charged),
             total_royalty_cost: None,
             total_storage_cost: None,
             total_tipping_cost: None,
@@ -937,16 +939,17 @@ fn assemble_published_tx(
         },
         |reason| CachedOutput::failed(vm_metadata(charged, Some(reason.clone()))),
     );
-    // A refused artifact is the sender's own defect — they chose what to
-    // publish — so it pays the ceiling, exactly as a trap does. Charging
-    // less would leave a rejected publish cheaper than an accepted one.
+    // A refused artifact settles the same price an accepted one burns —
+    // the artifact's length under the signed ceiling — as every refusal
+    // does: the shard judged these bytes before it knew the answer, and
+    // what it charges is what it declared, never the ceiling.
     let fee_receipt = match (&refusal, fee) {
         (Some(_), Some(payer)) => Some(build_fee_receipt(
             ctx.local_shard,
             ctx.shard_trie,
             tx_hash,
             payer.vault,
-            payer.max_fee,
+            charged,
         )),
         _ => None,
     };

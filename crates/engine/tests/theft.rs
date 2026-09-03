@@ -20,8 +20,8 @@ use hyperscale_storage::Substates;
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId,
-    PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie, Stake, StateWrites,
-    SubstateKey, TimestampRange, Transaction, Verified, WeightedTimestamp,
+    PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateWrites, SubstateKey,
+    TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::{Address, CollectionId, amount_cell, encode_amount};
 
@@ -208,8 +208,7 @@ fn the_gated_node_is_the_one_that_moves_the_balance() {
         .metadata
         .fee_summary
         .total_execution_cost
-        .expect("an executed receipt reports its cost")
-        / Stake::ATTOS_PER_WHOLE;
+        .expect("an executed receipt reports its cost");
     assert!(
         charged > 0 && charged < 2_000,
         "the burn is real and inside the signed ceiling, so the balance equation below \

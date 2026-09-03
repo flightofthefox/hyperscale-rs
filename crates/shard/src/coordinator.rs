@@ -100,10 +100,19 @@ use hyperscale_types::{
     StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, Transaction,
     TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier,
     Verify, VoteCount, absence_licenses_reclaim, derive_leaves, lapse_licenses_reclaim,
-    missed_proposals_since_prev_commit, ready_leaf_payload, validity_end_of,
+    lapse_probe_anchor, missed_proposals_since_prev_commit, ready_leaf_payload,
+    reclaim_probe_anchor, validity_end_of,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
+
+/// The window an absence proof is held to, for one probed cell family:
+/// the anchor the proof must sit at or past, derived from the name's
+/// validity end, and the half-open licence read against the same end.
+type AbsenceWindow = (
+    fn(WeightedTimestamp) -> WeightedTimestamp,
+    fn(WeightedTimestamp, WeightedTimestamp) -> bool,
+);
 
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::block_sync::{
@@ -1196,7 +1205,7 @@ impl ShardCoordinator {
                         verdict,
                         entry,
                         probed_wt,
-                        absence_licenses_reclaim,
+                        (reclaim_probe_anchor, absence_licenses_reclaim),
                         block_hash,
                     ) {
                         return false;
@@ -1209,7 +1218,7 @@ impl ShardCoordinator {
                         verdict,
                         entry,
                         probed_wt,
-                        lapse_licenses_reclaim,
+                        (lapse_probe_anchor, lapse_licenses_reclaim),
                         block_hash,
                     ) {
                         return false;
@@ -1232,7 +1241,7 @@ impl ShardCoordinator {
         verdict: &AbandonmentRecord,
         entry: &UnsettledTx,
         probed_wt: WeightedTimestamp,
-        licenses: fn(WeightedTimestamp, WeightedTimestamp) -> bool,
+        (floor, licenses): AbsenceWindow,
         block_hash: BlockHash,
     ) -> bool {
         let validity_end = validity_end_of(entry.deadline);
@@ -1248,10 +1257,16 @@ impl ShardCoordinator {
             );
             return false;
         }
+        // The mirror is keyed by transaction and shard and not by what
+        // was probed, so the floor it carries is what says which cell
+        // it asked about: a core's committed cell proved absent is not
+        // a delivery's claim proved absent, whatever the anchor.
         let proved = self
             .absences
             .get(&(entry.tx_hash, verdict.shard()))
-            .is_some_and(|absence| licenses(absence.probed_wt, validity_end));
+            .is_some_and(|absence| {
+                absence.floor == floor(validity_end) && licenses(absence.probed_wt, validity_end)
+            });
         if !proved {
             trace!(
                 validator = ?self.me,
@@ -11920,6 +11935,20 @@ mod tests {
         assert!(
             short.fence_abandonment_records(&sched, &record(lapse), BlockHash::ZERO),
             "a proof short of the lapse defers it"
+        );
+
+        let mut cores = fence_coordinator();
+        cores.record_absence(
+            ShardId::ROOT,
+            tx_hash,
+            Absence {
+                probed_wt: lapse,
+                floor: deadline,
+            },
+        );
+        assert!(
+            cores.fence_abandonment_records(&sched, &record(lapse), BlockHash::ZERO),
+            "a core's cell proved absent at the lapse is not the claim proved absent: it defers"
         );
     }
 

@@ -2281,9 +2281,11 @@ name = "hyperscale-mempool"
 version = "0.1.0"
 dependencies = [
  "hyperscale-core",
+ "hyperscale-engine",
  "hyperscale-metrics",
  "hyperscale-metrics-memory",
  "hyperscale-types",
+ "hyperscale-vm-types",
  "papaya",
  "proptest",
  "serde",

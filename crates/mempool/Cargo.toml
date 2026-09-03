@@ -7,6 +7,7 @@ description = "Mempool state machine"
 
 [dependencies]
 hyperscale-core.workspace = true
+hyperscale-engine.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-types.workspace = true
 papaya.workspace = true
@@ -15,6 +16,7 @@ serde.workspace = true
 
 [dev-dependencies]
 hyperscale-metrics-memory.workspace = true
+hyperscale-vm-types.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 proptest.workspace = true
 

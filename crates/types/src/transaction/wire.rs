@@ -487,6 +487,25 @@ impl Transaction {
         )
     }
 
+    /// This transaction with its derived legs replaced by `legs`, for a
+    /// test that needs a shape the stub derivation cannot produce.
+    /// Derives under `derivation` first where nothing has yet.
+    ///
+    /// # Panics
+    ///
+    /// If `derivation` refuses the body.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn with_legs(self, derivation: &dyn Derivation, legs: Vec<LegShape>) -> Self {
+        let base = self
+            .try_derived(derivation)
+            .expect("a stub transaction derives")
+            .clone();
+        let tx = Self::new(self.body().clone());
+        let _ = tx.derived.set(Derived { legs, ..base });
+        tx
+    }
+
     /// Derive (or fetch the cached) envelope derivation under this
     /// node's `derivation`.
     ///
