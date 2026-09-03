@@ -102,6 +102,19 @@ struct Owed {
     unsettled_by: Option<ShardId>,
 }
 
+impl Owed {
+    /// Whether `shard`, leaving at `cut`, was party to this entry: it
+    /// owned one of the entry's remote prefixes, and the transaction
+    /// committed before it left.
+    fn party_to(&self, shard: ShardId, cut: WeightedTimestamp) -> bool {
+        cut > self.committed_ts
+            && self
+                .remote_prefixes
+                .iter()
+                .any(|prefix| ShardTrie::shard_owns_prefix(shard, *prefix))
+    }
+}
+
 /// Where a departed participant's chain ended, and how long what it left
 /// behind can still be read.
 #[derive(Debug, Clone, Copy)]
@@ -582,12 +595,7 @@ impl UnresolvedTxs {
                 owed.certified
                     && owed.kind != Kind::Remainder
                     && owed.unsettled_by.is_none()
-                    && cut > owed.committed_ts
-            })
-            .filter(|(_, owed)| {
-                owed.remote_prefixes
-                    .iter()
-                    .any(|prefix| ShardTrie::shard_owns_prefix(shard, *prefix))
+                    && owed.party_to(shard, cut)
             })
             .map(|(tx_hash, owed)| UnsettledTx {
                 tx_hash: *tx_hash,
@@ -595,6 +603,21 @@ impl UnresolvedTxs {
                 declared_work: owed.declared_work,
                 charge: owed.charge,
             })
+            .collect()
+    }
+
+    /// The transactions this ledger holds that `shard`, leaving at `cut`,
+    /// was party to: what a departure record naming this shard's
+    /// business with it may name, and nothing else. Wider than
+    /// [`Self::outstanding_with`] — an entry no certificate covers, or one
+    /// a record already answered, is still one the shard was party to —
+    /// so a voter reading it refuses only a stranger.
+    #[must_use]
+    pub fn party_to(&self, shard: ShardId, cut: WeightedTimestamp) -> BTreeSet<TxHash> {
+        self.owed
+            .iter()
+            .filter(|(_, owed)| owed.party_to(shard, cut))
+            .map(|(tx_hash, _)| *tx_hash)
             .collect()
     }
 

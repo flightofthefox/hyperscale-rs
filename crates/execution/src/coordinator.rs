@@ -3646,6 +3646,13 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// The transactions this ledger holds that `shard`, leaving at
+    /// `cut`, was party to — what a departure record naming it may name.
+    #[must_use]
+    pub fn party_to(&self, shard: ShardId, cut: WeightedTimestamp) -> BTreeSet<TxHash> {
+        self.unresolved.party_to(shard, cut)
+    }
+
     /// Record a past-terminal shard's settled-transaction set for the finalize
     /// gate (mirrors the shard coordinator's fence feed). Pair with
     /// [`Self::redrive_gated_finalizations`] to release ticks that the

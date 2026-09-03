@@ -71,12 +71,18 @@ impl ShardParticipation {
                 terminal_wt,
             } => {
                 let set = SettledTxSet { txs, terminal_wt };
+                // What this shard's ledger says the departed shard was
+                // party to, mirrored beside the set for the vote fence:
+                // a departure record names only the departed shard's own
+                // business here.
+                let parties = self.execution_coordinator.party_to(shard, terminal_wt);
                 let mut actions = self.execution_coordinator.record_settled_txs(
                     topology_schedule,
                     shard,
                     set.clone(),
                 );
-                self.shard_coordinator.record_settled_txs(shard, set);
+                self.shard_coordinator
+                    .record_settled_txs(shard, set, parties);
                 actions.extend(
                     self.shard_coordinator
                         .redrive_pending_votes(topology_schedule),
