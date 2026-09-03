@@ -710,6 +710,12 @@ fn a_replay_reaches_a_record_no_verdict_has_discharged() {
 }
 
 #[test]
+fn a_replay_keeps_a_leg_its_own_finalization_settled() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_a_legs_own_finalization_keeps_the_floor(&storage);
+}
+
+#[test]
 fn recovery_carries_the_tip_drain_total() {
     let storage = SimShardStorage::default();
     test_helpers::test_recovery_carries_the_tip_drain_total(&storage, || {

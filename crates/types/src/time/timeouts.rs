@@ -80,6 +80,19 @@ pub fn reclaim_probe_anchor(validity_end: WeightedTimestamp) -> WeightedTimestam
     validity_end.plus(MAX_FINALIZATION_DELAY)
 }
 
+/// How long a leg entry outlives its deadline.
+///
+/// The room a reclaim of what its deliveries never claimed needs: one
+/// validity range to the lapse, and one more for the reclaim to commit
+/// before the record it takes back is swept. The escrow families' grace,
+/// measured from the deadline rather than the validity end.
+pub const LEG_ENTRY_HORIZON: Duration = Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() * 2);
+
+const _: () = assert!(
+    (MAX_FINALIZATION_DELAY.as_secs() + LEG_ENTRY_HORIZON.as_secs()) * 1_000 == ESCROW_GRACE_MS,
+    "a leg entry dies where the record it would reclaim is swept",
+);
+
 /// The validity end a transaction's deadline was derived from: the
 /// inverse of [`reclaim_probe_anchor`], for a voter holding a name's
 /// deadline and no body.

@@ -23,9 +23,9 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Address, Finalization, MAX_VALIDITY_RANGE, ShardId, ShardTrie,
-    SubstateKey, Transaction, TransactionDecision, TxHash, Unsettleable, UnsettledTx, Verifiable,
-    Verified, WeightedTimestamp, delivery_window_close,
+    AbandonmentRecord, AbortCharge, Address, Finalization, LEG_ENTRY_HORIZON, MAX_VALIDITY_RANGE,
+    ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision, TxHash, Unsettleable,
+    UnsettledTx, Verifiable, Verified, WeightedTimestamp, delivery_window_close,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -836,7 +836,7 @@ impl UnresolvedTxs {
             .into_iter()
             .filter(|(tx_hash, owed)| {
                 if owed.kind.is_leg() {
-                    return owed.deadline.plus(MAX_VALIDITY_RANGE * 2) > now;
+                    return owed.deadline.plus(LEG_ENTRY_HORIZON) > now;
                 }
                 if let Some(shard) = owed.unsettled_by {
                     if self.departed.get(&shard).is_some_and(|departure| {

@@ -18,8 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, EPOCH_DURATION, MAX_VALIDITY_RANGE, Provisions, RETENTION_HORIZON,
-    TERMINAL_EVIDENCE_EPOCHS, TxHash, Verifiable, Verified, WeightedTimestamp,
+    BlockHeight, CertifiedBlock, EPOCH_DURATION, LEG_ENTRY_HORIZON, MAX_FINALIZATION_DELAY,
+    MAX_VALIDITY_RANGE, Provisions, TERMINAL_EVIDENCE_EPOCHS, TxHash, Verifiable, Verified,
+    WeightedTimestamp,
 };
 
 use super::chain_reader::ShardChainReader;
@@ -28,9 +29,11 @@ use super::chain_reader::ShardChainReader;
 /// decides.
 ///
 /// A transaction committed at time `T` states a validity end at most
-/// `MAX_VALIDITY_RANGE` beyond it, and its own clock stops deciding it a
-/// `RETENTION_HORIZON` past that. So this spans every entry whose fate is
-/// its deadline's to settle.
+/// `MAX_VALIDITY_RANGE` beyond it, its deadline sits a
+/// `MAX_FINALIZATION_DELAY` past that, and a leg entry — the longest-lived
+/// of the entries a deadline settles — is kept `LEG_ENTRY_HORIZON` past
+/// its deadline for the reclaim of what its deliveries never claim. So
+/// this spans every entry whose fate is its deadline's to settle.
 ///
 /// It does **not** span every entry the ledger holds. One a certificate of
 /// this shard's covers lives while some counterpart can still answer,
@@ -39,7 +42,9 @@ use super::chain_reader::ShardChainReader;
 /// the entry survives to that departure's terminal-evidence expiry. No span
 /// measured back from the tip reaches such a commit, which is why widening
 /// this is not the answer — [`RECORD_WINDOW`] is.
-const FOLD_WINDOW: Duration = MAX_VALIDITY_RANGE.saturating_add(RETENTION_HORIZON);
+const FOLD_WINDOW: Duration = MAX_VALIDITY_RANGE
+    .saturating_add(MAX_FINALIZATION_DELAY)
+    .saturating_add(LEG_ENTRY_HORIZON);
 
 /// How far back a rebuild reads for a transaction a committed boundary
 /// record decides.
@@ -128,8 +133,12 @@ pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
                     undischarged.insert(tx_hash, height);
                 }
             }
+            // Only a deciding outcome retires an entry: a leg's own
+            // finalization names the leg and resolves nothing, since its
+            // entry lives on for the reclaim its core's refusal or its
+            // deliveries' lapse may license.
             for finalization in block.certificates().iter() {
-                for tx_hash in finalization.tx_hashes() {
+                for tx_hash in finalization.deciding_tx_hashes() {
                     unresolved.remove(&tx_hash);
                     undischarged.remove(&tx_hash);
                 }

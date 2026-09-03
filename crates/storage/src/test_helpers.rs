@@ -11,7 +11,8 @@ use std::sync::Arc;
 use hyperscale_hbor::from_slice;
 use hyperscale_jmt::{KEY_BYTES, TreeReader};
 use hyperscale_types::test_utils::{
-    install_stub_protocol_statics, make_finalization, stub_sweepable_cell, test_transaction,
+    install_stub_protocol_statics, make_finalization, make_leg_finalization, stub_sweepable_cell,
+    test_transaction,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock,
@@ -1801,5 +1802,57 @@ pub fn test_undischarged_record_holds_the_floor(
         unresolved_replay_floor(storage, BlockHeight::new(4), WeightedTimestamp::ZERO),
         None,
         "a discharged record holds nothing down",
+    );
+}
+
+/// Shared rebuild test: a leg's own finalization does not retire it from
+/// the replay floor.
+///
+/// Its entry lives on for the reclaim its core's refusal or its
+/// deliveries' lapse may license; the reclaim's deciding finalization is
+/// what retires it.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_legs_own_finalization_keeps_the_floor(
+    storage: &(impl ShardChainReader + ShardChainWriter),
+) {
+    let leg = test_transaction(4);
+
+    commit_empty_blocks_up_to(storage, BlockHeight::new(1));
+    let committing = with_transactions(
+        make_test_block(BlockHeight::new(1)),
+        vec![Arc::new(Verifiable::from(leg.clone()))],
+    );
+    storage.commit_block(&make_test_certified(committing), &[], &empty_witness());
+
+    let settling = push_certificate(
+        make_test_block(BlockHeight::new(2)),
+        Arc::new(Verifiable::from(make_leg_finalization(
+            BlockHeight::new(2),
+            leg.hash(),
+        ))),
+    );
+    storage.commit_block(&make_test_certified(settling), &[], &empty_witness());
+    assert_eq!(
+        unresolved_replay_floor(storage, BlockHeight::new(2), WeightedTimestamp::ZERO),
+        Some(BlockHeight::new(1)),
+        "a leg that succeeded is still owed a reclaim, so its commit holds the floor",
+    );
+
+    let reclaiming = push_certificate(
+        make_test_block(BlockHeight::new(3)),
+        Arc::new(Verifiable::from(make_finalization(
+            BlockHeight::new(3),
+            leg.hash(),
+            TransactionDecision::Aborted,
+        ))),
+    );
+    storage.commit_block(&make_test_certified(reclaiming), &[], &empty_witness());
+    assert_eq!(
+        unresolved_replay_floor(storage, BlockHeight::new(3), WeightedTimestamp::ZERO),
+        None,
+        "the reclaim's finalization decides it and releases the floor",
     );
 }
