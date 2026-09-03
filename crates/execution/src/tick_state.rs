@@ -139,6 +139,21 @@ impl Membership {
         }
     }
 
+    /// A member that settles nothing about the transaction: a retirement,
+    /// deleting records whose claims committed elsewhere. Awaits nobody
+    /// and decides nothing — the verdict was reached where the claims
+    /// were, and a name that decided here would be a second verdict on
+    /// a chain that may already hold the first.
+    #[must_use]
+    pub fn housekeeping(local: ShardId) -> Self {
+        Self {
+            awaited: BTreeSet::from([local]),
+            reach: BTreeSet::from([local]),
+            decides: false,
+            delivers: false,
+        }
+    }
+
     /// Whether this shard's certificate bears the verdict on the
     /// transaction.
     #[must_use]

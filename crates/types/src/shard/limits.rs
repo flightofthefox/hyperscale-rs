@@ -123,14 +123,20 @@ pub const MAX_UNSETTLED_PER_BLOCK: usize = (MAX_DRAIN_WORK / TX_UNITS) as usize;
 
 /// Hard cap on the abandonment records one block may carry.
 ///
-/// A block's records are in strictly ascending shard order, so it carries
-/// at most one per counterpart shard, and a record may name a live shard
-/// — a refusing core — as readily as one that left. So the bound is the
-/// shard count itself: more records than the trie has leaves names a
-/// shard that does not exist. A shard with evidence at several anchors
-/// drains one anchor per block, which costs settlement rate rather than
-/// this bound.
-pub const MAX_ABANDONMENT_RECORDS_PER_BLOCK: usize = MAX_PROVISION_TARGET_SHARDS;
+/// A block's records are in strictly ascending `(shard, arm)` order, so
+/// it carries at most one per counterpart shard per arm of the evidence
+/// vocabulary, and a record may name a live shard — a refusing core, a
+/// consumer that claimed — as readily as one that left. So the bound is
+/// the shard count times the arms: more records than that names a shard
+/// that does not exist or an arm twice. A shard with evidence at several
+/// anchors under one arm drains one anchor per block, which costs
+/// settlement rate rather than this bound.
+pub const MAX_ABANDONMENT_RECORDS_PER_BLOCK: usize =
+    MAX_PROVISION_TARGET_SHARDS * UNSETTLEABLE_ARMS;
+
+/// The arms of the record vocabulary: departed, refused, unclaimed,
+/// lapsed and claimed. Stated beside the cap that multiplies by it.
+pub const UNSETTLEABLE_ARMS: usize = 5;
 
 /// Cap on the number of shards a block can name as provision targets, at
 /// decode time.

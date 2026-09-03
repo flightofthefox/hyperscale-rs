@@ -49,7 +49,9 @@ use hyperscale_vm_types::{
 
 use crate::backend::EngineBackend;
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
-use crate::legs::{Classified, Runs, ShardPlan, Side, plan_for_shard, reclaim_for_shard};
+use crate::legs::{
+    Classified, Runs, ShardPlan, Side, plan_for_shard, reclaim_for_shard, retire_for_shard,
+};
 use crate::records::BatchRecords;
 use crate::sharding::writes_root;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
@@ -567,6 +569,44 @@ impl Executor {
                     format!("reclaim cell contradicts the declaration: {conflict}")
                 })?;
             }
+        }
+        Ok(PreparedTx {
+            calls: Vec::new(),
+            declaration,
+            nullifiers: Vec::new(),
+            gas_limit: 0,
+            plan,
+        })
+    }
+
+    /// The entry a retirement runs: no call, no nullifier, and a
+    /// declaration of its own over exactly the records it deletes.
+    ///
+    /// A record this shard cannot read is a refusal, as it is for a
+    /// reclaim: the plan says which records the committed evidence
+    /// covers, and a record that is not there was retired or taken back
+    /// already.
+    fn prepare_retire(
+        plan: ShardPlan,
+        snapshot: &(dyn Substates + Sync),
+    ) -> Result<PreparedTx, String> {
+        let mut declaration = Declaration::default();
+        for ((node, output), retire) in plan.legs.retired() {
+            let key = retire.record.key();
+            snapshot
+                .cell(key)
+                .and_then(|bytes| CrossingCell::from_bytes(&bytes))
+                .filter(|record| retire.record.names(record))
+                .ok_or_else(|| format!("retirement of edge ({node}, {output}) reads no record"))?;
+            declare(
+                &mut declaration,
+                Effect {
+                    target: EffectTarget::Point(key),
+                    mode: Mode::Write { moves: Moves::Both },
+                },
+                None,
+            )
+            .map_err(|conflict| format!("retired cell contradicts the declaration: {conflict}"))?;
         }
         Ok(PreparedTx {
             calls: Vec::new(),
@@ -1247,6 +1287,11 @@ impl Executor {
                         .map_err(|defect| format!("no reclaim for this shard: {defect}"))
                         .and_then(|plan| Self::prepare_reclaim(plan, snapshot))
                 }
+                Some((Runs::Retire { classified }, _)) => {
+                    retire_for_shard(tx.legs(), tx.crossings(), classified, ctx.local_shard)
+                        .map_err(|defect| format!("no retirement for this shard: {defect}"))
+                        .and_then(|plan| Self::prepare_retire(plan, snapshot))
+                }
                 Some((Runs::Shape { classified, side }, arrivals)) => {
                     Self::prepare_shape(ctx, tx, &records, classified, arrivals, *side)
                 }
@@ -1351,6 +1396,9 @@ impl Executor {
                 // receipt of this shard's that can still carry it.
                 let already_charged = match shapes.get(&tx.hash()).map(|shape| &shape.runs) {
                     Some(Runs::Reclaim { charged, .. }) => *charged,
+                    // A retirement is housekeeping on a transaction whose
+                    // price its leg settled: it charges nothing.
+                    Some(Runs::Retire { .. }) => true,
                     Some(Runs::Shape { classified, side }) => {
                         classified.second_member(ctx.local_shard, *side)
                     }

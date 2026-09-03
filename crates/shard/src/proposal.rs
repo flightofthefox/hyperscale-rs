@@ -419,10 +419,12 @@ pub fn select_abandonment_records(
     qc_chain_resolved_txs: &HashSet<TxHash>,
     dedup_index: &CommitDedupIndex,
 ) -> Vec<AbandonmentRecord> {
-    let resolved_here: HashSet<TxHash> = finalizations
-        .iter()
-        .flat_map(|fw| fw.deciding_tx_hashes())
-        .collect();
+    // Every name the block's finalizations carry, deciding or not: the
+    // voter holds a record's names to once per block against them all,
+    // and a claimed record can coincide with the delivery's own
+    // finalization of the same transaction on a mixed shard.
+    let resolved_here: HashSet<TxHash> =
+        finalizations.iter().flat_map(|fw| fw.tx_hashes()).collect();
     verdicts
         .into_iter()
         .filter(|verdict| {

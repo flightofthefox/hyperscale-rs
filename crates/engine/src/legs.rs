@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{Address, EscrowedValue, ShardId, ShardTrie};
 use hyperscale_vm_effects::{CrossingSite, StarShape, star_at};
-use hyperscale_vm_kernel::{Crossed, ExecutionScope, LegPlan, PlanTooWide, Reclaim};
+use hyperscale_vm_kernel::{Crossed, ExecutionScope, LegPlan, PlanTooWide, Reclaim, Retire};
 use hyperscale_vm_types::{Crossing, LegRole, LegShape, ProtocolHasher, SubstateKey};
 
 use crate::sharding::TrieShardResolver;
@@ -228,6 +228,14 @@ pub enum Runs {
         classified: Classified,
         /// Which of this shard's legs the member runs.
         side: Side,
+    },
+    /// No node at all: the records of the crossings a producer here
+    /// issued, deleted on the evidence a committed record carries that
+    /// every consumer claimed them.
+    Retire {
+        /// The classification the producer's committing block froze,
+        /// which the retirement reads its edges from.
+        classified: Classified,
     },
     /// No node at all: the crossings an inbound leg here issued, taken
     /// back on the evidence a committed record carries.
@@ -444,13 +452,57 @@ pub fn crossings_of(
 /// The claim cells the deliveries of `local`'s issued crossings write,
 /// each under the shard that delivers it.
 ///
+/// For every crossing an inbound leg here produces whose consumer is a
+/// core node: that consumer's claim cell and the shard holding it —
+/// the consumer's own home, since a claim sits under its target
+/// wherever else the core runs it. What a presence probe asks the core
+/// about once the transaction's deadline has passed: a claim present
+/// there says the core took the crossing, and the record here is
+/// retired on it. Empty when the shape runs whole.
+#[must_use]
+pub fn core_claims(
+    legs: &[LegShape],
+    crossings: &[Crossing],
+    classified: &Classified,
+    local: ShardId,
+) -> Vec<(ShardId, SubstateKey)> {
+    if !classified.decomposed().holds() {
+        return Vec::new();
+    }
+    let star = Star::of(legs, classified);
+    crossings
+        .iter()
+        .filter_map(|crossing| {
+            let producer = star.leg(crossing.node).ok()?;
+            if star.role(crossing.node) == LegRole::Core || star.home(crossing.node) != local {
+                return None;
+            }
+            let consumer = star.consumer_of(crossing.node, crossing.output)?;
+            if star.role(consumer) != LegRole::Core || star.running(consumer).contains(&local) {
+                return None;
+            }
+            let claim = CrossingSite::claim(
+                &ProtocolHasher,
+                star.leg(consumer).ok()?.target,
+                producer.intent,
+                producer.local,
+                crossing.output,
+                producer.expiry_ms,
+            )
+            .key();
+            Some((star.home(consumer), claim))
+        })
+        .collect()
+}
+
 /// For every crossing a node here produces — an inbound leg's, or the
 /// core's on a core shard — whose consumer is an outbound leg on another
-/// shard: that consumer's claim cell and its home. A delivery that never
-/// claimed leaves exactly this cell absent, which is what a lapse probe
-/// asks the delivering shard about, and the crossing is then the
-/// producer's to take back. Empty when the shape runs whole, since
-/// nothing is then handed between shards.
+/// shard: that consumer's claim cell and its home.
+///
+/// A delivery that never claimed leaves exactly this cell absent, which
+/// is what a lapse probe asks the delivering shard about, and the
+/// crossing is then the producer's to take back. Empty when the shape
+/// runs whole, since nothing is then handed between shards.
 #[must_use]
 pub fn delivered_claims(
     legs: &[LegShape],
@@ -544,6 +596,9 @@ pub enum PlanDefect {
     /// This shard issued nothing it could take back.
     #[error("this shard has no inbound crossing to reclaim")]
     NothingToReclaim,
+    /// A retirement composed on a shard that issued nothing.
+    #[error("this shard issued nothing to retire")]
+    NothingToRetire,
     /// More crossings than one outcome can state a verdict for.
     #[error(transparent)]
     TooWide(#[from] PlanTooWide),
@@ -640,6 +695,60 @@ pub fn plan_for_shard(
             producer.expiry_ms,
         );
         plan.departs(crossing.node, crossing.output, record)?;
+    }
+    Ok(ShardPlan {
+        legs: plan,
+        scope: star.scope_for(local),
+    })
+}
+
+/// The plan that retires every record a producer here wrote for a
+/// consumer running elsewhere: no node, and each record deleted.
+///
+/// Composed only once a committed record says every such consumer
+/// claimed, so the plan names them all; which shards those were is the
+/// ledger's question, not this one's.
+///
+/// # Errors
+///
+/// [`PlanDefect`]: a crossing naming a node the legs do not have, or a
+/// shard that issued nothing to retire.
+pub fn retire_for_shard(
+    legs: &[LegShape],
+    crossings: &[Crossing],
+    classified: &Classified,
+    local: ShardId,
+) -> Result<ShardPlan, PlanDefect> {
+    let star = Star::of(legs, classified);
+    let mut plan = LegPlan::whole();
+    for node in 0..star.len() {
+        plan.skip(node);
+    }
+    let mut retired = false;
+    for crossing in crossings {
+        let producer = star.leg(crossing.node)?;
+        if star.role(crossing.node) == LegRole::Outbound || star.home(crossing.node) != local {
+            continue;
+        }
+        let Some(consumer) = star.consumer_of(crossing.node, crossing.output) else {
+            continue;
+        };
+        if star.running(consumer).contains(&local) {
+            continue;
+        }
+        let record = CrossingSite::record(
+            &ProtocolHasher,
+            producer.target,
+            producer.intent,
+            producer.local,
+            crossing.output,
+            producer.expiry_ms,
+        );
+        plan.retires(crossing.node, crossing.output, Retire { record })?;
+        retired = true;
+    }
+    if !retired {
+        return Err(PlanDefect::NothingToRetire);
     }
     Ok(ShardPlan {
         legs: plan,

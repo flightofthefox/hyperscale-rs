@@ -626,7 +626,7 @@ pub fn validate_abandonment_records_well_formed(block: &Block) -> Result<(), Str
     }
 
     let mut named = 0usize;
-    let mut previous: Option<ShardId> = None;
+    let mut previous: Option<(ShardId, u8)> = None;
     for verdict in verdicts {
         if !verdict.is_well_formed() {
             return Err(format!(
@@ -634,17 +634,20 @@ pub fn validate_abandonment_records_well_formed(block: &Block) -> Result<(), Str
                 verdict.shard(),
             ));
         }
-        // Ascending by shard, which gives uniqueness and one encoding per
-        // claim set together — two records for one shard would leave which
-        // answer counts to the reader, and a reordering would be a second
-        // form of the same block.
-        if previous.is_some_and(|previous| previous >= verdict.shard()) {
+        // Ascending by shard and then by arm, which gives uniqueness and
+        // one encoding per claim set together — two records for one
+        // shard under one arm would leave which answer counts to the
+        // reader, and a reordering would be a second form of the same
+        // block. One shard may carry several arms: what it claimed and
+        // what it left unclaimed are different transactions.
+        let position = (verdict.shard(), verdict.evidence().discriminant());
+        if previous.is_some_and(|previous| previous >= position) {
             return Err(format!(
                 "abandonment record for {:?} repeats or precedes the one before it",
                 verdict.shard(),
             ));
         }
-        previous = Some(verdict.shard());
+        previous = Some(position);
         named = named.saturating_add(verdict.unsettled().len());
     }
     if named > MAX_UNSETTLED_PER_BLOCK {
@@ -1352,6 +1355,34 @@ mod tests {
                 .unwrap_err();
             assert!(err.contains("repeats or precedes"), "{err}");
         }
+
+        // One shard under two arms is two answers about two sets of
+        // transactions, in arm order.
+        let two_arms = vec![
+            verdict(left, &[1]),
+            AbandonmentRecord::claimed(
+                left,
+                WeightedTimestamp::from_millis(9),
+                [named(TxHash::from(Hash::from_bytes(&[2; 32])))],
+            ),
+        ];
+        let root = abandonment_root_from_records(&two_arms);
+        assert!(
+            validate_abandonment_records_well_formed(&block_with_verdicts(two_arms, root)).is_ok()
+        );
+        let arms_reversed = vec![
+            AbandonmentRecord::claimed(
+                left,
+                WeightedTimestamp::from_millis(9),
+                [named(TxHash::from(Hash::from_bytes(&[2; 32])))],
+            ),
+            verdict(left, &[1]),
+        ];
+        let root = abandonment_root_from_records(&arms_reversed);
+        assert!(
+            validate_abandonment_records_well_formed(&block_with_verdicts(arms_reversed, root))
+                .is_err()
+        );
     }
 
     /// The drain is one budget across every departure a block answers

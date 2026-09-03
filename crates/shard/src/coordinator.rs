@@ -16,13 +16,13 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    AbandonmentRecord, BlockHash, FinalizationHash, Hash, LocalTimestamp,
+    AbandonmentRecord, BlockHash, ClaimProof, FinalizationHash, Hash, LocalTimestamp,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK,
     PrincipalAddr, ProposerTimestamp, ProvisionHash, ReadySignal, ReshapeThresholds,
     ReshapeTrigger, Resolutions, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
     SplitAtBoundary, StoredReceipt, SubstateKey, TxClaim, TxOutcome, Unsettleable, UnsettledTx,
-    WeightedTimestamp, WorkInFlight, derive_reshape_trigger, ready_signal_window,
-    settled_set_verdict, verdict_window_close,
+    WeightedTimestamp, WorkInFlight, derive_reshape_trigger, lapse_probe_ceiling,
+    ready_signal_window, settled_set_verdict, verdict_window_close,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -469,6 +469,15 @@ pub struct ShardCoordinator {
     /// deadline is one fact at every anchor, and a voter holding no
     /// mirror defers. Each lives to its transaction's horizon.
     absences: HashMap<(TxHash, ShardId), Absence>,
+
+    /// The consumers' claims of crossings legs here issued for, as the
+    /// execution coordinator proved them present off commit-proven
+    /// headers. A `Claimed` record is checked against this and nothing
+    /// else: a mirror at any anchor short of the claim cell's sweep
+    /// stands for it, since a claim committed is one fact at every
+    /// anchor until then, and a voter holding no mirror defers. Each
+    /// lives to its transaction's horizon.
+    presences: HashMap<(TxHash, ShardId), ClaimProof>,
 }
 
 impl std::fmt::Debug for ShardCoordinator {
@@ -611,6 +620,7 @@ impl ShardCoordinator {
             chain_origin: recovered.chain_origin,
             precut: Precut::succeeding(recovered.predecessors),
             settled_sets: HashMap::new(),
+            presences: HashMap::new(),
             departure_parties: HashMap::new(),
             refusals: HashMap::new(),
             absences: HashMap::new(),
@@ -906,6 +916,14 @@ impl ShardCoordinator {
         self.absences.entry((tx_hash, shard)).or_insert(absence);
     }
 
+    /// Mirror a consumer's claim of a crossing a leg here issued for,
+    /// proved present off the consumer's commit-proven state. First
+    /// proof wins: a claim is one fact at every anchor short of its
+    /// sweep, so nothing a later proof adds changes the verdict.
+    pub fn record_presence(&mut self, shard: ShardId, tx_hash: TxHash, presence: ClaimProof) {
+        self.presences.entry((tx_hash, shard)).or_insert(presence);
+    }
+
     /// Drop settled-transaction sets past their evidence window. Once the
     /// committed chain advances beyond it, the fence rejects any tick
     /// naming the shard regardless of the set, so retaining it only leaks
@@ -926,6 +944,12 @@ impl ShardCoordinator {
         // deadline for a core's and from the lapse for a delivery's.
         self.absences
             .retain(|_, absence| now < verdict_window_close(absence.floor));
+        // A presence lives as long as the record it licenses the
+        // retirement of can still be read: to the claim cell's own
+        // sweep, past which nothing is offered against it.
+        self.presences.retain(|_, presence| {
+            now < lapse_probe_ceiling(validity_end_of(presence.probed_wt)).max(presence.probed_wt)
+        });
     }
 
     /// The settled-transaction set this validator has acquired for a terminated
@@ -1157,32 +1181,8 @@ impl ShardCoordinator {
             // mirror disagrees refuses.
             Unsettleable::Refused { refused_wt } => {
                 for entry in verdict.unsettled() {
-                    match self.refusals.get(&(entry.tx_hash, verdict.shard())) {
-                        Some(mirrored) if mirrored.refused_wt == refused_wt => {}
-                        Some(mirrored) => {
-                            warn!(
-                                validator = ?self.me,
-                                block_hash = ?block_hash,
-                                shard = ?verdict.shard(),
-                                tx_hash = ?entry.tx_hash,
-                                claimed = ?refused_wt,
-                                mirrored = ?mirrored.refused_wt,
-                                "Abandonment record restates a refusal at an anchor this \
-                                 validator did not see — not voting"
-                            );
-                            return false;
-                        }
-                        None => {
-                            trace!(
-                                validator = ?self.me,
-                                block_hash = ?block_hash,
-                                shard = ?verdict.shard(),
-                                tx_hash = ?entry.tx_hash,
-                                "Abandonment record restates a refusal this validator has not \
-                                 mirrored; deferring"
-                            );
-                            return false;
-                        }
+                    if !self.refusal_stands(verdict, entry, refused_wt, block_hash) {
+                        return false;
                     }
                 }
             }
@@ -1221,6 +1221,19 @@ impl ShardCoordinator {
                         (lapse_probe_anchor, lapse_licenses_reclaim),
                         block_hash,
                     ) {
+                        return false;
+                    }
+                }
+            }
+            // A claim is checked against this validator's own proof of
+            // it. A claim committed is one fact at every anchor from its
+            // commit to the claim cell's sweep, so the record's anchor
+            // and the mirror's need only both sit short of the sweep;
+            // a mirror at any such anchor stands for the record, and no
+            // mirror defers.
+            Unsettleable::Claimed { probed_wt } => {
+                for entry in verdict.unsettled() {
+                    if !self.presence_stands(verdict, entry, probed_wt, block_hash) {
                         return false;
                     }
                 }
@@ -1275,6 +1288,84 @@ impl ShardCoordinator {
                 tx_hash = ?entry.tx_hash,
                 "Abandonment record restates an absence this validator has not proved; \
                  deferring"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Whether one name's refusal, as a `Refused` record restates it at
+    /// `refused_wt`, stands on this validator's own mirror of the
+    /// core's certificate: equality on the anchor.
+    fn refusal_stands(
+        &self,
+        verdict: &AbandonmentRecord,
+        entry: &UnsettledTx,
+        refused_wt: WeightedTimestamp,
+        block_hash: BlockHash,
+    ) -> bool {
+        match self.refusals.get(&(entry.tx_hash, verdict.shard())) {
+            Some(mirrored) if mirrored.refused_wt == refused_wt => true,
+            Some(mirrored) => {
+                warn!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    shard = ?verdict.shard(),
+                    tx_hash = ?entry.tx_hash,
+                    claimed = ?refused_wt,
+                    mirrored = ?mirrored.refused_wt,
+                    "Abandonment record restates a refusal at an anchor this validator did \
+                     not see — not voting"
+                );
+                false
+            }
+            None => {
+                trace!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    shard = ?verdict.shard(),
+                    tx_hash = ?entry.tx_hash,
+                    "Abandonment record restates a refusal this validator has not mirrored; \
+                     deferring"
+                );
+                false
+            }
+        }
+    }
+
+    /// Whether one name's claim, as a `Claimed` record restates it at
+    /// `probed_wt`, stands on this validator's own proof: both anchors
+    /// short of the claim cell's sweep, and a proof held at all.
+    fn presence_stands(
+        &self,
+        verdict: &AbandonmentRecord,
+        entry: &UnsettledTx,
+        probed_wt: WeightedTimestamp,
+        block_hash: BlockHash,
+    ) -> bool {
+        let sweep = lapse_probe_ceiling(validity_end_of(entry.deadline));
+        if probed_wt >= sweep {
+            warn!(
+                validator = ?self.me,
+                block_hash = ?block_hash,
+                shard = ?verdict.shard(),
+                tx_hash = ?entry.tx_hash,
+                probed = ?probed_wt,
+                "Record restates a claim proved where the claim cell may be swept — not voting"
+            );
+            return false;
+        }
+        let proved = self
+            .presences
+            .get(&(entry.tx_hash, verdict.shard()))
+            .is_some_and(|presence| presence.probed_wt < sweep);
+        if !proved {
+            trace!(
+                validator = ?self.me,
+                block_hash = ?block_hash,
+                shard = ?verdict.shard(),
+                tx_hash = ?entry.tx_hash,
+                "Record restates a claim this validator has not proved; deferring"
             );
             return false;
         }
@@ -11949,6 +12040,59 @@ mod tests {
         assert!(
             cores.fence_abandonment_records(&sched, &record(lapse), BlockHash::ZERO),
             "a core's cell proved absent at the lapse is not the claim proved absent: it defers"
+        );
+    }
+
+    /// A `Claimed` record is checked against this validator's own proof
+    /// of the claim: a proof at any anchor short of the claim cell's
+    /// sweep passes a record anchored anywhere short of it too, a
+    /// record anchored at or past the sweep is refused whatever the
+    /// mirror holds, and no proof defers.
+    #[test]
+    fn a_claimed_record_stands_or_falls_on_the_mirror() {
+        let sched = make_terminating_schedule(4);
+        let figures = figures_of(b"tx");
+        let sweep = lapse_probe_ceiling(validity_end_of(figures.deadline));
+        let record = |probed_wt: WeightedTimestamp| {
+            block_with_records(
+                AFTER_CUT_MS,
+                vec![AbandonmentRecord::claimed(
+                    ShardId::ROOT,
+                    probed_wt,
+                    [figures],
+                )],
+            )
+        };
+
+        let mut matching = fence_coordinator();
+        matching.record_presence(
+            ShardId::ROOT,
+            figures.tx_hash,
+            ClaimProof {
+                probed_wt: figures.deadline,
+            },
+        );
+        assert!(
+            !matching.fence_abandonment_records(&sched, &record(figures.deadline), BlockHash::ZERO),
+            "a proof at the deadline passes a record at the deadline"
+        );
+        assert!(
+            !matching.fence_abandonment_records(
+                &sched,
+                &record(sweep.minus(Duration::from_millis(1))),
+                BlockHash::ZERO
+            ),
+            "and one anchored later: a claim is one fact at every anchor short of the sweep"
+        );
+        assert!(
+            matching.fence_abandonment_records(&sched, &record(sweep), BlockHash::ZERO),
+            "a record anchored where the claim cell may be swept is refused"
+        );
+
+        let absent = fence_coordinator();
+        assert!(
+            absent.fence_abandonment_records(&sched, &record(figures.deadline), BlockHash::ZERO),
+            "no proof defers it"
         );
     }
 

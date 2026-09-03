@@ -13,18 +13,18 @@ use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
     CandidateBeaconBlockVerifyError, CertRootVerifyError, CertificateRoot, CertifiedBeaconBlock,
     CertifiedBeaconBlockVerifyError, CertifiedBlock, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, Epoch, ExecutionCertificate, ExecutionCertificateVerifyError,
-    ExecutionVote, Finalization, FinalizationVerifyError, Hash, Inclusion, LeafIndex,
-    LocalReceiptRoot, LocalReceiptRootVerifyError, PcVote1, PcVote1VerifyError, PcVote2,
-    PcVote2VerifyError, PcVote3, PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap,
-    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError,
-    QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal,
-    Refusal, Resolutions, Round, ShardForkProof, ShardId, ShardVoteEquivocation,
-    ShardWitnessPayload, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
-    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
-    StateAnchor, StateRoot, StateRootVerifyError, StoredReceipt, SubstateKey, TickId, Timeout,
-    Transaction, TransactionRoot, TxHash, TxOutcome, TxResolution, TxRootVerifyError, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp,
+    CertifiedHeaderVerifyError, ClaimProof, Epoch, ExecutionCertificate,
+    ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationVerifyError, Hash,
+    Inclusion, LeafIndex, LocalReceiptRoot, LocalReceiptRootVerifyError, PcVote1,
+    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
+    ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
+    ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate, RatifyPhase,
+    RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal, Refusal, Resolutions, Round,
+    ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg,
+    SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
+    SpcProposalObjectVerifyError, SpcView, StateAnchor, StateRoot, StateRootVerifyError,
+    StoredReceipt, SubstateKey, TickId, Timeout, Transaction, TransactionRoot, TxHash, TxOutcome,
+    TxResolution, TxRootVerifyError, ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 
 /// What one tick's batch produced.
@@ -835,6 +835,21 @@ pub enum ProtocolEvent {
         tx_hash: TxHash,
         /// The absence as proved.
         absence: Absence,
+    },
+
+    /// The execution coordinator proved a consumer had claimed a
+    /// crossing a leg here issued for, off a state proof against one of
+    /// the consumer's commit-proven headers. The shard coordinator
+    /// records it for the vote fence, which checks a `Claimed` record
+    /// against exactly this, and re-drives the votes that deferred for
+    /// want of it.
+    ClaimObserved {
+        /// The consuming shard whose claim was proved.
+        shard: ShardId,
+        /// The transaction whose crossing it claimed.
+        tx_hash: TxHash,
+        /// The presence as proved.
+        presence: ClaimProof,
     },
 
     /// A state proof fetched against a commit-proven remote header

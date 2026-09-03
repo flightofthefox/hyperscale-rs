@@ -93,10 +93,12 @@ impl ShardParticipation {
                 );
                 actions
             }
-            // A core shard refused a transaction a leg here issued for:
-            // the vote fence checks a refusal record against this mirror,
-            // so record it and re-drive the votes that deferred without
-            // it.
+            // Evidence the execution coordinator mirrored about a
+            // transaction a leg here issued for — a core's refusal, a
+            // core's absence, a consumer's claim: the vote fence checks
+            // the matching record arm against exactly this mirror, so
+            // each is recorded and the votes that deferred without it
+            // re-driven.
             ProtocolEvent::RefusalObserved {
                 shard,
                 tx_hash,
@@ -104,13 +106,8 @@ impl ShardParticipation {
             } => {
                 self.shard_coordinator
                     .record_refusal(shard, tx_hash, refusal);
-                self.shard_coordinator
-                    .redrive_pending_votes(topology_schedule)
+                self.redrive_fence(topology_schedule)
             }
-            // A core shard is proved not to have committed a transaction
-            // a leg here issued for: the vote fence checks an absence
-            // record against this mirror, so record it and re-drive the
-            // votes that deferred without it.
             ProtocolEvent::AbsenceObserved {
                 shard,
                 tx_hash,
@@ -118,8 +115,16 @@ impl ShardParticipation {
             } => {
                 self.shard_coordinator
                     .record_absence(shard, tx_hash, absence);
+                self.redrive_fence(topology_schedule)
+            }
+            ProtocolEvent::ClaimObserved {
+                shard,
+                tx_hash,
+                presence,
+            } => {
                 self.shard_coordinator
-                    .redrive_pending_votes(topology_schedule)
+                    .record_presence(shard, tx_hash, presence);
+                self.redrive_fence(topology_schedule)
             }
             // A state proof against a core's commit-proven header
             // verified: the execution coordinator reads its probes off
@@ -268,6 +273,13 @@ impl ShardParticipation {
             self.shard_coordinator.retire_precut();
         }
         actions
+    }
+
+    /// Re-drive the votes the fence deferred for want of a mirror that
+    /// has just landed.
+    fn redrive_fence(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        self.shard_coordinator
+            .redrive_pending_votes(topology_schedule)
     }
 }
 

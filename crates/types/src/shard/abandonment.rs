@@ -17,6 +17,12 @@
 //! claimed it, as of one of the delivering shard's blocks inside the
 //! lapse window, on the same terms against the claim cell.
 //!
+//! One more thing is written down the same way, though it establishes
+//! the opposite: that a consumer *did* claim what a leg here issued. A
+//! record cell is a balance held for that claim, and the claim proved
+//! present is what lets the issuer retire it — the record family's one
+//! settling arm.
+//!
 //! So the answer is written down while it can still be read. A record
 //! names the transactions this chain still owes an outcome for that its
 //! counterpart can never settle, with the kind of evidence and the
@@ -240,6 +246,19 @@ pub enum Unsettleable {
         /// cell's sweep, or the proof says nothing.
         probed_wt: WeightedTimestamp,
     },
+    /// The consumer claimed it, as of one of its blocks: an inclusion
+    /// proof of the crossing's claim cell against that block's state
+    /// root is the proof. The one arm that records a settlement rather
+    /// than its impossibility — what it licenses is the retirement of
+    /// the record cell the issuer held for that claim, never an abort.
+    /// A claim is one fact at every anchor from its commit to its own
+    /// sweep, so the proof may sit anywhere short of the sweep.
+    Claimed {
+        /// The weighted timestamp of the block the presence was proved
+        /// against. Short of every named crossing's claim cell sweep, or
+        /// the proof says nothing.
+        probed_wt: WeightedTimestamp,
+    },
 }
 
 impl Unsettleable {
@@ -249,7 +268,9 @@ impl Unsettleable {
         match self {
             Self::Departed { terminal_wt } => *terminal_wt,
             Self::Refused { refused_wt } => *refused_wt,
-            Self::Unclaimed { probed_wt } | Self::Lapsed { probed_wt } => *probed_wt,
+            Self::Unclaimed { probed_wt }
+            | Self::Lapsed { probed_wt }
+            | Self::Claimed { probed_wt } => *probed_wt,
         }
     }
 
@@ -264,7 +285,15 @@ impl Unsettleable {
             Self::Refused { .. } => 1,
             Self::Unclaimed { .. } => 2,
             Self::Lapsed { .. } => 3,
+            Self::Claimed { .. } => 4,
         }
+    }
+
+    /// Whether this arm licenses a reclaim — the counterpart can never
+    /// settle — rather than a retirement, where it did.
+    #[must_use]
+    pub const fn abandons(&self) -> bool {
+        !matches!(self, Self::Claimed { .. })
     }
 }
 
@@ -309,7 +338,23 @@ pub struct Absence {
     pub floor: WeightedTimestamp,
 }
 
-/// One counterpart's unsettleable remainder, as this chain sees it.
+/// A consumer's claim of a crossing a leg here issued for, as this
+/// validator proved it present off the consumer's commit-proven state.
+///
+/// What a `Claimed` record restates and what a voter checks it against.
+/// The anchor is the voter's own probe, which need not be the
+/// proposer's: a claim committed is one fact at every anchor from its
+/// commit to the claim cell's own sweep, so a voter holding a proof at
+/// any block short of the sweep holds the evidence the record claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimProof {
+    /// The weighted timestamp of the block the presence was proved
+    /// against — short of the claim cell's sweep.
+    pub probed_wt: WeightedTimestamp,
+}
+
+/// One counterpart's remainder as this chain sees it: what it can never
+/// settle, or — under the one settling arm — what it has claimed.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct AbandonmentRecord {
     /// The counterpart shard that can never settle these.
@@ -384,6 +429,17 @@ impl AbandonmentRecord {
         unsettled: impl IntoIterator<Item = UnsettledTx>,
     ) -> Self {
         Self::new(shard, Unsettleable::Lapsed { probed_wt }, unsettled)
+    }
+
+    /// A record over what `shard`, consuming, had claimed as of its
+    /// block at `probed_wt`.
+    #[must_use]
+    pub fn claimed(
+        shard: ShardId,
+        probed_wt: WeightedTimestamp,
+        unsettled: impl IntoIterator<Item = UnsettledTx>,
+    ) -> Self {
+        Self::new(shard, Unsettleable::Claimed { probed_wt }, unsettled)
     }
 
     /// The counterpart shard.

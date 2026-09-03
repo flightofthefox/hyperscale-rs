@@ -92,10 +92,10 @@ struct Owed {
     /// What this shard's part in the transaction is, which decides what
     /// the entry waits on and what ends it.
     kind: Kind,
-    /// Whether a tick of this shard's has admitted the reclaim of a leg
-    /// entry, so the finalization naming the hash next is the
-    /// reclaim's. Meaningless off a leg entry.
-    reclaim_admitted: bool,
+    /// Which tick of this shard's has taken a leg entry's records — a
+    /// reclaim or a retirement — so the finalization naming the hash
+    /// next is that member's. Meaningless off a leg entry.
+    taken: Option<Taken>,
     /// The departed shard a committed record says left this transaction
     /// unsettled.
     ///
@@ -114,6 +114,19 @@ struct Owed {
     /// absence or a lapse — which is what the reclaim it licenses says
     /// the transaction's fate was.
     evidence: Option<Unsettleable>,
+    /// The consumer shards a committed record says claimed what this
+    /// entry issued. Once every consumer has, the records here have
+    /// nothing left to hold and the retirement is licensed.
+    claimed_by: BTreeSet<ShardId>,
+}
+
+/// What a tick of this shard's composed over a leg entry's records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Taken {
+    /// The reclaim, on a record that says the counterpart never will.
+    Reclaim,
+    /// The retirement, on a record that says every consumer claimed.
+    Retire,
 }
 
 impl Owed {
@@ -226,6 +239,24 @@ struct Kept {
     /// departed deliverer's successor; the prober resolves that off the
     /// trie, since the ledger holds no topology.
     deliveries: Vec<(ShardId, SubstateKey)>,
+    /// The claim cells core consumers write for the crossings a leg
+    /// here issued, each under the shard holding the consumer's target
+    /// — what a presence probe asks the core about past the deadline,
+    /// and what a `Claimed` record answers for.
+    claims: Vec<(ShardId, SubstateKey)>,
+}
+
+/// A leg entry a committed record has licensed the retirement of: every
+/// consumer of what it issued has claimed, so its records have nothing
+/// left to hold.
+#[derive(Debug, Clone)]
+pub struct Retirable {
+    /// The transaction.
+    pub tx_hash: TxHash,
+    /// Its body, which the retirement's edges derive from.
+    pub body: Arc<Verified<Transaction>>,
+    /// The classification its committing block froze.
+    pub classified: Classified,
 }
 
 /// A leg entry a committed record has licensed the reclaim of, with what
@@ -266,6 +297,10 @@ pub struct Probeable {
     /// Asked about past the lapse, there and on whatever shard holds
     /// the cell's prefix by then.
     pub deliveries: Vec<(ShardId, SubstateKey)>,
+    /// The claim cells core consumers write for what this leg issued,
+    /// each under the shard holding the consumer's target. Asked about
+    /// past the deadline: present says the core took it.
+    pub claims: Vec<(ShardId, SubstateKey)>,
 }
 
 /// Committed-but-unresolved transactions, each against its deadline and
@@ -326,9 +361,10 @@ impl UnresolvedTxs {
                 certified: false,
                 charged: false,
                 kind: Kind::Whole,
-                reclaim_admitted: false,
+                taken: None,
                 unsettled_by: None,
                 evidence: None,
+                claimed_by: BTreeSet::new(),
             };
             self.owed.entry(tx.hash()).or_insert(owed);
         }
@@ -346,6 +382,7 @@ impl UnresolvedTxs {
         body: Arc<Verified<Transaction>>,
         classified: Classified,
         deliveries: Vec<(ShardId, SubstateKey)>,
+        claims: Vec<(ShardId, SubstateKey)>,
     ) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
             owed.kind = Kind::Leg;
@@ -357,6 +394,7 @@ impl UnresolvedTxs {
                     classified,
                     core,
                     deliveries,
+                    claims,
                 },
             );
         }
@@ -385,6 +423,7 @@ impl UnresolvedTxs {
                 classified,
                 core: BTreeSet::new(),
                 deliveries,
+                claims: Vec::new(),
             },
         );
     }
@@ -454,6 +493,7 @@ impl UnresolvedTxs {
                     validity_end: leg.body.validity_range().end_timestamp_exclusive,
                     core: leg.core.clone(),
                     deliveries: leg.deliveries.clone(),
+                    claims: leg.claims.clone(),
                 })
             })
             .collect()
@@ -483,7 +523,7 @@ impl UnresolvedTxs {
         self.owed
             .iter()
             .filter(|(_, owed)| {
-                owed.kind.is_leg() && !owed.reclaim_admitted && owed.unsettled_by.is_some()
+                owed.kind.is_leg() && owed.taken.is_none() && owed.unsettled_by.is_some()
             })
             .filter_map(|(tx_hash, owed)| {
                 let kept = self.kept.get(tx_hash)?;
@@ -502,7 +542,51 @@ impl UnresolvedTxs {
     /// reclaim's and releases the entry.
     pub fn admit_reclaim(&mut self, tx_hash: TxHash) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
-            owed.reclaim_admitted = true;
+            owed.taken = Some(Taken::Reclaim);
+        }
+    }
+
+    /// The leg entries committed records have licensed the retirement of
+    /// and no tick has taken yet: every consumer of what each issued —
+    /// a core's, a delivery's — is on record as having claimed, no
+    /// record covers the entry as unsettled, and nothing is taking it
+    /// back. Read off committed content alone, like
+    /// [`Self::reclaimable`], so every replica composes the same.
+    #[must_use]
+    pub fn retirable(&self) -> Vec<Retirable> {
+        self.owed
+            .iter()
+            .filter(|(_, owed)| {
+                owed.kind.is_leg()
+                    && owed.taken.is_none()
+                    && owed.unsettled_by.is_none()
+                    && !owed.claimed_by.is_empty()
+            })
+            .filter_map(|(tx_hash, owed)| {
+                let kept = self.kept.get(tx_hash)?;
+                let consumers: BTreeSet<ShardId> = kept
+                    .claims
+                    .iter()
+                    .chain(&kept.deliveries)
+                    .map(|(shard, _)| *shard)
+                    .collect();
+                (!consumers.is_empty() && consumers.is_subset(&owed.claimed_by)).then(|| {
+                    Retirable {
+                        tx_hash: *tx_hash,
+                        body: Arc::clone(&kept.body),
+                        classified: kept.classified.clone(),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Record that a tick of this shard's has admitted the retirement
+    /// of `tx_hash`'s records, so the finalization naming the hash next
+    /// is the retirement's and releases the entry.
+    pub fn admit_retire(&mut self, tx_hash: TxHash) {
+        if let Some(owed) = self.owed.get_mut(&tx_hash) {
+            owed.taken = Some(Taken::Retire);
         }
     }
 
@@ -552,6 +636,16 @@ impl UnresolvedTxs {
         let mut reconstructed = 0usize;
         for verdict in verdicts {
             for entry in verdict.unsettled() {
+                // The settling arm: a consumer claimed, and the entry
+                // holds its records for the retirement rather than for a
+                // reclaim. A name this ledger does not hold is left
+                // alone — nothing here is owed for it.
+                if !verdict.evidence().abandons() {
+                    if let Some(owed) = self.owed.get_mut(&entry.tx_hash) {
+                        owed.claimed_by.insert(verdict.shard());
+                    }
+                    continue;
+                }
                 if let Some(owed) = self.owed.get_mut(&entry.tx_hash) {
                     owed.unsettled_by = Some(verdict.shard());
                     owed.evidence = Some(verdict.evidence());
@@ -585,9 +679,10 @@ impl UnresolvedTxs {
                         } else {
                             Kind::Leg
                         },
-                        reclaim_admitted: false,
+                        taken: None,
                         unsettled_by: Some(verdict.shard()),
                         evidence: Some(verdict.evidence()),
+                        claimed_by: BTreeSet::new(),
                     },
                 );
             }
@@ -793,7 +888,14 @@ impl UnresolvedTxs {
             for (tx_hash, decision) in finalization.tx_decisions() {
                 let owed = self.owed.get(&tx_hash);
                 let accepted = decision == TransactionDecision::Accept;
-                let resolution = if !deciding.contains(&tx_hash) {
+                let retired = owed
+                    .is_some_and(|owed| owed.kind.is_leg() && owed.taken == Some(Taken::Retire));
+                let resolution = if retired {
+                    // The retirement: every consumer claimed, so the
+                    // transaction was accepted, whatever this member's
+                    // own outcome says of the records.
+                    TxResolution::Decided(TransactionDecision::Accept)
+                } else if !deciding.contains(&tx_hash) {
                     if accepted && owed.is_some_and(|owed| owed.kind == Kind::Delivery) {
                         TxResolution::Decided(TransactionDecision::Accept)
                     } else {
@@ -807,7 +909,9 @@ impl UnresolvedTxs {
                         Some(Unsettleable::Departed { .. } | Unsettleable::Unclaimed { .. }) => {
                             TxResolution::Decided(TransactionDecision::Aborted)
                         }
-                        Some(Unsettleable::Lapsed { .. }) | None => continue,
+                        Some(Unsettleable::Lapsed { .. } | Unsettleable::Claimed { .. }) | None => {
+                            continue;
+                        }
                     }
                 } else {
                     TxResolution::Decided(decision)
@@ -823,9 +927,11 @@ impl UnresolvedTxs {
     /// path covers them all.
     ///
     /// A leg entry is released by a finalization that decides the
-    /// transaction, and only one: a leg that succeeded bears no verdict,
-    /// so the entry stays for the reclaim, whose finalization decides it
-    /// and releases it. A leg that failed is the transaction's end on
+    /// transaction, or by the retirement's, which decides nothing and
+    /// is the last word here all the same: a leg that succeeded bears
+    /// no verdict, so the entry stays for the member a tick takes its
+    /// records with — the reclaim, whose finalization decides it, or
+    /// the retirement. A leg that failed is the transaction's end on
     /// this shard — it issued nothing, so there is nothing to reclaim —
     /// and its own finalization releases it.
     pub fn release_resolved(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
@@ -835,7 +941,8 @@ impl UnresolvedTxs {
                 let Some(owed) = self.owed.get_mut(&tx_hash) else {
                     continue;
                 };
-                if owed.kind.is_leg() && !deciding.contains(&tx_hash) {
+                let retired = owed.taken == Some(Taken::Retire);
+                if owed.kind.is_leg() && !deciding.contains(&tx_hash) && !retired {
                     // The leg ran and its certificate burned the price
                     // inside its writes: what a reclaim of it charges
                     // nothing for.
@@ -1701,7 +1808,7 @@ mod tests {
         let whole = tx(5, 60_000);
         commit(&mut ledger, &leg);
         commit(&mut ledger, &whole);
-        ledger.mark_leg(leg.hash(), body(&leg), classified(), Vec::new());
+        ledger.mark_leg(leg.hash(), body(&leg), classified(), Vec::new(), Vec::new());
         ledger.certify(leg.hash());
         ledger.certify(whole.hash());
 
@@ -1720,6 +1827,7 @@ mod tests {
                 validity_end: ms(60_000),
                 core: BTreeSet::from([PARTNER]),
                 deliveries: Vec::new(),
+                claims: Vec::new(),
             }],
             "at the deadline the leg is probeable and the whole entry is not"
         );
@@ -1753,7 +1861,13 @@ mod tests {
             owner: test_prefix(AWAY),
             local: LocalKey([0xC1; 16]),
         };
-        ledger.mark_leg(leg.hash(), body(&leg), classified(), vec![(PARTNER, claim)]);
+        ledger.mark_leg(
+            leg.hash(),
+            body(&leg),
+            classified(),
+            vec![(PARTNER, claim)],
+            Vec::new(),
+        );
         ledger.certify(leg.hash());
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
@@ -1765,6 +1879,7 @@ mod tests {
                 validity_end: ms(60_000),
                 core: BTreeSet::from([PARTNER]),
                 deliveries: vec![(PARTNER, claim)],
+                claims: Vec::new(),
             }],
         );
         ledger.record_abandonment_records(&[AbandonmentRecord::lapsed(
@@ -1821,6 +1936,7 @@ mod tests {
                 validity_end: ms(60_000),
                 core: BTreeSet::new(),
                 deliveries: vec![(PARTNER, claim)],
+                claims: Vec::new(),
             }],
         );
         ledger.record_abandonment_records(&[AbandonmentRecord::lapsed(
@@ -1849,7 +1965,7 @@ mod tests {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(4, 60_000);
         commit(&mut ledger, &tx);
-        ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new());
+        ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new(), Vec::new());
         ledger.certify(tx.hash());
 
         let own = make_leg_finalization(BlockHeight::new(1), tx.hash());
@@ -1886,7 +2002,7 @@ mod tests {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(7, 60_000);
         commit(&mut ledger, &tx);
-        ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new());
+        ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new(), Vec::new());
         ledger.certify(tx.hash());
         ledger.record_abandonment_records(&[AbandonmentRecord::departed(
             PARTNER,
@@ -1934,7 +2050,7 @@ mod tests {
 
         let leg = tx(2, 60_000);
         commit(&mut ledger, &leg);
-        ledger.mark_leg(leg.hash(), body(&leg), classified(), Vec::new());
+        ledger.mark_leg(leg.hash(), body(&leg), classified(), Vec::new(), Vec::new());
         assert_eq!(
             fw(&ledger, make_leg_finalization(h, leg.hash())),
             vec![(leg.hash(), TxResolution::LegFinalized)],
@@ -2017,6 +2133,62 @@ mod tests {
         );
     }
 
+    /// A committed `Claimed` record is what licenses retiring a leg's
+    /// records — never a clock, never a certificate — once every
+    /// consumer is on record; the retirement's own finalization
+    /// releases the entry, and a claimed entry is neither reclaimable
+    /// nor abandonable meanwhile.
+    #[test]
+    fn a_claimed_record_licenses_the_retirement_and_its_finalization_releases_the_entry() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(8, 60_000);
+        commit(&mut ledger, &tx);
+        let claim = SubstateKey {
+            owner: test_prefix(AWAY),
+            local: LocalKey([0x77; 16]),
+        };
+        ledger.mark_leg(
+            tx.hash(),
+            body(&tx),
+            classified(),
+            Vec::new(),
+            vec![(PARTNER, claim)],
+        );
+        ledger.certify(tx.hash());
+        assert!(ledger.retirable().is_empty(), "nothing retires on a clock");
+
+        ledger.record_abandonment_records(&[AbandonmentRecord::claimed(
+            PARTNER,
+            ms(70_000),
+            [names(&tx)],
+        )]);
+        let retirable = ledger.retirable();
+        assert_eq!(retirable.len(), 1, "every consumer claimed");
+        assert_eq!(retirable[0].tx_hash, tx.hash());
+        assert!(
+            ledger.reclaimable().is_empty(),
+            "a claim is a settlement, not evidence for a reclaim"
+        );
+        assert!(
+            ledger.past_deadline(ms(200_000)).is_empty(),
+            "and abandons nothing"
+        );
+
+        ledger.admit_retire(tx.hash());
+        assert!(ledger.retirable().is_empty(), "a tick has taken it");
+        let retirement = make_leg_finalization(BlockHeight::new(9), tx.hash());
+        assert_eq!(
+            ledger.resolutions_of(&[Arc::new(Verifiable::from(retirement.clone()))]),
+            vec![(
+                tx.hash(),
+                TxResolution::Decided(TransactionDecision::Accept)
+            )],
+            "the retirement says every consumer claimed: the transaction was accepted"
+        );
+        ledger.release_resolved(&[Arc::new(Verifiable::from(retirement))]);
+        assert_eq!(ledger.len(), 0, "the retirement's finalization releases it");
+    }
+
     /// A leg that failed is the transaction's end on this shard: its
     /// finalization decides, and with nothing issued there is nothing
     /// to reclaim, so the entry goes with it — body and all — and no
@@ -2026,7 +2198,7 @@ mod tests {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(5, 60_000);
         commit(&mut ledger, &tx);
-        ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new());
+        ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new(), Vec::new());
         ledger.certify(tx.hash());
 
         let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Reject);
@@ -2053,7 +2225,7 @@ mod tests {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(6, 60_000);
         commit(&mut ledger, &tx);
-        ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new());
+        ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new(), Vec::new());
         ledger.certify(tx.hash());
         assert!(
             ledger.reclaimable().is_empty(),
@@ -2128,7 +2300,7 @@ mod tests {
             let mut ledger = UnresolvedTxs::default();
             let tx = tx(5, 60_000);
             commit(&mut ledger, &tx);
-            ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new());
+            ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new(), Vec::new());
             ledger.certify(tx.hash());
             if covered {
                 ledger.record_abandonment_records(&[AbandonmentRecord::departed(

@@ -1474,6 +1474,85 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
     );
 }
 
+/// Once the recipient's claim is on record, the sender's shard retires
+/// the record it held for it: no node, no fee, nothing moved, and the
+/// record deleted. A second retirement finds nothing and is refused
+/// before the kernel runs.
+#[test]
+fn a_retirement_deletes_the_record_and_moves_nothing() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let near_shard = trie.shard_for_prefix(alice());
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let classified = Classified::freeze(tx.legs(), tx.owners(), &trie);
+    let edge = crossings_of(tx.legs(), tx.crossings(), &classified).remove(0);
+
+    let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+    let run = |store: &MapDb, runs: Runs, reaches_beyond: bool| {
+        let ctx = TickBatchContext {
+            local_shard: near_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            transaction: &tx,
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            reaches_beyond,
+            abortable: false,
+            runs,
+            arrivals: &[],
+        };
+        executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
+    };
+
+    let sent = run(
+        &store,
+        Runs::Shape {
+            classified: classified.clone(),
+            side: Side::Issuing,
+        },
+        true,
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &sent.consensus else {
+        panic!("the sender's legs must succeed: {:?}", sent.metadata);
+    };
+    store.apply(writes);
+    assert!(store.cell(edge.record).is_some(), "the record is written");
+
+    let retired = run(
+        &store,
+        Runs::Retire {
+            classified: classified.clone(),
+        },
+        false,
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &retired.consensus else {
+        panic!("the retirement must succeed: {:?}", retired.metadata);
+    };
+    assert!(retired.escrowed.is_empty(), "a retirement issues nothing");
+    assert!(retired.fee_receipt.is_none(), "and charges nothing");
+    store.apply(writes);
+    assert!(store.cell(edge.record).is_none(), "the record is gone");
+    assert_eq!(
+        store.cell(vault_key(alice(), *XRD)),
+        Some(encode_amount(900).to_vec()),
+        "and the value stays where the claim took it"
+    );
+
+    let again = run(&store, Runs::Retire { classified }, false);
+    assert!(
+        matches!(again.consensus, ConsensusReceipt::Failed),
+        "a second retirement finds no record and is refused: {:?}",
+        again.metadata
+    );
+}
+
 /// The reclaim of a leg that never ran finds no record to reclaim from,
 /// and is refused before the kernel runs. The refusal is the sender's
 /// terminal on this shard and the one receipt left to carry the price:
