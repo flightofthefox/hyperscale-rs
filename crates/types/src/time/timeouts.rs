@@ -103,6 +103,20 @@ const _: () = assert!(
     "a leg entry dies where the record it would reclaim is swept",
 );
 
+/// The last instant a verdict may be composed against `anchor`: one
+/// [`MAX_VALIDITY_RANGE`] past it.
+///
+/// The room every abandonment gets to be committed past the deadline
+/// that opened it, and the width of every absence window — a proof
+/// taken at or past an anchor licenses a reclaim until the cell it asks
+/// about may be swept, which sits exactly this far on. A shard that
+/// holds a mirrored refusal or absence holds it this long past its
+/// anchor and no longer, since nothing is offered against it after.
+#[must_use]
+pub fn verdict_window_close(anchor: WeightedTimestamp) -> WeightedTimestamp {
+    anchor.plus(MAX_VALIDITY_RANGE)
+}
+
 /// The validity end a transaction's deadline was derived from: the
 /// inverse of [`reclaim_probe_anchor`], for a voter holding a name's
 /// deadline and no body.
@@ -339,7 +353,7 @@ mod tests {
     use super::{
         MAX_FINALIZATION_DELAY, RETENTION_HORIZON, absence_licenses_reclaim, absence_probe_ceiling,
         delivery_admissible, delivery_window_close, lapse_licenses_reclaim, lapse_probe_anchor,
-        lapse_probe_ceiling, reclaim_probe_anchor, validity_end_of,
+        lapse_probe_ceiling, reclaim_probe_anchor, validity_end_of, verdict_window_close,
     };
     use crate::{MAX_VALIDITY_RANGE, WeightedTimestamp};
 
@@ -428,6 +442,22 @@ mod tests {
             validity_end
         ));
         assert!(!lapse_licenses_reclaim(lapse_ceiling, validity_end));
+    }
+
+    /// Every absence window is one verdict window wide: it closes where a
+    /// verdict composed against its anchor could last be committed,
+    /// which is where the cell it asks about may be swept.
+    #[test]
+    fn an_absence_window_is_one_verdict_window_past_its_anchor() {
+        let validity_end = WeightedTimestamp::from_millis(60_000);
+        assert_eq!(
+            absence_probe_ceiling(validity_end),
+            verdict_window_close(reclaim_probe_anchor(validity_end))
+        );
+        assert_eq!(
+            lapse_probe_ceiling(validity_end),
+            verdict_window_close(lapse_probe_anchor(validity_end))
+        );
     }
 
     /// A probe at the validity end itself licenses nothing: a core block

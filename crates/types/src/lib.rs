@@ -218,7 +218,7 @@ pub use time::timeouts::{
     VIEW_CHANGE_TIMEOUT, VIEW_CHANGE_TIMEOUT_INCREMENT, VIEW_CHANGE_TIMEOUT_MAX,
     absence_licenses_reclaim, absence_probe_ceiling, delivery_admissible, delivery_window_close,
     lapse_licenses_reclaim, lapse_probe_anchor, lapse_probe_ceiling, leg_entry_horizon,
-    reclaim_probe_anchor, validity_end_of,
+    reclaim_probe_anchor, validity_end_of, verdict_window_close,
 };
 pub use time::timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
 pub use topology::awaiting::AwaitingTopologyBuffer;

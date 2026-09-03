@@ -22,7 +22,7 @@ use hyperscale_types::{
     ReshapeTrigger, Resolutions, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
     SplitAtBoundary, StoredReceipt, SubstateKey, TxClaim, TxOutcome, Unsettleable, UnsettledTx,
     WeightedTimestamp, WorkInFlight, derive_reshape_trigger, ready_signal_window,
-    settled_set_verdict,
+    settled_set_verdict, verdict_window_close,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -920,12 +920,12 @@ impl ShardCoordinator {
         // of: the transaction's deadline plus the room to commit the
         // record, past which nothing is offered against it.
         self.refusals
-            .retain(|_, refusal| now < refusal.deadline.plus(MAX_VALIDITY_RANGE));
+            .retain(|_, refusal| now < verdict_window_close(refusal.deadline));
         // An absence lives as long as the entry it licenses a reclaim of
         // lives past its floor: the same room, measured from the
         // deadline for a core's and from the lapse for a delivery's.
         self.absences
-            .retain(|_, absence| now < absence.floor.plus(MAX_VALIDITY_RANGE));
+            .retain(|_, absence| now < verdict_window_close(absence.floor));
     }
 
     /// The settled-transaction set this validator has acquired for a terminated

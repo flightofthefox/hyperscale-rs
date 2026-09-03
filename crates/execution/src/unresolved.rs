@@ -23,9 +23,9 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Address, Finalization, MAX_VALIDITY_RANGE, ShardId, ShardTrie,
-    SubstateKey, Transaction, TransactionDecision, TxHash, TxResolution, Unsettleable, UnsettledTx,
-    Verifiable, Verified, WeightedTimestamp, delivery_window_close, leg_entry_horizon,
+    AbandonmentRecord, AbortCharge, Address, Finalization, ShardId, ShardTrie, SubstateKey,
+    Transaction, TransactionDecision, TxHash, TxResolution, Unsettleable, UnsettledTx, Verifiable,
+    Verified, WeightedTimestamp, delivery_window_close, leg_entry_horizon, verdict_window_close,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -895,7 +895,7 @@ impl UnresolvedTxs {
             .filter(|(_, owed)| !owed.kind.is_leg())
             .filter(|(_, owed)| {
                 now >= owed.deadline
-                    && (owed.unsettled_by.is_some() || now < owed.deadline.plus(MAX_VALIDITY_RANGE))
+                    && (owed.unsettled_by.is_some() || now < verdict_window_close(owed.deadline))
             })
             .map(|(tx_hash, owed)| Abandonable {
                 tx_hash: *tx_hash,
@@ -990,7 +990,7 @@ impl UnresolvedTxs {
                     });
                     return false;
                 }
-                owed.deadline.plus(MAX_VALIDITY_RANGE) > now
+                verdict_window_close(owed.deadline) > now
             })
             .collect();
         self.owed = kept;
@@ -1035,7 +1035,7 @@ mod tests {
     };
     use hyperscale_types::{
         BlockHeight, EPOCH_DURATION, EpochWindows, LocalKey, MAX_FINALIZATION_DELAY,
-        TimestampRange, UnsettledTx, Verified, WeightedTimestamp,
+        MAX_VALIDITY_RANGE, TimestampRange, UnsettledTx, Verified, WeightedTimestamp,
     };
 
     use super::*;

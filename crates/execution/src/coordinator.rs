@@ -46,13 +46,13 @@ use hyperscale_types::{
     BlockHeight, BloomFilter, CertifiedBlock, DeclaredKey, Derivation, ExecutionCertificate,
     ExecutionCertificateVerifyError, ExecutionOutcome, ExecutionVote, Finalization,
     FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
-    MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, Mode,
-    Provisions, RETENTION_HORIZON, Refusal, ScheduleLookup, SettledSetVerdict, SettledTxSet,
-    ShardId, ShardTrie, StateAnchor, StateRoot, StoredReceipt, SubstateKey, TickId,
-    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxHash,
-    TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    absence_licenses_reclaim, derive_block_transactions, lapse_licenses_reclaim,
-    lapse_probe_anchor, settled_set_verdict, tick_leader, tick_leader_at,
+    MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, Mode, Provisions,
+    RETENTION_HORIZON, Refusal, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
+    ShardTrie, StateAnchor, StateRoot, StoredReceipt, SubstateKey, TickId, TopologySchedule,
+    TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution,
+    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, absence_licenses_reclaim,
+    derive_block_transactions, lapse_licenses_reclaim, lapse_probe_anchor, reclaim_probe_anchor,
+    settled_set_verdict, tick_leader, tick_leader_at,
 };
 use tracing::instrument;
 
@@ -859,7 +859,7 @@ impl ExecutionCoordinator {
             self.candidates.record_engagement_wait(
                 tx_hash,
                 counterparts,
-                validity_end.plus(MAX_FINALIZATION_DELAY),
+                reclaim_probe_anchor(validity_end),
             );
         }
     }

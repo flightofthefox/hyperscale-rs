@@ -37,8 +37,8 @@
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, ShardId, SubstateKey, Transaction, TxHash,
-    WeightedTimestamp,
+    MAX_UNSETTLED_PER_BLOCK, ShardId, SubstateKey, Transaction, TxHash, WeightedTimestamp,
+    reclaim_probe_anchor,
 };
 
 /// What an abort of one transaction burns, and out of whose vault.
@@ -81,9 +81,9 @@ impl UnsettledTx {
     ///
     /// The one place every figure is derived, so a proposer restating
     /// them and a voter checking the restatement compute one value: the
-    /// deadline is the validity end plus [`MAX_FINALIZATION_DELAY`], the
-    /// reservation is the declared work, and the charge is the fee vault
-    /// at the declared price.
+    /// deadline is the reclaim probe anchor, the reservation is the
+    /// declared work, and the charge is the fee vault at the declared
+    /// price.
     ///
     /// # Panics
     ///
@@ -92,10 +92,7 @@ impl UnsettledTx {
     pub fn for_transaction(tx: &Transaction) -> Self {
         Self {
             tx_hash: tx.hash(),
-            deadline: tx
-                .validity_range()
-                .end_timestamp_exclusive
-                .plus(MAX_FINALIZATION_DELAY),
+            deadline: reclaim_probe_anchor(tx.validity_range().end_timestamp_exclusive),
             declared_work: tx.work(),
             charge: AbortCharge {
                 vault: tx.fee_vault(),
