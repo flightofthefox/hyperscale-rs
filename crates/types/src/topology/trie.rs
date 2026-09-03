@@ -8,13 +8,14 @@
 
 use std::collections::BTreeSet;
 
+use hyperscale_hbor::Hbor;
 use hyperscale_vm_types::AddressClass;
 
 use crate::{Address, ShardId};
 
 /// The set of live shards, forming a complete partition of the keyspace: every
 /// infinite bit path from the root passes through exactly one leaf.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct ShardTrie {
     leaves: BTreeSet<ShardId>,
 }

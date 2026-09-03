@@ -48,7 +48,7 @@ use hyperscale_types::{
     BlockHeight, BloomFilter, CertifiedBlock, ClaimProof, DeclaredKey, Derivation,
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome, ExecutionVote,
     Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
-    MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+    LegEntry, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
     MerkleInclusionProof, Mode, Provisions, RETENTION_HORIZON, Refusal, ScheduleLookup,
     SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateAnchor, StateProofBundle, StateRoot,
     StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot, Transaction,
@@ -403,6 +403,16 @@ pub struct ExecutionCoordinator {
     /// and are empty from then on.
     replay_blocks: Vec<Verified<CertifiedBlock>>,
 
+    /// The leg entries the store held, seeded into the ledger before the
+    /// replay folds on top. A leg entry outlives the replay window, so
+    /// these are the ones the fold alone would lose; inside the window
+    /// the fold is what decides, and it overwrites what it reaches.
+    seed_entries: Vec<(LegEntry, Transaction)>,
+
+    /// The transactions the store has a row for, as this coordinator
+    /// last left it: what says which rows a commit released.
+    persisted: BTreeSet<TxHash>,
+
     /// Tick fates known but not yet emittable, each with the tick that
     /// carries its entries. Drained whenever a tick completes or a block
     /// commits.
@@ -657,6 +667,12 @@ impl ExecutionCoordinator {
             ticked: BTreeMap::new(),
             unresolved: UnresolvedTxs::default(),
             replay_blocks: recovered.replay.blocks.clone(),
+            seed_entries: recovered.leg_entries.clone(),
+            persisted: recovered
+                .leg_entries
+                .iter()
+                .map(|(entry, _)| entry.tx_hash)
+                .collect(),
             pending_tick_resolutions: Vec::new(),
             candidates: TickCandidates::new(local_shard),
             ticks: TickRegistry::new(),
@@ -991,6 +1007,31 @@ impl ExecutionCoordinator {
         topology_schedule: &TopologySchedule,
         derivation: &dyn Derivation,
     ) -> Vec<Action> {
+        // The entries the store carried past the window, before the
+        // replay: a row the fold reaches is overwritten by it, and one
+        // it does not reach is the reason the store exists.
+        let seeded: Vec<(LegEntry, Arc<Verified<Transaction>>)> =
+            std::mem::take(&mut self.seed_entries)
+                .into_iter()
+                .filter_map(|(entry, body)| {
+                    // A body nothing here can derive composes no member,
+                    // so its row is dropped rather than seeded blind.
+                    body.try_derived(derivation).ok()?;
+                    Some((
+                        entry,
+                        Arc::new(Verified::<Transaction>::from_persisted(body)),
+                    ))
+                })
+                .collect();
+        if !seeded.is_empty() {
+            tracing::info!(
+                shard = %self.local_shard,
+                entries = seeded.len(),
+                "Seeding the leg entries the restart's replay does not reach"
+            );
+            self.unresolved.seed(self.local_shard, seeded);
+        }
+
         let blocks = std::mem::take(&mut self.replay_blocks);
         if blocks.is_empty() {
             return Vec::new();
@@ -2688,6 +2729,24 @@ impl ExecutionCoordinator {
             .collect()
     }
 
+    /// Write down what this commit left the ledger holding.
+    ///
+    /// Emitted every commit rather than on a change, because what a
+    /// commit changed is spread across the fold above it and reading it
+    /// back out would be a second answer to the same question. The
+    /// entries are few — one per leg this shard still owes a record for
+    /// — and the write is what carries them past the window the replay
+    /// reaches.
+    fn persist_leg_entries(&mut self) -> Vec<Action> {
+        let held: Vec<TxHash> = self.persisted.iter().copied().collect();
+        let (entries, released) = self.unresolved.persistable(&held);
+        if entries.is_empty() && released.is_empty() {
+            return Vec::new();
+        }
+        self.persisted = entries.iter().map(|entry| entry.tx_hash).collect();
+        vec![Action::PersistLegEntries { entries, released }]
+    }
+
     /// Drop the probes whose leg entries are gone — released by the
     /// reclaim, or dropped at their horizon — and release the fetch slot
     /// of any still in flight, so a core that never serves the height
@@ -2946,6 +3005,7 @@ impl ExecutionCoordinator {
         }
         self.stamp_departures(topology_schedule);
         let unanswerable = self.unresolved.prune(self.committed_ts);
+        actions.extend(self.persist_leg_entries());
         self.release_unanswerable(&unanswerable);
         // The committed clock is what opens a leg's deadline, so the
         // cores gone silent past it are asked here.
@@ -4562,9 +4622,9 @@ mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_storage::ReplayWindow;
     use hyperscale_types::test_utils::{
-        StubVmStatics, certify as test_certify, make_leg_finalization,
-        make_live_block as helpers_make_live_block, state_and_proof, test_prefix, test_transaction,
-        test_transaction_running, test_transaction_with_prefixes,
+        StubVmStatics, certify as test_certify, make_finalization as helpers_make_finalization,
+        make_leg_finalization, make_live_block as helpers_make_live_block, state_and_proof,
+        test_prefix, test_transaction, test_transaction_running, test_transaction_with_prefixes,
     };
     use hyperscale_types::{
         AbortCharge, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
@@ -8205,6 +8265,83 @@ mod tests {
             vec![AbandonmentRecord::lapsed(PEER, later, [figures])],
             "offered as a lapse, under the anchor it was proved at"
         );
+    }
+
+    /// A leg entry outlives the window a restart replays, so the store
+    /// is what carries it: a coordinator rebuilt with no replay at all
+    /// holds the same entry, composes the same reclaim from it, and
+    /// stops holding a row for what it released.
+    #[test]
+    fn a_leg_entry_survives_a_restart_the_replay_does_not_reach() {
+        let schedule = two_shard_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let figures = UnsettledTx::for_transaction(&transaction);
+        let live = leg_state(&transaction);
+
+        let (rows, released) = live.unresolved.persistable(&[]);
+        assert!(released.is_empty(), "nothing was released");
+        let row = match rows.as_slice() {
+            [row] => row.clone(),
+            other => panic!("one leg entry is held, not {}", other.len()),
+        };
+        assert_eq!(row.tx_hash, tx_hash);
+        assert!(row.certified, "the account rides the row");
+
+        // The restart reaches no block at all: the entry is the store's
+        // to supply or it is lost.
+        let recovered = RecoveredState {
+            committed_height: BlockHeight::new(2),
+            leg_entries: vec![(row, (**transaction).clone())],
+            ..RecoveredState::default()
+        };
+        let mut restarted = ExecutionCoordinator::with_shared_stores(
+            ValidatorId::new(0),
+            HOME,
+            &recovered,
+            Arc::new(ExecCertStore::new()),
+            Arc::new(FinalizationStore::new()),
+        );
+        restarted.on_committed_state_restored(&schedule, &StubVmStatics);
+
+        assert!(
+            restarted.unresolved.contains(tx_hash),
+            "the entry the replay never reached is held"
+        );
+        assert_eq!(
+            restarted.unresolved.unsettled_leg_figures(tx_hash),
+            Some(figures),
+            "and states the same terms a record would restate for it"
+        );
+
+        // A record licenses the reclaim, and the rebuilt entry composes
+        // it — which is what the body on the row is for.
+        restarted
+            .unresolved
+            .record_abandonment_records(&[AbandonmentRecord::unclaimed(
+                PEER,
+                figures.deadline,
+                [figures],
+            )]);
+        let reclaimable = restarted.unresolved.reclaimable();
+        assert_eq!(
+            reclaimable.len(),
+            1,
+            "the rebuilt entry is the one a reclaim is composed from"
+        );
+        assert_eq!(reclaimable[0].tx_hash, tx_hash);
+
+        // Released by the finalization that decides it — the reclaim's —
+        // the row goes, and the store is told which to drop.
+        let reclaimed: Arc<Verifiable<Finalization>> = Arc::new(Verifiable::from(
+            helpers_make_finalization(BlockHeight::new(3), tx_hash, TransactionDecision::Aborted),
+        ));
+        restarted.unresolved.release_resolved(&[reclaimed]);
+        let (rows, released) = restarted.unresolved.persistable(&[tx_hash]);
+        assert!(rows.is_empty(), "nothing is held");
+        assert_eq!(released, vec![tx_hash], "and its row is dropped");
     }
 
     /// A proof this validator's fetch answered is committed content

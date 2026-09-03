@@ -1127,6 +1127,13 @@ fn safe_vote_registers_recover_their_justification() {
 /// Writes merge field-wise max and survive a coordinator "restart" —
 /// the store handle outlives the state machine, so a rebuilt machine
 /// recovers them through `load_recovered_state`.
+/// A leg entry written down reads back whole, is replaced by a second
+/// write, and goes when it is released.
+#[test]
+fn leg_entries_round_trip() {
+    test_helpers::test_leg_entries_round_trip(&SimShardStorage::default());
+}
+
 #[test]
 fn safe_vote_registers_are_monotone_and_recoverable() {
     let storage = SimShardStorage::default();

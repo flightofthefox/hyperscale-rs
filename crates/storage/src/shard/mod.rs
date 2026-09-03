@@ -12,6 +12,7 @@ pub mod chain_reader;
 pub mod chain_writer;
 pub mod dedup_window;
 pub mod genesis;
+pub mod leg_entries;
 pub mod packages;
 pub mod pending_chain;
 pub mod recovered_state;

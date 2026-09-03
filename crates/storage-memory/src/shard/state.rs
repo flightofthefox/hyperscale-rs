@@ -10,7 +10,7 @@ use hyperscale_storage::{JmtSnapshot, entry_leaf_rows, package_of_cell, sweepabl
 use hyperscale_types::{
     Address, Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt,
     EntryKey, ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash,
-    ProvisionHash, Provisions, QuorumCertificate, SafeVoteRegisters, SettledWrites,
+    LegEntry, ProvisionHash, Provisions, QuorumCertificate, SafeVoteRegisters, SettledWrites,
     ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, SweepBucket, TickId, Transaction,
     TxHash, ValidatorId,
 };
@@ -212,6 +212,9 @@ pub struct ConsensusState {
     /// production `safe_vote_registers` CF; reads ignore records whose
     /// tag differs from the current `chain_origin`.
     pub safe_vote_registers: HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>,
+    /// The leg entries this shard holds beside its chain, keyed by
+    /// transaction. See [`LegEntryStore`](hyperscale_storage::LegEntryStore).
+    pub leg_entries: BTreeMap<TxHash, LegEntry>,
 }
 
 /// Maximum number of blocks worth of receipts to retain in simulation storage.
@@ -236,6 +239,7 @@ impl ConsensusState {
             provisions: BTreeMap::new(),
             chain_origin: ChainOrigin::ROOT,
             safe_vote_registers: HashMap::new(),
+            leg_entries: BTreeMap::new(),
         }
     }
 

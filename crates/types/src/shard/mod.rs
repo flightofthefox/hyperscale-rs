@@ -36,6 +36,7 @@ pub mod evidence;
 pub mod fork_fence;
 pub mod header;
 pub mod inventory;
+pub mod leg_entry;
 pub mod limits;
 pub mod load;
 pub mod manifest;

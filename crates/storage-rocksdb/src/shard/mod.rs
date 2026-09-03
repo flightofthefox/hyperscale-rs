@@ -17,6 +17,7 @@ pub(crate) mod execution_certs;
 pub(crate) mod gc;
 pub(crate) mod jmt_snapshot_store;
 pub(crate) mod jmt_stored;
+mod leg_entries;
 pub(crate) mod metadata;
 pub(crate) mod receipts;
 pub(crate) mod recovery;
@@ -27,7 +28,7 @@ pub(crate) mod store;
 pub(crate) mod substate_key;
 pub(crate) mod sweep_key;
 pub(crate) mod versioned_key;
-pub(crate) mod vote_registers;
+mod vote_registers;
 
 #[cfg(test)]
 mod tests;

@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, CommittedTip, Hash,
-    PredecessorTerminal, Provisions, QuorumCertificate, SafeVoteRegisters, ShardAnchor, StateRoot,
-    ValidatorId, Verified, WeightedTimestamp,
+    LegEntry, PredecessorTerminal, Provisions, QuorumCertificate, SafeVoteRegisters, ShardAnchor,
+    StateRoot, Transaction, ValidatorId, Verified, WeightedTimestamp,
 };
 
 use super::dedup_window::DedupWindow;
@@ -157,6 +157,23 @@ pub struct RecoveredState {
     /// already consumed. Empty on a fresh start — including after
     /// snap-sync, where the imported store carries no signing history.
     pub safe_vote_registers: BTreeMap<ValidatorId, SafeVoteRegisters>,
+
+    /// The leg entries the store held, which seed the execution ledger
+    /// before it replays.
+    ///
+    /// A leg entry outlives the replay window — it stands until the
+    /// record cell it would take back is retired, and a record is
+    /// retired on a counterpart's evidence rather than on a clock — so
+    /// the fold alone would lose one whose block sits below the floor.
+    /// The replay folds on top of these, and inside its window the fold
+    /// is what decides.
+    ///
+    /// Each carries the body its members are composed from: a row holds
+    /// the account and the trie alone, and the legs, owners and
+    /// crossings read back off the transaction the store kept. A row
+    /// whose body is gone is not handed over — nothing could compose a
+    /// member for it.
+    pub leg_entries: Vec<(LegEntry, Transaction)>,
 }
 
 impl RecoveredState {
@@ -224,6 +241,7 @@ impl RecoveredState {
                 ChainOrigin::ROOT
             },
             safe_vote_registers: BTreeMap::new(),
+            leg_entries: Vec::new(),
         }
     }
 

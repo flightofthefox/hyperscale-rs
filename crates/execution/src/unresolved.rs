@@ -21,11 +21,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use hyperscale_engine::legs::Classified;
+use hyperscale_engine::legs::{Classified, core_claims, delivered_claims};
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Address, Finalization, ShardId, ShardTrie, SubstateKey,
-    Transaction, TransactionDecision, TxHash, TxResolution, Unsettleable, UnsettledTx, Verifiable,
-    Verified, WeightedTimestamp, delivery_window_close, leg_entry_horizon, verdict_window_close,
+    AbandonmentRecord, AbortCharge, Address, Finalization, LegEntry, LegEntryKind, LegEntryTaken,
+    ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision, TxHash, TxResolution,
+    Unsettleable, UnsettledTx, Verifiable, Verified, WeightedTimestamp, delivery_window_close,
+    leg_entry_horizon, verdict_window_close,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -218,6 +219,44 @@ impl Kind {
     const fn is_leg(self) -> bool {
         matches!(self, Self::Leg | Self::Remainder)
     }
+
+    /// This kind as the store keeps it.
+    const fn written(self) -> LegEntryKind {
+        match self {
+            Self::Whole => LegEntryKind::Whole,
+            Self::Delivery => LegEntryKind::Delivery,
+            Self::Leg => LegEntryKind::Leg,
+            Self::Remainder => LegEntryKind::Remainder,
+        }
+    }
+
+    /// A kind read back off a row.
+    const fn read(kind: LegEntryKind) -> Self {
+        match kind {
+            LegEntryKind::Whole => Self::Whole,
+            LegEntryKind::Delivery => Self::Delivery,
+            LegEntryKind::Leg => Self::Leg,
+            LegEntryKind::Remainder => Self::Remainder,
+        }
+    }
+}
+
+impl Taken {
+    /// This member as the store keeps it.
+    const fn written(self) -> LegEntryTaken {
+        match self {
+            Self::Reclaim => LegEntryTaken::Reclaim,
+            Self::Retire => LegEntryTaken::Retire,
+        }
+    }
+
+    /// A member read back off a row.
+    const fn read(taken: LegEntryTaken) -> Self {
+        match taken {
+            LegEntryTaken::Reclaim => Self::Reclaim,
+            LegEntryTaken::Retire => Self::Retire,
+        }
+    }
 }
 
 /// What an entry that may be reclaimed keeps beside its account: a leg
@@ -367,6 +406,96 @@ impl UnresolvedTxs {
                 claimed_by: BTreeSet::new(),
             };
             self.owed.entry(tx.hash()).or_insert(owed);
+        }
+    }
+
+    /// The leg entries this ledger holds, in the form the store keeps
+    /// them, and the transactions it no longer holds among `held`.
+    ///
+    /// The pair a commit hands the store: every live leg entry, and
+    /// every hash the store still has a row for that the ledger has
+    /// released. A whole entry is never written down — its fate is its
+    /// own deadline's, and no deadline outlives the window the replay
+    /// reaches.
+    #[must_use]
+    pub fn persistable(&self, held: &[TxHash]) -> (Vec<LegEntry>, Vec<TxHash>) {
+        let rows: Vec<LegEntry> = self
+            .owed
+            .iter()
+            .filter(|(_, owed)| owed.kind.is_leg())
+            .filter_map(|(tx_hash, owed)| {
+                let kept = self.kept.get(tx_hash)?;
+                Some(LegEntry {
+                    tx_hash: *tx_hash,
+                    deadline: owed.deadline,
+                    declared_work: owed.declared_work,
+                    charge: owed.charge,
+                    committed_ts: owed.committed_ts,
+                    remote_prefixes: owed.remote_prefixes.clone(),
+                    certified: owed.certified,
+                    charged: owed.charged,
+                    kind: owed.kind.written(),
+                    taken: owed.taken.map(Taken::written),
+                    unsettled_by: owed.unsettled_by,
+                    evidence: owed.evidence,
+                    claimed_by: owed.claimed_by.clone(),
+                    trie: kept.classified.trie().clone(),
+                })
+            })
+            .collect();
+        let released = held
+            .iter()
+            .filter(|tx_hash| !self.owed.contains_key(tx_hash))
+            .copied()
+            .collect();
+        (rows, released)
+    }
+
+    /// Seed the ledger with the entries the store held.
+    ///
+    /// Runs before the replay, which folds on top: inside the window the
+    /// replay reaches, the fold is what decides, and a row for a
+    /// transaction it re-registers is overwritten by the same figures.
+    /// A row whose body the store no longer holds is dropped — nothing
+    /// could compose a member for it.
+    pub fn seed(
+        &mut self,
+        local_shard: ShardId,
+        entries: Vec<(LegEntry, Arc<Verified<Transaction>>)>,
+    ) {
+        for (entry, body) in entries {
+            let classified = Classified::freeze(body.legs(), body.owners(), &entry.trie);
+            let core = classified.core().clone();
+            self.owed.insert(
+                entry.tx_hash,
+                Owed {
+                    deadline: entry.deadline,
+                    declared_work: entry.declared_work,
+                    charge: entry.charge,
+                    committed_ts: entry.committed_ts,
+                    remote_prefixes: entry.remote_prefixes,
+                    certified: entry.certified,
+                    charged: entry.charged,
+                    kind: Kind::read(entry.kind),
+                    taken: entry.taken.map(Taken::read),
+                    unsettled_by: entry.unsettled_by,
+                    evidence: entry.evidence,
+                    claimed_by: entry.claimed_by,
+                },
+            );
+            let deliveries =
+                delivered_claims(body.legs(), body.crossings(), &classified, local_shard);
+            let claims = core_claims(body.legs(), body.crossings(), &classified, local_shard);
+            self.kept.insert(
+                entry.tx_hash,
+                Kept {
+                    body,
+                    classified,
+                    core,
+                    deliveries,
+                    claims,
+                },
+            );
         }
     }
 

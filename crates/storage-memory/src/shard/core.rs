@@ -190,6 +190,16 @@ impl SimShardStorage {
             .map(|(validator, (_, registers))| (*validator, registers.clone()))
             .collect();
         let retained_provisions = c.provisions.values().map(Arc::clone).collect();
+        // A row whose body the store no longer holds composes no
+        // member, so it is not handed over.
+        let leg_entries = c
+            .leg_entries
+            .values()
+            .filter_map(|entry| {
+                let body = c.transactions.get(&entry.tx_hash)?;
+                Some((entry.clone(), body.clone()))
+            })
+            .collect();
         drop(c);
 
         RecoveredState {
@@ -228,6 +238,7 @@ impl SimShardStorage {
                 .unwrap_or(0),
             chain_origin,
             safe_vote_registers,
+            leg_entries,
         }
     }
 

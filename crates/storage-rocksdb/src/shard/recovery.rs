@@ -4,10 +4,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_metrics::record_storage_operation;
-use hyperscale_storage::{DedupWindow, RecoveredState, SubstateStore, replay_window};
+use hyperscale_storage::{
+    DedupWindow, LegEntryStore, RecoveredState, SubstateStore, replay_window,
+};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, CommittedTip, Hash,
-    Provisions, SafeVoteRegisters, ShardWitnessPayload, ValidatorId, WeightedTimestamp,
+    LegEntry, Provisions, SafeVoteRegisters, ShardWitnessPayload, Transaction, TxHash, ValidatorId,
+    WeightedTimestamp,
 };
 
 use super::column_families::{BeaconWitnessesCf, BlocksCf, ProvisionsCf, SafeVoteRegistersCf};
@@ -104,6 +107,7 @@ impl RocksDbShardStorage {
                 .unwrap_or(0),
             chain_origin,
             safe_vote_registers: self.load_safe_vote_registers(chain_origin),
+            leg_entries: self.recovered_leg_entries(),
         }
     }
 
@@ -111,6 +115,26 @@ impl RocksDbShardStorage {
     /// the store's current origin. Records inherited through a
     /// checkpoint-seeded child store carry the parent's origin and are
     /// excluded — the child chain's round numbering is unrelated.
+    /// The leg entries the store holds, each with the body its members
+    /// are composed from. A row whose body is gone composes nothing, so
+    /// it is left behind.
+    fn recovered_leg_entries(&self) -> Vec<(LegEntry, Transaction)> {
+        let entries = self.leg_entries();
+        let hashes: Vec<TxHash> = entries.iter().map(|entry| entry.tx_hash).collect();
+        let bodies: BTreeMap<TxHash, Transaction> = self
+            .get_transactions_batch(&hashes)
+            .into_iter()
+            .map(|tx| (tx.hash(), tx))
+            .collect();
+        entries
+            .into_iter()
+            .filter_map(|entry| {
+                let body = bodies.get(&entry.tx_hash)?.clone();
+                Some((entry, body))
+            })
+            .collect()
+    }
+
     fn load_safe_vote_registers(
         &self,
         origin: ChainOrigin,

@@ -20,24 +20,25 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts,
     BlockHeight, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId, ConsensusReceipt,
     EntryKey, EntryLeaf, Epoch, Event, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome,
-    FeeSummary, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel,
-    MerkleInclusionProof, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp,
-    ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, Randomness,
-    RatifyCert, RatifyRound, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor,
-    ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
-    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint,
-    TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources, WorkInFlight,
-    compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
+    FeeSummary, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LegEntry, LegEntryKind,
+    LocalKey, LogLevel, MerkleInclusionProof, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof,
+    ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions,
+    QuorumCertificate, Randomness, RatifyCert, RatifyRound, Round, SWEEP_BUCKET_MS,
+    SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId, ShardTrie, ShardWitnessPayload,
+    SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt,
+    SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, Transaction,
+    TransactionDecision, TxHash, TxOutcome, UnsettledTx, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, WitnessSources, WorkInFlight, compute_global_receipt_root,
+    compute_merkle_root, entry_leaf_key,
 };
 
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
     Anchored, BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, JmtSnapshot,
-    ParentAnchor, RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
-    SubstateStore, Substates, SweepIndex, VersionedStore, WitnessSeed, committed_tx_cell_key,
-    committed_tx_cells, sweep_for_block,
+    LegEntryStore, ParentAnchor, RecoveredState, SafeVoteRegisterStore, ShardChainReader,
+    ShardChainWriter, SubstateStore, Substates, SweepIndex, VersionedStore, WitnessSeed,
+    committed_tx_cell_key, committed_tx_cells, sweep_for_block,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -1473,6 +1474,61 @@ fn commit_block_with_provisions(storage: &impl ShardChainWriter, height: u64) ->
         .hash();
     storage.commit_block(&make_test_certified(block), &[], &empty_witness());
     hash
+}
+
+/// Shared storage test: a leg entry written down reads back whole, a
+/// second write for the same transaction replaces it, and a release
+/// drops it.
+///
+/// The store is what carries an entry past the window the replay
+/// reaches, so what it returns has to be the entry the ledger wrote and
+/// not a projection of it.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_leg_entries_round_trip(storage: &impl LegEntryStore) {
+    use std::collections::BTreeSet;
+
+    use hyperscale_types::test_utils::{stub_abort_charge, test_principal};
+
+    let entry = |seed: u8, certified: bool| LegEntry {
+        tx_hash: TxHash::from(Hash::from_bytes(&[seed; 32])),
+        deadline: WeightedTimestamp::from_millis(u64::from(seed) * 1_000),
+        declared_work: u64::from(seed) * 7,
+        charge: stub_abort_charge(seed),
+        committed_ts: WeightedTimestamp::from_millis(u64::from(seed) * 100),
+        remote_prefixes: BTreeSet::from([test_principal(seed).into()]),
+        certified,
+        charged: false,
+        kind: LegEntryKind::Leg,
+        taken: None,
+        unsettled_by: None,
+        evidence: None,
+        claimed_by: BTreeSet::from([ShardId::leaf(1, 1)]),
+        trie: ShardTrie::uniform(1),
+    };
+
+    storage.persist_leg_entries(&[entry(1, false), entry(2, false)], &[]);
+    assert_eq!(
+        storage.leg_entries(),
+        vec![entry(1, false), entry(2, false)],
+        "both rows read back whole, in transaction order",
+    );
+
+    storage.persist_leg_entries(&[entry(1, true)], &[]);
+    assert_eq!(
+        storage.leg_entries(),
+        vec![entry(1, true), entry(2, false)],
+        "a second write for one transaction replaces its row",
+    );
+
+    storage.persist_leg_entries(&[], &[entry(2, false).tx_hash]);
+    assert_eq!(
+        storage.leg_entries(),
+        vec![entry(1, true)],
+        "a released entry leaves no row",
+    );
 }
 
 /// Shared recovery test: a durable lock comes back with the certificate

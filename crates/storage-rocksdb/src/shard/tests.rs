@@ -9,10 +9,10 @@ use hyperscale_storage::test_helpers::{
     test_a_legs_own_finalization_keeps_the_floor, test_committed_bundle_outlives_sealing,
     test_ec_storage_batch as helpers_test_ec_storage_batch,
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
-    test_entries_commit_serve_and_history, test_prepared_commit_writes_committed_cells,
-    test_recovery_carries_the_tip_drain_total, test_registers_recover_their_justification,
-    test_retained_bundle_drops_below_the_history_floor, test_sweep_index_tracks_the_leaves,
-    test_sweep_stops_at_the_ceiling_or_the_cap,
+    test_entries_commit_serve_and_history, test_leg_entries_round_trip,
+    test_prepared_commit_writes_committed_cells, test_recovery_carries_the_tip_drain_total,
+    test_registers_recover_their_justification, test_retained_bundle_drops_below_the_history_floor,
+    test_sweep_index_tracks_the_leaves, test_sweep_stops_at_the_ceiling_or_the_cap,
     test_tx_index_answers_with_the_local_shards_certificate,
     test_undischarged_record_holds_the_floor, test_unresolved_fold,
     test_widest_tick_copy_holds_the_slot,
@@ -1555,6 +1555,15 @@ fn safe_vote_registers_recover_their_justification() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     test_registers_recover_their_justification(&storage, || storage.load_recovered_state());
+}
+
+/// A leg entry written down reads back whole, is replaced by a second
+/// write, and goes when it is released.
+#[test]
+fn leg_entries_round_trip() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_leg_entries_round_trip(&storage);
 }
 
 /// Persisted registers read back, survive a reopen, and land in

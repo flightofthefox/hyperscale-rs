@@ -5,9 +5,9 @@
 
 use hyperscale_types::{
     Address, BlockHeight, BlockMetadata, ChainOrigin, ConsensusReceipt, EntryKey,
-    ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash,
-    Provisions, SafeVoteRegisters, ShardWitnessPayload, SubstateKey, SweepBucket, TickId,
-    Transaction, ValidatorId,
+    ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash, LegEntry,
+    ProvisionHash, Provisions, SafeVoteRegisters, ShardWitnessPayload, SubstateKey, SweepBucket,
+    TickId, Transaction, ValidatorId,
 };
 use rocksdb::{ColumnFamily, DB};
 
@@ -144,6 +144,9 @@ pub const SUBSTATE_BYTES_CF: &str = "substate_bytes";
 /// leaves the process.
 pub const SAFE_VOTE_REGISTERS_CF: &str = "safe_vote_registers";
 
+/// Leg entries a shard holds beside its chain, keyed by transaction.
+pub const LEG_ENTRIES_CF: &str = "leg_entries";
+
 /// Column family staging verified snap-sync chunks before finalize.
 ///
 /// Key: the substate key's 32 bytes — its JMT leaf key, so the bytewise
@@ -222,6 +225,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     BEACON_WITNESSES_CF,
     SUBSTATE_BYTES_CF,
     SAFE_VOTE_REGISTERS_CF,
+    LEG_ENTRIES_CF,
     IMPORT_STAGING_CF,
     PROVISIONS_CF,
     PACKAGE_ARTIFACTS_CF,
@@ -255,6 +259,7 @@ pub struct CfHandles<'a> {
     beacon_witnesses: &'a ColumnFamily,
     substate_bytes: &'a ColumnFamily,
     safe_vote_registers: &'a ColumnFamily,
+    leg_entries: &'a ColumnFamily,
     import_staging: &'a ColumnFamily,
     provisions: &'a ColumnFamily,
     package_artifacts: &'a ColumnFamily,
@@ -290,6 +295,7 @@ impl<'a> CfHandles<'a> {
             beacon_witnesses: resolve(BEACON_WITNESSES_CF),
             substate_bytes: resolve(SUBSTATE_BYTES_CF),
             safe_vote_registers: resolve(SAFE_VOTE_REGISTERS_CF),
+            leg_entries: resolve(LEG_ENTRIES_CF),
             import_staging: resolve(IMPORT_STAGING_CF),
             package_artifacts: resolve(PACKAGE_ARTIFACTS_CF),
             sweep_index: resolve(SWEEP_INDEX_CF),
@@ -739,6 +745,20 @@ impl DbCodec<(ChainOrigin, SafeVoteRegisters)> for SafeVoteRegisterRecordCodec {
         let registers =
             HborCodec::<SafeVoteRegisters>::default().decode(&bytes[CHAIN_ORIGIN_BYTES..]);
         (origin, registers)
+    }
+}
+
+/// Leg entries beside the chain; see [`LEG_ENTRIES_CF`].
+pub struct LegEntriesCf;
+impl TypedCf for LegEntriesCf {
+    const NAME: &'static str = LEG_ENTRIES_CF;
+    type Key = Hash;
+    type Value = LegEntry;
+    type KeyCodec = HashCodec;
+    type ValueCodec = HborCodec<LegEntry>;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.leg_entries
     }
 }
 

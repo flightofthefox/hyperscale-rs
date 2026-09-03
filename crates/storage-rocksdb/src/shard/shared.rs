@@ -14,13 +14,13 @@ use std::sync::Arc;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::{
     AdoptSource, BlockForSync, BoundaryStore, GenesisCommit, ImportProgress, JmtSnapshot,
-    PackageArtifactStore, ParentAnchor, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
-    SubstateStore, Substates, SweepIndex, VersionedStore, WitnessSeed,
+    LegEntryStore, PackageArtifactStore, ParentAnchor, SafeVoteRegisterStore, ShardChainReader,
+    ShardChainWriter, SubstateStore, Substates, SweepIndex, VersionedStore, WitnessSeed,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, DeclaredRange, ExecutionCertificate,
-    Finalization, FinalizationHash, Hash, PreparedCommit, Provisions, QuorumCertificate,
+    Finalization, FinalizationHash, Hash, LegEntry, PreparedCommit, Provisions, QuorumCertificate,
     SafeVoteRegisters, SettledWrites, ShardWitnessPayload, StateRoot, SubstateKey, SubstateLeaf,
     SweepFrontier, TickId, Transaction, TxHash, ValidatorId, Verifiable, Verified,
 };
@@ -244,6 +244,16 @@ impl ShardChainWriter for SharedStorage {
         witness: &BeaconWitnessCommit,
     ) -> StateRoot {
         self.0.commit_block(certified, removals, witness)
+    }
+}
+
+impl LegEntryStore for SharedStorage {
+    fn persist_leg_entries(&self, entries: &[LegEntry], released: &[TxHash]) {
+        self.0.persist_leg_entries(entries, released);
+    }
+
+    fn leg_entries(&self) -> Vec<LegEntry> {
+        self.0.leg_entries()
     }
 }
 
