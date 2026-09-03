@@ -20,7 +20,7 @@ use thiserror::Error;
 
 use crate::transaction::vm::{Derivation, ProtocolVerifier, SchemeVerifier};
 use crate::{
-    DeclaredKey, DerivationError, Derived, EnvelopeExt, Hash, LocalKey, MAX_TX_BYTES_LEN,
+    Address, DeclaredKey, DerivationError, Derived, EnvelopeExt, Hash, LocalKey, MAX_TX_BYTES_LEN,
     NetworkId, PrincipalAddr, Routing, ShardId, ShardTrie, SubstateKey, TimestampRange,
     TransactionEnvelope, TxHash, Verified, Verify, protocol_statics,
 };
@@ -211,6 +211,17 @@ impl Transaction {
     #[must_use]
     pub fn legs(&self) -> &[LegShape] {
         &self.derived().legs
+    }
+
+    /// The parties the routing declares beyond any node's frame: the
+    /// fee payer and every signer.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn owners(&self) -> &[Address] {
+        &self.derived().owners
     }
 
     /// The record cell of every value edge, in (node, output) order.
@@ -730,6 +741,7 @@ mod tests {
                 // binds the signer to the payer field — every stubbed
                 // transaction's payer admits its signer.
                 signer: vm.fee_payer,
+                owners: vec![vm.fee_payer.address()],
                 fee_vault_local: [0xEE; 16],
                 auth_cell_local: [0xAE; 16],
                 routing: Routing {

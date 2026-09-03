@@ -791,7 +791,7 @@ impl ExecutionCoordinator {
         let members: Vec<CommittedMember> = members
             .into_iter()
             .map(|(tx, participating)| CommittedMember {
-                classified: Classified::freeze(tx.legs(), trie),
+                classified: Classified::freeze(tx.legs(), tx.owners(), trie),
                 tx,
                 participating,
             })
@@ -8325,7 +8325,7 @@ mod tests {
             leg(0, LegRole::Inbound, &[]),
             leg(2, LegRole::Core, &[(0, 0)]),
         ];
-        let classified = Classified::freeze(&legs, &ShardTrie::uniform(1));
+        let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(1));
         assert_eq!(classified.core(), &BTreeSet::from([PEER]));
         classified
     }
@@ -8340,7 +8340,7 @@ mod tests {
             leg(0, LegRole::Inbound, &[]),
             leg(3, LegRole::Core, &[(0, 0)]),
         ];
-        let classified = Classified::freeze(&legs, &ShardTrie::uniform(2));
+        let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(2));
         assert_eq!(classified.core(), &BTreeSet::from([ShardId::leaf(2, 3)]));
         classified
     }

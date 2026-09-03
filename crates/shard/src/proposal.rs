@@ -298,7 +298,7 @@ pub fn late_deliveries<T: Deref<Target = Transaction>>(
     let trie = snapshot.shard_trie();
     txs.iter()
         .filter(|tx| anchor >= tx.validity_range().end_timestamp_exclusive)
-        .filter(|tx| Classified::freeze(tx.legs(), trie).delivers_at(local_shard))
+        .filter(|tx| Classified::freeze(tx.legs(), tx.owners(), trie).delivers_at(local_shard))
         .map(|tx| tx.hash())
         .collect()
 }

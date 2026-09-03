@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use hyperscale_types::{EscrowedValue, ShardId, ShardTrie};
+use hyperscale_types::{Address, EscrowedValue, ShardId, ShardTrie};
 use hyperscale_vm_effects::{CrossingSite, StarShape, star_at};
 use hyperscale_vm_kernel::{Crossed, ExecutionScope, LegPlan, PlanTooWide, Reclaim};
 use hyperscale_vm_types::{Crossing, LegRole, LegShape, ProtocolHasher, SubstateKey};
@@ -113,10 +113,11 @@ impl Classified {
     /// and every replica committing the transaction under one trie
     /// freezes one shape.
     #[must_use]
-    pub fn freeze(legs: &[LegShape], trie: &ShardTrie) -> Self {
+    pub fn freeze(legs: &[LegShape], owners: &[Address], trie: &ShardTrie) -> Self {
         let trie = Arc::new(trie.clone());
         let star = star_of(legs, &trie);
-        let decomposed = Decomposed(star.decomposes(legs, &TrieShardResolver { trie: &trie }));
+        let decomposed =
+            Decomposed(star.decomposes(legs, owners, &TrieShardResolver { trie: &trie }));
         let core: BTreeSet<ShardId> = star
             .core
             .iter()
@@ -341,11 +342,12 @@ fn leg_outputs(legs: &[LegShape], node: u32) -> impl Iterator<Item = u32> + '_ {
 /// bundle to itself. Running whole is always correct, so such a shape
 /// takes that.
 #[must_use]
-pub fn decomposes(legs: &[LegShape], trie: &ShardTrie) -> Decomposed {
+pub fn decomposes(legs: &[LegShape], owners: &[Address], trie: &ShardTrie) -> Decomposed {
     let resolver = TrieShardResolver { trie };
     let star = star_at(legs, &resolver);
     Decomposed(
-        star.decomposes(legs, &resolver) && no_sink_is_fed_from_both_sides(legs, &star, trie),
+        star.decomposes(legs, owners, &resolver)
+            && no_sink_is_fed_from_both_sides(legs, &star, trie),
     )
 }
 
@@ -951,7 +953,7 @@ mod tests {
     }
 
     fn frozen(legs: &[LegShape]) -> Classified {
-        let classified = Classified::freeze(legs, &trie());
+        let classified = Classified::freeze(legs, &[], &trie());
         assert!(
             classified.decomposed().holds(),
             "the fixture has to decompose"
@@ -1160,7 +1162,7 @@ mod tests {
         let legs = swap();
         let divided = frozen(&legs);
         let elsewhere = ShardTrie::uniform(2);
-        let divided_deeper = Classified::freeze(&legs, &elsewhere);
+        let divided_deeper = Classified::freeze(&legs, &[], &elsewhere);
         assert!(divided_deeper.decomposed().holds());
         // Under a four-leaf trie the low owners sit at path 0 and the
         // venue at path 2, so leaf 1 runs nothing.
@@ -1306,7 +1308,7 @@ mod tests {
             crossing(&legs, 2, 0),
             crossing(&legs, 3, 0),
         ];
-        let classified = Classified::freeze(&legs, &trie);
+        let classified = Classified::freeze(&legs, &[], &trie);
         assert!(classified.decomposed().holds());
         assert_eq!(classified.core(), &BTreeSet::from([leaf0, leaf2]));
         let edges = crossings_of(&legs, &crossings, &classified);
@@ -1391,10 +1393,10 @@ mod tests {
             leg(alice, LegRole::Inbound, &[], 3),
             leg(alice, LegRole::Outbound, &[(2, 0), (3, 0)], 4),
         ];
-        assert!(!decomposes(&legs, &trie()).holds());
+        assert!(!decomposes(&legs, &[], &trie()).holds());
         let mut one_sided = legs;
         one_sided[4] = leg(alice, LegRole::Outbound, &[(2, 0)], 4);
         one_sided[3] = leg(alice, LegRole::Outbound, &[], 3);
-        assert!(decomposes(&one_sided, &trie()).holds());
+        assert!(decomposes(&one_sided, &[], &trie()).holds());
     }
 }

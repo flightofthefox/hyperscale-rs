@@ -1236,7 +1236,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
-    let divided = Classified::freeze(tx.legs(), &trie);
+    let divided = Classified::freeze(tx.legs(), tx.owners(), &trie);
     assert!(divided.decomposed().holds(), "a transfer decomposes");
     assert_eq!(core_shards(tx.legs(), &trie), BTreeSet::from([near_shard]));
 
@@ -1309,7 +1309,7 @@ fn a_transfer_executes_divided_on_both_shards() {
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
-    let classified = Classified::freeze(tx.legs(), &trie);
+    let classified = Classified::freeze(tx.legs(), tx.owners(), &trie);
     assert!(classified.decomposed().holds());
     let edge = crossings_of(tx.legs(), tx.crossings(), &classified).remove(0);
 
@@ -1403,7 +1403,7 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
-    let classified = Classified::freeze(tx.legs(), &trie);
+    let classified = Classified::freeze(tx.legs(), tx.owners(), &trie);
     assert!(classified.decomposed().holds());
     let edge = crossings_of(tx.legs(), tx.crossings(), &classified).remove(0);
 
@@ -1507,7 +1507,7 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
             reaches_beyond: false,
             abortable: false,
             runs: Runs::Reclaim {
-                classified: Classified::freeze(tx.legs(), &trie),
+                classified: Classified::freeze(tx.legs(), tx.owners(), &trie),
                 charged,
             },
             arrivals: &[],

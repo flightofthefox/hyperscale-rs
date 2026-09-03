@@ -903,7 +903,7 @@ impl MempoolCoordinator {
     ) -> WeightedTimestamp {
         let validity_end = tx.validity_range().end_timestamp_exclusive;
         let delivers = cross_shard
-            && Classified::freeze(tx.legs(), topology_snapshot.shard_trie())
+            && Classified::freeze(tx.legs(), tx.owners(), topology_snapshot.shard_trie())
                 .delivers_at(self.local_shard);
         if delivers {
             delivery_window_close(validity_end)

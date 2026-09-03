@@ -284,6 +284,10 @@ pub struct Derived {
     /// Each manifest node's placement-free shape, in node order. Empty
     /// for a publish, which has no manifest to divide.
     pub legs: Vec<LegShape>,
+    /// The parties the routing declares beyond any node's frame — the
+    /// fee payer and every signer — which the classifier holds to some
+    /// member's scope before it divides the shape. Sorted and unique.
+    pub owners: Vec<Address>,
     /// The record cell of every value edge, in (node, output) order.
     ///
     /// Every edge, not only the ones that turn out to cross: which cross

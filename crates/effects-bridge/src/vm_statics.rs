@@ -42,6 +42,28 @@ use crate::records::{
     InstanceCache, LocalCells, NodeRecords, PackageCache, committed_package, sweepable_cell,
 };
 
+/// The parties a transaction's routing declares beyond any node's
+/// frame: the payer, whose vault the reservation and the burn reach,
+/// and every signer, whose nullifier a bound subintent writes. Sorted
+/// and unique, so two derivations of one envelope agree byte for byte.
+fn route_owners(
+    vm: &TransactionEnvelope,
+    signer: PrincipalAddr,
+    admitted: &AdmittedTree,
+) -> Vec<Address> {
+    [vm.fee_payer.address(), signer.address()]
+        .into_iter()
+        .chain(
+            admitted
+                .subintents
+                .iter()
+                .map(|record| record.signer.address()),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// The footprint of the cells a transaction's value edges write.
 ///
 /// The record under the producer and the claim under the consumer, each
@@ -504,8 +526,13 @@ impl BridgeStatics {
             work,
             footprint,
             // No manifest, so nothing to divide, nothing crossing, and no
-            // subintent bound.
+            // subintent bound; the publisher pays and signs.
             legs: Vec::new(),
+            owners: [publisher.address(), signer.address()]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
             crossings: Vec::new(),
             nullifiers: Vec::new(),
             signer,
@@ -723,6 +750,7 @@ impl Derivation for BridgeStatics {
                 .iter()
                 .map(|record| record.nullifier)
                 .collect(),
+            owners: route_owners(vm, signer, &admitted),
             signer,
             routing: Routing {
                 read_prefixes: prefixes(&read_keys),

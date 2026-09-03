@@ -1060,7 +1060,7 @@ mod tests {
             leg(0, LegRole::Inbound, &[]),
             leg(2, LegRole::Core, &[(0, 0)]),
         ];
-        let classified = Classified::freeze(&legs, &ShardTrie::uniform(1));
+        let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(1));
         assert_eq!(classified.core(), &BTreeSet::from([PARTNER]));
         classified
     }
