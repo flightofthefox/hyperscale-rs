@@ -442,12 +442,13 @@ pub fn crossings_of(
 /// The claim cells the deliveries of `local`'s issued crossings write,
 /// each under the shard that delivers it.
 ///
-/// For every crossing an inbound leg here produces whose consumer is an
-/// outbound leg on another shard: that consumer's claim cell and its
-/// home. A delivery that never claimed leaves exactly this cell absent,
-/// which is what a lapse probe asks the delivering shard about. Empty
-/// when the shape runs whole, since nothing is then handed between
-/// shards.
+/// For every crossing a node here produces — an inbound leg's, or the
+/// core's on a core shard — whose consumer is an outbound leg on another
+/// shard: that consumer's claim cell and its home. A delivery that never
+/// claimed leaves exactly this cell absent, which is what a lapse probe
+/// asks the delivering shard about, and the crossing is then the
+/// producer's to take back. Empty when the shape runs whole, since
+/// nothing is then handed between shards.
 #[must_use]
 pub fn delivered_claims(
     legs: &[LegShape],
@@ -463,7 +464,7 @@ pub fn delivered_claims(
         .iter()
         .filter_map(|crossing| {
             let producer = star.leg(crossing.node).ok()?;
-            if star.role(crossing.node) != LegRole::Inbound || star.home(crossing.node) != local {
+            if star.role(crossing.node) == LegRole::Outbound || star.home(crossing.node) != local {
                 return None;
             }
             let consumer = star.consumer_of(crossing.node, crossing.output)?;
@@ -530,15 +531,6 @@ pub enum PlanDefect {
     /// not run, and nothing attested arrived for it.
     #[error("nothing arrived for edge ({node}, {output})")]
     MissingArrival {
-        /// The producing node.
-        node: u32,
-        /// Which of its outputs.
-        output: u32,
-    },
-    /// A producer this shard runs sends an edge off it, and its frame
-    /// reserved no single cell for the value to leave from.
-    #[error("edge ({node}, {output}) departs from no reserved cell")]
-    NoOrigin {
         /// The producing node.
         node: u32,
         /// Which of its outputs.
@@ -637,17 +629,6 @@ pub fn plan_for_shard(
         if runs_here(consumer) {
             continue;
         }
-        // Only an inbound leg's crossing is ever reclaimed, so only an
-        // inbound leg's crossing has to name the cell a reclaim credits —
-        // and it has to name one now, before anything is issued that
-        // could not be taken back. A core's crossing — minted, or drawn
-        // from several cells — names none, and nobody takes it back.
-        if star.role(crossing.node) == LegRole::Inbound && crossing.origin.is_none() {
-            return Err(PlanDefect::NoOrigin {
-                node: crossing.node,
-                output: crossing.output,
-            });
-        }
         let record = CrossingSite::record(
             &ProtocolHasher,
             producer.target,
@@ -664,12 +645,14 @@ pub fn plan_for_shard(
     })
 }
 
-/// What `local` takes back of a transaction whose core will never claim
-/// it: every crossing an inbound leg here issued, claimed by that leg's
-/// own target.
+/// What `local` takes back of a transaction whose consumer will never
+/// claim it.
 ///
-/// Only an inbound leg's crossings are ever reclaimed. Outbound value was
-/// issued by a core that already committed, and nobody may take it back.
+/// Every crossing a node here issued to a consumer elsewhere, claimed by
+/// the producer's own target and credited to the cell its record names.
+/// An inbound leg's crossing is taken back when its core refuses or
+/// never answers; a core's, when the delivery it was issued to lapses.
+/// Both credit the cell the record names, so neither needs the body.
 ///
 /// # Errors
 ///
@@ -689,7 +672,7 @@ pub fn reclaim_for_shard(
     let mut reclaimed = false;
     for crossing in crossings {
         let producer = star.leg(crossing.node)?;
-        if star.role(crossing.node) != LegRole::Inbound || star.home(crossing.node) != local {
+        if star.role(crossing.node) == LegRole::Outbound || star.home(crossing.node) != local {
             continue;
         }
         let Some(consumer) = star.consumer_of(crossing.node, crossing.output) else {
@@ -698,10 +681,6 @@ pub fn reclaim_for_shard(
         if star.running(consumer).contains(&local) {
             continue;
         }
-        let origin = crossing.origin.ok_or(PlanDefect::NoOrigin {
-            node: crossing.node,
-            output: crossing.output,
-        })?;
         let claim = CrossingSite::claim(
             &ProtocolHasher,
             producer.target,
@@ -716,7 +695,6 @@ pub fn reclaim_for_shard(
             Reclaim {
                 record: crossing.record,
                 claim,
-                origin,
             },
         )?;
         reclaimed = true;
@@ -906,7 +884,7 @@ mod tests {
         }
     }
 
-    fn crossing(legs: &[LegShape], node: u32, output: u32, origin: bool) -> Crossing {
+    fn crossing(legs: &[LegShape], node: u32, output: u32) -> Crossing {
         let producer = &legs[node as usize];
         Crossing {
             node,
@@ -920,7 +898,6 @@ mod tests {
                 producer.expiry_ms,
             )
             .key(),
-            origin: origin.then(|| cell(producer.target, 1)),
         }
     }
 
@@ -989,7 +966,7 @@ mod tests {
     #[test]
     fn delivered_claims_name_the_deliveries_of_what_a_shard_issued() {
         let legs = transfer();
-        let crossings = [crossing(&legs, 1, 0, true)];
+        let crossings = [crossing(&legs, 1, 0)];
         let bob = owner(0x22, true);
         let expected = CrossingSite::claim(
             &ProtocolHasher,
@@ -1014,7 +991,7 @@ mod tests {
         );
 
         let swap = swap();
-        let crossings = [crossing(&swap, 1, 0, true), crossing(&swap, 2, 0, false)];
+        let crossings = [crossing(&swap, 1, 0), crossing(&swap, 2, 0)];
         assert!(
             delivered_claims(&swap, &crossings, &frozen(&swap), low()).is_empty(),
             "a crossing the core consumes is answered by the core, not a delivery",
@@ -1029,9 +1006,7 @@ mod tests {
             .expect("a whole plan needs nothing");
         assert!(plan.legs.is_whole());
         assert!(plan.scope.covers(owner(0x22, true)));
-        assert!(
-            crossings_of(&legs, &[crossing(&legs, 1, 0, true)], &Classified::whole()).is_empty()
-        );
+        assert!(crossings_of(&legs, &[crossing(&legs, 1, 0)], &Classified::whole()).is_empty());
     }
 
     /// A transfer plans one inbound leg on the sender's shard and one
@@ -1039,7 +1014,7 @@ mod tests {
     #[test]
     fn a_transfer_divides_into_an_inbound_and_an_outbound_leg() {
         let legs = transfer();
-        let crossings = vec![crossing(&legs, 1, 0, true)];
+        let crossings = vec![crossing(&legs, 1, 0)];
         let divided = frozen(&legs);
 
         let edges = crossings_of(&legs, &crossings, &divided);
@@ -1082,7 +1057,7 @@ mod tests {
     #[test]
     fn a_swap_keeps_the_core_on_the_venue_alone() {
         let legs = swap();
-        let crossings = vec![crossing(&legs, 1, 0, true), crossing(&legs, 2, 0, true)];
+        let crossings = vec![crossing(&legs, 1, 0), crossing(&legs, 2, 0)];
         let divided = frozen(&legs);
         assert_eq!(core_shards(&legs, &trie()), BTreeSet::from([high()]));
 
@@ -1131,7 +1106,7 @@ mod tests {
     #[test]
     fn a_missing_arrival_is_a_defect() {
         let legs = transfer();
-        let crossings = vec![crossing(&legs, 1, 0, true)];
+        let crossings = vec![crossing(&legs, 1, 0)];
         let divided = frozen(&legs);
         assert_eq!(
             plan_for_shard(&legs, &crossings, &[], &divided, high(), Side::Delivering).err(),
@@ -1139,13 +1114,14 @@ mod tests {
         );
     }
 
-    /// A departing edge from a producer that reserved no single cell has
-    /// nowhere for its value to leave from, and the plan says so rather
-    /// than inventing a cell.
+    /// A core's crossing to a delivery elsewhere is the core shard's to
+    /// take back when the delivery lapses, claimed under the core node's
+    /// own target; the caller's shard, which issued the withdraw, takes
+    /// back that one and never the venue's.
     #[test]
-    fn a_core_departure_needs_no_origin() {
+    fn a_core_shard_reclaims_what_it_issued_to_a_delivery() {
         let legs = swap();
-        let crossings = vec![crossing(&legs, 1, 0, true), crossing(&legs, 2, 0, false)];
+        let crossings = vec![crossing(&legs, 1, 0), crossing(&legs, 2, 0)];
         let divided = frozen(&legs);
         let venue = plan_for_shard(
             &legs,
@@ -1157,18 +1133,23 @@ mod tests {
         )
         .expect("a core issues what it minted");
         assert!(venue.legs.departing(2, 0).is_some());
-    }
 
-    /// An inbound leg's departure is the reclaimable kind, and one with
-    /// no origin is a defect rather than a record nothing can credit.
-    #[test]
-    fn a_departure_without_an_origin_is_a_defect() {
-        let legs = transfer();
-        let crossings = vec![crossing(&legs, 1, 0, false)];
-        let divided = frozen(&legs);
+        let reclaimed: Vec<((u32, u32), Reclaim)> =
+            reclaim_for_shard(&legs, &crossings, &divided, high())
+                .expect("the venue issued the return crossing")
+                .legs
+                .reclaimed()
+                .collect();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].0, (2, 0));
+        assert_eq!(reclaimed[0].1.claim.key().owner, owner(0x33, true));
         assert_eq!(
-            plan_for_shard(&legs, &crossings, &[], &divided, low(), Side::Issuing).err(),
-            Some(PlanDefect::NoOrigin { node: 1, output: 0 }),
+            delivered_claims(&legs, &crossings, &divided, high())
+                .into_iter()
+                .map(|(shard, _)| shard)
+                .collect::<Vec<_>>(),
+            vec![low()],
+            "and its deliveries are the caller's shard's to make"
         );
     }
 
@@ -1197,7 +1178,7 @@ mod tests {
         );
         let past = Crossing {
             node: 9,
-            ..crossing(&legs, 1, 0, true)
+            ..crossing(&legs, 1, 0)
         };
         assert_eq!(
             plan_for_shard(
@@ -1214,11 +1195,12 @@ mod tests {
     }
 
     /// The sender takes back exactly what its inbound leg issued, under
-    /// its own target; the recipient issued nothing it could reclaim.
+    /// its own target, and never the venue's crossing; a shard that
+    /// issued nothing has nothing to reclaim.
     #[test]
     fn a_reclaim_takes_back_the_inbound_crossing_alone() {
         let legs = swap();
-        let crossings = vec![crossing(&legs, 1, 0, true), crossing(&legs, 2, 0, true)];
+        let crossings = vec![crossing(&legs, 1, 0), crossing(&legs, 2, 0)];
         let caller = reclaim_for_shard(&legs, &crossings, &frozen(&legs), low())
             .expect("the caller issued")
             .legs;
@@ -1229,11 +1211,12 @@ mod tests {
         assert_eq!(reclaimed[0].1.claim.key().owner, owner(0x11, false));
         assert!((0..4).all(|node| !caller.runs(node)));
 
-        // The venue's crossing is outbound value: a core committed it,
-        // and nobody takes it back.
+        let legs = transfer();
+        let crossings = vec![crossing(&legs, 1, 0)];
         assert_eq!(
             reclaim_for_shard(&legs, &crossings, &frozen(&legs), high()).err(),
             Some(PlanDefect::NothingToReclaim),
+            "the recipient's shard issued nothing"
         );
     }
 
@@ -1252,7 +1235,7 @@ mod tests {
             leg(venue, LegRole::Core, &[(1, 0)], 2),
             leg(recipient, LegRole::Outbound, &[(2, 0)], 3),
         ];
-        let crossings = [crossing(&legs, 1, 0, true), crossing(&legs, 2, 0, false)];
+        let crossings = [crossing(&legs, 1, 0), crossing(&legs, 2, 0)];
         let classified = frozen(&legs);
         assert!(
             !classified.mixed_at(high()),
@@ -1319,9 +1302,9 @@ mod tests {
             leg(owner_at(0x14, 1), LegRole::Outbound, &[(3, 0)], 4),
         ];
         let crossings = [
-            crossing(&legs, 1, 0, true),
-            crossing(&legs, 2, 0, false),
-            crossing(&legs, 3, 0, false),
+            crossing(&legs, 1, 0),
+            crossing(&legs, 2, 0),
+            crossing(&legs, 3, 0),
         ];
         let classified = Classified::freeze(&legs, &trie);
         assert!(classified.decomposed().holds());
@@ -1361,9 +1344,9 @@ mod tests {
             leg(carol, LegRole::Outbound, &[(4, 0)], 5),
         ];
         let crossings = [
-            crossing(&legs, 1, 0, true),
-            crossing(&legs, 2, 0, false),
-            crossing(&legs, 4, 0, true),
+            crossing(&legs, 1, 0),
+            crossing(&legs, 2, 0),
+            crossing(&legs, 4, 0),
         ];
         let classified = frozen(&legs);
         assert!(

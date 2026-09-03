@@ -24,10 +24,10 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
-    AdmittedTree, ChainRecords, Claim, Composed, CrossingSite, EnvelopeTree, FrameDeclaration,
-    IntentHeader, ManifestHash, PackageHash, PrefixShardResolver, Routing as RoutedTransaction,
-    RuleBytes, Value, admit_tree, child_key, footprint, legs_of, package_hash,
-    package_key as canonical_package_key, principal_address, route_tree, xrd,
+    AdmittedTree, ChainRecords, Claim, Composed, CrossingSite, EnvelopeTree, IntentHeader,
+    ManifestHash, PackageHash, PrefixShardResolver, Routing as RoutedTransaction, RuleBytes, Value,
+    admit_tree, child_key, footprint, legs_of, package_hash, package_key as canonical_package_key,
+    principal_address, route_tree, xrd,
 };
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
@@ -575,35 +575,11 @@ fn divide(
                 node: edge.source,
                 output: edge.output,
                 record,
-                origin: admitted
-                    .admitted
-                    .frames()
-                    .iter()
-                    .find(|frame| frame.node == edge.source)
-                    .and_then(reserved_origin),
             });
         }
     }
     crossings.sort_unstable_by_key(|crossing| (crossing.node, crossing.output));
     Ok(Division { legs, crossings })
-}
-
-/// The one cell a frame reserves, where it reserves exactly one — the
-/// shape an inbound leg takes, and the cell its departing value leaves
-/// from. A frame reserving nothing, several cells, or a range names no
-/// origin.
-fn reserved_origin(frame: &FrameDeclaration) -> Option<SubstateKey> {
-    let mut reserves = frame
-        .ordered
-        .iter()
-        .filter(|access| matches!(access.effect.mode, Mode::Reserve { .. }));
-    match (reserves.next(), reserves.next()) {
-        (Some(only), None) => match only.effect.target {
-            EffectTarget::Point(key) => Some(key),
-            EffectTarget::Entry { .. } | EffectTarget::Range { .. } => None,
-        },
-        _ => None,
-    }
 }
 
 impl Derivation for BridgeStatics {
@@ -1023,11 +999,6 @@ mod tests {
             crossing.record.owner,
             composer_addr().address(),
             "the record sits under the producing node's target"
-        );
-        assert_eq!(
-            crossing.origin,
-            Some(vault_key(composer_addr(), RES_X)),
-            "and names the cell the withdraw reserved"
         );
 
         assert!(

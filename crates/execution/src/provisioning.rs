@@ -559,7 +559,6 @@ mod tests {
                 producer.expiry_ms,
             )
             .key(),
-            origin: None,
         }
     }
 

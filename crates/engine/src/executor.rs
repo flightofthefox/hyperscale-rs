@@ -537,6 +537,9 @@ impl Executor {
                 .cell(reclaim.record)
                 .and_then(|bytes| CrossingCell::from_bytes(&bytes))
                 .ok_or_else(|| format!("reclaim of edge ({node}, {output}) reads no record"))?;
+            let origin = record.origin.ok_or_else(|| {
+                format!("reclaim of edge ({node}, {output}) reads a record naming no origin")
+            })?;
             for (effect, holds) in [
                 (
                     Effect {
@@ -554,7 +557,7 @@ impl Executor {
                 ),
                 (
                     Effect {
-                        target: EffectTarget::Point(reclaim.origin),
+                        target: EffectTarget::Point(origin),
                         mode: Mode::Delta { moves: Moves::Both },
                     },
                     Some(record.resource),
