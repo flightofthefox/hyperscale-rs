@@ -577,7 +577,7 @@ mod tests {
         // venue on the high one. The core is the venue alone.
         let swap = fixtures::swap();
         let crossings = vec![record_of(&swap, 1), record_of(&swap, 2)];
-        let classified = Classified::freeze(&swap, &trie, &BTreeSet::new());
+        let classified = Classified::freeze(&swap, &trie);
         assert!(classified.decomposed().holds());
 
         // The caller's issuing member waits on the venue's record and no
@@ -632,7 +632,7 @@ mod tests {
         );
         let route = fixtures::route();
         let crossings = vec![record_of(&route, 0), record_of(&route, 1)];
-        let classified = Classified::freeze(&route, &trie, &BTreeSet::new());
+        let classified = Classified::freeze(&route, &trie);
         assert!(classified.decomposed().holds());
         assert_eq!(classified.core(), &BTreeSet::from([high, third]));
         let arrival = Requirement::Crossing {

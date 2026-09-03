@@ -270,36 +270,7 @@ pub struct SplitStraddlerSetup {
     /// Straddler transfers: `(payer key, payer account in survivor, recipient in
     /// splitter)`.
     pub straddlers: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
-    /// The leg whose payer sits in the *terminating* splitter, so the
-    /// reservation it engages is held by a shard that dies before the tick
-    /// can resolve: `(payer key, payer in the splitter's left child,
-    /// recipient in the survivor)`.
-    pub terminating: (Ed25519PrivateKey, PrincipalAddr, PrincipalAddr),
-    /// A recipient in the terminating payer's successor child, so the
-    /// post-terminal probe stays intra-shard.
-    pub successor_recipient: PrincipalAddr,
-    /// An unencumbered payer in the same shard as [`Self::terminating`]'s,
-    /// funded normally. Submitted beside the encumbered probe at the same
-    /// instant, it separates "this shard is refusing everything" from "this
-    /// shard is refusing this payer".
-    pub control: (Ed25519PrivateKey, PrincipalAddr),
 }
-
-/// The successor child the terminating payer's cells land in when the
-/// splitter splits.
-pub const STRADDLER_SUCCESSOR: ShardId = ShardId::leaf(2, 0);
-
-/// What the terminating payer holds at genesis.
-///
-/// Above one signed fee ceiling and below two, so a reservation surviving
-/// its shard's terminal would leave the payer unable to cover a second
-/// transaction — which is exactly the encumbrance the probe looks for.
-pub const TERMINATING_PAYER_FUNDING: u128 = MAX_FEE + MAX_FEE / 2;
-
-const _: () = assert!(
-    TERMINATING_PAYER_FUNDING > MAX_FEE && TERMINATING_PAYER_FUNDING < 2 * MAX_FEE,
-    "the terminating payer must cover exactly one fee ceiling: one transaction      admits, a second while the first is in flight cannot",
-);
 
 /// Push `count` ballast accounts routing to `shard` under a
 /// `num_shards`-wide trie onto `accounts`.
@@ -380,6 +351,24 @@ const CONTENTION_RECIPIENT_BASE: u8 = 200;
 #[must_use]
 pub fn split_ballast_accounts() -> Vec<(PrincipalAddr, u128)> {
     split_ballast_accounts_over(stdlib_flash_bytes())
+}
+
+/// Ballast on one quarter of a four-shard partition, leading a genesis
+/// flash of `flash` bytes by the splitter's margin: what puts that
+/// quarter alone over a threshold voted to [`split_bytes_over`].
+///
+/// # Panics
+///
+/// Panics if the ballast count does not fit `usize`.
+///
+/// [`split_bytes_over`]: crate::straddler::split_bytes_over
+#[must_use]
+pub fn quarter_ballast_over(shard: ShardId, flash: u64) -> Vec<(PrincipalAddr, u128)> {
+    let mut accounts = Vec::new();
+    let bulk = usize::try_from((flash + SPLITTER_BALLAST_LEAD) / BALLAST_CELL_BYTES)
+        .expect("ballast count fits usize");
+    ballast(shard, 4, bulk, &mut accounts);
+    accounts
 }
 
 /// [`split_ballast_accounts`] for a network whose genesis flash is
@@ -492,25 +481,9 @@ pub fn split_straddler_setup() -> SplitStraddlerSetup {
         })
         .collect();
 
-    // The terminating payer is ground into the splitter's *left child*, so
-    // the successor holding its cells after the split is known up front
-    // rather than derived from a trie the scenario would have to rebuild.
-    let (terminating_key, terminating_payer) =
-        account_routing_to_n(STRADDLER_SUCCESSOR, 4, &mut taken);
-    let (_, terminating_recipient) = account_routing_to(STRADDLER_SURVIVOR, &mut taken);
-    let (_, successor_recipient) = account_routing_to_n(STRADDLER_SUCCESSOR, 4, &mut taken);
-    let (control_key, control_payer) = account_routing_to_n(STRADDLER_SUCCESSOR, 4, &mut taken);
-    accounts.push((terminating_payer, TERMINATING_PAYER_FUNDING));
-    accounts.push((terminating_recipient, 10));
-    accounts.push((successor_recipient, 10));
-    accounts.push((control_payer, 10_000));
-
     SplitStraddlerSetup {
         accounts,
         straddlers,
-        terminating: (terminating_key, terminating_payer, terminating_recipient),
-        successor_recipient,
-        control: (control_key, control_payer),
     }
 }
 

@@ -16,27 +16,33 @@
 
 use hyperscale_engine::XRD;
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, PrincipalAddr, ShardId, TransactionDecision, TransactionStatus,
-    TxHash,
+    BlockHeight, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey, TransactionDecision,
+    TransactionStatus, TxHash, WorkInFlight,
 };
 
 use crate::reshape::split_lifecycle;
+use crate::route::{FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD, TRADER_SHARD};
 use crate::straddler::{
-    STRADDLER_PAYMENT, cast_splitter_vote, split_bytes_over, straddler_split_bytes,
-    vote_splitter_down_to,
+    STRADDLER_PAYMENT, cast_splitter_vote, cast_threshold_vote, isolate_ec_intake,
+    split_bytes_over, straddler_split_bytes, vote_splitter_down_to,
 };
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
     anchored_genesis_height, held, held_at, merge_keeper_count, split_admitted,
 };
 use crate::support::tx::{
-    MERGE_STRADDLER_LEFT, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, build_swap_tx, build_transfer_tx,
-    fixture_flash_bytes, merge_train_setup, split_ballast_accounts_over, split_train_setup,
-    validity_around,
+    MERGE_STRADDLER_LEFT, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, build_route_tx, build_swap_tx,
+    build_transfer_tx, fixture_flash_bytes, merge_train_setup, quarter_ballast_over,
+    split_ballast_accounts_over, split_train_setup, validity_around,
 };
-use crate::support::wait::{await_anchor_seeded, await_serves, await_tx_terminal};
-use crate::support::{Budget, Cluster, epochs};
-use crate::venue::{SWAP_INPUT, StockedVenue, reserve_cell, stand_up_venue, swappers_on};
+use crate::support::wait::{
+    await_anchor_seeded, await_serves, await_split_admitted, await_tx_terminal,
+};
+use crate::support::{Budget, Cluster, FaultableCluster, epochs};
+use crate::venue::{
+    PROVIDER_FUNDING, SWAP_INPUT, SWAPPER_FUNDING, StockedVenue, grind_onto, reserve_cell,
+    stand_up_venue, swappers_on,
+};
 
 /// The most transfers the train carries into the splitter, and what the
 /// funding covers: enough to reach the admission at a few submissions
@@ -69,11 +75,11 @@ enum Phase {
     Departing,
     /// The gate drained: the reshape no longer pends, the shard still
     /// includes for a while, then coasts on empty blocks to its terminal.
-    /// A transfer it included settles; one it never included is either
-    /// refused at the payer's deadline, crediting nobody — the shape a
-    /// shard's final window keeps whole — or accepted on the payer's
-    /// chain and delivered by the shard's successor once the cut has
-    /// landed the recipient's prefix there.
+    /// A transfer it included settles; one it never included is accepted
+    /// on the payer's chain and delivered by the shard's successor once
+    /// the cut has landed the recipient's prefix there, or, where the
+    /// delivery window closes first, reclaimed on the successor's proof
+    /// that it never was.
     Draining,
 }
 
@@ -91,6 +97,28 @@ pub fn departing_venue_ballast() -> Vec<(PrincipalAddr, u128)> {
 #[must_use]
 pub fn departing_venue_split_bytes() -> u64 {
     fixture_flash_bytes() + 30_000
+}
+
+/// Genesis funding for the departing-route scenarios.
+///
+/// On the four-shard route topology: ballast putting the first venue's
+/// quarter alone over the threshold the scenarios vote in, a provider on
+/// each venue's shard, and the trader on its own, ground in the order
+/// [`departing_route`] stands them up.
+#[must_use]
+pub fn departing_route_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let mut accounts = quarter_ballast_over(FIRST_VENUE_SHARD, fixture_flash_bytes());
+    let mut taken = Vec::new();
+    accounts.push((
+        grind_onto(FIRST_VENUE_SHARD, &mut taken).1,
+        PROVIDER_FUNDING,
+    ));
+    accounts.push((
+        grind_onto(SECOND_VENUE_SHARD, &mut taken).1,
+        PROVIDER_FUNDING,
+    ));
+    accounts.push((grind_onto(TRADER_SHARD, &mut taken).1, SWAPPER_FUNDING));
+    accounts
 }
 
 /// Genesis funding for [`a_train_into_a_splitter_strands_nothing`].
@@ -216,6 +244,305 @@ pub fn a_departing_venue_clears_swaps_and_carries_on(c: &mut impl Cluster, budge
         &Charges::default(),
         budget,
         "swaps across the venue's split",
+    );
+}
+
+/// Two stocked venues, one on a shard about to leave, and the trader on
+/// a shard of its own, opened over the worlds a route can reach.
+struct DepartingRoute {
+    leaving: StockedVenue,
+    staying: StockedVenue,
+    key: Ed25519PrivateKey,
+    trader: PrincipalAddr,
+    reserves: [SubstateKey; 2],
+    stocked: [u128; 2],
+    xrd: World,
+    units: World,
+}
+
+/// Stand the departing route up on the four-shard route topology: the
+/// first venue's shard is voted over the threshold and admitted to
+/// split, and both venues are stocked before that. The trader sits on a
+/// shard of its own: a leg beside a core node on one shard runs as that
+/// core member and waits with it, where the leg under test pays and
+/// settles alone.
+///
+/// # Panics
+///
+/// Panics if a quarter is unserved, if either venue misses its budget
+/// standing up, or if the split is not admitted, or admitted elsewhere.
+fn departing_route<C: Cluster>(c: &mut C) -> DepartingRoute {
+    let departing = FIRST_VENUE_SHARD;
+    assert!(
+        (0..4).all(|path| c.serves_shard(ShardId::leaf(2, path))),
+        "the grown four-shard topology must seat every quarter",
+    );
+    let mut taken = Vec::new();
+    let leaving = stand_up_venue(c, departing, &mut taken);
+    let staying = stand_up_venue(c, SECOND_VENUE_SHARD, &mut taken);
+    let (key, trader) = grind_onto(TRADER_SHARD, &mut taken);
+    let reserves = [
+        reserve_cell(&leaving.meta, *XRD),
+        reserve_cell(&staying.meta, *XRD),
+    ];
+    let stocked = reserves.map(|reserve| held_at(c, reserve));
+    assert!(
+        stocked.iter().all(|&held| held > 0),
+        "both venues have to be holding something to price against"
+    );
+    let xrd = World::open(c, *XRD, [trader.address()], reserves);
+    let units = World::open(
+        c,
+        leaving.unit,
+        [trader.address()],
+        [
+            reserve_cell(&leaving.meta, leaving.unit),
+            reserve_cell(&staying.meta, staying.unit),
+        ],
+    );
+    // The departing venue's shard is leaving from here to the cut: its
+    // ballast alone crosses the voted threshold. The vote settles before
+    // any certificate channel is cut, since it crosses the same shards.
+    cast_threshold_vote(c, split_bytes_over(fixture_flash_bytes()));
+    assert!(
+        await_split_admitted(c, departing, epochs(20)),
+        "only the over-threshold venue shard must admit a split",
+    );
+    assert!(
+        (0..4)
+            .map(|path| ShardId::leaf(2, path))
+            .filter(|&shard| shard != departing)
+            .all(|shard| !split_admitted(c, shard)),
+        "no other quarter may split",
+    );
+    DepartingRoute {
+        leaving,
+        staying,
+        key,
+        trader,
+        reserves,
+        stocked,
+        xrd,
+        units,
+    }
+}
+
+/// Submit one route through the departing venue and hold it until both
+/// shards have committed it while both are live, the survivor's drain
+/// has engaged, and the trader's leg has paid. Returns the route's hash,
+/// the survivor's drain before the route, and what the trader holds
+/// once its leg has paid.
+///
+/// # Panics
+///
+/// Panics if both shards do not commit the route while both are live,
+/// if it engages no hold on the survivor, or if the trader's leg does
+/// not pay.
+fn submit_departing_route<C: Cluster>(
+    c: &mut C,
+    route: &DepartingRoute,
+    charges: &mut Charges,
+) -> (TxHash, WorkInFlight, u128) {
+    let (departing, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+    let baseline = c
+        .committed_work_in_flight(survivor)
+        .expect("the survivor must serve a committed tip before the route");
+    let tx = build_route_tx(
+        &route.key,
+        route.trader,
+        (&route.leaving.meta, &route.staying.meta),
+        *XRD,
+        ROUTE_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let hash = charges.submit(c, tx);
+    assert!(
+        c.run_until(epochs(12), |c| c.chain_fate(survivor, hash).0.is_some()
+            && c.chain_fate(departing, hash).0.is_some()),
+        "both shards must commit the route while both are live",
+    );
+    let engaged = c
+        .committed_work_in_flight(survivor)
+        .expect("the survivor must serve a committed tip once it holds the route");
+    assert!(
+        engaged > baseline,
+        "the route must engage a hold against the survivor's drain, or its release below \
+         proves nothing; baseline = {baseline:?}, engaged = {engaged:?}",
+    );
+    assert!(
+        c.run_until(epochs(8), |c| held(c, route.trader.address(), *XRD)
+            < SWAPPER_FUNDING - ROUTE_INPUT),
+        "the trader's leg must pay before the core is asked anything",
+    );
+    (hash, baseline, held(c, route.trader.address(), *XRD))
+}
+
+/// Wait for the departing venue's shard to terminate: both children
+/// served.
+///
+/// # Panics
+///
+/// Panics if a child is not served within budget.
+fn await_departed<C: Cluster>(c: &mut C) {
+    let (left, right) = FIRST_VENUE_SHARD.children();
+    assert!(
+        await_serves(c, left, epochs(28)) && await_serves(c, right, epochs(28)),
+        "both splitter children must be served within budget",
+    );
+}
+
+/// A route through a departing venue releases the surviving venue's
+/// hold at the terminal and gives the trader its input back.
+///
+/// A route's two venues are one core, each awaiting the other's
+/// certificate, so a route is the shape that still holds work across a
+/// shard's terminal: the trader's leg pays and settles alone, and the
+/// two venue ticks wait. With the certificate channel cut both ways
+/// neither venue ever holds the other's, the departing venue abandons
+/// at its deadline and terminates having settled nothing, and the
+/// survivor's tick — fenced on the departing shard's settled set from
+/// the admission — stays engaged against the survivor's drain until that
+/// set arrives. Then the departure record speaks: the survivor abandons
+/// the core member, the drain returns to its baseline, and the trader's
+/// crossing is reclaimed. Neither reserve moves.
+///
+/// # Panics
+///
+/// Panics as [`departing_route`] and [`submit_departing_route`] do, and
+/// if the hold does not return to its baseline or the input to the
+/// trader after the terminal, if the route is not abandoned, if a
+/// reserve moves, or if either side of the pair is not conserved.
+pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCluster>(c: &mut C) {
+    let (departing, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+    let route = departing_route(c);
+    // Neither venue may hold the other's certificate. Provisions and
+    // headers still flow, so each venue commits the route and runs its
+    // own core leg, which is the state under test.
+    let _ = isolate_ec_intake(c, departing, survivor);
+    let _ = isolate_ec_intake(c, survivor, departing);
+    let mut charges = Charges::default();
+    let (hash, baseline, paid) = submit_departing_route(c, &route, &mut charges);
+
+    // The cut. The departing venue's cells land under a child, and its
+    // settled set reaches the survivor.
+    await_departed(c);
+    assert!(
+        c.run_until(epochs(12), |c| c.committed_work_in_flight(survivor)
+            == Some(baseline)),
+        "the survivor's hold must return to its baseline once the departed venue's settled \
+         set has answered; holds {:?} against {baseline:?}",
+        c.committed_work_in_flight(survivor),
+    );
+    assert!(
+        c.run_until(epochs(12), |c| held(c, route.trader.address(), *XRD)
+            == paid + ROUTE_INPUT),
+        "the trader must get the route's input back on the departure record; holds {} \
+         against {}",
+        held(c, route.trader.address(), *XRD),
+        paid + ROUTE_INPUT,
+    );
+    // The trader's own leg accepted and stays accepted; the core it
+    // fed is abandoned on both shards, never settled one-sided.
+    for shard in [departing, survivor] {
+        let fate = c.chain_fate(shard, hash).1.map(|(_, decision)| decision);
+        assert!(
+            fate != Some(TransactionDecision::Accept),
+            "a venue settled a route its counterpart never certified; {shard} reached {fate:?}",
+        );
+    }
+    for (reserve, before) in route.reserves.into_iter().zip(route.stocked) {
+        assert_eq!(
+            held_at(c, reserve),
+            before,
+            "neither venue may have applied its side of a route the other never certified",
+        );
+    }
+    c.clear_drops();
+    route
+        .xrd
+        .assert_settles_within(c, &charges, epochs(8), "a route through a departing venue");
+    route.units.assert_settles_within(
+        c,
+        &Charges::default(),
+        epochs(8),
+        "a route through a departing venue",
+    );
+}
+
+/// A route the departing venue settled is settled by the surviving venue
+/// too, from the certificate the departed chain left behind.
+///
+/// The mirror of
+/// [`a_route_into_a_departing_venue_releases_the_survivors_hold`]: the
+/// cut takes only the survivor's intake, so the departing venue holds
+/// both certificates and settles, applying its half, while the survivor
+/// holds only its own and cannot apply until the departed venue's
+/// reaches it. What that leaves the survivor is a transaction its
+/// counterpart's settled set names as settled — so no record covers it,
+/// the fence refuses any abandonment of it, and the only resolution left
+/// is the certificate itself, committed on the departed shard's tail
+/// chain. The cut lifts once the children seat, so what is measured is
+/// a retention limit and not a partition: the survivor asks for the
+/// certificate on a whole network, having missed it while the cut was
+/// up, and the route banks its output.
+///
+/// # Panics
+///
+/// Panics as [`departing_route`] and [`submit_departing_route`] do, and
+/// if the departing venue does not settle the route before it leaves,
+/// if the survivor never applies what the departed venue settled, if
+/// its hold does not return to its baseline, or if either side of the
+/// pair is not conserved.
+pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: FaultableCluster>(
+    c: &mut C,
+) {
+    let (departing, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+    let route = departing_route(c);
+    let _ = isolate_ec_intake(c, survivor, departing);
+    let mut charges = Charges::default();
+    let (hash, baseline, paid) = submit_departing_route(c, &route, &mut charges);
+    assert!(
+        c.run_until(epochs(12), |c| matches!(
+            c.chain_fate(departing, hash).1,
+            Some((_, TransactionDecision::Accept))
+        )),
+        "the departing venue holds both certificates and settles the route before it leaves",
+    );
+    assert!(
+        c.chain_fate(survivor, hash).1.is_none(),
+        "the survivor holds only its own certificate and cannot apply yet",
+    );
+
+    await_departed(c);
+    c.clear_drops();
+    assert!(
+        c.run_until(epochs(12), |c| matches!(
+            c.chain_fate(survivor, hash).1,
+            Some((_, TransactionDecision::Accept))
+        )),
+        "the survivor must recover the departed venue's certificate from its tail chain and \
+         apply what it settled",
+    );
+    assert!(
+        c.run_until(epochs(12), |c| c.committed_work_in_flight(survivor)
+            == Some(baseline)),
+        "the survivor's hold must return to its baseline once it has settled; holds {:?} \
+         against {baseline:?}",
+        c.committed_work_in_flight(survivor),
+    );
+    assert!(
+        c.run_until(epochs(8), |c| held(c, route.trader.address(), *XRD) > paid),
+        "the route must bank its output for the trader",
+    );
+    route
+        .xrd
+        .assert_settles_within(c, &charges, epochs(8), "a route settled across a departure");
+    route.units.assert_settles_within(
+        c,
+        &Charges::default(),
+        epochs(8),
+        "a route settled across a departure",
     );
 }
 

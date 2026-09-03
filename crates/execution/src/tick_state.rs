@@ -1569,7 +1569,7 @@ mod tests {
         let trie = trie();
         let (low, high, third) = (leaf(0), leaf(1), leaf(2));
 
-        let swap = Classified::freeze(&swap(), &trie, &BTreeSet::new());
+        let swap = Classified::freeze(&swap(), &trie);
         assert!(swap.decomposed().holds());
         let participating = BTreeSet::from([low, high]);
         let caller = Membership::of(&swap, low, participating.clone(), Side::Issuing);
@@ -1589,7 +1589,7 @@ mod tests {
         assert_eq!(venue.reach(), &participating);
         assert!(venue.decides(), "and decides");
 
-        let route = Classified::freeze(&route(), &trie, &BTreeSet::new());
+        let route = Classified::freeze(&route(), &trie);
         let participating = BTreeSet::from([low, high, third]);
         let core_member = Membership::of(&route, high, participating.clone(), Side::Issuing);
         assert_eq!(
@@ -1632,12 +1632,11 @@ mod tests {
                 leg(1, LegRole::Outbound, &[(0, 0)]),
             ],
             placement,
-            &BTreeSet::new(),
         );
         assert!(transfer.decomposed().holds());
         assert!(transfer.delivers_at(recipient));
         assert!(!transfer.delivers_at(sender), "the core bears the verdict");
-        let swap = Classified::freeze(&swap(), placement, &BTreeSet::new());
+        let swap = Classified::freeze(&swap(), placement);
         assert!(
             !swap.delivers_at(leaf(0)),
             "a shard that also issues runs on the transaction's window"
@@ -1696,7 +1695,7 @@ mod tests {
 
         let trie = trie();
         let (local, venue) = (leaf(0), leaf(1));
-        let classified = Classified::freeze(&swap(), &trie, &BTreeSet::new());
+        let classified = Classified::freeze(&swap(), &trie);
         let leg = tx(1);
         let mut tick = TickState::new(
             TickId::new(local, BlockHeight::new(1)),

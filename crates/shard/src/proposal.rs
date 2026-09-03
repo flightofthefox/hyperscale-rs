@@ -14,7 +14,7 @@
 //! emit — full content, empty fallback, empty sync — so a single
 //! build-and-dispatch helper can drive them uniformly.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -277,9 +277,9 @@ pub fn select_transactions(
 }
 
 /// The transactions among `txs`, past their validity end at `anchor`,
-/// that `local_shard` only delivers for: frozen divided against the
-/// placement of `anchor`'s window with this shard outside the core and
-/// every leg here a delivery.
+/// that `local_shard` only delivers for: frozen divided against the trie
+/// of `anchor`'s window with this shard outside the core and every leg
+/// here a delivery.
 ///
 /// Computed against the block's own anchor by the proposer selecting
 /// and by every voter checking, so the set is one set. Empty when the
@@ -296,13 +296,9 @@ pub fn late_deliveries<T: Deref<Target = Transaction>>(
         return HashSet::new();
     };
     let trie = snapshot.shard_trie();
-    let final_window: BTreeSet<ShardId> = trie
-        .leaves()
-        .filter(|shard| topology_schedule.terminates_at_next_boundary(*shard, anchor) == Some(true))
-        .collect();
     txs.iter()
         .filter(|tx| anchor >= tx.validity_range().end_timestamp_exclusive)
-        .filter(|tx| Classified::freeze(tx.legs(), trie, &final_window).delivers_at(local_shard))
+        .filter(|tx| Classified::freeze(tx.legs(), trie).delivers_at(local_shard))
         .map(|tx| tx.hash())
         .collect()
 }

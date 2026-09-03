@@ -568,7 +568,7 @@ mod tests {
 
         let trie = trie();
         let (local, venue) = (leaf(0), leaf(1));
-        let classified = Classified::freeze(&swap(), &trie, &BTreeSet::new());
+        let classified = Classified::freeze(&swap(), &trie);
         assert!(classified.decomposed().holds());
 
         let mut candidates = TickCandidates::new(local);
@@ -634,7 +634,7 @@ mod tests {
         assert!(admitted[0].request.abortable);
         assert_eq!(whole.len(), 1, "and the other waits on its fate");
 
-        let classified = Classified::freeze(&swap(), &trie, &BTreeSet::new());
+        let classified = Classified::freeze(&swap(), &trie);
         assert_eq!(classified.core(), &BTreeSet::from([venue]));
         let mut divided = TickCandidates::new(venue);
         for seed in [1, 2] {

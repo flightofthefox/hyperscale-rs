@@ -75,17 +75,16 @@ pub use route::{
 };
 pub use route_reshape::{
     MERGE_TRAIN, SPLIT_TRAIN, a_departing_venue_clears_swaps_and_carries_on,
+    a_route_into_a_departing_venue_releases_the_survivors_hold,
+    a_route_the_departing_venue_settled_is_settled_by_the_survivor,
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
-    departing_venue_ballast, departing_venue_split_bytes, merge_train_genesis_accounts,
-    split_train_genesis_accounts,
+    departing_route_genesis_accounts, departing_venue_ballast, departing_venue_split_bytes,
+    merge_train_genesis_accounts, split_train_genesis_accounts,
 };
 pub use straddler::{
     a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed, isolate_ec_intake,
     merge_straddler_atomic, split_straddler_atomic, split_straddler_ec_partition_atomic,
-    split_straddler_run, split_surviving_counterpart_releases_its_reservation,
-    split_survivor_recovers_a_settlement_it_never_received,
-    split_terminating_payer_releases_its_reservation, straddler_one_sided_count,
-    surviving_sibling_split_seats_full_committees,
+    split_straddler_run, straddler_one_sided_count, surviving_sibling_split_seats_full_committees,
 };
 pub use support::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, conservation, epochs, grow_to,

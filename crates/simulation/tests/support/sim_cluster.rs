@@ -125,6 +125,27 @@ impl SimCluster {
         })
     }
 
+    /// [`Self::with_packages`] with every pool extra on its own host, so
+    /// the committees a split seats share no host — what a fault rule
+    /// keyed on committee hosts needs to cut one shard's traffic and no
+    /// other's.
+    #[must_use]
+    pub fn with_packages_on_dedicated_pool_hosts(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+        packages: GenesisPackages,
+    ) -> Self {
+        Self::build_full(&BuildArgs {
+            config,
+            seed,
+            dedicated_pool_hosts: true,
+            accounts,
+            execution_mode: ExecutionMode::Serial,
+            packages,
+        })
+    }
+
     #[must_use]
     pub fn with_accounts_and_dedicated_pool_hosts(
         config: &ScenarioConfig,

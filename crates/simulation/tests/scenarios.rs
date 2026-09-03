@@ -30,8 +30,10 @@ use hyperscale_scenarios::{
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_published_package_matures_before_it_runs,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
+    a_route_into_a_departing_venue_releases_the_survivors_hold,
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
     a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
+    a_route_the_departing_venue_settled_is_settled_by_the_survivor,
     a_spent_nullifier_is_swept_once_unreachable, a_swap_charges_its_caller_its_input_and_one_price,
     a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,
     a_swap_the_venue_refuses_gives_its_caller_back_its_leg,
@@ -43,12 +45,13 @@ use hyperscale_scenarios::{
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
-    delegation_folds_into_beacon_state, departing_venue_ballast, departing_venue_split_bytes,
-    deploy_storm_rides_out, epochs, events_land_on_their_emitters_home_shard,
-    failure_charges_its_payer, gossip_drop_engages_fetch_fallback,
-    grow_reaches_four_shard_topology, grow_reaches_two_shard_topology,
-    halted_shard_recovers_by_committee_redraw, halted_shard_straddler_atomic, hot_recipient,
-    hot_venue_clears_swaps, hot_venue_clears_swaps_on, insolvent_payer_engages_nothing,
+    delegation_folds_into_beacon_state, departing_route_genesis_accounts, departing_venue_ballast,
+    departing_venue_split_bytes, deploy_storm_rides_out, epochs,
+    events_land_on_their_emitters_home_shard, failure_charges_its_payer,
+    gossip_drop_engages_fetch_fallback, grow_reaches_four_shard_topology,
+    grow_reaches_two_shard_topology, halted_shard_recovers_by_committee_redraw,
+    halted_shard_straddler_atomic, hot_recipient, hot_venue_clears_swaps,
+    hot_venue_clears_swaps_on, insolvent_payer_engages_nothing,
     inter_shard_partition_strands_ticks_until_it_heals, isolated_validator_still_settles,
     livelock_resolves_promptly, liveness_baseline, merge_boundary_admits_an_uncommitted_precut_tx,
     merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
@@ -64,14 +67,11 @@ use hyperscale_scenarios::{
     split_boundary_admits_an_uncommitted_precut_tx,
     split_boundary_hands_back_what_it_never_included, split_boundary_refuses_a_replay,
     split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
-    split_surviving_counterpart_releases_its_reservation,
-    split_survivor_recovers_a_settlement_it_never_received,
-    split_terminating_payer_releases_its_reservation, split_train_genesis_accounts,
-    stake_withdraw_drops_effective_stake, surviving_sibling_split_seats_full_committees,
-    unbound_payer_engages_nothing, unbound_remote_payer_engages_nothing, venue_genesis_accounts,
-    venue_genesis_accounts_on, wide_swapper_shards,
-    withdrawal_ejects_a_validator_that_a_deposit_reactivates, withdrawals_compose_over_one_vault,
-    zipf_payments,
+    split_train_genesis_accounts, stake_withdraw_drops_effective_stake,
+    surviving_sibling_split_seats_full_committees, unbound_payer_engages_nothing,
+    unbound_remote_payer_engages_nothing, venue_genesis_accounts, venue_genesis_accounts_on,
+    wide_swapper_shards, withdrawal_ejects_a_validator_that_a_deposit_reactivates,
+    withdrawals_compose_over_one_vault, zipf_payments,
 };
 use hyperscale_simulation::ExecutionMode;
 use hyperscale_storage::ShardChainReader;
@@ -1181,6 +1181,35 @@ fn a_departing_venue_clears_swaps_and_carries_on_sim() {
 }
 
 #[test]
+fn a_route_into_a_departing_venue_releases_the_survivors_hold_sim() {
+    let mut cluster = departing_route_cluster();
+    cluster.run_faultable(a_route_into_a_departing_venue_releases_the_survivors_hold);
+}
+
+/// The route topology grown to four shards on dedicated pool hosts, with
+/// a cohort to spare for the first venue's split and the reshape trigger
+/// armed above every quarter until the scenario votes it down.
+fn departing_route_cluster() -> SimCluster {
+    SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &ScenarioConfig {
+            num_shards: 4,
+            pool_surplus: 18,
+            split_bytes: departing_venue_split_bytes(),
+            ..cross_shard_config()
+        },
+        42,
+        &departing_route_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    )
+}
+
+#[test]
+fn a_route_the_departing_venue_settled_is_settled_by_the_survivor_sim() {
+    let mut cluster = departing_route_cluster();
+    cluster.run_faultable(a_route_the_departing_venue_settled_is_settled_by_the_survivor);
+}
+
+#[test]
 fn a_train_into_a_splitter_strands_nothing_sim() {
     let mut cluster =
         SimCluster::with_accounts(&straddler_config(), 11, &split_train_genesis_accounts());
@@ -1222,39 +1251,6 @@ fn a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed_sim() {
     let setup = split_straddler_setup();
     let mut cluster = SimCluster::with_accounts(&straddler_config(), 11, &setup.accounts);
     cluster.run_faultable(a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed);
-}
-
-#[test]
-fn split_terminating_payer_releases_its_reservation_sim() {
-    let setup = split_straddler_setup();
-    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
-        &straddler_config(),
-        11,
-        &setup.accounts,
-    );
-    cluster.run_faultable(split_terminating_payer_releases_its_reservation);
-}
-
-#[test]
-fn split_surviving_counterpart_releases_its_reservation_sim() {
-    let setup = split_straddler_setup();
-    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
-        &straddler_config(),
-        11,
-        &setup.accounts,
-    );
-    cluster.run_faultable(split_surviving_counterpart_releases_its_reservation);
-}
-
-#[test]
-fn split_survivor_recovers_a_settlement_it_never_received_sim() {
-    let setup = split_straddler_setup();
-    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
-        &straddler_config(),
-        11,
-        &setup.accounts,
-    );
-    cluster.run_faultable(split_survivor_recovers_a_settlement_it_never_received);
 }
 
 #[test]
