@@ -40,12 +40,15 @@ pub enum Requirement {
     /// A counterpart's committed state for the transaction, carried by a
     /// bundle from that shard.
     CommittedState(ShardId),
-    /// A crossing's record cell, present in a committed bundle.
+    /// A crossing's record cell, present in a committed bundle from the
+    /// shard that wrote it.
     ///
-    /// Satisfied by a present value at `key` from any source: an edge's
-    /// producer is one manifest node and a node runs on one shard, so a
-    /// key names exactly one bundle. `source` is the shard whose verdict
-    /// commits it — what a fetch chases, never what satisfaction reads.
+    /// Satisfied only by a present value at `key` carried by a bundle
+    /// from `source`: the record sits under the producer's prefix, so
+    /// the producer's root is the one root a proof of it means anything
+    /// under, and a bundle from any other shard carrying the key is a
+    /// quorum there planting a cell it does not own. The same bundle is
+    /// what the arrival is read from.
     Crossing {
         /// The shard that writes the record.
         source: ShardId,
@@ -140,9 +143,11 @@ pub struct ProvisioningTracker {
     /// indexed by nothing else. Populated at tick creation.
     required: HashMap<TxHash, BTreeSet<Requirement>>,
 
-    /// The cells committed bundles carried present for each tx, whatever
-    /// shard sent them — what a [`Requirement::Crossing`] reads.
-    present: HashMap<TxHash, BTreeSet<SubstateKey>>,
+    /// The cells committed bundles carried present for each tx, each
+    /// under the shard whose bundle carried it, with its bytes — what a
+    /// [`Requirement::Crossing`] is satisfied by and what the arrival it
+    /// names is read from.
+    present: HashMap<TxHash, BTreeMap<(ShardId, SubstateKey), Vec<u8>>>,
 
     /// Remote shards whose provisions have been received, each with the
     /// environment anchor its bundle carried. Populated by
@@ -259,10 +264,10 @@ impl ProvisioningTracker {
                     .received
                     .get(&tx_hash)
                     .is_some_and(|received| received.contains_key(shard)),
-                Requirement::Crossing { key, .. } => self
+                Requirement::Crossing { source, key } => self
                     .present
                     .get(&tx_hash)
-                    .is_some_and(|present| present.contains(key)),
+                    .is_some_and(|present| present.contains_key(&(*source, *key))),
             })
         })
     }
@@ -289,8 +294,7 @@ impl ProvisioningTracker {
             self.present.entry(tx_hash).or_default().extend(
                 entries
                     .iter()
-                    .filter(|entry| entry.value.is_some())
-                    .map(|entry| entry.key),
+                    .filter_map(|entry| Some(((source_shard, entry.key), entry.value.clone()?))),
             );
             self.verified.entry(tx_hash).or_default().push(entries);
             self.received
@@ -346,6 +350,22 @@ impl ProvisioningTracker {
     /// per-tx lookup against committed provisions.
     pub fn provisions_for(&self, tx_hash: TxHash) -> Option<&[Arc<Vec<SubstateEntry>>]> {
         self.verified.get(&tx_hash).map(Vec::as_slice)
+    }
+
+    /// The bytes of `key` as a committed bundle from `source` carried
+    /// them present for `tx_hash` — a crossing's record, read from the
+    /// one bundle whose root says anything about it.
+    #[must_use]
+    pub fn present_cell(
+        &self,
+        tx_hash: TxHash,
+        source: ShardId,
+        key: SubstateKey,
+    ) -> Option<&[u8]> {
+        self.present
+            .get(&tx_hash)?
+            .get(&(source, key))
+            .map(Vec::as_slice)
     }
 
     pub fn verified_len(&self) -> usize {
@@ -466,12 +486,13 @@ mod tests {
         assert!(t.is_fully_provisioned(tx));
     }
 
-    /// A crossing is answered by a present value at its cell from any
-    /// source — an absent value, or a bundle from the named shard that
-    /// carries other cells, answers nothing — and a bundle absorbed
-    /// before the requirement was filed still answers it.
+    /// A crossing is answered by a present value at its cell carried by
+    /// the named source and nothing else — a bundle from another shard
+    /// carrying the key, an absent value, or the source carrying other
+    /// cells, answers nothing — and a bundle absorbed before the
+    /// requirement was filed still answers it, with the bytes it carried.
     #[test]
-    fn a_crossing_is_met_by_the_cell_present_whoever_sent_it() {
+    fn a_crossing_is_met_only_by_the_cell_its_source_carried() {
         use hyperscale_types::{Address, AddressClass, LocalKey};
 
         let record = SubstateKey {
@@ -498,16 +519,32 @@ mod tests {
             key: record,
         };
 
+        // A stranger carrying the key answers nothing, and its bytes are
+        // never the arrival.
+        let mut planted = ProvisioningTracker::new();
+        planted.record_required(tx, BTreeSet::from([requirement]));
+        planted.absorb_provisions(&bundle(
+            shard(3),
+            vec![SubstateEntry::new(record, Some(vec![9]))],
+        ));
+        assert!(
+            !planted.is_fully_provisioned(tx),
+            "only the producer's bundle carries the record"
+        );
+        assert_eq!(planted.present_cell(tx, shard(1), record), None);
+
         // Absorbed first, filed second.
         let mut early = ProvisioningTracker::new();
         early.absorb_provisions(&bundle(
-            shard(3),
+            shard(1),
             vec![SubstateEntry::new(record, Some(vec![7]))],
         ));
         early.record_required(tx, BTreeSet::from([requirement]));
-        assert!(
-            early.is_fully_provisioned(tx),
-            "the source is not consulted"
+        assert!(early.is_fully_provisioned(tx));
+        assert_eq!(
+            early.present_cell(tx, shard(1), record),
+            Some(&[7u8][..]),
+            "and the arrival is read off the same bundle"
         );
 
         // The named source, carrying the wrong cell or an absent value.

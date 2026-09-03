@@ -18,8 +18,7 @@ use std::sync::Arc;
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::legs::{Classified, Runs, Side, crossings_of};
 use hyperscale_types::{
-    EscrowedValue, ShardId, SubstateKey, Transaction, TxHash, Verified, WeightedTimestamp,
-    delivery_window_close,
+    EscrowedValue, ShardId, Transaction, TxHash, Verified, WeightedTimestamp, delivery_window_close,
 };
 use hyperscale_vm_effects::CrossingCell;
 
@@ -73,10 +72,12 @@ impl Candidate {
 /// consume: each crossing landing here, with the value its record cell
 /// says left.
 ///
-/// A divided member only. The cell was proven against the source's
-/// committed root when the bundle was absorbed, and its bytes are the
+/// A divided member only. The cell was proven against the producer's
+/// committed root when its bundle was absorbed, and its bytes are the
 /// kernel's own record, so what it says left is what the consumer
-/// claims. An edge whose cell is missing or unreadable is left out, and
+/// claims — read from that bundle and no other, since a bundle from any
+/// other shard carrying the key proves nothing about a cell it does not
+/// own. An edge whose cell is missing or unreadable is left out, and
 /// the planner refuses the member for it rather than running short.
 fn arrivals_for(
     tx: &Transaction,
@@ -88,19 +89,12 @@ fn arrivals_for(
     if !classified.decomposed().holds() {
         return Vec::new();
     }
-    let edges = crossings_of(tx.legs(), tx.crossings(), classified);
-    let cells: BTreeMap<SubstateKey, &[u8]> = provisioning
-        .provisions_for(tx.hash())
-        .into_iter()
-        .flatten()
-        .flat_map(|entries| entries.iter())
-        .filter_map(|entry| Some((entry.key, entry.value.as_deref()?)))
-        .collect();
-    edges
+    crossings_of(tx.legs(), tx.crossings(), classified)
         .into_iter()
         .filter(|edge| edge.to.contains(&local) && edge.delivers == (side == Side::Delivering))
         .filter_map(|edge| {
-            let record = CrossingCell::from_bytes(cells.get(&edge.record)?)?;
+            let bytes = provisioning.present_cell(tx.hash(), edge.from, edge.record)?;
+            let record = CrossingCell::from_bytes(bytes)?;
             Some(EscrowedValue {
                 node: edge.node,
                 output: edge.output,

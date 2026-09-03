@@ -26,14 +26,14 @@ use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
     AdmittedTree, ChainRecords, Claim, Composed, CrossingSite, EnvelopeTree, IntentHeader,
     ManifestHash, PackageHash, PrefixShardResolver, Routing as RoutedTransaction, RuleBytes, Value,
-    admit_tree, child_key, footprint, legs_of, package_hash, package_key as canonical_package_key,
-    principal_address, route_tree, xrd,
+    admit_tree, child_key, effect_units, footprint, legs_of, package_hash,
+    package_key as canonical_package_key, principal_address, route_tree, xrd,
 };
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
-    Address, Crossing, EffectSet, EffectTarget, LegShape, Mode, Moves, PrincipalAddr, ResourceAddr,
-    SchemeId, SubstateKey,
+    Address, Crossing, Effect, EffectSet, EffectTarget, LegShape, Mode, Moves, PrincipalAddr,
+    ResourceAddr, SchemeId, SubstateKey,
 };
 
 use crate::ProtocolHasher;
@@ -41,6 +41,22 @@ use crate::artifact::admit_package;
 use crate::records::{
     InstanceCache, LocalCells, NodeRecords, PackageCache, committed_package, sweepable_cell,
 };
+
+/// The footprint of the cells a transaction's value edges write.
+///
+/// The record under the producer and the claim under the consumer, each
+/// a point write on the effects schedule, for every edge whether or not
+/// it crosses at any placement.
+#[must_use]
+pub fn crossing_cells_footprint(crossings: &[Crossing]) -> u64 {
+    crossings.iter().fold(0u64, |total, crossing| {
+        let cell = effect_units(Effect {
+            target: EffectTarget::Point(crossing.record),
+            mode: Mode::Write { moves: Moves::Both },
+        });
+        total.saturating_add(cell.saturating_mul(2))
+    })
+}
 
 /// The protocol fee and transfer resource: the genesis publisher's
 /// primary issue.
@@ -680,17 +696,22 @@ impl Derivation for BridgeStatics {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        let Division { legs, crossings } = divide(&tree, &admitted, &chain)?;
         // What this transaction costs a block, on the engine's own
         // schedule: the fixed charge for carrying it, what it declared it
         // would touch, and the ceiling it signed for its own execution.
         // The declaration spans every shard it routes to, because the
-        // reservation is taken once against the whole of it.
+        // reservation is taken once against the whole of it — and every
+        // value edge's record and claim beside it, which the engine
+        // declares at prepare wherever the edge turns out to cross:
+        // placement is a fact of the anchor, and the price is fixed when
+        // the envelope is composed.
         let declared_footprint = routing
             .per_shard
             .values()
-            .fold(0u64, |total, set| total.saturating_add(footprint(set)));
+            .fold(0u64, |total, set| total.saturating_add(footprint(set)))
+            .saturating_add(crossing_cells_footprint(&crossings));
         let work = declared_work(declared_footprint, vm.gas_limit, vm.signature_work());
-        let Division { legs, crossings } = divide(&tree, &admitted, &chain)?;
         Ok(Derived {
             effective_window,
             work,
@@ -1007,8 +1028,21 @@ mod tests {
         );
 
         // The footprint is the term of the price the declaration fixes,
-        // carried whole beside the sum it feeds.
-        assert!(derived.footprint > 0);
+        // carried whole beside the sum it feeds — and it prices the
+        // crossing's record and claim beside what the routing declares.
+        let cells = crossing_cells_footprint(&derived.crossings);
+        assert_eq!(
+            cells,
+            2 * effect_units(Effect {
+                target: EffectTarget::Point(crossing.record),
+                mode: Mode::Write { moves: Moves::Both },
+            }),
+            "one record and one claim, each a point write"
+        );
+        assert!(
+            derived.footprint > cells,
+            "the routing's own declaration is priced beside them"
+        );
         assert_eq!(
             derived.work,
             declared_work(derived.footprint, vm.gas_limit, vm.signature_work())
