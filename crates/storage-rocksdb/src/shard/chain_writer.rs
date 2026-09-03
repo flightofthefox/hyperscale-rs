@@ -6,7 +6,7 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, committed_tx_cells,
+    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, block_settled_writes,
     merge_writes_from_receipts, with_sweep,
 };
 use hyperscale_types::{
@@ -148,26 +148,13 @@ impl ShardChainWriter for RocksDbShardStorage {
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
-        let settling: Vec<StoredReceipt> = block
-            .certificates()
-            .iter()
-            .flat_map(|fw| fw.settling_receipts())
-            .collect();
         // Under the lock, and off a snapshot rather than the live store:
         // the baseline a movement resolves against has to be the state
         // this block is about to land on, and both a concurrent commit
         // and this node's own persistence depth move a live read out
         // from under it.
         let _commit_guard = self.commit_lock.lock().unwrap();
-        let creations = committed_tx_cells(
-            block.header().shard_id(),
-            block.transactions().iter().map(|tx| tx.as_unverified()),
-        );
-        let merged_writes = with_sweep(
-            merge_writes_from_receipts(&settling, &self.snapshot()),
-            &creations,
-            removals,
-        );
+        let merged_writes = block_settled_writes(block, &self.snapshot(), removals);
         self.commit_block_inner_locked(&merged_writes, block, qc, &receipts, witness)
     }
 }
@@ -218,40 +205,29 @@ fn build_prepared_commit(
                 return result_root;
             }
 
-            // Fast path failed — RocksDB state advanced since preparation
-            // (sync path committed blocks between prepare and flush). Hold
-            // `commit_lock` across the version check AND the commit so
-            // `base_version` can't move under us; splitting the lock
-            // would let a concurrent sync commit open a gap and trip the
-            // contiguity assert in `commit_block_inner_locked`.
+            // The fast path refused: the store advanced since the commit
+            // was prepared. A sync commit that landed this very block is
+            // the one benign cause, and the block is then already in.
+            // Anything else — the store at a height below this block
+            // with a base the prepared batch was not built on — is a
+            // divergence between what the chain committed and what this
+            // node prepared, and a fresh fold here would commit a root
+            // no verifier compared with the header's.
             let _guard = storage.commit_lock.lock().unwrap();
             let (current_version, _) =
                 SnapshotTreeStore::new(&storage.db, storage.root_path.clone()).read_jmt_metadata();
-            if block.height().inner() <= current_version {
-                tracing::debug!(
-                    height = block.height().inner(),
-                    current_version,
-                    "PreparedCommit stale — block already committed, skipping"
-                );
-                return result_root;
-            }
+            assert!(
+                block.height().inner() <= current_version,
+                "BFT CRITICAL: prepared commit for height {} refused with the store at {}",
+                block.height().inner(),
+                current_version,
+            );
             tracing::debug!(
                 height = block.height().inner(),
                 current_version,
-                "PreparedCommit stale, falling back to commit_block"
+                "PreparedCommit stale — block already committed, skipping"
             );
-            let receipts: Vec<StoredReceipt> = block
-                .certificates()
-                .iter()
-                .flat_map(|fw| fw.receipts().iter().cloned())
-                .collect();
-            let settling: Vec<StoredReceipt> = block
-                .certificates()
-                .iter()
-                .flat_map(|fw| fw.settling_receipts())
-                .collect();
-            let merged_writes = merge_writes_from_receipts(&settling, &storage.snapshot());
-            storage.commit_block_inner_locked(&merged_writes, block, qc, &receipts, witness)
+            result_root
         },
     )
 }

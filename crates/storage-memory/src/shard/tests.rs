@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use hyperscale_storage::lock_recover::read_or_recover;
 use hyperscale_storage::test_helpers::{
     make_settled_writes, make_test_block, make_test_block_with_anchor_wt, make_test_certified,
     make_test_qc, state_key, test_entries_commit_serve_and_history,
@@ -543,6 +544,45 @@ fn test_prepare_then_commit_fast_path() {
 
     assert_eq!(result_prepared, result_direct);
     assert_eq!(spec_root, result_prepared);
+}
+
+/// A prepared commit for a block the store already holds — landed by a
+/// sync commit between prepare and flush, or by a second vnode on the
+/// store — applies nothing: the block is in, and its history would
+/// otherwise be written twice at one version.
+#[test]
+fn a_prepared_commit_for_a_committed_block_applies_nothing() {
+    let storage = Arc::new(SimShardStorage::default());
+    let block = make_test_block(BlockHeight::new(1));
+    let qc = make_test_qc(&block);
+    let parent_root = storage.state_root();
+    let (spec_root, _jmt_snapshot, prepared) = storage.prepare_block_commit(
+        ParentAnchor {
+            state_root: parent_root,
+            height: BlockHeight::GENESIS,
+            state: &storage.snapshot(),
+            pending: &[],
+            base_reads: None,
+        },
+        &[],
+        &[],
+        &[],
+        BlockHeight::new(1),
+    );
+    let direct = commit_empty(&storage, &block, &qc);
+    let history_rows = read_or_recover(&storage.state).state_history.len();
+    let certified = make_test_certified(block);
+    assert_eq!(
+        prepared(SyncHint::FlushNow, &certified, &no_witness()),
+        direct
+    );
+    assert_eq!(spec_root, direct);
+    assert_eq!(storage.jmt_height(), BlockHeight::new(1));
+    assert_eq!(
+        read_or_recover(&storage.state).state_history.len(),
+        history_rows,
+        "nothing is written a second time"
+    );
 }
 
 #[test]

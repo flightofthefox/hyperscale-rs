@@ -8,7 +8,7 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, committed_tx_cells,
+    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, block_settled_writes,
     covers_strictly_more, merge_writes_from_receipts, widest_tick_copies, with_sweep,
 };
 use hyperscale_types::{
@@ -132,22 +132,7 @@ impl ShardChainWriter for SimShardStorage {
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
-        let creations = committed_tx_cells(
-            block.header().shard_id(),
-            block.transactions().iter().map(|tx| tx.as_unverified()),
-        );
-        let merged_writes = with_sweep(
-            merge_writes_from_receipts(
-                &block
-                    .certificates()
-                    .iter()
-                    .flat_map(|fw| fw.settling_receipts())
-                    .collect::<Vec<_>>(),
-                &self.snapshot(),
-            ),
-            &creations,
-            removals,
-        );
+        let merged_writes = block_settled_writes(block, &self.snapshot(), removals);
         self.append_beacon_witnesses(witness);
         self.commit_block_inner(&merged_writes, block, qc, &receipts)
     }
@@ -171,10 +156,20 @@ fn build_prepared_commit(
               certified: &Arc<Verified<CertifiedBlock>>,
               witness: &BeaconWitnessCommit|
               -> StateRoot {
+            let result_root = snapshot.result_root;
+            // A block already committed — by a sync commit that landed
+            // it between prepare and flush, or by a second vnode on this
+            // store — is in, and applying it again would write its
+            // history twice at one version. The tree's own version says
+            // so, as it does on the persistent backend: a chain adopted
+            // from a checkpoint carries a committed height above its
+            // first blocks, and the tree starts where the chain does.
+            if storage.jmt_height() >= snapshot.new_height {
+                return result_root;
+            }
             storage.append_beacon_witnesses(witness);
 
             let block_height_u64 = snapshot.new_height.inner();
-            let result_root = snapshot.result_root;
 
             {
                 let mut s = write_or_recover(&storage.state);
