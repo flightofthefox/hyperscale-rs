@@ -79,6 +79,16 @@ struct Owed {
     /// certificate outlives the tick, and a shard that could not say
     /// whether it had issued one would have to assume it had.
     certified: bool,
+    /// Whether a committed finalization of this shard's settled the
+    /// transaction's price: a leg's own, which burned it inside its
+    /// writes, or the verdict that made an issuer a remainder.
+    ///
+    /// A committed fact rather than the tick's admission, which is what
+    /// [`Self::certified`] records: a tick discarded before its
+    /// finalization commits burned nothing, and a reclaim reading the
+    /// admission would charge nothing either. Meaningless off a leg
+    /// entry.
+    charged: bool,
     /// What this shard's part in the transaction is, which decides what
     /// the entry waits on and what ends it.
     kind: Kind,
@@ -224,7 +234,8 @@ pub struct Reclaimable {
     pub body: Arc<Verified<Transaction>>,
     /// The classification its committing block froze.
     pub classified: Classified,
-    /// Whether this shard's own certificate of the leg settled the price.
+    /// Whether a committed finalization of this shard's settled the
+    /// price, so the reclaim charges nothing.
     pub charged: bool,
 }
 
@@ -309,6 +320,7 @@ impl UnresolvedTxs {
                     .filter(|prefix| !ShardTrie::shard_owns_prefix(local_shard, *prefix))
                     .collect(),
                 certified: false,
+                charged: false,
                 kind: Kind::Whole,
                 reclaim_admitted: false,
                 unsettled_by: None,
@@ -457,10 +469,10 @@ impl UnresolvedTxs {
     /// Never a clock reading: a record is the only thing that puts an
     /// entry here, and a record carries evidence.
     ///
-    /// Each carries whether a tick of this shard's certified the leg —
-    /// a leg that ran settled its price inside its own certificate, and
-    /// one that never ran (held for a bundle that never came) owes it on
-    /// the reclaim's.
+    /// Each carries whether a committed finalization of this shard's
+    /// settled the price — a leg that ran settled it inside its own
+    /// certificate, and one that never ran, or whose tick was discarded
+    /// before its finalization committed, owes it on the reclaim's.
     #[must_use]
     pub fn reclaimable(&self) -> Vec<Reclaimable> {
         self.owed
@@ -474,7 +486,7 @@ impl UnresolvedTxs {
                     tx_hash: *tx_hash,
                     body: Arc::clone(&kept.body),
                     classified: kept.classified.clone(),
-                    charged: owed.certified,
+                    charged: owed.charged,
                 })
             })
             .collect()
@@ -552,6 +564,7 @@ impl UnresolvedTxs {
                         committed_ts: verdict.evidence().moment(),
                         remote_prefixes: BTreeSet::new(),
                         certified: true,
+                        charged: false,
                         // A leg entry lives inside the replay window —
                         // its horizon is the transaction's own — so a
                         // replay registers and marks it before any record
@@ -764,6 +777,10 @@ impl UnresolvedTxs {
                     continue;
                 };
                 if owed.kind.is_leg() && !deciding.contains(&tx_hash) {
+                    // The leg ran and its certificate burned the price
+                    // inside its writes: what a reclaim of it charges
+                    // nothing for.
+                    owed.charged = true;
                     continue;
                 }
                 // An issuer that accepted has crossings out that its
@@ -778,6 +795,7 @@ impl UnresolvedTxs {
                         .is_some_and(|kept| !kept.deliveries.is_empty());
                 if issued {
                     owed.kind = Kind::Remainder;
+                    owed.charged = true;
                 } else {
                     self.owed.remove(&tx_hash);
                     self.kept.remove(&tx_hash);
@@ -1796,6 +1814,36 @@ mod tests {
             "a record licenses a reclaim of it, never an abort"
         );
         assert_eq!(ledger.len(), 1);
+    }
+
+    /// A reclaim charges the price only where no committed finalization
+    /// of this shard's did: a leg admitted to a tick that was discarded
+    /// before its finalization committed burned nothing, so its reclaim
+    /// carries the price; once the leg's own finalization commits, the
+    /// price is settled and the reclaim charges nothing.
+    #[test]
+    fn a_reclaim_charges_what_no_committed_finalization_settled() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(7, 60_000);
+        commit(&mut ledger, &tx);
+        ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new());
+        ledger.certify(tx.hash());
+        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+            PARTNER,
+            ms(1_000),
+            [names(&tx)],
+        )]);
+        assert!(
+            !ledger.reclaimable()[0].charged,
+            "admission to a tick settles nothing"
+        );
+
+        let own = make_leg_finalization(BlockHeight::new(1), tx.hash());
+        ledger.release_resolved(&[Arc::new(Verifiable::from(own))]);
+        assert!(
+            ledger.reclaimable()[0].charged,
+            "the leg's committed finalization settled the price"
+        );
     }
 
     /// A leg that failed is the transaction's end on this shard: its

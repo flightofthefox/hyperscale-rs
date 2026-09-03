@@ -4242,8 +4242,9 @@ mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_storage::ReplayWindow;
     use hyperscale_types::test_utils::{
-        StubVmStatics, certify as test_certify, make_live_block as helpers_make_live_block,
-        test_prefix, test_transaction, test_transaction_running, test_transaction_with_prefixes,
+        StubVmStatics, certify as test_certify, make_leg_finalization,
+        make_live_block as helpers_make_live_block, test_prefix, test_transaction,
+        test_transaction_running, test_transaction_with_prefixes,
     };
     use hyperscale_types::{
         AbortCharge, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
@@ -7483,6 +7484,12 @@ mod tests {
         state.unresolved.certify(tx_hash);
         state
             .unresolved
+            .release_resolved(&[Arc::new(Verifiable::from(make_leg_finalization(
+                BlockHeight::new(1),
+                tx_hash,
+            )))]);
+        state
+            .unresolved
             .record_abandonment_records(&[AbandonmentRecord::departed(
                 PEER,
                 WeightedTimestamp::from_millis(1_000),
@@ -7519,7 +7526,7 @@ mod tests {
             .expect("the reclaim is dispatched to the engine");
         assert!(
             matches!(request.runs, Runs::Reclaim { charged: true, .. }),
-            "the leg ran here, so its own certificate settled the price"
+            "the leg's finalization committed here, so its certificate settled the price"
         );
         assert!(!request.abortable, "nothing retracts a reclaim");
         assert!(
