@@ -344,6 +344,56 @@ pub fn crossings_of(
         .collect()
 }
 
+/// The claim cells the deliveries of `local`'s issued crossings write,
+/// each under the shard that delivers it.
+///
+/// For every crossing an inbound leg here produces whose consumer is an
+/// outbound leg on another shard: that consumer's claim cell and its
+/// home. A delivery that never claimed leaves exactly this cell absent,
+/// which is what a lapse probe asks the delivering shard about. Empty
+/// when the shape runs whole, since nothing is then handed between
+/// shards.
+#[must_use]
+pub fn delivered_claims(
+    legs: &[LegShape],
+    crossings: &[Crossing],
+    decomposed: Decomposed,
+    trie: &ShardTrie,
+    local: ShardId,
+) -> Vec<(ShardId, SubstateKey)> {
+    if !decomposed.holds() {
+        return Vec::new();
+    }
+    let star = Star::of(legs, trie);
+    crossings
+        .iter()
+        .filter_map(|crossing| {
+            let producer = star.leg(crossing.node).ok()?;
+            if star.role(crossing.node) != LegRole::Inbound || star.home(crossing.node) != local {
+                return None;
+            }
+            let consumer = star.consumer_of(crossing.node, crossing.output)?;
+            if star.role(consumer) != LegRole::Outbound {
+                return None;
+            }
+            let home = star.home(consumer);
+            if home == local {
+                return None;
+            }
+            let claim = CrossingSite::claim(
+                &ProtocolHasher,
+                star.leg(consumer).ok()?.target,
+                producer.intent,
+                producer.local,
+                crossing.output,
+                producer.expiry_ms,
+            )
+            .key();
+            Some((home, claim))
+        })
+        .collect()
+}
+
 /// What one shard runs of a transaction, and the scope it judges under.
 #[derive(Clone, Debug)]
 pub struct ShardPlan {
@@ -795,6 +845,45 @@ mod tests {
         let verdict = decomposes(legs, &trie(), &BTreeSet::new());
         assert!(verdict.holds(), "the fixture has to decompose");
         verdict
+    }
+
+    /// The claim cells a shard's issued crossings are owed by deliveries
+    /// elsewhere: a transfer's withdraw is owed the deposit's claim on
+    /// the recipient's shard, the recipient's shard issues nothing, and a
+    /// swap's withdraw is consumed by the core, which is no delivery.
+    #[test]
+    fn delivered_claims_name_the_deliveries_of_what_a_shard_issued() {
+        let legs = transfer();
+        let crossings = [crossing(&legs, 1, 0, true)];
+        let bob = owner(0x22, true);
+        let expected = CrossingSite::claim(
+            &ProtocolHasher,
+            bob,
+            legs[1].intent,
+            legs[1].local,
+            0,
+            legs[1].expiry_ms,
+        )
+        .key();
+        assert_eq!(
+            delivered_claims(&legs, &crossings, decomposed(&legs), &trie(), low()),
+            vec![(high(), expected)],
+        );
+        assert!(
+            delivered_claims(&legs, &crossings, decomposed(&legs), &trie(), high()).is_empty(),
+            "the delivering shard issued nothing",
+        );
+        assert!(
+            delivered_claims(&legs, &crossings, Decomposed::WHOLE, &trie(), low()).is_empty(),
+            "a whole shape hands nothing between shards",
+        );
+
+        let swap = swap();
+        let crossings = [crossing(&swap, 1, 0, true), crossing(&swap, 2, 0, false)];
+        assert!(
+            delivered_claims(&swap, &crossings, decomposed(&swap), &trie(), low()).is_empty(),
+            "a crossing the core consumes is answered by the core, not a delivery",
+        );
     }
 
     /// The whole shape on every participant, whatever the trie.

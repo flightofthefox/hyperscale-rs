@@ -37,7 +37,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::{Classified, Runs, Side, crossings_of};
+use hyperscale_engine::legs::{Classified, Runs, Side, crossings_of, delivered_claims};
 use hyperscale_engine::{TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_unresolvable_tx};
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
@@ -51,8 +51,8 @@ use hyperscale_types::{
     ShardId, ShardTrie, StateAnchor, StateRoot, StoredReceipt, SubstateKey, TickId,
     TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxHash,
     TxOutcome, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    absence_licenses_reclaim, derive_block_transactions, settled_set_verdict, tick_leader,
-    tick_leader_at,
+    absence_licenses_reclaim, derive_block_transactions, lapse_licenses_reclaim,
+    lapse_probe_anchor, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use tracing::instrument;
 
@@ -213,22 +213,34 @@ struct ProvenSource {
     state_root: StateRoot,
 }
 
-/// What this shard has asked a silent core about one transaction.
+/// Which counterpart a probe asks, and so which record its absence is
+/// offered as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probed {
+    /// A core's committed cell, past the transaction's deadline.
+    Core,
+    /// A delivering shard's claim cell, past the crossing's lapse.
+    Delivery,
+}
+
+/// What this shard has asked a silent counterpart about one transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Probe {
     /// A proof of `key` is out against `anchor`, whose block sits at
-    /// `probed_wt`; `deadline` is the entry's own, kept beside it so
-    /// the absence can be dated without the ledger.
+    /// `probed_wt`; `floor` is the anchor the answer is held to, kept
+    /// beside it so the absence can be dated without the ledger.
     Issued {
         anchor: StateAnchor,
         key: SubstateKey,
         probed_wt: WeightedTimestamp,
-        deadline: WeightedTimestamp,
+        floor: WeightedTimestamp,
+        probed: Probed,
     },
-    /// The core committed it: its certificate is what speaks next.
+    /// The counterpart took it: a core's certificate is what speaks
+    /// next, and a delivery's claim leaves nothing to reclaim.
     Committed,
-    /// The core had not committed it past the deadline.
-    Absent(Absence),
+    /// The counterpart had not taken it past the floor.
+    Absent(Absence, Probed),
 }
 
 /// Execution state machine.
@@ -435,12 +447,12 @@ pub struct ExecutionCoordinator {
     /// collected before it is drained. Each lives to its leg entry.
     refusals: BTreeMap<(TxHash, ShardId), Refusal>,
 
-    /// What this shard has asked a silent core about a transaction a
-    /// leg here issued for, keyed like the refusals: a probe in flight,
-    /// a core that turned out to have committed it, or an absence
-    /// proved — which is what an `Unclaimed` abandonment record is
-    /// offered from, and which is handed to the vote fence the moment
-    /// it is proved. Each lives to its leg entry.
+    /// What this shard has asked a silent counterpart about a
+    /// transaction a leg here issued for, keyed like the refusals: a
+    /// probe in flight, a counterpart that turned out to have taken it,
+    /// or an absence proved — which is what an `Unclaimed` or a `Lapsed`
+    /// abandonment record is offered from, and which is handed to the
+    /// vote fence the moment it is proved. Each lives to its leg entry.
     probes: BTreeMap<(TxHash, ShardId), Probe>,
 
     /// Finalizations built but withheld because a contained EC names a
@@ -824,6 +836,13 @@ impl ExecutionCoordinator {
                         tx.hash(),
                         Arc::clone(&verified),
                         classified.core().clone(),
+                        delivered_claims(
+                            tx.legs(),
+                            tx.crossings(),
+                            classified.decomposed(),
+                            trie,
+                            local_shard,
+                        ),
                     );
                 }
             }
@@ -2238,65 +2257,88 @@ impl ExecutionCoordinator {
         for cert in deferred {
             actions.extend(self.on_execution_certificate(topology_schedule, cert));
         }
-        // A core's header past a leg's deadline is what a probe of its
-        // committed set waits on.
-        actions.extend(self.probe_silent_cores());
+        // A counterpart's header past a leg's deadline is what a probe
+        // of its committed set, or of its claim cell, waits on.
+        actions.extend(self.probe_silent_counterparts());
         actions
     }
 
-    /// Ask each silent core whether it committed the transaction a leg
-    /// here issued for, once the transaction's deadline has passed.
+    /// Ask each silent counterpart whether it took the transaction a
+    /// leg here issued for, once the transaction's deadline has passed.
     ///
-    /// The deadline gates the probe and never the reclaim: absence from
-    /// the core's committed set at a block past the deadline is the
-    /// evidence, and before it the core may still legitimately commit.
-    /// The probe goes to the core's lowest shard — any one core shard's
-    /// absence suffices, and the choice has to be the same on every
-    /// validator or a voter's mirror would name a shard the record does
-    /// not — against the lowest commit-proven header of that shard at
-    /// or past the deadline, so validators reaching the same headers
-    /// probe at the same anchor. A shard whose header has not reached
-    /// here yet is asked when it does.
+    /// The deadline gates the probe and never the reclaim: absence at a
+    /// block past the floor is the evidence, and before it the
+    /// counterpart may still legitimately act. A core is asked about the
+    /// transaction's committed cell past the deadline, and the probe
+    /// goes to the core's lowest shard — any one core shard's absence
+    /// suffices, and the choice has to be the same on every validator or
+    /// a voter's mirror would name a shard the record does not. A
+    /// delivering shard is asked about the crossing's claim cell past
+    /// the lapse, the delivery window's close plus the finalization
+    /// delay, since a delivery admitted under the close has claimed by
+    /// then or never will. Each is asked against the lowest
+    /// commit-proven header of that shard at or past its floor, so
+    /// validators reaching the same headers probe at the same anchor. A
+    /// shard whose header has not reached here yet is asked when it
+    /// does.
     ///
-    /// The cell is named from signed content and the core shard alone,
-    /// so nothing but the header and the proof is fetched.
-    fn probe_silent_cores(&mut self) -> Vec<Action> {
+    /// The cell is named from signed content and the counterpart shard
+    /// alone, so nothing but the header and the proof is fetched.
+    fn probe_silent_counterparts(&mut self) -> Vec<Action> {
         let mut wanted: BTreeMap<StateAnchor, Vec<SubstateKey>> = BTreeMap::new();
         for entry in self.unresolved.probeable(self.committed_ts) {
-            let Some(&shard) = entry.core.iter().next() else {
-                continue;
-            };
-            if self.probes.contains_key(&(entry.tx_hash, shard)) {
-                continue;
+            let core = entry.core.iter().next().map(|&shard| {
+                (
+                    shard,
+                    committed_tx_cell_key(shard, entry.tx_hash, entry.validity_end),
+                    entry.deadline,
+                    Probed::Core,
+                )
+            });
+            let deliveries = entry.deliveries.iter().map(|&(shard, claim)| {
+                (
+                    shard,
+                    claim,
+                    lapse_probe_anchor(entry.validity_end),
+                    Probed::Delivery,
+                )
+            });
+            for (shard, key, floor, probed) in core.into_iter().chain(deliveries) {
+                if self.probes.contains_key(&(entry.tx_hash, shard)) {
+                    continue;
+                }
+                let licenses = |ts: WeightedTimestamp| match probed {
+                    Probed::Core => absence_licenses_reclaim(ts, entry.validity_end),
+                    Probed::Delivery => lapse_licenses_reclaim(ts, entry.validity_end),
+                };
+                let Some((height, source)) = self
+                    .proven_remote
+                    .iter()
+                    .filter(|((source_shard, _), source)| {
+                        *source_shard == shard && licenses(source.ts)
+                    })
+                    .map(|((_, height), source)| (*height, *source))
+                    .min_by_key(|(height, _)| *height)
+                else {
+                    continue;
+                };
+                let anchor = StateAnchor {
+                    shard,
+                    height,
+                    state_root: source.state_root,
+                };
+                self.probes.insert(
+                    (entry.tx_hash, shard),
+                    Probe::Issued {
+                        anchor,
+                        key,
+                        probed_wt: source.ts,
+                        floor,
+                        probed,
+                    },
+                );
+                wanted.entry(anchor).or_default().push(key);
             }
-            let Some((height, source)) = self
-                .proven_remote
-                .iter()
-                .filter(|((source_shard, _), source)| {
-                    *source_shard == shard
-                        && absence_licenses_reclaim(source.ts, entry.validity_end)
-                })
-                .map(|((_, height), source)| (*height, *source))
-                .min_by_key(|(height, _)| *height)
-            else {
-                continue;
-            };
-            let anchor = StateAnchor {
-                shard,
-                height,
-                state_root: source.state_root,
-            };
-            let key = committed_tx_cell_key(shard, entry.tx_hash, entry.validity_end);
-            self.probes.insert(
-                (entry.tx_hash, shard),
-                Probe::Issued {
-                    anchor,
-                    key,
-                    probed_wt: source.ts,
-                    deadline: entry.deadline,
-                },
-            );
-            wanted.entry(anchor).or_default().push(key);
         }
         wanted
             .into_iter()
@@ -2316,12 +2358,13 @@ impl ExecutionCoordinator {
     ///
     /// An answer is matched on the anchor as well as the key: a proof
     /// taken at another height says nothing about the probe issued at
-    /// this one. A key found present means the core committed the
-    /// transaction, and what speaks for it next is the core's own
-    /// certificate — a refusal there is mirrored on arrival, and a
-    /// success leaves nothing to reclaim. The hand-off is a
-    /// continuation emitted here rather than a map the fence reads
-    /// later, so an absence is never collected before it is drained.
+    /// this one. A key found present means the counterpart took the
+    /// transaction: a core's own certificate speaks for it next — a
+    /// refusal there is mirrored on arrival, and a success leaves
+    /// nothing to reclaim — and a delivery's claim leaves nothing to
+    /// reclaim either. The hand-off is a continuation emitted here
+    /// rather than a map the fence reads later, so an absence is never
+    /// collected before it is drained.
     pub fn on_state_proof_verified(
         &mut self,
         anchor: StateAnchor,
@@ -2334,7 +2377,8 @@ impl ExecutionCoordinator {
                     anchor: issued,
                     key: asked,
                     probed_wt,
-                    deadline,
+                    floor,
+                    probed,
                 } = *probe
                 else {
                     continue;
@@ -2345,11 +2389,8 @@ impl ExecutionCoordinator {
                 match inclusion {
                     Inclusion::Present => *probe = Probe::Committed,
                     Inclusion::Absent => {
-                        let absence = Absence {
-                            probed_wt,
-                            floor: deadline,
-                        };
-                        *probe = Probe::Absent(absence);
+                        let absence = Absence { probed_wt, floor };
+                        *probe = Probe::Absent(absence, probed);
                         actions.push(Action::Continuation(ProtocolEvent::AbsenceObserved {
                             shard,
                             tx_hash,
@@ -2613,7 +2654,7 @@ impl ExecutionCoordinator {
         self.release_unanswerable(&unanswerable);
         // The committed clock is what opens a leg's deadline, so the
         // cores gone silent past it are asked here.
-        actions.extend(self.probe_silent_cores());
+        actions.extend(self.probe_silent_counterparts());
 
         // Timeout checks + pruning run every block, not just commits that
         // carry txs.
@@ -3001,21 +3042,28 @@ impl ExecutionCoordinator {
             refused,
             AbandonmentRecord::refused,
         );
-        // Proved absences, grouped the same way: a record states the
-        // one anchor every name in it was proved at.
-        let absent = self
-            .probes
-            .iter()
-            .filter_map(|((tx_hash, shard), probe)| match probe {
-                Probe::Absent(absence) => Some((*tx_hash, *shard, absence.probed_wt)),
-                Probe::Issued { .. } | Probe::Committed => None,
-            });
-        self.offer_at_earliest_anchor(
-            &mut records,
-            &mut budget,
-            absent,
-            AbandonmentRecord::unclaimed,
-        );
+        // Proved absences, grouped the same way, one arm per kind of
+        // counterpart: a record states the one anchor every name in it
+        // was proved at, and a core's absence and a delivery's are
+        // different claims held to different floors.
+        for (probed, record) in [
+            (
+                Probed::Core,
+                AbandonmentRecord::unclaimed as fn(_, _, _) -> _,
+            ),
+            (Probed::Delivery, AbandonmentRecord::lapsed),
+        ] {
+            let absent = self
+                .probes
+                .iter()
+                .filter_map(|((tx_hash, shard), probe)| match probe {
+                    Probe::Absent(absence, kind) if *kind == probed => {
+                        Some((*tx_hash, *shard, absence.probed_wt))
+                    }
+                    Probe::Absent(..) | Probe::Issued { .. } | Probe::Committed => None,
+                });
+            self.offer_at_earliest_anchor(&mut records, &mut budget, absent, record);
+        }
         records.into_values().collect()
     }
 
@@ -4153,9 +4201,9 @@ mod tests {
         AbortCharge, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
         ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed,
         EpochWindows, ExecutionOutcome, GlobalReceiptHash, Hash, LocalKey, MAX_FINALIZATION_DELAY,
-        NetworkDefinition, QuorumCertificate, Randomness, RecoveryCause, SeedRing, SeedSource,
-        ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateRoot, StoredReceipt, SubstateKey,
-        TickHalf, UnsettledTx, ValidatorInfo, ValidatorSet,
+        MAX_VALIDITY_RANGE, NetworkDefinition, QuorumCertificate, Randomness, RecoveryCause,
+        SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateRoot,
+        StoredReceipt, SubstateKey, TickHalf, UnsettledTx, ValidatorInfo, ValidatorSet,
     };
     use hyperscale_vm_types::Seeded;
 
@@ -7381,6 +7429,7 @@ mod tests {
             tx_hash,
             Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
             BTreeSet::from([PEER]),
+            Vec::new(),
         );
         state.unresolved.certify(tx_hash);
         state
@@ -7452,6 +7501,7 @@ mod tests {
             tx_hash,
             Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
             BTreeSet::from([PEER]),
+            Vec::new(),
         );
         state.unresolved.certify(tx_hash);
 
@@ -7509,6 +7559,7 @@ mod tests {
             tx_hash,
             Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
             BTreeSet::from([PEER]),
+            Vec::new(),
         );
         let actions = accepting.handle_attestation(
             &schedule,
@@ -7538,6 +7589,7 @@ mod tests {
             transaction.hash(),
             Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
             BTreeSet::from([PEER]),
+            Vec::new(),
         );
         state.unresolved.certify(transaction.hash());
         state
@@ -7574,6 +7626,81 @@ mod tests {
 
     /// A core silent past a leg's deadline is asked whether it committed
     /// the transaction, against its lowest commit-proven header at or
+    /// A delivery that never claimed is probed at its lapse, the
+    /// deadline plus a validity range, and never at a header short of
+    /// it — the deadline itself included, where a core would already be
+    /// asked. Its absence reaches the vote fence with the lapse as its
+    /// floor and is offered as a lapse record.
+    #[test]
+    fn a_silent_delivery_is_probed_past_the_lapse_and_its_lapse_offered() {
+        let schedule = two_shard_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let figures = UnsettledTx::for_transaction(&transaction);
+        let deadline = figures.deadline;
+        let lapse = deadline.plus(MAX_VALIDITY_RANGE);
+        let claim = SubstateKey {
+            owner: test_prefix(0x81),
+            local: LocalKey([0xC1; 16]),
+        };
+        let root = |tag: &[u8]| StateRoot::from_raw(Hash::from_bytes(tag));
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        state.unresolved.register_committed(
+            HOME,
+            WeightedTimestamp::ZERO,
+            std::iter::once(&transaction),
+        );
+        state.unresolved.mark_leg(
+            tx_hash,
+            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+            BTreeSet::new(),
+            vec![(PEER, claim)],
+        );
+        state.unresolved.certify(tx_hash);
+
+        let held: [(u64, WeightedTimestamp, &[u8]); 3] = [
+            (3, deadline, b"deadline"),
+            (5, lapse.plus(Duration::from_secs(1)), b"later"),
+            (4, lapse, b"at"),
+        ];
+        for (height, ts, tag) in held {
+            state.on_committed_remote_header(
+                &schedule,
+                PEER,
+                BlockHeight::new(height),
+                ts,
+                root(tag),
+            );
+        }
+        state.committed_ts = deadline;
+        let anchor = StateAnchor {
+            shard: PEER,
+            height: BlockHeight::new(4),
+            state_root: root(b"at"),
+        };
+        assert_eq!(
+            state_proof_fetches(&state.probe_silent_counterparts()),
+            vec![(anchor, vec![claim])],
+            "the lowest header at or past the lapse is the anchor, and the claim cell the key"
+        );
+
+        let answered = state.on_state_proof_verified(anchor, &[(claim, Inclusion::Absent)]);
+        assert_eq!(
+            absences_observed(&answered, tx_hash),
+            vec![Absence {
+                probed_wt: lapse,
+                floor: lapse
+            }],
+        );
+        assert_eq!(
+            state.pending_abandonment_records(),
+            vec![AbandonmentRecord::lapsed(PEER, lapse, [figures])],
+            "offered as a lapse, under the anchor it was proved at"
+        );
+    }
+
     /// past the deadline and never against one short of it. An absence
     /// reaches the vote fence and is offered under the anchor it was
     /// proved at; an answer at another anchor is nobody's.
@@ -7621,12 +7748,12 @@ mod tests {
             state_root: root(b"at"),
         };
         assert_eq!(
-            state_proof_fetches(&state.probe_silent_cores()),
+            state_proof_fetches(&state.probe_silent_counterparts()),
             vec![(anchor, vec![key])],
             "the lowest header at or past the deadline is the anchor"
         );
         assert!(
-            state_proof_fetches(&state.probe_silent_cores()).is_empty(),
+            state_proof_fetches(&state.probe_silent_counterparts()).is_empty(),
             "a probe in flight is not re-issued"
         );
 
@@ -7695,7 +7822,7 @@ mod tests {
         );
         assert!(state.pending_abandonment_records().is_empty());
         assert!(
-            state_proof_fetches(&state.probe_silent_cores()).is_empty(),
+            state_proof_fetches(&state.probe_silent_counterparts()).is_empty(),
             "and is not asked again"
         );
     }

@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, Finalization, MAX_VALIDITY_RANGE, ShardId, ShardTrie,
-    Transaction, TxHash, Unsettleable, UnsettledTx, Verifiable, Verified, WeightedTimestamp,
-    delivery_window_close,
+    SubstateKey, Transaction, TxHash, Unsettleable, UnsettledTx, Verifiable, Verified,
+    WeightedTimestamp, delivery_window_close,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -150,24 +150,34 @@ pub struct Unanswerable {
 struct Leg {
     body: Arc<Verified<Transaction>>,
     core: BTreeSet<ShardId>,
+    /// The claim cells deliveries elsewhere write for the crossings this
+    /// leg issued, each under its delivering shard — what a lapse probe
+    /// asks about once the delivery window has closed.
+    deliveries: Vec<(ShardId, SubstateKey)>,
 }
 
-/// A leg entry whose core has been silent past the transaction's
-/// deadline — what a probe of the core's committed set asks about.
+/// A leg entry whose counterparts have been silent past the
+/// transaction's deadline — what a probe of a core's committed set, or
+/// of a delivering shard's claim cell, asks about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probeable {
     /// The transaction.
     pub tx_hash: TxHash,
     /// Its deadline: the earliest core anchor at which absence means
-    /// anything, and the figure the probe's answer is dated against.
+    /// anything, and the figure a core's answer is dated against.
     pub deadline: WeightedTimestamp,
     /// Its validity end, which names the committed cell the core would
-    /// have written.
+    /// have written and dates the lapse a delivery's answer is held to.
     pub validity_end: WeightedTimestamp,
     /// The core set. Any one core shard's absence suffices — no core
     /// shard finalizes without every other's certificate — so the probe
-    /// goes to one of them.
+    /// goes to one of them. Empty for a shape with no core, whose
+    /// counterparts are deliveries alone.
     pub core: BTreeSet<ShardId>,
+    /// The claim cells deliveries elsewhere write for what this leg
+    /// issued, each under its delivering shard. Asked about past the
+    /// lapse, one probe per delivering shard.
+    pub deliveries: Vec<(ShardId, SubstateKey)>,
 }
 
 /// Committed-but-unresolved transactions, each against its deadline and
@@ -244,10 +254,18 @@ impl UnresolvedTxs {
         tx_hash: TxHash,
         body: Arc<Verified<Transaction>>,
         core: BTreeSet<ShardId>,
+        deliveries: Vec<(ShardId, SubstateKey)>,
     ) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
             owed.leg = true;
-            self.legs.insert(tx_hash, Leg { body, core });
+            self.legs.insert(
+                tx_hash,
+                Leg {
+                    body,
+                    core,
+                    deliveries,
+                },
+            );
         }
     }
 
@@ -289,14 +307,17 @@ impl UnresolvedTxs {
             })
     }
 
-    /// The leg entries whose core may now be asked whether it committed
-    /// the transaction: past the deadline and covered by no record yet.
+    /// The leg entries whose counterparts may now be asked whether they
+    /// took the transaction: past the deadline and covered by no record
+    /// yet.
     ///
     /// The deadline gates the probe and nothing else. Before it the core
     /// may still legitimately commit, so absence says nothing; past it
     /// absence is proof, and the proof is what a record is composed on.
-    /// Read off committed content alone, like [`Self::past_deadline`],
-    /// so every replica at the same frontier asks about the same set.
+    /// A delivery's answer is held to a later floor still, the lapse,
+    /// which the prober applies to the header it reads. Read off
+    /// committed content alone, like [`Self::past_deadline`], so every
+    /// replica at the same frontier asks about the same set.
     #[must_use]
     pub fn probeable(&self, now: WeightedTimestamp) -> Vec<Probeable> {
         self.owed
@@ -309,6 +330,7 @@ impl UnresolvedTxs {
                     deadline: owed.deadline,
                     validity_end: leg.body.validity_range().end_timestamp_exclusive,
                     core: leg.core.clone(),
+                    deliveries: leg.deliveries.clone(),
                 })
             })
             .collect()
@@ -675,14 +697,16 @@ impl UnresolvedTxs {
     /// every record still owed a verdict.
     ///
     /// A leg entry has a clock of its own, and it is the transaction's:
-    /// `deadline + MAX_VALIDITY_RANGE`, which is the validity end plus the
-    /// retention horizon — the moment the record cell it would reclaim
-    /// sweeps. Past it there is nothing to take back, whatever evidence
-    /// arrives, so the entry goes on that reading alone. Dropping gives a
-    /// reclaim up; it never licenses one. A record's evidence does not
-    /// extend it, and no counterpart's silence shortens it: a reclaim
-    /// waits on a record, and the record's arms are the evidence, not the
-    /// counterpart's answerability.
+    /// `deadline + 2 * MAX_VALIDITY_RANGE`, which is the validity end plus
+    /// the escrow grace — the moment the record cell it would reclaim
+    /// sweeps, one validity range past the lapse a delivery's absence is
+    /// proved at, so a lapse proved at the earliest has a validity range
+    /// to become a committed reclaim. Past it there is nothing to take
+    /// back, whatever evidence arrives, so the entry goes on that reading
+    /// alone. Dropping gives a reclaim up; it never licenses one. A
+    /// record's evidence does not extend it, and no counterpart's silence
+    /// shortens it: a reclaim waits on a record, and the record's arms
+    /// are the evidence, not the counterpart's answerability.
     ///
     /// Returns the transactions dropped because every counterpart has
     /// fallen silent. Each carries whether a committed record had covered
@@ -696,7 +720,7 @@ impl UnresolvedTxs {
             .into_iter()
             .filter(|(tx_hash, owed)| {
                 if owed.leg {
-                    return owed.deadline.plus(MAX_VALIDITY_RANGE) > now;
+                    return owed.deadline.plus(MAX_VALIDITY_RANGE * 2) > now;
                 }
                 if let Some(shard) = owed.unsettled_by {
                     if self.departed.get(&shard).is_some_and(|departure| {
@@ -774,8 +798,8 @@ mod tests {
         make_finalization, stub_transaction, test_prefix, test_principal,
     };
     use hyperscale_types::{
-        BlockHeight, EPOCH_DURATION, EpochWindows, MAX_FINALIZATION_DELAY, TimestampRange,
-        TransactionDecision, UnsettledTx, Verified, WeightedTimestamp,
+        BlockHeight, EPOCH_DURATION, EpochWindows, LocalKey, MAX_FINALIZATION_DELAY,
+        TimestampRange, TransactionDecision, UnsettledTx, Verified, WeightedTimestamp,
     };
 
     use super::*;
@@ -1424,7 +1448,12 @@ mod tests {
         let whole = tx(5, 60_000);
         commit(&mut ledger, &leg);
         commit(&mut ledger, &whole);
-        ledger.mark_leg(leg.hash(), body(&leg), BTreeSet::from([PARTNER]));
+        ledger.mark_leg(
+            leg.hash(),
+            body(&leg),
+            BTreeSet::from([PARTNER]),
+            Vec::new(),
+        );
         ledger.certify(leg.hash());
         ledger.certify(whole.hash());
 
@@ -1442,6 +1471,7 @@ mod tests {
                 deadline,
                 validity_end: ms(60_000),
                 core: BTreeSet::from([PARTNER]),
+                deliveries: Vec::new(),
             }],
             "at the deadline the leg is probeable and the whole entry is not"
         );
@@ -1462,6 +1492,51 @@ mod tests {
         );
     }
 
+    /// A leg whose counterpart is a delivery is probeable past the
+    /// deadline like any other, and carries the claim cells the probe
+    /// asks about; a record over the lapse covers it and licenses the
+    /// reclaim.
+    #[test]
+    fn a_leg_delivered_elsewhere_is_probeable_with_its_claims() {
+        let mut ledger = UnresolvedTxs::default();
+        let leg = tx(6, 60_000);
+        commit(&mut ledger, &leg);
+        let claim = SubstateKey {
+            owner: test_prefix(AWAY),
+            local: LocalKey([0xC1; 16]),
+        };
+        ledger.mark_leg(
+            leg.hash(),
+            body(&leg),
+            BTreeSet::new(),
+            vec![(PARTNER, claim)],
+        );
+        ledger.certify(leg.hash());
+
+        let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
+        assert_eq!(
+            ledger.probeable(deadline),
+            vec![Probeable {
+                tx_hash: leg.hash(),
+                deadline,
+                validity_end: ms(60_000),
+                core: BTreeSet::new(),
+                deliveries: vec![(PARTNER, claim)],
+            }],
+        );
+        ledger.record_abandonment_records(&[AbandonmentRecord::lapsed(
+            PARTNER,
+            deadline.plus(MAX_VALIDITY_RANGE),
+            [names(&leg)],
+        )]);
+        assert!(ledger.probeable(deadline).is_empty(), "covered once");
+        assert_eq!(
+            ledger.reclaimable().len(),
+            1,
+            "and the lapse licenses the reclaim"
+        );
+    }
+
     /// A leg's own finalization bears no verdict on the transaction, so
     /// it releases nothing, and the entry is never abandoned — not at its
     /// deadline, and not when a committed record names it.
@@ -1470,7 +1545,7 @@ mod tests {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(4, 60_000);
         commit(&mut ledger, &tx);
-        ledger.mark_leg(tx.hash(), body(&tx), BTreeSet::from([PARTNER]));
+        ledger.mark_leg(tx.hash(), body(&tx), BTreeSet::from([PARTNER]), Vec::new());
         ledger.certify(tx.hash());
 
         let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Accept);
@@ -1505,7 +1580,7 @@ mod tests {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(6, 60_000);
         commit(&mut ledger, &tx);
-        ledger.mark_leg(tx.hash(), body(&tx), BTreeSet::from([PARTNER]));
+        ledger.mark_leg(tx.hash(), body(&tx), BTreeSet::from([PARTNER]), Vec::new());
         ledger.certify(tx.hash());
         assert!(
             ledger.reclaimable().is_empty(),
@@ -1563,7 +1638,7 @@ mod tests {
         );
         let horizon = ms(60_000)
             .plus(MAX_FINALIZATION_DELAY)
-            .plus(MAX_VALIDITY_RANGE);
+            .plus(MAX_VALIDITY_RANGE * 2);
         assert!(ledger.prune(horizon).is_empty());
         assert_eq!(ledger.len(), 0, "gone at its horizon");
     }
@@ -1575,12 +1650,12 @@ mod tests {
     fn a_leg_entry_lives_to_the_record_cells_own_horizon() {
         let horizon = ms(60_000)
             .plus(MAX_FINALIZATION_DELAY)
-            .plus(MAX_VALIDITY_RANGE);
+            .plus(MAX_VALIDITY_RANGE * 2);
         for covered in [false, true] {
             let mut ledger = UnresolvedTxs::default();
             let tx = tx(5, 60_000);
             commit(&mut ledger, &tx);
-            ledger.mark_leg(tx.hash(), body(&tx), BTreeSet::from([PARTNER]));
+            ledger.mark_leg(tx.hash(), body(&tx), BTreeSet::from([PARTNER]), Vec::new());
             ledger.certify(tx.hash());
             if covered {
                 ledger.record_abandonment_records(&[AbandonmentRecord::departed(
