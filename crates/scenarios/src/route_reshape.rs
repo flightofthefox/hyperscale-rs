@@ -417,11 +417,26 @@ fn assert_train_fates<C: Cluster>(
             "never included"
         };
         let status = await_tx_terminal(c, *hash, epochs(12));
+        // The credit is the recipient's chain's to give: the leaving
+        // shard's or, for a transfer it never included, whichever
+        // successor took the recipient's prefix. A transfer accepted by
+        // its payer and by no chain holding the recipient is one whose
+        // delivery lapsed, and the reclaim returns the payment — the
+        // world's conservation is what reads that.
+        let delivered = std::iter::once(terminating)
+            .chain(successors.iter().copied())
+            .any(|shard| {
+                c.chain_fate(shard, *hash)
+                    .1
+                    .is_some_and(|(_, decision)| decision == TransactionDecision::Accept)
+            });
         let credited = match status {
-            Some(TransactionStatus::Completed(TransactionDecision::Accept)) => {
+            Some(TransactionStatus::Completed(TransactionDecision::Accept)) if delivered => {
                 10 + STRADDLER_PAYMENT
             }
-            Some(TransactionStatus::Completed(TransactionDecision::Aborted)) if !included => 10,
+            Some(TransactionStatus::Completed(
+                TransactionDecision::Accept | TransactionDecision::Aborted,
+            )) if !included || !delivered => 10,
             other => panic!(
                 "a transfer sent {phase:?} and {taken} by the leaving shard reached {other:?}",
             ),

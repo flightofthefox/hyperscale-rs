@@ -452,6 +452,23 @@ impl TickState {
             .is_some_and(|membership| membership.awaited().iter().any(|&s| s != local))
     }
 
+    /// Whether `outcome`, attested by `shard`, covers its member here: the
+    /// member awaits `shard`, and a success counts only if the
+    /// counterpart awaited this shard for it — ran the shape that has
+    /// this shard in it. Two shards freeze a member's shape each at its
+    /// own anchor, and one that froze it divided while this one froze it
+    /// whole attests a leg that awaited nobody; settling a whole shape on
+    /// that would credit here what the leg escrowed there, and the
+    /// escrow's reclaim then pays it a second time. An abort settles
+    /// nothing and is terminal whoever speaks it, and the tick's own
+    /// certificate is what it awaited of itself.
+    fn covers(&self, outcome: &TxOutcome, shard: ShardId, is_local: bool) -> bool {
+        self.awaits(outcome.tx_hash(), shard)
+            && (is_local
+                || outcome.is_aborted()
+                || outcome.counterparts().contains(&self.tick_id.shard_id()))
+    }
+
     /// Whether `tx_hash`'s settlement waits on `shard`'s certificate.
     fn awaits(&self, tx_hash: TxHash, shard: ShardId) -> bool {
         self.membership
@@ -817,11 +834,10 @@ impl TickState {
         let is_local = ec.tick_id() == &self.tick_id;
 
         let covers_something_new = ec.tx_outcomes().iter().any(|outcome| {
-            let tx_hash = outcome.tx_hash();
-            self.awaits(tx_hash, shard)
+            self.covers(outcome, shard, is_local)
                 && self
                     .covered_shards
-                    .get(&tx_hash)
+                    .get(&outcome.tx_hash())
                     .is_some_and(|covered| !covered.contains(&shard))
         });
         // An empty tick's own certificate covers nothing yet still has to
@@ -833,7 +849,7 @@ impl TickState {
 
         for outcome in ec.tx_outcomes() {
             let tx_hash = outcome.tx_hash();
-            if !self.awaits(tx_hash, shard) {
+            if !self.covers(outcome, shard, is_local) {
                 continue;
             }
             if let Some(covered) = self.covered_shards.get_mut(&tx_hash) {
@@ -1304,6 +1320,57 @@ mod tests {
         (tick, determined, leg)
     }
 
+    /// A counterpart that ran the member as a leg awaited nobody, and its
+    /// certificate is not the counterpart a whole shape here waits on:
+    /// the member stays uncovered until a certificate whose outcome
+    /// awaited this shard arrives.
+    #[test]
+    fn a_counterpart_that_awaited_nobody_does_not_cover_a_whole_shape() {
+        let (local, peer) = (shard(0), shard(1));
+        let member = tx(3);
+        let mut tick = TickState::new(
+            TickId::new(local, BlockHeight::new(1)),
+            BlockHash::ZERO,
+            WeightedTimestamp::from_millis(1_000),
+        );
+        tick.admit(
+            member,
+            Membership::whole(BTreeSet::from([local, peer])),
+            10,
+            Admission::Executes,
+        );
+        let from_peer = |counterparts: Vec<ShardId>| {
+            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+                TickId::new(peer, BlockHeight::new(7)),
+                WeightedTimestamp::from_millis(1_000),
+                GlobalReceiptRoot::ZERO,
+                vec![
+                    TxOutcome::attesting(
+                        member,
+                        ExecutionOutcome::Succeeded {
+                            receipt_hash: GlobalReceiptHash::ZERO,
+                        },
+                        1,
+                    )
+                    .awaiting(counterparts),
+                ],
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            )))
+        };
+
+        tick.add_execution_certificate(from_peer(Vec::new()));
+        assert!(
+            !tick.covered_shards[&member].contains(&peer),
+            "a leg's certificate awaited nobody and covers nothing here"
+        );
+        tick.add_execution_certificate(from_peer(vec![local]));
+        assert!(
+            tick.covered_shards[&member].contains(&peer),
+            "a certificate whose outcome awaited this shard is the counterpart"
+        );
+    }
+
     /// The hostage-taking runs both ways, and neither is allowed.
     ///
     /// A determined member this validator holds no receipt for cannot
@@ -1359,12 +1426,15 @@ mod tests {
                 TickId::new(shard(1), BlockHeight::new(4)),
                 WeightedTimestamp::from_millis(1_000),
                 GlobalReceiptRoot::ZERO,
-                vec![TxOutcome::new(
-                    leg,
-                    ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
-                    },
-                )],
+                vec![
+                    TxOutcome::new(
+                        leg,
+                        ExecutionOutcome::Succeeded {
+                            receipt_hash: GlobalReceiptHash::ZERO,
+                        },
+                    )
+                    .awaiting([local]),
+                ],
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
@@ -1427,12 +1497,15 @@ mod tests {
                 TickId::new(shard(1), BlockHeight::new(4)),
                 WeightedTimestamp::from_millis(1_000),
                 GlobalReceiptRoot::ZERO,
-                vec![TxOutcome::new(
-                    leg,
-                    ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
-                    },
-                )],
+                vec![
+                    TxOutcome::new(
+                        leg,
+                        ExecutionOutcome::Succeeded {
+                            receipt_hash: GlobalReceiptHash::ZERO,
+                        },
+                    )
+                    .awaiting([shard(0)]),
+                ],
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
