@@ -16,8 +16,8 @@ use crate::{
     ChainOrigin, Derivation, Finalization, LocalReceiptRoot, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ShardId,
-    SharedWitnessSources, SplitChildRoots, StateRoot, Transaction, TransactionRoot, TxHash,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    SharedWitnessSources, SplitChildRoots, StateProofBundle, StateRoot, Transaction,
+    TransactionRoot, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -120,6 +120,11 @@ pub enum Block {
         /// Committed via the header's `abandonment_root`.
         #[hbor(max = MAX_ABANDONMENT_RECORDS_PER_BLOCK)]
         abandonment_records: Arc<Vec<AbandonmentRecord>>,
+        /// Proofs of counterparts' cells the proposer's fetches answered,
+        /// committed via the header's `state_proofs_root` and folded by
+        /// every replica at commit. See [`StateProofBundle`].
+        #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
+        state_proofs: Arc<Vec<StateProofBundle>>,
         /// Proposer-supplied beacon-witness inputs. Committed via the
         /// header's `beacon_witness_root`; carried on the body so
         /// commit-time leaf derivation is identical on every node. See
@@ -153,6 +158,11 @@ pub enum Block {
         /// came from, which is the whole reason it is written down.
         #[hbor(max = MAX_ABANDONMENT_RECORDS_PER_BLOCK)]
         abandonment_records: Arc<Vec<AbandonmentRecord>>,
+        /// Proofs of counterparts' cells, retained through sealing like
+        /// the records: a replay of any depth re-folds its answers off
+        /// the block it reads, and the root binds at every stage.
+        #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
+        state_proofs: Arc<Vec<StateProofBundle>>,
         /// Proposer-supplied beacon-witness inputs — retained through
         /// sealing (unlike provisions) because the beacon-witness fold
         /// consuming them can run well after the block sealed. See
@@ -226,6 +236,7 @@ impl Block {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -252,6 +263,7 @@ impl Block {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -281,6 +293,7 @@ impl Block {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -416,6 +429,16 @@ impl Block {
         }
     }
 
+    /// Proofs of counterparts' cells the block carries, regardless of
+    /// variant — what every replica folds at commit to answer the
+    /// ledger's probes.
+    #[must_use]
+    pub fn state_proofs(&self) -> &[StateProofBundle] {
+        match self {
+            Self::Live { state_proofs, .. } | Self::Sealed { state_proofs, .. } => state_proofs,
+        }
+    }
+
     /// Gas this shard consumed across the ticks the block settles.
     ///
     /// The increment behind the header's running gas total, and the reason
@@ -500,6 +523,7 @@ impl Block {
                 certificates,
                 provisions,
                 abandonment_records,
+                state_proofs,
                 witness_sources,
             } => {
                 let hashes: Vec<ProvisionHash> = provisions.iter().map(|p| p.hash()).collect();
@@ -509,6 +533,7 @@ impl Block {
                     certificates,
                     provision_hashes: Arc::new(hashes),
                     abandonment_records,
+                    state_proofs,
                     witness_sources,
                 }
             }
@@ -532,6 +557,7 @@ impl Block {
                 transactions,
                 certificates,
                 abandonment_records,
+                state_proofs,
                 witness_sources,
                 ..
             } => Self::Live {
@@ -540,6 +566,7 @@ impl Block {
                 certificates,
                 provisions,
                 abandonment_records,
+                state_proofs,
                 witness_sources,
             },
             Self::Live { .. } => {

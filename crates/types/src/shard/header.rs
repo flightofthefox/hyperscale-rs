@@ -14,8 +14,8 @@ use crate::{
     CertificateRoot, ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot,
     MAX_PROVISION_TARGET_SHARDS, PredecessorTerminal, ProposerTimestamp, ProvisionTxRoot,
     ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad,
-    SplitChildRoots, StateRoot, SweepFrontier, TerminalRoots, TransactionRoot, ValidatorId,
-    Verifiable, Verified, Verify, WeightedTimestamp, WorkInFlight,
+    SplitChildRoots, StateProofsRoot, StateRoot, SweepFrontier, TerminalRoots, TransactionRoot,
+    ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, WorkInFlight,
 };
 
 /// The running values a block extending the committed tip is checked
@@ -84,6 +84,7 @@ pub struct BlockHeader {
     /// business, written down while the evidence for it could still be
     /// read.
     abandonment_root: AbandonmentRoot,
+    state_proofs_root: StateProofsRoot,
     work_in_flight: WorkInFlight,
     /// The highest tick whose determined half has settled at or below
     /// this block: the parent's, raised to the last determined half this
@@ -188,6 +189,7 @@ pub struct BlockHeaderParts {
     pub provision_root: ProvisionsRoot,
     pub provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
     pub abandonment_root: AbandonmentRoot,
+    pub state_proofs_root: StateProofsRoot,
     pub work_in_flight: WorkInFlight,
     pub settled_tick_frontier: BlockHeight,
     pub sweep_frontier: SweepFrontier,
@@ -219,6 +221,7 @@ impl Default for BlockHeaderParts {
             provision_root: ProvisionsRoot::ZERO,
             provision_tx_roots: BTreeMap::new(),
             abandonment_root: AbandonmentRoot::ZERO,
+            state_proofs_root: StateProofsRoot::ZERO,
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
             sweep_frontier: SweepFrontier::ZERO,
@@ -239,7 +242,7 @@ impl BlockHeader {
     /// # Panics
     ///
     /// Panics if `provision_tx_roots.len() > MAX_PROVISION_TARGET_SHARDS`.
-    #[allow(clippy::too_many_arguments)] // mirrors the 23 stored fields
+    #[allow(clippy::too_many_arguments)] // mirrors the stored fields one to one
     #[must_use]
     pub fn new(parts: BlockHeaderParts) -> Self {
         let BlockHeaderParts {
@@ -258,6 +261,7 @@ impl BlockHeader {
             provision_root,
             provision_tx_roots,
             abandonment_root,
+            state_proofs_root,
             work_in_flight,
             settled_tick_frontier,
             sweep_frontier,
@@ -285,6 +289,7 @@ impl BlockHeader {
             provision_root,
             provision_tx_roots,
             abandonment_root,
+            state_proofs_root,
             work_in_flight,
             settled_tick_frontier,
             sweep_frontier,
@@ -331,6 +336,7 @@ impl BlockHeader {
             provision_root: ProvisionsRoot::ZERO,
             provision_tx_roots: BTreeMap::new(),
             abandonment_root: AbandonmentRoot::ZERO,
+            state_proofs_root: StateProofsRoot::ZERO,
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
             sweep_frontier: SweepFrontier::ZERO,
@@ -385,6 +391,7 @@ impl BlockHeader {
             provision_root: ProvisionsRoot::ZERO,
             provision_tx_roots: BTreeMap::new(),
             abandonment_root: AbandonmentRoot::ZERO,
+            state_proofs_root: StateProofsRoot::ZERO,
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
             sweep_frontier: SweepFrontier::ZERO,
@@ -453,6 +460,7 @@ impl BlockHeader {
             provision_root: ProvisionsRoot::ZERO,
             provision_tx_roots: BTreeMap::new(),
             abandonment_root: AbandonmentRoot::ZERO,
+            state_proofs_root: StateProofsRoot::ZERO,
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
             sweep_frontier: SweepFrontier::ZERO,
@@ -600,6 +608,13 @@ impl BlockHeader {
     #[must_use]
     pub const fn abandonment_root(&self) -> AbandonmentRoot {
         self.abandonment_root
+    }
+
+    /// Merkle root over the state-proof bundles the block carries —
+    /// the proofs of counterparts' cells every replica folds at commit.
+    #[must_use]
+    pub const fn state_proofs_root(&self) -> StateProofsRoot {
+        self.state_proofs_root
     }
 
     /// Approximate number of in-flight transactions on this shard at proposal time.
@@ -770,6 +785,7 @@ impl BlockHeader {
             provision_root: self.provision_root,
             provision_tx_roots: self.provision_tx_roots,
             abandonment_root: self.abandonment_root,
+            state_proofs_root: self.state_proofs_root,
             work_in_flight: self.work_in_flight,
             settled_tick_frontier: self.settled_tick_frontier,
             sweep_frontier: self.sweep_frontier,

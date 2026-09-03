@@ -43,6 +43,7 @@ pub mod quorum_certificate;
 pub mod reshape;
 pub mod roots;
 pub mod state_anchor;
+pub mod state_proof;
 pub mod storage_commit;
 pub mod sweep;
 pub mod timeout;

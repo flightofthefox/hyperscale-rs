@@ -15,8 +15,8 @@ use hyperscale_types::{
     CertifiedBeaconBlockVerifyError, CertifiedBlock, CertifiedBlockHeader,
     CertifiedHeaderVerifyError, ClaimProof, Epoch, ExecutionCertificate,
     ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationVerifyError, Hash,
-    Inclusion, LeafIndex, LocalReceiptRoot, LocalReceiptRootVerifyError, PcVote1,
-    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
+    Inclusion, LeafIndex, LocalReceiptRoot, LocalReceiptRootVerifyError, MerkleInclusionProof,
+    PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
     ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
     ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate, RatifyPhase,
     RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal, Refusal, Resolutions, Round,
@@ -426,6 +426,16 @@ pub enum ProtocolEvent {
         block_hash: BlockHash,
         /// How the resolutions stand against the committed bodies.
         verdict: Resolutions,
+    },
+
+    /// State-proof check completed for a pending block: every bundle
+    /// reconstructs the root its anchor names, or one does not.
+    StateProofsVerified {
+        /// Block whose state proofs were checked.
+        block_hash: BlockHash,
+        /// `Ok` when every bundle reconstructs its root; the failing
+        /// diagnostic otherwise.
+        result: Result<(), String>,
     },
 
     /// Beacon-witness-root verification completed for a pending block.
@@ -855,10 +865,13 @@ pub enum ProtocolEvent {
     /// A state proof fetched against a commit-proven remote header
     /// verified: each key asked is present or absent under the anchor's
     /// root. Every answer here arrives already checked against that
-    /// root; the execution coordinator reads its probes off it.
+    /// root; the execution coordinator reads its probes off it, and
+    /// keeps the bytes to offer in a block it proposes.
     StateProofVerified {
         /// The state the proof was checked against.
         anchor: StateAnchor,
+        /// The proof as fetched.
+        proof: MerkleInclusionProof,
         /// What the proof attests for each key asked.
         inclusions: Vec<(SubstateKey, Inclusion)>,
     },

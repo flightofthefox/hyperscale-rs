@@ -582,6 +582,7 @@ impl PendingBlock {
             cert_ids,
             provision_hashes,
             block.abandonment_records().to_vec(),
+            block.state_proofs().to_vec(),
             block.witness_sources().as_ref().clone(),
         );
         let mut received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>> =
@@ -764,6 +765,7 @@ impl PendingBlock {
             certificates: Arc::new(certificates),
             provisions: Arc::new(provisions),
             abandonment_records: Arc::new(self.manifest.abandonment_records().clone()),
+            state_proofs: Arc::new(self.manifest.state_proofs().clone()),
             witness_sources: Arc::new(self.manifest.witness_sources().clone()),
         });
 
@@ -900,6 +902,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -935,6 +938,7 @@ mod tests {
                 vec![one, two],
                 vec![],
                 vec![],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -966,6 +970,7 @@ mod tests {
             BlockManifest::new(
                 vec![],
                 vec![fw.receipt_hash()],
+                vec![],
                 vec![],
                 vec![],
                 WitnessSources::empty(),
@@ -1005,6 +1010,7 @@ mod tests {
                 vec![fw.receipt_hash()],
                 vec![],
                 vec![],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1040,6 +1046,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         };
 
         let pending = PendingBlock::from_complete_block(
@@ -1067,6 +1074,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![prov_a, prov_b],
+                vec![],
                 vec![],
                 WitnessSources::empty(),
             ),
@@ -1117,6 +1125,7 @@ mod tests {
                 vec![],
                 vec![shared, only_stale],
                 vec![],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1127,6 +1136,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![shared],
+                vec![],
                 vec![],
                 WitnessSources::empty(),
             ),
@@ -1156,6 +1166,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1165,6 +1176,7 @@ mod tests {
             make_header(BlockHeight::new(8)),
             BlockManifest::new(
                 vec![shared],
+                vec![],
                 vec![],
                 vec![],
                 vec![],

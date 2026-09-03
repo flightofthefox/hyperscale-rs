@@ -29,6 +29,7 @@ pub mod provisions;
 pub mod reveal_chain;
 pub mod settled_txs;
 pub mod state;
+pub mod state_proofs;
 pub mod terminal;
 pub mod transaction;
 
@@ -54,5 +55,8 @@ pub use provisions::{ProvisionRootVerifyError, ProvisionsRootContext};
 pub use reveal_chain::{REVEAL_CHAIN_DOMAIN_TAG, extend_reveal_chain, next_reveal_chain};
 pub use settled_txs::{local_settled_tx_hashes, settled_txs_root_from_hashes};
 pub use state::{SplitChildRoots, StateRootContext, StateRootVerifyError};
+pub use state_proofs::{
+    StateProofsRootContext, StateProofsRootVerifyError, state_proofs_root_from_bundles,
+};
 pub use terminal::TerminalRoots;
 pub use transaction::{TransactionRootContext, TxRootVerifyError};

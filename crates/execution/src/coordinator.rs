@@ -48,13 +48,14 @@ use hyperscale_types::{
     BlockHeight, BloomFilter, CertifiedBlock, ClaimProof, DeclaredKey, Derivation,
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome, ExecutionVote,
     Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
-    MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, Mode, Provisions,
-    RETENTION_HORIZON, Refusal, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
-    ShardTrie, StateAnchor, StateRoot, StoredReceipt, SubstateKey, TickId, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution,
-    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, absence_licenses_reclaim,
-    derive_block_transactions, lapse_licenses_reclaim, lapse_probe_anchor, lapse_probe_ceiling,
-    reclaim_probe_anchor, settled_set_verdict, tick_leader, tick_leader_at,
+    MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+    MerkleInclusionProof, Mode, Provisions, RETENTION_HORIZON, Refusal, ScheduleLookup,
+    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateAnchor, StateProofBundle, StateRoot,
+    StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot, Transaction,
+    TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
+    Verifiable, Verified, WeightedTimestamp, absence_licenses_reclaim, derive_block_transactions,
+    lapse_licenses_reclaim, lapse_probe_anchor, lapse_probe_ceiling, reclaim_probe_anchor,
+    settled_set_verdict, tick_leader, tick_leader_at,
 };
 use tracing::instrument;
 
@@ -485,6 +486,14 @@ pub struct ExecutionCoordinator {
     /// vote fence the moment it is proved. Each lives to its leg entry.
     probes: BTreeMap<(TxHash, ShardId, Probed), Probe>,
 
+    /// The proofs this validator's own fetches answered, each with the
+    /// transactions whose probes it spoke to, held to offer in a block
+    /// this validator proposes: a proof is committed content, folded by
+    /// every replica at the same height, and the fetch is only how the
+    /// proposer comes by the bytes. A bundle leaves when a block
+    /// carries it, or when every transaction it answered for is gone.
+    fetched: BTreeMap<StateProofBundle, BTreeSet<TxHash>>,
+
     /// Finalizations built but withheld because a contained EC names a
     /// shard that is scheduled to terminate, or past-terminal with its
     /// settled set not yet known (the gate's `Defer`). Re-checked on every
@@ -599,6 +608,7 @@ impl ExecutionCoordinator {
             refusals: BTreeMap::new(),
             accepted: BTreeMap::new(),
             probes: BTreeMap::new(),
+            fetched: BTreeMap::new(),
             gated_finalized: BTreeMap::new(),
             me,
             local_shard,
@@ -2471,10 +2481,13 @@ impl ExecutionCoordinator {
     pub fn on_state_proof_verified(
         &mut self,
         anchor: StateAnchor,
+        proof: MerkleInclusionProof,
         inclusions: &[(SubstateKey, Inclusion)],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut unanswered: Vec<(TxHash, ShardId, Probed)> = Vec::new();
+        let mut answered: BTreeSet<TxHash> = BTreeSet::new();
+        let mut anchor_ts = None;
         for &(key, inclusion) in inclusions {
             for (&(tx_hash, shard, kind), probe) in &mut self.probes {
                 let Probe::Issued {
@@ -2490,6 +2503,8 @@ impl ExecutionCoordinator {
                 if issued != anchor || asked != key {
                     continue;
                 }
+                answered.insert(tx_hash);
+                anchor_ts = Some(probed_wt);
                 match (inclusion, probed) {
                     // The core took it, and its certificate says how: a
                     // refusal there is mirrored on arrival and licenses
@@ -2539,7 +2554,28 @@ impl ExecutionCoordinator {
         for key in unanswered {
             self.probes.remove(&key);
         }
+        // Kept for the block, keyed to what it answered for: an answer
+        // nothing here asked about is nobody's to commit.
+        if let Some(anchor_ts) = anchor_ts {
+            let keys = inclusions.iter().map(|(key, _)| *key);
+            self.fetched
+                .entry(StateProofBundle::new(anchor, anchor_ts, keys, proof))
+                .or_default()
+                .extend(answered);
+        }
         actions
+    }
+
+    /// The proofs this validator's fetches answered that no block has
+    /// carried yet, in the one order a block carries them, under the
+    /// block's cap.
+    #[must_use]
+    pub fn pending_state_proofs(&self) -> Vec<StateProofBundle> {
+        self.fetched
+            .keys()
+            .take(MAX_PROVISIONS_PER_BLOCK)
+            .cloned()
+            .collect()
     }
 
     /// Drop the probes whose leg entries are gone — released by the
@@ -2548,6 +2584,8 @@ impl ExecutionCoordinator {
     /// does not pin it.
     fn gc_probes(&mut self) -> Vec<Action> {
         let unresolved = &self.unresolved;
+        self.fetched
+            .retain(|_, answered| answered.iter().any(|tx_hash| unresolved.contains(*tx_hash)));
         let mut abandoned = Vec::new();
         self.probes.retain(|(tx_hash, _, _), probe| {
             if unresolved.contains(*tx_hash) {
@@ -2775,6 +2813,11 @@ impl ExecutionCoordinator {
         self.provisioning.advance_clock(self.committed_ts);
         self.gc_settled_sets(topology_schedule);
         self.gc_mirrors();
+        // A proof the chain now carries is everybody's; nothing here
+        // offers it again.
+        for bundle in block.state_proofs() {
+            self.fetched.remove(bundle);
+        }
         let mut actions = self.gc_probes();
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
@@ -7983,7 +8026,11 @@ mod tests {
             "the newest header inside the lapse window is the anchor, and the claim cell the key"
         );
 
-        let answered = state.on_state_proof_verified(anchor, &[(claim, Inclusion::Absent)]);
+        let answered = state.on_state_proof_verified(
+            anchor,
+            MerkleInclusionProof::dummy(),
+            &[(claim, Inclusion::Absent)],
+        );
         assert_eq!(
             absences_observed(&answered, tx_hash),
             vec![Absence {
@@ -7995,6 +8042,105 @@ mod tests {
             state.pending_abandonment_records(),
             vec![AbandonmentRecord::lapsed(PEER, later, [figures])],
             "offered as a lapse, under the anchor it was proved at"
+        );
+    }
+
+    /// A proof this validator's fetch answered is committed content
+    /// waiting for a block: it is offered, dated to the clock the probe
+    /// read off the header, until a block carries it, and not after.
+    #[test]
+    fn a_fetched_proof_is_offered_until_a_block_carries_it() {
+        let schedule = two_shard_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let deadline = UnsettledTx::for_transaction(&transaction).deadline;
+        let later = deadline
+            .plus(MAX_VALIDITY_RANGE)
+            .plus(Duration::from_secs(1));
+        let claim = SubstateKey {
+            owner: test_prefix(0x81),
+            local: LocalKey([0xC1; 16]),
+        };
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        state.unresolved.register_committed(
+            HOME,
+            WeightedTimestamp::ZERO,
+            std::iter::once(&transaction),
+        );
+        state.unresolved.mark_leg(
+            tx_hash,
+            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+            delivery_classified(),
+            vec![(PEER, claim)],
+            Vec::new(),
+        );
+        state.unresolved.certify(tx_hash);
+        let anchor = StateAnchor {
+            shard: PEER,
+            height: BlockHeight::new(5),
+            state_root: StateRoot::from_raw(Hash::from_bytes(b"later")),
+        };
+        state.on_committed_remote_header(&schedule, PEER, anchor.height, later, anchor.state_root);
+        state.committed_ts = deadline;
+        assert_eq!(
+            state_proof_fetches(&state.probe_silent_counterparts(&schedule)),
+            vec![(anchor, vec![claim])],
+        );
+        let _ = state.on_state_proof_verified(
+            anchor,
+            MerkleInclusionProof::dummy(),
+            &[(claim, Inclusion::Absent)],
+        );
+
+        let bundle = StateProofBundle::new(anchor, later, [claim], MerkleInclusionProof::dummy());
+        assert_eq!(
+            state.pending_state_proofs(),
+            vec![bundle.clone()],
+            "dated to the clock the probe read off the header"
+        );
+        let deadline_ms = deadline.as_millis();
+        let block_at = |height: u64, state_proofs: Vec<StateProofBundle>| {
+            let Block::Live {
+                header,
+                transactions,
+                certificates,
+                provisions,
+                abandonment_records,
+                witness_sources,
+                ..
+            } = make_live_block_on_shard(
+                HOME,
+                BlockHeight::new(height),
+                deadline_ms,
+                ValidatorId::new(0),
+                vec![],
+            )
+            else {
+                unreachable!("a live block")
+            };
+            let block = Block::Live {
+                header,
+                transactions,
+                certificates,
+                provisions,
+                abandonment_records,
+                state_proofs: Arc::new(state_proofs),
+                witness_sources,
+            };
+            test_certify(block, deadline_ms)
+        };
+        state.on_block_committed(&schedule, &block_at(1, Vec::new()));
+        assert_eq!(
+            state.pending_state_proofs(),
+            vec![bundle.clone()],
+            "a block carrying no proofs leaves the offer standing"
+        );
+        state.on_block_committed(&schedule, &block_at(2, vec![bundle]));
+        assert!(
+            state.pending_state_proofs().is_empty(),
+            "a proof the chain carries is everybody's"
         );
     }
 
@@ -8073,7 +8219,11 @@ mod tests {
              claim cell the key; the departed peer, with no header, is not asked"
         );
 
-        let answered = state.on_state_proof_verified(anchor, &[(claim, Inclusion::Absent)]);
+        let answered = state.on_state_proof_verified(
+            anchor,
+            MerkleInclusionProof::dummy(),
+            &[(claim, Inclusion::Absent)],
+        );
         assert_eq!(
             absences_observed_at(&answered, successor, tx_hash),
             vec![Absence {
@@ -8196,12 +8346,20 @@ mod tests {
         );
 
         let elsewhere = earlier;
-        let answered = state.on_state_proof_verified(elsewhere, &[(key, Inclusion::Absent)]);
+        let answered = state.on_state_proof_verified(
+            elsewhere,
+            MerkleInclusionProof::dummy(),
+            &[(key, Inclusion::Absent)],
+        );
         assert!(
             absences_observed(&answered, tx_hash).is_empty(),
             "a proof at another anchor answers nothing"
         );
-        let answered = state.on_state_proof_verified(anchor, &[(key, Inclusion::Absent)]);
+        let answered = state.on_state_proof_verified(
+            anchor,
+            MerkleInclusionProof::dummy(),
+            &[(key, Inclusion::Absent)],
+        );
         assert_eq!(
             absences_observed(&answered, tx_hash),
             vec![Absence {
@@ -8215,7 +8373,11 @@ mod tests {
             vec![AbandonmentRecord::unclaimed(PEER, later, [figures])],
             "and a record is offered under the anchor it was proved at"
         );
-        let again = state.on_state_proof_verified(anchor, &[(key, Inclusion::Absent)]);
+        let again = state.on_state_proof_verified(
+            anchor,
+            MerkleInclusionProof::dummy(),
+            &[(key, Inclusion::Absent)],
+        );
         assert!(
             absences_observed(&again, tx_hash).is_empty(),
             "a second copy adds nothing"
@@ -8249,7 +8411,11 @@ mod tests {
             state_root: root,
         };
         assert_eq!(state_proof_fetches(&actions), vec![(anchor, vec![key])]);
-        let answered = state.on_state_proof_verified(anchor, &[(key, Inclusion::Present)]);
+        let answered = state.on_state_proof_verified(
+            anchor,
+            MerkleInclusionProof::dummy(),
+            &[(key, Inclusion::Present)],
+        );
         assert!(
             absences_observed(&answered, tx_hash).is_empty(),
             "a core that committed it is not absent"
@@ -8333,6 +8499,7 @@ mod tests {
 
         let answered = state.on_state_proof_verified(
             anchor,
+            MerkleInclusionProof::dummy(),
             &[(core_key, Inclusion::Present), (claim, Inclusion::Absent)],
         );
         assert!(
@@ -8402,7 +8569,11 @@ mod tests {
             "the claim is asked about"
         );
 
-        let answered = state.on_state_proof_verified(anchor, &[(claim, Inclusion::Present)]);
+        let answered = state.on_state_proof_verified(
+            anchor,
+            MerkleInclusionProof::dummy(),
+            &[(claim, Inclusion::Present)],
+        );
         assert!(
             answered.iter().any(|action| matches!(
                 action,

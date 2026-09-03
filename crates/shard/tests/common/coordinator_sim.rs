@@ -871,6 +871,7 @@ impl ShardCoordinatorSim {
             vec![],
             vec![],
             vec![],
+            vec![],
         )
     }
 
@@ -1220,6 +1221,7 @@ impl ShardCoordinatorSim {
                 vec![],
                 vec![],
                 vec![],
+                vec![],
             ),
         }
     }
@@ -1435,6 +1437,7 @@ impl ShardCoordinatorSim {
                 transactions,
                 finalizations,
                 abandonment_records,
+                state_proofs,
                 provisions,
                 fee_checks: _,
                 fee_read_height: _,
@@ -1535,6 +1538,7 @@ impl ShardCoordinatorSim {
                     &classification_topology,
                     provisions.clone(),
                     abandonment_records,
+                    state_proofs,
                     parent_in_flight,
                     parent_settled_frontier,
                     parent_sweep_frontier,

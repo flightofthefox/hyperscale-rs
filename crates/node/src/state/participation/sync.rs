@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
 use hyperscale_shard::SettledTxSet;
 use hyperscale_types::{
-    PredecessorTerminal, TerminalEvidence, TopologySchedule, TxHash, derive_block_transactions,
+    PredecessorTerminal, ShardId, TerminalEvidence, TopologySchedule, TxHash,
+    derive_block_transactions,
 };
 
 use super::ShardParticipation;
@@ -69,30 +70,11 @@ impl ShardParticipation {
                 shard,
                 txs,
                 terminal_wt,
-            } => {
-                let set = SettledTxSet { txs, terminal_wt };
-                // What this shard's ledger says the departed shard was
-                // party to, mirrored beside the set for the vote fence:
-                // a departure record names only the departed shard's own
-                // business here.
-                let parties = self.execution_coordinator.party_to(shard, terminal_wt);
-                let mut actions = self.execution_coordinator.record_settled_txs(
-                    topology_schedule,
-                    shard,
-                    set.clone(),
-                );
-                self.shard_coordinator
-                    .record_settled_txs(shard, set, parties);
-                actions.extend(
-                    self.shard_coordinator
-                        .redrive_pending_votes(topology_schedule),
-                );
-                actions.extend(
-                    self.execution_coordinator
-                        .redrive_gated_finalizations(topology_schedule),
-                );
-                actions
-            }
+            } => self.on_settled_txs_reconstructed(
+                topology_schedule,
+                shard,
+                SettledTxSet { txs, terminal_wt },
+            ),
             // Evidence the execution coordinator mirrored about a
             // transaction a leg here issued for — a core's refusal, a
             // core's absence, a consumer's claim: the vote fence checks
@@ -129,9 +111,13 @@ impl ShardParticipation {
             // A state proof against a core's commit-proven header
             // verified: the execution coordinator reads its probes off
             // it and hands each absence on.
-            ProtocolEvent::StateProofVerified { anchor, inclusions } => self
+            ProtocolEvent::StateProofVerified {
+                anchor,
+                proof,
+                inclusions,
+            } => self
                 .execution_coordinator
-                .on_state_proof_verified(anchor, &inclusions),
+                .on_state_proof_verified(anchor, proof, &inclusions),
             // A predecessor answered which of the queried transactions it
             // committed. Record the answers, then re-drive the votes that
             // deferred for want of them and the proposal that was
@@ -272,6 +258,35 @@ impl ShardParticipation {
         if !live {
             self.shard_coordinator.retire_precut();
         }
+        actions
+    }
+
+    /// Record a past-terminal shard's settled set on both coordinators,
+    /// then re-drive the votes and the gate-held finalizations that
+    /// deferred for want of it.
+    fn on_settled_txs_reconstructed(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+        set: SettledTxSet,
+    ) -> Vec<Action> {
+        // What this shard's ledger says the departed shard was party
+        // to, mirrored beside the set for the vote fence: a departure
+        // record names only the departed shard's own business here.
+        let parties = self.execution_coordinator.party_to(shard, set.terminal_wt);
+        let mut actions =
+            self.execution_coordinator
+                .record_settled_txs(topology_schedule, shard, set.clone());
+        self.shard_coordinator
+            .record_settled_txs(shard, set, parties);
+        actions.extend(
+            self.shard_coordinator
+                .redrive_pending_votes(topology_schedule),
+        );
+        actions.extend(
+            self.execution_coordinator
+                .redrive_gated_finalizations(topology_schedule),
+        );
         actions
     }
 

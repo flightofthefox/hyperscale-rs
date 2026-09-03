@@ -22,10 +22,10 @@ use hyperscale_core::{Action, FeeDemand};
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash,
-    LocalTimestamp, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger,
-    RevealChain, Round, ScheduleLookup, ShardId, TopologySchedule, TopologySnapshot, Transaction,
-    TxHash, Unsettleable, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    delivery_admissible, sweep_admits_block,
+    LocalTimestamp, MAX_PROVISIONS_PER_BLOCK, ProposerTimestamp, ProvisionHash, Provisions,
+    ReadySignal, ReshapeTrigger, RevealChain, Round, ScheduleLookup, ShardId, StateProofBundle,
+    TopologySchedule, TopologySnapshot, Transaction, TxHash, Unsettleable, UnsettledTx,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, delivery_admissible, sweep_admits_block,
 };
 use tracing::debug;
 
@@ -42,12 +42,7 @@ use crate::verification::VerificationPipeline;
 #[derive(Debug)]
 pub enum ProposalKind {
     /// Normal proposal with a filtered payload and a real-clock timestamp.
-    Normal {
-        transactions: Vec<Arc<Verified<Transaction>>>,
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
-        provisions: Vec<Arc<Verifiable<Provisions>>>,
-        abandonment_records: Vec<AbandonmentRecord>,
-    },
+    Normal(ProposalPayload),
     /// View-change fallback: empty payload, parent's weighted timestamp
     /// (prevents Byzantine proposers from manipulating consensus time on
     /// timeout), `is_fallback = true`.
@@ -55,6 +50,17 @@ pub enum ProposalKind {
     /// Syncing proposer: empty payload, normal timestamp. Proposer is
     /// online with an accurate clock but can't execute transactions.
     Sync,
+}
+
+/// What a normal proposal carries, each list already selected against
+/// the chain. Empty for a block that exists only to advance the chain.
+#[derive(Debug, Default)]
+pub struct ProposalPayload {
+    pub transactions: Vec<Arc<Verified<Transaction>>>,
+    pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
+    pub provisions: Vec<Arc<Verifiable<Provisions>>>,
+    pub abandonment_records: Vec<AbandonmentRecord>,
+    pub state_proofs: Vec<StateProofBundle>,
 }
 
 #[derive(Debug, Clone)]
@@ -448,6 +454,21 @@ pub fn select_abandonment_records(
         .collect()
 }
 
+/// The state-proof bundles a block may carry, in the one order it
+/// carries them: ascending, without repeats, and no more than the
+/// block's cap, with the rest waiting a block.
+#[must_use]
+pub fn select_state_proofs(state_proofs: Vec<StateProofBundle>) -> Vec<StateProofBundle> {
+    let mut selected: Vec<StateProofBundle> = state_proofs
+        .into_iter()
+        .filter(StateProofBundle::is_well_formed)
+        .collect();
+    selected.sort_unstable();
+    selected.dedup();
+    selected.truncate(MAX_PROVISIONS_PER_BLOCK);
+    selected
+}
+
 /// Drop cross-shard transactions whose payer bundle is neither among
 /// the block's selected provisions nor committed within the retention
 /// window — the proposer-side form of `validate_engagement`, applied
@@ -582,52 +603,36 @@ pub fn assemble_build_action(
     let parent_sweep_frontier = chain.parent_sweep_frontier(parent_block_hash);
     let parent_load = chain.parent_load_checked(parent_block_hash);
 
-    let (
-        timestamp,
-        is_fallback,
-        transactions,
-        finalizations,
-        provisions,
-        abandonment_records,
-        log_label,
-        record_leader_activity,
-    ) = match kind {
-        ProposalKind::Normal {
-            transactions,
-            finalizations,
-            provisions,
-            abandonment_records,
-        } => (
+    let (timestamp, is_fallback, payload, log_label, record_leader_activity) = match kind {
+        ProposalKind::Normal(payload) => (
             ProposerTimestamp::from_local(now),
             false,
-            transactions,
-            finalizations,
-            provisions,
-            abandonment_records,
+            payload,
             "Requesting block build for proposal",
             false,
         ),
         ProposalKind::Fallback => (
             ProposerTimestamp::from_millis(parent_qc.weighted_timestamp().as_millis()),
             true,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            ProposalPayload::default(),
             "Building fallback block (leader timeout)",
             true,
         ),
         ProposalKind::Sync => (
             ProposerTimestamp::from_local(now),
             false,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            ProposalPayload::default(),
             "Building sync block (syncing, empty payload)",
             true,
         ),
     };
+    let ProposalPayload {
+        transactions,
+        finalizations,
+        provisions,
+        abandonment_records,
+        state_proofs,
+    } = payload;
 
     // The proposer's new BlockHeader will carry parent_qc in its wire
     // form; HBOR encoding is byte-identical between the raw and
@@ -648,6 +653,7 @@ pub fn assemble_build_action(
         finalizations,
         provisions,
         abandonment_records,
+        state_proofs,
         fee_checks,
         fee_read_height,
         parent_in_flight,

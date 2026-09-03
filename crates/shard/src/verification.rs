@@ -59,6 +59,9 @@ pub enum VerificationKind {
     /// name: the figures its records restate, and the deliveries its
     /// finalizations carry, held short of the lapse.
     Resolutions,
+    /// The block's state-proof bundles, each reconstructing the root
+    /// its anchor names.
+    StateProofs,
 }
 
 /// Whether a block carries anything the resolutions check reads: a
@@ -929,6 +932,10 @@ impl VerificationPipeline {
                 self.is_root_tracked(block_hash, VerificationKind::Reservations),
             )
             && root_ok(VerificationKind::Resolutions, resolutions_to_check(block))
+            && root_ok(
+                VerificationKind::StateProofs,
+                !block.state_proofs().is_empty(),
+            )
             && self.verified_in_flight.contains(&block_hash)
     }
 
@@ -999,6 +1006,11 @@ impl VerificationPipeline {
             "skipped(nothing_to_check)",
             resolutions_to_check(block),
         );
+        let state_proofs_status = root_status(
+            VerificationKind::StateProofs,
+            "skipped(no_state_proofs)",
+            !block.state_proofs().is_empty(),
+        );
         let beacon_witness_defer = self.beacon_witness_defer(block_hash);
         let beacon_witness_root_status = match beacon_witness_defer {
             Some((_, BeaconWitnessDefer::WitnessAncestor)) => "deferred(witness_ancestor)",
@@ -1027,6 +1039,7 @@ impl VerificationPipeline {
             provision_tx_root = provision_tx_root_status,
             reservations = reservations_status,
             resolutions = resolutions_status,
+            state_proofs = state_proofs_status,
             beacon_witness_root = beacon_witness_root_status,
             beacon_witness_blocker = ?beacon_witness_defer.map(|(blocker, _)| blocker),
             in_flight = in_flight_status,
@@ -1359,6 +1372,27 @@ impl VerificationPipeline {
             deliveries,
             anchor,
             trie,
+        }]
+    }
+
+    /// Initiate the state-proof check for a block: each bundle walked
+    /// against the root its anchor names. The anchor's own standing —
+    /// held, commit-proven, agreeing on root and clock — is the
+    /// coordinator's synchronous fence, run before this.
+    pub fn initiate_state_proofs_verification(
+        &mut self,
+        block_hash: BlockHash,
+        block: &Block,
+    ) -> Vec<Action> {
+        debug!(
+            ?block_hash,
+            bundles = block.state_proofs().len(),
+            "Initiating state proofs verification"
+        );
+        self.mark_root_in_flight(block_hash, VerificationKind::StateProofs);
+        vec![Action::VerifyStateProofs {
+            block_hash,
+            state_proofs: block.state_proofs().to_vec(),
         }]
     }
 
@@ -1891,7 +1925,7 @@ impl VerificationPipeline {
     /// so the beacon-witness initiator can resolve `parent_witness_leaves`
     /// by walking the pending chain — beacon-witness is the only root
     /// verifier whose inputs span the in-flight chain prefix.
-    #[allow(clippy::too_many_arguments)] // single dispatch over six per-root sub-verifications
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one dispatch over the per-root verifiers
     pub(crate) fn initiate_block_verifications(
         &mut self,
         topology_snapshot: &TopologySnapshot,
@@ -2005,6 +2039,14 @@ impl VerificationPipeline {
             resolutions_to_check(block),
         ) {
             actions.extend(self.initiate_resolutions_verification(block_hash, block, schedule));
+        }
+
+        if self.needs_root(
+            block_hash,
+            VerificationKind::StateProofs,
+            !block.state_proofs().is_empty(),
+        ) {
+            actions.extend(self.initiate_state_proofs_verification(block_hash, block));
         }
 
         if self.needs_root(block_hash, VerificationKind::BeaconWitnessRoot, true)
@@ -2607,6 +2649,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         }
     }
 
@@ -2651,6 +2694,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         }
     }
 
@@ -3421,6 +3465,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         };
         let block_hash = block.hash();
         vp.track_pending_assembly(Arc::new(block));

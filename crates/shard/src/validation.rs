@@ -17,11 +17,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, LocalTimestamp, MAX_ROUND_GAP,
+    Block, BlockHeader, BlockHeight, LocalTimestamp, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP,
     MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
     MAX_UNSETTLED_PER_BLOCK, ProvisionHash, QuorumCertificate, ShardId, ShardLoad,
     TopologySnapshot, Transaction, TxHash, Verifiable, VoteCount, abandonment_root_from_records,
-    sweep_admits_block,
+    state_proofs_root_from_bundles, sweep_admits_block,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -597,6 +597,50 @@ pub fn validate_block_for_vote(
     validate_sweepable_creation(topology_snapshot, local_shard, block)?;
     validate_engagement(topology_snapshot, local_shard, block, dedup_index)?;
     validate_abandonment_records_well_formed(block)?;
+    validate_state_proofs_well_formed(block)?;
+    Ok(())
+}
+
+/// Validate the block's state-proof bundles against the header that
+/// commits them and against the one form a section may take.
+///
+/// Structural only — whether each proof reconstructs its anchor's root
+/// is the delegated check, and whether the anchor is the commit-proven
+/// header's is the vote fence's. What this establishes is that every
+/// replica reads the same section: the root binds the bundles to the
+/// header, and the canonical order — within each bundle and across
+/// them — means one set of answers has one encoding.
+pub fn validate_state_proofs_well_formed(block: &Block) -> Result<(), String> {
+    let bundles = block.state_proofs();
+    let computed = state_proofs_root_from_bundles(bundles);
+    let claimed = block.header().state_proofs_root();
+    if computed != claimed {
+        return Err(format!(
+            "state proofs root {claimed:?} does not commit the block's bundles {computed:?}"
+        ));
+    }
+    if bundles.len() > MAX_PROVISIONS_PER_BLOCK {
+        return Err(format!(
+            "block carries {} state proofs, over the cap of {MAX_PROVISIONS_PER_BLOCK}",
+            bundles.len()
+        ));
+    }
+    for (at, bundle) in bundles.iter().enumerate() {
+        if !bundle.is_well_formed() {
+            return Err(format!(
+                "state proof against {:?} at {} is empty, over its cap, or out of order",
+                bundle.anchor.shard,
+                bundle.anchor.height.inner(),
+            ));
+        }
+        if at > 0 && bundles[at - 1] >= *bundle {
+            return Err(format!(
+                "state proof against {:?} at {} repeats or precedes the one before it",
+                bundle.anchor.shard,
+                bundle.anchor.height.inner(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -690,6 +734,12 @@ fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
             block.abandonment_records().len()
         ));
     }
+    if !block.state_proofs().is_empty() {
+        return Err(format!(
+            "coast block past the terminal window carries {} state proofs",
+            block.state_proofs().len()
+        ));
+    }
     Ok(())
 }
 
@@ -734,10 +784,11 @@ mod tests {
         TestCommittee, make_finalization, stub_abort_charge, test_principal,
     };
     use hyperscale_types::{
-        AbandonmentRecord, AbandonmentRoot, Address, AggregateSignature, BlockHash, BlockHeader,
-        BlockHeaderParts, ChainOrigin, Finalization, Hash, MAX_SUBINTENTS, MerkleInclusionProof,
-        NetworkDefinition, PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions,
-        QuorumCertificate, Round, ShardId, ShardLoad, Signer, SignerBitfield, TimestampRange,
+        AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
+        BlockHeader, BlockHeaderParts, ChainOrigin, Finalization, Hash, LocalKey, MAX_SUBINTENTS,
+        MerkleInclusionProof, NetworkDefinition, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
+        Provisions, QuorumCertificate, Round, ShardId, ShardLoad, Signer, SignerBitfield,
+        StateAnchor, StateProofBundle, StateProofsRoot, StateRoot, SubstateKey, TimestampRange,
         Transaction, TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet,
         Verifiable, Verified, WeightedTimestamp, WitnessSources, test_utils,
     };
@@ -1202,6 +1253,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         }
     }
 
@@ -1271,8 +1323,98 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(verdicts),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
+    }
+
+    /// A block carrying `bundles` under a header claiming `root`.
+    fn block_with_state_proofs(bundles: Vec<StateProofBundle>, root: StateProofsRoot) -> Block {
+        let base = header_at_height(BlockHeight::new(6), 100_000);
+        Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                height: base.height(),
+                parent_block_hash: base.parent_block_hash(),
+                parent_qc: base.parent_qc().clone().into(),
+                proposer: base.proposer(),
+                timestamp: base.timestamp(),
+                round: base.round(),
+                provision_tx_roots: std::collections::BTreeMap::new(),
+                state_proofs_root: root,
+                ..Default::default()
+            }),
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(Vec::new()),
+            provisions: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(bundles),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        }
+    }
+
+    /// A bundle against `ROOT` at `height`, answering for `keys`.
+    fn bundle_at(height: u64, keys: &[u8]) -> StateProofBundle {
+        StateProofBundle::new(
+            StateAnchor {
+                shard: ShardId::ROOT,
+                height: BlockHeight::new(height),
+                state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
+            },
+            WeightedTimestamp::from_millis(height * 1_000),
+            keys.iter().map(|seed| SubstateKey {
+                owner: Address::new([*seed; 31], AddressClass::Component),
+                local: LocalKey([*seed; 16]),
+            }),
+            MerkleInclusionProof::dummy(),
+        )
+    }
+
+    /// The section is bound to the header's root and held to one form:
+    /// ascending without repeats, every bundle naming something. A
+    /// second form of the same answers, or a root that does not commit
+    /// them, is refused before any proof is walked.
+    #[test]
+    fn a_state_proof_section_is_held_to_its_root_and_form() {
+        let bundles = vec![bundle_at(3, &[1]), bundle_at(4, &[2, 3])];
+        let root = state_proofs_root_from_bundles(&bundles);
+        assert!(
+            validate_state_proofs_well_formed(&block_with_state_proofs(bundles.clone(), root))
+                .is_ok()
+        );
+
+        let err = validate_state_proofs_well_formed(&block_with_state_proofs(
+            bundles.clone(),
+            StateProofsRoot::ZERO,
+        ))
+        .expect_err("a root that does not commit the bundles is refused");
+        assert!(err.contains("does not commit"), "{err}");
+
+        let reversed: Vec<StateProofBundle> = bundles.iter().rev().cloned().collect();
+        let err = validate_state_proofs_well_formed(&block_with_state_proofs(
+            reversed.clone(),
+            state_proofs_root_from_bundles(&reversed),
+        ))
+        .expect_err("out of order is a second form of the same section");
+        assert!(err.contains("repeats or precedes"), "{err}");
+
+        let repeated = vec![bundle_at(3, &[1]), bundle_at(3, &[1])];
+        let err = validate_state_proofs_well_formed(&block_with_state_proofs(
+            repeated.clone(),
+            state_proofs_root_from_bundles(&repeated),
+        ))
+        .expect_err("a repeated bundle is refused");
+        assert!(err.contains("repeats or precedes"), "{err}");
+
+        let empty = vec![StateProofBundle {
+            keys: Vec::new(),
+            ..bundle_at(3, &[1])
+        }];
+        let err = validate_state_proofs_well_formed(&block_with_state_proofs(
+            empty.clone(),
+            state_proofs_root_from_bundles(&empty),
+        ))
+        .expect_err("a bundle naming no key is refused");
+        assert!(err.contains("empty"), "{err}");
     }
 
     fn named(tx_hash: TxHash) -> UnsettledTx {
@@ -1536,6 +1678,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         }
     }
 
@@ -1654,6 +1797,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(vec![Arc::new((*settled).clone().into())]),
             provisions: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(vec![AbandonmentRecord::departed(
                 ShardId::ROOT,
@@ -1723,6 +1867,7 @@ mod tests {
             provisions: Arc::new(wrapped),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         }
     }
 
@@ -1988,6 +2133,7 @@ mod tests {
             provisions: Arc::new(provisions),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         }
     }
 

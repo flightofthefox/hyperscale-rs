@@ -117,7 +117,7 @@ pub use primitives::hash_kinds::{
     AbandonmentRoot, BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot,
     CommittedTxsRoot, EventRoot, FinalizationHash, GenesisConfigHash, GlobalReceiptHash,
     GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot,
-    RevealChain, SettledTxsRoot, StateRoot, TransactionRoot, TxHash, WritesRoot,
+    RevealChain, SettledTxsRoot, StateProofsRoot, StateRoot, TransactionRoot, TxHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex, RatifyRound,
@@ -179,15 +179,17 @@ pub use shard::roots::{
     BeaconWitnessRootVerifyError, CertRootVerifyError, CertificateRootContext, CommittedTxAbsence,
     LocalReceiptRootContext, LocalReceiptRootVerifyError, ProvisionRootVerifyError,
     ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
-    ProvisionsRootContext, REVEAL_CHAIN_DOMAIN_TAG, SplitChildRoots, StateRootContext,
-    StateRootVerifyError, TerminalRoots, TransactionRootContext, TxRootVerifyError,
-    abandonment_root_from_records, certificate_root_from_receipt_hashes, commit_witness_window,
-    committed_crossings, committed_tx_leaf, committed_txs_root_from_hashes, derive_leaves,
-    derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, prove_committed_tx_absent,
-    ready_leaf_payload, settled_txs_root_from_hashes,
+    ProvisionsRootContext, REVEAL_CHAIN_DOMAIN_TAG, SplitChildRoots, StateProofsRootContext,
+    StateProofsRootVerifyError, StateRootContext, StateRootVerifyError, TerminalRoots,
+    TransactionRootContext, TxRootVerifyError, abandonment_root_from_records,
+    certificate_root_from_receipt_hashes, commit_witness_window, committed_crossings,
+    committed_tx_leaf, committed_txs_root_from_hashes, derive_leaves, derive_reshape_trigger,
+    extend_reveal_chain, local_settled_tx_hashes, missed_proposals_since_prev_commit,
+    next_reveal_chain, prove_committed_tx_absent, ready_leaf_payload, settled_txs_root_from_hashes,
+    state_proofs_root_from_bundles,
 };
 pub use shard::state_anchor::StateAnchor;
+pub use shard::state_proof::StateProofBundle;
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};

@@ -80,6 +80,7 @@ where
             | Action::VerifyProvisionTxRoots { .. }
             | Action::VerifyReservations { .. }
             | Action::VerifyResolutions { .. }
+            | Action::VerifyStateProofs { .. }
             | Action::VerifyProvisions { .. }
             | Action::ExecuteTransactions { .. }
             | Action::FetchAndBroadcastProvisions { .. }

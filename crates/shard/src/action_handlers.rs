@@ -29,13 +29,13 @@ use hyperscale_types::{
     ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
     ReshapeTrigger, Resolutions, RevealChain, Round, ShardId, ShardLoad, SplitChildRoots,
-    StateRoot, StateRootContext, StateRootVerifyError, Stopwatch, StoredReceipt, SubstateKey,
-    SweepFrontier, TerminalRoots, Timeout, TimeoutContext, TopologySnapshot, Transaction,
-    TransactionRoot, TransactionRootContext, TxHash, UnsettledTx, ValidatorId, Verifiable,
-    Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
-    WorkInFlight, absorb_committed_cells, commit_witness_window, derive_leaves, lapse_probe_anchor,
-    local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
-    protocol_statics, shard_reveal_sign, signed_bytes, vrf_output_from_proof,
+    StateProofBundle, StateProofsRoot, StateRoot, StateRootContext, StateRootVerifyError,
+    Stopwatch, StoredReceipt, SubstateKey, SweepFrontier, TerminalRoots, Timeout, TimeoutContext,
+    TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, UnsettledTx,
+    ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp,
+    WitnessSources, WorkInFlight, absorb_committed_cells, commit_witness_window, derive_leaves,
+    lapse_probe_anchor, local_settled_tx_hashes, missed_proposals_since_prev_commit,
+    next_reveal_chain, protocol_statics, shard_reveal_sign, signed_bytes, vrf_output_from_proof,
     work_over_certificates,
 };
 
@@ -216,6 +216,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     topology_snapshot: &TopologySnapshot,
     provisions: Vec<Arc<Verifiable<Provisions>>>,
     abandonment_records: Vec<AbandonmentRecord>,
+    state_proofs: Vec<StateProofBundle>,
     parent_in_flight: WorkInFlight,
     parent_settled_frontier: BlockHeight,
     parent_sweep_frontier: SweepFrontier,
@@ -382,6 +383,9 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // What departed shards left unresolved, committed so a verdict on it
     // outlives the settled set the records were read from.
     let abandonment_root = Verified::<AbandonmentRoot>::compute(&abandonment_records).into_inner();
+    // Proofs of counterparts' cells, committed so every replica folds
+    // the same answers at this height.
+    let state_proofs_root = Verified::<StateProofsRoot>::compute(&state_proofs).into_inner();
 
     let header = BlockHeader::new(BlockHeaderParts {
         shard_id: local_shard,
@@ -399,6 +403,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         provision_root,
         provision_tx_roots,
         abandonment_root,
+        state_proofs_root,
         work_in_flight,
         settled_tick_frontier,
         sweep_frontier,
@@ -417,6 +422,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         certificates: Arc::new(certificates),
         provisions: Arc::new(provisions),
         abandonment_records: Arc::new(abandonment_records),
+        state_proofs: Arc::new(state_proofs),
         witness_sources,
     };
 
@@ -767,6 +773,27 @@ where
             });
         }
 
+        Action::VerifyStateProofs {
+            block_hash,
+            state_proofs,
+        } => {
+            let start = Stopwatch::start();
+            let result = state_proofs.iter().try_for_each(|bundle| {
+                bundle.inclusions().map(|_| ()).map_err(|error| {
+                    format!(
+                        "state proof against {:?} at {} does not answer for its keys: {error}",
+                        bundle.anchor.shard,
+                        bundle.anchor.height.inner(),
+                    )
+                })
+            });
+            record_signature_verification_latency("state_proofs", start.elapsed().as_secs_f64());
+            if let Err(reason) = &result {
+                tracing::warn!(?block_hash, %reason, "State proofs verification FAILED");
+            }
+            ctx.notify_protocol(ProtocolEvent::StateProofsVerified { block_hash, result });
+        }
+
         Action::VerifyProvisionRoot {
             block_hash,
             expected_root,
@@ -1041,6 +1068,7 @@ where
             finalizations,
             provisions,
             abandonment_records,
+            state_proofs,
             fee_checks,
             fee_read_height,
             parent_in_flight,
@@ -1195,6 +1223,7 @@ where
                 &classification_topology,
                 provisions.clone(),
                 abandonment_records,
+                state_proofs,
                 parent_in_flight,
                 parent_settled_frontier,
                 parent_sweep_frontier,

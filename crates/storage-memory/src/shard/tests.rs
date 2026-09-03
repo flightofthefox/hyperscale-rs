@@ -138,6 +138,7 @@ fn commit_with(
                 certificates,
                 provisions,
                 abandonment_records,
+                state_proofs,
                 witness_sources,
             } => {
                 let mut certificates = (*certificates).clone();
@@ -148,6 +149,7 @@ fn commit_with(
                     certificates: Arc::new(certificates),
                     provisions,
                     abandonment_records,
+                    state_proofs,
                     witness_sources,
                 }
             }
@@ -157,6 +159,7 @@ fn commit_with(
                 certificates,
                 provision_hashes,
                 abandonment_records,
+                state_proofs,
                 witness_sources,
             } => {
                 let mut certificates = (*certificates).clone();
@@ -167,6 +170,7 @@ fn commit_with(
                     certificates: Arc::new(certificates),
                     provision_hashes,
                     abandonment_records,
+                    state_proofs,
                     witness_sources,
                 }
             }
@@ -362,6 +366,7 @@ fn test_transactions_batch_with_indexed_block() {
             certificates,
             provisions,
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
         Block::Sealed {
@@ -375,6 +380,7 @@ fn test_transactions_batch_with_indexed_block() {
             certificates,
             provision_hashes,
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     };
@@ -1181,6 +1187,7 @@ fn block_with_txs(
             certificates,
             provisions,
             abandonment_records,
+            state_proofs,
             witness_sources,
             ..
         } => Block::Live {
@@ -1189,6 +1196,7 @@ fn block_with_txs(
             certificates,
             provisions,
             abandonment_records,
+            state_proofs,
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,

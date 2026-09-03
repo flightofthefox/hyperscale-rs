@@ -18,11 +18,11 @@ use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
     AbandonmentRecord, BlockHash, ClaimProof, FinalizationHash, Hash, LocalTimestamp,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK,
-    PrincipalAddr, ProposerTimestamp, ProvisionHash, ReadySignal, ReshapeThresholds,
-    ReshapeTrigger, Resolutions, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
-    SplitAtBoundary, StoredReceipt, SubstateKey, TxClaim, TxOutcome, Unsettleable, UnsettledTx,
-    WeightedTimestamp, WorkInFlight, derive_reshape_trigger, lapse_probe_ceiling,
-    ready_signal_window, settled_set_verdict, verdict_window_close,
+    PrincipalAddr, ProposerTimestamp, ProvisionHash, RETENTION_HORIZON, ReadySignal,
+    ReshapeThresholds, ReshapeTrigger, Resolutions, ScheduleLookup, SettledSetVerdict,
+    SettledTxSet, ShardId, SplitAtBoundary, StateProofBundle, StoredReceipt, SubstateKey, TxClaim,
+    TxOutcome, Unsettleable, UnsettledTx, WeightedTimestamp, WorkInFlight, derive_reshape_trigger,
+    lapse_probe_ceiling, ready_signal_window, settled_set_verdict, verdict_window_close,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -128,9 +128,10 @@ use crate::lookups::{committee_public_keys, vote_recipients};
 use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
 use crate::precut::{Precut, PrecutStatus, PrecutVerdict};
 use crate::proposal::{
-    AdmissionWindows, ProposalKind, ProposalTracker, TakeResult, assemble_build_action,
-    dispatch_or_defer, filter_engaged_transactions, late_deliveries, select_abandonment_records,
-    select_finalizations, select_provisions, select_transactions,
+    AdmissionWindows, ProposalKind, ProposalPayload, ProposalTracker, TakeResult,
+    assemble_build_action, dispatch_or_defer, filter_engaged_transactions, late_deliveries,
+    select_abandonment_records, select_finalizations, select_provisions, select_state_proofs,
+    select_transactions,
 };
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::timeout_keeper::TimeoutKeeper;
@@ -478,6 +479,28 @@ pub struct ShardCoordinator {
     /// anchor until then, and a voter holding no mirror defers. Each
     /// lives to its transaction's horizon.
     presences: HashMap<(TxHash, ShardId), ClaimProof>,
+
+    /// Commit-proven anchors of remote shards — the root and parent-QC
+    /// clock each header carries — mirrored off `RemoteHeaderCommitted`
+    /// for the state-proof check: a block's bundle names an anchor, and
+    /// the voter holds it to the header it has. Pruned on the retention
+    /// horizon, past which no probe anchors.
+    proven_anchors: HashMap<(ShardId, BlockHeight), ProvenAnchor>,
+}
+
+/// One commit-proven remote header as the state-proof check reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProvenAnchor {
+    state_root: StateRoot,
+    ts: WeightedTimestamp,
+}
+
+impl ProvenAnchor {
+    /// Whether `bundle` names this header: the root its anchor claims
+    /// and the clock it dates the answer to are both the header's.
+    fn is_named_by(&self, bundle: &StateProofBundle) -> bool {
+        self.state_root == bundle.anchor.state_root && self.ts == bundle.anchor_ts
+    }
 }
 
 impl std::fmt::Debug for ShardCoordinator {
@@ -621,6 +644,7 @@ impl ShardCoordinator {
             precut: Precut::succeeding(recovered.predecessors),
             settled_sets: HashMap::new(),
             presences: HashMap::new(),
+            proven_anchors: HashMap::new(),
             departure_parties: HashMap::new(),
             refusals: HashMap::new(),
             absences: HashMap::new(),
@@ -916,6 +940,18 @@ impl ShardCoordinator {
         self.absences.entry((tx_hash, shard)).or_insert(absence);
     }
 
+    /// Mirror a commit-proven remote header for the state-proof check.
+    pub fn record_proven_anchor(
+        &mut self,
+        shard: ShardId,
+        height: BlockHeight,
+        state_root: StateRoot,
+        ts: WeightedTimestamp,
+    ) {
+        self.proven_anchors
+            .insert((shard, height), ProvenAnchor { state_root, ts });
+    }
+
     /// Mirror a consumer's claim of a crossing a leg here issued for,
     /// proved present off the consumer's commit-proven state. First
     /// proof wins: a claim is one fact at every anchor short of its
@@ -950,6 +986,63 @@ impl ShardCoordinator {
         self.presences.retain(|_, presence| {
             now < lapse_probe_ceiling(validity_end_of(presence.probed_wt)).max(presence.probed_wt)
         });
+        // An anchor lives as long as a probe can be taken against it,
+        // which is the horizon the execution coordinator keeps its own
+        // commit-proven sources to.
+        let anchor_floor = now.minus(RETENTION_HORIZON);
+        self.proven_anchors
+            .retain(|_, anchor| anchor.ts >= anchor_floor);
+    }
+
+    /// Whether the block's state proofs name anchors this voter can
+    /// check, and so whether voting on it must be withheld.
+    ///
+    /// A bundle claims a root and a clock for a counterpart's height.
+    /// Both are read off the commit-proven header this voter holds for
+    /// it: one that agrees passes to the delegated proof walk, one that
+    /// disagrees is refused, and a voter holding no proven header for
+    /// the height defers and asks for its commit proof — the same
+    /// deferral a provision takes on a source block not yet proven.
+    /// The proposer probed at a header it held, so an honest bundle's
+    /// anchor reaches every voter in the ordinary course.
+    fn fence_state_proofs(&self, block: &Block, block_hash: BlockHash) -> Option<Vec<Action>> {
+        let mut wanted = Vec::new();
+        for bundle in block.state_proofs() {
+            let anchor = bundle.anchor;
+            match self.proven_anchors.get(&(anchor.shard, anchor.height)) {
+                Some(held) if held.is_named_by(bundle) => {}
+                Some(held) => {
+                    warn!(
+                        validator = ?self.me,
+                        block_hash = ?block_hash,
+                        shard = ?anchor.shard,
+                        height = anchor.height.inner(),
+                        claimed_root = ?anchor.state_root,
+                        held_root = ?held.state_root,
+                        claimed_ts = ?bundle.anchor_ts,
+                        held_ts = ?held.ts,
+                        "State proof names an anchor this validator's commit-proven header \
+                         disagrees with — not voting"
+                    );
+                    return Some(vec![]);
+                }
+                None => {
+                    trace!(
+                        validator = ?self.me,
+                        block_hash = ?block_hash,
+                        shard = ?anchor.shard,
+                        height = anchor.height.inner(),
+                        "State proof names a height this validator has not commit-proven; \
+                         deferring"
+                    );
+                    wanted.push(Action::Continuation(ProtocolEvent::CommitProofNeeded {
+                        source_shard: anchor.shard,
+                        block_height: anchor.height,
+                    }));
+                }
+            }
+        }
+        (!wanted.is_empty()).then_some(wanted)
     }
 
     /// The settled-transaction set this validator has acquired for a terminated
@@ -2265,6 +2358,7 @@ impl ShardCoordinator {
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         abandonment_records: Vec<AbandonmentRecord>,
+        state_proofs: Vec<StateProofBundle>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // not the committed block — this lets the chain grow while the
@@ -2313,12 +2407,7 @@ impl ShardCoordinator {
                 topology_schedule,
                 next_height,
                 round,
-                ProposalKind::Normal {
-                    transactions: Vec::new(),
-                    finalizations: Vec::new(),
-                    provisions: Vec::new(),
-                    abandonment_records: Vec::new(),
-                },
+                ProposalKind::Normal(ProposalPayload::default()),
             );
         }
 
@@ -2338,12 +2427,7 @@ impl ShardCoordinator {
                 topology_schedule,
                 next_height,
                 round,
-                ProposalKind::Normal {
-                    transactions: Vec::new(),
-                    finalizations: Vec::new(),
-                    provisions: Vec::new(),
-                    abandonment_records: Vec::new(),
-                },
+                ProposalKind::Normal(ProposalPayload::default()),
             );
         }
 
@@ -2373,6 +2457,7 @@ impl ShardCoordinator {
             finalizations,
             abandonment_records,
         );
+        let state_proofs = select_state_proofs(state_proofs);
         let provisions = select_provisions(
             provisions,
             &qc_chain_provision_hashes,
@@ -2394,12 +2479,13 @@ impl ShardCoordinator {
             topology_schedule,
             next_height,
             round,
-            ProposalKind::Normal {
+            ProposalKind::Normal(ProposalPayload {
                 transactions,
                 finalizations,
                 provisions,
                 abandonment_records,
-            },
+                state_proofs,
+            }),
         )
     }
 
@@ -2778,7 +2864,7 @@ impl ShardCoordinator {
         // uncommitted window. The builder adds candidate ceilings on
         // top and drops what a payer cannot cover.
         let fee_checks = match &kind {
-            ProposalKind::Normal { transactions, .. } => {
+            ProposalKind::Normal(ProposalPayload { transactions, .. }) => {
                 let payer_seeds = self.local_payer_fees(
                     committee,
                     transactions.iter().map(|tx| PayerFee {
@@ -3761,6 +3847,12 @@ impl ShardCoordinator {
                 return vec![];
             }
 
+            // And over the proofs it carries of counterparts' cells,
+            // which this voter's commit-proven headers answer for.
+            if let Some(withheld) = self.fence_state_proofs(block, block_hash) {
+                return withheld;
+            }
+
             // Content from before this chain's origin. A certificate is
             // refused outright; a transaction only once a predecessor is
             // known to have committed it. Unresolved waits for the
@@ -4576,6 +4668,31 @@ impl ShardCoordinator {
         )
     }
 
+    /// Handle a completed state-proof check: every bundle reconstructed
+    /// its anchor's root, or the block is refused as any root failure
+    /// is.
+    pub fn on_state_proofs_verified(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        block_hash: BlockHash,
+        result: &Result<(), String>,
+    ) -> Vec<Action> {
+        if let Err(reason) = result {
+            warn!(
+                validator = ?self.me,
+                block_hash = ?block_hash,
+                %reason,
+                "A state proof does not reconstruct its anchor's root — not voting"
+            );
+        }
+        self.on_root_verified_impl(
+            topology_schedule,
+            VerificationKind::StateProofs,
+            block_hash,
+            result.is_ok(),
+        )
+    }
+
     /// Handle a completed beacon-witness-root verification.
     pub fn on_beacon_witness_root_verified(
         &mut self,
@@ -5072,6 +5189,7 @@ impl ShardCoordinator {
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         abandonment_records: Vec<AbandonmentRecord>,
+        state_proofs: Vec<StateProofBundle>,
     ) -> Vec<Action> {
         let height = qc.height();
 
@@ -5151,6 +5269,7 @@ impl ShardCoordinator {
             finalizations,
             provisions,
             abandonment_records,
+            state_proofs,
         ));
 
         actions
@@ -7662,6 +7781,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -8123,6 +8243,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -8204,6 +8325,7 @@ mod tests {
                 certificates: Arc::new(Vec::new()),
                 provisions: Arc::new(Vec::new()),
                 abandonment_records: Arc::new(Vec::new()),
+                state_proofs: Arc::new(Vec::new()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             }
         };
@@ -8408,6 +8530,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -8849,6 +8972,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let parent_block_hash = parent_block.hash();
@@ -9698,6 +9822,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
         );
 
         // Should emit BuildProposal for height 4 even with empty content.
@@ -9754,6 +9879,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
         );
         assert!(
             actions.is_empty(),
@@ -9768,6 +9894,7 @@ mod tests {
             block_3_hash,
             &honest,
             &[],
+            vec![],
             vec![],
             vec![],
             vec![],
@@ -9836,7 +9963,7 @@ mod tests {
         // Intentionally do NOT call on_block_persisted — parent tree
         // unavailable forces the defer branch.
 
-        let first = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let first = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(
             first
                 .iter()
@@ -9848,7 +9975,7 @@ mod tests {
             "defer slot should be recorded"
         );
 
-        let second = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let second = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(
             second.is_empty(),
             "second try_propose for same (height, round) must be suppressed"
@@ -9866,7 +9993,7 @@ mod tests {
             "deferred slot should be cleared"
         );
 
-        let third = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let third = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(
             third.iter().any(
                 |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
@@ -9910,7 +10037,7 @@ mod tests {
         // the sync-commit shape, whose commits carry no byte delta.
         assert_ne!(state.substate_bytes_frontier.0, state.committed_height);
 
-        let first = state.try_propose(&snapshot, &[], vec![], vec![], vec![]);
+        let first = state.try_propose(&snapshot, &[], vec![], vec![], vec![], vec![]);
         assert!(
             first
                 .iter()
@@ -9929,7 +10056,7 @@ mod tests {
             "the reconcile must latch a proposal retry"
         );
 
-        let second = state.try_propose(&snapshot, &[], vec![], vec![], vec![]);
+        let second = state.try_propose(&snapshot, &[], vec![], vec![], vec![], vec![]);
         assert!(
             second.iter().any(
                 |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
@@ -10211,7 +10338,14 @@ mod tests {
 
         // Ready txs must be dropped — sync blocks are always empty.
         let ready_txs = vec![Arc::new(test_utils::verified_test_transaction(1))];
-        let actions = state.try_propose(&topology_schedule, &ready_txs, vec![], vec![], vec![]);
+        let actions = state.try_propose(
+            &topology_schedule,
+            &ready_txs,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
 
         let proposal = actions
             .iter()
@@ -10266,7 +10400,7 @@ mod tests {
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
 
-        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         let Some(Action::BuildProposal { timestamp, .. }) = actions
             .iter()
             .find(|a| matches!(a, Action::BuildProposal { .. }))
@@ -10299,7 +10433,7 @@ mod tests {
 
         let height = BlockHeight::new(4);
         let round = Round::new(4);
-        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(
             actions
                 .iter()
@@ -10322,7 +10456,7 @@ mod tests {
         assert_eq!(state.last_voted_round(), round);
 
         // The retry at the same view must be a no-op, not a sibling build.
-        let retry = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let retry = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(retry.is_empty(), "retry built a sibling: {retry:?}");
     }
 
@@ -10383,7 +10517,7 @@ mod tests {
         sched.insert(Epoch::new(1), Arc::clone(&post_split));
         sched.set_head(post_split);
 
-        let actions = state.try_propose(&sched, &[], vec![], vec![], vec![]);
+        let actions = state.try_propose(&sched, &[], vec![], vec![], vec![], vec![]);
         let classification = actions
             .iter()
             .find_map(|a| match a {
@@ -10963,6 +11097,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         };
         let mut sub_quorum_signers = SignerBitfield::new(4);
         sub_quorum_signers.set(0); // single signer — far below 2f+1 = 3
@@ -11032,6 +11167,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         };
         let block_hash = block.hash();
         // The linkage assert fires before the committee resolves, so a
@@ -11080,6 +11216,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         };
         let qc = {
             let __qc = make_test_qc(block.hash(), BlockHeight::new(1));
@@ -11132,7 +11269,7 @@ mod tests {
         // Height 4 proposes at round 4 (rounds increase per block).
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
-        let _ = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let _ = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
 
         assert_eq!(
             state.view_change.last_leader_activity,
@@ -11243,7 +11380,7 @@ mod tests {
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
 
-        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(
             actions
                 .iter()
@@ -11286,6 +11423,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         };
         let ancestor_hash = ancestor_block.hash();
         install_complete_block(&mut state, &ancestor_block);
@@ -11320,6 +11458,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         };
 
         let result = {
@@ -11365,6 +11504,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         };
         let ancestor_hash = ancestor_block.hash();
 
@@ -11397,6 +11537,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         };
 
         // Ancestor is at committed height, so walk stops before checking it
@@ -11637,8 +11778,104 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(records),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
+    }
+
+    /// A block carrying `bundles`, committed under their root.
+    fn block_with_state_proofs(bundles: Vec<StateProofBundle>) -> Block {
+        use hyperscale_types::state_proofs_root_from_bundles;
+        Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(1),
+                state_proofs_root: state_proofs_root_from_bundles(&bundles),
+                ..Default::default()
+            }),
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(Vec::new()),
+            provisions: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(bundles),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        }
+    }
+
+    /// A bundle against `shard` at height 5 under the root `root` names,
+    /// claiming the anchor's clock is `ts_ms`.
+    fn bundle_against(shard: ShardId, root: &[u8], ts_ms: u64) -> StateProofBundle {
+        use hyperscale_types::{MerkleInclusionProof, StateAnchor};
+        StateProofBundle::new(
+            StateAnchor {
+                shard,
+                height: BlockHeight::new(5),
+                state_root: StateRoot::from_raw(Hash::from_bytes(root)),
+            },
+            WeightedTimestamp::from_millis(ts_ms),
+            [stub_abort_charge(1).vault],
+            MerkleInclusionProof::dummy(),
+        )
+    }
+
+    /// A bundle names a counterpart's height this voter has not
+    /// commit-proven: the vote defers and asks for the commit proof,
+    /// as a provision on an unproven source block does.
+    #[test]
+    fn a_state_proof_against_an_unproven_height_defers_and_asks_for_its_proof() {
+        let coord = fence_coordinator();
+        let peer = ShardId::leaf(1, 1);
+        let block = block_with_state_proofs(vec![bundle_against(peer, b"root", 5_000)]);
+        let withheld = coord
+            .fence_state_proofs(&block, BlockHash::ZERO)
+            .expect("the vote is withheld");
+        assert!(
+            matches!(
+                withheld.as_slice(),
+                [Action::Continuation(ProtocolEvent::CommitProofNeeded {
+                    source_shard,
+                    block_height,
+                })] if *source_shard == peer && *block_height == BlockHeight::new(5)
+            ),
+            "{withheld:?}"
+        );
+    }
+
+    /// A bundle whose root or clock disagrees with the commit-proven
+    /// header this voter holds is refused outright: the proof would
+    /// reconstruct a root the chain never committed, or date it to a
+    /// clock the chain never carried.
+    #[test]
+    fn a_state_proof_disagreeing_with_the_held_header_is_refused() {
+        let mut coord = fence_coordinator();
+        let peer = ShardId::leaf(1, 1);
+        coord.record_proven_anchor(
+            peer,
+            BlockHeight::new(5),
+            StateRoot::from_raw(Hash::from_bytes(b"root")),
+            WeightedTimestamp::from_millis(5_000),
+        );
+
+        let other_root = block_with_state_proofs(vec![bundle_against(peer, b"other", 5_000)]);
+        assert!(
+            coord
+                .fence_state_proofs(&other_root, BlockHash::ZERO)
+                .is_some_and(|withheld| withheld.is_empty()),
+            "refused, with nothing to wait for"
+        );
+        let other_clock = block_with_state_proofs(vec![bundle_against(peer, b"root", 5_001)]);
+        assert!(
+            coord
+                .fence_state_proofs(&other_clock, BlockHash::ZERO)
+                .is_some_and(|withheld| withheld.is_empty()),
+        );
+
+        let agreeing = block_with_state_proofs(vec![bundle_against(peer, b"root", 5_000)]);
+        assert!(
+            coord
+                .fence_state_proofs(&agreeing, BlockHash::ZERO)
+                .is_none(),
+            "the anchor the chain committed passes to the proof walk"
+        );
     }
 
     /// What abandoning `tx` takes, as the transaction fixes it.
@@ -12128,6 +12365,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         }
     }
 
@@ -12427,6 +12665,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         }
     }
 
@@ -12521,6 +12760,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         }
     }
 
@@ -12542,6 +12782,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
         }
     }
 

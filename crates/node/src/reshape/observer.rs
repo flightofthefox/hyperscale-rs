@@ -980,6 +980,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }

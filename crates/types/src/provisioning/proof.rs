@@ -17,7 +17,7 @@ use crate::{MAX_MERKLE_PROOF_LEN, StateRoot, SubstateKey};
 /// The proof contains:
 /// - Per-claimed-key termination metadata (leaf / empty-subtree / leaf-mismatch)
 /// - Sibling hashes for bottom-up verification
-#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hbor)]
 #[hbor(transparent)]
 pub struct MerkleInclusionProof(#[hbor(max = MAX_MERKLE_PROOF_LEN)] pub Vec<u8>);
 

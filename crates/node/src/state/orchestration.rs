@@ -188,6 +188,16 @@ impl NodeStateMachine {
             certified_header.header().parent_qc().weighted_timestamp(),
             certified_header.state_root(),
         ));
+        // The vote fence holds a block's state proofs to the anchors
+        // this validator has commit-proven; a vote that deferred for
+        // want of this header is re-driven.
+        s.shard_coordinator.record_proven_anchor(
+            certified_header.shard_id(),
+            certified_header.header().height(),
+            certified_header.state_root(),
+            certified_header.header().parent_qc().weighted_timestamp(),
+        );
+        actions.extend(s.shard_coordinator.redrive_pending_votes(topology_schedule));
         actions
     }
 }

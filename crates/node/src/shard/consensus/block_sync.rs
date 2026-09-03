@@ -29,8 +29,8 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{
     AbandonmentRoot, BlockHeight, CertificateRoot, CertifiedBlock, ElidedCertifiedBlock, Hash,
-    Inventory, LocalReceiptRoot, ProvisionHash, ProvisionsRoot, RehydrateError, StoredReceipt,
-    TransactionRoot, Verifiable, Verified,
+    Inventory, LocalReceiptRoot, ProvisionHash, ProvisionsRoot, RehydrateError, StateProofsRoot,
+    StoredReceipt, TransactionRoot, Verifiable, Verified,
 };
 
 use crate::event::classify_fetch_error;
@@ -391,6 +391,12 @@ fn validate_synced_block(
         return Err("abandonment_root_mismatch");
     }
 
+    if Verified::<StateProofsRoot>::compute(certified.block().state_proofs()).into_inner()
+        != header.state_proofs_root()
+    {
+        return Err("state_proofs_root_mismatch");
+    }
+
     if Verified::<TransactionRoot>::compute(certified.block().transactions()).into_inner()
         != header.transaction_root()
     {
@@ -575,6 +581,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -590,6 +597,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -609,6 +617,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(
@@ -632,6 +641,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(
@@ -664,6 +674,57 @@ mod tests {
         })
     }
 
+    /// A block's state proofs are the one body list beside the records
+    /// that a manifest holds by value, and every replica folds them at
+    /// commit; a serving peer that drops or forges them hands back a
+    /// block whose answers are not the chain's.
+    #[test]
+    fn validate_binds_state_proofs_in_both_directions() {
+        use hyperscale_types::{MerkleInclusionProof, StateAnchor, StateProofBundle, StateRoot};
+        let bundles = vec![StateProofBundle::new(
+            StateAnchor {
+                shard: ShardId::leaf(1, 0),
+                height: BlockHeight::new(3),
+                state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
+            },
+            WeightedTimestamp::from_millis(3_000),
+            [stub_abort_charge(1).vault],
+            MerkleInclusionProof::dummy(),
+        )];
+        let root = Verified::<StateProofsRoot>::compute(&bundles).into_inner();
+        let live = |state_proofs: Vec<StateProofBundle>| Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                height: HEIGHT,
+                parent_block_hash: BlockHash::ZERO,
+                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+                timestamp: ProposerTimestamp::from_millis(1_000),
+                provision_tx_roots: std::collections::BTreeMap::new(),
+                state_proofs_root: root,
+                ..Default::default()
+            }),
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(Vec::new()),
+            provisions: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(state_proofs),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+
+        let dropped = live(Vec::new());
+        let qc = qc_for(&dropped);
+        assert_eq!(
+            validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(dropped, qc)).unwrap_err(),
+            "state_proofs_root_mismatch"
+        );
+
+        let carried = live(bundles);
+        let qc = qc_for(&carried);
+        assert!(
+            validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(carried, qc)).is_ok(),
+            "the proofs the header commits are the ones it accepts"
+        );
+    }
+
     fn boundary_record() -> AbandonmentRecord {
         AbandonmentRecord::departed(
             ShardId::leaf(1, 0),
@@ -690,6 +751,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(vec![boundary_record()]),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -714,6 +776,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(abandonment_records),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -742,6 +805,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -767,6 +831,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -793,6 +858,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -815,6 +881,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -849,6 +916,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provision_hashes: Arc::new(provision_hashes),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -883,6 +951,7 @@ mod tests {
             certificates: Arc::new(vec![fw]),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -941,6 +1010,7 @@ mod tests {
             certificates: Arc::new(vec![fw]),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -970,6 +1040,7 @@ mod tests {
             certificates: Arc::new(vec![fw]),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1025,6 +1096,7 @@ mod tests {
             certificates: Arc::new(vec![fw]),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);

@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    AbandonmentRecord, Finalization, MAX_TXS_PER_BLOCK, Provisions, TopologySchedule,
-    TopologySnapshot, Transaction, Verifiable, Verified,
+    AbandonmentRecord, Finalization, MAX_TXS_PER_BLOCK, Provisions, StateProofBundle,
+    TopologySchedule, TopologySnapshot, Transaction, Verifiable, Verified,
 };
 
 use super::ShardParticipation;
@@ -20,6 +20,7 @@ pub(in crate::state) struct ProposalInputs {
     pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
     pub provisions: Vec<Arc<Verifiable<Provisions>>>,
     pub abandonment_records: Vec<AbandonmentRecord>,
+    pub state_proofs: Vec<StateProofBundle>,
 }
 
 impl ShardParticipation {
@@ -53,6 +54,9 @@ impl ShardParticipation {
         // What departed counterparts left of this chain's business, while
         // the settled sets that say so can still be read.
         let abandonment_records = self.execution_coordinator.pending_abandonment_records();
+        // Proofs of counterparts' cells this validator's fetches
+        // answered, for every replica to fold at commit.
+        let state_proofs = self.execution_coordinator.pending_state_proofs();
         let queued = self.provisions_coordinator.queued_provisions(self.now);
 
         // The engagement gate: a non-payer shard proposes a cross-shard
@@ -81,6 +85,7 @@ impl ShardParticipation {
             finalizations,
             provisions,
             abandonment_records,
+            state_proofs,
         }
     }
 
@@ -126,6 +131,7 @@ impl ShardParticipation {
             inputs.finalizations,
             inputs.provisions,
             inputs.abandonment_records,
+            inputs.state_proofs,
         )
     }
 }

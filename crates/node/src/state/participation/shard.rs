@@ -165,6 +165,9 @@ impl ShardParticipation {
             ProtocolEvent::ReservationsVerified { block_hash, result } => self
                 .shard_coordinator
                 .on_reservations_verified(topology_schedule, block_hash, &result),
+            ProtocolEvent::StateProofsVerified { block_hash, result } => self
+                .shard_coordinator
+                .on_state_proofs_verified(topology_schedule, block_hash, &result),
             ProtocolEvent::ResolutionsVerified {
                 block_hash,
                 verdict,
@@ -443,6 +446,7 @@ impl ShardParticipation {
             inputs.finalizations,
             inputs.provisions,
             inputs.abandonment_records,
+            inputs.state_proofs,
         )
     }
 
@@ -828,6 +832,7 @@ mod tests {
 
         let manifest = BlockManifest::new(
             vec![TxHash::ZERO],
+            vec![],
             vec![],
             vec![],
             vec![],

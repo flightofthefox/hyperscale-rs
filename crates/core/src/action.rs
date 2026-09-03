@@ -20,10 +20,10 @@ use hyperscale_types::{
     ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round, RoutingCommittees,
     SafeVoteRegisters, ShardForkProof, ShardId, ShardLoad, ShardTrie, ShardVoteEquivocation,
     SharedCertificates, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
-    SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry,
-    SubstateKey, SweepFrontier, TerminalEvidence, TerminalRoots, TickId, Timeout, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome, UnsettledTx, ValidatorId,
-    Verifiable, Verified, VoteCount, WeightedTimestamp, WorkInFlight,
+    SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateProofBundle, StateRoot,
+    SubstateEntry, SubstateKey, SweepFrontier, TerminalEvidence, TerminalRoots, TickId, Timeout,
+    TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
+    UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, WeightedTimestamp, WorkInFlight,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -946,6 +946,21 @@ pub enum Action {
         trie: ShardTrie,
     },
 
+    /// Check that each of a block's state-proof bundles reconstructs
+    /// the root its anchor names.
+    ///
+    /// The anchor itself — that its root and clock are the commit-proven
+    /// header's — is the shard coordinator's to check synchronously
+    /// against the anchors it holds, before this is dispatched; what is
+    /// delegated is the proof walk. Returns
+    /// `ProtocolEvent::StateProofsVerified`.
+    VerifyStateProofs {
+        /// Block whose state proofs are being checked.
+        block_hash: BlockHash,
+        /// Every bundle the block carries.
+        state_proofs: Vec<StateProofBundle>,
+    },
+
     /// Build a complete block proposal.
     ///
     /// Computes the new state root from certificates, builds the complete block,
@@ -986,6 +1001,9 @@ pub enum Action {
         /// — written down here while the settled sets they were read
         /// from can still be checked against.
         abandonment_records: Vec<AbandonmentRecord>,
+        /// Proofs of counterparts' cells this proposer's fetches
+        /// answered, for every replica to fold at commit.
+        state_proofs: Vec<StateProofBundle>,
         /// Prior fee-reservation demand per local payer among the
         /// candidate transactions — in-flight holds plus the uncommitted
         /// window, excluding the candidates themselves. The builder
@@ -1738,6 +1756,7 @@ impl Action {
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyReservations { .. }
             | Self::VerifyResolutions { .. }
+            | Self::VerifyStateProofs { .. }
             | Self::VerifyStateRoot { .. }
             | Self::VerifyBeaconWitnessRoot { .. }
             | Self::BuildProposal { .. }
@@ -1845,6 +1864,7 @@ impl Action {
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyReservations { .. }
             | Self::VerifyResolutions { .. }
+            | Self::VerifyStateProofs { .. }
             | Self::BuildProposal { .. }
             | Self::ExecuteTransactions { .. }
             | Self::ResolveTicks { .. }
@@ -1931,6 +1951,7 @@ impl Action {
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyReservations { .. }
             | Self::VerifyResolutions { .. }
+            | Self::VerifyStateProofs { .. }
             | Self::VerifyStateRoot { .. }
             | Self::VerifyBeaconWitnessRoot { .. }
             | Self::BuildProposal { .. }

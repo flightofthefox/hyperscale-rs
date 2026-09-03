@@ -350,6 +350,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ProvisionTxRootsVerified { .. }
             | ProtocolEvent::ReservationsVerified { .. }
             | ProtocolEvent::ResolutionsVerified { .. }
+            | ProtocolEvent::StateProofsVerified { .. }
             | ProtocolEvent::BeaconWitnessRootVerified { .. }
             | ProtocolEvent::StateRootVerified { .. }
             | ProtocolEvent::ProposalBuilt { .. }

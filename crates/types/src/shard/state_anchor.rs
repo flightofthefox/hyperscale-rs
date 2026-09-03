@@ -1,5 +1,7 @@
 //! A commit-proven state root of one shard at one height.
 
+use hyperscale_hbor::Hbor;
+
 use crate::{BlockHeight, CertifiedBlockHeader, ShardId, StateRoot, Verified};
 
 /// One shard's state at one committed height, named by the root a
@@ -12,7 +14,7 @@ use crate::{BlockHeight, CertifiedBlockHeader, ShardId, StateRoot, Verified};
 /// up at verification, so a response is checked where it lands and a
 /// peer serving a proof against some other root is rotated off like
 /// any other unusable answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
 pub struct StateAnchor {
     /// The shard whose state this is.
     pub shard: ShardId,

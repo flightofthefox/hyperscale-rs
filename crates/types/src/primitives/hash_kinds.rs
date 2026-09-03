@@ -179,6 +179,19 @@ hash_newtype!(
 );
 
 hash_newtype!(
+    /// Merkle root over the [`StateProofBundle`](crate::StateProofBundle)
+    /// bundles a block carries.
+    ///
+    /// Carried in
+    /// [`BlockHeader::state_proofs_root`](crate::BlockHeader), so a
+    /// proof of a counterpart's cell is committed content every replica
+    /// folds at the same height rather than a reading one validator
+    /// fetched.
+    pub StateProofsRoot,
+    "StateProofsRoot"
+);
+
+hash_newtype!(
     /// Merkle root over the transactions a shard committed within its
     /// retention window up to a terminal block.
     ///
