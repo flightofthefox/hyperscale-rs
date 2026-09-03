@@ -19,6 +19,7 @@ use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::legs::{Classified, Runs, Side, crossings_of};
 use hyperscale_types::{
     EscrowedValue, ShardId, SubstateKey, Transaction, TxHash, Verified, WeightedTimestamp,
+    delivery_window_close,
 };
 use hyperscale_vm_effects::CrossingCell;
 
@@ -267,6 +268,17 @@ impl TickCandidates {
                 continue;
             }
             if !candidate.engagement_settled(now) {
+                continue;
+            }
+            // A delivery is admissible to the window's close and no
+            // later: past it the crossing lapses and its issuer may
+            // reclaim on a proof the claim is absent, so a delivery
+            // composed past the close would claim what a reclaim may
+            // already have taken back. It is abandoned at the close.
+            if candidate.side == Side::Delivering
+                && now
+                    >= delivery_window_close(candidate.tx.validity_range().end_timestamp_exclusive)
+            {
                 continue;
             }
             let membership = Membership::of(
