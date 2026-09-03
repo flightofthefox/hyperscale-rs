@@ -750,17 +750,20 @@ impl UnresolvedTxs {
     /// arrives this way — accepted, refused, or aborted — so one release
     /// path covers them all.
     ///
-    /// A leg's own finalization bears no verdict on the transaction and
-    /// releases nothing: the entry stays for the reclaim, whose
-    /// finalization is the one that releases it, and otherwise lives to
-    /// its own horizon.
+    /// A leg entry is released by a finalization that decides the
+    /// transaction, and only one: a leg that succeeded bears no verdict,
+    /// so the entry stays for the reclaim, whose finalization decides it
+    /// and releases it. A leg that failed is the transaction's end on
+    /// this shard — it issued nothing, so there is nothing to reclaim —
+    /// and its own finalization releases it.
     pub fn release_resolved(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
         for finalization in finalizations {
+            let deciding: BTreeSet<TxHash> = finalization.deciding_tx_hashes().collect();
             for (tx_hash, decision) in finalization.tx_decisions() {
                 let Some(owed) = self.owed.get_mut(&tx_hash) else {
                     continue;
                 };
-                if owed.kind.is_leg() && !owed.reclaim_admitted {
+                if owed.kind.is_leg() && !deciding.contains(&tx_hash) {
                     continue;
                 }
                 // An issuer that accepted has crossings out that its
@@ -950,7 +953,7 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_types::test_utils::{
-        make_finalization, stub_transaction, test_prefix, test_principal,
+        make_finalization, make_leg_finalization, stub_transaction, test_prefix, test_principal,
     };
     use hyperscale_types::{
         BlockHeight, EPOCH_DURATION, EpochWindows, LocalKey, MAX_FINALIZATION_DELAY,
@@ -1771,7 +1774,7 @@ mod tests {
         ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new());
         ledger.certify(tx.hash());
 
-        let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Accept);
+        let own = make_leg_finalization(BlockHeight::new(1), tx.hash());
         ledger.release_resolved(&[Arc::new(Verifiable::from(own))]);
         assert_eq!(ledger.len(), 1, "the leg's finalization decides nothing");
 
@@ -1793,6 +1796,34 @@ mod tests {
             "a record licenses a reclaim of it, never an abort"
         );
         assert_eq!(ledger.len(), 1);
+    }
+
+    /// A leg that failed is the transaction's end on this shard: its
+    /// finalization decides, and with nothing issued there is nothing
+    /// to reclaim, so the entry goes with it — body and all — and no
+    /// record can license a reclaim of it afterwards.
+    #[test]
+    fn a_failed_legs_own_finalization_releases_its_entry() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(5, 60_000);
+        commit(&mut ledger, &tx);
+        ledger.mark_leg(tx.hash(), body(&tx), classified(), Vec::new());
+        ledger.certify(tx.hash());
+
+        let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Reject);
+        ledger.release_resolved(&[Arc::new(Verifiable::from(own))]);
+        assert_eq!(ledger.len(), 0, "a failed leg's finalization decides it");
+        assert!(ledger.kept.is_empty(), "and the body goes with it");
+
+        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
+            PARTNER,
+            ms(1_000),
+            [names(&tx)],
+        )]);
+        assert!(
+            ledger.reclaimable().is_empty(),
+            "a record naming it afterwards rebuilds an entry with no body to reclaim from"
+        );
     }
 
     /// A committed record is what makes a leg entry reclaimable — never a
