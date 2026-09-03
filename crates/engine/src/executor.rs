@@ -734,8 +734,8 @@ fn apply_fee_burn(writes: &mut StateWrites, fee: Option<PayerFee>, amount: u128)
     //
     // This composition lands in the receipt `writes_root` commits over,
     // so it stays exact gross — and it can: the standing debit is
-    // bounded by the XRD that exists, the burn by the `u64` fuel reads
-    // in, and the two together sit far inside `u128`.
+    // bounded by the XRD that exists, the burn by the ceiling the payer
+    // signed, and the two together sit far inside `u128`.
     let burned = Movement::debit(*XRD, burn);
     writes
         .movements

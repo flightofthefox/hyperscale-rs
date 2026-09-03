@@ -4,15 +4,18 @@
 //! A cross-shard transaction needs every certificate its settlement
 //! waits on, so one whose counterpart can never certify it can never
 //! settle anywhere. That is the fact this shard needs in order to abandon
-//! it, and three things establish it. The counterpart left without
+//! it, and four things establish it. The counterpart left without
 //! settling: its settled set is complete and beacon-attested, so absence
 //! from it is proof, but the set can only be fetched while the terminal
 //! it belongs to is still served. The core refused: its certificate says
-//! so, and a refusal ends the transaction outright. Or the core never
-//! committed it, as of one of its blocks past the deadline: a
+//! so, and a refusal ends the transaction outright. The core never
+//! committed it, as of one of its blocks inside the absence window: a
 //! non-inclusion proof of the committed-transaction cell against that
 //! block's state root says so, and before the deadline it says nothing,
-//! since the core may still legitimately commit.
+//! since the core may still legitimately commit, nor past the cell's own
+//! sweep, where the cell is gone either way. Or the delivery never
+//! claimed it, as of one of the delivering shard's blocks inside the
+//! lapse window, on the same terms against the claim cell.
 //!
 //! So the answer is written down while it can still be read. A record
 //! names the transactions this chain still owes an outcome for that its
@@ -290,9 +293,10 @@ pub struct Refusal {
 /// What an `Unclaimed` or a `Lapsed` record restates and what a voter
 /// checks it against. The anchor is the voter's own probe, which need
 /// not be the proposer's: absence past the floor is the same fact at
-/// every anchor, so a voter holding a proof at any block past it holds
-/// the evidence the record claims. The floor is the clock the mirror
-/// lives on, as a refusal's deadline is.
+/// every anchor short of the probed cell's sweep, so a voter holding a
+/// proof at any block inside that window holds the evidence the record
+/// claims. The floor is the clock the mirror lives on, as a refusal's
+/// deadline is, and what says which cell the mirror asked about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Absence {
     /// The weighted timestamp of the block the absence was proved
