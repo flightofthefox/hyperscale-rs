@@ -884,6 +884,66 @@ mod tests {
     /// floor projection carries the parent across the whole lifecycle:
     /// from the pending record at admission, then from the boundary stamp
     /// once the record is consumed (the coast).
+    /// A gate met inside a window schedules the terminal for the next
+    /// one, after that window's projection was published, so the
+    /// projection carries no terminal where the fold carries one — a
+    /// reader keyed on `scheduled_terminal` answers differently from the
+    /// two copies. The trie has no such gap: the cut lands a whole window
+    /// after the gate, and every projection of the children's window is
+    /// published after the gate has seated them.
+    #[test]
+    fn a_terminal_scheduled_inside_a_window_is_absent_from_that_windows_projection() {
+        let p = ShardId::leaf(1, 0);
+        let (left, right) = p.children();
+        let mut state = grow_state(4);
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit { shard: p },
+        );
+        let gate_epoch = state.current_epoch;
+        // The next window's projection as the fold before the gate
+        // published it.
+        let published_before_the_gate = state.derive_next_topology_snapshot(net());
+        let left_observer = observer_for(&state, p, left);
+        mark_ready(&mut state, p, left_observer);
+        let right_observer = observer_for(&state, p, right);
+        mark_ready(&mut state, p, right_observer);
+        schedule_ready_splits(&mut state);
+        let terminal = state
+            .pending_reshapes
+            .get(&p)
+            .and_then(PendingReshape::scheduled_terminal)
+            .expect("the gate schedules the cut");
+        assert_eq!(
+            terminal,
+            gate_epoch.next(),
+            "the parent's final window is the next one"
+        );
+        // What the fold into that window freezes: the live window as the
+        // gate left it.
+        let frozen_at_the_fold = state.derive_next_topology_snapshot(net());
+        assert_eq!(published_before_the_gate.scheduled_terminal(p), None);
+        assert_eq!(frozen_at_the_fold.scheduled_terminal(p), Some(terminal));
+        assert_eq!(
+            published_before_the_gate
+                .shard_trie()
+                .leaves()
+                .collect::<Vec<_>>(),
+            frozen_at_the_fold.shard_trie().leaves().collect::<Vec<_>>(),
+            "the final window's trie still carries the parent in both copies",
+        );
+        // The children's window: projected at the final window's fold,
+        // after the gate, so the children are already in its trie.
+        assert!(advance_to_scheduled_cut(&mut state));
+        apply_scheduled_splits(&mut state);
+        let children = state.derive_next_topology_snapshot(net());
+        assert!(children.shard_trie().contains(left) && children.shard_trie().contains(right));
+        assert!(!children.shard_trie().contains(p));
+    }
+
     #[test]
     fn execution_stamps_the_admission_epoch_on_the_terminal_boundary() {
         use hyperscale_types::RETENTION_HORIZON;
