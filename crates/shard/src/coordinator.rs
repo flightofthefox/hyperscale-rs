@@ -19,7 +19,7 @@ use hyperscale_types::{
     AbandonmentRecord, BlockHash, FinalizationHash, Hash, LocalTimestamp,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK,
     PrincipalAddr, ProposerTimestamp, ProvisionHash, ReadySignal, ReshapeThresholds,
-    ReshapeTrigger, Restatement, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
+    ReshapeTrigger, Resolutions, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
     SplitAtBoundary, StoredReceipt, SubstateKey, TxClaim, TxOutcome, Unsettleable, UnsettledTx,
     WeightedTimestamp, WorkInFlight, derive_reshape_trigger, ready_signal_window,
     settled_set_verdict,
@@ -1257,7 +1257,7 @@ impl ShardCoordinator {
     /// The figures each name restates are not this fence's to check:
     /// they are read off the committed body, which lives in the store,
     /// and so are checked by the delegated verification the vote also
-    /// waits on ([`Self::on_abandonment_figures_verified`]).
+    /// waits on ([`Self::on_resolutions_verified`]).
     fn fence_abandonment_records(
         &self,
         topology_schedule: &TopologySchedule,
@@ -4376,23 +4376,23 @@ impl ShardCoordinator {
         )
     }
 
-    /// Handle a completed abandonment-figure check.
+    /// Handle a completed resolutions check.
     ///
-    /// An exact restatement verifies the root and a wrong one refuses
-    /// the block, as any root does. An unknown name is neither: this
-    /// validator's store never held the transaction, so it cannot say,
-    /// and the root is left in flight — the block stays pending and
-    /// unvoted here, and commits on a quorum's certificate like any
-    /// block this validator did not vote for.
-    pub fn on_abandonment_figures_verified(
+    /// An exact answer verifies the root; a wrong figure or a lapsed
+    /// delivery refuses the block, as any root does. An unknown name is
+    /// neither: this validator's store never held the transaction, so it
+    /// cannot say, and the root is left in flight — the block stays
+    /// pending and unvoted here, and commits on a quorum's certificate
+    /// like any block this validator did not vote for.
+    pub fn on_resolutions_verified(
         &mut self,
         topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
-        restatement: Restatement,
+        verdict: Resolutions,
     ) -> Vec<Action> {
-        match restatement {
-            Restatement::Exact => {}
-            Restatement::Wrong(tx_hash) => {
+        match verdict {
+            Resolutions::Exact => {}
+            Resolutions::Wrong(tx_hash) => {
                 warn!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
@@ -4401,7 +4401,15 @@ impl ShardCoordinator {
                      not voting"
                 );
             }
-            Restatement::Unknown(tx_hash) => {
+            Resolutions::Lapsed(tx_hash) => {
+                warn!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    ?tx_hash,
+                    "Finalization delivers a crossing at or past its lapse — not voting"
+                );
+            }
+            Resolutions::Unknown(tx_hash) => {
                 trace!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
@@ -4414,9 +4422,9 @@ impl ShardCoordinator {
         }
         self.on_root_verified_impl(
             topology_schedule,
-            VerificationKind::AbandonmentFigures,
+            VerificationKind::Resolutions,
             block_hash,
-            matches!(restatement, Restatement::Exact),
+            matches!(verdict, Resolutions::Exact),
         )
     }
 
@@ -11618,23 +11626,23 @@ mod tests {
         );
         let block_hash = block.hash();
         let tx_hash = figures_of(b"tx").tx_hash;
-        let kind = VerificationKind::AbandonmentFigures;
+        let kind = VerificationKind::Resolutions;
 
         let mut coord = fence_coordinator();
         install_complete_block(&mut coord, &block);
         let actions = coord
             .verification
-            .initiate_abandonment_figures_verification(block_hash, &block);
+            .initiate_resolutions_verification(block_hash, &block, &sched);
         assert!(
             matches!(
                 actions.as_slice(),
-                [Action::VerifyAbandonmentFigures { entries, .. }] if *entries == vec![figures_of(b"tx")]
+                [Action::VerifyResolutions { entries, .. }] if *entries == vec![figures_of(b"tx")]
             ),
             "the names go to the store: {actions:?}"
         );
         assert!(coord.verification.is_root_in_flight(block_hash, kind));
 
-        coord.on_abandonment_figures_verified(&sched, block_hash, Restatement::Unknown(tx_hash));
+        coord.on_resolutions_verified(&sched, block_hash, Resolutions::Unknown(tx_hash));
         assert!(
             coord.verification.is_root_in_flight(block_hash, kind),
             "an unknown name leaves the root in flight"
@@ -11644,7 +11652,7 @@ mod tests {
             "and the block pending"
         );
 
-        coord.on_abandonment_figures_verified(&sched, block_hash, Restatement::Wrong(tx_hash));
+        coord.on_resolutions_verified(&sched, block_hash, Resolutions::Wrong(tx_hash));
         assert!(
             coord.pending_blocks.get(block_hash).is_none(),
             "a wrong figure refuses the block"
@@ -11654,8 +11662,19 @@ mod tests {
         install_complete_block(&mut coord, &block);
         coord
             .verification
-            .initiate_abandonment_figures_verification(block_hash, &block);
-        coord.on_abandonment_figures_verified(&sched, block_hash, Restatement::Exact);
+            .initiate_resolutions_verification(block_hash, &block, &sched);
+        coord.on_resolutions_verified(&sched, block_hash, Resolutions::Lapsed(tx_hash));
+        assert!(
+            coord.pending_blocks.get(block_hash).is_none(),
+            "a delivery past its lapse refuses the block"
+        );
+
+        let mut coord = fence_coordinator();
+        install_complete_block(&mut coord, &block);
+        coord
+            .verification
+            .initiate_resolutions_verification(block_hash, &block, &sched);
+        coord.on_resolutions_verified(&sched, block_hash, Resolutions::Exact);
         assert!(
             coord.verification.is_root_verified(block_hash, kind),
             "an exact restatement verifies the root"

@@ -146,6 +146,13 @@ enum Kind {
     /// This shard's verdict is the transaction's, or a share of it: the
     /// entry is abandonable at its deadline and released by that verdict.
     Whole,
+    /// This shard only delivers for the transaction: a leg outside the
+    /// core that bears no verdict and issues nothing, admissible to the
+    /// delivery window's close, which is its deadline. Abandoned there
+    /// like a whole entry — and, unlike one, out of any tick still
+    /// holding it, since past the close the crossing it would claim
+    /// lapses and its issuer may reclaim it.
+    Delivery,
     /// This shard ran only a leg of the transaction: it froze divided
     /// with this shard outside the core set.
     ///
@@ -363,6 +370,7 @@ impl UnresolvedTxs {
     /// released by its own finalization.
     pub fn mark_delivery(&mut self, tx_hash: TxHash, validity_end: WeightedTimestamp) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
+            owed.kind = Kind::Delivery;
             owed.deadline = delivery_window_close(validity_end);
         }
     }
@@ -593,6 +601,14 @@ impl UnresolvedTxs {
     /// Whether a committed record has established that `tx_hash` can
     /// never settle — the question the split-boundary fence otherwise
     /// puts to a settled set that expires.
+    /// Whether this shard only delivers for `tx_hash`.
+    #[must_use]
+    pub fn is_delivery(&self, tx_hash: TxHash) -> bool {
+        self.owed
+            .get(&tx_hash)
+            .is_some_and(|owed| owed.kind == Kind::Delivery)
+    }
+
     #[must_use]
     pub fn is_unsettled_by_departed(&self, tx_hash: TxHash) -> bool {
         self.owed
@@ -1538,6 +1554,7 @@ mod tests {
         let tx = tx(4, 60_000);
         commit(&mut ledger, &tx);
         ledger.mark_delivery(tx.hash(), ms(60_000));
+        assert!(ledger.is_delivery(tx.hash()));
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         let close = delivery_window_close(ms(60_000));
 

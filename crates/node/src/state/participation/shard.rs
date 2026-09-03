@@ -165,13 +165,13 @@ impl ShardParticipation {
             ProtocolEvent::ReservationsVerified { block_hash, result } => self
                 .shard_coordinator
                 .on_reservations_verified(topology_schedule, block_hash, &result),
-            ProtocolEvent::AbandonmentFiguresVerified {
+            ProtocolEvent::ResolutionsVerified {
                 block_hash,
-                restatement,
-            } => self.shard_coordinator.on_abandonment_figures_verified(
+                verdict,
+            } => self.shard_coordinator.on_resolutions_verified(
                 topology_schedule,
                 block_hash,
-                restatement,
+                verdict,
             ),
             ProtocolEvent::BeaconWitnessRootVerified { block_hash, result } => self
                 .shard_coordinator

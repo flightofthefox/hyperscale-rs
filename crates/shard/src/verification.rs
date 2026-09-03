@@ -17,9 +17,10 @@ use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
     BlockManifest, CertificateRoot, CertifiedBlock, ChainOrigin, Finalization, LinkageError,
     LocalReceiptRoot, ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ReshapeThresholds,
-    RevealChain, ShardId, SplitChildRoots, StateRoot, SubstateKey, SweepFrontier, TerminalRoots,
-    TopologySchedule, TopologySnapshot, TransactionRoot, TxHash, UnsettledTx, Verifiable, Verified,
-    VerifiedBlockAssembleError, WeightedTimestamp, WorkInFlight,
+    RevealChain, ScheduleLookup, ShardId, ShardTrie, SplitChildRoots, StateRoot, SubstateKey,
+    SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot, TransactionRoot, TxHash,
+    TxOutcome, UnsettledTx, Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp,
+    WorkInFlight,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -54,9 +55,38 @@ pub enum VerificationKind {
     /// Payer-shard fee reservations against vault balances at the
     /// committed frontier.
     Reservations,
-    /// The figures the block's abandonment records restate, against the
-    /// committed transactions they name.
-    AbandonmentFigures,
+    /// The block's resolutions against the committed transactions they
+    /// name: the figures its records restate, and the deliveries its
+    /// finalizations carry, held short of the lapse.
+    Resolutions,
+}
+
+/// Whether a block carries anything the resolutions check reads: a
+/// record's figures, or a finalization resolving a name it does not
+/// decide, which is a delivery or a leg.
+fn resolutions_to_check(block: &Block) -> bool {
+    !block.abandonment_records().is_empty() || !undecided_names(block).is_empty()
+}
+
+/// The trie of `anchor`'s window, which a delivered body is classified
+/// against. A block anchored in a window nobody retains is refused on
+/// other grounds, and its deliveries go unchecked under the root trie.
+fn anchor_trie(schedule: &TopologySchedule, anchor: WeightedTimestamp) -> ShardTrie {
+    match schedule.lookup(anchor) {
+        ScheduleLookup::Committee(snapshot) => snapshot.shard_trie().clone(),
+        _ => ShardTrie::single(),
+    }
+}
+
+/// Every transaction the block's finalizations resolve without deciding.
+fn undecided_names(block: &Block) -> Vec<TxHash> {
+    block
+        .certificates()
+        .iter()
+        .flat_map(|fw| fw.local_ec().tx_outcomes().iter())
+        .filter(|outcome| !outcome.decides())
+        .map(TxOutcome::tx_hash)
+        .collect()
 }
 
 /// Lifecycle position for a verification entry. `InFlight` covers the
@@ -898,10 +928,7 @@ impl VerificationPipeline {
                 VerificationKind::Reservations,
                 self.is_root_tracked(block_hash, VerificationKind::Reservations),
             )
-            && root_ok(
-                VerificationKind::AbandonmentFigures,
-                !block.abandonment_records().is_empty(),
-            )
+            && root_ok(VerificationKind::Resolutions, resolutions_to_check(block))
             && self.verified_in_flight.contains(&block_hash)
     }
 
@@ -967,10 +994,10 @@ impl VerificationPipeline {
             "skipped(no_local_payers)",
             self.is_root_tracked(block_hash, VerificationKind::Reservations),
         );
-        let abandonment_figures_status = root_status(
-            VerificationKind::AbandonmentFigures,
-            "skipped(no_records)",
-            !block.abandonment_records().is_empty(),
+        let resolutions_status = root_status(
+            VerificationKind::Resolutions,
+            "skipped(nothing_to_check)",
+            resolutions_to_check(block),
         );
         let beacon_witness_defer = self.beacon_witness_defer(block_hash);
         let beacon_witness_root_status = match beacon_witness_defer {
@@ -999,7 +1026,7 @@ impl VerificationPipeline {
             provision_root = provision_root_status,
             provision_tx_root = provision_tx_root_status,
             reservations = reservations_status,
-            abandonment_figures = abandonment_figures_status,
+            resolutions = resolutions_status,
             beacon_witness_root = beacon_witness_root_status,
             beacon_witness_blocker = ?beacon_witness_defer.map(|(blocker, _)| blocker),
             in_flight = in_flight_status,
@@ -1295,33 +1322,43 @@ impl VerificationPipeline {
         }]
     }
 
-    /// Initiate the check of the figures a block's abandonment records
-    /// restate, over every name the records carry; callers skip the
-    /// dispatch when there are none. The handler reads each named
-    /// transaction off the store and answers with a [`Restatement`](hyperscale_types::Restatement),
-    /// which the coordinator folds into the pipeline: exact verifies,
-    /// wrong refuses, and unknown leaves the root in flight — the vote
+    /// Initiate the check of a block's resolutions against the bodies
+    /// they name: the figures its abandonment records restate, and the
+    /// deliveries its finalizations carry against the lapse at the
+    /// block's anchor. Callers skip the dispatch when there is nothing to
+    /// check. The handler reads each named transaction off the store and
+    /// answers with a [`Resolutions`](hyperscale_types::Resolutions), which
+    /// the coordinator folds into the pipeline: exact verifies, wrong or
+    /// lapsed refuses, and unknown leaves the root in flight — the vote
     /// deferred, the block pending.
-    pub fn initiate_abandonment_figures_verification(
+    pub fn initiate_resolutions_verification(
         &mut self,
         block_hash: BlockHash,
         block: &Block,
+        schedule: &TopologySchedule,
     ) -> Vec<Action> {
+        let anchor = block.header().parent_qc().weighted_timestamp();
+        let trie = anchor_trie(schedule, anchor);
         let entries: Vec<UnsettledTx> = block
             .abandonment_records()
             .iter()
             .flat_map(AbandonmentRecord::unsettled)
             .copied()
             .collect();
+        let deliveries = undecided_names(block);
         debug!(
             ?block_hash,
             names = entries.len(),
-            "Initiating abandonment-figure verification"
+            deliveries = deliveries.len(),
+            "Initiating resolutions verification"
         );
-        self.mark_root_in_flight(block_hash, VerificationKind::AbandonmentFigures);
-        vec![Action::VerifyAbandonmentFigures {
+        self.mark_root_in_flight(block_hash, VerificationKind::Resolutions);
+        vec![Action::VerifyResolutions {
             block_hash,
             entries,
+            deliveries,
+            anchor,
+            trie,
         }]
     }
 
@@ -1964,10 +2001,10 @@ impl VerificationPipeline {
 
         if self.needs_root(
             block_hash,
-            VerificationKind::AbandonmentFigures,
-            !block.abandonment_records().is_empty(),
+            VerificationKind::Resolutions,
+            resolutions_to_check(block),
         ) {
-            actions.extend(self.initiate_abandonment_figures_verification(block_hash, block));
+            actions.extend(self.initiate_resolutions_verification(block_hash, block, schedule));
         }
 
         if self.needs_root(block_hash, VerificationKind::BeaconWitnessRoot, true)

@@ -2951,6 +2951,10 @@ impl ExecutionCoordinator {
     fn discard_tick(&mut self, tick_id: TickId) {
         let counts = self.ticks.discard_tick(&tick_id);
         self.ticked.remove(&tick_id);
+        // Its finalization goes with it: a proposer offering one for a
+        // member abandoned here would be refused by every voter, and
+        // would keep offering it.
+        self.finalized.remove_tick(&tick_id);
         tracing::info!(
             tick = %tick_id,
             released = counts.assignments,
@@ -2992,7 +2996,14 @@ impl ExecutionCoordinator {
     fn beyond_every_shard(&self, composing: TickId, tx_hash: TxHash) -> bool {
         match self.ticks.tick_assignment(tx_hash) {
             Some(tick_id) if tick_id == composing => false,
-            Some(_) => self.unresolved.is_unsettled_by_departed(tx_hash),
+            // A delivery's tick is not left to past the close: it awaits
+            // nobody, so nothing could still close its coverage, and the
+            // claim it would write past the close is one the crossing's
+            // issuer may already have proved absent and taken back.
+            Some(_) => {
+                self.unresolved.is_unsettled_by_departed(tx_hash)
+                    || self.unresolved.is_delivery(tx_hash)
+            }
             None => {
                 !self.unresolved.is_certified(tx_hash) || self.no_counterpart_can_settle(tx_hash)
             }
@@ -4230,6 +4241,7 @@ mod tests {
         MAX_VALIDITY_RANGE, NetworkDefinition, QuorumCertificate, Randomness, RecoveryCause,
         SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateRoot,
         StoredReceipt, SubstateKey, TickHalf, UnsettledTx, ValidatorInfo, ValidatorSet,
+        delivery_window_close,
     };
     use hyperscale_vm_types::Seeded;
 
@@ -7970,6 +7982,56 @@ mod tests {
         assert!(
             state_proof_fetches(&state.probe_silent_counterparts(&schedule)).is_empty(),
             "and is not asked again"
+        );
+    }
+
+    /// A delivery is abandoned at its window's close out of any tick
+    /// still holding it: past the close its issuer may prove the claim
+    /// absent and take the crossing back, so the tick that would write
+    /// the claim is discarded, its finalization with it.
+    #[test]
+    fn a_delivery_held_by_a_tick_is_abandoned_at_the_close() {
+        let schedule = make_test_topology();
+        let mut state = make_test_state();
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+        let validity_end = tx.validity_range().end_timestamp_exclusive;
+        let close_ms = delivery_window_close(validity_end).as_millis();
+
+        state.on_block_committed(
+            &schedule,
+            &test_certify(
+                make_live_block(
+                    BlockHeight::new(1),
+                    1_000,
+                    ValidatorId::new(0),
+                    vec![Arc::new(tx)],
+                ),
+                1_000,
+            ),
+        );
+        state.unresolved.mark_delivery(tx_hash, validity_end);
+        state.unresolved.certify(tx_hash);
+        let held_by = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+        assert_eq!(state.ticks.tick_assignment(tx_hash), Some(held_by));
+
+        let outcomes = abandonment_vote(&mut state, &schedule, 2, close_ms - 1);
+        assert!(
+            outcomes.is_empty(),
+            "inside the window the tick is left to it"
+        );
+        assert!(state.ticks.contains_tick(&held_by));
+
+        let outcomes = abandonment_vote(&mut state, &schedule, 3, close_ms);
+        assert!(
+            outcomes
+                .iter()
+                .any(|outcome| outcome.tx_hash() == tx_hash && outcome.decides()),
+            "at the close the delivery is abandoned: {outcomes:?}"
+        );
+        assert!(
+            !state.ticks.contains_tick(&held_by),
+            "and the tick that held it is discarded"
         );
     }
 

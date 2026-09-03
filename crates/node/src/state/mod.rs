@@ -349,7 +349,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ProvisionsRootVerified { .. }
             | ProtocolEvent::ProvisionTxRootsVerified { .. }
             | ProtocolEvent::ReservationsVerified { .. }
-            | ProtocolEvent::AbandonmentFiguresVerified { .. }
+            | ProtocolEvent::ResolutionsVerified { .. }
             | ProtocolEvent::BeaconWitnessRootVerified { .. }
             | ProtocolEvent::StateRootVerified { .. }
             | ProtocolEvent::ProposalBuilt { .. }

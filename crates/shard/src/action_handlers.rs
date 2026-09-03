@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
+use hyperscale_engine::legs::Classified;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
@@ -27,12 +28,12 @@ use hyperscale_types::{
     LocalReceiptRootContext, NetworkDefinition, PreparedCommit, PrincipalAddr as AccountAddr,
     ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
-    ReshapeTrigger, Restatement, RevealChain, Round, ShardId, ShardLoad, SplitChildRoots,
+    ReshapeTrigger, Resolutions, RevealChain, Round, ShardId, ShardLoad, SplitChildRoots,
     StateRoot, StateRootContext, StateRootVerifyError, Stopwatch, StoredReceipt, SubstateKey,
     SweepFrontier, TerminalRoots, Timeout, TimeoutContext, TopologySnapshot, Transaction,
     TransactionRoot, TransactionRootContext, TxHash, UnsettledTx, ValidatorId, Verifiable,
     Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
-    WorkInFlight, absorb_committed_cells, commit_witness_window, derive_leaves,
+    WorkInFlight, absorb_committed_cells, commit_witness_window, derive_leaves, lapse_probe_anchor,
     local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
     protocol_statics, shard_reveal_sign, signed_bytes, vrf_output_from_proof,
     work_over_certificates,
@@ -707,36 +708,62 @@ where
             ctx.notify_protocol(ProtocolEvent::ReservationsVerified { block_hash, result });
         }
 
-        Action::VerifyAbandonmentFigures {
+        Action::VerifyResolutions {
             block_hash,
             entries,
+            deliveries,
+            anchor,
+            trie,
         } => {
-            // A record names transactions committed long before it — a
-            // departure's terminal, a refusal, a deadline probe all come
-            // epochs after the commit — so the store's persist lag never
-            // reaches a name, and a body lifted out of it carries no
-            // derivation of its own: this node derives it, and one it
-            // cannot derive it does not hold.
-            let hashes: Vec<TxHash> = entries.iter().map(|entry| entry.tx_hash).collect();
+            // A resolution names a transaction committed before it — a
+            // record epochs after the commit, a finalization a tick or
+            // more after — so the store's persist lag never reaches a
+            // name, and a body lifted out of it carries no derivation of
+            // its own: this node derives it, and one it cannot derive it
+            // does not hold.
+            let hashes: Vec<TxHash> = entries
+                .iter()
+                .map(|entry| entry.tx_hash)
+                .chain(deliveries.iter().copied())
+                .collect();
             let derivation = ctx.executor.derivation();
-            let held: HashMap<TxHash, UnsettledTx> = ctx
+            let held: HashMap<TxHash, Verified<Transaction>> = ctx
                 .pending_chain
                 .transactions_batch(&hashes)
-                .iter()
+                .into_iter()
                 .filter(|tx| tx.try_derived(derivation.as_ref()).is_ok())
-                .map(|tx| (tx.hash(), UnsettledTx::for_transaction(tx)))
+                .map(|tx| (tx.hash(), tx))
                 .collect();
-            let restatement = Restatement::of(entries, |tx_hash| held.get(&tx_hash).copied());
-            if let Restatement::Wrong(tx_hash) = restatement {
-                tracing::warn!(
+            let verdict = Resolutions::of(entries, |tx_hash| {
+                held.get(&tx_hash)
+                    .map(|tx| UnsettledTx::for_transaction(tx))
+            })
+            .and_deliveries(deliveries, |tx_hash| {
+                // A finalization resolving a name it does not decide is a
+                // leg's or a delivery's; only a delivery here is held to
+                // the lapse, and a body this shard delivers for is one
+                // frozen divided with this shard delivering.
+                held.get(&tx_hash).map(|tx| {
+                    Classified::freeze(tx.legs(), &trie).delivers_at(ctx.shard)
+                        && anchor >= lapse_probe_anchor(tx.validity_range().end_timestamp_exclusive)
+                })
+            });
+            match verdict {
+                Resolutions::Wrong(tx_hash) => tracing::warn!(
                     ?block_hash,
                     ?tx_hash,
-                    "Abandonment-figure verification FAILED: the record misstates a figure"
-                );
+                    "Resolutions verification FAILED: a record misstates a figure"
+                ),
+                Resolutions::Lapsed(tx_hash) => tracing::warn!(
+                    ?block_hash,
+                    ?tx_hash,
+                    "Resolutions verification FAILED: a finalization delivers past the lapse"
+                ),
+                Resolutions::Exact | Resolutions::Unknown(_) => {}
             }
-            ctx.notify_protocol(ProtocolEvent::AbandonmentFiguresVerified {
+            ctx.notify_protocol(ProtocolEvent::ResolutionsVerified {
                 block_hash,
-                restatement,
+                verdict,
             });
         }
 

@@ -79,7 +79,7 @@ where
             | Action::VerifyCertificateRoot { .. }
             | Action::VerifyProvisionTxRoots { .. }
             | Action::VerifyReservations { .. }
-            | Action::VerifyAbandonmentFigures { .. }
+            | Action::VerifyResolutions { .. }
             | Action::VerifyProvisions { .. }
             | Action::ExecuteTransactions { .. }
             | Action::FetchAndBroadcastProvisions { .. }

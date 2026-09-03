@@ -18,7 +18,7 @@ use hyperscale_types::{
     PrincipalAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadySignal,
     ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round, RoutingCommittees,
-    SafeVoteRegisters, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation,
+    SafeVoteRegisters, ShardForkProof, ShardId, ShardLoad, ShardTrie, ShardVoteEquivocation,
     SharedCertificates, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
     SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry,
     SubstateKey, SweepFrontier, TerminalEvidence, TerminalRoots, TickId, Timeout, TopologySnapshot,
@@ -929,12 +929,21 @@ pub enum Action {
     /// at any distance — so the check needs no window of its own. A body
     /// the store never held answers `Unknown`, and the vote defers on it
     /// rather than accepting.
-    /// Returns `ProtocolEvent::AbandonmentFiguresVerified`.
-    VerifyAbandonmentFigures {
-        /// Block whose records are being checked.
+    /// Returns `ProtocolEvent::ResolutionsVerified`.
+    VerifyResolutions {
+        /// Block whose resolutions are being checked.
         block_hash: BlockHash,
-        /// Every name the block's records carry; empty never dispatches.
+        /// Every name the block's records carry.
         entries: Vec<UnsettledTx>,
+        /// Every transaction the block's finalizations resolve without
+        /// deciding — a delivery or a leg — checked against the lapse
+        /// where the body says this shard delivers for it.
+        deliveries: Vec<TxHash>,
+        /// The block's own anchor, which the lapse is read against.
+        anchor: WeightedTimestamp,
+        /// The trie of the anchor's window, which the body is classified
+        /// against.
+        trie: ShardTrie,
     },
 
     /// Build a complete block proposal.
@@ -1728,7 +1737,7 @@ impl Action {
             | Self::VerifyCertificateRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyReservations { .. }
-            | Self::VerifyAbandonmentFigures { .. }
+            | Self::VerifyResolutions { .. }
             | Self::VerifyStateRoot { .. }
             | Self::VerifyBeaconWitnessRoot { .. }
             | Self::BuildProposal { .. }
@@ -1835,7 +1844,7 @@ impl Action {
             | Self::VerifyCertificateRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyReservations { .. }
-            | Self::VerifyAbandonmentFigures { .. }
+            | Self::VerifyResolutions { .. }
             | Self::BuildProposal { .. }
             | Self::ExecuteTransactions { .. }
             | Self::ResolveTicks { .. }
@@ -1921,7 +1930,7 @@ impl Action {
             | Self::VerifyCertificateRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyReservations { .. }
-            | Self::VerifyAbandonmentFigures { .. }
+            | Self::VerifyResolutions { .. }
             | Self::VerifyStateRoot { .. }
             | Self::VerifyBeaconWitnessRoot { .. }
             | Self::BuildProposal { .. }

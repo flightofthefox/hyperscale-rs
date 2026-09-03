@@ -105,27 +105,34 @@ impl UnsettledTx {
     }
 }
 
-/// How a record's restatement of its names' figures stands against the
-/// transactions themselves.
+/// How a block's resolutions stand against the transactions they name:
+/// the figures its records restate, and the deliveries its finalizations
+/// carry.
 ///
-/// The voter's answer to a record. Every figure is read off the
-/// committed body, so a validator whose store holds a transaction
-/// answers for it exactly or wrongly, and one whose store never held it
-/// — having synced past its block — cannot say, which is a third answer
-/// and not a pass.
+/// The voter's answer, read off committed bodies. A validator whose
+/// store holds a transaction answers for it — a figure exactly or
+/// wrongly, a delivery inside its window or past the lapse — and one
+/// whose store never held it, having synced past its block, cannot say,
+/// which is a third answer and not a pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Restatement {
-    /// Every figure of every name is the one its transaction fixes.
+pub enum Resolutions {
+    /// Every figure of every name is the one its transaction fixes, and
+    /// no delivery has lapsed.
     Exact,
     /// A figure of this name differs from the one its transaction fixes:
-    /// the record is refused.
+    /// the block is refused.
     Wrong(TxHash),
+    /// A finalization delivers a crossing of this transaction at an
+    /// anchor at or past its lapse, where its issuer may already have
+    /// proved the claim absent and taken the crossing back: the block is
+    /// refused.
+    Lapsed(TxHash),
     /// This validator does not hold this name's transaction, so it cannot
     /// say: the vote is deferred.
     Unknown(TxHash),
 }
 
-impl Restatement {
+impl Resolutions {
     /// How `entries` stand against the figures `held` reads off each
     /// named transaction, `None` for one it does not hold.
     ///
@@ -143,6 +150,35 @@ impl Restatement {
                 Some(_) => return Self::Wrong(entry.tx_hash),
                 None => {
                     unknown.get_or_insert(entry.tx_hash);
+                }
+            }
+        }
+        unknown.map_or(Self::Exact, Self::Unknown)
+    }
+
+    /// This answer folded with the deliveries the block's finalizations
+    /// carry, `lapsed` saying whether each has lapsed at the block's
+    /// anchor, `None` for one this validator does not hold.
+    ///
+    /// A refusal answers over a deferral: a block carrying a lapsed
+    /// delivery is refused whatever else this validator cannot say.
+    #[must_use]
+    pub fn and_deliveries(
+        self,
+        deliveries: impl IntoIterator<Item = TxHash>,
+        lapsed: impl Fn(TxHash) -> Option<bool>,
+    ) -> Self {
+        let mut unknown = match self {
+            Self::Wrong(_) | Self::Lapsed(_) => return self,
+            Self::Unknown(tx_hash) => Some(tx_hash),
+            Self::Exact => None,
+        };
+        for tx_hash in deliveries {
+            match lapsed(tx_hash) {
+                Some(true) => return Self::Lapsed(tx_hash),
+                Some(false) => {}
+                None => {
+                    unknown.get_or_insert(tx_hash);
                 }
             }
         }
@@ -426,10 +462,10 @@ mod tests {
     #[test]
     fn a_holder_checks_every_figure() {
         let held = |hash: TxHash| (hash == tx(1).tx_hash).then(|| tx(1));
-        let restated = |entry: UnsettledTx| Restatement::of([entry], held);
+        let restated = |entry: UnsettledTx| Resolutions::of([entry], held);
 
-        assert_eq!(restated(tx(1)), Restatement::Exact);
-        let wrong = Restatement::Wrong(tx(1).tx_hash);
+        assert_eq!(restated(tx(1)), Resolutions::Exact);
+        let wrong = Resolutions::Wrong(tx(1).tx_hash);
         assert_eq!(
             restated(UnsettledTx {
                 charge: AbortCharge {
@@ -473,15 +509,15 @@ mod tests {
     fn a_non_holder_cannot_say_unless_a_figure_is_wrong() {
         let held = |hash: TxHash| (hash == tx(1).tx_hash).then(|| tx(1));
         assert_eq!(
-            Restatement::of([tx(2)], held),
-            Restatement::Unknown(tx(2).tx_hash)
+            Resolutions::of([tx(2)], held),
+            Resolutions::Unknown(tx(2).tx_hash)
         );
         assert_eq!(
-            Restatement::of([tx(2), tx(1)], held),
-            Restatement::Unknown(tx(2).tx_hash)
+            Resolutions::of([tx(2), tx(1)], held),
+            Resolutions::Unknown(tx(2).tx_hash)
         );
         assert_eq!(
-            Restatement::of(
+            Resolutions::of(
                 [
                     tx(2),
                     UnsettledTx {
@@ -491,9 +527,38 @@ mod tests {
                 ],
                 held
             ),
-            Restatement::Wrong(tx(1).tx_hash)
+            Resolutions::Wrong(tx(1).tx_hash)
         );
-        assert_eq!(Restatement::of([], held), Restatement::Exact);
+        assert_eq!(Resolutions::of([], held), Resolutions::Exact);
+
+        // Deliveries fold after the figures: a lapsed one refuses over an
+        // unknown name, an unknown delivery defers, and a wrong figure
+        // stands whatever the deliveries say.
+        let lapsed = |tx_hash: TxHash| {
+            if tx_hash == tx(3).tx_hash {
+                Some(true)
+            } else if tx_hash == tx(1).tx_hash {
+                Some(false)
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            Resolutions::Exact.and_deliveries([tx(1).tx_hash], lapsed),
+            Resolutions::Exact
+        );
+        assert_eq!(
+            Resolutions::Exact.and_deliveries([tx(2).tx_hash], lapsed),
+            Resolutions::Unknown(tx(2).tx_hash)
+        );
+        assert_eq!(
+            Resolutions::Unknown(tx(2).tx_hash).and_deliveries([tx(3).tx_hash], lapsed),
+            Resolutions::Lapsed(tx(3).tx_hash)
+        );
+        assert_eq!(
+            Resolutions::Wrong(tx(1).tx_hash).and_deliveries([tx(3).tx_hash], lapsed),
+            Resolutions::Wrong(tx(1).tx_hash)
+        );
     }
 
     #[test]

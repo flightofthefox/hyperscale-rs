@@ -19,7 +19,7 @@ use hyperscale_types::{
     PcVote2VerifyError, PcVote3, PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError,
     QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal,
-    Refusal, Restatement, Round, ShardForkProof, ShardId, ShardVoteEquivocation,
+    Refusal, Resolutions, Round, ShardForkProof, ShardId, ShardVoteEquivocation,
     ShardWitnessPayload, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
     SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
     StateAnchor, StateRoot, StateRootVerifyError, StoredReceipt, SubstateKey, TickId, Timeout,
@@ -421,11 +421,11 @@ pub enum ProtocolEvent {
     },
 
     /// Abandonment-figure check completed for a pending block.
-    AbandonmentFiguresVerified {
-        /// Block whose records were checked.
+    ResolutionsVerified {
+        /// Block whose resolutions were checked.
         block_hash: BlockHash,
-        /// How the records' names stand against the committed bodies.
-        restatement: Restatement,
+        /// How the resolutions stand against the committed bodies.
+        verdict: Resolutions,
     },
 
     /// Beacon-witness-root verification completed for a pending block.
