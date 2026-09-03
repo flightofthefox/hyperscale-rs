@@ -80,19 +80,24 @@ pub fn reclaim_probe_anchor(validity_end: WeightedTimestamp) -> WeightedTimestam
     validity_end.plus(MAX_FINALIZATION_DELAY)
 }
 
-/// How long a leg entry outlives its deadline.
+/// How long a leg is still reported after its deadline.
 ///
 /// The room a reclaim of what its deliveries never claimed needs: one
-/// validity range to the lapse, and one more for the reclaim to commit
-/// before the record it takes back is swept. The escrow families' grace,
-/// measured from the deadline rather than the validity end.
+/// validity range to the lapse, and one more for the reclaim to commit.
+/// Past it no evidence that could decide the leg survives — the claim
+/// cell it would be proved against is swept — so the mempool stops
+/// answering for one nothing has decided.
+///
+/// It does not bound the ledger's own leg entry, which stands until the
+/// record it would take back is consumed.
 pub const LEG_ENTRY_HORIZON: Duration = Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() * 2);
 
-/// The moment a leg entry, and everything a shard holds for its
-/// reclaim, goes: [`LEG_ENTRY_HORIZON`] past the transaction's deadline.
+/// The moment a leg stops being answered for: [`LEG_ENTRY_HORIZON`]
+/// past the transaction's deadline.
 ///
-/// That is where the record cell the reclaim would take back is swept,
-/// and past it nothing can still decide the transaction on this shard.
+/// That is where the claim cell a lapse would be proved against is
+/// swept, so past it no evidence that could decide the leg can still be
+/// taken.
 #[must_use]
 pub fn leg_entry_horizon(deadline: WeightedTimestamp) -> WeightedTimestamp {
     deadline.plus(LEG_ENTRY_HORIZON)
@@ -100,7 +105,7 @@ pub fn leg_entry_horizon(deadline: WeightedTimestamp) -> WeightedTimestamp {
 
 const _: () = assert!(
     (MAX_FINALIZATION_DELAY.as_secs() + LEG_ENTRY_HORIZON.as_secs()) * 1_000 == ESCROW_GRACE_MS,
-    "a leg entry dies where the record it would reclaim is swept",
+    "a leg stops being answered for where the evidence that could decide it is swept",
 );
 
 /// The last instant a verdict may be composed against `anchor`: one

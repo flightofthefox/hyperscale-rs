@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arc_swap::ArcSwap;
 use hyperscale_hbor::from_slice as hbor_from_slice;
 use hyperscale_vm_effects::{
-    ChainRecords, ClaimCell, CommittedTxCell, CrossingCell, Hasher, InstanceMeta, InstanceRegistry,
-    Issuance, MetadataCache, NullifierCell, PackageHash, PackageMetadata, ResourceMeta, Value,
-    committed_tx_key, escrow_claim_key, escrow_record_key, nullifier_key, package_hash,
+    ChainRecords, ClaimCell, CommittedTxCell, Hasher, InstanceMeta, InstanceRegistry, Issuance,
+    MetadataCache, NullifierCell, PackageHash, PackageMetadata, ResourceMeta, Value,
+    committed_tx_key, escrow_claim_key, nullifier_key, package_hash,
 };
 use hyperscale_vm_types::{
     Address, CallTarget, ComponentAddr, LocalKey, ResourceAddr, SubstateKey, SweepBucket,
@@ -67,11 +67,17 @@ const WASM_PREAMBLE: &[u8] = b"\0asm";
 /// cannot claim a life its declaration does not name — the key a false
 /// expiry produces is not the key the declaration covers.
 ///
-/// Four families: the nullifier, the committed-transaction cell, and the
-/// escrow record and claim. Each arm is its own derivation, so arms
-/// cannot overlap and the order they are tried in does not decide the
-/// answer — a value that decodes under two layouts re-derives at most
-/// one family's key.
+/// Three families: the nullifier, the committed-transaction cell, and
+/// the escrow claim. Each arm is its own derivation, so arms cannot
+/// overlap and the order they are tried in does not decide the answer —
+/// a value that decodes under two layouts re-derives at most one
+/// family's key.
+///
+/// The escrow record is not among them, and that is what makes it a
+/// balance rather than a witness: it is retired by whoever consumes it,
+/// so its key names the edge alone and carries no bucket for a sweep to
+/// walk. The claim beside it is a witness of a delivery admitted inside
+/// a window on its own chain's clock, and keeps its bucket.
 ///
 /// Three tests per arm, cheapest first, because this runs over every
 /// cell of every commit. The decode rejects on width alone; the bucket
@@ -81,7 +87,6 @@ const WASM_PREAMBLE: &[u8] = b"\0asm";
 pub fn sweepable_cell(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u64> {
     nullifier_expiry(owner, local, value)
         .or_else(|| committed_tx_expiry(owner, local, value))
-        .or_else(|| escrow_record_expiry(owner, local, value))
         .or_else(|| escrow_claim_expiry(owner, local, value))
 }
 
@@ -105,25 +110,6 @@ fn committed_tx_expiry(owner: Address, local: [u8; 16], value: &[u8]) -> Option<
         return None;
     }
     let key = committed_tx_key(&ProtocolHasher, owner, cell.tx, cell.expiry_ms);
-    (key.local.0 == local).then_some(cell.expiry_ms)
-}
-
-/// The expiry an escrow record cell carries, or `None` for every other
-/// cell. The value names the edge and the intent's expiry, and the key
-/// re-derives from them under the record's own slot.
-fn escrow_record_expiry(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u64> {
-    let cell: CrossingCell = hbor_from_slice(value).ok()?;
-    if SweepBucket::claimed_by(LocalKey(local)) != SweepBucket::of(cell.expiry_ms) {
-        return None;
-    }
-    let key = escrow_record_key(
-        &ProtocolHasher,
-        owner,
-        cell.intent,
-        cell.local,
-        cell.output,
-        cell.expiry_ms,
-    );
     (key.local.0 == local).then_some(cell.expiry_ms)
 }
 
@@ -935,13 +921,13 @@ mod tests {
         );
     }
 
-    /// An escrow record and the claim on it are judged sweepable off
-    /// their own leaves, at the producing intent's validity end plus the
-    /// escrow grace — the record's own expiry, which the reclaim of a
-    /// lapsed crossing needs room under — and at no other local, under
-    /// no other owner, and never under each other's slot.
+    /// An escrow claim is judged sweepable off its own leaf, at the
+    /// producing intent's validity end plus the escrow grace, and at no
+    /// other local and under no other owner. The record beside it is
+    /// swept by nothing: it is a balance, retired by whoever consumes
+    /// it, so a sweep that could reach it would burn value on a clock.
     #[test]
-    fn an_escrow_record_and_its_claim_are_judged_off_their_leaves() {
+    fn a_claim_is_judged_off_its_leaf_and_a_record_is_swept_by_nothing() {
         use hyperscale_vm_effects::{CrossingSite, IntentHeader, escrow_expiry_ms};
         use hyperscale_vm_types::{
             AddressClass, ESCROW_GRACE_MS, NetworkId, SubintentHash, TxHash,
@@ -964,26 +950,28 @@ mod tests {
         let record = record_site.crossing(ResourceAddr::new([0xE0; 31]), 500, None);
         let claim = claim_site.claimed_by(TxHash(Hash32([0xC0; 32])));
 
-        for (site, owner, value) in [
-            (record_site, producer, record.to_bytes()),
-            (claim_site, taker, claim.to_bytes()),
-        ] {
-            let local = site.key().local.0;
-            assert_eq!(sweepable_cell(owner, local, &value), Some(expiry_ms));
-            let mut elsewhere = local;
-            elsewhere[15] ^= 1;
-            assert_eq!(sweepable_cell(owner, elsewhere, &value), None);
-            let other_owner = Address::new([0x5B; 31], AddressClass::Component);
-            assert_eq!(sweepable_cell(other_owner, local, &value), None);
-        }
-        // A record's bytes at a claim's local, or a claim's at a record's:
-        // the slots differ, so neither family answers for the other.
+        let claim_value = claim.to_bytes();
+        let local = claim_site.key().local.0;
+        assert_eq!(sweepable_cell(taker, local, &claim_value), Some(expiry_ms));
+        let mut elsewhere = local;
+        elsewhere[15] ^= 1;
+        assert_eq!(sweepable_cell(taker, elsewhere, &claim_value), None);
+        let other_owner = Address::new([0x5B; 31], AddressClass::Component);
+        assert_eq!(sweepable_cell(other_owner, local, &claim_value), None);
+
+        // The record answers for nothing, at its own leaf or anywhere
+        // else: no arm claims it, so no sweep can name it.
+        let record_value = record.to_bytes();
         assert_eq!(
-            sweepable_cell(producer, claim_site.key().local.0, &record.to_bytes()),
+            sweepable_cell(producer, record_site.key().local.0, &record_value),
             None
         );
         assert_eq!(
-            sweepable_cell(taker, record_site.key().local.0, &claim.to_bytes()),
+            sweepable_cell(producer, claim_site.key().local.0, &record_value),
+            None
+        );
+        assert_eq!(
+            sweepable_cell(taker, record_site.key().local.0, &claim_value),
             None
         );
     }

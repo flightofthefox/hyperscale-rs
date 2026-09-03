@@ -1200,8 +1200,20 @@ impl UnresolvedTxs {
         let kept: BTreeMap<TxHash, Owed> = std::mem::take(&mut self.owed)
             .into_iter()
             .filter(|(tx_hash, owed)| {
+                // A leg entry stands until the record it would take
+                // back is consumed, and a record is retired on a
+                // counterpart's evidence rather than on a clock — so
+                // nothing here reads a clock for one. What ends it is
+                // the finalization that decides it: the reclaim's, the
+                // retirement's, or a failed leg's own.
+                //
+                // Except one rebuilt from a record, which holds no body
+                // and so can compose neither member. It stands for the
+                // abandonable set alone, and once nothing can still name
+                // it there is nothing left for it to stand for.
                 if owed.kind.is_leg() {
-                    return leg_entry_horizon(owed.deadline) > now;
+                    return self.kept.contains_key(tx_hash)
+                        || leg_entry_horizon(owed.deadline) > now;
                 }
                 if let Some(shard) = owed.unsettled_by {
                     if self.departed.get(&shard).is_some_and(|departure| {
@@ -2427,14 +2439,15 @@ mod tests {
         assert_eq!(ledger.len(), 0, "gone at its horizon");
     }
 
-    /// A leg entry lives on the transaction's own clock, to the moment
-    /// the record cell it would reclaim sweeps — whether or not a record
-    /// has named it, and whatever its counterparts are doing.
+    /// A leg entry outlives every clock: the record it would take back
+    /// is retired on a counterpart's evidence, so a counterpart silent
+    /// for a day leaves both standing for a day. Only the finalization
+    /// that decides the transaction ends it.
     #[test]
-    fn a_leg_entry_lives_to_the_record_cells_own_horizon() {
-        let horizon = ms(60_000)
+    fn a_leg_entry_outlives_every_clock() {
+        let far_past_any_horizon = ms(60_000)
             .plus(MAX_FINALIZATION_DELAY)
-            .plus(MAX_VALIDITY_RANGE * 2);
+            .plus(MAX_VALIDITY_RANGE * 20);
         for covered in [false, true] {
             let mut ledger = UnresolvedTxs::default();
             let tx = tx(5, 60_000);
@@ -2448,21 +2461,21 @@ mod tests {
                     [names(&tx)],
                 )]);
             }
-            assert!(
-                ledger
-                    .prune(horizon.minus(Duration::from_millis(1)))
-                    .is_empty()
-            );
+            assert!(ledger.prune(far_past_any_horizon).is_empty());
             assert_eq!(
                 ledger.len(),
                 1,
-                "covered={covered}: readable until the sweep"
+                "covered={covered}: it stands, and leaks no reservation standing"
             );
-            assert!(
-                ledger.prune(horizon).is_empty(),
-                "covered={covered}: a leg dropped at its horizon leaks no reservation"
+
+            let reclaim =
+                make_finalization(BlockHeight::new(9), tx.hash(), TransactionDecision::Aborted);
+            ledger.release_resolved(&[Arc::new(Verifiable::from(reclaim))]);
+            assert_eq!(
+                ledger.len(),
+                0,
+                "covered={covered}: the finalization that decides it is what ends it"
             );
-            assert_eq!(ledger.len(), 0, "covered={covered}: gone with the cell");
         }
     }
 }
