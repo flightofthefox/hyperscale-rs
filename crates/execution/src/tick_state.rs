@@ -168,6 +168,22 @@ impl Membership {
     pub const fn reach(&self) -> &BTreeSet<ShardId> {
         &self.reach
     }
+
+    /// Whether a counterpart's verdict can still discard this member's
+    /// effects — off what it awaits, which is what puts it in the legs
+    /// half of a tick rather than the determined.
+    #[must_use]
+    pub fn abortable(&self, local: ShardId) -> bool {
+        self.awaited.iter().any(|&shard| shard != local)
+    }
+
+    /// Whether the transaction touches a shard besides this one — off
+    /// what it reaches, never off what this member awaits. A leg of a
+    /// divided transaction reaches beyond and awaits only itself.
+    #[must_use]
+    pub fn reaches_beyond(&self, local: ShardId) -> bool {
+        self.reach.iter().any(|&shard| shard != local)
+    }
 }
 
 /// How a member joins its tick.
@@ -452,7 +468,7 @@ impl TickState {
         let local = self.tick_id.shard_id();
         self.membership
             .get(&tx_hash)
-            .is_some_and(|membership| membership.awaited().iter().any(|&s| s != local))
+            .is_some_and(|membership| membership.abortable(local))
     }
 
     /// Whether `outcome`, attested by `shard`, covers its member here: the
@@ -788,7 +804,7 @@ impl TickState {
                 .escrowing(escrowed)
                 .crossing_to(targets)
                 .deciding(decides)
-                .reaching_beyond(membership.is_some_and(|m| m.reach().iter().any(|&s| s != local)))
+                .reaching_beyond(membership.is_some_and(|m| m.reaches_beyond(local)))
             })
             .collect();
 

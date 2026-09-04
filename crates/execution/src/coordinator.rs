@@ -96,6 +96,15 @@ struct CommittedMember {
     classified: Classified,
 }
 
+impl CommittedMember {
+    /// Whether the transaction touches a shard besides this one — asked
+    /// here, before a member of it exists, to pick the ones that need a
+    /// cross-shard registration at all.
+    fn reaches_beyond(&self, local: ShardId) -> bool {
+        self.participating.iter().any(|&shard| shard != local)
+    }
+}
+
 /// The committed block a tick is created against: its identity, and the
 /// environment anchors the transactions it commits execute under.
 #[derive(Clone, Copy, Debug)]
@@ -930,7 +939,7 @@ impl ExecutionCoordinator {
             .collect();
         let reaches_beyond: Vec<CommittedMember> = members
             .iter()
-            .filter(|member| member.participating.iter().any(|&s| s != local_shard))
+            .filter(|member| member.reaches_beyond(local_shard))
             .cloned()
             .collect();
         let engagement_waits = if reaches_beyond.is_empty() {
