@@ -686,6 +686,15 @@ pub struct VenueReport {
     /// The median swap's time from the queue opening to its own
     /// settlement.
     pub latency_p50: Duration,
+    /// Blocks the venue's own shard committed across the same span.
+    ///
+    /// The resolution the clock readings do not have. A harness samples
+    /// its predicate once a second, so a queue that drains in six or
+    /// eight of them is measured in a handful of steps and a bar loose
+    /// enough to survive the two epoch clocks is loose enough to admit
+    /// the regression it exists to catch. The venue's chain commits many
+    /// times a second and its height is exact.
+    pub blocks: u64,
 }
 
 /// Stand a venue up and drive every swapper at it at once.
@@ -730,6 +739,10 @@ pub fn hot_venue_clears_swaps_on<C: Cluster>(
     // Every swapper at once: the venue's cells are what they contend
     // for, so what the run measures is how fast that queue drains.
     let start = c.now();
+    let opened = c
+        .committed_height(venue_shard)
+        .expect("the venue's shard commits")
+        .inner();
     let mut submissions: Vec<TxHash> = Vec::with_capacity(swappers.len());
     for (key, account) in &swappers {
         let tx = build_swap_tx(
@@ -744,7 +757,7 @@ pub fn hot_venue_clears_swaps_on<C: Cluster>(
         submissions.push(charges.submit(c, tx));
     }
 
-    let report = settle_swaps(c, &submissions, start, budget);
+    let report = settle_swaps(c, &submissions, (start, opened), venue_shard, budget);
     assert_pair_conserved(c, &worlds, &charges, budget, "a hot venue's queue");
     report
 }
@@ -754,7 +767,8 @@ pub fn hot_venue_clears_swaps_on<C: Cluster>(
 fn settle_swaps<C: Cluster>(
     c: &mut C,
     submissions: &[TxHash],
-    start: Duration,
+    (start, opened): (Duration, u64),
+    venue_shard: ShardId,
     budget: Budget,
 ) -> VenueReport {
     let settled = RefCell::new(BTreeMap::<TxHash, Duration>::new());
@@ -789,9 +803,14 @@ fn settle_swaps<C: Cluster>(
         .collect();
     latencies.sort_unstable();
     let last = settled.values().max().copied().unwrap_or(start);
+    let closed = c
+        .committed_height(venue_shard)
+        .expect("the venue's shard commits")
+        .inner();
     VenueReport {
         submitted: submissions.len(),
         elapsed: last.saturating_sub(start),
         latency_p50: latencies[latencies.len() / 2],
+        blocks: closed.saturating_sub(opened),
     }
 }

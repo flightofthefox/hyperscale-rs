@@ -83,7 +83,6 @@ use hyperscale_types::{
     ShardId, Timeout,
 };
 use support::SimCluster;
-use support::sim_cluster::SLICE;
 
 /// Baseline single-shard config: resharding disarmed, four-validator committee.
 const fn liveness_config() -> ScenarioConfig {
@@ -381,6 +380,12 @@ fn wide_venue_cluster() -> SimCluster {
     )
 }
 
+/// Blocks the fanned-in queue may take beyond the single-caller one.
+///
+/// Two above the worst reading across the two epoch clocks, and well
+/// under the third of a 27-block queue a fan-in cost would show as.
+const FAN_IN_MARGIN: u64 = 3;
+
 /// The fan-in bar: a venue priced from three caller shards clears its
 /// queue no slower than one priced from a single caller shard. A venue's
 /// cost is the hold on its own cells, not a round trip per caller, and
@@ -396,20 +401,21 @@ fn a_hot_venue_clears_swaps_no_slower_fanned_in_sim() {
         &wide_swapper_shards(),
         epochs(40),
     );
-    // Both readings sit on the harness's polling grid, so each is its
-    // queue's latency rounded up to a slice. That grants one slice of
-    // resolution; the second is the baseline's own jitter — the
-    // single-caller queue alone reads two slices apart under the two
-    // epoch clocks while the fanned-in queue reads the same on both, so
-    // a bar tighter than that fails on the clock rather than on fan-in.
-    eprintln!(
-        "FANIN single elapsed={:?} p50={:?} | fanned elapsed={:?} p50={:?}",
-        single.elapsed, single.latency_p50, fanned.elapsed, fanned.latency_p50,
-    );
+    // Measured in the venue's own blocks, not in clock readings. The
+    // harness samples once a second and both queues drain in six to eight
+    // of those, so a clock bar loose enough to survive the two epoch
+    // clocks — the single-caller queue alone reads two slices apart
+    // between them — is loose enough to admit the whole regression it
+    // exists to catch. The venue's chain commits many times a second: the
+    // single-caller queue is 27 blocks on either clock, the fanned-in one
+    // 24 and 28, and a fan-in cost of the third the design table claims
+    // would show as nine.
     assert!(
-        fanned.elapsed <= single.elapsed + 2 * SLICE,
+        fanned.blocks <= single.blocks + FAN_IN_MARGIN,
         "fan-in from three caller shards must be no worse than from one: \
-         {:?} against {:?}",
+         {} blocks against {}, and {:?} against {:?}",
+        fanned.blocks,
+        single.blocks,
         fanned.elapsed,
         single.elapsed,
     );
