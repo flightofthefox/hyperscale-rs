@@ -696,9 +696,11 @@ fn train_world<C: Cluster>(
     )
 }
 
-/// Send `legs` into `terminating` one every few blocks until its reshape
-/// has drained and several more have gone after it, recording the phase
-/// each went in. `pending` reads whether the reshape is admitted and
+/// Send `legs` into `terminating` every few blocks until its reshape has
+/// drained and several more have gone after it, recording the phase each
+/// went in — and sooner than that wherever a phase nothing has covered
+/// opens, so the coverage the train exists for does not turn on the
+/// reshape's timing. `pending` reads whether the reshape is admitted and
 /// pending; `arm` runs once the cadence is measured, before the second
 /// leg — where a scenario casts the vote that starts its reshape.
 ///
@@ -744,8 +746,18 @@ fn drive_train<C: Cluster>(
                 break;
             }
         }
+        // The spacing is what the train rides, and phase coverage is
+        // what it is for: a phase narrower than the spacing would get no
+        // leg at all, and the assertion below would fail on the reshape's
+        // timing rather than on anything the train measures. So the wait
+        // ends early the moment a phase nothing has been sent in opens.
         let from_height = height(c);
-        c.run_until(epochs(2), |c| height(c) >= from_height + spacing);
+        let covered: Vec<Phase> = sent.iter().map(|(_, _, phase)| *phase).collect();
+        let seen_admitted = admitted_once;
+        c.run_until(epochs(2), |c| {
+            height(c) >= from_height + spacing
+                || !covered.contains(&phase_of(pending(c), seen_admitted))
+        });
     }
     for phase in [Phase::Live, Phase::Departing, Phase::Draining] {
         assert!(
@@ -834,6 +846,19 @@ fn assert_train_fates<C: Cluster>(
 /// when it went. The reshape shows as pending from its admission until
 /// the gate drains, so a shard once admitted and no longer pending is
 /// draining.
+/// Which phase a shard is in, from whether its reshape pends now and
+/// whether one ever has.
+///
+/// Read without sending anything, so the train can wait on a phase
+/// opening as well as record the one a leg went in.
+const fn phase_of(pending: bool, admitted_once: bool) -> Phase {
+    match (pending, admitted_once) {
+        (true, _) => Phase::Departing,
+        (false, false) => Phase::Live,
+        (false, true) => Phase::Draining,
+    }
+}
+
 fn send_leg<C: Cluster>(
     c: &mut C,
     (key, from, to): &(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr),
@@ -844,11 +869,7 @@ fn send_leg<C: Cluster>(
 ) -> Phase {
     let pending = pending(c);
     *admitted_once |= pending;
-    let phase = match (pending, *admitted_once) {
-        (true, _) => Phase::Departing,
-        (false, false) => Phase::Live,
-        (false, true) => Phase::Draining,
-    };
+    let phase = phase_of(pending, *admitted_once);
     let tx = build_transfer_tx(key, *from, *to, STRADDLER_PAYMENT, validity_around(c.now()));
     sent.push((charges.submit(c, tx), *to, phase));
     phase
