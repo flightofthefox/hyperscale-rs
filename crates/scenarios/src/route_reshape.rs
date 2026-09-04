@@ -30,17 +30,19 @@ use crate::support::query::{
     anchored_genesis_height, held, held_at, merge_keeper_count, split_admitted,
 };
 use crate::support::tx::{
-    MERGE_STRADDLER_LEFT, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, build_route_tx, build_swap_tx,
-    build_transfer_tx, fixture_flash_bytes, merge_train_setup, quarter_ballast_over,
+    MERGE_STRADDLER_LEFT, MERGE_STRADDLER_SURVIVOR, STRADDLER_SPLITTER, STRADDLER_SURVIVOR,
+    build_route_tx, build_swap_tx, build_transfer_tx, fixture_flash_bytes,
+    merge_survivor_ballast_accounts, merge_train_setup, quarter_ballast_over,
     split_ballast_accounts_over, split_train_setup, validity_around,
 };
 use crate::support::wait::{
-    await_anchor_seeded, await_serves, await_split_admitted, await_tx_terminal,
+    await_anchor_seeded, await_merge_keeper_count, await_serves, await_split_admitted,
+    await_tx_terminal,
 };
 use crate::support::{Budget, Cluster, FaultableCluster, epochs};
 use crate::venue::{
     PROVIDER_FUNDING, SWAP_INPUT, SWAPPER_FUNDING, StockedVenue, grind_onto, reserve_cell,
-    stand_up_venue, swappers_on,
+    stand_up_venue, swappers_on, venue_genesis_accounts_on,
 };
 
 /// The most transfers the train carries into the splitter, and what the
@@ -243,6 +245,324 @@ pub fn a_departing_venue_clears_swaps_and_carries_on(c: &mut impl Cluster, budge
         &Charges::default(),
         budget,
         "swaps across the venue's split",
+    );
+}
+
+/// The ballast [`a_leg_issued_on_a_departing_shard_reaches_its_venue`]
+/// arms its trigger over.
+///
+/// The callers' shard carries the lead, so the flash-holding venue shard
+/// stays under the threshold the scenario votes in.
+#[must_use]
+pub fn departing_caller_ballast() -> Vec<(PrincipalAddr, u128)> {
+    split_ballast_accounts_over(fixture_flash_bytes())
+}
+
+/// A venue that stays, callers on the shard that is leaving, and the
+/// worlds a swap between them can reach.
+struct DepartingCallers {
+    venue: StockedVenue,
+    swappers: Vec<(Ed25519PrivateKey, PrincipalAddr)>,
+    reserve: SubstateKey,
+    stocked: u128,
+    xrd: World,
+    units: World,
+}
+
+/// Stand the venue up on the survivor, the callers on the splitter, and
+/// vote the splitter down so the callers' shard alone is leaving.
+///
+/// # Panics
+///
+/// Panics if either shard is unserved, if the venue misses its budget
+/// standing up or is holding nothing, or if the split is not admitted on
+/// the callers' shard or is admitted on the venue's.
+fn departing_callers<C: Cluster>(c: &mut C) -> DepartingCallers {
+    let (venue_shard, caller_shard) = (STRADDLER_SURVIVOR, STRADDLER_SPLITTER);
+    split_lifecycle(c);
+    let set = stock_callers_against(c, venue_shard, caller_shard);
+    // The callers' shard is leaving from here to the cut; the venue's
+    // stays under the threshold with the flash on it.
+    vote_splitter_down_to(c, split_bytes_over(fixture_flash_bytes()));
+    assert!(
+        await_split_admitted(c, caller_shard, epochs(20)),
+        "the callers' shard must admit the split",
+    );
+    assert!(
+        !split_admitted(c, venue_shard),
+        "the venue's shard must not split",
+    );
+    set
+}
+
+/// Stand the venue up on a surviving quarter and the callers on the
+/// merge-left child, then wait for the light pair to pair its keepers so
+/// the callers' shard is the one leaving.
+///
+/// # Panics
+///
+/// Panics if a quarter is unserved, if the venue misses its budget
+/// standing up or is holding nothing, or if the light pair does not pair
+/// a keeper quorum within budget.
+fn merging_callers<C: Cluster>(c: &mut C) -> DepartingCallers {
+    let (venue_shard, caller_shard) = (MERGE_STRADDLER_SURVIVOR, MERGE_STRADDLER_LEFT);
+    assert!(
+        (0..4).all(|path| await_serves(c, ShardId::leaf(2, path), epochs(4))),
+        "the grown four-shard topology must seat every quarter",
+    );
+    let set = stock_callers_against(c, venue_shard, caller_shard);
+    // The light merging pair asserts its merge from the genesis byte
+    // skew, so the callers' shard is leaving from the pairing to the cut.
+    let parent = caller_shard.parent().expect("a depth-2 leaf has a parent");
+    assert!(
+        await_merge_keeper_count(c, parent, 3, epochs(24)),
+        "the light merging pair must pair a keeper quorum within budget",
+    );
+    assert!(
+        c.serves_shard(caller_shard),
+        "the callers' shard must still be committing when the swaps go",
+    );
+    set
+}
+
+/// Stand a venue up on `venue_shard` with its callers on `caller_shard`,
+/// and open the worlds a swap between them can reach.
+///
+/// # Panics
+///
+/// Panics if either shard is unserved, or if the venue misses its budget
+/// standing up or is holding nothing to price against.
+fn stock_callers_against<C: Cluster>(
+    c: &mut C,
+    venue_shard: ShardId,
+    caller_shard: ShardId,
+) -> DepartingCallers {
+    assert!(
+        c.serves_shard(venue_shard) && c.serves_shard(caller_shard),
+        "the grow must seat the venue's shard and its callers'",
+    );
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(c, venue_shard, &mut taken);
+    let swappers = swappers_on(&[caller_shard], &mut taken);
+    let reserve = reserve_cell(&venue.meta, *XRD);
+    let stocked = held_at(c, reserve);
+    assert!(
+        stocked > 0,
+        "the venue has to be holding something to price against"
+    );
+    let holders: Vec<_> = swappers
+        .iter()
+        .map(|(_, account)| account.address())
+        .collect();
+    let xrd = World::open(c, *XRD, holders.iter().copied(), [reserve]);
+    let units = World::open(
+        c,
+        venue.unit,
+        holders,
+        [reserve_cell(&venue.meta, venue.unit)],
+    );
+    DepartingCallers {
+        venue,
+        swappers,
+        reserve,
+        stocked,
+        xrd,
+        units,
+    }
+}
+
+/// A caller whose own shard is leaving still reaches a venue that stays,
+/// and its successor holds what the swap returned.
+///
+/// The mirror of [`a_departing_venue_clears_swaps_and_carries_on`]: there
+/// the core's shard leaves, here the issuer's. With the reshape pending
+/// the callers' shard is departing, and a swap issued there divides as it
+/// would anywhere — the caller's leg pays, its crossing reaches the
+/// venue, and the venue claims the input and returns the units. Then the
+/// cut, which `cut` waits for: the callers' cells land on the successor,
+/// the units read there at exactly what the swaps returned, and a swap
+/// issued from the successor settles like any other.
+///
+/// # Panics
+///
+/// Panics if any swap fails to accept, if the venue does not claim every
+/// input, if a caller's output does not carry across the cut, or if
+/// either side of the pair is not conserved.
+fn swaps_across_the_callers_cut<C: Cluster>(
+    c: &mut C,
+    set: DepartingCallers,
+    cut: impl FnOnce(&mut C),
+    budget: Budget,
+) {
+    let DepartingCallers {
+        venue,
+        swappers,
+        reserve,
+        stocked,
+        xrd,
+        units,
+    } = set;
+    let mut charges = Charges::default();
+
+    let (leaving, later) = swappers.split_at(swappers.len() - 1);
+    let mut submitted: Vec<TxHash> = Vec::new();
+    for (key, caller) in leaving {
+        let swap = build_swap_tx(
+            key,
+            *caller,
+            &venue.meta,
+            *XRD,
+            SWAP_INPUT,
+            0,
+            validity_around(c.now()),
+        );
+        submitted.push(charges.submit(c, swap));
+    }
+    for hash in &submitted {
+        let status = await_tx_terminal(c, *hash, budget);
+        assert!(
+            matches!(
+                status,
+                Some(TransactionStatus::Completed(TransactionDecision::Accept))
+            ),
+            "a swap issued on a departing shard must still settle; status = {status:?}",
+        );
+    }
+    let claimed = stocked + SWAP_INPUT * u128::try_from(leaving.len()).expect("a few swaps");
+    assert!(
+        c.run_until(budget, |c| held_at(c, reserve) == claimed),
+        "the staying venue must claim every input a departing caller sent: reserve {} against \
+         {claimed}",
+        held_at(c, reserve),
+    );
+    // What the issuing side is owed: the venue's return crosses back into
+    // the shard that is leaving, and every caller banks it before the cut.
+    let callers: Vec<PrincipalAddr> = leaving.iter().map(|(_, caller)| *caller).collect();
+    assert!(
+        c.run_until(budget, |c| callers.iter().all(|caller| held(
+            c,
+            caller.address(),
+            venue.unit
+        ) > 0)),
+        "every caller on the departing shard must bank its output before the cut; holdings = {:?}",
+        callers
+            .iter()
+            .map(|caller| held(c, caller.address(), venue.unit))
+            .collect::<Vec<_>>(),
+    );
+    let banked: Vec<u128> = callers
+        .iter()
+        .map(|caller| held(c, caller.address(), venue.unit))
+        .collect();
+
+    cut(c);
+    // The successor answers for the prefix once it has adopted it, which
+    // is a moment after it serves — so the read is awaited and the
+    // assertion is on the figure, not on when it arrives.
+    let carried = |c: &C| {
+        callers
+            .iter()
+            .map(|caller| held(c, caller.address(), venue.unit))
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        c.run_until(budget, |c| carried(c) == banked),
+        "a departing caller's output must carry across its own shard's cut untouched: {:?} \
+         against {banked:?}",
+        carried(c),
+    );
+
+    swap_against_the_child(c, &venue, &later[0], &mut charges, claimed, budget);
+
+    xrd.assert_settles_within(c, &charges, budget, "swaps across the callers' cut");
+    units.assert_settles_within(
+        c,
+        &Charges::default(),
+        budget,
+        "swaps across the callers' cut",
+    );
+}
+
+/// A swap issued on a splitting shard reaches its venue, and the child
+/// that takes the caller's prefix holds what came back.
+///
+/// # Panics
+///
+/// Panics as [`departing_callers`] and [`swaps_across_the_callers_cut`]
+/// do.
+pub fn a_leg_issued_on_a_departing_shard_reaches_its_venue(c: &mut impl Cluster, budget: Budget) {
+    let set = departing_callers(c);
+    swaps_across_the_callers_cut(c, set, |c| await_cut(c, STRADDLER_SPLITTER), budget);
+}
+
+/// A swap issued on a merging shard reaches its venue, and the parent the
+/// pair collapses into holds what came back.
+///
+/// [`a_leg_issued_on_a_departing_shard_reaches_its_venue`] across the
+/// other reshape: the callers sit on the merge-left child, which the
+/// grown topology's byte skew pairs with its sibling from the grow alone,
+/// and the venue on a surviving quarter. Requires the
+/// [`merging_caller_genesis_accounts`] funding on a config grown to four
+/// shards.
+///
+/// # Panics
+///
+/// Panics as [`merging_callers`] and [`swaps_across_the_callers_cut`] do,
+/// and if the merged parent is not served within budget.
+pub fn a_leg_issued_on_a_merging_shard_reaches_its_venue(c: &mut impl Cluster, budget: Budget) {
+    let parent = MERGE_STRADDLER_LEFT
+        .parent()
+        .expect("a depth-2 leaf has a parent");
+    let set = merging_callers(c);
+    swaps_across_the_callers_cut(
+        c,
+        set,
+        |c| {
+            assert!(
+                await_serves(c, parent, epochs(28)),
+                "the merged parent must be served within budget",
+            );
+        },
+        budget,
+    );
+}
+
+/// Genesis funding for [`a_leg_issued_on_a_merging_shard_reaches_its_venue`].
+///
+/// The merge topology's byte skew, the venue's provider on a surviving
+/// quarter, and the callers on the merge-left child — so the pair that
+/// merges is the callers', and the venue's shard never reshapes.
+#[must_use]
+pub fn merging_caller_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let mut accounts = merge_survivor_ballast_accounts();
+    accounts.extend(venue_genesis_accounts_on(
+        MERGE_STRADDLER_SURVIVOR,
+        &[MERGE_STRADDLER_LEFT],
+    ));
+    accounts
+}
+
+/// Wait for `splitter` to cut: both children served and the beacon
+/// carrying their seeded genesis, so the prefixes it held read on the
+/// children.
+///
+/// # Panics
+///
+/// Panics if a child is unserved within budget or the anchor is never
+/// composed.
+fn await_cut<C: Cluster>(c: &mut C, splitter: ShardId) {
+    let (left, right) = splitter.children();
+    assert!(
+        await_serves(c, left, epochs(28)) && await_serves(c, right, epochs(28)),
+        "both splitter children must be served within budget",
+    );
+    assert!(
+        await_anchor_seeded(c, left, epochs(6)),
+        "the beacon must compose the split children's anchor",
+    );
+    assert!(
+        anchored_genesis_height(c, left).is_some(),
+        "the children's seeded genesis pins the split shard's cells under a child",
     );
 }
 

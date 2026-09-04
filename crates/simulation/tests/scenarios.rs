@@ -14,7 +14,7 @@ use hyperscale_node::shard::{HostEvent, ShardScopedInput};
 use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, badge_buyer,
     cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
-    cross_shard_genesis_accounts, genesis_accounts, halt_straddler_setup,
+    cross_shard_genesis_accounts, fixture_flash_bytes, genesis_accounts, halt_straddler_setup,
     insolvent_genesis_accounts, livelock_genesis_accounts, merge_straddler_setup,
     native_pq_genesis_accounts, nullifier_race_genesis_accounts, overdraw_genesis_accounts,
     participant_sweep_genesis_accounts, probe_train_genesis_accounts, remote_delegator,
@@ -27,6 +27,8 @@ use hyperscale_scenarios::{
     a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed,
     a_delivery_cut_off_past_its_window_is_reclaimed, a_departing_venue_clears_swaps_and_carries_on,
     a_failed_attempt_still_attests_work, a_healed_network_does_not_revive_a_closed_delivery,
+    a_leg_issued_on_a_departing_shard_reaches_its_venue,
+    a_leg_issued_on_a_merging_shard_reaches_its_venue,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_published_package_matures_before_it_runs,
@@ -47,8 +49,8 @@ use hyperscale_scenarios::{
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
-    delegation_folds_into_beacon_state, departing_route_genesis_accounts, departing_venue_ballast,
-    departing_venue_split_bytes, deploy_storm_rides_out, epochs,
+    delegation_folds_into_beacon_state, departing_caller_ballast, departing_route_genesis_accounts,
+    departing_venue_ballast, departing_venue_split_bytes, deploy_storm_rides_out, epochs,
     events_land_on_their_emitters_home_shard, failure_charges_its_payer,
     gossip_drop_engages_fetch_fallback, grow_reaches_four_shard_topology,
     grow_reaches_two_shard_topology, halted_shard_recovers_by_committee_redraw,
@@ -57,7 +59,8 @@ use hyperscale_scenarios::{
     inter_shard_partition_strands_ticks_until_it_heals, isolated_validator_still_settles,
     livelock_resolves_promptly, liveness_baseline, merge_boundary_admits_an_uncommitted_precut_tx,
     merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
-    merge_train_genesis_accounts, minority_fragment_rejoins_after_partition, multi_vnode_progress,
+    merge_train_genesis_accounts, merging_caller_genesis_accounts,
+    minority_fragment_rejoins_after_partition, multi_vnode_progress,
     nullifier_race_admits_exactly_one, participant_count_sweep, partition_halts_and_heals,
     partition_heals_at_exact_quorum, pool_capacity_caps_registrations,
     pool_transfer_moves_operatorship, preview_reports_resource_changes,
@@ -1205,6 +1208,24 @@ fn a_departing_venue_clears_swaps_and_carries_on_sim() {
     a_departing_venue_clears_swaps_and_carries_on(&mut cluster, epochs(12));
 }
 
+/// The split-straddler pair with the venue on the surviving side and its
+/// callers on the splitter: the callers' shard is the one that leaves.
+#[test]
+fn a_leg_issued_on_a_departing_shard_reaches_its_venue_sim() {
+    let mut accounts = departing_caller_ballast();
+    accounts.extend(venue_genesis_accounts_on(
+        STRADDLER_SURVIVOR,
+        &[STRADDLER_SPLITTER],
+    ));
+    let mut cluster = SimCluster::with_packages(
+        &departing_venue_config(),
+        11,
+        &accounts,
+        GenesisPackages::with_fixtures(),
+    );
+    a_leg_issued_on_a_departing_shard_reaches_its_venue(&mut cluster, epochs(12));
+}
+
 #[test]
 fn a_route_into_a_departing_venue_releases_the_survivors_hold_sim() {
     let mut cluster = departing_route_cluster();
@@ -1329,6 +1350,27 @@ fn merge_straddler_atomic_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&merge_straddler_config(), 11, &setup.accounts);
     merge_straddler_atomic(&mut cluster);
+}
+
+/// The merge-straddler topology sized around the fixture flash, so the
+/// venue's packages are on it: the callers sit on the merge-left child,
+/// which pairs with its sibling from the grow alone.
+fn merging_caller_config() -> ScenarioConfig {
+    ScenarioConfig {
+        split_bytes: fixture_flash_bytes() + 18_000,
+        ..merge_straddler_config()
+    }
+}
+
+#[test]
+fn a_leg_issued_on_a_merging_shard_reaches_its_venue_sim() {
+    let mut cluster = SimCluster::with_grown_packages(
+        &merging_caller_config(),
+        11,
+        &merging_caller_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    );
+    a_leg_issued_on_a_merging_shard_reaches_its_venue(&mut cluster, epochs(12));
 }
 
 #[test]

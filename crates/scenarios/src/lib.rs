@@ -76,11 +76,14 @@ pub use route::{
 };
 pub use route_reshape::{
     MERGE_TRAIN, SPLIT_TRAIN, a_departing_venue_clears_swaps_and_carries_on,
+    a_leg_issued_on_a_departing_shard_reaches_its_venue,
+    a_leg_issued_on_a_merging_shard_reaches_its_venue,
     a_route_into_a_departing_venue_releases_the_survivors_hold,
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
-    departing_route_genesis_accounts, departing_venue_ballast, departing_venue_split_bytes,
-    merge_train_genesis_accounts, split_train_genesis_accounts,
+    departing_caller_ballast, departing_route_genesis_accounts, departing_venue_ballast,
+    departing_venue_split_bytes, merge_train_genesis_accounts, merging_caller_genesis_accounts,
+    split_train_genesis_accounts,
 };
 pub use straddler::{
     a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed, isolate_ec_intake,

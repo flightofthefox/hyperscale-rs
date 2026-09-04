@@ -487,6 +487,15 @@ pub fn split_straddler_setup() -> SplitStraddlerSetup {
     }
 }
 
+/// [`merge_survivor_ballast`] on its own, for a scenario composing the
+/// merge topology's byte skew with funding of its own.
+#[must_use]
+pub fn merge_survivor_ballast_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let mut accounts = Vec::new();
+    merge_survivor_ballast(&mut accounts);
+    accounts
+}
+
 /// Lift the surviving quarters (`leaf(2, 2)` and `leaf(2, 3)`) above
 /// `merge_bytes`, so neither emits an unpairable merge against the other
 /// and churns the schedule, while the lighter pair stays under it.
