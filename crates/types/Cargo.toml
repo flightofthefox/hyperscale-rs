@@ -33,7 +33,6 @@ tracing.workspace = true
 ed25519-dalek.workspace = true
 k256.workspace = true
 ml-dsa.workspace = true
-indexmap.workspace = true
 zeroize.workspace = true
 
 [features]

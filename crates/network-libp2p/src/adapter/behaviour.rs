@@ -1,5 +1,9 @@
 //! libp2p network behaviour definition.
 
+// The `NetworkBehaviour` derive expands to a poll whose tail is unreachable
+// once every field arm diverges.
+#![allow(unreachable_code)]
+
 use hyperscale_types::ShardId;
 use libp2p::StreamProtocol;
 use libp2p::connection_limits::Behaviour as ConnectionLimitsBehaviour;

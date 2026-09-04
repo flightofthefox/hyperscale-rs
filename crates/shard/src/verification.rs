@@ -1057,16 +1057,11 @@ impl VerificationPipeline {
     pub fn needs_state_root_verification(&self, block: &Block) -> bool {
         let block_hash = block.hash();
 
-        if self.state_roots.contains_key(&block_hash)
-            || self
+        !self.state_roots.contains_key(&block_hash)
+            && !self
                 .deferred_state_root_verifications
                 .values()
                 .any(|v| v.iter().any(|r| r.block_hash == block_hash))
-        {
-            return false;
-        }
-
-        true
     }
 
     /// Push a `PendingStateRootVerification` onto the ready queue and mark

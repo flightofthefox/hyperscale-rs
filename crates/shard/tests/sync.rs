@@ -160,11 +160,10 @@ fn silenced_replica_triggers_sync_and_catches_up_via_apply() {
 #[test]
 fn fresh_sim_has_no_sync_targets_captured() {
     let sim = ShardCoordinatorSim::new(4, 0xCA_FE);
-    for idx in 0..sim.n() {
+    for (idx, targets) in sim.sync_targets.iter().enumerate() {
         assert!(
-            sim.sync_targets[idx].is_empty(),
-            "replica {idx} reported a sync target before any deafening: {:?}",
-            sim.sync_targets[idx],
+            targets.is_empty(),
+            "replica {idx} reported a sync target before any deafening: {targets:?}",
         );
     }
     let _ = BlockHeight::new(0);

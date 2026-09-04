@@ -336,19 +336,16 @@ impl<T: HborDecode> HborDecode for Verifiable<T> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::convert::Infallible;
 
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
 
-    /// Test-only verifier error. Each real verifier defines its own
-    /// per-type error enum; this one is a stub that never produces a
-    /// value (verification on `u32` is infallible in the test fixture).
-    #[derive(Debug, PartialEq, Eq)]
-    pub enum VForTestError {}
-
     impl Verify<()> for u32 {
-        type Error = VForTestError;
+        // Each real verifier defines its own per-type error enum;
+        // verification on `u32` in this fixture cannot fail.
+        type Error = Infallible;
         fn verify(&self, _ctx: ()) -> Result<Verified<Self>, Self::Error> {
             Ok(Verified::new_unchecked(*self))
         }

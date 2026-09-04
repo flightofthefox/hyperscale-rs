@@ -38,9 +38,9 @@ fn silent_leader_triggers_view_change() {
     // in the held buffers and any votes go nowhere useful.
     sim.run_for_at_most(100);
 
-    for idx in 0..sim.n() {
+    for (idx, commits) in sim.commits.iter().enumerate() {
         assert_eq!(
-            sim.commits[idx].len(),
+            commits.len(),
             0,
             "replica {idx} committed despite silent leader",
         );
@@ -58,16 +58,16 @@ fn silent_leader_triggers_view_change() {
 
     // Every replica advances past the silent round-1 slot (round 2's
     // leader is a different proposer, idx 2) and counts the self-timeout.
-    for idx in 0..sim.n() {
+    for (idx, coordinator) in sim.coordinators.iter().enumerate() {
         assert!(
-            sim.coordinators[idx].view().inner() >= 2,
+            coordinator.view().inner() >= 2,
             "replica {idx} view didn't advance past round 1: {}",
-            sim.coordinators[idx].view().inner(),
+            coordinator.view().inner(),
         );
         assert!(
-            sim.coordinators[idx].stats().view_changes >= 1,
+            coordinator.stats().view_changes >= 1,
             "replica {idx} view_changes counter didn't increment: {}",
-            sim.coordinators[idx].stats().view_changes,
+            coordinator.stats().view_changes,
         );
     }
 }
@@ -161,9 +161,9 @@ fn linear_backoff_grows_timeout_per_consecutive_view_change() {
         sim.run_for_at_most(MAX_STEPS);
         // No block certifies (headers held), so every replica advances on
         // each timeout quorum and the height-start round never rebases.
-        for idx in 0..sim.n() {
+        for (idx, coordinator) in sim.coordinators.iter().enumerate() {
             assert_eq!(
-                sim.coordinators[idx].stats().view_changes,
+                coordinator.stats().view_changes,
                 u64::from(k),
                 "replica {idx} view_changes count after iteration {k}",
             );
@@ -247,16 +247,16 @@ fn bracha_amplification_completes_quorum_from_f_plus_one() {
     sim.fire_view_change_timer(ValidatorId::new(1));
     sim.run_for_at_most(MAX_STEPS);
 
-    for idx in 0..sim.n() {
+    for (idx, coordinator) in sim.coordinators.iter().enumerate() {
         assert!(
-            sim.coordinators[idx].view().inner() >= 2,
+            coordinator.view().inner() >= 2,
             "replica {idx} should have advanced via the amplified quorum; view {}",
-            sim.coordinators[idx].view().inner(),
+            coordinator.view().inner(),
         );
         assert!(
-            sim.coordinators[idx].stats().view_changes >= 1,
+            coordinator.stats().view_changes >= 1,
             "replica {idx} view_changes didn't tick: {}",
-            sim.coordinators[idx].stats().view_changes,
+            coordinator.stats().view_changes,
         );
     }
 }
@@ -274,14 +274,14 @@ fn lone_timeout_does_not_advance() {
     sim.fire_view_change_timer(ValidatorId::new(0));
     sim.run_for_at_most(MAX_STEPS);
 
-    for idx in 0..sim.n() {
+    for (idx, coordinator) in sim.coordinators.iter().enumerate() {
         assert_eq!(
-            sim.coordinators[idx].view().inner(),
+            coordinator.view().inner(),
             1,
             "replica {idx} advanced on a single timeout (no quorum)",
         );
         assert_eq!(
-            sim.coordinators[idx].stats().view_changes,
+            coordinator.stats().view_changes,
             0,
             "replica {idx} counted a view change without a 2f+1 quorum",
         );
@@ -312,14 +312,14 @@ fn a_voted_tip_proposal_leaves_the_round_timer_to_the_nominal_timeout() {
     sim.kick_off();
     sim.run_for_at_most(MAX_STEPS);
 
-    for idx in 0..sim.n() {
+    for (idx, coordinator) in sim.coordinators.iter().enumerate() {
         assert_eq!(
-            sim.coordinators[idx].last_voted_round(),
+            coordinator.last_voted_round(),
             Round::new(1),
             "replica {idx} should have voted the round-1 proposal",
         );
         assert!(
-            sim.coordinators[idx].latest_qc().is_none(),
+            coordinator.latest_qc().is_none(),
             "replica {idx} formed a QC despite withheld votes",
         );
     }
@@ -335,11 +335,11 @@ fn a_voted_tip_proposal_leaves_the_round_timer_to_the_nominal_timeout() {
     sim.fire_view_change_timer_all();
     sim.run_for_at_most(MAX_STEPS);
 
-    for idx in 0..sim.n() {
+    for (idx, coordinator) in sim.coordinators.iter().enumerate() {
         assert!(
-            sim.coordinators[idx].view().inner() >= 2,
+            coordinator.view().inner() >= 2,
             "replica {idx} didn't advance past round 1 on the nominal timeout; view {}",
-            sim.coordinators[idx].view().inner(),
+            coordinator.view().inner(),
         );
     }
 }

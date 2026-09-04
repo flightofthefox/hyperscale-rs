@@ -124,8 +124,8 @@ fn ready_signal_below_min_dwell_excluded_from_proposal() {
     // A block with no governance event carries no beacon-witness leaf at
     // all, so any leaf here would be the below-dwell ready signal slipping
     // in.
-    for replica in 0..sim.n() {
-        let leaf_count = sim.commits[replica][0]
+    for (replica, commits) in sim.commits.iter().enumerate() {
+        let leaf_count = commits[0]
             .certified
             .block()
             .header()

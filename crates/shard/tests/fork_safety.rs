@@ -44,8 +44,8 @@ fn committed_block(
 /// `(height, block_a, block_b)` if any, else `None`.
 fn find_fork(sim: &ShardCoordinatorSim) -> Option<(BlockHeight, BlockHash, BlockHash)> {
     let mut by_height: HashMap<BlockHeight, BlockHash> = HashMap::new();
-    for replica in 0..sim.n() {
-        for c in &sim.commits[replica] {
+    for commits in &sim.commits {
+        for c in commits {
             match by_height.get(&c.height) {
                 Some(&existing) if existing != c.block_hash => {
                     return Some((c.height, existing, c.block_hash));

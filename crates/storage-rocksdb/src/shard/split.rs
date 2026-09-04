@@ -823,7 +823,7 @@ mod tests {
                 TxHash::from(Hash::from_bytes(&[seed])),
                 Arc::new(ConsensusReceipt::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
-                    writes: writes.clone(),
+                    writes,
                     beacon_witness_events: Vec::new(),
                     events: Vec::new(),
                 }),

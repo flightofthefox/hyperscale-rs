@@ -34,8 +34,8 @@ fn equivocating_proposer_does_not_split_consensus() {
 
     let reference = &sim.commits[0][0];
     assert_eq!(reference.height, BlockHeight::new(1));
-    for r in 1..sim.n() {
-        let cmp = &sim.commits[r][0];
+    for (r, commits) in sim.commits.iter().enumerate().skip(1) {
+        let cmp = &commits[0];
         assert_eq!(
             cmp.block_hash, reference.block_hash,
             "replica {r} diverged from replica 0 under proposer equivocation",
@@ -76,9 +76,9 @@ fn sub_timeout_slow_proposer_commits_without_view_change() {
         sim.byzantine_fires[1] >= 1,
         "the slow proposer's delay transform never fired",
     );
-    for idx in 0..sim.n() {
+    for (idx, coordinator) in sim.coordinators.iter().enumerate() {
         assert_eq!(
-            sim.coordinators[idx].stats().view_changes,
+            coordinator.stats().view_changes,
             0,
             "replica {idx} view-changed under a sub-timeout slow proposer",
         );
@@ -126,9 +126,9 @@ fn super_timeout_slow_proposer_is_rotated_past() {
 
     // No block the slow proposer authored ever commits: every one of its
     // headers lands after its round has already been abandoned.
-    for idx in 0..sim.n() {
+    for (idx, commits) in sim.commits.iter().enumerate() {
         assert!(
-            sim.commits[idx]
+            commits
                 .iter()
                 .all(|c| c.certified.block().header().proposer() != slow),
             "replica {idx} committed a block the rotated-past proposer authored",
@@ -143,9 +143,9 @@ fn super_timeout_slow_proposer_is_rotated_past() {
         vc0 >= 1,
         "a super-timeout slow proposer must cost view changes"
     );
-    for idx in 1..sim.n() {
+    for (idx, coordinator) in sim.coordinators.iter().enumerate().skip(1) {
         assert_eq!(
-            sim.coordinators[idx].stats().view_changes,
+            coordinator.stats().view_changes,
             vc0,
             "replica {idx} view-change count diverged from replica 0",
         );
@@ -235,9 +235,9 @@ fn stale_parent_proposal_cannot_orphan_certified_block() {
 
     // The stale slot could not certify, so its round timed out: every
     // replica records a view change.
-    for idx in 0..sim.n() {
+    for (idx, coordinator) in sim.coordinators.iter().enumerate() {
         assert!(
-            sim.coordinators[idx].stats().view_changes >= 1,
+            coordinator.stats().view_changes >= 1,
             "replica {idx} never view-changed — the stale proposal was not \
              rotated past",
         );
@@ -263,8 +263,8 @@ fn stale_parent_proposal_cannot_orphan_certified_block() {
 fn assert_no_fork(sim: &ShardCoordinatorSim, target: usize) {
     for h in 0..target {
         let reference = &sim.commits[0][h];
-        for r in 1..sim.n() {
-            let cmp = &sim.commits[r][h];
+        for (r, commits) in sim.commits.iter().enumerate().skip(1) {
+            let cmp = &commits[h];
             assert_eq!(
                 cmp.height, reference.height,
                 "replica {r} committed a different height at commit index {h}",

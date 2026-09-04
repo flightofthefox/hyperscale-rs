@@ -43,8 +43,8 @@ fn four_party_cluster_converges_per_height() {
             reference.height,
             reference.certified.block().header().round().inner(),
         );
-        for r in 1..sim.n() {
-            let cmp = &sim.commits[r][h];
+        for (r, commits) in sim.commits.iter().enumerate().skip(1) {
+            let cmp = &commits[h];
             assert_eq!(
                 cmp.height, reference.height,
                 "replica {r} committed at height {:?} at slot {h}, expected {:?}",

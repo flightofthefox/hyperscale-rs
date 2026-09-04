@@ -18,7 +18,6 @@ hyperscale-vm-stdlib.workspace = true
 
 arc-swap.workspace = true
 blake3.workspace = true
-dashmap.workspace = true
 indexmap.workspace = true
 tracing.workspace = true
 
