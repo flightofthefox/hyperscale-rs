@@ -95,6 +95,13 @@ impl SimulationRunner {
     /// `storage`: a retained store (committed past genesis) resumes in place, a
     /// fresh store snap-syncs against the beacon-attested anchor through the
     /// [`ShardBootstrap`] sequencer, served from the shard's current committee.
+    ///
+    /// The routing question is whether there is a chain to resume, so it reads
+    /// the committed tip. That is not the question the import gate asks —
+    /// `hyperscale_storage::holds_state` reads the trie, and the two answer
+    /// differently for a store whose trie an adoption filled while its
+    /// coordinator sits at genesis. A seat that read the trie would resume a
+    /// chain holding no blocks.
     /// Every member shares the one store and one bootstrap, mirroring the
     /// production supervisor seating a whole committee group at once. A snap-sync
     /// whose attested anchor has gone stale leaves the group unseated; the

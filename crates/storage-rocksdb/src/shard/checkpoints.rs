@@ -20,7 +20,7 @@ use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeK
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
     AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, SubstateStore, Substates, WitnessSeed,
-    entry_from_leaf, followed_block_writes, package_of_cell, sweepable_expiry,
+    entry_from_leaf, followed_block_writes, holds_state, package_of_cell, sweepable_expiry,
 };
 use hyperscale_types::{Block, BlockHeight, ChainOrigin, StateRoot, SubstateKey, SubstateLeaf};
 use hyperscale_vm_types::{Address, CollectionId, SweepBucket};
@@ -223,7 +223,7 @@ impl RocksDbShardStorage {
     /// poison the store for every later import attempt.
     fn check_finalize_preconditions(&self, height: BlockHeight) -> Result<(), String> {
         let (version, root) = self.read_jmt_metadata();
-        if version != 0 || root != StateRoot::ZERO {
+        if holds_state(BlockHeight::new(version), root) {
             return Err("snap-sync import requires an empty store".to_string());
         }
         if let Some(progress) = self.read_import_progress()
@@ -562,7 +562,7 @@ impl BoundaryStore for RocksDbShardStorage {
             .lock()
             .map_err(|_| "commit lock poisoned".to_string())?;
         let (version, root) = self.read_jmt_metadata();
-        if version != 0 || root != StateRoot::ZERO {
+        if holds_state(BlockHeight::new(version), root) {
             return Err("snap-sync staging requires an empty store".to_string());
         }
 
@@ -696,7 +696,7 @@ mod tests {
     use hyperscale_storage::test_helpers::{
         completed_import_progress, import_boundary_state, make_settled_writes,
         test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
-        test_boundary_unpinned_height_not_served,
+        test_boundary_unpinned_height_not_served, test_import_gate_reads_the_trie,
     };
     use hyperscale_storage::{BOUNDARY_RETAIN, SubstateStore};
     use hyperscale_types::AddressClass;
@@ -870,6 +870,16 @@ mod tests {
         let fresh_dir = TempDir::new().unwrap();
         let fresh = open_storage(fresh_dir.path());
         test_boundary_import_roundtrip(&storage, &fresh, |writes| storage.commit(writes).unwrap());
+    }
+
+    #[test]
+    fn the_import_gate_reads_the_trie_not_the_chain() {
+        let replicated_dir = TempDir::new().unwrap();
+        let born_dir = TempDir::new().unwrap();
+        test_import_gate_reads_the_trie(
+            &open_storage(replicated_dir.path()),
+            &open_storage(born_dir.path()),
+        );
     }
 
     /// An import leaf whose top byte places it under one trie half.

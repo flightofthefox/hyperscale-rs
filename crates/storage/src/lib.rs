@@ -41,6 +41,7 @@ use hyperscale_jmt::TreeReader;
 pub use hyperscale_vm_kernel::Substates;
 pub use shard::boundary::{
     AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, WitnessSeed,
+    holds_state,
 };
 pub use shard::chain_reader::{BlockForSync, ShardChainReader};
 pub use shard::chain_writer::{ParentAnchor, ShardChainWriter};

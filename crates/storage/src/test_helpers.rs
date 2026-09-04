@@ -35,10 +35,10 @@ use hyperscale_types::{
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
-    Anchored, BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, JmtSnapshot,
-    LegEntryStore, ParentAnchor, RecoveredState, SafeVoteRegisterStore, ShardChainReader,
-    ShardChainWriter, SubstateStore, Substates, SweepIndex, VersionedStore, WitnessSeed,
-    committed_tx_cell_key, committed_tx_cells, sweep_for_block,
+    Anchored, BOUNDARY_RETAIN, BoundaryStore, GenesisCommit, ImportCursor, ImportProgress,
+    JmtSnapshot, LegEntryStore, ParentAnchor, RecoveredState, SafeVoteRegisterStore,
+    ShardChainReader, ShardChainWriter, SubstateStore, Substates, SweepIndex, VersionedStore,
+    WitnessSeed, committed_tx_cell_key, committed_tx_cells, holds_state, sweep_for_block,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -1129,6 +1129,57 @@ where
     // that swept nothing has not skipped anything.
     let (resumed, _) = sweep_for_block(storage, early_frontier, clock);
     assert_eq!(resumed, vec![cells[0].0, cells[1].0]);
+}
+
+/// Shared emptiness gate: which of a store's two vintages the import
+/// path reads, and which it does not.
+///
+/// `replicated` takes the engine bootstrap a joiner replicates before its
+/// span imports — substates without a trie — and must still import.
+/// `born` takes a genesis build, which fills the trie at `GENESIS` while
+/// leaving the chain with nothing to resume, and must be refused. That
+/// pair is the reason the gate reads [`holds_state`](crate::holds_state)
+/// over the trie rather than a committed height: the second store answers
+/// `GENESIS` to the chain and holds a root all the same, which is the
+/// vintage a reshape seat boots on.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_import_gate_reads_the_trie<S>(replicated: &S, born: &S)
+where
+    S: BoundaryStore + SubstateStore + ShardChainReader + GenesisCommit,
+{
+    let writes = make_settled_writes(3, 3, vec![3, 3, 3]);
+
+    replicated.replicate_genesis_substates(&writes);
+    assert!(
+        !holds_state(replicated.jmt_height(), replicated.state_root()),
+        "replicated substates are not authenticated state"
+    );
+    import_boundary_state(
+        replicated,
+        BlockHeight::new(6),
+        &[SubstateLeaf {
+            key: state_key(3, 3),
+            value: vec![3, 3, 3],
+        }],
+        WitnessSeed::default(),
+    )
+    .expect("a replicated bootstrap still imports");
+
+    let root = born.install_genesis(&writes, &writes);
+    assert_ne!(root, StateRoot::ZERO);
+    assert_eq!(born.jmt_height(), BlockHeight::GENESIS);
+    assert_eq!(born.committed_height(), BlockHeight::GENESIS);
+    assert!(
+        holds_state(born.jmt_height(), born.state_root()),
+        "a root at GENESIS is state an import would overwrite"
+    );
+    assert!(
+        import_boundary_state(born, BlockHeight::new(6), &[], WitnessSeed::default()).is_err(),
+        "the gate must not read the committed height"
+    );
 }
 
 /// Shared serve → import round trip: leaves enumerated and resolved

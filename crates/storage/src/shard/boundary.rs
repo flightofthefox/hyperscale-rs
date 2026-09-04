@@ -102,6 +102,25 @@ pub enum AdoptSource {
     InPlace,
 }
 
+/// Whether a JMT at `height` carrying `root` already holds authenticated
+/// state — anything a snap-sync import would overwrite.
+///
+/// The gate every import call owes the [`BoundaryStore`] contract, stated
+/// once rather than spelled at each of them. Neither term implies the
+/// other: a store past `BlockHeight::GENESIS` always holds state, and one
+/// at `GENESIS` holds it as soon as a genesis build or a reshape clone has
+/// filled its trie. Callers pass the pair they read under whatever lock
+/// makes the two atomic for their backend.
+///
+/// Not "has a chain to resume from". A reshape seat boots with its
+/// coordinator at `GENESIS` over a trie its adoption already filled, so a
+/// caller choosing between resuming a chain and snap-syncing one asks the
+/// chain, not this.
+#[must_use]
+pub fn holds_state(height: BlockHeight, root: StateRoot) -> bool {
+    height != BlockHeight::GENESIS || root != StateRoot::ZERO
+}
+
 /// Pin and serve committed state at epoch boundary heights.
 pub trait BoundaryStore {
     /// A pinned boundary opened for serving: the JMT at the pinned

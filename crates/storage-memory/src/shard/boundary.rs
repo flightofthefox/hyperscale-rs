@@ -13,7 +13,8 @@ use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
     AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, SubstateStore, Substates,
-    WitnessSeed, entry_from_leaf, followed_block_writes, package_of_cell, sweepable_expiry,
+    WitnessSeed, entry_from_leaf, followed_block_writes, holds_state, package_of_cell,
+    sweepable_expiry,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryKey, StateRoot, SubstateKey, SubstateLeaf,
@@ -119,9 +120,7 @@ impl BoundaryStore for SimShardStorage {
         leaves: &[SubstateLeaf],
     ) -> Result<(), String> {
         let state = read_or_recover(&self.state);
-        if state.current_block_height != BlockHeight::GENESIS
-            || state.current_root_hash != StateRoot::ZERO
-        {
+        if holds_state(state.current_block_height, state.current_root_hash) {
             return Err("snap-sync staging requires an empty store".to_string());
         }
         drop(state);
@@ -153,9 +152,7 @@ impl BoundaryStore for SimShardStorage {
         witnesses: WitnessSeed,
     ) -> Result<StateRoot, String> {
         let mut state = write_or_recover(&self.state);
-        if state.current_block_height != BlockHeight::GENESIS
-            || state.current_root_hash != StateRoot::ZERO
-        {
+        if holds_state(state.current_block_height, state.current_root_hash) {
             return Err("snap-sync import requires an empty store".to_string());
         }
 
@@ -279,6 +276,7 @@ mod tests {
     use hyperscale_storage::test_helpers::{
         block_settling, make_settled_writes, make_state_writes, test_boundary_import_roundtrip,
         test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
+        test_import_gate_reads_the_trie,
     };
     use hyperscale_storage::{SubstateStore, Substates, committed_tx_cell_key};
     use hyperscale_types::test_utils::{
@@ -399,6 +397,11 @@ mod tests {
         let storage = SimShardStorage::default();
         let fresh = SimShardStorage::default();
         test_boundary_import_roundtrip(&storage, &fresh, |writes| storage.commit_shared(writes));
+    }
+
+    #[test]
+    fn the_import_gate_reads_the_trie_not_the_chain() {
+        test_import_gate_reads_the_trie(&SimShardStorage::default(), &SimShardStorage::default());
     }
 
     /// One write under the owner prefix `[seed; 16]` wrapped as a synced
