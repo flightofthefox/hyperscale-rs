@@ -2703,8 +2703,8 @@ impl ExecutionCoordinator {
                     };
                     let slot = (entry.tx_hash, shard, probed);
                     let answer = match (inclusion, probed) {
-                        (Inclusion::Present, Probed::Core) => Answer::Committed,
-                        (Inclusion::Present, Probed::Claim | Probed::Delivery) => {
+                        (Inclusion::Present(_), Probed::Core) => Answer::Committed,
+                        (Inclusion::Present(_), Probed::Claim | Probed::Delivery) => {
                             Answer::Present(ClaimProof {
                                 probed_wt: bundle.anchor_ts,
                             })
@@ -2728,7 +2728,7 @@ impl ExecutionCoordinator {
                         continue;
                     }
                     self.answers.insert(slot, answer);
-                    record_reclaim_probe_answered(inclusion == Inclusion::Present);
+                    record_reclaim_probe_answered(inclusion.is_present());
                     let tx_hash = entry.tx_hash;
                     actions.push(match answer {
                         // The core took it, and its certificate says how.

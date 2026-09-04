@@ -8,14 +8,13 @@ use std::fmt::{self, Debug, Formatter};
 use std::sync::OnceLock;
 
 use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
-use hyperscale_jmt::{Blake3Hasher, Key as JmtKey, MultiProof, Tree};
 use thiserror::Error;
 
 use crate::state_key::jmt_value_hash;
 use crate::{
     BlockHeight, CertifiedBlockHeader, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof,
-    ProvisionEntry, ProvisionHash, RETENTION_HORIZON, ShardId, SubstateEntry, TxHash, Verified,
-    Verify, WeightedTimestamp, shard_prefix_path,
+    ProvisionEntry, ProvisionHash, RETENTION_HORIZON, ShardId, StateProofError, SubstateEntry,
+    SubstateKey, TxHash, Verified, Verify, WeightedTimestamp,
 };
 
 /// All provisions from a single source block, scoped to a single target shard.
@@ -285,6 +284,14 @@ pub enum ProvisionsVerifyError {
     /// commit-proven source header's parent-QC weighted timestamp.
     #[error("provisions source block timestamp does not match the committed header")]
     SourceBlockTsMismatch,
+    /// The proof reconstructs the root, but an entry carries a value the
+    /// source's chain does not hold at that key — or claims a cell the
+    /// chain holds is absent.
+    #[error("provisions entry for {key:?} is not what the source's chain attested")]
+    EntryMisstated {
+        /// The cell whose carried value the proof contradicts.
+        key: SubstateKey,
+    },
 }
 
 /// Construction asserts: the aggregated merkle multiproof in
@@ -331,39 +338,37 @@ impl Verify<&ProvisionsContext<'_>> for Provisions {
         }
 
         let entries = self.all_entries_deduped();
-        let proof_bytes = self.proof.as_bytes();
 
-        if proof_bytes.is_empty() {
+        if self.proof.as_bytes().is_empty() {
             if entries.is_empty() {
                 return Ok(Verified::new_unchecked(self.clone()));
             }
             return Err(ProvisionsVerifyError::EmptyProofWithEntries);
         }
 
-        let multi_proof =
-            MultiProof::decode(proof_bytes).map_err(|_| ProvisionsVerifyError::MalformedProof)?;
+        // One routine reads a proof, and it is the one the evidence path
+        // reads through: it decodes once, roots the reconstruction at the
+        // source shard's prefix — which is what binds every claim to a
+        // cell that shard owns — and answers per key. What is left here
+        // is this bundle's own claim, that the values it carries are the
+        // ones the source's chain attested.
+        let keys: Vec<SubstateKey> = entries.iter().map(|entry| entry.key).collect();
+        let attested = self
+            .proof
+            .inclusions(ctx.certified_header.state_root(), source_shard, &keys)
+            .map_err(|error| match error {
+                StateProofError::Malformed => ProvisionsVerifyError::MalformedProof,
+                StateProofError::MissingClaim | StateProofError::RootMismatch => {
+                    ProvisionsVerifyError::BadInclusion
+                }
+            })?;
 
-        let mut expected: Vec<(JmtKey, Option<[u8; 32]>)> = Vec::with_capacity(entries.len());
-        for e in &entries {
-            let value_hash = e.value.as_ref().map(|v| jmt_value_hash(v));
-            expected.push((e.key.to_bytes(), value_hash));
+        for (entry, (_, inclusion)) in entries.iter().zip(&attested) {
+            let carried = entry.value.as_ref().map(|value| jmt_value_hash(value));
+            if carried != inclusion.value_hash() {
+                return Err(ProvisionsVerifyError::EntryMisstated { key: entry.key });
+            }
         }
-
-        // Rooted at the source shard's prefix, which is what binds every
-        // entry to a cell that shard owns: the reconstruction reads a key
-        // only from the root depth down, so the bits naming the shard
-        // reach no hash. An absence is what that would forge — a present
-        // leaf's hash covers its key, an empty slot's does not — so
-        // without this a quorum could answer for another shard's cell by
-        // relabelling an empty slot of its own.
-        let root_bytes: [u8; 32] = *ctx.certified_header.state_root().as_raw().as_bytes();
-        <Tree<Blake3Hasher, 1>>::verify(
-            &multi_proof,
-            root_bytes,
-            &shard_prefix_path(source_shard),
-            &expected,
-        )
-        .map_err(|_| ProvisionsVerifyError::BadInclusion)?;
 
         Ok(Verified::new_unchecked(self.clone()))
     }
@@ -505,14 +510,14 @@ mod tests {
         use std::collections::BTreeMap;
 
         use hyperscale_jmt::{
-            Blake3Hasher, ClaimTermination, LeafValue, MemoryStore, NodeKey, Tree,
+            Blake3Hasher, ClaimTermination, Key as JmtKey, LeafValue, MemoryStore, NodeKey, Tree,
         };
 
         use super::*;
         use crate::state_key::jmt_value_hash;
         use crate::{
             BlockHeader, BlockHeight, ChainOrigin, Hash, QuorumCertificate, ShardId, StateRoot,
-            ValidatorId,
+            ValidatorId, shard_prefix_path,
         };
 
         type Jmt = Tree<Blake3Hasher, 1>;
@@ -744,6 +749,64 @@ mod tests {
             assert_eq!(
                 provisions.verify(&ctx),
                 Err(ProvisionsVerifyError::BadInclusion)
+            );
+        }
+
+        /// The proof reconstructs the root and the bundle still lies:
+        /// the value it carries is not the one the source's chain holds
+        /// at that key.
+        ///
+        /// Named apart from a bad proof because they are different
+        /// faults — one says the evidence is unusable, the other that
+        /// the evidence is fine and the bundle misreports it — and the
+        /// consuming shard executes against the carried bytes.
+        #[test]
+        fn verify_rejects_an_entry_the_proof_does_not_attest() {
+            let items = vec![entry(1), entry(2)];
+            let (state_root, proof) = build_jmt(&items);
+            let verified_header = header_with_state_root(state_root);
+            let ctx = ProvisionsContext {
+                certified_header: &verified_header,
+            };
+
+            // The honest bundle clears.
+            assert!(
+                provisions_with(proof.clone(), items.clone())
+                    .verify(&ctx)
+                    .is_ok()
+            );
+
+            // One entry's value swapped for another's: same keys, same
+            // proof, a value the chain does not hold there.
+            let (key, _) = items[0].clone();
+            let lied = vec![(key, vec![0xAA, 0xBB]), items[1].clone()];
+            assert_eq!(
+                provisions_with(proof.clone(), lied).verify(&ctx),
+                Err(ProvisionsVerifyError::EntryMisstated { key }),
+            );
+
+            // And a cell the chain holds, carried as absent.
+            let absent = vec![
+                ProvisionEntry::new(
+                    TxHash::from(Hash::from_bytes(b"tx")),
+                    vec![SubstateEntry::new(key, None)],
+                ),
+                ProvisionEntry::new(
+                    TxHash::from(Hash::from_bytes(b"ty")),
+                    vec![SubstateEntry::new(items[1].0, Some(items[1].1.clone()))],
+                ),
+            ];
+            let bundle = Provisions::new(
+                SOURCE,
+                ShardId::leaf(1, 1),
+                BlockHeight::new(1),
+                WeightedTimestamp::ZERO,
+                proof,
+                absent,
+            );
+            assert_eq!(
+                bundle.verify(&ctx),
+                Err(ProvisionsVerifyError::EntryMisstated { key }),
             );
         }
 

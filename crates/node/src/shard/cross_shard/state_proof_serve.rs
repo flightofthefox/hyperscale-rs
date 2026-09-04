@@ -124,10 +124,10 @@ mod tests {
             &GetStateProofRequest::new(BlockHeight::new(1), keys.clone()),
         );
         let proof = response.proof.expect("the height is held");
-        assert_eq!(
-            proof.inclusions(root, SHARD, &keys).unwrap(),
-            vec![(never, Inclusion::Absent), (committed, Inclusion::Present)]
-        );
+        let attested = proof.inclusions(root, SHARD, &keys).unwrap();
+        assert_eq!(attested[0], (never, Inclusion::Absent));
+        assert_eq!(attested[1].0, committed);
+        assert!(attested[1].1.is_present());
 
         let unheld = serve_state_proof_request(
             &chain,
