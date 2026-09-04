@@ -129,7 +129,7 @@ pub trait SubstateStore: Substates + Send + Sync + 'static {
 ///
 /// # Panics
 ///
-/// `snapshot_at(V)` panics if `V < current_version - jmt_history_length`
+/// `snapshot_at(V)` panics if `V` is below the retention floor
 /// (saturating). This is an internal DA-assumption check — below the
 /// retention floor, the history log has been GC'd and historical reads
 /// can't be served correctly. External-facing APIs that accept

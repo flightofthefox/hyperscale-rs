@@ -1,9 +1,10 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_jmt::NibblePath;
 use hyperscale_storage::test_helpers::{
-    PendingBaseline, entry_key, make_settled_writes, make_test_block,
+    PendingBaseline, entry_key, make_settled_writes, make_test_block, make_test_block_at,
     make_test_block_with_anchor_wt, make_test_certified, make_test_execution_certificate,
     make_test_finalization, make_test_qc, make_test_receipt, state_key,
     test_a_legs_own_finalization_keeps_the_floor, test_committed_bundle_outlives_sealing,
@@ -27,9 +28,10 @@ use hyperscale_types::{
     Address, AddressClass, AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block,
     BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
     Finalization, FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey,
-    ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId,
-    SignerBitfield, StateRoot, StateWrites, StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId,
-    TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, SafeVoteRegisters,
+    SettledWrites, ShardId, SignerBitfield, StateRoot, StateWrites, StoredReceipt, SubstateKey,
+    SyncHint, TickHalf, TickId, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -56,7 +58,6 @@ use tempfile::TempDir;
 use super::column_families::STATE_HISTORY_CF;
 use super::core::RocksDbShardStorage;
 use super::metadata::write_chain_origin;
-use crate::config::RocksDbConfig;
 
 /// Helper: wrap writes into a single `StoredReceipt` for test commit calls.
 /// The union of already-settled fixtures — values, so nothing to fold.
@@ -122,27 +123,34 @@ fn the_sweep_index_tracks_the_leaves() {
     });
 }
 
+/// Version `v` of a chain pacing `blocks` of itself into one retention
+/// horizon, so a tip at version `v` leaves the floor at `v - blocks`.
+fn paced(version: u64, blocks: u64) -> WeightedTimestamp {
+    let step = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX) / blocks;
+    WeightedTimestamp::from_millis(version * step)
+}
+
 #[test]
 fn entries_commit_serve_ranges_and_gc_history() {
     let temp_dir = TempDir::new().unwrap();
-    let config = RocksDbConfig {
-        jmt_history_length: 2,
-        ..RocksDbConfig::default()
-    };
-    let storage =
-        RocksDbShardStorage::open_with_config(temp_dir.path(), &config, NibblePath::empty())
-            .unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
+    let version = Cell::new(0u64);
     test_entries_commit_serve_and_history(&storage, |writes| {
-        storage.commit(writes).unwrap();
+        version.set(version.get() + 1);
+        storage.commit_at(writes, paced(version.get(), 2)).unwrap();
     });
 
-    // Push the tip past retention and GC: the superseded history rows
+    // Carry the tip past the horizon and GC: the superseded history rows
     // go, the current index and a scan at the floor survive.
     let key = entry_key(7, 5);
-    for version in 3..=6u8 {
+    for seed in 3..=6u8 {
+        version.set(version.get() + 1);
         storage
-            .commit(&make_settled_writes(9, version, vec![version]))
+            .commit_at(
+                &make_settled_writes(9, seed, vec![seed]),
+                paced(version.get(), 2),
+            )
             .unwrap();
     }
     assert!(storage.run_state_history_gc() > 0);
@@ -1349,21 +1357,16 @@ fn test_state_history_create_delete_create() {
 #[test]
 fn substate_bytes_pruned_by_jmt_gc() {
     let temp_dir = TempDir::new().unwrap();
-    let config = RocksDbConfig {
-        jmt_history_length: 2,
-        ..Default::default()
-    };
-    let storage =
-        RocksDbShardStorage::open_with_config(temp_dir.path(), &config, NibblePath::empty())
-            .unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
     for h in 1..=10u64 {
         let writes = make_settled_writes(u8::try_from(h).unwrap_or(u8::MAX), 1, vec![1]);
-        storage.commit(&writes).unwrap();
+        storage.commit_at(&writes, paced(h, 2)).unwrap();
     }
     storage.run_jmt_gc();
 
-    // current=10, cutoff=8: below-cutoff entries pruned, the rest intact.
+    // Two blocks fit the horizon, so a tip at 10 floors at 8: below it
+    // the entries are pruned, the rest intact.
     assert_eq!(storage.substate_bytes_at(BlockHeight::new(7)), None);
     assert_eq!(storage.substate_bytes_at(BlockHeight::new(8)), Some(8));
     assert_eq!(storage.substate_bytes_at(BlockHeight::new(10)), Some(10));
@@ -1374,20 +1377,15 @@ fn substate_bytes_pruned_by_jmt_gc() {
 #[should_panic(expected = "below retention floor")]
 fn test_snapshot_at_below_retention_panics() {
     let temp_dir = TempDir::new().unwrap();
-    let config = RocksDbConfig {
-        jmt_history_length: 2,
-        ..Default::default()
-    };
-    let storage =
-        RocksDbShardStorage::open_with_config(temp_dir.path(), &config, NibblePath::empty())
-            .unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
     for h in 1..=10u64 {
-        let block = make_test_block(BlockHeight::new(h));
+        let block = make_test_block_at(BlockHeight::new(h), paced(h, 2).as_millis());
         let qc = make_test_qc(&block);
         commit_empty(&storage, &block, &qc);
     }
-    // current=10, floor=8. V=1 is well below floor.
+    // Two blocks fit the horizon, so a tip at 10 floors at 8, and V=1 is
+    // well below it.
     let _snap = <RocksDbShardStorage as VersionedStore>::snapshot_at(&storage, BlockHeight::new(1));
 }
 
@@ -1396,13 +1394,7 @@ fn test_snapshot_at_below_retention_panics() {
 #[test]
 fn test_historical_substate_read_respects_retention() {
     let temp_dir = TempDir::new().unwrap();
-    let config = RocksDbConfig {
-        jmt_history_length: 2,
-        ..Default::default()
-    };
-    let storage =
-        RocksDbShardStorage::open_with_config(temp_dir.path(), &config, NibblePath::empty())
-            .unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
     let key = SubstateKey {
         owner: Address::new([9u8; 31], AddressClass::Component),
@@ -1410,7 +1402,7 @@ fn test_historical_substate_read_respects_retention() {
     };
 
     for h in 1..=10u64 {
-        let block = make_test_block(BlockHeight::new(h));
+        let block = make_test_block_at(BlockHeight::new(h), paced(h, 2).as_millis());
         let qc = make_test_qc(&block);
         let writes = SettledWrites::from_absolutes(BTreeMap::from([(
             key,
@@ -1692,13 +1684,7 @@ fn a_committed_bundle_survives_a_reopen() {
 #[test]
 fn a_retained_bundle_drops_below_the_history_floor() {
     let temp_dir = TempDir::new().unwrap();
-    let config = RocksDbConfig {
-        jmt_history_length: 3,
-        ..RocksDbConfig::default()
-    };
-    let storage =
-        RocksDbShardStorage::open_with_config(temp_dir.path(), &config, NibblePath::empty())
-            .unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     test_retained_bundle_drops_below_the_history_floor(&storage, 3, || {
         storage.load_recovered_state()
     });

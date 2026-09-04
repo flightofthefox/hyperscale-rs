@@ -117,7 +117,7 @@ A transaction whose shape divides runs each leg where its state lives and its co
 | **INV-STATE-1** | Determinism | **Root agreement.** Same parent state + same receipts ⇒ same JMT root on every replica; the header root is QC-attested. |
 | **INV-STATE-2** | Safety | **Clean subtrees.** Every shard is a prefix subtree; owner-prefixed leaf keys place all of an owner's state under the owner's prefix and never re-parent once committed. |
 | **INV-STATE-3** | Safety | **Verified import.** Snap-sync imports only leaves proven (with completeness) into a beacon-attested root, with leaf-key and value-hash bindings independently rechecked and the rebuilt root compared against the anchor. |
-| **INV-STATE-4** | Safety | **Bounded history.** Versioned reads are bounded by `jmt_history_length`; every protocol requiring historical reads is designed within that window. |
+| **INV-STATE-4** | Safety | **Bounded history.** Versioned reads are bounded by `RETENTION_HORIZON` of weighted time behind the tip; every protocol requiring historical reads is licensed inside that same span. |
 | **INV-STATE-5** | Safety | **One verifier.** Sync-path and consensus-path commits share one state-root verification path; a sync-path mismatch is unrecoverable divergence and halts the node rather than admitting corruption. |
 | **INV-STATE-6** | Safety | **Ancestry visibility.** Pending-chain reads traverse parent-hash links to the committed tip; orphaned forks are structurally unreachable. |
 

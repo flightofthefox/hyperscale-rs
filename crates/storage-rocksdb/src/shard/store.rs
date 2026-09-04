@@ -17,6 +17,7 @@ use super::column_families::{PackageArtifactsCf, StateCf, SweepIndexCf};
 use super::core::RocksDbShardStorage;
 use super::execution_certs::append_block_certs_to_batch;
 use super::metadata::read_jmt_metadata;
+use super::retention::retention_floor;
 use super::snapshot::RocksDbSnapshot;
 use super::substate_key::SubstateKeyCodec;
 use super::sweep_key::{SweepRowCodec, leaf_bucket_bounds, row_seek};
@@ -59,8 +60,7 @@ impl SubstateStore for RocksDbShardStorage {
         if block_height.inner() > current_version {
             return None;
         }
-        let floor = current_version.saturating_sub(self.jmt_history_length);
-        if block_height.inner() < floor {
+        if block_height.inner() < retention_floor(&snapshot) {
             return None;
         }
         let snap = RocksDbSnapshot {
@@ -83,8 +83,7 @@ impl SubstateStore for RocksDbShardStorage {
         if block_height.inner() > current_version {
             return None;
         }
-        let floor = current_version.saturating_sub(self.jmt_history_length);
-        if block_height.inner() < floor {
+        if block_height.inner() < retention_floor(&snapshot) {
             return None;
         }
         let snap = RocksDbSnapshot {
@@ -115,22 +114,17 @@ impl VersionedStore for RocksDbShardStorage {
         let snapshot = self.db.snapshot();
         let (current_version, _) = read_jmt_metadata(&snapshot);
 
-        // Retention invariant: below the configured floor we can't
-        // serve historical reads reliably (history entries have been GC'd).
-        // This is an internal DA-assumption check — external APIs that
-        // accept network-supplied versions (e.g. `list_substates_for_node_at_height`)
-        // must check retention themselves and return None, not call
-        // through here.
-        //
-        // `floor` MUST match the cutoff in `run_state_history_gc` — see the
-        // boundary invariant there. Zero-margin by design.
-        let floor = current_version.saturating_sub(self.jmt_history_length);
+        // Below the floor there is no history left to reconstruct from.
+        // An internal DA-assumption check — external APIs taking a
+        // network-supplied version (`list_substates_for_node_at_height`,
+        // say) check retention themselves and answer `None` rather than
+        // calling through here.
+        let floor = retention_floor(&snapshot);
         assert!(
             height.inner() >= floor,
             "snapshot_at({height}) below retention floor {floor} \
-             (current_version={current_version}, jmt_history_length={}) — \
+             (current_version={current_version}) — \
              Shard consensus + DA invariant broken; caller must anchor within retention",
-            self.jmt_history_length,
         );
         RocksDbSnapshot {
             snapshot,

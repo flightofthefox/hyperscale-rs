@@ -59,13 +59,6 @@ pub struct SimShardStorage {
     /// Consensus metadata (single `RwLock`).
     pub(crate) consensus: Arc<RwLock<ConsensusState>>,
 
-    /// Retention window for historical substate reads. `snapshot_at(V)`
-    /// panics if `V < current_version - jmt_history_length` (saturating).
-    /// Defaults to `u64::MAX` so tests keep working — deliberately set
-    /// a smaller value in tests that want to exercise retention
-    /// behaviour.
-    pub(crate) jmt_history_length: u64,
-
     /// Boundary heights pinned for snap-sync serving. The in-memory
     /// store retains every JMT version, so a pin is pure bookkeeping —
     /// kept under the production ring's retention so eviction behaviour
@@ -105,23 +98,19 @@ impl SimShardStorage {
         Self {
             state: Arc::new(RwLock::new(shared)),
             consensus: Arc::new(RwLock::new(ConsensusState::new())),
-            jmt_history_length: u64::MAX,
             boundary_pins: Arc::new(RwLock::new(BTreeSet::new())),
             import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
         }
     }
 
-    /// Create storage with a specific retention window. Used by tests
-    /// that exercise the retention panic.
+    /// The oldest version this store answers historical reads at.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state lock is poisoned.
     #[must_use]
-    pub fn with_jmt_history_length(jmt_history_length: u64) -> Self {
-        Self {
-            state: Arc::new(RwLock::new(SharedState::new())),
-            consensus: Arc::new(RwLock::new(ConsensusState::new())),
-            jmt_history_length,
-            boundary_pins: Arc::new(RwLock::new(BTreeSet::new())),
-            import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
-        }
+    pub fn retention_floor(&self) -> u64 {
+        read_or_recover(&self.state).retention_floor
     }
 
     /// Clear all data (useful for testing).

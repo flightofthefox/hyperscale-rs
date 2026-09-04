@@ -41,7 +41,6 @@ impl SimShardStorage {
         Self {
             state: Arc::new(RwLock::new(shared)),
             consensus: Arc::new(RwLock::new(ConsensusState::new())),
-            jmt_history_length: self.jmt_history_length,
             boundary_pins: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
             import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
         }

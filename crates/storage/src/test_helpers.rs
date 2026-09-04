@@ -23,13 +23,13 @@ use hyperscale_types::{
     FeeSummary, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LegEntry, LegEntryKind,
     LocalKey, LogLevel, MerkleInclusionProof, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof,
     ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions,
-    QuorumCertificate, Randomness, RatifyCert, RatifyRound, Round, SWEEP_BUCKET_MS,
-    SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId, ShardTrie, ShardWitnessPayload,
-    SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt,
-    SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, Transaction,
-    TransactionDecision, TxHash, TxOutcome, UnsettledTx, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, WitnessSources, WorkInFlight, compute_global_receipt_root,
-    compute_merkle_root, entry_leaf_key,
+    QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, Round,
+    SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId, ShardTrie,
+    ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
+    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint,
+    TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources, WorkInFlight,
+    compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
 };
 
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
@@ -216,6 +216,27 @@ pub fn make_test_finalization(height: BlockHeight, shard: ShardId) -> Finalizati
 #[must_use]
 pub fn make_test_block(height: BlockHeight) -> Block {
     make_test_block_with_anchor_wt(height, 0)
+}
+
+/// Build a single-validator test block at `height` stamped `timestamp_ms`.
+///
+/// [`make_test_qc`] carries the header's timestamp onto the QC, so this
+/// is how a fixture chain sets the pace its retention floor moves at: a
+/// chain a retention horizon wide per block leaves every prior version
+/// behind, one a fraction of a horizon apart keeps a known number.
+#[must_use]
+pub fn make_test_block_at(height: BlockHeight, timestamp_ms: u64) -> Block {
+    let mut block = make_test_block_with_anchor_wt(height, 0);
+    if let Block::Live { header, .. } = &mut block {
+        *header = BlockHeader::new(BlockHeaderParts {
+            height,
+            parent_block_hash: header.parent_block_hash(),
+            parent_qc: header.parent_qc().clone().into(),
+            timestamp: ProposerTimestamp::from_millis(timestamp_ms),
+            ..Default::default()
+        });
+    }
+    block
 }
 
 /// Build a single-validator test block at `height` whose `parent_qc` carries
@@ -1460,10 +1481,14 @@ where
 /// Commit a block at `height` carrying one provision bundle, and return
 /// the bundle's hash. The bundle's transaction varies with the height, so
 /// each block's bundle has its own identity.
-fn commit_block_with_provisions(storage: &impl ShardChainWriter, height: u64) -> ProvisionHash {
+fn commit_block_with_provisions(
+    storage: &impl ShardChainWriter,
+    height: u64,
+    step_ms: u64,
+) -> ProvisionHash {
     let seed = u8::try_from(height).expect("small fixture");
     let block = with_provisions(
-        make_test_block(BlockHeight::new(height)),
+        make_test_block_at(BlockHeight::new(height), height * step_ms),
         ShardId::leaf(1, 1),
         TxHash::from(Hash::from_bytes(&[seed; 32])),
     );
@@ -1641,7 +1666,7 @@ pub fn test_committed_bundle_outlives_sealing(
     storage: &(impl ShardChainReader + ShardChainWriter),
     recovered: impl Fn() -> RecoveredState,
 ) {
-    let hash = commit_block_with_provisions(storage, 1);
+    let hash = commit_block_with_provisions(storage, 1, 1_000);
 
     assert!(
         storage
@@ -1668,21 +1693,24 @@ pub fn test_committed_bundle_outlives_sealing(
 ///
 /// The floor is the history retention floor — below it `snapshot_at`
 /// cannot serve the baseline a replayed tick reads, so a body kept there
-/// could never be replayed against. `storage` must be configured with
-/// `history_length` as its JMT history length; the walk is derived from
-/// it.
+/// could never be replayed against. The chain is paced so `blocks` of it
+/// fit inside the retention horizon, which is what fixes where the floor
+/// stands: a chain running faster keeps more versions and one running
+/// slower keeps fewer, and the count is a consequence of the pace rather
+/// than a setting.
 ///
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
 pub fn test_retained_bundle_drops_below_the_history_floor(
     storage: &(impl ShardChainReader + ShardChainWriter),
-    history_length: u64,
+    blocks: u64,
     recovered: impl Fn() -> RecoveredState,
 ) {
-    let first = commit_block_with_provisions(storage, 1);
-    for height in 2..=history_length + 1 {
-        commit_block_with_provisions(storage, height);
+    let step_ms = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX) / blocks;
+    let first = commit_block_with_provisions(storage, 1, step_ms);
+    for height in 2..=blocks + 1 {
+        commit_block_with_provisions(storage, height, step_ms);
     }
     assert!(
         recovered()
@@ -1692,7 +1720,7 @@ pub fn test_retained_bundle_drops_below_the_history_floor(
         "at the floor the body is still readable",
     );
 
-    commit_block_with_provisions(storage, history_length + 2);
+    commit_block_with_provisions(storage, blocks + 2, step_ms);
     let retained = recovered().retained_provisions;
     assert!(
         !retained.iter().any(|bundle| bundle.hash() == first),
@@ -1700,7 +1728,7 @@ pub fn test_retained_bundle_drops_below_the_history_floor(
     );
     assert_eq!(
         retained.len() as u64,
-        history_length + 1,
+        blocks + 1,
         "and keeps the readable window, plus the block of slack at its floor",
     );
 }

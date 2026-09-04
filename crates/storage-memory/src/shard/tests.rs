@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use hyperscale_storage::lock_recover::read_or_recover;
 use hyperscale_storage::test_helpers::{
-    make_settled_writes, make_test_block, make_test_block_with_anchor_wt, make_test_certified,
-    make_test_qc, state_key, test_entries_commit_serve_and_history,
+    make_settled_writes, make_test_block, make_test_block_at, make_test_block_with_anchor_wt,
+    make_test_certified, make_test_qc, state_key, test_entries_commit_serve_and_history,
     test_sweep_index_tracks_the_leaves, test_sweep_stops_at_the_ceiling_or_the_cap,
 };
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
@@ -191,6 +191,13 @@ fn commit_empty(
     qc: &Verified<QuorumCertificate>,
 ) -> StateRoot {
     commit_with(storage, &SettledWrites::default(), block, qc)
+}
+
+/// Height `h` of a chain pacing `blocks` of itself into one retention
+/// horizon, so a tip at `h` leaves the floor at `h - blocks`.
+fn paced(height: u64, blocks: u64) -> u64 {
+    let step = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX) / blocks;
+    height * step
 }
 
 #[test]
@@ -779,7 +786,7 @@ fn a_committed_bundle_outlives_its_block_s_sealing() {
 
 #[test]
 fn a_retained_bundle_drops_below_the_history_floor() {
-    let storage = SimShardStorage::with_jmt_history_length(3);
+    let storage = SimShardStorage::default();
     test_helpers::test_retained_bundle_drops_below_the_history_floor(&storage, 3, || {
         storage.load_recovered_state()
     });
@@ -969,14 +976,14 @@ fn test_state_history_create_delete_create() {
 #[test]
 #[should_panic(expected = "below retention floor")]
 fn test_snapshot_at_below_retention_panics() {
-    // Tiny retention: floor = current - 2.
-    let storage = SimShardStorage::with_jmt_history_length(2);
+    // Two blocks to the horizon, so a tip at 10 floors at 8.
+    let storage = SimShardStorage::default();
     for h in 1..=10u64 {
-        let block = make_test_block(BlockHeight::new(h));
+        let block = make_test_block_at(BlockHeight::new(h), paced(h, 2));
         let qc = make_test_qc(&block);
         commit_with(&storage, &SettledWrites::default(), &block, &qc);
     }
-    // current=10, floor=8. Asking for V=1 is well below floor.
+    // Asking for V=1 is well below the floor.
     let _snap = <SimShardStorage as VersionedStore>::snapshot_at(&storage, BlockHeight::new(1));
 }
 
@@ -990,9 +997,9 @@ fn test_historical_substate_read_respects_retention() {
         local: LocalKey([1; 16]),
     };
 
-    let storage = SimShardStorage::with_jmt_history_length(2);
+    let storage = SimShardStorage::default();
     for h in 1..=10u64 {
-        let block = make_test_block(BlockHeight::new(h));
+        let block = make_test_block_at(BlockHeight::new(h), paced(h, 2));
         let qc = make_test_qc(&block);
         let writes = SettledWrites::from_absolutes(BTreeMap::from([(
             key,
@@ -1000,7 +1007,7 @@ fn test_historical_substate_read_respects_retention() {
         )]));
         commit_with(&storage, &writes, &block, &qc);
     }
-    // current=10, floor=8.
+    // Two blocks to the horizon, so a tip at 10 floors at 8.
 
     // Within retention: returns Some.
     let got = storage.get_substate_at_height(key, BlockHeight::new(9));

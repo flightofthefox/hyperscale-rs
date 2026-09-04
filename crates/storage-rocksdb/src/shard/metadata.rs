@@ -9,7 +9,7 @@ use rocksdb::WriteBatch;
 
 use crate::typed_cf::{
     self, ChainOriginEntry, CommittedHashEntry, CommittedHeightEntry, CommittedQcEntry,
-    JmtMetadataEntry, ReadableStore,
+    JmtMetadataEntry, ReadableStore, RetentionFloorEntry,
 };
 
 // ─── Chain metadata ──────────────────────────────────────────────────────────
@@ -58,6 +58,20 @@ pub fn write_jmt_metadata(batch: &mut WriteBatch, version: u64, root: StateRoot)
 /// Returns `(0, ZERO)` for an uninitialized database.
 pub fn read_jmt_metadata(store: &impl ReadableStore) -> (u64, StateRoot) {
     typed_cf::meta_read::<JmtMetadataEntry>(store).unwrap_or((0, StateRoot::ZERO))
+}
+
+/// Move the retention floor to `version`.
+pub fn write_retention_floor(batch: &mut WriteBatch, version: u64) {
+    typed_cf::meta_write::<RetentionFloorEntry>(batch, &version);
+}
+
+/// The oldest version still inside the retention horizon.
+///
+/// Returns `0` for a store that has never written one, which retains
+/// everything it holds — the answer a chain that has not yet run for a
+/// horizon's worth of time gives anyway.
+pub fn read_retention_floor(store: &impl ReadableStore) -> u64 {
+    typed_cf::meta_read::<RetentionFloorEntry>(store).unwrap_or(0)
 }
 
 // ─── Chain origin ────────────────────────────────────────────────────────────

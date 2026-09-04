@@ -38,12 +38,11 @@ impl SubstateStore for SimShardStorage {
         block_height: BlockHeight,
     ) -> Option<Option<Vec<u8>>> {
         use hyperscale_storage::Substates;
-        let current_version = read_or_recover(&self.state).current_block_height.inner();
-        if block_height.inner() > current_version {
-            return None;
-        }
-        let floor = current_version.saturating_sub(self.jmt_history_length);
-        if block_height.inner() < floor {
+        let guard = read_or_recover(&self.state);
+        let current_version = guard.current_block_height.inner();
+        let floor = guard.retention_floor;
+        drop(guard);
+        if block_height.inner() > current_version || block_height.inner() < floor {
             return None;
         }
         Some(self.snapshot_at(block_height).cell(key))
@@ -54,12 +53,11 @@ impl SubstateStore for SimShardStorage {
         range: DeclaredRange,
         block_height: BlockHeight,
     ) -> Option<Vec<(u128, Vec<u8>)>> {
-        let current_version = read_or_recover(&self.state).current_block_height.inner();
-        if block_height.inner() > current_version {
-            return None;
-        }
-        let floor = current_version.saturating_sub(self.jmt_history_length);
-        if block_height.inner() < floor {
+        let guard = read_or_recover(&self.state);
+        let current_version = guard.current_block_height.inner();
+        let floor = guard.retention_floor;
+        drop(guard);
+        if block_height.inner() > current_version || block_height.inner() < floor {
             return None;
         }
         Some(self.snapshot_at(block_height).entries_in_range(
@@ -79,13 +77,12 @@ impl VersionedStore for SimShardStorage {
         // reads; hitting this is a DA-assumption bug in the caller.
         let guard = read_or_recover(&self.state);
         let current_version = guard.current_block_height.inner();
-        let floor = current_version.saturating_sub(self.jmt_history_length);
+        let floor = guard.retention_floor;
         assert!(
             height.inner() >= floor,
             "snapshot_at({height}) below retention floor {floor} \
-             (current_version={current_version}, jmt_history_length={}) — \
+             (current_version={current_version}) — \
              Shard consensus + DA invariant broken; caller must anchor within retention",
-            self.jmt_history_length,
         );
         // Clone state + state-history for snapshot isolation. Memory
         // snapshots are point-in-time copies — they don't observe later

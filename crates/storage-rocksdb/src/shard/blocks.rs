@@ -123,6 +123,7 @@ impl RocksDbShardStorage {
         block: &Block,
         qc: &Verified<QuorumCertificate>,
         beacon_witness_leaf_count_at_block_end: BeaconWitnessLeafCount,
+        retention_floor: u64,
     ) {
         // Resolve column-family handles once for the whole append loop.
         // Per-call `cf_put`/`cf_put_raw` would each invoke `self.cf()`,
@@ -156,7 +157,7 @@ impl RocksDbShardStorage {
                 &fw.attestation(),
             );
         }
-        self.append_provisions_to_batch(batch, block);
+        self.append_provisions_to_batch(batch, block, retention_floor);
     }
 
     /// Fold a block's provision bodies into the same batch, and drop
@@ -168,22 +169,20 @@ impl RocksDbShardStorage {
     ///
     /// The floor is the history retention floor rather than the
     /// unresolved set's: a replay reads state as of the block below the
-    /// one it starts at, and `snapshot_at` cannot serve that below
-    /// `height - jmt_history_length`. Nothing kept under that line could
-    /// be replayed against, so nothing under it is worth keeping.
+    /// one it starts at, and `snapshot_at` cannot serve below the floor.
+    /// Nothing kept under that line could be replayed against, so nothing
+    /// under it is worth keeping.
     ///
-    /// Cut at the floor rather than one above it, which is where the
-    /// lowest startable replay actually sits. The extra block costs one
-    /// commit's bundles and keeps the boundary from depending on the
-    /// commit's version matching its height, which a genesis commit
-    /// re-recording its own height does not.
-    fn append_provisions_to_batch(&self, batch: &mut WriteBatch, block: &Block) {
+    /// The floor is the one this commit's own advance established, passed
+    /// in rather than read back: the store still holds the previous one
+    /// until the batch lands, and cutting at that would keep a block of
+    /// bundles nothing can replay against.
+    fn append_provisions_to_batch(&self, batch: &mut WriteBatch, block: &Block, floor: u64) {
         let provisions = block.provisions();
         let height = block.height();
         let cf = self.cf();
         let provisions_cf = ProvisionsCf::handle(&cf);
 
-        let floor = height.inner().saturating_sub(self.jmt_history_length);
         if floor > 0 {
             let codec = ProvisionKeyCodec;
             batch.delete_range_cf(

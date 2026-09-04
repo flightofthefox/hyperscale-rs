@@ -10,9 +10,9 @@ use hyperscale_storage::{JmtSnapshot, entry_leaf_rows, package_of_cell, sweepabl
 use hyperscale_types::{
     Address, Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt,
     EntryKey, ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash,
-    LegEntry, ProvisionHash, Provisions, QuorumCertificate, SafeVoteRegisters, SettledWrites,
-    ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, SweepBucket, TickId, Transaction,
-    TxHash, ValidatorId,
+    LegEntry, ProvisionHash, Provisions, QuorumCertificate, RETENTION_HORIZON, SafeVoteRegisters,
+    SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, SweepBucket, TickId,
+    Transaction, TxHash, ValidatorId, WeightedTimestamp,
 };
 
 use super::tree_store::SimTreeStore;
@@ -45,6 +45,16 @@ pub struct SharedState {
     /// Per-write prior-value entries for the entry index, mirroring
     /// `state_history` row for row.
     pub entries_history: BTreeMap<(EntryKey, u64), Option<Vec<u8>>>,
+    /// Each version's weighted timestamp, and the oldest version still
+    /// inside [`RETENTION_HORIZON`] of the tip. The floor moves only past
+    /// what it retires, which is what the `RocksDB` backend's collectors
+    /// do — the two stores answer one contract, so they derive the edge
+    /// one way.
+    ///
+    /// [`RETENTION_HORIZON`]: hyperscale_types::RETENTION_HORIZON
+    pub version_time: BTreeMap<u64, u64>,
+    /// The oldest version historical reads are answered at.
+    pub retention_floor: u64,
     /// Committed substate byte total per version, written in
     /// lockstep with each applied snapshot. Consensus-critical:
     /// shard-witness derivation reads it, so it must be identical on
@@ -64,12 +74,40 @@ pub struct SharedState {
 }
 
 impl SharedState {
+    /// Date `version` and move the floor past what falls outside
+    /// [`RETENTION_HORIZON`] of `tip_ts`.
+    ///
+    /// Returns the floor this commit establishes. The floor moves only
+    /// past what it retires, so a version with no date of its own — the
+    /// empty tree at zero — stays readable.
+    ///
+    /// [`RETENTION_HORIZON`]: hyperscale_types::RETENTION_HORIZON
+    pub(crate) fn advance_retention_floor(
+        &mut self,
+        version: u64,
+        tip_ts: WeightedTimestamp,
+    ) -> u64 {
+        self.version_time.insert(version, tip_ts.as_millis());
+        let cutoff = tip_ts.minus(RETENTION_HORIZON).as_millis();
+        let retire: Vec<u64> = self
+            .version_time
+            .range(self.retention_floor..version)
+            .take_while(|(_, ts)| **ts < cutoff)
+            .map(|(dated, _)| *dated)
+            .collect();
+        for dated in retire {
+            self.version_time.remove(&dated);
+            self.retention_floor = dated + 1;
+        }
+        self.retention_floor
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             // Pruning disabled: historical substate reads traverse the JMT at
-            // past heights and need old nodes to still exist. In production,
-            // RocksDB GC respects `jmt_history_length` (default 256).
-            // In simulation, tests are short-lived so retaining all nodes is fine.
+            // past heights and need old nodes to still exist. The floor
+            // still moves, so the contract is the persistent backend's;
+            // what differs is that nothing here reclaims behind it.
             tree_store: SimTreeStore::new(),
             current_block_height: BlockHeight::GENESIS,
             current_root_hash: StateRoot::ZERO,
@@ -77,6 +115,8 @@ impl SharedState {
             state_history: BTreeMap::new(),
             current_entries: BTreeMap::new(),
             entries_history: BTreeMap::new(),
+            version_time: BTreeMap::new(),
+            retention_floor: 0,
             substate_bytes: BTreeMap::new(),
             package_artifacts: BTreeMap::new(),
             sweep_index: BTreeMap::new(),
@@ -96,9 +136,8 @@ impl SharedState {
         }
         // Stale JMT nodes are NOT deleted here. Historical JMT nodes must be
         // retained so that provision-fetch proof generation can read the
-        // tree at past block heights. In production, RocksDB GC handles
-        // pruning after `jmt_history_length` blocks (default 256). In
-        // simulation, we retain all nodes (tests are short-lived).
+        // tree at past block heights, and a simulation's runs are short
+        // enough that keeping every one costs nothing.
 
         // Substate bytes: the byte total behind the currently applied version
         // (equal across any interleaved empty commits) plus this
@@ -244,12 +283,12 @@ impl ConsensusState {
     }
 
     /// Record the provision bodies a committing block carried, and drop
-    /// every body below `jmt_history_length` blocks back — the depth a
-    /// replay can still read state at, and so the depth one can start
-    /// from. Mirrors `RocksDbShardStorage::append_provisions_to_batch`.
-    pub(crate) fn record_provisions(&mut self, block: &Block, jmt_history_length: u64) {
+    /// every body below the retention floor — the depth a replay can
+    /// still read state at, and so the depth one can start from. Mirrors
+    /// `RocksDbShardStorage::append_provisions_to_batch`.
+    pub(crate) fn record_provisions(&mut self, block: &Block, retention_floor: u64) {
         let height = block.height();
-        let floor = height.saturating_sub(jmt_history_length);
+        let floor = BlockHeight::new(retention_floor);
         if floor > BlockHeight::GENESIS {
             self.provisions.retain(|(at, _), _| *at >= floor);
         }

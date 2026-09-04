@@ -79,7 +79,6 @@ pub struct RocksDbShardStorage {
     pub(crate) commit_lock: Mutex<()>,
 
     /// Number of block heights of JMT history to retain before garbage collection.
-    pub(crate) jmt_history_length: u64,
 
     /// Path this store's JMT is rooted at — its shard's prefix, so the root is
     /// the global tree's subtree at that prefix. Empty for a single-shard /
@@ -279,16 +278,10 @@ impl RocksDbShardStorage {
         Ok(Self {
             db,
             commit_lock: Mutex::new(()),
-            jmt_history_length: config.jmt_history_length,
             root_path,
             checkpoints,
             vote_registers: Mutex::new(HashMap::new()),
         })
-    }
-
-    /// Get the configured JMT history retention length (in block heights).
-    pub const fn jmt_history_length(&self) -> u64 {
-        self.jmt_history_length
     }
 
     /// Resolve all column family handles from the database.
@@ -915,6 +908,7 @@ impl TreeReader for RocksDbShardStorage {
 #[cfg(test)]
 mod test_helpers {
     use hyperscale_metrics::record_storage_write;
+    use hyperscale_types::WeightedTimestamp;
 
     use super::*;
 
@@ -934,6 +928,25 @@ mod test_helpers {
             latency_us = Empty,
         ))]
         pub fn commit(&self, writes: &SettledWrites) -> Result<(), StorageError> {
+            self.commit_at(writes, WeightedTimestamp::from_millis(0))
+        }
+
+        /// [`Self::commit`] with the version dated, for a test that wants
+        /// the retention floor to move: a commit a horizon's worth of
+        /// weighted time after an earlier one retires it.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`StorageError`] if the underlying `RocksDB` write fails.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the commit lock is poisoned.
+        pub fn commit_at(
+            &self,
+            writes: &SettledWrites,
+            at: WeightedTimestamp,
+        ) -> Result<(), StorageError> {
             let _commit_guard = self.commit_lock.lock().unwrap();
 
             let start = Instant::now();
@@ -968,6 +981,7 @@ mod test_helpers {
             );
 
             self.append_jmt_to_batch(&mut batch, &jmt_snapshot, new_version);
+            self.advance_retention_floor(&mut batch, new_version, at);
 
             self.db
                 .write(batch)

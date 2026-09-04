@@ -183,11 +183,17 @@ fn build_prepared_commit(
             let block = certified.block();
             let qc = certified.qc_verified();
 
+            let floor = storage.advance_retention_floor(
+                &mut write_batch,
+                block.height().inner(),
+                qc.weighted_timestamp(),
+            );
             storage.append_block_to_batch(
                 &mut write_batch,
                 block,
                 qc,
                 witness.leaf_count_at_block_end,
+                floor,
             );
             storage.append_beacon_witnesses_to_batch(&mut write_batch, witness);
 
@@ -273,7 +279,14 @@ impl RocksDbShardStorage {
             /* pending */ &[],
         );
 
-        self.append_block_to_batch(&mut batch, block, qc, witness.leaf_count_at_block_end);
+        let floor = self.advance_retention_floor(&mut batch, block_height, qc.weighted_timestamp());
+        self.append_block_to_batch(
+            &mut batch,
+            block,
+            qc,
+            witness.leaf_count_at_block_end,
+            floor,
+        );
         self.append_beacon_witnesses_to_batch(&mut batch, witness);
 
         append_block_certs_to_batch(self, &mut batch, block);

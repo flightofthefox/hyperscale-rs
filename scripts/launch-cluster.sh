@@ -39,7 +39,6 @@ SKIP_BUILD="${SKIP_BUILD:-false}"               # Skip building binaries
 NODE_HOSTNAME="${NODE_HOSTNAME:-localhost}"     # Hostname for spammer endpoints
 NETWORK_LATENCY_MS="100"                        # Network latency in milliseconds (empty = disabled)
 PACKET_LOSS_PERCENT=""                          # Packet loss percentage (empty = disabled)
-JMT_HISTORY_LENGTH=256                          # Number of block heights of JMT history to retain (default: 256)
 
 # Mempool configuration
 MEMPOOL_MAX_PENDING=8192                        # Max pending before RPC backpressure
@@ -119,10 +118,6 @@ while [[ $# -gt 0 ]]; do
             MEMPOOL_MAX_PENDING="$2"
             shift 2
             ;;
-        --state-history-length)
-            JMT_HISTORY_LENGTH="$2"
-            shift 2
-            ;;
         --help|-h)
             echo "Usage: $0 [--shards N] [--validators-per-shard M] [--clean] [--monitoring] [--log-level LEVEL] [--smoke-timeout DURATION] [--node-hostname HOST]"
             echo ""
@@ -144,7 +139,6 @@ while [[ $# -gt 0 ]]; do
             echo "  --latency MS             Add network latency between validators (requires sudo)"
             echo "  --packet-loss PERCENT    Add packet loss between validators (requires sudo)"
             echo "  --mempool-max-pending N  Max pending transactions before RPC backpressure (default: 8192)"
-            echo "  --state-history-length N Number of state versions to retain (default: 60000)"
             echo ""
             echo "Environment Variables:"
             echo "  VALIDATOR_BIN            Path to validator binary (default: ./target/release/hyperscale-validator)"
@@ -491,7 +485,6 @@ pin_cores = false
 max_background_jobs = 2
 write_buffer_mb = 64
 block_cache_mb = 256
-jmt_history_length = $JMT_HISTORY_LENGTH
 
 [mempool]
 max_pending = $MEMPOOL_MAX_PENDING

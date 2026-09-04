@@ -325,11 +325,20 @@ impl RocksDbShardStorage {
     /// chain origin.
     fn append_genesis_tip_to_batch(&self, batch: &mut WriteBatch, genesis: &Block) {
         let pair = Verified::<CertifiedBlock>::genesis_certified(genesis.clone());
+        // A child's history begins here, and its genesis QC carries the
+        // chain origin's anchor: dating it is what puts the floor at the
+        // adoption rather than below everything the parent held.
+        let floor = self.advance_retention_floor(
+            batch,
+            genesis.height().inner(),
+            pair.qc_verified().weighted_timestamp(),
+        );
         self.append_block_to_batch(
             batch,
             pair.block(),
             pair.qc_verified(),
             BeaconWitnessLeafCount::ZERO,
+            floor,
         );
         write_committed_height(batch, genesis.height());
         write_committed_hash(batch, genesis.hash().as_raw());

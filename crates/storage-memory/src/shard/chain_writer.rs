@@ -171,7 +171,10 @@ fn build_prepared_commit(
 
             let block_height_u64 = snapshot.new_height.inner();
 
-            {
+            let block = certified.block();
+            let qc = certified.qc_verified();
+
+            let floor = {
                 let mut s = write_or_recover(&storage.state);
                 s.apply_jmt_snapshot(&snapshot);
                 apply_writes(
@@ -180,10 +183,8 @@ fn build_prepared_commit(
                     block_height_u64,
                     /* write_history */ true,
                 );
-            }
-
-            let block = certified.block();
-            let qc = certified.qc_verified();
+                s.advance_retention_floor(block_height_u64, qc.weighted_timestamp())
+            };
 
             // SAFETY: synthetic in-memory commit wrapper; the certified
             // value is already verified upstream and we're just copying
@@ -203,7 +204,7 @@ fn build_prepared_commit(
                     .or_default()
                     .push(tick_id);
             }
-            c.record_provisions(block, storage.jmt_history_length);
+            c.record_provisions(block, floor);
             c.insert_receipts(&receipts);
             record_execution_certs(&mut c, block);
             c.committed_height = block.height();
@@ -260,6 +261,7 @@ impl SimShardStorage {
         );
 
         let new_root = apply_state_writes(&mut s, merged_writes, block_height);
+        let floor = s.advance_retention_floor(block_height.inner(), qc.weighted_timestamp());
 
         drop(s);
 
@@ -283,7 +285,7 @@ impl SimShardStorage {
                     .or_default()
                     .push(tick_id);
             }
-            c.record_provisions(block, self.jmt_history_length);
+            c.record_provisions(block, floor);
             // Store receipts atomically with block commit.
             c.insert_receipts(receipts);
             // Store execution certificates (extracted from finalizations) atomically.

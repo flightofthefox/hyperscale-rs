@@ -21,6 +21,7 @@ mod leg_entries;
 pub(crate) mod metadata;
 pub(crate) mod receipts;
 pub(crate) mod recovery;
+pub(crate) mod retention;
 pub(crate) mod shared;
 pub(crate) mod snapshot;
 pub(crate) mod split;

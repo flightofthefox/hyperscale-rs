@@ -70,7 +70,7 @@ pub const JMT_NODES_CF: &str = "jmt_nodes";
 /// Column family for stale JMT nodes pending garbage collection.
 /// Key: `version_BE_8B` (the version at which nodes became stale).
 /// Value: HBOR-encoded `Vec<StaleTreePart>`.
-/// GC deletes entries older than `current_version - jmt_history_length`.
+/// GC deletes entries below the retention floor.
 pub const STALE_JMT_NODES_CF: &str = "stale_jmt_nodes";
 
 /// Column family indexing `state_history` entries by their write version so
@@ -129,8 +129,21 @@ pub const BEACON_WITNESSES_CF: &str = "beacon_witnesses";
 /// entry per committed version. Consensus-critical: shard-witness
 /// derivation reads the byte total behind a block's parent state, so it
 /// must be identical on every replica. GC prunes entries below the same
-/// `jmt_history_length` cutoff as historical tree data.
+/// retention floor as historical tree data.
 pub const SUBSTATE_BYTES_CF: &str = "substate_bytes";
+
+/// Column family for each version's weighted timestamp.
+///
+/// Key: `version_BE_8B`; value: HBOR-encoded `u64` — the milliseconds of
+/// the weighted timestamp on the QC that certified the block at that
+/// version. Written in the same batch as the commit, one entry per
+/// committed version, and it is what makes retention a span of time
+/// rather than a count of blocks: the floor is the oldest version still
+/// inside `RETENTION_HORIZON` of the tip, which is a question only these
+/// rows can answer. Kept here rather than read back off the block store
+/// so retention answers for itself — a version this shard holds tree
+/// data for is one it can date, whatever else has been pruned.
+pub const VERSION_TIME_CF: &str = "version_time";
 
 /// Column family for durable safe-vote registers, keyed by validator.
 ///
@@ -224,6 +237,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     TX_CERT_INDEX_CF,
     BEACON_WITNESSES_CF,
     SUBSTATE_BYTES_CF,
+    VERSION_TIME_CF,
     SAFE_VOTE_REGISTERS_CF,
     LEG_ENTRIES_CF,
     IMPORT_STAGING_CF,
@@ -258,6 +272,7 @@ pub struct CfHandles<'a> {
     tx_cert_index: &'a ColumnFamily,
     beacon_witnesses: &'a ColumnFamily,
     substate_bytes: &'a ColumnFamily,
+    version_time: &'a ColumnFamily,
     safe_vote_registers: &'a ColumnFamily,
     leg_entries: &'a ColumnFamily,
     import_staging: &'a ColumnFamily,
@@ -294,6 +309,7 @@ impl<'a> CfHandles<'a> {
             tx_cert_index: resolve(TX_CERT_INDEX_CF),
             beacon_witnesses: resolve(BEACON_WITNESSES_CF),
             substate_bytes: resolve(SUBSTATE_BYTES_CF),
+            version_time: resolve(VERSION_TIME_CF),
             safe_vote_registers: resolve(SAFE_VOTE_REGISTERS_CF),
             leg_entries: resolve(LEG_ENTRIES_CF),
             import_staging: resolve(IMPORT_STAGING_CF),
@@ -386,6 +402,20 @@ impl TypedCf for SubstateBytesCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.substate_bytes
+    }
+}
+
+/// Each version's weighted timestamp; see [`VERSION_TIME_CF`].
+pub struct VersionTimeCf;
+impl TypedCf for VersionTimeCf {
+    const NAME: &'static str = VERSION_TIME_CF;
+    type Key = u64; // version
+    type Value = u64; // weighted timestamp of the QC certifying it, in ms
+    type KeyCodec = BeU64Codec;
+    type ValueCodec = HborCodec<u64>;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.version_time
     }
 }
 
