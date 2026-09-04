@@ -23,10 +23,10 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::{Classified, core_claims, delivered_claims};
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Address, Finalization, LegEntry, LegEntryKind, LegEntryTaken,
-    ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision, TxHash, TxResolution,
-    Unsettleable, UnsettledTx, Verifiable, Verified, WeightedTimestamp, delivery_window_close,
-    leg_entry_horizon, verdict_window_close,
+    AbandonmentRecord, AbortCharge, Address, CounterpartEvidence, Finalization, LegEntry,
+    LegEntryKind, LegEntryTaken, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision,
+    TxHash, TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp,
+    delivery_window_close, leg_entry_horizon, verdict_window_close,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -114,7 +114,7 @@ struct Owed {
     /// What that record established — a refusal, a departure, an
     /// absence or a lapse — which is what the reclaim it licenses says
     /// the transaction's fate was.
-    evidence: Option<Unsettleable>,
+    evidence: Option<CounterpartEvidence>,
     /// The consumer shards a committed record says claimed what this
     /// entry issued. Once every consumer has, the records here have
     /// nothing left to hold and the retirement is licensed.
@@ -813,7 +813,8 @@ impl UnresolvedTxs {
                         // that way has no body to reclaim with, so it
                         // waits out its horizon rather than abandoning
                         // what the record licenses a reclaim of.
-                        kind: if matches!(verdict.evidence(), Unsettleable::Departed { .. }) {
+                        kind: if matches!(verdict.evidence(), CounterpartEvidence::Departed { .. })
+                        {
                             Kind::Whole
                         } else {
                             Kind::Leg
@@ -1042,13 +1043,18 @@ impl UnresolvedTxs {
                     }
                 } else if accepted && owed.is_some_and(|owed| owed.kind.is_leg()) {
                     match owed.and_then(|owed| owed.evidence) {
-                        Some(Unsettleable::Refused { .. }) => {
+                        Some(CounterpartEvidence::Refused { .. }) => {
                             TxResolution::Decided(TransactionDecision::Reject)
                         }
-                        Some(Unsettleable::Departed { .. } | Unsettleable::Unclaimed { .. }) => {
-                            TxResolution::Decided(TransactionDecision::Aborted)
-                        }
-                        Some(Unsettleable::Lapsed { .. } | Unsettleable::Claimed { .. }) | None => {
+                        Some(
+                            CounterpartEvidence::Departed { .. }
+                            | CounterpartEvidence::Unclaimed { .. },
+                        ) => TxResolution::Decided(TransactionDecision::Aborted),
+                        Some(
+                            CounterpartEvidence::Lapsed { .. }
+                            | CounterpartEvidence::Claimed { .. },
+                        )
+                        | None => {
                             continue;
                         }
                     }

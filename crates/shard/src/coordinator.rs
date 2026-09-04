@@ -17,12 +17,12 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_metrics::record_verdict_claim_deferred;
 use hyperscale_types::{
-    AbandonmentRecord, BlockHash, ClaimProof, CounterpartClaim, FinalizationHash, Hash,
-    LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, PrincipalAddr, ProposerTimestamp, ProvenAnchor, ProvenAnchors,
-    ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger, Resolutions, ScheduleLookup,
-    SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StateProofBundle, StoredReceipt,
-    SubstateKey, TxClaim, TxOutcome, Unsettleable, UnsettledTx, VerdictClaim, WeightedTimestamp,
+    AbandonmentRecord, BlockHash, ClaimProof, CounterpartClaim, CounterpartEvidence,
+    FinalizationHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
+    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr, ProposerTimestamp, ProvenAnchor,
+    ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger, Resolutions,
+    ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StateProofBundle,
+    StoredReceipt, SubstateKey, TxClaim, TxOutcome, UnsettledTx, VerdictClaim, WeightedTimestamp,
     WorkInFlight, derive_reshape_trigger, lapse_probe_ceiling, ready_signal_window,
     settled_set_verdict, verdict_window_close,
 };
@@ -1312,7 +1312,7 @@ impl ShardCoordinator {
             // stranger to the departed shard is absent from its set
             // trivially, and abandoning it would charge a payer for a
             // transaction a live counterpart can still settle.
-            Unsettleable::Departed { terminal_wt } => {
+            CounterpartEvidence::Departed { terminal_wt } => {
                 let scheduled =
                     topology_schedule.terminal_cut_for_shard(verdict.shard(), anchored_wt);
                 if scheduled != Some(terminal_wt) {
@@ -1355,7 +1355,7 @@ impl ShardCoordinator {
             // of the core's certificate: equality on the anchor. A
             // voter holding no mirror cannot say and defers; one whose
             // mirror disagrees refuses.
-            Unsettleable::Refused { refused_wt } => {
+            CounterpartEvidence::Refused { refused_wt } => {
                 for entry in verdict.unsettled() {
                     if !self.refusal_stands(verdict, entry, refused_wt, block_hash) {
                         return false;
@@ -1375,7 +1375,7 @@ impl ShardCoordinator {
             // check against the later window a delivery's claim cell
             // has. Both windows derive from the deadline the record
             // restates, so the voter needs no body to find them.
-            Unsettleable::Unclaimed { probed_wt } => {
+            CounterpartEvidence::Unclaimed { probed_wt } => {
                 for entry in verdict.unsettled() {
                     if !self.absence_stands(
                         verdict,
@@ -1388,7 +1388,7 @@ impl ShardCoordinator {
                     }
                 }
             }
-            Unsettleable::Lapsed { probed_wt } => {
+            CounterpartEvidence::Lapsed { probed_wt } => {
                 for entry in verdict.unsettled() {
                     if !self.absence_stands(
                         verdict,
@@ -1405,7 +1405,7 @@ impl ShardCoordinator {
             // the record's anchor short of the claim cell's sweep, and
             // the one this validator folded. A voter that has not folded
             // it defers.
-            Unsettleable::Claimed { probed_wt } => {
+            CounterpartEvidence::Claimed { probed_wt } => {
                 for entry in verdict.unsettled() {
                     if !self.presence_stands(verdict, entry, probed_wt, block_hash) {
                         return false;
@@ -1599,7 +1599,7 @@ impl ShardCoordinator {
         let claims = block
             .abandonment_records()
             .iter()
-            .filter(|verdict| matches!(verdict.evidence(), Unsettleable::Departed { .. }))
+            .filter(|verdict| matches!(verdict.evidence(), CounterpartEvidence::Departed { .. }))
             .flat_map(|verdict| {
                 verdict
                     .tx_hashes()

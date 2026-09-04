@@ -1,5 +1,5 @@
-//! What this shard owes an outcome for that no counterpart can ever
-//! settle, and the evidence that says so.
+//! What a counterpart's chain established about the transactions this
+//! shard still owes an outcome for, and the evidence that says so.
 //!
 //! A cross-shard transaction needs every certificate its settlement
 //! waits on, so one whose counterpart can never certify it can never
@@ -17,24 +17,23 @@
 //! claimed it, as of one of the delivering shard's blocks inside the
 //! lapse window, on the same terms against the claim cell.
 //!
-//! One more thing is written down the same way, though it establishes
-//! the opposite: that a consumer *did* claim what a leg here issued. A
-//! record cell is a balance held for that claim, and the claim proved
-//! present is what lets the issuer retire it — the record family's one
-//! settling arm.
+//! A fifth establishes the opposite and is written down the same way:
+//! that a consumer *did* claim what a leg here issued. A record cell is
+//! a balance held for that claim, and the claim proved present is what
+//! lets the issuer retire it — the family's one settling arm.
 //!
 //! So the answer is written down while it can still be read. A record
-//! names the transactions this chain still owes an outcome for that its
-//! counterpart can never settle, with the kind of evidence and the
-//! moment it was taken at, and once committed it is ordinary history:
+//! names the transactions this chain still owes an outcome for, with the
+//! kind of evidence its counterpart's chain gave and the moment it was
+//! taken at, and once committed it is ordinary history:
 //! every replica reads the same verdicts off its own chain at any
 //! distance, including one that was switched off when the counterpart
 //! left.
 //!
-//! Only the negative is recorded. That a counterpart *did* settle a
-//! transaction changes nothing this shard can act on — the transaction
-//! stays owed and unabandonable either way — while the impossibility of
-//! a settlement is what licenses a verdict.
+//! What is never recorded is a settlement. That a counterpart *did*
+//! settle a transaction changes nothing this shard can act on — the
+//! transaction stays owed and unabandonable either way. Every arm here
+//! licenses something: four an abort, the fifth a retirement.
 //!
 //! Each name carries the figures composing the abort takes: the deadline
 //! it opens at, the reservation it returns, and the charge it settles.
@@ -73,7 +72,7 @@ pub struct UnsettledTx {
     /// The moment past which it can no longer finalize anywhere:
     /// `validity_range.end_timestamp_exclusive + MAX_FINALIZATION_DELAY`.
     ///
-    /// Also the anchor an [`Unsettleable::Unclaimed`] probe has to sit at
+    /// Also the anchor an [`CounterpartEvidence::Unclaimed`] probe has to sit at
     /// or past, so a voter checks the proof's block against this figure
     /// rather than against a clock.
     pub deadline: WeightedTimestamp,
@@ -192,8 +191,8 @@ impl Resolutions {
     }
 }
 
-/// Why a counterpart can never settle the transactions a record names,
-/// and when that became so.
+/// What a counterpart's chain shows about the transactions a record
+/// names, and when it was read there.
 ///
 /// Every arm carries a moment and none carries its proof. The proof is
 /// fetched by the voter — a settled set, a certificate, or a state proof
@@ -201,7 +200,7 @@ impl Resolutions {
 /// defers. An absence proof is a JMT non-inclusion path; carrying one
 /// per entry would blow the record's size budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
-pub enum Unsettleable {
+pub enum CounterpartEvidence {
     /// The shard left without settling. Absence from its complete,
     /// beacon-attested settled set is the proof.
     Departed {
@@ -248,11 +247,11 @@ pub enum Unsettleable {
     },
     /// The consumer claimed it, as of one of its blocks: an inclusion
     /// proof of the crossing's claim cell against that block's state
-    /// root is the proof. The one arm that records a settlement rather
-    /// than its impossibility — what it licenses is the retirement of
-    /// the record cell the issuer held for that claim, never an abort.
-    /// A claim is one fact at every anchor from its commit to its own
-    /// sweep, so the proof may sit anywhere short of the sweep.
+    /// root is the proof. The one arm read off a presence rather than an
+    /// absence — what it licenses is the retirement of the record cell
+    /// the issuer held for that claim, never an abort. A claim is one
+    /// fact at every anchor from its commit to its own sweep, so the
+    /// proof may sit anywhere short of the sweep.
     Claimed {
         /// The weighted timestamp of the block the presence was proved
         /// against. Short of every named crossing's claim cell sweep, or
@@ -261,7 +260,7 @@ pub enum Unsettleable {
     },
 }
 
-impl Unsettleable {
+impl CounterpartEvidence {
     /// The moment the evidence was taken at.
     #[must_use]
     pub const fn moment(&self) -> WeightedTimestamp {
@@ -365,7 +364,7 @@ pub struct AbandonmentRecord {
     /// The counterpart shard that can never settle these.
     shard: ShardId,
     /// Why not, and as of when.
-    evidence: Unsettleable,
+    evidence: CounterpartEvidence,
     /// Transactions this chain still owes an outcome for that `shard`
     /// can never settle.
     ///
@@ -380,7 +379,7 @@ impl AbandonmentRecord {
     #[must_use]
     pub fn new(
         shard: ShardId,
-        evidence: Unsettleable,
+        evidence: CounterpartEvidence,
         unsettled: impl IntoIterator<Item = UnsettledTx>,
     ) -> Self {
         let mut unsettled: Vec<UnsettledTx> = unsettled.into_iter().collect();
@@ -401,7 +400,11 @@ impl AbandonmentRecord {
         terminal_wt: WeightedTimestamp,
         unsettled: impl IntoIterator<Item = UnsettledTx>,
     ) -> Self {
-        Self::new(shard, Unsettleable::Departed { terminal_wt }, unsettled)
+        Self::new(
+            shard,
+            CounterpartEvidence::Departed { terminal_wt },
+            unsettled,
+        )
     }
 
     /// A record over what `shard`, a core, refused at `refused_wt`.
@@ -411,7 +414,11 @@ impl AbandonmentRecord {
         refused_wt: WeightedTimestamp,
         unsettled: impl IntoIterator<Item = UnsettledTx>,
     ) -> Self {
-        Self::new(shard, Unsettleable::Refused { refused_wt }, unsettled)
+        Self::new(
+            shard,
+            CounterpartEvidence::Refused { refused_wt },
+            unsettled,
+        )
     }
 
     /// A record over what `shard`, a core, had not committed as of its
@@ -422,7 +429,11 @@ impl AbandonmentRecord {
         probed_wt: WeightedTimestamp,
         unsettled: impl IntoIterator<Item = UnsettledTx>,
     ) -> Self {
-        Self::new(shard, Unsettleable::Unclaimed { probed_wt }, unsettled)
+        Self::new(
+            shard,
+            CounterpartEvidence::Unclaimed { probed_wt },
+            unsettled,
+        )
     }
 
     /// A record over what `shard`, delivering, had not claimed as of its
@@ -433,7 +444,7 @@ impl AbandonmentRecord {
         probed_wt: WeightedTimestamp,
         unsettled: impl IntoIterator<Item = UnsettledTx>,
     ) -> Self {
-        Self::new(shard, Unsettleable::Lapsed { probed_wt }, unsettled)
+        Self::new(shard, CounterpartEvidence::Lapsed { probed_wt }, unsettled)
     }
 
     /// A record over what `shard`, consuming, had claimed as of its
@@ -444,7 +455,7 @@ impl AbandonmentRecord {
         probed_wt: WeightedTimestamp,
         unsettled: impl IntoIterator<Item = UnsettledTx>,
     ) -> Self {
-        Self::new(shard, Unsettleable::Claimed { probed_wt }, unsettled)
+        Self::new(shard, CounterpartEvidence::Claimed { probed_wt }, unsettled)
     }
 
     /// The counterpart shard.
@@ -455,7 +466,7 @@ impl AbandonmentRecord {
 
     /// Why it can never settle these, and as of when.
     #[must_use]
-    pub const fn evidence(&self) -> Unsettleable {
+    pub const fn evidence(&self) -> CounterpartEvidence {
         self.evidence
     }
 
@@ -647,14 +658,14 @@ mod tests {
     fn a_record_out_of_its_canonical_order_is_refused() {
         let reversed = AbandonmentRecord {
             shard: ShardId::ROOT,
-            evidence: Unsettleable::Departed { terminal_wt: wt() },
+            evidence: CounterpartEvidence::Departed { terminal_wt: wt() },
             unsettled: vec![tx(2), tx(1)],
         };
         assert!(!reversed.is_well_formed());
 
         let repeating = AbandonmentRecord {
             shard: ShardId::ROOT,
-            evidence: Unsettleable::Departed { terminal_wt: wt() },
+            evidence: CounterpartEvidence::Departed { terminal_wt: wt() },
             unsettled: vec![tx(1), tx(1)],
         };
         assert!(!repeating.is_well_formed());
@@ -677,12 +688,12 @@ mod tests {
     #[test]
     fn every_arm_has_its_own_discriminant_and_reads_its_moment() {
         let arms = [
-            Unsettleable::Departed { terminal_wt: wt() },
-            Unsettleable::Refused { refused_wt: wt() },
-            Unsettleable::Unclaimed { probed_wt: wt() },
-            Unsettleable::Lapsed { probed_wt: wt() },
+            CounterpartEvidence::Departed { terminal_wt: wt() },
+            CounterpartEvidence::Refused { refused_wt: wt() },
+            CounterpartEvidence::Unclaimed { probed_wt: wt() },
+            CounterpartEvidence::Lapsed { probed_wt: wt() },
         ];
-        let mut bytes: Vec<u8> = arms.iter().map(Unsettleable::discriminant).collect();
+        let mut bytes: Vec<u8> = arms.iter().map(CounterpartEvidence::discriminant).collect();
         bytes.dedup();
         assert_eq!(bytes.len(), arms.len());
         for arm in arms {

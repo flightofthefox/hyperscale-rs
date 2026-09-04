@@ -20,7 +20,9 @@ use std::collections::BTreeSet;
 
 use hyperscale_hbor::Hbor;
 
-use crate::{AbortCharge, Address, ShardId, ShardTrie, TxHash, Unsettleable, WeightedTimestamp};
+use crate::{
+    AbortCharge, Address, CounterpartEvidence, ShardId, ShardTrie, TxHash, WeightedTimestamp,
+};
 
 /// What this shard's part in a transaction is, which decides what its
 /// entry waits on and what ends it.
@@ -85,7 +87,7 @@ pub struct LegEntry {
     /// The shard a committed record says left it unsettled.
     pub unsettled_by: Option<ShardId>,
     /// What that record established.
-    pub evidence: Option<Unsettleable>,
+    pub evidence: Option<CounterpartEvidence>,
     /// The consumer shards a committed record says claimed what it
     /// issued.
     pub claimed_by: BTreeSet<ShardId>,

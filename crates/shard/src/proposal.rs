@@ -21,10 +21,10 @@ use std::sync::Arc;
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, CounterpartClaim, Epoch,
-    Finalization, Hash, LocalTimestamp, MAX_PROVISIONS_PER_BLOCK, ProposerTimestamp, ProvisionHash,
-    Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round, ScheduleLookup, ShardId,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, Unsettleable, UnsettledTx,
+    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, CounterpartClaim,
+    CounterpartEvidence, Epoch, Finalization, Hash, LocalTimestamp, MAX_PROVISIONS_PER_BLOCK,
+    ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round,
+    ScheduleLookup, ShardId, TopologySchedule, TopologySnapshot, Transaction, TxHash, UnsettledTx,
     ValidatorId, Verifiable, Verified, WeightedTimestamp, delivery_admissible, sweep_admits_block,
 };
 use tracing::debug;
@@ -434,7 +434,7 @@ pub fn select_abandonment_records(
     verdicts
         .into_iter()
         .filter(|verdict| {
-            !matches!(verdict.evidence(), Unsettleable::Departed { .. })
+            !matches!(verdict.evidence(), CounterpartEvidence::Departed { .. })
                 || topology_schedule.terminal_evidence_readable(verdict.shard(), anchor_wt)
         })
         .filter_map(|verdict| {

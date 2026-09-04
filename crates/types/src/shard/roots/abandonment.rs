@@ -98,8 +98,8 @@ impl Verify<&AbandonmentRootContext<'_>> for AbandonmentRoot {
 mod tests {
     use super::*;
     use crate::{
-        AbortCharge, Address, AddressClass, LocalKey, ShardId, SubstateKey, TxHash, Unsettleable,
-        UnsettledTx, WeightedTimestamp,
+        AbortCharge, Address, AddressClass, CounterpartEvidence, LocalKey, ShardId, SubstateKey,
+        TxHash, UnsettledTx, WeightedTimestamp,
     };
 
     fn tx(seed: u8) -> UnsettledTx {
@@ -210,12 +210,12 @@ mod tests {
         let departed = AbandonmentRecord::departed(ShardId::ROOT, moment, [tx(1)]);
         let refused = AbandonmentRecord::new(
             ShardId::ROOT,
-            Unsettleable::Refused { refused_wt: moment },
+            CounterpartEvidence::Refused { refused_wt: moment },
             [tx(1)],
         );
         let unclaimed = AbandonmentRecord::new(
             ShardId::ROOT,
-            Unsettleable::Unclaimed { probed_wt: moment },
+            CounterpartEvidence::Unclaimed { probed_wt: moment },
             [tx(1)],
         );
         let lapsed = AbandonmentRecord::lapsed(ShardId::ROOT, moment, [tx(1)]);
