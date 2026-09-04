@@ -1226,8 +1226,9 @@ pub fn stub_transaction_running(
     tx
 }
 
-/// A one-version state tree holding `present`, and a proof over `asked`
-/// against it: the root the proof reconstructs, and the proof.
+/// A one-version state tree for `shard` holding `present`, and a proof
+/// over `asked` against it: the root the proof reconstructs, and the
+/// proof.
 ///
 /// What a test hands a coordinator in place of a fetch: a key in
 /// `present` reads back present under the root, any other absent. The
@@ -1235,25 +1236,55 @@ pub fn stub_transaction_running(
 /// state is otherwise empty still has a root to prove against — a
 /// counterpart chain always holds something.
 ///
+/// Rooted at `shard`'s prefix, as a shard's tree is, so a proof built
+/// here is checkable the way a served one is: every key it speaks for
+/// must be one `shard` owns.
+///
 /// # Panics
 ///
 /// If `asked` names the unrelated leaf, whose presence would be an
-/// answer the caller did not ask for.
+/// answer the caller did not ask for, or if any key falls outside
+/// `shard`'s prefix.
 #[must_use]
 pub fn state_and_proof(
+    shard: ShardId,
     present: &[SubstateKey],
     asked: &[SubstateKey],
 ) -> (StateRoot, MerkleInclusionProof) {
     use std::collections::BTreeMap;
 
-    use hyperscale_jmt::{Blake3Hasher, Key as JmtKey, LeafValue, MemoryStore, NodeKey, Tree};
+    use hyperscale_jmt::{
+        Blake3Hasher, Key as JmtKey, LeafValue, MemoryStore, NibblePath, NodeKey, Tree,
+    };
 
+    use crate::shard_prefix_path;
     use crate::state_key::jmt_value_hash;
 
-    let unrelated = test_key(0xEE);
+    let root_path = shard_prefix_path(shard);
+    let under = |key: &SubstateKey| {
+        NibblePath::from_key_prefix(&key.to_bytes(), root_path.len()) == root_path
+    };
+    // The spare leaf sits under the same prefix, so it is a cell this
+    // shard could hold rather than one no proof of its could name.
+    let mut unrelated = test_key(0xEE);
+    let mut owner = unrelated.owner.to_bytes();
+    let shard_first = root_path.as_bytes().first().copied().unwrap_or(0);
+    let keep = u8::try_from(root_path.len().min(8)).unwrap_or(8);
+    if keep > 0 {
+        let mask = 0xFFu8 << (8 - keep);
+        owner[0] = (owner[0] & !mask) | (shard_first & mask);
+        unrelated = SubstateKey {
+            owner: Address::from_bytes(owner).expect("the class byte is untouched"),
+            local: unrelated.local,
+        };
+    }
     assert!(
         !asked.contains(&unrelated),
         "the tree's unrelated leaf is not a key a test may ask about",
+    );
+    assert!(
+        present.iter().chain(asked).all(under),
+        "a fixture proof for a shard speaks only for keys that shard owns",
     );
     let mut store = MemoryStore::new();
     let updates: BTreeMap<JmtKey, Option<LeafValue>> = present
@@ -1267,12 +1298,12 @@ pub fn state_and_proof(
             )
         })
         .collect();
-    let result = Tree::<Blake3Hasher, 1>::apply_updates(&store, None, 1, &updates)
+    let result = Tree::<Blake3Hasher, 1>::apply_updates_at(&store, None, 1, &root_path, &updates)
         .expect("a fresh tree takes its first version");
     let root = StateRoot::from_raw(Hash::from_hash_bytes(&result.root_hash));
     store.apply(&result);
     let jmt_keys: Vec<JmtKey> = asked.iter().map(SubstateKey::to_bytes).collect();
-    let proof = Tree::<Blake3Hasher, 1>::prove(&store, &NodeKey::root(1), &jmt_keys)
+    let proof = Tree::<Blake3Hasher, 1>::prove(&store, &NodeKey::new(1, root_path), &jmt_keys)
         .expect("every key proves against a held version");
     (root, MerkleInclusionProof::new(proof.encode()))
 }

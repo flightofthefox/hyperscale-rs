@@ -4,7 +4,7 @@ use hyperscale_hbor::Hbor;
 use hyperscale_jmt::{Blake3Hasher, ClaimTermination, MultiProof, Tree};
 use thiserror::Error;
 
-use crate::{MAX_MERKLE_PROOF_LEN, StateRoot, SubstateKey};
+use crate::{MAX_MERKLE_PROOF_LEN, ShardId, StateRoot, SubstateKey, shard_prefix_path};
 
 /// Merkle multiproof authenticating substates' presence in, or absence
 /// from, the JMT state tree.
@@ -52,8 +52,8 @@ impl MerkleInclusionProof {
         Self(bytes)
     }
 
-    /// Each of `keys` as this proof attests it under `root`, in the
-    /// order asked.
+    /// Each of `keys` as this proof attests it under `shard`'s `root`, in
+    /// the order asked.
     ///
     /// The proof's own claims are what is checked: each asked key's
     /// claim is read off the proof and the tree is reconstructed from
@@ -62,12 +62,20 @@ impl MerkleInclusionProof {
     /// that does not decode, and one reconstructing another root are
     /// each refused whole — a proof is usable or it is not.
     ///
+    /// `shard` is whose root this is, and every claim must sit under its
+    /// prefix. A shard's tree is rooted there, so the reconstruction
+    /// never reads the bits above it: without the prefix a proof from one
+    /// shard answers for another shard's keys, and since an absence
+    /// contributes the same empty hash whatever key it names, it answers
+    /// them absent.
+    ///
     /// # Errors
     ///
     /// As [`StateProofError`] lists them.
     pub fn inclusions(
         &self,
         root: StateRoot,
+        shard: ShardId,
         keys: &[SubstateKey],
     ) -> Result<Vec<(SubstateKey, Inclusion)>, StateProofError> {
         let proof = MultiProof::decode(self.as_bytes()).map_err(|_| StateProofError::Malformed)?;
@@ -96,7 +104,7 @@ impl MerkleInclusionProof {
             inclusions.push((*key, inclusion));
         }
         let root_bytes: [u8; 32] = *root.as_raw().as_bytes();
-        <Tree<Blake3Hasher, 1>>::verify(&proof, root_bytes, &expected)
+        <Tree<Blake3Hasher, 1>>::verify(&proof, root_bytes, &shard_prefix_path(shard), &expected)
             .map_err(|_| StateProofError::RootMismatch)?;
         Ok(inclusions)
     }
@@ -164,7 +172,9 @@ mod tests {
         let (held, other, missing) = (test_key(1), test_key(2), test_key(3));
         let (root, proof) = tree_and_proof(&[held, other], &[missing, held]);
         assert_eq!(
-            proof.inclusions(root, &[missing, held]).unwrap(),
+            proof
+                .inclusions(root, ShardId::ROOT, &[missing, held])
+                .unwrap(),
             vec![(missing, Inclusion::Absent), (held, Inclusion::Present)]
         );
     }
@@ -177,16 +187,16 @@ mod tests {
         let (root, proof) = tree_and_proof(&[held], &[missing]);
         let other_root = StateRoot::from_raw(Hash::from_bytes(b"another state"));
         assert_eq!(
-            proof.inclusions(other_root, &[missing]),
+            proof.inclusions(other_root, ShardId::ROOT, &[missing]),
             Err(StateProofError::RootMismatch)
         );
         assert_eq!(
-            proof.inclusions(root, &[missing, held]),
+            proof.inclusions(root, ShardId::ROOT, &[missing, held]),
             Err(StateProofError::MissingClaim),
             "the proof was taken over the missing key alone"
         );
         assert_eq!(
-            MerkleInclusionProof::new(vec![0xff; 8]).inclusions(root, &[missing]),
+            MerkleInclusionProof::new(vec![0xff; 8]).inclusions(root, ShardId::ROOT, &[missing]),
             Err(StateProofError::Malformed)
         );
     }

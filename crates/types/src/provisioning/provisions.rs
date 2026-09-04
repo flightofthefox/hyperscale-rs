@@ -15,7 +15,7 @@ use crate::state_key::jmt_value_hash;
 use crate::{
     BlockHeight, CertifiedBlockHeader, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof,
     ProvisionEntry, ProvisionHash, RETENTION_HORIZON, ShardId, SubstateEntry, TxHash, Verified,
-    Verify, WeightedTimestamp,
+    Verify, WeightedTimestamp, shard_prefix_path,
 };
 
 /// All provisions from a single source block, scoped to a single target shard.
@@ -277,6 +277,10 @@ pub enum ProvisionsVerifyError {
     /// entries.
     #[error("merkle inclusion verification failed against committed state root")]
     BadInclusion,
+    /// The bundle names a source shard other than the one whose header
+    /// it is checked against.
+    #[error("provisions source shard does not match the committed header")]
+    SourceShardMismatch,
     /// The bundle's claimed `source_block_ts` does not equal the
     /// commit-proven source header's parent-QC weighted timestamp.
     #[error("provisions source block timestamp does not match the committed header")]
@@ -304,6 +308,15 @@ impl Verify<&ProvisionsContext<'_>> for Provisions {
     type Error = ProvisionsVerifyError;
 
     fn verify(&self, ctx: &ProvisionsContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        // The bundle's own account of who is answering must be the shard
+        // whose root it is checked against. Only the header is trusted,
+        // and consumers key what they absorb — the source of every entry,
+        // and which requirement it satisfies — off the bundle's field.
+        let source_shard = ctx.certified_header.shard_id();
+        if self.source_shard != source_shard {
+            return Err(ProvisionsVerifyError::SourceShardMismatch);
+        }
+
         // The carried source-block timestamp must be the header's own
         // parent-QC anchor: receivers consume it as the transaction
         // clock, so it clears verification or the bundle does not.
@@ -336,9 +349,21 @@ impl Verify<&ProvisionsContext<'_>> for Provisions {
             expected.push((e.key.to_bytes(), value_hash));
         }
 
+        // Rooted at the source shard's prefix, which is what binds every
+        // entry to a cell that shard owns: the reconstruction reads a key
+        // only from the root depth down, so the bits naming the shard
+        // reach no hash. An absence is what that would forge — a present
+        // leaf's hash covers its key, an empty slot's does not — so
+        // without this a quorum could answer for another shard's cell by
+        // relabelling an empty slot of its own.
         let root_bytes: [u8; 32] = *ctx.certified_header.state_root().as_raw().as_bytes();
-        <Tree<Blake3Hasher, 1>>::verify(&multi_proof, root_bytes, &expected)
-            .map_err(|_| ProvisionsVerifyError::BadInclusion)?;
+        <Tree<Blake3Hasher, 1>>::verify(
+            &multi_proof,
+            root_bytes,
+            &shard_prefix_path(source_shard),
+            &expected,
+        )
+        .map_err(|_| ProvisionsVerifyError::BadInclusion)?;
 
         Ok(Verified::new_unchecked(self.clone()))
     }
@@ -479,7 +504,9 @@ mod tests {
     mod verify {
         use std::collections::BTreeMap;
 
-        use hyperscale_jmt::{Blake3Hasher, LeafValue, MemoryStore, NodeKey, Tree};
+        use hyperscale_jmt::{
+            Blake3Hasher, ClaimTermination, LeafValue, MemoryStore, NodeKey, Tree,
+        };
 
         use super::*;
         use crate::state_key::jmt_value_hash;
@@ -489,6 +516,12 @@ mod tests {
         };
 
         type Jmt = Tree<Blake3Hasher, 1>;
+
+        /// The shard the fixtures' tree is rooted at and whose header
+        /// every bundle here is checked against. A one-bit prefix of `0`,
+        /// so a `test_prefix` seed below `0x80` is a cell it owns and one
+        /// at or above is a cell its sibling owns.
+        const SOURCE: ShardId = ShardId::leaf(1, 0);
 
         fn entry(seed: u8) -> (SubstateKey, Vec<u8>) {
             (cell(seed, seed), vec![seed, seed.wrapping_add(1)])
@@ -503,10 +536,11 @@ mod tests {
                     (k.to_bytes(), Some(val))
                 })
                 .collect();
-            let result = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
+            let root_path = shard_prefix_path(SOURCE);
+            let result = Jmt::apply_updates_at(&store, None, 1, &root_path, &updates).unwrap();
             let root_hash = result.root_hash;
             store.apply(&result);
-            let root_key = NodeKey::root(1);
+            let root_key = NodeKey::new(1, root_path);
             let jmt_keys: Vec<JmtKey> = entries.iter().map(|(k, _)| k.to_bytes()).collect();
             let proof = Jmt::prove(&store, &root_key, &jmt_keys).unwrap();
             let state_root = StateRoot::from_raw(Hash::from_hash_bytes(&root_hash));
@@ -514,7 +548,7 @@ mod tests {
         }
 
         fn header_with_state_root(state_root: StateRoot) -> Verified<CertifiedBlockHeader> {
-            let shard = ShardId::leaf(1, 0);
+            let shard = SOURCE;
             let header =
                 BlockHeader::genesis(shard, ValidatorId::new(0), state_root, ChainOrigin::ROOT);
             Verified::<CertifiedBlockHeader>::new_unchecked_for_test(CertifiedBlockHeader::new(
@@ -536,8 +570,8 @@ mod tests {
                 })
                 .collect();
             Provisions::new(
+                SOURCE,
                 ShardId::leaf(1, 1),
-                ShardId::leaf(1, 0),
                 BlockHeight::new(1),
                 WeightedTimestamp::ZERO,
                 proof,
@@ -592,8 +626,8 @@ mod tests {
             let state_root = StateRoot::ZERO;
             let verified_header = header_with_state_root(state_root);
             let provisions = Provisions::new(
+                SOURCE,
                 ShardId::leaf(1, 1),
-                ShardId::leaf(1, 0),
                 BlockHeight::new(1),
                 WeightedTimestamp::ZERO,
                 MerkleInclusionProof::new(vec![]),
@@ -621,6 +655,98 @@ mod tests {
             );
         }
 
+        /// Only the header says who is answering. Consumers key what they
+        /// absorb off the bundle's own field, so the two must agree.
+        #[test]
+        fn verify_rejects_a_bundle_naming_another_source_shard() {
+            let items = vec![entry(1)];
+            let (state_root, proof) = build_jmt(&items);
+            let verified_header = header_with_state_root(state_root);
+            let mut provisions = provisions_with(proof, items);
+            provisions.source_shard = ShardId::leaf(1, 1);
+            let ctx = ProvisionsContext {
+                certified_header: &verified_header,
+            };
+            assert_eq!(
+                provisions.verify(&ctx),
+                Err(ProvisionsVerifyError::SourceShardMismatch)
+            );
+        }
+
+        /// A shard cannot answer for a cell it does not own, and absence
+        /// is the direction that needs saying so.
+        ///
+        /// The proof reconstructs from the source shard's prefix
+        /// downward, so the bits naming the shard reach no hash: an
+        /// absence taken from an empty slot of this shard's own tree
+        /// carries over to the same position under its sibling's prefix
+        /// untouched. A present entry cannot travel that way — the leaf
+        /// hash covers its key — which is why this is stated on an
+        /// absence.
+        #[test]
+        fn verify_rejects_an_absence_for_a_cell_the_source_shard_does_not_own() {
+            let items = vec![entry(1), entry(2)];
+            let (state_root, _) = build_jmt(&items);
+
+            // An honest absence for a cell this shard owns and lacks.
+            let absent = cell(0x40, 0x40);
+            let (_, honest) = {
+                let mut store = MemoryStore::new();
+                let updates: BTreeMap<JmtKey, Option<LeafValue>> = items
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.to_bytes(),
+                            Some(LeafValue::new(jmt_value_hash(v), v.len() as u64)),
+                        )
+                    })
+                    .collect();
+                let root_path = shard_prefix_path(SOURCE);
+                let result = Jmt::apply_updates_at(&store, None, 1, &root_path, &updates).unwrap();
+                store.apply(&result);
+                let proof =
+                    Jmt::prove(&store, &NodeKey::new(1, root_path), &[absent.to_bytes()]).unwrap();
+                (result.root_hash, proof)
+            };
+
+            // Relabel it onto the sibling shard's prefix — the same
+            // position, one bit up. Both the claim and the entry move,
+            // which is what a forging quorum controls.
+            let foreign = cell(0xC0, 0x40);
+            assert_ne!(
+                shard_prefix_path(SOURCE),
+                shard_prefix_path(ShardId::leaf(1, 1)),
+                "the two prefixes differ, so the relabel crosses shards"
+            );
+            let mut forged = honest;
+            for claim in &mut forged.claims {
+                claim.key = foreign.to_bytes();
+                if let ClaimTermination::LeafMismatch { stored_key, .. } = &mut claim.termination {
+                    stored_key[0] |= 0x80;
+                }
+            }
+
+            let verified_header = header_with_state_root(state_root);
+            let provisions = Provisions::new(
+                SOURCE,
+                ShardId::leaf(1, 1),
+                BlockHeight::new(1),
+                WeightedTimestamp::ZERO,
+                MerkleInclusionProof::new(forged.encode()),
+                vec![ProvisionEntry::new(
+                    TxHash::from(Hash::from_bytes(b"tx")),
+                    vec![SubstateEntry::new(foreign, None)],
+                )],
+            );
+            let ctx = ProvisionsContext {
+                certified_header: &verified_header,
+            };
+            assert_eq!(
+                provisions.verify(&ctx),
+                Err(ProvisionsVerifyError::BadInclusion)
+            );
+        }
+
         #[test]
         fn verify_rejects_a_mismatched_source_block_ts() {
             // The bundle claims a source anchor the commit-proven header
@@ -630,8 +756,8 @@ mod tests {
             let (state_root, proof) = build_jmt(&items);
             let verified_header = header_with_state_root(state_root);
             let provisions = Provisions::new(
+                SOURCE,
                 ShardId::leaf(1, 1),
-                ShardId::leaf(1, 0),
                 BlockHeight::new(1),
                 WeightedTimestamp::from_millis(1),
                 proof,

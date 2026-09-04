@@ -197,7 +197,7 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
         if proof.root_depth_bits != root_depth {
             return Err(ProofError::Malformed("proof rooted at unexpected depth"));
         }
-        check_claim_grid::<ARITY_BITS>(&proof.claims, root_depth)?;
+        check_claim_grid::<ARITY_BITS>(&proof.claims, root_path)?;
         if start > requested_end {
             return Err(ProofError::Malformed("inverted range"));
         }

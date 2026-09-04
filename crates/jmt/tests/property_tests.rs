@@ -14,8 +14,8 @@
 use std::collections::BTreeMap;
 
 use hyperscale_jmt::{
-    Blake3Hasher, EMPTY_HASH, Hash, KEY_BYTES, Key, LeafValue, MemoryStore, MultiProof, NodeKey,
-    Tree, TreeReader, ValueHash,
+    Blake3Hasher, EMPTY_HASH, Hash, KEY_BYTES, Key, LeafValue, MemoryStore, MultiProof, NibblePath,
+    NodeKey, Tree, TreeReader, ValueHash,
 };
 use proptest::prelude::*;
 
@@ -137,7 +137,7 @@ proptest! {
         let proof = Jmt::prove(&store, &root, &keys).unwrap();
         let expected: Vec<(Key, Option<ValueHash>)> =
             entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
-        Jmt::verify(&proof, root_hash, &expected).unwrap();
+        Jmt::verify(&proof, root_hash, &NibblePath::empty(), &expected).unwrap();
     }
 
     /// A subset of keys must also prove-and-verify correctly, exercising
@@ -162,7 +162,7 @@ proptest! {
         let proof = Jmt::prove(&store, &root, &subset_keys).unwrap();
         let expected: Vec<(Key, Option<ValueHash>)> =
             subset.iter().map(|(k, v)| (*k, Some(*v))).collect();
-        Jmt::verify(&proof, root_hash, &expected).unwrap();
+        Jmt::verify(&proof, root_hash, &NibblePath::empty(), &expected).unwrap();
     }
 
     /// Non-inclusion proofs: a key not in the tree must prove as absent.
@@ -178,7 +178,7 @@ proptest! {
         let (store, root_opt, root_hash) = build_tree(&entries);
         let root = root_opt.unwrap();
         let proof = Jmt::prove(&store, &root, &[absent]).unwrap();
-        Jmt::verify(&proof, root_hash, &[(absent, None)]).unwrap();
+        Jmt::verify(&proof, root_hash, &NibblePath::empty(), &[(absent, None)]).unwrap();
     }
 
     /// Mixed batch: some present, some absent.
@@ -210,7 +210,7 @@ proptest! {
         for a in &absent {
             expected.push((*a, None));
         }
-        Jmt::verify(&proof, root_hash, &expected).unwrap();
+        Jmt::verify(&proof, root_hash, &NibblePath::empty(), &expected).unwrap();
     }
 
     /// Tampering any single byte of a proof's siblings must cause verify
@@ -237,7 +237,7 @@ proptest! {
         proof.siblings[i][j] ^= 0xFF;
 
         let expected = vec![(k, Some(*entries.get(&k).unwrap()))];
-        let result = Jmt::verify(&proof, root_hash, &expected);
+        let result = Jmt::verify(&proof, root_hash, &NibblePath::empty(), &expected);
         prop_assert!(result.is_err());
     }
 
@@ -265,7 +265,7 @@ proptest! {
         }
 
         let expected = vec![(k, Some(*entries.get(&k).unwrap()))];
-        let result = Jmt::verify(&proof, root_hash, &expected);
+        let result = Jmt::verify(&proof, root_hash, &NibblePath::empty(), &expected);
         prop_assert!(result.is_err());
     }
 
@@ -396,7 +396,7 @@ proptest! {
         let proof = Jmt::prove(&store, &root, &keys).unwrap();
         let expected: Vec<(Key, Option<ValueHash>)> =
             entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
-        Jmt::verify(&proof, root_hash, &expected).unwrap();
+        Jmt::verify(&proof, root_hash, &NibblePath::empty(), &expected).unwrap();
     }
 
     /// Any proof generated from a random tree must encode+decode to an
@@ -429,7 +429,7 @@ proptest! {
         // Dedup because query may contain duplicates after extras overlap.
         expected.sort_by_key(|(k, _)| *k);
         expected.dedup_by_key(|(k, _)| *k);
-        Jmt::verify(&decoded, root_hash, &expected).unwrap();
+        Jmt::verify(&decoded, root_hash, &NibblePath::empty(), &expected).unwrap();
     }
 }
 

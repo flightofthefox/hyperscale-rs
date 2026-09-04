@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
-use hyperscale_jmt::{Key as JmtKey, MultiProof};
+use hyperscale_jmt::{Key as JmtKey, MultiProof, NibblePath};
 use hyperscale_provisions::build_provisions;
 use hyperscale_storage::test_helpers::{entry_key, make_settled_entries};
 use hyperscale_storage::tree::Jmt;
@@ -73,8 +73,13 @@ fn a_range_serves_its_leaves_and_the_receiver_rederives_the_interval() {
             )
         })
         .collect();
-    Jmt::verify(&proof, *source_root.as_raw().as_bytes(), &expected)
-        .expect("every entry leaf verifies against the source root");
+    Jmt::verify(
+        &proof,
+        *source_root.as_raw().as_bytes(),
+        &NibblePath::empty(),
+        &expected,
+    )
+    .expect("every entry leaf verifies against the source root");
 
     // The receiver re-derives the interval from the self-describing
     // leaves alone — the merge the executor's baseline performs.

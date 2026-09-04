@@ -125,7 +125,7 @@ mod tests {
         );
         let proof = response.proof.expect("the height is held");
         assert_eq!(
-            proof.inclusions(root, &keys).unwrap(),
+            proof.inclusions(root, SHARD, &keys).unwrap(),
             vec![(never, Inclusion::Absent), (committed, Inclusion::Present)]
         );
 

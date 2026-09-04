@@ -79,7 +79,8 @@ impl StateProofBundle {
     /// As [`MerkleInclusionProof::inclusions`]: a proof that does not
     /// decode, does not claim every key, or reconstructs another root.
     pub fn inclusions(&self) -> Result<Vec<(SubstateKey, Inclusion)>, StateProofError> {
-        self.proof.inclusions(self.anchor.state_root, &self.keys)
+        self.proof
+            .inclusions(self.anchor.state_root, self.anchor.shard, &self.keys)
     }
 }
 

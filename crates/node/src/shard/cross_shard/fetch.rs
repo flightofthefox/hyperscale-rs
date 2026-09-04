@@ -506,7 +506,7 @@ impl FetchBinding for StateProofBinding {
                     // Checked here so an unusable proof rotates the peer
                     // rather than reaching a block. What it says is read
                     // off the block that carries it, by every replica.
-                    if let Err(error) = proof.inclusions(anchor.state_root, &keys) {
+                    if let Err(error) = proof.inclusions(anchor.state_root, anchor.shard, &keys) {
                         tracing::warn!(
                             shard = ?anchor.shard,
                             height = anchor.height.inner(),

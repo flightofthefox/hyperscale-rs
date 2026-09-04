@@ -8242,7 +8242,7 @@ mod tests {
         present: &[SubstateKey],
         asked: &[SubstateKey],
     ) -> (StateProofBundle, Vec<Action>) {
-        let (state_root, proof) = state_and_proof(present, asked);
+        let (state_root, proof) = state_and_proof(shard, present, asked);
         let height = BlockHeight::new(height);
         let opened = state.on_committed_remote_header(schedule, shard, height, ts, state_root);
         let anchor = StateAnchor {

@@ -68,7 +68,7 @@
 //! decoded proof against a root or key set. Use [`Tree::verify`] for that.
 
 use crate::hasher::{EMPTY_HASH, Hash, Hasher};
-use crate::node::{KEY_BYTES, Key, MAX_DEPTH_BITS, Node, NodeKey, ValueHash, bits_at};
+use crate::node::{KEY_BYTES, Key, MAX_DEPTH_BITS, NibblePath, Node, NodeKey, ValueHash, bits_at};
 use crate::storage::TreeReader;
 use crate::tree::Tree;
 
@@ -212,7 +212,8 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
         })
     }
 
-    /// Verify a multiproof against an expected root.
+    /// Verify a multiproof against an expected root, rooted at
+    /// `root_path`.
     ///
     /// `expected_claims` is the application-level assertion: for each
     /// key the caller asserts what value (or absence) it expects. The
@@ -220,19 +221,33 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
     /// `expected_root` and that the proved results match the caller's
     /// assertions.
     ///
+    /// `root_path` is the prefix the tree is rooted at — the caller knows
+    /// it, and every claim must sit under it. The reconstruction reads a
+    /// key only from `root_path.len()` downward, so without this the bits
+    /// above it are unconstrained: a proof rooted at one subtree would
+    /// authenticate a key belonging to another. Presence is bound anyway,
+    /// since the leaf hash covers the key, but absence is not — an
+    /// `EmptySubtree` claim contributes the same empty hash whatever key
+    /// it names.
+    ///
     /// # Errors
     ///
     /// Returns [`ProofError::MissingClaim`] when `expected_claims`
     /// names a key the proof does not authenticate;
     /// [`ProofError::ValueMismatch`] when a claim disagrees with the
     /// expected value; [`ProofError::Malformed`] when the proof is
-    /// structurally invalid; and [`ProofError::RootMismatch`] when the
-    /// reconstructed root differs from `expected_root`.
+    /// structurally invalid or claims a key outside `root_path`; and
+    /// [`ProofError::RootMismatch`] when the reconstructed root differs
+    /// from `expected_root`.
     pub fn verify(
         proof: &MultiProof,
         expected_root: Hash,
+        root_path: &NibblePath,
         expected_claims: &[(Key, Option<ValueHash>)],
     ) -> Result<(), ProofError> {
+        if proof.root_depth_bits != root_path.len() {
+            return Err(ProofError::Malformed("proof rooted at unexpected depth"));
+        }
         // Cross-check each expected claim against the proof. Both are
         // keyed by 48-byte keys; sort expected and walk together with
         // proof.claims (which is sorted by prove()).
@@ -276,7 +291,7 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
             };
         }
 
-        check_claim_grid::<ARITY_BITS>(&proof.claims, proof.root_depth_bits)?;
+        check_claim_grid::<ARITY_BITS>(&proof.claims, root_path)?;
 
         // Reconstruct root by walking the claim topology, starting at the depth
         // the tree is rooted at (zero for a whole-keyspace tree).
@@ -300,18 +315,29 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
 // ============================================================
 
 /// Bound every claim onto the arity grid the reconstruction walks, at
-/// or below the proof root, and the root itself onto the grid.
+/// or below the proof root and under its path, and the root itself onto
+/// the grid.
 ///
 /// A claim off the grid never matches the recursion depth, so the
 /// bucket split would keep descending and `bits_at` would index a key
 /// byte past its end; bounding the whole claim set up front keeps the
 /// walk (and `siblings_needed`) from ever descending past the tree
 /// height on a peer-supplied proof.
+///
+/// A claim outside `root_path` is refused for a different reason: the
+/// walk never reads a key above the root depth, so those bits reach no
+/// hash and a claim naming a key in a sibling subtree reconstructs the
+/// same root as the honest one it was copied from.
 pub(crate) fn check_claim_grid<const ARITY_BITS: u8>(
     claims: &[ProofClaim],
-    root_depth_bits: u16,
+    root_path: &NibblePath,
 ) -> Result<(), ProofError> {
+    let root_depth_bits = root_path.len();
     for claim in claims {
+        if NibblePath::from_key_prefix(&claim.key, root_depth_bits) != *root_path {
+            return Err(ProofError::Malformed("claim key outside the proof root"));
+        }
+
         if claim.depth_bits > MAX_DEPTH_BITS
             || !claim.depth_bits.is_multiple_of(u16::from(ARITY_BITS))
         {
@@ -949,19 +975,37 @@ mod tests {
             panic!("second claim should be a LeafMismatch");
         }
 
-        let err = Jmt::verify(&proof, root_hash, &[(k(0), Some(v(0)))]).unwrap_err();
+        let err = Jmt::verify(
+            &proof,
+            root_hash,
+            &NibblePath::empty(),
+            &[(k(0), Some(v(0)))],
+        )
+        .unwrap_err();
         assert!(matches!(err, ProofError::Malformed(_)));
 
         // The untampered group still verifies.
         let clean = Jmt::prove(&store, &root, &[k(0), x]).unwrap();
-        Jmt::verify(&clean, root_hash, &[(k(0), Some(v(0)))]).unwrap();
+        Jmt::verify(
+            &clean,
+            root_hash,
+            &NibblePath::empty(),
+            &[(k(0), Some(v(0)))],
+        )
+        .unwrap();
     }
 
     #[test]
     fn prove_and_verify_single_inclusion() {
         let (store, root, root_hash) = build_store(&[(k(1), v(10)), (k(2), v(20))]);
         let proof = Jmt::prove(&store, &root, &[k(1)]).unwrap();
-        Jmt::verify(&proof, root_hash, &[(k(1), Some(v(10)))]).unwrap();
+        Jmt::verify(
+            &proof,
+            root_hash,
+            &NibblePath::empty(),
+            &[(k(1), Some(v(10)))],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -973,7 +1017,7 @@ mod tests {
         let proof = Jmt::prove(&store, &root, &keys).unwrap();
         let expected: Vec<(Key, Option<ValueHash>)> =
             entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
-        Jmt::verify(&proof, root_hash, &expected).unwrap();
+        Jmt::verify(&proof, root_hash, &NibblePath::empty(), &expected).unwrap();
     }
 
     #[test]
@@ -1011,11 +1055,23 @@ mod tests {
         let proof = Jmt::prove(&store, &root_key, &keys).unwrap();
         let expected: Vec<(Key, Option<ValueHash>)> =
             entries.iter().map(|(k, val)| (*k, Some(*val))).collect();
-        Jmt::verify(&proof, res.root_hash, &expected).unwrap();
+        Jmt::verify(&proof, res.root_hash, &prefix, &expected).unwrap();
 
         // Tampered value still fails against the prefix-rooted root.
-        let bad = Jmt::verify(&proof, res.root_hash, &[(entries[0].0, Some(v(255)))]).unwrap_err();
+        let bad = Jmt::verify(
+            &proof,
+            res.root_hash,
+            &prefix,
+            &[(entries[0].0, Some(v(255)))],
+        )
+        .unwrap_err();
         assert!(matches!(bad, ProofError::ValueMismatch));
+
+        // And the root path is checked, not merely carried: the same proof
+        // offered as a whole-keyspace one is refused.
+        let wrong_root =
+            Jmt::verify(&proof, res.root_hash, &NibblePath::empty(), &expected).unwrap_err();
+        assert!(matches!(wrong_root, ProofError::Malformed(_)));
     }
 
     #[test]
@@ -1023,14 +1079,20 @@ mod tests {
         let (store, root, root_hash) = build_store(&[(k(1), v(10)), (k(2), v(20))]);
         // k(99) isn't in the tree.
         let proof = Jmt::prove(&store, &root, &[k(99)]).unwrap();
-        Jmt::verify(&proof, root_hash, &[(k(99), None)]).unwrap();
+        Jmt::verify(&proof, root_hash, &NibblePath::empty(), &[(k(99), None)]).unwrap();
     }
 
     #[test]
     fn verify_rejects_wrong_value() {
         let (store, root, root_hash) = build_store(&[(k(1), v(10))]);
         let proof = Jmt::prove(&store, &root, &[k(1)]).unwrap();
-        let err = Jmt::verify(&proof, root_hash, &[(k(1), Some(v(99)))]).unwrap_err();
+        let err = Jmt::verify(
+            &proof,
+            root_hash,
+            &NibblePath::empty(),
+            &[(k(1), Some(v(99)))],
+        )
+        .unwrap_err();
         assert!(matches!(err, ProofError::ValueMismatch));
     }
 
@@ -1038,7 +1100,13 @@ mod tests {
     fn verify_rejects_wrong_root() {
         let (store, root, _root_hash) = build_store(&[(k(1), v(10))]);
         let proof = Jmt::prove(&store, &root, &[k(1)]).unwrap();
-        let err = Jmt::verify(&proof, [0xAA; 32], &[(k(1), Some(v(10)))]).unwrap_err();
+        let err = Jmt::verify(
+            &proof,
+            [0xAA; 32],
+            &NibblePath::empty(),
+            &[(k(1), Some(v(10)))],
+        )
+        .unwrap_err();
         assert!(matches!(err, ProofError::RootMismatch));
     }
 
@@ -1050,7 +1118,13 @@ mod tests {
         if let Some(sib) = proof.siblings.first_mut() {
             sib[0] ^= 0xFF;
         }
-        let err = Jmt::verify(&proof, root_hash, &[(k(1), Some(v(10)))]).unwrap_err();
+        let err = Jmt::verify(
+            &proof,
+            root_hash,
+            &NibblePath::empty(),
+            &[(k(1), Some(v(10)))],
+        )
+        .unwrap_err();
         assert!(matches!(err, ProofError::RootMismatch));
     }
 
@@ -1066,7 +1140,8 @@ mod tests {
             stored_key: claim.key,
             stored_value_hash: claim.value_hash.take().unwrap(),
         };
-        let err = Jmt::verify(&proof, root_hash, &[(k(1), None)]).unwrap_err();
+        let err =
+            Jmt::verify(&proof, root_hash, &NibblePath::empty(), &[(k(1), None)]).unwrap_err();
         assert!(matches!(err, ProofError::Malformed(_)), "{err:?}");
     }
 
@@ -1086,7 +1161,7 @@ mod tests {
         } else {
             panic!("the claim should be a LeafMismatch");
         }
-        let err = Jmt::verify(&proof, root_hash, &[(x, None)]).unwrap_err();
+        let err = Jmt::verify(&proof, root_hash, &NibblePath::empty(), &[(x, None)]).unwrap_err();
         assert!(matches!(err, ProofError::Malformed(_)), "{err:?}");
         assert!(prefix_agrees(&k(0), &k(1), 0));
         assert!(!prefix_agrees(&[0x80; KEY_BYTES], &[0x00; KEY_BYTES], 1));
@@ -1100,6 +1175,7 @@ mod tests {
         Jmt::verify(
             &proof,
             root_hash,
+            &NibblePath::empty(),
             &[(k(1), Some(v(10))), (k(3), Some(v(30))), (k(99), None)],
         )
         .unwrap();
@@ -1129,7 +1205,7 @@ mod tests {
 
         let (store, root, root_hash) = build_store(&[(k1, v(1)), (k2, v(2))]);
         let proof = Jmt::prove(&store, &root, &[k1]).unwrap();
-        Jmt::verify(&proof, root_hash, &[(k1, Some(v(1)))]).unwrap();
+        Jmt::verify(&proof, root_hash, &NibblePath::empty(), &[(k1, Some(v(1)))]).unwrap();
     }
 
     #[test]
@@ -1146,7 +1222,7 @@ mod tests {
         let proof = Jmt::prove(&store, &root, &keys).unwrap();
         let expected: Vec<(Key, Option<ValueHash>)> =
             entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
-        Jmt::verify(&proof, root_hash, &expected).unwrap();
+        Jmt::verify(&proof, root_hash, &NibblePath::empty(), &expected).unwrap();
 
         // Also try a subset of keys.
         let subset: Vec<Key> = keys.iter().take(10).copied().collect();
@@ -1156,7 +1232,7 @@ mod tests {
             .take(10)
             .map(|(k, v)| (*k, Some(*v)))
             .collect();
-        Jmt::verify(&sub_proof, root_hash, &sub_expected).unwrap();
+        Jmt::verify(&sub_proof, root_hash, &NibblePath::empty(), &sub_expected).unwrap();
     }
 
     #[test]
@@ -1176,7 +1252,7 @@ mod tests {
         let proof = Jmt4::prove(&store, &root, &keys).unwrap();
         let expected: Vec<(Key, Option<ValueHash>)> =
             entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
-        Jmt4::verify(&proof, res.root_hash, &expected).unwrap();
+        Jmt4::verify(&proof, res.root_hash, &NibblePath::empty(), &expected).unwrap();
     }
 
     // ========================================================
@@ -1212,6 +1288,7 @@ mod tests {
         Jmt::verify(
             &decoded,
             root_hash,
+            &NibblePath::empty(),
             &[(k(1), Some(v(10))), (k(3), Some(v(30)))],
         )
         .unwrap();
@@ -1226,7 +1303,7 @@ mod tests {
         let decoded = MultiProof::decode(&bytes).unwrap();
         assert_eq!(proof, decoded);
 
-        Jmt::verify(&decoded, root_hash, &[(k(99), None)]).unwrap();
+        Jmt::verify(&decoded, root_hash, &NibblePath::empty(), &[(k(99), None)]).unwrap();
     }
 
     #[test]
@@ -1248,7 +1325,7 @@ mod tests {
         let decoded = MultiProof::decode(&bytes).unwrap();
         assert_eq!(proof, decoded);
 
-        Jmt::verify(&decoded, root_hash, &[(other, None)]).unwrap();
+        Jmt::verify(&decoded, root_hash, &NibblePath::empty(), &[(other, None)]).unwrap();
     }
 
     #[test]
@@ -1373,7 +1450,7 @@ mod tests {
             }],
             siblings: vec![EMPTY_HASH; MAX_DEPTH_BITS as usize],
         };
-        let err = Jmt4::verify(&proof, [0u8; 32], &[]).unwrap_err();
+        let err = Jmt4::verify(&proof, [0u8; 32], &NibblePath::empty(), &[]).unwrap_err();
         assert!(matches!(err, ProofError::Malformed(_)));
     }
 
@@ -1393,7 +1470,10 @@ mod tests {
             }],
             siblings: vec![EMPTY_HASH; MAX_DEPTH_BITS as usize],
         };
-        let err = Jmt::verify(&proof, [0u8; 32], &[]).unwrap_err();
+        // Rooted where the claim's key sits, so the depth check is what
+        // this reaches rather than the root-path one.
+        let root_path = NibblePath::from_key_prefix(&k(1), 1);
+        let err = Jmt::verify(&proof, [0u8; 32], &root_path, &[]).unwrap_err();
         assert!(matches!(
             err,
             ProofError::Malformed("claim depth above the proof root")
@@ -1408,5 +1488,55 @@ mod tests {
         let a = proof.encode();
         let b = proof.encode();
         assert_eq!(a, b);
+    }
+
+    /// A proof rooted at one subtree does not answer for a key belonging
+    /// to a sibling subtree.
+    ///
+    /// The reconstruction reads a key only from the root depth down, so
+    /// relabelling the bits above it changes nothing it hashes. Presence
+    /// survives that on its own — the leaf hash covers the key — but an
+    /// absence does not, and an absence is what licenses the reader to
+    /// act as though a cell is not there.
+    #[test]
+    fn verify_rejects_a_claim_from_a_sibling_subtree() {
+        let mut prefix = NibblePath::empty();
+        prefix.push_bits(0, 1);
+        let under = |first: u8, body: u8| {
+            let mut key = [0u8; KEY_BYTES];
+            key[0] = (first << 7) | (body >> 1);
+            key[1] = body;
+            key
+        };
+
+        let mut store = MemoryStore::new();
+        let updates: BTreeMap<Key, Option<LeafValue>> = (1..=6u8)
+            .map(|i| (under(0, i), Some(LeafValue::new(v(i), 1))))
+            .collect();
+        let res = Jmt::apply_updates_at(&store, None, 1, &prefix, &updates).unwrap();
+        store.apply(&res);
+        let root_key = store.get_root_key(1).unwrap();
+
+        // An honest absence for a key this subtree does own.
+        let absent = under(0, 200);
+        let honest = Jmt::prove(&store, &root_key, &[absent]).unwrap();
+        Jmt::verify(&honest, res.root_hash, &prefix, &[(absent, None)]).unwrap();
+
+        // The same proof relabelled onto the sibling subtree: every bit
+        // below the root depth is identical, so the reconstruction is
+        // untouched.
+        let foreign = under(1, 200);
+        let mut forged = honest;
+        for claim in &mut forged.claims {
+            claim.key = foreign;
+            if let ClaimTermination::LeafMismatch { stored_key, .. } = &mut claim.termination {
+                stored_key[0] |= 0x80;
+            }
+        }
+        let err = Jmt::verify(&forged, res.root_hash, &prefix, &[(foreign, None)]).unwrap_err();
+        assert!(matches!(
+            err,
+            ProofError::Malformed("claim key outside the proof root")
+        ));
     }
 }
