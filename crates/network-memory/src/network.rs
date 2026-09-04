@@ -36,7 +36,9 @@ use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network::fault::{Decision, Engine, FaultBuilder, HostId, MessageContext, Tier};
+use hyperscale_network::fault::{
+    Decision, DropSpec, Engine, FaultBuilder, HostId, MessageContext, Rewrite, RuleHandle, Tier,
+};
 use hyperscale_network::{HandlerRegistry, RequestError, ResponseVerdict, compression};
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use rand::RngExt;
@@ -615,6 +617,29 @@ impl SimulatedNetwork {
         FaultBuilder::new(&mut self.faults)
     }
 
+    /// Install a rewrite over the responses `host` serves for `type_id`.
+    ///
+    /// The byzantine seam: the host answers, and answers wrongly. A drop
+    /// rule can only make it silent, which every fetch path already has a
+    /// fallback for; what an evidence check is exercised by is a
+    /// well-formed answer that says the wrong thing.
+    pub fn rewrite_responses(
+        &mut self,
+        host: NodeIndex,
+        type_id: &'static str,
+        rewrite: Rewrite,
+    ) -> RuleHandle {
+        self.faults.install_rewrite(
+            &DropSpec {
+                type_id: Some(type_id),
+                from: Some(HostId(host)),
+                tier: Some(Tier::Response),
+                ..DropSpec::default()
+            },
+            rewrite,
+        )
+    }
+
     /// Set the traffic analyzer for bandwidth metrics recording.
     pub fn set_traffic_analyzer(&mut self, analyzer: Arc<NetworkTrafficAnalyzer>) {
         self.traffic_analyzer = Some(analyzer);
@@ -1083,7 +1108,19 @@ impl SimulatedNetwork {
         else {
             return AttemptOutcome::HardError { rtt };
         };
-        let response_bytes = handler(body);
+        // The answering host's own bytes, before any rewrite installed on
+        // it: a byzantine responder is one that answers wrongly, which is
+        // the one thing a drop rule cannot model.
+        let response_bytes = self.faults.rewrite(
+            &MessageContext {
+                sender: HostId(peer),
+                recipient: HostId(requester),
+                type_id,
+                tier: Tier::Response,
+            },
+            body,
+            handler(body),
+        );
         if response_bytes.is_empty() {
             return AttemptOutcome::HardError { rtt };
         }

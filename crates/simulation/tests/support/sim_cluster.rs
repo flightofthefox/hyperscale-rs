@@ -14,7 +14,7 @@ use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_engine::{PreviewGrants, PreviewInputs, PreviewReport, TickEnvironment};
 use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
-use hyperscale_network::fault::{HostId, RuleHandle};
+use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::query::{RanAs, chain_fate, chain_membership, status_rank};
@@ -402,6 +402,30 @@ impl SimCluster {
     /// Panics if `host` does not serve `shard`, or if the rejoin does not
     /// take the retained-storage path — a snap-sync there would be a
     /// different test entirely.
+    /// Make `host` answer requests of `type_id` with what `rewrite`
+    /// returns, given the request's bytes and the answer it was about to
+    /// send.
+    ///
+    /// The byzantine seam, and sim-only for the same reason
+    /// [`Self::restart_host`] is: the portable surface is the
+    /// intersection of what both harnesses do, and a host that answers
+    /// wrongly is a transport the libp2p gate has no hook for. A drop
+    /// rule can only make a responder silent, which every fetch path has
+    /// a fallback for; what an evidence check is exercised by is a
+    /// well-formed answer that says the wrong thing.
+    pub fn rewrite_responses(
+        &mut self,
+        host: usize,
+        type_id: &'static str,
+        rewrite: Rewrite,
+    ) -> FaultHandle {
+        let handle =
+            self.runner
+                .network_mut()
+                .rewrite_responses(host_index(host), type_id, rewrite);
+        FaultHandle::new(move || handle.fired())
+    }
+
     pub fn restart_host(&mut self, host: usize, shard: ShardId) {
         let host = host_index(host);
         let validator = self

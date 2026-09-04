@@ -163,6 +163,36 @@ struct FaultRule {
     fired: Arc<AtomicU64>,
 }
 
+/// What a byzantine host answers with: the request's bytes and the
+/// answer it was about to send, in; the answer it actually sends, out.
+pub type Rewrite = Arc<dyn Fn(&[u8], &[u8]) -> Vec<u8> + Send + Sync>;
+
+/// A rewrite installed over one host's outbound payloads: the bytes a
+/// matching dispatch carries are replaced by what the closure returns.
+///
+/// The one thing a drop rule cannot model. A host that answers wrongly is
+/// not a host that goes quiet — every evidence seam in the protocol is a
+/// payload checked against something, and a suppressed payload exercises
+/// the fetch fallback rather than the check. Held apart from the drop
+/// rules because it composes with them rather than competing: a dispatch
+/// the rules pass is what a rewrite gets to touch.
+struct RewriteRule {
+    id: u64,
+    matcher: Matcher,
+    rewrite: Rewrite,
+    fired: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for RewriteRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RewriteRule")
+            .field("id", &self.id)
+            .field("matcher", &self.matcher)
+            .field("fired", &self.fired.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
 /// Handle returned by [`RuleBuilder::install`]. Cheaply cloneable.
 ///
 /// Holds the fire counter shared with the live rule; reads always reflect the
@@ -193,6 +223,7 @@ impl RuleHandle {
 #[derive(Debug)]
 pub struct Engine {
     rules: Vec<FaultRule>,
+    rewrites: Vec<RewriteRule>,
     next_id: u64,
     blocked: HashSet<(HostId, HostId)>,
     rng: Mutex<ChaCha8Rng>,
@@ -204,6 +235,7 @@ impl Engine {
     pub fn new(seed: u64) -> Self {
         Self {
             rules: Vec::new(),
+            rewrites: Vec::new(),
             next_id: 0,
             blocked: HashSet::new(),
             rng: Mutex::new(ChaCha8Rng::seed_from_u64(seed ^ FAULT_SALT)),
@@ -240,14 +272,77 @@ impl Engine {
 
     /// Remove a rule by handle. Returns true if a rule was removed.
     pub fn remove(&mut self, handle: &RuleHandle) -> bool {
-        let before = self.rules.len();
+        let before = self.rules.len() + self.rewrites.len();
         self.rules.retain(|r| r.id != handle.id);
-        self.rules.len() < before
+        self.rewrites.retain(|r| r.id != handle.id);
+        self.rules.len() + self.rewrites.len() < before
     }
 
-    /// Remove every installed drop rule (leaves the block-set intact).
+    /// Remove every installed drop rule and rewrite (leaves the block-set
+    /// intact).
     pub fn clear(&mut self) {
         self.rules.clear();
+        self.rewrites.clear();
+    }
+
+    // ── Rewrites ─────────────────────────────────────────────────────────
+
+    /// Install a rewrite over the payloads a matching dispatch carries.
+    ///
+    /// `spec`'s probability and window are ignored: a byzantine host
+    /// answers wrongly whenever it is asked, and a scenario that wants it
+    /// to start or stop lying installs and removes the rule.
+    pub fn install_rewrite(&mut self, spec: &DropSpec, rewrite: Rewrite) -> RuleHandle {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut matcher = Matcher::default();
+        if let Some(type_id) = spec.type_id {
+            matcher.types = TypeFilter::OneOf(vec![type_id]);
+        }
+        if let Some(from) = spec.from {
+            matcher.sender = HostFilter::Is(from);
+        }
+        if let Some(to) = spec.to {
+            matcher.recipient = HostFilter::Is(to);
+        }
+        if let Some(tier) = spec.tier {
+            matcher.tier = TierFilter::OneOf(vec![tier]);
+        }
+        let fire_counter = Arc::new(AtomicU64::new(0));
+        self.rewrites.push(RewriteRule {
+            id,
+            matcher,
+            rewrite,
+            fired: Arc::clone(&fire_counter),
+        });
+        RuleHandle {
+            id,
+            fired: fire_counter,
+        }
+    }
+
+    /// The bytes a matching dispatch actually carries.
+    ///
+    /// The first matching rewrite decides, in install order — the same
+    /// rule the drop path follows, so two rules over one type read the
+    /// same way whichever kind they are. Returns `bytes` unchanged when
+    /// nothing matches, which is every dispatch in a run that installed
+    /// no rewrite.
+    ///
+    /// `asked` is what the dispatch answers — the request's own bytes on
+    /// a response leg. A forgery worth checking is rarely a mangled
+    /// payload: it is a well-formed answer to a different question, and
+    /// the question has to be in reach to build one.
+    #[must_use]
+    pub fn rewrite(&self, ctx: &MessageContext<'_>, asked: &[u8], bytes: Vec<u8>) -> Vec<u8> {
+        for rule in &self.rewrites {
+            if !rule.matcher.matches(ctx) {
+                continue;
+            }
+            rule.fired.fetch_add(1, Ordering::Relaxed);
+            return (rule.rewrite)(asked, &bytes);
+        }
+        bytes
     }
 
     fn install(&mut self, matcher: Matcher, action: FaultAction, window: TimeWindow) -> RuleHandle {

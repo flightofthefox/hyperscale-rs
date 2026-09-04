@@ -1,0 +1,137 @@
+//! A host that answers, and answers wrongly.
+//!
+//! Every evidence seam in the protocol is a payload checked against
+//! something the checker already holds, and a drop rule cannot reach any
+//! of them: a suppressed answer exercises the fetch fallback, not the
+//! check. So these run against a host whose responses are rewritten in
+//! flight — the smallest thing that puts a forgery in front of a checker.
+//!
+//! Sim-only. The rewrite hooks the in-memory transport's response leg,
+//! which the libp2p gate has no counterpart for, so the portable
+//! `FaultableCluster` surface does not carry it.
+
+mod support;
+
+use std::sync::Arc;
+
+use hyperscale_scenarios::query::{declared_price, vault_balance};
+use hyperscale_scenarios::tx::{
+    build_transfer_tx, cross_shard_cast, cross_shard_genesis_accounts, validity_around,
+};
+use hyperscale_scenarios::wait::await_tx_terminal;
+use hyperscale_scenarios::{Cluster, FaultableCluster, ScenarioConfig, epochs};
+use hyperscale_types::{
+    ShardId, TransactionDecision, TransactionStatus, WeightedTimestamp, lapse_probe_anchor,
+};
+use support::SimCluster;
+
+/// Two shards, four validators each, resharding disarmed — the topology
+/// the delivery-lapse scenarios use, so the reclaim under test is the one
+/// they already pin honestly.
+const fn cross_shard_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 4,
+        num_shards: 2,
+        split_bytes: u64::MAX,
+        latency: std::time::Duration::from_millis(150),
+    }
+}
+
+/// A forged state proof convinces nobody, and the reclaim it was meant to
+/// forge lands anyway from an honest peer.
+///
+/// The lapse arm rests on a proof: the payer's shard reads the delivery's
+/// claim cell absent from the recipient's committed state past `L`, and
+/// that absence is what licenses taking the crossing back. Every part of
+/// that is checked at the fetch — the anchor's root, the keys asked, the
+/// proof's own reconstruction — and this is the scenario that makes one
+/// responder attack it rather than assuming the checks hold.
+///
+/// One host of the recipient's committee answers every state-proof
+/// request with a payload that reconstructs nothing. The requester must
+/// refuse it and rotate: the proof it eventually carries into a block is
+/// an honest peer's, the reclaim commits, and the payment comes back. A
+/// checker that took the forgery would reclaim on a proof of nothing —
+/// which, for a delivery that had claimed, is the crossing disposed
+/// twice.
+#[test]
+fn a_forged_state_proof_convinces_nobody() {
+    let mut cluster =
+        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
+    let (payer_key, from, to) = cross_shard_cast();
+    let payer_shard = ShardId::leaf(1, 0);
+    let recipient_shard = ShardId::leaf(1, 1);
+
+    cluster.run_faultable(|c| {
+        let before = vault_balance(c, payer_shard, from);
+        let recipient_before = vault_balance(c, recipient_shard, to);
+
+        // One host of the shard the proof is asked of answers with bytes
+        // that decode to nothing usable. Its peers answer honestly, which
+        // is what makes this a rotation rather than an outage.
+        let liar = *c
+            .committee_hosts(recipient_shard)
+            .first()
+            .expect("the recipient's shard has a seated committee");
+        let forged = c.rewrite_responses(
+            liar,
+            "state_proof.request",
+            Arc::new(|_asked: &[u8], _honest: &[u8]| vec![0xFF; 64]),
+        );
+
+        // The bundle never reaches the recipient, so the delivery lapses
+        // and the payer asks the recipient's chain about the claim cell.
+        let broadcast_dropped = c.drop_type("provisions.broadcast");
+        let fetch_dropped = c.drop_type("provision.request");
+
+        let validity = validity_around(c.now());
+        let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
+        let price = declared_price(c, &tx);
+        let hash = tx.hash();
+        c.submit(Arc::new(tx));
+
+        let verdict = await_tx_terminal(c, hash, epochs(8));
+        assert!(
+            matches!(
+                verdict,
+                Some(TransactionStatus::Completed(TransactionDecision::Accept))
+            ),
+            "the payer's leg settles alone and accepts; verdict = {verdict:?}",
+        );
+        assert!(
+            c.run_until(epochs(4), |c| vault_balance(c, payer_shard, from)
+                == before - 100 - price),
+            "the leg pays the payment and the price",
+        );
+
+        let lapse = lapse_probe_anchor(validity.end_timestamp_exclusive);
+        assert!(
+            c.run_until(epochs(12), |c| WeightedTimestamp::ZERO.plus(c.now())
+                >= lapse),
+            "the cut must stand past the lapse",
+        );
+        assert!(
+            broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
+            "both bundle channels must actually have been exercised and cut",
+        );
+
+        // The reclaim lands on an honest peer's proof.
+        assert!(
+            c.run_until(epochs(10), |c| vault_balance(c, payer_shard, from)
+                == before - price),
+            "the payment must come back on a proof the checks accept; holds {}",
+            vault_balance(c, payer_shard, from),
+        );
+        assert!(
+            forged.fired() > 0,
+            "the forgery has to have been served, or nothing was attacked",
+        );
+        assert_eq!(
+            vault_balance(c, recipient_shard, to),
+            recipient_before,
+            "the recipient was never credited",
+        );
+    });
+}
