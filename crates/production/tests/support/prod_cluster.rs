@@ -16,7 +16,7 @@ use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network_libp2p::fault::{DropSpec, HostId, RuleHandle};
 use hyperscale_network_libp2p::test_utils::TestFixtures;
 use hyperscale_production::LocalValidator;
-use hyperscale_scenarios::query::status_rank;
+use hyperscale_scenarios::query::{RanAs, status_rank};
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, vote_reshape_threshold,
@@ -293,6 +293,10 @@ impl Cluster for ProdCluster {
 
     fn committed_work_in_flight(&self, shard: ShardId) -> Option<WorkInFlight> {
         self.inner.committed_work_in_flight(shard)
+    }
+
+    fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs> {
+        self.inner.ran(shard, tx)
     }
 
     fn chain_fate(

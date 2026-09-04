@@ -41,7 +41,10 @@ use hyperscale_engine::legs::{
     Classified, Runs, Side, core_claims, crossings_of, delivered_claims,
 };
 use hyperscale_engine::{TickEnvironment, build_fee_receipt};
-use hyperscale_metrics::{record_rebuilt_verdict_entry, record_unresolvable_tx};
+use hyperscale_metrics::{
+    record_rebuilt_verdict_entry, record_reclaim_admitted, record_reclaim_probe_answered,
+    record_unresolvable_tx,
+};
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
 use hyperscale_types::{
     AbandonmentRecord, Absence, Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader,
@@ -1169,6 +1172,7 @@ impl ExecutionCoordinator {
             );
             self.ticks.assign_tx(tx_hash, tick_id);
             self.unresolved.admit_reclaim(tx_hash);
+            record_reclaim_admitted();
             requests.push(CrossShardExecutionRequest {
                 tx_hash,
                 transaction,
@@ -2680,6 +2684,7 @@ impl ExecutionCoordinator {
                         continue;
                     }
                     self.answers.insert(slot, answer);
+                    record_reclaim_probe_answered(inclusion == Inclusion::Present);
                     let tx_hash = entry.tx_hash;
                     actions.push(match answer {
                         // The core took it, and its certificate says how.

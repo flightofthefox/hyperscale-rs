@@ -12,6 +12,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyperscale_engine::XRD;
 use hyperscale_types::{
@@ -21,6 +22,17 @@ use hyperscale_types::{
 use super::query::{assert_a_full_block_fits, declared_price, held, held_at, owning_shard};
 use super::tx::{recipient, sender};
 use super::{Budget, Cluster};
+
+/// How long a settled world is held settled before it is asserted.
+///
+/// The equality a scenario drives to is reached on the way past if value
+/// comes back twice, so the sample that matters is the one taken after
+/// the chain has had room to credit it again. A duplicate reclaim is
+/// composed by a proposer a block or two behind the first, and the
+/// harness advances its clock a second at a time on either harness, so
+/// a handful of seconds covers several blocks without pricing a beacon
+/// epoch into every conservation check.
+const SETTLED_TAIL: Duration = Duration::from_secs(5);
 
 /// The world a [`build_probe_transfer_tx`](super::tx::build_probe_transfer_tx)
 /// train reaches: the first genesis-funded sender and recipient, in XRD.
@@ -97,9 +109,12 @@ impl World {
     }
 
     /// Drive until the world settles against what `charges` burned, then
-    /// assert it: a delivery lands a hop after its verdict and a burn a
-    /// block after its status, so the equality is reached rather than
-    /// read at an instant.
+    /// hold it there for [`SETTLED_TAIL`] and assert it: a delivery lands
+    /// a hop after its verdict and a burn a block after its status, so
+    /// the equality is reached rather than read at an instant — and a
+    /// second credit of the same value reaches it on the way past, so
+    /// reading it once says nothing about how many times value came
+    /// back.
     ///
     /// # Panics
     ///
@@ -112,6 +127,8 @@ impl World {
         context: &str,
     ) {
         let _ = c.run_until(budget, |c| self.settles(c, charges.burned(c)));
+        let tail = c.now() + SETTLED_TAIL;
+        let _ = c.run_until(budget, |c| c.now() >= tail);
         self.assert_settled(c, charges.burned(c), context);
         charges.assert_each_fits_a_full_block(c);
     }

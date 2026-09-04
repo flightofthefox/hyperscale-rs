@@ -154,6 +154,12 @@ pub struct Metrics {
     /// across a shard's replicas: an outlier is one whose rebuild missed
     /// the transaction's own block.
     pub rebuilt_verdict_entries: Counter,
+    /// Counterpart cells a committed proof answered for, by whether the
+    /// cell was present. An absent answer is what licenses a reclaim.
+    pub reclaim_probes_answered: CounterVec,
+    /// Reclaims admitted into a tick — escrowed value taken back on
+    /// committed evidence.
+    pub reclaims_admitted: Counter,
 
     // === Network class accounting ===
     /// Per-class in-flight request slot count.
@@ -747,6 +753,19 @@ impl Metrics {
             )
             .unwrap(),
 
+            reclaim_probes_answered: register_counter_vec!(
+                "hyperscale_reclaim_probes_answered_total",
+                "Counterpart cells a committed state proof answered for, by presence",
+                &["presence"]
+            )
+            .unwrap(),
+
+            reclaims_admitted: register_counter!(
+                "hyperscale_reclaims_admitted_total",
+                "Reclaims admitted into a tick on committed evidence"
+            )
+            .unwrap(),
+
             request_slots_in_flight: register_gauge_vec!(
                 "hyperscale_request_slots_in_flight",
                 "In-flight request slots, broken down by message class",
@@ -1047,6 +1066,18 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_rebuilt_verdict_entry(&self) {
         self.metrics.rebuilt_verdict_entries.inc();
+    }
+
+    fn record_reclaim_probe_answered(&self, present: bool) {
+        let label = if present { "present" } else { "absent" };
+        self.metrics
+            .reclaim_probes_answered
+            .with_label_values(&[label])
+            .inc();
+    }
+
+    fn record_reclaim_admitted(&self) {
+        self.metrics.reclaims_admitted.inc();
     }
 
     fn set_request_slots_in_flight(&self, class: &str, count: usize) {

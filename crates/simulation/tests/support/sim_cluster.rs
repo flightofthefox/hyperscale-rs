@@ -17,7 +17,7 @@ use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network::fault::{HostId, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
-use hyperscale_scenarios::query::{chain_fate, status_rank};
+use hyperscale_scenarios::query::{RanAs, chain_fate, chain_membership, status_rank};
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, vote_reshape_threshold,
@@ -597,6 +597,12 @@ impl Cluster for SimCluster {
             .max_by_key(|store| ShardChainReader::committed_height(*store))
             .and_then(|store| store.get_certified_header(store.committed_height()))
             .map(|header| header.header().work_in_flight())
+    }
+
+    fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs> {
+        (0..self.runner.num_hosts())
+            .find_map(|host| self.runner.hosts_shard(host, shard))
+            .map_or_else(Vec::new, |store| chain_membership(store, tx))
     }
 
     fn chain_fate(

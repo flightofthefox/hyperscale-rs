@@ -184,6 +184,105 @@ pub fn chain_fate(
     (committed, finalized)
 }
 
+/// One thing a shard's own certificate said it ran of a transaction.
+///
+/// Read off the local execution certificate's outcome, so it is the
+/// membership the shard froze and attested rather than anything a
+/// scenario can infer from an end state: a whole-shape run and a divided
+/// one reach the same balances, and differ here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RanAs {
+    /// The other shards whose certificates this shard's settlement
+    /// waited on. Empty for a leg, a delivery, or a single-shard core.
+    pub awaited: Vec<ShardId>,
+    /// Whether this outcome bore the verdict on the transaction. False
+    /// for a leg that succeeded and for a delivering member.
+    pub decides: bool,
+    /// Whether the transaction reached beyond this shard. False for a
+    /// member this shard composed for itself — a reclaim or a
+    /// retirement.
+    pub reaches_beyond: bool,
+    /// The shards this execution's crossings were issued to.
+    pub crossing_targets: Vec<ShardId>,
+}
+
+impl RanAs {
+    /// Whether this is a member the shard composed for itself off
+    /// committed evidence — a reclaim or a retirement — rather than one
+    /// the transaction's own admission put there.
+    #[must_use]
+    pub const fn is_local_only(&self) -> bool {
+        !self.reaches_beyond
+    }
+}
+
+/// Walk `store`'s committed chain for everything its own certificates
+/// said it ran of `tx`, in commit order.
+///
+/// Empty until a finalization whose local certificate names `tx` has
+/// committed, and more than one entry where the shard ran a member and
+/// later composed a reclaim or a retirement for the same transaction.
+#[must_use]
+pub fn chain_membership(store: &impl ShardChainReader, tx: TxHash) -> Vec<RanAs> {
+    let tip = store.committed_height();
+    let mut ran = Vec::new();
+    let mut height = BlockHeight::new(1);
+    while height <= tip {
+        if let Some(certified) = store.get_block(height) {
+            for fw in certified.block().certificates().iter() {
+                ran.extend(
+                    fw.local_ec()
+                        .tx_outcomes()
+                        .iter()
+                        .filter(|outcome| outcome.tx_hash() == tx)
+                        .map(|outcome| RanAs {
+                            awaited: outcome.counterparts().to_vec(),
+                            decides: outcome.decides(),
+                            reaches_beyond: outcome.reaches_beyond(),
+                            crossing_targets: outcome.crossing_targets().to_vec(),
+                        }),
+                );
+            }
+        }
+        height = height.next();
+    }
+    ran
+}
+
+/// Assert `shard` ran `tx` divided — nothing it attested for a
+/// transaction reaching past it bore the verdict — and composed exactly
+/// one member of its own off committed evidence.
+///
+/// The reclaim of a refused leg is that member. Under whole-shape
+/// replication the shard would attest one deciding member reaching
+/// beyond and compose nothing of its own, and every end state the
+/// refusal scenarios assert would be reached identically; this is what
+/// tells the two apart.
+///
+/// # Panics
+///
+/// Panics if the shard attested nothing for `tx`, if anything it
+/// attested for the wider transaction decided it, or if it composed any
+/// number of local members but one.
+pub fn assert_reclaimed_leg<C: Cluster + ?Sized>(c: &C, shard: ShardId, tx: TxHash, context: &str) {
+    let ran = c.ran(shard, tx);
+    assert!(
+        !ran.is_empty(),
+        "{context}: {shard:?} attested nothing for the transaction",
+    );
+    let deciding = ran.iter().filter(|r| r.reaches_beyond && r.decides).count();
+    assert_eq!(
+        deciding, 0,
+        "{context}: {shard:?} ran a leg, which decides nothing — a member \
+         deciding here is the whole shape replicated; ran {ran:?}",
+    );
+    let reclaims = ran.iter().filter(|r| r.is_local_only()).count();
+    assert_eq!(
+        reclaims, 1,
+        "{context}: {shard:?} reclaims the leg's crossing exactly once; ran {ran:?}",
+    );
+}
+
 /// The committed balance of `owner`'s native vault on `shard`, read through
 /// the harness's client-proven snapshot seam.
 ///

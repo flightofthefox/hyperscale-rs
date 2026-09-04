@@ -29,7 +29,7 @@ use hyperscale_vm_effects::{InstanceMeta, Value, child_key};
 use hyperscale_vm_fixtures::amm;
 
 use crate::support::conservation::{Charges, World};
-use crate::support::query::{declared_price, held, held_at, vault_balance};
+use crate::support::query::{assert_reclaimed_leg, declared_price, held, held_at, vault_balance};
 use crate::support::tx::{
     GENESIS_POOL_ID, account_routing_to_n, build_add_liquidity_tx, build_instantiate_tx,
     build_stake_tx, build_swap_tx, pool_at, validity_around, venue_on,
@@ -534,7 +534,17 @@ pub fn a_swap_the_venue_refuses_gives_its_caller_back_its_leg<C: Cluster>(
     // the success it displaced would have. Asserting the difference
     // rather than an inequality against the input is what makes this
     // separate a reclaim from a price that happens to exceed it.
-    let _ = terminal(c, &mut charges, refused, budget);
+    let refused_hash = charges.submit(c, refused);
+    let paid = c.run_until(budget, |c| {
+        funded.saturating_sub(vault_balance(c, SWAPPER_SHARD, caller)) == SWAP_INPUT + price
+    });
+    assert!(
+        paid,
+        "the caller's leg must take its input and its price before the \
+         venue has said anything: a shard replicating the whole shape \
+         would only ever be out the price",
+    );
+    let _ = await_tx_terminal(c, refused_hash, budget);
     let back = c.run_until(budget, |c| {
         funded.saturating_sub(vault_balance(c, SWAPPER_SHARD, caller)) == price
     });
@@ -550,6 +560,7 @@ pub fn a_swap_the_venue_refuses_gives_its_caller_back_its_leg<C: Cluster>(
         stocked,
         "a venue that refused a swap holds exactly what it held",
     );
+    assert_reclaimed_leg(c, SWAPPER_SHARD, refused_hash, "a swap the venue refuses");
 
     // That the venue can still price is the weaker claim, and the one
     // that says the swap after this is not running against a wedged

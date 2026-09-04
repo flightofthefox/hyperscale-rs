@@ -12,13 +12,13 @@ use std::time::Duration;
 
 use hyperscale_engine::XRD;
 use hyperscale_types::{
-    Address, Ed25519PrivateKey, PrincipalAddr, ShardId, TransactionDecision, TransactionStatus,
-    TxHash, WeightedTimestamp, delivery_window_close, reclaim_probe_anchor,
+    Address, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey, TransactionDecision,
+    TransactionStatus, TxHash, WeightedTimestamp, delivery_window_close, reclaim_probe_anchor,
 };
 
 use crate::straddler::isolate_ec_intake;
 use crate::support::conservation::{Charges, World};
-use crate::support::query::{declared_price, held, held_at, vault_balance};
+use crate::support::query::{assert_reclaimed_leg, declared_price, held, held_at, vault_balance};
 use crate::support::tx::{build_route_tx, validity_around};
 use crate::support::{Budget, Cluster, FaultableCluster, epochs};
 use crate::venue::{
@@ -132,11 +132,6 @@ pub fn a_route_settles_when_its_venues_certificates_are_dropped<C: FaultableClus
     );
 }
 
-/// How long past the reclaim probe's anchor the cut is held: enough for
-/// a probe issued at the anchor to have fetched its proof and for any
-/// reclaim it licensed to have composed and committed.
-const PROBE_SETTLING: Duration = Duration::from_secs(12);
-
 /// One route with the certificate channel cut across the trader's
 /// deadline, and the trader's paid leg not reclaimed at it.
 ///
@@ -203,15 +198,27 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
     );
     let paid = held(c, trader.address(), *XRD);
 
-    // Past the anchor a probe of the core is licensed at, and far enough
-    // past it that the proof has come back and any reclaim it licensed
-    // has composed and committed.
+    // Past the anchor a probe of the core is licensed at, and held there
+    // until the probe has been answered: the answer is `Present` — the
+    // core's block is on its chain — and that is what refuses the
+    // reclaim. Read off the probe rather than off a settling delay, so
+    // the scenario fails where the evidence is instead of wherever a
+    // timer happened to land.
     let validity_end = validity.end_timestamp_exclusive;
-    let held_until = reclaim_probe_anchor(validity_end).plus(PROBE_SETTLING);
+    let anchor = reclaim_probe_anchor(validity_end);
     let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
     assert!(
-        c.run_until(epochs(8), |c| clock(c) >= held_until),
+        c.run_until(epochs(8), |c| clock(c) >= anchor),
         "the cut must stand past the reclaim probe's anchor",
+    );
+    let probed = c.metric("reclaim_probes_answered", Some("present"));
+    let reclaimed = c.metric("reclaims_admitted", None);
+    assert!(
+        c.run_until(epochs(8), |c| c
+            .metric("reclaim_probes_answered", Some("present"))
+            > probed),
+        "the trader's leg must probe the core past its deadline and be \
+         answered that the core's block is there",
     );
     assert!(
         cut.iter().any(|handle| handle.fired() > 0),
@@ -233,6 +240,11 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         paid,
         "a leg whose core committed the transaction must stay paid at its deadline: \
          the probe finds the core's block, and the reclaim is refused",
+    );
+    assert_eq!(
+        c.metric("reclaims_admitted", None),
+        reclaimed,
+        "a present answer licenses no reclaim anywhere in the cluster",
     );
 
     // Whole network from here: the certificates flow, the core settles,
@@ -261,6 +273,45 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         &Charges::default(),
         epochs(8),
         "a route cut off across the deadline",
+    );
+}
+
+/// Assert both venues hold exactly what they held before a refused
+/// route, and hold it once.
+///
+/// Driven until the reclaim lands rather than read once: the verdict
+/// comes from the hop that declined and the reclaim is a block of the
+/// first venue's own, so it follows the trader's refund. Then read
+/// again after the chain has had room for several more blocks — the
+/// equality is reached on the way past if the shard keeps reclaiming the
+/// same transaction, so sampling it once says nothing about how many
+/// times the claim came back.
+fn assert_venues_gave_back<C: Cluster>(
+    c: &mut C,
+    (first_cell, second_cell): (SubstateKey, SubstateKey),
+    (first_before, second_before): (u128, u128),
+    budget: Budget,
+) {
+    let reclaimed = c.run_until(budget, |c| {
+        held_at(c, first_cell) == first_before && held_at(c, second_cell) == second_before
+    });
+    let (first_after, second_after) = (held_at(c, first_cell), held_at(c, second_cell));
+    assert!(
+        reclaimed,
+        "a refused route leaves neither venue holding a claim of it: \
+         first {first_before} before and {first_after} after, \
+         second {second_before} before and {second_after} after, \
+         on an input of {ROUTE_INPUT}",
+    );
+
+    c.run_until(epochs(5), |_| false);
+    assert_eq!(
+        (held_at(c, first_cell), held_at(c, second_cell)),
+        (first_before, second_before),
+        "a claim comes back once: {first_before} and {second_before} before \
+         the route, {} and {} after the chain ran on",
+        held_at(c, first_cell),
+        held_at(c, second_cell),
     );
 }
 
@@ -420,6 +471,21 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
     let (xrd, units) = route_worlds(c, &first, &second, &cast[..1]);
     let mut charges = Charges::default();
     let refused_hash = charges.submit(c, refused);
+
+    // The trader's withdraw is a leg, its own to reach: it takes the
+    // input and the price on the trader's own chain before either venue
+    // has said anything. A shard replicating the whole shape would only
+    // ever be out the price, so this is the divided path's own signature
+    // on the balance.
+    let paid = c.run_until(budget, |c| {
+        funded.saturating_sub(vault_balance(c, TRADER_SHARD, trader)) == ROUTE_INPUT + price
+    });
+    assert!(
+        paid,
+        "the trader's leg must take its input and its price before the \
+         route reaches a verdict",
+    );
+
     let settled = c.run_until(budget, |c| {
         c.tx_status(refused_hash).is_some_and(|s| s.is_final())
     });
@@ -446,37 +512,18 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
          charge it the price: {funded} before, {kept} after, on an input \
          of {ROUTE_INPUT} priced at {price}",
     );
-
-    // The route died at its second venue, so what the first had already
-    // claimed is what it has to give back. Driven until the reclaim
-    // lands rather than read once: the verdict comes from the hop that
-    // declined and the reclaim is a block of the first venue's own, so
-    // it follows the trader's refund.
-    let reclaimed = c.run_until(budget, |c| {
-        held_at(c, first_cell) == first_before && held_at(c, second_cell) == second_before
-    });
-    let (first_after, second_after) = (held_at(c, first_cell), held_at(c, second_cell));
-    assert!(
-        reclaimed,
-        "a refused route leaves neither venue holding a claim of it: \
-         first {first_before} before and {first_after} after, \
-         second {second_before} before and {second_after} after, \
-         on an input of {ROUTE_INPUT}",
+    assert_reclaimed_leg(
+        c,
+        TRADER_SHARD,
+        refused_hash,
+        "a route refused at its second venue",
     );
 
-    // The reclaim is what the refusal settles, and a route has one
-    // refusal. Read again after the chain has had room to compose
-    // several more blocks: the equality above is reached on the way past
-    // if the shard keeps reclaiming the same transaction, so sampling it
-    // once says nothing about how many times the claim came back.
-    c.run_until(epochs(5), |_| false);
-    assert_eq!(
-        (held_at(c, first_cell), held_at(c, second_cell)),
+    assert_venues_gave_back(
+        c,
+        (first_cell, second_cell),
         (first_before, second_before),
-        "a claim comes back once: {first_before} and {second_before} before \
-         the route, {} and {} after the chain ran on",
-        held_at(c, first_cell),
-        held_at(c, second_cell),
+        budget,
     );
 
     // That the venues can still price is a weaker claim than the reserves

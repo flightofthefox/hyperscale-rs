@@ -357,6 +357,20 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// is what puts it back in step with them.
     fn record_rebuilt_verdict_entry(&self) {}
 
+    /// Record a counterpart cell a committed proof answered for, as
+    /// `present` or absent — the fold every replica of a shard reaches
+    /// at the same height.
+    ///
+    /// Absences are what license a reclaim, so an absent rate rising
+    /// against a flat present one is counterparts going silent, not
+    /// proofs going missing.
+    fn record_reclaim_probe_answered(&self, present: bool) {}
+
+    /// Record a reclaim admitted into a tick — one transaction whose
+    /// escrowed value this shard is taking back on the evidence its
+    /// chain committed.
+    fn record_reclaim_admitted(&self) {}
+
     /// Set the in-flight request slot count for a `MessageClass`.
     ///
     /// Sampled by the request manager whenever a slot is acquired or
@@ -810,6 +824,18 @@ pub fn record_unresolvable_tx(cause: &str) {
 #[inline]
 pub fn record_rebuilt_verdict_entry() {
     recorder().record_rebuilt_verdict_entry();
+}
+
+/// Record a counterpart cell a committed proof answered for.
+#[inline]
+pub fn record_reclaim_probe_answered(present: bool) {
+    recorder().record_reclaim_probe_answered(present);
+}
+
+/// Record a reclaim admitted into a tick.
+#[inline]
+pub fn record_reclaim_admitted() {
+    recorder().record_reclaim_admitted();
 }
 
 /// Set the in-flight request slot count for a class.

@@ -262,6 +262,15 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("rebuilt_verdict_entries", None, 1);
     }
 
+    fn record_reclaim_probe_answered(&self, present: bool) {
+        let label = if present { "present" } else { "absent" };
+        self.inc("reclaim_probes_answered", Some(label), 1);
+    }
+
+    fn record_reclaim_admitted(&self) {
+        self.inc("reclaims_admitted", None, 1);
+    }
+
     // ── Sync ─────────────────────────────────────────────────────────
 
     fn set_sync_blocks_behind(&self, kind: &str, shard: u64, blocks_behind: u64) {
