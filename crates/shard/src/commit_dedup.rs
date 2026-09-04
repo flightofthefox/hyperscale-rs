@@ -8,8 +8,11 @@
 //! Per-artifact deadline maps bound the index by artifact-specific
 //! BFT-attested horizons:
 //!
-//! - **txs**: each tx's own `end_timestamp_exclusive` (capped by
-//!   `MAX_VALIDITY_RANGE` at admission).
+//! - **txs**: the delivery window's close on each tx's own
+//!   `end_timestamp_exclusive` — the last anchor a block may carry the
+//!   transaction at, since a delivery-only member is admissible past the
+//!   validity end and a shorter window would leave room to commit one
+//!   twice.
 //! - **certs**: `vote_anchor_ts + RETENTION_HORIZON` from the tick's local
 //!   EC.
 //! - **provisions**: `local_committed_ts + RETENTION_HORIZON`, a
@@ -31,14 +34,14 @@ use std::sync::Arc;
 
 use hyperscale_storage::DedupWindow;
 use hyperscale_types::{
-    Finalization, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId, Transaction, TxHash,
-    Verifiable, WeightedTimestamp,
+    DEDUP_WINDOW, Finalization, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId, Transaction,
+    TxHash, Verifiable, WeightedTimestamp, delivery_window_close,
 };
 
 #[allow(clippy::struct_field_names)] // shared `_retention` postfix is the artifact-tier convention
 pub struct CommitDedupIndex {
-    /// `tx_hash → end_timestamp_exclusive`. Pruned when
-    /// `end_timestamp_exclusive <= current_committed_ts`.
+    /// `tx_hash → delivery_window_close(end_timestamp_exclusive)`. Pruned
+    /// when the deadline is at or below `current_committed_ts`.
     tx_retention: HashMap<TxHash, WeightedTimestamp>,
     /// `tx_hash → vote_anchor_ts + RETENTION_HORIZON` of the finalization
     /// that resolved it. Every transaction a committed finalization
@@ -118,9 +121,9 @@ impl CommitDedupIndex {
     /// Whether the index covers the whole window a chain at `now` has to
     /// refuse duplicates across.
     ///
-    /// True once the coverage runs a full [`RETENTION_HORIZON`] behind
-    /// `now`, or bottoms out at the chain's own origin — below which
-    /// nothing was ever committed to be missed.
+    /// True once the coverage runs a full [`DEDUP_WINDOW`] behind `now`,
+    /// or bottoms out at the chain's own origin — below which nothing was
+    /// ever committed to be missed.
     ///
     /// Diagnostic, not a gate. A false answer means the index under-refuses
     /// by an unknown amount, and nothing here holds a vote back over it: the
@@ -133,7 +136,7 @@ impl CommitDedupIndex {
         self.reached_origin
             || self
                 .covered_from
-                .is_some_and(|from| now.elapsed_since(from) >= RETENTION_HORIZON)
+                .is_some_and(|from| now.elapsed_since(from) >= DEDUP_WINDOW)
     }
 
     /// Record that the coverage bottoms out at the chain's origin.
@@ -156,12 +159,13 @@ impl CommitDedupIndex {
     }
 
     /// Record a block's transactions in the retention lookup. Each entry's
-    /// stored value is the tx's `validity_range.end_timestamp_exclusive`.
+    /// stored value is [`delivery_window_close`] of the tx's validity end
+    /// — the last anchor a block may carry the transaction at.
     pub fn register_committed_txs(&mut self, transactions: &[Arc<Verifiable<Transaction>>]) {
         for tx in transactions {
             let tx_hash = tx.hash();
-            let end = tx.validity_range().end_timestamp_exclusive;
-            self.tx_retention.entry(tx_hash).or_insert(end);
+            let deadline = delivery_window_close(tx.validity_range().end_timestamp_exclusive);
+            self.tx_retention.entry(tx_hash).or_insert(deadline);
         }
     }
 
@@ -331,8 +335,36 @@ mod tests {
         assert_eq!(idx.tx_retention_len(), 1);
     }
 
+    /// A transaction is refusable to the close of its delivery window,
+    /// not to its validity end: a delivery-only member is admissible past
+    /// the end, so an index that forgot the hash there would let a
+    /// proposer commit the same delivery twice.
     #[test]
-    fn prune_drops_txs_past_their_end_exclusive() {
+    fn a_tx_stays_refusable_across_its_delivery_window() {
+        let mut idx = CommitDedupIndex::new();
+        let tx = tx_with_end(1, 100);
+        let tx_hash = tx.hash();
+        let close = delivery_window_close(WeightedTimestamp::from_millis(100));
+        idx.register_committed_txs(std::slice::from_ref(&tx));
+
+        idx.prune(WeightedTimestamp::from_millis(101));
+        assert!(
+            idx.contains_tx(&tx_hash),
+            "past the validity end a delivery may still be admitted",
+        );
+
+        idx.prune(close.minus(std::time::Duration::from_millis(1)));
+        assert!(idx.contains_tx(&tx_hash), "short of the window's close");
+
+        idx.prune(close);
+        assert!(
+            !idx.contains_tx(&tx_hash),
+            "at the close nothing may carry it"
+        );
+    }
+
+    #[test]
+    fn prune_drops_txs_past_their_window() {
         let mut idx = CommitDedupIndex::new();
         let early = tx_with_end(1, 100);
         let later = tx_with_end(2, 900);
@@ -340,7 +372,7 @@ mod tests {
         let later_hash = later.hash();
         idx.register_committed_txs(&[early, later]);
 
-        idx.prune(WeightedTimestamp::from_millis(500));
+        idx.prune(delivery_window_close(WeightedTimestamp::from_millis(500)));
 
         assert!(!idx.contains_tx(&early_hash));
         assert!(idx.contains_tx(&later_hash));

@@ -80,6 +80,22 @@ pub fn reclaim_probe_anchor(validity_end: WeightedTimestamp) -> WeightedTimestam
     validity_end.plus(MAX_FINALIZATION_DELAY)
 }
 
+/// How far back a chain is folded to rebuild the committed-artifact
+/// dedup window.
+///
+/// The widest of the index's tiers. A transaction is held to the close of
+/// its delivery window — one [`MAX_VALIDITY_RANGE`] past a validity end
+/// that may itself sit a whole range past the block that committed it —
+/// so an entry still live can come from a block two ranges back. The
+/// resolution and provision tiers are keyed at most
+/// [`RETENTION_HORIZON`] past their own block, which this covers.
+pub const DEDUP_WINDOW: Duration = Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() * 2);
+
+const _: () = assert!(
+    DEDUP_WINDOW.as_secs() >= RETENTION_HORIZON.as_secs(),
+    "the dedup walk covers every tier of the index it rebuilds",
+);
+
 /// How long a leg is still reported after its deadline.
 ///
 /// The room a reclaim of what its deliveries never claimed needs: one

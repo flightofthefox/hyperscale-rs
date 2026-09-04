@@ -22,7 +22,7 @@ use hyperscale_types::{
     ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, SafeVoteRegisters,
     SettledWrites, ShardId, StateRoot, StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId,
     TimestampRange, Transaction, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    WitnessSources,
+    WitnessSources, delivery_window_close,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -1226,8 +1226,9 @@ fn dedup_tx(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
     )))
 }
 
-/// The fold recovers each committed transaction against its own signed
-/// deadline, not against when the block carrying it committed.
+/// The fold recovers each committed transaction against the close of the
+/// delivery window its own signed end opens, not against when the block
+/// carrying it committed.
 #[test]
 fn dedup_window_recovers_committed_txs_with_their_own_deadlines() {
     let storage = SimShardStorage::default();
@@ -1249,7 +1250,10 @@ fn dedup_window_recovers_committed_txs_with_their_own_deadlines() {
 
     assert_eq!(
         window.committed,
-        vec![(tx_hash, WeightedTimestamp::from_millis(90_000))],
+        vec![(
+            tx_hash,
+            delivery_window_close(WeightedTimestamp::from_millis(90_000))
+        )],
     );
 }
 
@@ -1318,7 +1322,10 @@ fn dedup_window_stops_short_without_claiming_the_origin() {
 
     assert_eq!(
         window.committed,
-        vec![(tx_hash, WeightedTimestamp::from_millis(900_000))],
+        vec![(
+            tx_hash,
+            delivery_window_close(WeightedTimestamp::from_millis(900_000))
+        )],
     );
     assert!(
         !window.reached_origin,
