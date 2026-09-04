@@ -246,6 +246,18 @@ impl SimulationRunner {
                     let storage = self
                         .retained_storages
                         .remove(&(host, shard))
+                        // The seat has two branches and between them they take a
+                        // store with a chain or a store with nothing. A store
+                        // that snap-synced and left before committing is
+                        // neither: it holds the import's state under no chain,
+                        // so resuming has no tip to resume from and importing
+                        // has nowhere to write. It is not the retained fast
+                        // path; it is an abandoned bootstrap, and the seat
+                        // starts again from an empty store against the anchor
+                        // that has since advanced.
+                        .filter(|storage| {
+                            storage.load_recovered_state().committed_height > BlockHeight::GENESIS
+                        })
                         .unwrap_or_else(|| SimShardStorage::new(shard_prefix_path(shard)));
                     self.seat_joined_group(host, shard, &placed, storage);
                 }

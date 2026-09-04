@@ -1203,7 +1203,9 @@ fn drive_train<C: Cluster>(
     for phase in [Phase::Live, Phase::Departing, Phase::Draining] {
         assert!(
             sent.iter().any(|(_, _, sent_in)| *sent_in == phase),
-            "the train has to hold a transfer sent {phase:?}, or that phase's fate goes unread",
+            "the train has to hold a transfer sent {phase:?}, or that phase's fate goes unread; \
+             sent = {:?}",
+            sent.iter().map(|(_, _, phase)| *phase).collect::<Vec<_>>(),
         );
     }
     sent

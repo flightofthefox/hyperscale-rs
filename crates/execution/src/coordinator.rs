@@ -326,13 +326,15 @@ fn delivery_floor(side: Side, validity_end: WeightedTimestamp) -> Option<Weighte
 /// Whether a proposer offers `Claimed` records from the claims the
 /// chain has proved.
 ///
-/// A record cell retired is state a shard stops carrying, and a shard's
-/// reshape is triggered on the bytes it carries. Turning the offer on
-/// moves a byte-triggered split: measured on the splitter train, the
-/// shard's substate bytes peak some 1,400 lower and its split lands
-/// elsewhere in the run. The probes, the fold, the fence and the
-/// retirement are live and pinned; the offer waits on the scenarios
-/// that read a reshape's timing.
+/// Turned on, the scenario suite is green but for one: the splitter
+/// train's split never admits. Its shard reads 77.6 KB against a
+/// threshold voted to 63.0 KB, its sibling reads 59.5 KB, so the
+/// threshold sits where it is meant to and the shard is 14.5 KB over it
+/// — and the beacon's pending reshapes stay empty for the length of the
+/// run. The byte readings are within 1 KB of the offer-off run, so the
+/// load the trigger reads is not what changed. Nothing else in the
+/// suite moves, the retirement machinery itself is live and pinned, and
+/// what the offer waits on is an explanation for that one shard.
 const CLAIMED_RECORDS_OFFERED: bool = false;
 
 /// Whether an answer taken at `probed_wt` says anything about the
@@ -9171,7 +9173,7 @@ mod tests {
         );
         assert!(
             state.pending_abandonment_records().is_empty(),
-            "the offer waits on the scenarios that read a reshape's timing"
+            "the offer is gated; what the fold and the retirement do with a record is not"
         );
 
         state
