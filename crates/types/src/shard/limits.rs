@@ -35,12 +35,19 @@ pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 /// the removal side would leave a sweep that bounds ordinary operation
 /// and not the peak, which is not a bound.
 ///
-/// Four families share it — the nullifier, the escrow record, the
-/// escrow claim (a reclaim's included) and the committed-transaction
+/// Three families are sweepable and share that capacity — the nullifier,
+/// the escrow claim (a reclaim's included) and the committed-transaction
 /// cell the chain writes for every transaction it carries — because the
 /// removal capacity they draw on is one capacity. A budget per family
 /// would cost throughput as well as counters: a block could be invalid
 /// on one family's peak while the shared walk had room.
+///
+/// The count has a fourth term that is not one of them. An escrow record
+/// is a balance, retired by whoever consumes it and reachable by no
+/// clock, so no sweep removes it and it draws on none of the capacity
+/// this cap rations. It is counted anyway, and counting it only tightens
+/// the ceiling on the three: the alternative is a figure whose slack
+/// depends on how many of a block's edges cross.
 ///
 /// Counted per shard, since that is where a cell lands and where the
 /// sweep that retires it runs: a transaction's kernel cells whose owner
@@ -69,8 +76,8 @@ pub const MAX_SWEEPABLE_CREATED_PER_BLOCK: usize = 4 * MAX_TXS_PER_BLOCK;
 /// advance makes, and it is why a proposer cannot decline to sweep in
 /// order to keep block space for what does pay.
 ///
-/// One walk over the four families, in key order: the bucket leads
-/// every sweepable cell's local key, so a block's removals are one
+/// One walk over the three sweepable families, in key order: the bucket
+/// leads every sweepable cell's local key, so a block's removals are one
 /// contiguous range whatever families they mix, and the cap is on the
 /// range rather than on any family's share of it.
 ///
