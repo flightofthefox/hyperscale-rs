@@ -37,7 +37,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_engine::legs::{Classified, Side};
+use hyperscale_engine::legs::Member;
 use hyperscale_types::{
     BlockHash, BlockHeight, EscrowedValue, ExecutionCertificate, ExecutionOutcome, Finalization,
     GlobalReceiptRoot, MAX_FINALIZATION_DELAY, Settles, ShardId, StoredReceipt, TickHalf, TickId,
@@ -98,32 +98,20 @@ pub struct Membership {
 }
 
 impl Membership {
-    /// The membership of a member of `participating`, frozen as
-    /// `classified`, on `local`.
+    /// The two sets and the two bits `member` answers — a cache of its
+    /// derivation, in the shape a tick carries.
     #[must_use]
-    pub fn of(
-        classified: &Classified,
-        local: ShardId,
-        participating: BTreeSet<ShardId>,
-        side: Side,
-    ) -> Self {
-        let in_core = classified.core().contains(&local);
-        let awaited = if !classified.decomposed().holds() {
-            participating.clone()
-        } else if in_core {
-            classified.core().clone()
-        } else {
-            BTreeSet::from([local])
-        };
+    pub fn of(member: &Member) -> Self {
+        let awaited = member.awaited();
         debug_assert!(
-            awaited.is_subset(&participating),
+            awaited.is_subset(member.reach()),
             "a member awaits only shards the transaction reaches"
         );
         Self {
             awaited,
-            reach: participating,
-            decides: !classified.decomposed().holds() || in_core,
-            delivers: classified.decomposed().holds() && side == Side::Delivering,
+            reach: member.reach().clone(),
+            decides: member.decides(),
+            delivers: member.delivers(),
         }
     }
 
@@ -1262,6 +1250,7 @@ impl TickState {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_engine::legs::{Classified, Side};
     use hyperscale_types::{
         AggregateSignature, ConsensusReceipt, GlobalReceiptHash, Hash, SignerBitfield,
     };
@@ -1587,7 +1576,15 @@ mod tests {
         let swap = Classified::freeze(&swap(), &[], &trie);
         assert!(swap.decomposed().holds());
         let participating = BTreeSet::from([low, high]);
-        let caller = Membership::of(&swap, low, participating.clone(), Side::Issuing);
+        let member_of = |classified: &Classified, local, participating: &BTreeSet<ShardId>| {
+            Member::of(
+                classified.clone(),
+                local,
+                Side::Issuing,
+                participating.clone(),
+            )
+        };
+        let caller = Membership::of(&member_of(&swap, low, &participating));
         assert_eq!(
             caller.awaited(),
             &BTreeSet::from([low]),
@@ -1595,7 +1592,7 @@ mod tests {
         );
         assert_eq!(caller.reach(), &participating);
         assert!(!caller.decides(), "and its core decides the transaction");
-        let venue = Membership::of(&swap, high, participating.clone(), Side::Issuing);
+        let venue = Membership::of(&member_of(&swap, high, &participating));
         assert_eq!(
             venue.awaited(),
             &BTreeSet::from([high]),
@@ -1606,22 +1603,17 @@ mod tests {
 
         let route = Classified::freeze(&route(), &[], &trie);
         let participating = BTreeSet::from([low, high, third]);
-        let core_member = Membership::of(&route, high, participating.clone(), Side::Issuing);
+        let core_member = Membership::of(&member_of(&route, high, &participating));
         assert_eq!(
             core_member.awaited(),
             &BTreeSet::from([high, third]),
             "a core member awaits the core set"
         );
         assert_eq!(core_member.reach(), &participating);
-        let feeder = Membership::of(&route, low, participating.clone(), Side::Issuing);
+        let feeder = Membership::of(&member_of(&route, low, &participating));
         assert_eq!(feeder.awaited(), &BTreeSet::from([low]));
 
-        let whole = Membership::of(
-            &Classified::whole(),
-            low,
-            participating.clone(),
-            Side::Issuing,
-        );
+        let whole = Membership::of(&member_of(&Classified::whole(), low, &participating));
         assert_eq!(whole, Membership::whole(participating));
     }
 
@@ -1665,19 +1657,19 @@ mod tests {
         );
         let participating = BTreeSet::from([sender, recipient]);
         let delivery = tx(1);
-        let membership = Membership::of(
-            &transfer,
+        let membership = Membership::of(&Member::of(
+            transfer,
             recipient,
-            participating.clone(),
             Side::Delivering,
-        );
+            participating.clone(),
+        ));
         assert!(membership.delivers());
         assert!(!membership.decides());
         tick.admit(delivery, membership, 10, Admission::Executes);
         let issuer = tx(2);
         tick.admit(
             issuer,
-            Membership::of(&swap, leaf(0), participating, Side::Issuing),
+            Membership::of(&Member::of(swap, leaf(0), Side::Issuing, participating)),
             10,
             Admission::Executes,
         );
@@ -1720,12 +1712,12 @@ mod tests {
         );
         tick.admit(
             leg,
-            Membership::of(
-                &classified,
+            Membership::of(&Member::of(
+                classified,
                 local,
-                BTreeSet::from([local, venue]),
                 Side::Issuing,
-            ),
+                BTreeSet::from([local, venue]),
+            )),
             10,
             Admission::Executes,
         );

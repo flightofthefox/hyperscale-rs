@@ -15,14 +15,15 @@ use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::ExecutedTx;
-use hyperscale_engine::legs::{Classified, Runs, Side};
+use hyperscale_engine::legs::{Member, Runs};
 use hyperscale_execution::action_handlers::accumulate_tick_output;
 use hyperscale_storage::TickOutput;
 use hyperscale_types::{
     Address, AddressClass, CollectionId, ConsensusReceipt, DeclaredKey, DeclaredRange, Derivation,
     DerivationError, Derived, EnvelopeExt, ExecutionMetadata, GlobalReceiptHash, Hash, LocalKey,
-    Mode, NetworkId, PrincipalAddr, Routing, SchemeId, StateWrites, SubstateKey, Transaction,
-    TransactionBody, TransactionEnvelope, TxHash, Verified, WeightedTimestamp, declared_work,
+    Mode, NetworkId, PrincipalAddr, Routing, SchemeId, ShardId, StateWrites, SubstateKey,
+    Transaction, TransactionBody, TransactionEnvelope, TxHash, Verified, WeightedTimestamp,
+    declared_work,
 };
 use hyperscale_vm_types::Moves;
 
@@ -134,10 +135,7 @@ fn request_for(tx: &Arc<Verified<Transaction>>) -> CrossShardExecutionRequest {
         clock: WeightedTimestamp::from_millis(1_000),
         reaches_beyond: true,
         abortable: true,
-        runs: Runs::Shape {
-            classified: Classified::whole(),
-            side: Side::Issuing,
-        },
+        runs: Runs::Shape(Member::whole(ShardId::ROOT)),
         arrivals: Vec::new(),
     }
 }

@@ -195,15 +195,6 @@ impl Classified {
         }
     }
 
-    /// Whether a member on `side` is the second `shard` runs of this
-    /// transaction: a mixed shard's delivering member, whose issuing one
-    /// took the block's reservation, settled the price and committed
-    /// the signers' nullifiers, so this one does none of those.
-    #[must_use]
-    pub fn second_member(&self, shard: ShardId, side: Side) -> bool {
-        side == Side::Delivering && self.mixed_at(shard)
-    }
-
     /// Whether the legs run where their state lives.
     #[must_use]
     pub const fn decomposed(&self) -> Decomposed {
@@ -217,18 +208,164 @@ impl Classified {
     }
 }
 
+/// One shard's member of a frozen transaction.
+///
+/// Every per-member quantity is a function of the frozen classification,
+/// where the member runs, which of its shard's legs it takes and what the
+/// transaction reaches. Derived once here and asked by name, so a
+/// consumer reads the question it means and cannot reach another's answer
+/// except through its own name.
+///
+/// The two that look alike stay apart, and the sets they read are why.
+/// [`reaches_beyond`](Self::reaches_beyond) asks whether the transaction
+/// touches another shard at all, off the participants;
+/// [`abortable`](Self::abortable) asks whether *this member's*
+/// settlement waits on another shard, off what it awaits. A leg of a
+/// divided transaction reaches beyond and is not abortable — it awaits
+/// only itself — and reading either for the other is how a member's
+/// writes get held provisional that nothing can retract, or released
+/// that something can.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Member {
+    classified: Classified,
+    local: ShardId,
+    side: Side,
+    /// Every shard the transaction touches. Beside the classification
+    /// because a whole shape's member awaits all of them, and no frozen
+    /// answer names them.
+    participating: BTreeSet<ShardId>,
+}
+
+impl Member {
+    /// The member `local` runs on `side` of a transaction frozen as
+    /// `classified` and reaching `participating`.
+    #[must_use]
+    pub const fn of(
+        classified: Classified,
+        local: ShardId,
+        side: Side,
+        participating: BTreeSet<ShardId>,
+    ) -> Self {
+        Self {
+            classified,
+            local,
+            side,
+            participating,
+        }
+    }
+
+    /// The member a caller with no placement to freeze against runs:
+    /// the whole transaction, on its own shard, reaching nobody else.
+    #[must_use]
+    pub fn whole(local: ShardId) -> Self {
+        Self::of(
+            Classified::whole(),
+            local,
+            Side::Issuing,
+            BTreeSet::from([local]),
+        )
+    }
+
+    /// The classification this member was frozen against.
+    #[must_use]
+    pub const fn classified(&self) -> &Classified {
+        &self.classified
+    }
+
+    /// The shard running it.
+    #[must_use]
+    pub const fn local(&self) -> ShardId {
+        self.local
+    }
+
+    /// Which of its shard's legs it runs.
+    #[must_use]
+    pub const fn side(&self) -> Side {
+        self.side
+    }
+
+    /// Every shard the transaction touches — who this tick's certificate
+    /// is owed to, since any of them may need what a member escrowed.
+    #[must_use]
+    pub const fn reach(&self) -> &BTreeSet<ShardId> {
+        &self.participating
+    }
+
+    /// Whether the transaction reaches beyond this shard — the fact that
+    /// makes its writes provisional and its verdict a counterpart's to
+    /// share. Off the participants, never off what this member awaits.
+    #[must_use]
+    pub fn reaches_beyond(&self) -> bool {
+        self.participating.iter().any(|&shard| shard != self.local)
+    }
+
+    /// Whether a counterpart's verdict can still discard this member's
+    /// effects after it executes. Off what this member awaits, never off
+    /// what the transaction reaches.
+    #[must_use]
+    pub fn abortable(&self) -> bool {
+        self.awaited().iter().any(|&shard| shard != self.local)
+    }
+
+    /// Whose certificate this member's settlement waits on: the whole
+    /// core set for a member of it, every participant for a whole shape,
+    /// and itself otherwise.
+    #[must_use]
+    pub fn awaited(&self) -> BTreeSet<ShardId> {
+        if !self.classified.decomposed().holds() {
+            self.participating.clone()
+        } else if self.in_core() {
+            self.classified.core().clone()
+        } else {
+            BTreeSet::from([self.local])
+        }
+    }
+
+    /// Whether this shard's certificate decides the transaction: it does
+    /// unless the member is a leg, whose transaction its core decides.
+    #[must_use]
+    pub fn decides(&self) -> bool {
+        !self.classified.decomposed().holds() || self.in_core()
+    }
+
+    /// Whether the member only delivers: a leg that failed is the
+    /// transaction's end on its shard, but a delivery that failed decides
+    /// nothing — the value it claims stays in its cell for a later claim.
+    #[must_use]
+    pub fn delivers(&self) -> bool {
+        self.classified.decomposed().holds() && self.side == Side::Delivering
+    }
+
+    /// Whether this shard's nodes sit in the core set.
+    #[must_use]
+    pub fn in_core(&self) -> bool {
+        self.classified.core().contains(&self.local)
+    }
+
+    /// Whether this shard runs an outbound leg beside an inbound one, and
+    /// so runs the transaction as two members.
+    #[must_use]
+    pub fn runs_both_sides(&self) -> bool {
+        self.classified.mixed_at(self.local)
+    }
+
+    /// Whether this is the second member its shard runs of the
+    /// transaction: a mixed shard's delivering one, whose issuing member
+    /// took the block's reservation, settled the price and committed the
+    /// signers' nullifiers, so this one does none of those.
+    #[must_use]
+    pub fn is_second(&self) -> bool {
+        self.side == Side::Delivering && self.runs_both_sides()
+    }
+}
+
 /// What a member runs of its transaction: the shape its committing
 /// block froze, or the reclaim of what a leg here issued.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Runs {
     /// The transaction as classified at commit — whole, or the legs
-    /// this shard's placement gives it on `side`.
-    Shape {
-        /// The classification the committing block froze.
-        classified: Classified,
-        /// Which of this shard's legs the member runs.
-        side: Side,
-    },
+    /// this shard's placement gives it on its side.
+    Shape(Member),
     /// No node at all: the records of the crossings a producer here
     /// issued, deleted on the evidence a committed record carries that
     /// every consumer claimed them.

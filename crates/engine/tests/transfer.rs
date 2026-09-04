@@ -13,7 +13,7 @@ use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
 };
 use hyperscale_engine::legs::{
-    Classified, PlanDefect, Runs, Side, core_shards, crossings_of, plan_for_shard,
+    Classified, Member, PlanDefect, Runs, Side, core_shards, crossings_of, plan_for_shard,
 };
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
@@ -1330,10 +1330,12 @@ fn a_transfer_executes_divided_on_both_shards() {
             // A leg awaiting nobody but its own shard: nothing retracts
             // it, so no charge is held in reserve against an abort.
             abortable: false,
-            runs: Runs::Shape {
-                classified: classified.clone(),
-                side: classified.first_side_at(local_shard),
-            },
+            runs: Runs::Shape(Member::of(
+                classified.clone(),
+                local_shard,
+                classified.first_side_at(local_shard),
+                BTreeSet::from([near_shard, far_shard]),
+            )),
             arrivals,
         };
         executor
@@ -1430,10 +1432,14 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
 
     let sent = run(
         &store,
-        Runs::Shape {
-            classified: classified.clone(),
-            side: Side::Issuing,
-        },
+        Runs::Shape(Member::of(
+            classified.clone(),
+            near_shard,
+            Side::Issuing,
+            std::iter::once(near_shard)
+                .chain(edge.to.iter().copied())
+                .collect(),
+        )),
         true,
     );
     let ConsensusReceipt::Succeeded { writes, .. } = &sent.consensus else {
@@ -1513,10 +1519,14 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
 
     let sent = run(
         &store,
-        Runs::Shape {
-            classified: classified.clone(),
-            side: Side::Issuing,
-        },
+        Runs::Shape(Member::of(
+            classified.clone(),
+            near_shard,
+            Side::Issuing,
+            std::iter::once(near_shard)
+                .chain(edge.to.iter().copied())
+                .collect(),
+        )),
         true,
     );
     let ConsensusReceipt::Succeeded { writes, .. } = &sent.consensus else {
@@ -1653,10 +1663,12 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
             clock: WeightedTimestamp::from_millis(1_000),
             reaches_beyond: true,
             abortable: true,
-            runs: Runs::Shape {
-                classified: Classified::whole(),
-                side: Side::Issuing,
-            },
+            runs: Runs::Shape(Member::of(
+                Classified::whole(),
+                local_shard,
+                Side::Issuing,
+                BTreeSet::from([near_shard, far_shard]),
+            )),
             arrivals: &[],
         };
         executor

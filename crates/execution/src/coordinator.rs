@@ -1290,7 +1290,7 @@ impl ExecutionCoordinator {
         // one reserves nothing and issues nothing.
         let second_member = matches!(
             &member.request.runs,
-            Runs::Shape { classified, side } if classified.second_member(local_shard, *side)
+            Runs::Shape(shape) if shape.is_second()
         );
         let reach = member.membership_reach();
         state.admit(
@@ -1308,24 +1308,16 @@ impl ExecutionCoordinator {
         // to, if it issues anything. Only an issuing member issues;
         // a delivery and a reclaim promise nobody a bundle.
         let targets: BTreeSet<ShardId> = match &member.request.runs {
-            Runs::Shape {
-                classified,
-                side: Side::Issuing,
-            } => crossings_of(
+            Runs::Shape(shape) if shape.side() == Side::Issuing => crossings_of(
                 member.request.transaction.legs(),
                 member.request.transaction.crossings(),
-                classified,
+                shape.classified(),
             )
             .into_iter()
             .filter(|edge| edge.from == local_shard)
             .flat_map(|edge| edge.to)
             .collect(),
-            Runs::Shape {
-                side: Side::Delivering,
-                ..
-            }
-            | Runs::Reclaim { .. }
-            | Runs::Retire { .. } => BTreeSet::new(),
+            Runs::Shape(_) | Runs::Reclaim { .. } | Runs::Retire { .. } => BTreeSet::new(),
         };
         state.record_crossing_targets(member.request.tx_hash, targets);
         self.ticks.assign_tx(member.request.tx_hash, tick_id);
@@ -1335,18 +1327,16 @@ impl ExecutionCoordinator {
         // that waits on what the core returns. Registered here, at the
         // issuing admission, so every replica composes it from the
         // same commit; it joins a later tick once its arrival lands.
-        if let Runs::Shape {
-            classified,
-            side: Side::Issuing,
-        } = &member.request.runs
-            && classified.mixed_at(local_shard)
+        if let Runs::Shape(shape) = &member.request.runs
+            && shape.side() == Side::Issuing
+            && shape.runs_both_sides()
         {
             self.provisioning.record_required(
                 member.request.tx_hash,
                 divided_requirements(
                     member.request.transaction.legs(),
                     member.request.transaction.crossings(),
-                    classified,
+                    shape.classified(),
                     local_shard,
                     Side::Delivering,
                 ),
@@ -1363,7 +1353,7 @@ impl ExecutionCoordinator {
                 Arc::clone(&member.request.transaction),
                 reach,
                 member.request.clock,
-                classified.clone(),
+                shape.classified().clone(),
             );
         }
         if member.request.abortable {

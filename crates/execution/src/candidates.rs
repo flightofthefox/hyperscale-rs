@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
-use hyperscale_engine::legs::{Classified, Runs, Side, crossings_of};
+use hyperscale_engine::legs::{Classified, Member, Runs, Side, crossings_of};
 use hyperscale_types::{
     EscrowedValue, ShardId, Transaction, TxHash, Verified, WeightedTimestamp, delivery_window_close,
 };
@@ -30,8 +30,11 @@ use crate::tick_state::{Admission, Membership};
 #[derive(Debug)]
 struct Candidate {
     tx: Arc<Verified<Transaction>>,
-    /// Shards whose certificates its settlement needs, this one included.
-    participating: BTreeSet<ShardId>,
+    /// This shard's member of it, derived once at registration: the
+    /// frozen classification, where it runs, which of its shard's legs it
+    /// takes and what the transaction reaches. Every per-member question
+    /// below is asked of this and none is re-derived beside it.
+    member: Member,
     /// The committing block's weighted timestamp — the clock a member
     /// executes under when no payer bundle names another. It stays the
     /// committing block's however many ticks later the member runs: the
@@ -44,20 +47,9 @@ struct Candidate {
     /// executes anyway, to be attested `Aborted` by the tick that runs it.
     /// `None` when nothing is engagement-gated.
     engagement_deadline: Option<WeightedTimestamp>,
-    /// The classification its committing block froze.
-    classified: Classified,
-    /// Which of this shard's legs the member runs.
-    side: Side,
 }
 
 impl Candidate {
-    /// Whether the transaction reaches beyond this shard — the fact that
-    /// makes its writes provisional and its verdict a counterpart's to
-    /// share.
-    fn reaches_beyond(&self, local: ShardId) -> bool {
-        self.participating.iter().any(|&s| s != local)
-    }
-
     /// Whether the payer's wait for engagement echoes is over, either
     /// covered or past its deadline.
     fn engagement_settled(&self, now: WeightedTimestamp) -> bool {
@@ -160,14 +152,13 @@ impl TickCandidates {
         classified: Classified,
     ) {
         let side = classified.first_side_at(self.local_shard);
+        let member = Member::of(classified, self.local_shard, side, participating);
         self.candidates.entry(tx.hash()).or_insert(Candidate {
             tx,
-            participating,
+            member,
             committed_ts,
             engagement_pending: BTreeSet::new(),
             engagement_deadline: None,
-            classified,
-            side,
         });
     }
 
@@ -184,14 +175,18 @@ impl TickCandidates {
         committed_ts: WeightedTimestamp,
         classified: Classified,
     ) {
+        let member = Member::of(
+            classified,
+            self.local_shard,
+            Side::Delivering,
+            participating,
+        );
         self.candidates.entry(tx.hash()).or_insert(Candidate {
             tx,
-            participating,
+            member,
             committed_ts,
             engagement_pending: BTreeSet::new(),
             engagement_deadline: None,
-            classified,
-            side: Side::Delivering,
         });
     }
 
@@ -247,7 +242,7 @@ impl TickCandidates {
         let local = self.local_shard;
         let mut ordered: Vec<TxHash> = self.candidates.keys().copied().collect();
         ordered.sort_by_key(|tx_hash| {
-            let reaches_beyond = self.candidates[tx_hash].reaches_beyond(local);
+            let reaches_beyond = self.candidates[tx_hash].member.reaches_beyond();
             (!reaches_beyond, *tx_hash)
         });
 
@@ -255,7 +250,7 @@ impl TickCandidates {
         let mut admitted: Vec<Admitted> = Vec::with_capacity(ordered.len());
         for tx_hash in ordered {
             let candidate = &self.candidates[&tx_hash];
-            let reaches_beyond = candidate.reaches_beyond(local);
+            let reaches_beyond = candidate.member.reaches_beyond();
             // A transaction reaching no further than this shard needs no
             // provisions; one that does waits for every shard it named.
             if reaches_beyond && !provisioning.is_fully_provisioned(tx_hash) {
@@ -269,25 +264,20 @@ impl TickCandidates {
             // reclaim on a proof the claim is absent, so a delivery
             // composed past the close would claim what a reclaim may
             // already have taken back. It is abandoned at the close.
-            if candidate.side == Side::Delivering
+            if candidate.member.side() == Side::Delivering
                 && now
                     >= delivery_window_close(candidate.tx.validity_range().end_timestamp_exclusive)
             {
                 continue;
             }
-            let membership = Membership::of(
-                &candidate.classified,
-                local,
-                candidate.participating.clone(),
-                candidate.side,
-            );
+            let membership = Membership::of(&candidate.member);
             // A member whose effects a counterpart's verdict can still
             // discard: its writes stay provisional, and its declaration
             // is a claim the members after it must compose with. One
             // that awaits nobody but this shard holds nothing back —
             // its writes are determined at once, and the kernel's own
             // conflict groups sequence its batch-mates against it.
-            let abortable = membership.awaited().iter().any(|&s| s != local);
+            let abortable = candidate.member.abortable();
             let declared = &candidate.tx.routing().declared_modes;
             if !held.is_empty() && held.blocks(declared) {
                 continue;
@@ -303,10 +293,10 @@ impl TickCandidates {
             // requirement is met, so every edge has its cell.
             let arrivals = arrivals_for(
                 &candidate.tx,
-                &candidate.classified,
+                candidate.member.classified(),
                 provisioning,
                 local,
-                candidate.side,
+                candidate.member.side(),
             );
             // A remote-payer leg executes under the anchor its payer
             // bundle carried; every other member under its own committing
@@ -327,10 +317,7 @@ impl TickCandidates {
                     clock: anchor.map_or(candidate.committed_ts, |a| a.clock),
                     reaches_beyond,
                     abortable,
-                    runs: Runs::Shape {
-                        classified: candidate.classified.clone(),
-                        side: candidate.side,
-                    },
+                    runs: Runs::Shape(candidate.member.clone()),
                     arrivals,
                 },
                 membership,
@@ -370,7 +357,7 @@ impl TickCandidates {
             .candidates
             .iter()
             .filter(|(_, candidate)| {
-                candidate.side == Side::Delivering
+                candidate.member.side() == Side::Delivering
                     && now
                         >= delivery_window_close(
                             candidate.tx.validity_range().end_timestamp_exclusive,

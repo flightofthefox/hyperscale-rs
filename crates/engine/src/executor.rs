@@ -49,9 +49,7 @@ use hyperscale_vm_types::{
 
 use crate::backend::EngineBackend;
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
-use crate::legs::{
-    Classified, Runs, ShardPlan, Side, plan_for_shard, reclaim_for_shard, retire_for_shard,
-};
+use crate::legs::{Member, Runs, ShardPlan, plan_for_shard, reclaim_for_shard, retire_for_shard};
 use crate::records::BatchRecords;
 use crate::sharding::writes_root;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
@@ -489,27 +487,25 @@ impl Executor {
     /// the legs `decomposed` gives this shard under `ctx`, with its
     /// crossing cells declared.
     fn prepare_shape(
-        ctx: &TickBatchContext<'_>,
         tx: &Transaction,
         records: &BatchRecords,
-        classified: &Classified,
+        member: &Member,
         arrivals: &[EscrowedValue],
-        side: Side,
     ) -> Result<PreparedTx, String> {
         let mut entry = Self::prepare(tx, records)?;
         entry.plan = plan_for_shard(
             tx.legs(),
             tx.crossings(),
             arrivals,
-            classified,
-            ctx.local_shard,
-            side,
+            member.classified(),
+            member.local(),
+            member.side(),
         )
         .map_err(|defect| format!("no plan for this shard: {defect}"))?;
         // The second member a shard runs of one transaction commits no
         // nullifier: the issuing one did, and a second spend of the same
         // cell would refuse this one before it ran.
-        if classified.second_member(ctx.local_shard, side) {
+        if member.is_second() {
             entry.nullifiers.clear();
         }
         declare_crossing_cells(&mut entry.declaration, &entry.plan.legs)?;
@@ -1292,12 +1288,10 @@ impl Executor {
                         .map_err(|defect| format!("no retirement for this shard: {defect}"))
                         .and_then(|plan| Self::prepare_retire(plan, snapshot))
                 }
-                Some((Runs::Shape { classified, side }, arrivals)) => {
-                    Self::prepare_shape(ctx, tx, &records, classified, arrivals, *side)
+                Some((Runs::Shape(member), arrivals)) => {
+                    Self::prepare_shape(tx, &records, member, arrivals)
                 }
-                None => {
-                    Self::prepare_shape(ctx, tx, &records, &Classified::whole(), &[], Side::Issuing)
-                }
+                None => Self::prepare_shape(tx, &records, &Member::whole(ctx.local_shard), &[]),
             };
             match planned {
                 Ok(entry) => {
@@ -1399,9 +1393,7 @@ impl Executor {
                     // A retirement is housekeeping on a transaction whose
                     // price its leg settled: it charges nothing.
                     Some(Runs::Retire { .. }) => true,
-                    Some(Runs::Shape { classified, side }) => {
-                        classified.second_member(ctx.local_shard, *side)
-                    }
+                    Some(Runs::Shape(member)) => member.is_second(),
                     None => false,
                 };
                 if already_charged {
