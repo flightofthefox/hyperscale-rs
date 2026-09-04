@@ -14,14 +14,11 @@
 //! shard keeps clearing from admission through the cut and from the
 //! successor after it.
 
-use std::time::Duration;
-
 use hyperscale_engine::XRD;
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey, TransactionDecision,
     TransactionStatus, TxHash, WeightedTimestamp, WorkInFlight, delivery_window_close,
 };
-use hyperscale_vm_types::ESCROW_GRACE_MS;
 
 use crate::reshape::split_lifecycle;
 use crate::route::{FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD, TRADER_SHARD};
@@ -431,7 +428,7 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
     let _ = isolate_ec_intake(c, departing, survivor);
     let _ = isolate_ec_intake(c, survivor, departing);
     let mut charges = Charges::default();
-    let (hash, baseline, paid, validity_end) = submit_departing_route(c, &route, &mut charges);
+    let (hash, baseline, paid, ..) = submit_departing_route(c, &route, &mut charges);
 
     // The cut. The departing venue's cells land under a child, and its
     // settled set reaches the survivor.
@@ -444,32 +441,19 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
         c.committed_work_in_flight(survivor),
     );
     // The departure record licenses the trader's reclaim, which reads the
-    // record cell the trader's leg wrote — a cell that lives to its
-    // intent's end plus the escrow grace and is swept then. A departure
-    // inside that grace gives the input back; one past it, which is
-    // every departure on a clock whose epochs outrun the grace, comes to
-    // a swept cell and strands the input by the record's own sweep. The
-    // scenario reads which it got and holds the world to it.
-    let record_swept_at = validity_end.plus(Duration::from_millis(ESCROW_GRACE_MS));
-    let departed_at = WeightedTimestamp::ZERO.plus(c.now());
-    let stranded = if departed_at < record_swept_at {
-        assert!(
-            c.run_until(epochs(12), |c| held(c, route.trader.address(), *XRD)
-                == paid + ROUTE_INPUT),
-            "the trader must get the route's input back on the departure record; holds {} \
-             against {}",
-            held(c, route.trader.address(), *XRD),
-            paid + ROUTE_INPUT,
-        );
-        0
-    } else {
-        assert!(
-            !c.run_until(epochs(4), |c| held(c, route.trader.address(), *XRD) != paid),
-            "past the record's sweep nothing can give the input back; holds {} against {paid}",
-            held(c, route.trader.address(), *XRD),
-        );
-        ROUTE_INPUT
-    };
+    // record cell the trader's leg wrote — and reads it whenever the
+    // record lands, because a record is value and value is not swept on
+    // a clock. So the input comes back however long the departure took,
+    // which is what makes this readable on either epoch clock: one whose
+    // epochs outrun the escrow grace reaches the reclaim just the same.
+    assert!(
+        c.run_until(epochs(12), |c| held(c, route.trader.address(), *XRD)
+            == paid + ROUTE_INPUT),
+        "the trader must get the route's input back on the departure record; holds {} \
+         against {}",
+        held(c, route.trader.address(), *XRD),
+        paid + ROUTE_INPUT,
+    );
     // The trader's own leg accepted and stays accepted; the core it
     // fed is abandoned on both shards, never settled one-sided.
     for shard in [departing, survivor] {
@@ -487,20 +471,15 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
         );
     }
     c.clear_drops();
-    // Held to the fate read above: conserved outright inside the grace,
-    // and short by exactly the stranded input past it.
+    // And conserved outright: nothing of the route is stranded, because
+    // nothing it issued was swept out from under its reclaim.
     assert!(
-        c.run_until(epochs(8), |c| route
-            .xrd
-            .settles(c, charges.burned(c) + stranded)),
-        "a route through a departing venue: the world must settle against the burn and the \
-         input the record's sweep stranded ({stranded})",
+        c.run_until(epochs(8), |c| route.xrd.settles(c, charges.burned(c))),
+        "a route through a departing venue: the world must settle against the burn alone",
     );
-    route.xrd.assert_settled(
-        c,
-        charges.burned(c) + stranded,
-        "a route through a departing venue",
-    );
+    route
+        .xrd
+        .assert_settled(c, charges.burned(c), "a route through a departing venue");
     charges.assert_each_fits_a_full_block(c);
     route.units.assert_settles_within(
         c,
