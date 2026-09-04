@@ -563,7 +563,7 @@ fn set_bits(key: &mut Key, at: u16, count: u8, val: u8) {
 /// Set every bit of `key` at offsets `>= from` to one.
 fn fill_ones_from(key: &mut Key, from: u16) {
     let from = usize::from(from);
-    if from >= 256 {
+    if from >= usize::from(KEY_BITS) {
         return;
     }
     let byte = from / 8;
@@ -1111,5 +1111,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ProofError::RangeIncomplete));
+    }
+
+    /// A cursor resuming inside one owner's cells still enumerates the
+    /// rest of them.
+    ///
+    /// Every substate key is a 32-byte owner followed by a 16-byte local
+    /// half, so two cells of one owner diverge at or below bit 256 — and
+    /// a span bound computed for a subtree that deep must still reach the
+    /// end of the key space, or the walk prunes the subtree the cursor
+    /// points into and reports the owner's remaining cells as absent.
+    #[test]
+    fn a_cursor_inside_a_deep_subtree_enumerates_the_rest_of_it() {
+        let owner_wide = |tail: u8| {
+            let mut key = [0u8; KEY_BYTES];
+            key[47] = tail;
+            key
+        };
+        let entries: Vec<_> = (1..=6u8).map(|i| (owner_wide(i), v(i))).collect();
+        let (store, root, _) = build_store(&entries);
+
+        let end = [0xFFu8; KEY_BYTES];
+        let all = Jmt::collect_range(&store, &root, &[0u8; KEY_BYTES], &end, 100).unwrap();
+        assert_eq!(all.leaves.len(), 6);
+
+        // Paginate: one leaf, then resume just past it.
+        let first = Jmt::collect_range(&store, &root, &[0u8; KEY_BYTES], &end, 1).unwrap();
+        assert!(first.more);
+        let cursor = next_key(&first.leaves.last().unwrap().0).expect("a successor exists");
+        let rest = Jmt::collect_range(&store, &root, &cursor, &end, 100).unwrap();
+        assert_eq!(
+            first.leaves.len() + rest.leaves.len(),
+            6,
+            "pagination across a deep divergence loses no leaf"
+        );
+
+        // And a start landing exactly on a leaf includes it.
+        let at_leaf = Jmt::collect_range(&store, &root, &owner_wide(2), &end, 100).unwrap();
+        assert_eq!(at_leaf.leaves.len(), 5);
     }
 }
