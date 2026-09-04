@@ -409,12 +409,11 @@ pub fn a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed<C: Faultable
 
     // The vote goes in first, since it activates epochs later and the
     // split is admitted only after that; the leg goes in at the
-    // activation epoch, under the cut, while the splitter is still live
-    // and its split not yet pending, so the shape divides — the leg pays
-    // on the survivor and the delivery is the splitter's. As late as
-    // that so the lapse falls past the cut, which is what puts the proof
-    // on the successor; a shape reaching a shard whose split is pending
-    // would run whole instead.
+    // activation epoch, while the splitter still owns the recipient's
+    // prefix, so the delivery is the splitter's own — a leg committed
+    // after the cut would name the successor from the start and ask
+    // nothing of an inheritance. As late as that so the lapse falls past
+    // the cut, which is what puts the proof on the successor.
     let cast_at = beacon_epoch(c).expect("post-grow beacon epoch");
     let epoch_ms = c
         .beacon_state()
@@ -439,7 +438,9 @@ pub fn a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed<C: Faultable
     );
     assert!(
         !split_admitted(c, splitter),
-        "the leg has to be committed before the split is admitted, or the shape runs whole",
+        "the leg has to be committed while the splitter still owns the recipient's \
+         prefix, and the split's admission is the conservative marker of that: \
+         past the cut the delivery is the successor's from the start",
     );
     // Read before the admission is awaited: on a clock whose epochs
     // outlast the lapse the reclaim lands inside that wait, and the
