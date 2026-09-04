@@ -371,6 +371,13 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
 /// back is [`a_delivery_cut_off_past_its_window_is_reclaimed`]'s to
 /// show.
 ///
+/// The conservation equality reads the figure the chains give, not a
+/// bound. What is bounded is which probes may appear in it: the doomed
+/// batch's two survivor-paid deliveries at the floor, the racing batch's
+/// two at the ceiling — each landing in whichever bucket it raced into —
+/// and nothing from the settling batch, which finalized on both children
+/// before any fault installed.
+///
 /// [`a_delivery_cut_off_past_its_window_is_reclaimed`]: crate::execution::a_delivery_cut_off_past_its_window_is_reclaimed
 fn assert_conserved_less_the_strand<C: Cluster>(
     c: &mut C,
@@ -379,9 +386,11 @@ fn assert_conserved_less_the_strand<C: Cluster>(
     stranded: u128,
 ) {
     assert!(
-        stranded >= 2 * STRADDLER_PAYMENT,
-        "the doomed batch's survivor-paid deliveries are stranded by construction; \
-         stranded = {stranded}",
+        (2 * STRADDLER_PAYMENT..=4 * STRADDLER_PAYMENT).contains(&stranded),
+        "the doomed batch's two survivor-paid deliveries strand by construction and \
+         the racing batch's two may, each by the race it was submitted into; \
+         nothing else can, since the settling batch finalized on both children \
+         before any fault installed. stranded = {stranded}",
     );
     let balanced = c.run_until(epochs(8), |c| {
         world.held(c) + charges.burned(c) + stranded == world.before()
@@ -393,6 +402,47 @@ fn assert_conserved_less_the_strand<C: Cluster>(
         world.before(),
         world.held(c),
         charges.burned(c),
+    );
+}
+
+/// Assert one crossing's halves under the severance: the payer settles
+/// it alone if its chain carried it at all, and no delivery lands.
+///
+/// Whether the payer committed it is the race the cut lands in the
+/// middle of, so that is read first rather than assumed — a transaction
+/// the partition beat into the block is nobody's to decide.
+fn assert_severed_crossing<C: FaultableCluster>(
+    c: &mut C,
+    (left, right): (ShardId, ShardId),
+    crossing: &Crossing,
+    label: &str,
+) {
+    let payer_shard = payer_of(crossing, left, right);
+    if c.chain_fate(payer_shard, crossing.hash).0.is_some() {
+        let decided = c.run_until(epochs(4), |c| {
+            matches!(
+                c.chain_fate(payer_shard, crossing.hash).1,
+                Some((_, TransactionDecision::Accept))
+            )
+        });
+        let payer_fate = c.chain_fate(payer_shard, crossing.hash).1.map(|(_, d)| d);
+        assert!(
+            decided,
+            "a payer that committed the {label} transfer settles it alone under the \
+             severance — it awaits nobody: {payer_fate:?}",
+        );
+    } else {
+        assert!(
+            c.chain_fate(payer_shard, crossing.hash).1.is_none(),
+            "the {label} transfer's payer reached a verdict on a transaction its \
+             chain never carried",
+        );
+    }
+    assert!(
+        c.chain_fate(crossing.recipient_shard, crossing.hash)
+            .0
+            .is_none(),
+        "the {label} delivery landed across the severance",
     );
 }
 
@@ -462,13 +512,7 @@ fn assert_deliveries_agree<C: Cluster>(
     at_freeze: &[ChainFate],
 ) -> u128 {
     let fate_on = |c: &C, shard: ShardId, idx: usize, hash: TxHash| {
-        let now = c.chain_fate(shard, hash);
-        if shard == halted {
-            let frozen = at_freeze[idx];
-            (now.0.or(frozen.0), now.1.or(frozen.1))
-        } else {
-            now
-        }
+        fate_including_freeze(c, halted, at_freeze, shard, idx, hash)
     };
     let mut report = String::new();
     let mut settled = 0u32;
@@ -529,19 +573,10 @@ fn assert_deliveries_agree<C: Cluster>(
     // its payer's reclaim reaches nothing either, the halt having
     // outlasted the record's grace.
     let now = WeightedTimestamp::ZERO.plus(c.now());
-    let owed: Vec<&Probe> = probes
-        .iter()
-        .enumerate()
-        .filter(|(idx, p)| {
-            p.payer_shard == survivor
-                && matches!(
-                    fate_on(c, survivor, *idx, p.hash).1,
-                    Some((_, TransactionDecision::Accept))
-                )
-                && fate_on(c, halted, *idx, p.hash).0.is_none()
-                && now < p.delivery_closes
-        })
-        .map(|(_, p)| p)
+    let owed: Vec<&Probe> = undelivered_survivor_paid(c, halted, survivor, probes, at_freeze)
+        .into_iter()
+        .map(|idx| &probes[idx])
+        .filter(|p| now < p.delivery_closes)
         .collect();
     let landed = c.run_until(epochs(10), |c| {
         owed.iter()
@@ -554,19 +589,66 @@ fn assert_deliveries_agree<C: Cluster>(
         owed.iter().map(|p| p.hash).collect::<Vec<_>>(),
     );
 
-    let stranded = probes
+    let stranded = undelivered_survivor_paid(c, halted, survivor, probes, at_freeze);
+    assert!(
+        stranded.iter().all(|&idx| idx >= HALT_STRADDLER_BATCH),
+        "the settling batch finalized on both children before any fault installed, \
+         so nothing of it can strand; stranded probes = {stranded:?}",
+    );
+    u128::try_from(stranded.len()).expect("a handful of probes") * STRADDLER_PAYMENT
+}
+
+/// A probe's fate on `shard`, taking the halted shard's reading from
+/// before the freeze where its chain has since said nothing.
+///
+/// A recovered shard's chain answers for what it committed before the
+/// freeze, but a scenario that read it only after the recovery would
+/// miss a probe the shard settled and then stopped answering for.
+fn fate_including_freeze<C: Cluster>(
+    c: &C,
+    halted: ShardId,
+    at_freeze: &[ChainFate],
+    shard: ShardId,
+    idx: usize,
+    hash: TxHash,
+) -> ChainFate {
+    let now = c.chain_fate(shard, hash);
+    if shard == halted {
+        let frozen = at_freeze[idx];
+        (now.0.or(frozen.0), now.1.or(frozen.1))
+    } else {
+        now
+    }
+}
+
+/// The probes the survivor accepted and the halted shard has not
+/// committed a delivery of, by index.
+///
+/// Read twice: once to drive whatever is still inside its window onto
+/// the recovered shard, and once after, when what is left is what the
+/// halt stranded.
+fn undelivered_survivor_paid<C: Cluster>(
+    c: &C,
+    halted: ShardId,
+    survivor: ShardId,
+    probes: &[Probe],
+    at_freeze: &[ChainFate],
+) -> Vec<usize> {
+    probes
         .iter()
         .enumerate()
         .filter(|(idx, p)| {
             p.payer_shard == survivor
                 && matches!(
-                    fate_on(c, survivor, *idx, p.hash).1,
+                    fate_including_freeze(c, halted, at_freeze, survivor, *idx, p.hash).1,
                     Some((_, TransactionDecision::Accept))
                 )
-                && fate_on(c, halted, *idx, p.hash).0.is_none()
+                && fate_including_freeze(c, halted, at_freeze, halted, *idx, p.hash)
+                    .0
+                    .is_none()
         })
-        .count();
-    u128::try_from(stranded).expect("a handful of probes") * STRADDLER_PAYMENT
+        .map(|(idx, _)| idx)
+        .collect()
 }
 
 /// A staged shard freeze: the fault rules are installed and the shard has
@@ -1060,26 +1142,20 @@ pub fn inter_shard_partition_strands_ticks_until_it_heals(c: &mut impl Faultable
         "the right shard wedged under the severance (before={right_before}, during={right_during})",
     );
 
-    // No delivery lands across the cut. A divided transfer's payer settles
-    // it alone, so the severance stalls the delivery and not the verdict:
-    // a payer that has decided has accepted, and the recipient's chain,
-    // cut off from the bundle the delivery rides, has not committed it.
-    // Read off the chains rather than waited for: with the beacon starved
-    // by the same partition, no attested clock is advancing, so a
-    // delivery that has not landed by now is not going to.
+    // No delivery lands across the cut, and a payer that carried the
+    // transaction reaches its verdict anyway. A divided transfer's payer
+    // settles it alone, so the severance stalls the delivery and nothing
+    // else — the case worth failing is a payer that committed the
+    // transaction and then waits on a counterpart it does not await.
+    // Whether it committed at all is the race the cut lands in the middle
+    // of, so that is read first rather than assumed: a transaction the
+    // partition beat into the block is nobody's to decide, and the
+    // `resolved > 0` check below is what keeps the pair from being
+    // vacuous. The delivery's absence is read off the chain rather than
+    // waited for: with the beacon starved by the same partition, one that
+    // has not landed is not going to.
     for (crossing, label) in [(&before, "left→right"), (&during, "right→left")] {
-        let payer_shard = payer_of(crossing, left, right);
-        let payer_fate = c.chain_fate(payer_shard, crossing.hash).1.map(|(_, d)| d);
-        assert!(
-            matches!(payer_fate, None | Some(TransactionDecision::Accept)),
-            "the {label} transfer's payer refused it under the severance: {payer_fate:?}",
-        );
-        assert!(
-            c.chain_fate(crossing.recipient_shard, crossing.hash)
-                .0
-                .is_none(),
-            "the {label} delivery landed across the severance",
-        );
+        assert_severed_crossing(c, (left, right), crossing, label);
     }
 
     // Heal every edge. Epoch production resumes and both clocks restart, so a
