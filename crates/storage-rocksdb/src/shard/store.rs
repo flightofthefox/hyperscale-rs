@@ -137,6 +137,10 @@ impl VersionedStore for RocksDbShardStorage {
     fn substate_bytes_at(&self, height: BlockHeight) -> Option<u64> {
         self.substate_bytes_at_version(height.inner())
     }
+
+    fn retention_floor(&self) -> u64 {
+        Self::retention_floor(self)
+    }
 }
 
 impl RocksDbShardStorage {

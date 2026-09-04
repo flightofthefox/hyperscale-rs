@@ -71,6 +71,10 @@ impl SubstateStore for SimShardStorage {
 }
 
 impl VersionedStore for SimShardStorage {
+    fn retention_floor(&self) -> u64 {
+        Self::retention_floor(self)
+    }
+
     fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
         // Retention invariant: see `RocksDbShardStorage::snapshot_at` for the
         // full reasoning. Below the floor we can't serve historical

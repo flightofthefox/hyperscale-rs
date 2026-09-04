@@ -148,4 +148,13 @@ pub trait VersionedStore: SubstateStore {
     /// every replica — it is written atomically with the commit, never
     /// recomputed out-of-band.
     fn substate_bytes_at(&self, height: BlockHeight) -> Option<u64>;
+
+    /// The oldest height this store answers historical reads at.
+    ///
+    /// The bound every external-facing reader owes the contract above,
+    /// stated rather than inferred: a caller that decides what it serves
+    /// by whether the collector has run yet answers for heights the
+    /// store no longer promises, and two such callers answer differently
+    /// for the same height.
+    fn retention_floor(&self) -> u64;
 }

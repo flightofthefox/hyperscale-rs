@@ -196,6 +196,10 @@ impl SubstateStore for StubBase {
 }
 
 impl VersionedStore for StubBase {
+    fn retention_floor(&self) -> u64 {
+        0
+    }
+
     fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
         StubSnapshot(self.cells_at(height))
     }

@@ -753,6 +753,10 @@ mod tests {
     }
 
     impl VersionedStore for StubStore {
+        fn retention_floor(&self) -> u64 {
+            0
+        }
+
         fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
             lock_or_recover(&self.anchors).push(height);
             StubSnapshot(self.cells_at(height))

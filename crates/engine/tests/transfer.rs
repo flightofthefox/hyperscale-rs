@@ -173,6 +173,10 @@ impl SubstateStore for MapDb {
 }
 
 impl VersionedStore for MapDb {
+    fn retention_floor(&self) -> u64 {
+        0
+    }
+
     fn snapshot_at(&self, _height: BlockHeight) -> Self::Snapshot<'_> {
         Self(self.0.clone())
     }

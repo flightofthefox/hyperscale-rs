@@ -1007,6 +1007,20 @@ impl<S: SubstateStore + VersionedStore + SweepIndex> SweepIndex for SubstateView
     }
 }
 
+impl<S: SubstateStore + VersionedStore> SubstateView<S> {
+    /// Whether this view answers historical reads at `height`.
+    ///
+    /// The base's retention floor, asked rather than inferred: a server
+    /// that decides by whether the tree still happens to hold a version's
+    /// nodes answers for heights the store no longer promises, and the
+    /// two servers that read history through this view would then answer
+    /// differently for the same height.
+    #[must_use]
+    pub fn serves_at(&self, height: BlockHeight) -> bool {
+        height.inner() >= self.base.retention_floor()
+    }
+}
+
 impl<S: SubstateStore + VersionedStore> SubstateStore for SubstateView<S> {
     type Snapshot<'a>
         = ViewSnapshot<S::Snapshot<'a>>
@@ -1246,6 +1260,10 @@ mod tests {
     }
 
     impl VersionedStore for StubStore {
+        fn retention_floor(&self) -> u64 {
+            0
+        }
+
         fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
             self.recorded_snapshot_at
                 .lock()

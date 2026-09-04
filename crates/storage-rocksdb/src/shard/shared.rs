@@ -155,6 +155,10 @@ impl VersionedStore for SharedStorage {
     fn substate_bytes_at(&self, height: BlockHeight) -> Option<u64> {
         self.0.substate_bytes_at(height)
     }
+
+    fn retention_floor(&self) -> u64 {
+        VersionedStore::retention_floor(&*self.0)
+    }
 }
 
 impl TreeReader for SharedStorage {
