@@ -135,7 +135,7 @@ impl Fixture {
             Arc::new(StubVmStatics),
             shard,
             &ShardConsensusConfig::default(),
-            RecoveredState::default(),
+            &RecoveredState::default(),
             beacon,
             MempoolConfig::default(),
             ProvisionConfig::default(),

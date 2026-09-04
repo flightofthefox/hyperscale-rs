@@ -119,7 +119,7 @@ impl ShardParticipation {
         me: ValidatorId,
         local_shard: ShardId,
         shard_config: &ShardConsensusConfig,
-        recovered: RecoveredState,
+        recovered: &RecoveredState,
         mempool_config: MempoolConfig,
         provision_config: ProvisionConfig,
         provision_store: Arc<ProvisionStore>,
@@ -133,23 +133,29 @@ impl ShardParticipation {
         // flight both seed from the same recovered tip the shard
         // coordinator restores, so the first post-restart commit
         // classifies its ticks exactly as a non-restarted peer's does.
+        let shard_coordinator = ShardCoordinator::new(
+            verifier,
+            me,
+            local_shard,
+            shard_config.clone(),
+            recovered.clone(),
+        );
+        // One mirror of the commit-proven remote anchors, owned by the
+        // shard coordinator: the vote fence and the certificate gate ask
+        // the same question of it, and two copies could answer
+        // differently.
         let execution_coordinator = ExecutionCoordinator::with_shared_stores(
             me,
             local_shard,
-            &recovered,
+            recovered,
             exec_cert_store,
             finalization_store,
+            Arc::clone(shard_coordinator.proven_anchors()),
         );
         Self {
             local_shard,
             derivation,
-            shard_coordinator: ShardCoordinator::new(
-                verifier,
-                me,
-                local_shard,
-                shard_config.clone(),
-                recovered,
-            ),
+            shard_coordinator,
             execution_coordinator,
             mempool_coordinator,
             provisions_coordinator: ProvisionCoordinator::with_config_and_store(

@@ -1,0 +1,225 @@
+//! The commit-proven remote headers this node holds, as one mirror.
+//!
+//! A header this node has a commit proof for is a fact two consumers ask
+//! about, and they must not be able to disagree. The vote fence holds a
+//! block's state proofs to the anchors this validator has proven; the
+//! execution coordinator gates a cross-shard execution certificate on
+//! its source block being proven, and anchors a reclaim probe at the
+//! newest proven header a window licenses. Two mirrors of one fact would
+//! let a bundle pass the fence against an anchor the prober would never
+//! have chosen, and the difference between them would be nobody's to
+//! notice.
+//!
+//! # Why a projection rather than the header store
+//!
+//! `REMOTE_HEADER_RETENTION` is the store's, and both consumers here need
+//! [`RETENTION_HORIZON`] — the span a probe or a provision may still be
+//! licensed across, which is five times as long. Keeping whole certified
+//! headers that long to answer a question about forty bytes is the wrong
+//! half of the trade, and the fork-sibling and commit-proof machinery
+//! hanging off the store has no reason to live that long either. So this
+//! is a deliberate projection that outlives what it projects from, and
+//! this paragraph is where the asymmetry is stated rather than
+//! rediscovered.
+//!
+//! # Node-local, and shared
+//!
+//! Which headers a node has proven is that node's own view — it is why
+//! the fence defers rather than refusing — so nothing here is consensus
+//! content and there is no determinism to preserve. One instance is
+//! shared by handle, on [`TopologySnapshot`](crate::TopologySnapshot)'s
+//! terms: one per host, read wherever it is needed.
+
+use std::collections::BTreeMap;
+use std::sync::RwLock;
+
+use crate::{BlockHeight, RETENTION_HORIZON, ShardId, StateRoot, WeightedTimestamp};
+
+/// One commit-proven remote header, projected to what its consumers ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProvenAnchor {
+    /// The state root the header commits to — what a proof taken against
+    /// this height must reconstruct.
+    pub state_root: StateRoot,
+    /// The header's parent-QC weighted timestamp: the clock every window
+    /// an answer at this anchor is held to is read against, and the one
+    /// this anchor is retired on.
+    pub ts: WeightedTimestamp,
+}
+
+/// Every commit-proven remote header this node holds, by shard and
+/// height.
+#[derive(Debug, Default)]
+pub struct ProvenAnchors {
+    by_height: RwLock<BTreeMap<(ShardId, BlockHeight), ProvenAnchor>>,
+}
+
+impl ProvenAnchors {
+    /// An empty mirror.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a header this node has commit-proven.
+    ///
+    /// # Panics
+    ///
+    /// If the lock is poisoned, which means a consumer panicked holding
+    /// it — the node is already unsound at that point.
+    pub fn record(
+        &self,
+        shard: ShardId,
+        height: BlockHeight,
+        state_root: StateRoot,
+        ts: WeightedTimestamp,
+    ) {
+        self.by_height
+            .write()
+            .expect("proven anchors lock poisoned")
+            .insert((shard, height), ProvenAnchor { state_root, ts });
+    }
+
+    /// The anchor at `(shard, height)`, if this node has proven it.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::record`].
+    #[must_use]
+    pub fn at(&self, shard: ShardId, height: BlockHeight) -> Option<ProvenAnchor> {
+        self.by_height
+            .read()
+            .expect("proven anchors lock poisoned")
+            .get(&(shard, height))
+            .copied()
+    }
+
+    /// The highest anchor of `shard` this node has proven that `licensed`
+    /// accepts — the one a shard is likeliest to still serve, since a
+    /// proof comes from a bounded history behind its own tip.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::record`].
+    #[must_use]
+    pub fn newest_licensed(
+        &self,
+        shard: ShardId,
+        licensed: impl Fn(WeightedTimestamp) -> bool,
+    ) -> Option<(BlockHeight, ProvenAnchor)> {
+        self.by_height
+            .read()
+            .expect("proven anchors lock poisoned")
+            .iter()
+            .filter(|((at, _), anchor)| *at == shard && licensed(anchor.ts))
+            .map(|((_, height), anchor)| (*height, *anchor))
+            .max_by_key(|(height, _)| *height)
+    }
+
+    /// How many anchors are held, for the metric that reports it.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::record`].
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.by_height
+            .read()
+            .expect("proven anchors lock poisoned")
+            .len()
+    }
+
+    /// Whether nothing is held.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::record`].
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Retire every anchor a probe can no longer be taken against.
+    ///
+    /// One rule for both consumers, on the clock the committed block
+    /// carries: past [`RETENTION_HORIZON`] no window licenses an answer
+    /// at the anchor and no execution certificate against the block is
+    /// consumable anywhere.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::record`].
+    pub fn retire_below(&self, now: WeightedTimestamp) {
+        let floor = now.minus(RETENTION_HORIZON);
+        self.by_height
+            .write()
+            .expect("proven anchors lock poisoned")
+            .retain(|_, anchor| anchor.ts >= floor);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Hash;
+
+    fn root(seed: u8) -> StateRoot {
+        StateRoot::from_raw(Hash::from_bytes(&[seed; 32]))
+    }
+
+    fn ms(at: u64) -> WeightedTimestamp {
+        WeightedTimestamp::from_millis(at)
+    }
+
+    /// One mirror answers both questions of it: whether a height is
+    /// proven, and which of a shard's proven heights a window reaches.
+    #[test]
+    fn one_mirror_answers_the_fence_and_the_prober() {
+        let anchors = ProvenAnchors::new();
+        let shard = ShardId::leaf(1, 1);
+        anchors.record(shard, BlockHeight::new(4), root(4), ms(4_000));
+        anchors.record(shard, BlockHeight::new(9), root(9), ms(9_000));
+        anchors.record(ShardId::leaf(1, 0), BlockHeight::new(9), root(1), ms(9_000));
+
+        assert_eq!(
+            anchors.at(shard, BlockHeight::new(4)).unwrap().state_root,
+            root(4)
+        );
+        assert_eq!(anchors.at(shard, BlockHeight::new(5)), None);
+        assert_eq!(
+            anchors.newest_licensed(shard, |_| true).unwrap().0,
+            BlockHeight::new(9),
+            "the highest of that shard's, and never another shard's",
+        );
+        assert_eq!(
+            anchors
+                .newest_licensed(shard, |ts| ts <= ms(5_000))
+                .unwrap()
+                .0,
+            BlockHeight::new(4),
+            "and the highest the window reaches, not the highest held",
+        );
+    }
+
+    /// One retirement rule, so the fence and the prober lose an anchor at
+    /// the same moment.
+    #[test]
+    fn an_anchor_retires_for_both_consumers_at_once() {
+        let anchors = ProvenAnchors::new();
+        let shard = ShardId::leaf(1, 1);
+        let old = ms(1_000);
+        let horizon = u64::try_from(RETENTION_HORIZON.as_millis()).expect("fits");
+        // Exactly a horizon back is still reachable; a millisecond past
+        // it is not, which is the edge the retirement is stated at.
+        anchors.record(shard, BlockHeight::new(1), root(1), old);
+        anchors.record(shard, BlockHeight::new(2), root(2), ms(1_001));
+
+        anchors.retire_below(ms(1_000 + horizon));
+        assert!(anchors.at(shard, BlockHeight::new(1)).is_some());
+
+        anchors.retire_below(ms(1_001 + horizon));
+        assert_eq!(anchors.at(shard, BlockHeight::new(1)), None);
+        assert!(anchors.at(shard, BlockHeight::new(2)).is_some());
+        assert_eq!(anchors.len(), 1);
+    }
+}

@@ -97,7 +97,7 @@ impl NodeStateMachine {
         derivation: Arc<dyn Derivation>,
         local_shard: ShardId,
         shard_config: &ShardConsensusConfig,
-        recovered: RecoveredState,
+        recovered: &RecoveredState,
         beacon_coordinator: BeaconCoordinator,
         mempool_config: MempoolConfig,
         provision_config: ProvisionConfig,

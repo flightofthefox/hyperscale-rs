@@ -52,8 +52,8 @@ use hyperscale_types::{
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome, ExecutionVote,
     Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
     LegEntry, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    MerkleInclusionProof, Mode, Provisions, RETENTION_HORIZON, Refusal, ScheduleLookup,
-    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateAnchor, StateProofBundle, StateRoot,
+    MerkleInclusionProof, Mode, ProvenAnchors, Provisions, Refusal, ScheduleLookup,
+    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateAnchor, StateProofBundle,
     StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot, Transaction,
     TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
     Verifiable, Verified, WeightedTimestamp, absence_licenses_reclaim, derive_block_transactions,
@@ -220,14 +220,6 @@ pub struct ExecutionMemoryStats {
     /// sustained rise means a source shard certifies without proving
     /// commits — the fork/withholding signature.
     pub unproven_ecs: usize,
-}
-
-/// A commit-proven remote source block: its authenticated timestamp and
-/// the state root its header carries.
-#[derive(Debug, Clone, Copy)]
-struct ProvenSource {
-    ts: WeightedTimestamp,
-    state_root: StateRoot,
 }
 
 /// Which counterpart a probe asks, and so which record its absence is
@@ -532,16 +524,19 @@ pub struct ExecutionCoordinator {
     // ═══════════════════════════════════════════════════════════════════════
     // Commit-proof gate
     // ═══════════════════════════════════════════════════════════════════════
-    /// Commit-proven remote source blocks, fed by `RemoteHeaderCommitted`:
-    /// the remote-header coordinator also holds each block's committing
-    /// structure. A cross-shard EC is consumable only against a proven
-    /// source block — a bare QC certifies availability, and an f+1..2f
-    /// corrupt committee can certify a sibling that never commits and
-    /// export ECs computed from it. Values are the source block's
-    /// authenticated timestamp — the pruning anchor — and its state
-    /// root, which a probe of the shard's committed set is taken
-    /// against.
-    proven_remote: HashMap<(ShardId, BlockHeight), ProvenSource>,
+    /// Commit-proven remote source blocks, shared with the shard
+    /// coordinator, which owns the mirror and feeds it off
+    /// `RemoteHeaderCommitted`.
+    ///
+    /// A cross-shard EC is consumable only against a proven source block
+    /// — a bare QC certifies availability, and an f+1..2f corrupt
+    /// committee can certify a sibling that never commits and export ECs
+    /// computed from it. The same anchors are what a probe of a
+    /// counterpart's committed set is taken against, and what this
+    /// validator's vote fence holds a block's state proofs to: one
+    /// mirror, so a bundle cannot pass the fence at an anchor no prober
+    /// here would have chosen.
+    proven_anchors: Arc<ProvenAnchors>,
 
     /// Cross-shard ECs racing ahead of their source block's commit proof,
     /// keyed by the EC's shard, bounded per shard (drop-oldest). Replayed
@@ -626,6 +621,7 @@ impl ExecutionCoordinator {
             &RecoveredState::default(),
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
+            Arc::new(ProvenAnchors::new()),
         )
     }
 
@@ -657,6 +653,7 @@ impl ExecutionCoordinator {
         recovered: &RecoveredState,
         exec_certs: Arc<ExecCertStore>,
         finalized: Arc<FinalizationStore>,
+        proven_anchors: Arc<ProvenAnchors>,
     ) -> Self {
         // Execution resumes below the first block it replays, so the
         // replay carries the frontier up to the tip rather than starting
@@ -682,6 +679,7 @@ impl ExecutionCoordinator {
             None => recovered.committee_anchor_wt(),
         };
         Self {
+            proven_anchors,
             finalized,
             committed_height,
             committed_ts: committed_block_anchor_wt,
@@ -711,7 +709,7 @@ impl ExecutionCoordinator {
             pending_finalization_verifications: HashSet::new(),
             awaiting_certs: AwaitingTopologyBuffer::new(),
             awaiting_finalizations: AwaitingTopologyBuffer::new(),
-            proven_remote: HashMap::new(),
+
             unproven_ecs: AwaitingTopologyBuffer::new(),
             settled_sets: HashMap::new(),
             refusals: BTreeMap::new(),
@@ -2258,9 +2256,7 @@ impl ExecutionCoordinator {
         // `settled_set_admits` — because a departed chain supplies no
         // further commit proofs.
         if shard != self.local_shard
-            && !self
-                .proven_remote
-                .contains_key(&(shard, cert.block_height()))
+            && self.proven_anchors.at(shard, cert.block_height()).is_none()
             && !self.settled_set_admits(shard, &cert)
         {
             let height = cert.block_height();
@@ -2467,31 +2463,29 @@ impl ExecutionCoordinator {
     // Expected Execution Certificate Tracking
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /// The shared mirror of commit-proven remote anchors, which the shard
+    /// coordinator owns and fills.
+    #[must_use]
+    pub const fn proven_anchors(&self) -> &Arc<ProvenAnchors> {
+        &self.proven_anchors
+    }
+
     /// Handle a commit-proven remote header from the `RemoteHeaderCoordinator`.
     ///
-    /// Marks the source block proven — opening the commit-proof gate for
-    /// its ECs — and replays the shard's deferred ECs through
-    /// [`Self::on_execution_certificate`]. Entries whose source block is still
-    /// unproven re-buffer.
+    /// The anchor is already in the shared mirror — the shard coordinator
+    /// records it before this runs, which is what opens the commit-proof
+    /// gate. What is left here is replaying the shard's deferred ECs
+    /// through [`Self::on_execution_certificate`], with entries whose
+    /// source block is still unproven re-buffering, and taking the probes
+    /// the new header now anchors.
     pub fn on_committed_remote_header(
         &mut self,
         topology_schedule: &TopologySchedule,
         source_shard: ShardId,
-        block_height: BlockHeight,
-        source_ts: WeightedTimestamp,
-        state_root: StateRoot,
     ) -> Vec<Action> {
         if source_shard == self.local_shard {
             return vec![];
         }
-        self.proven_remote.insert(
-            (source_shard, block_height),
-            ProvenSource {
-                ts: source_ts,
-                state_root,
-            },
-        );
-
         let deferred = self.unproven_ecs.drain_shard(source_shard);
         let mut actions = Vec::new();
         for cert in deferred {
@@ -2552,13 +2546,8 @@ impl ExecutionCoordinator {
                 // likeliest to still serve, since a proof is taken from
                 // a bounded history behind its tip.
                 let Some((height, source)) = self
-                    .proven_remote
-                    .iter()
-                    .filter(|((source_shard, _), source)| {
-                        *source_shard == shard && licenses(probed, source.ts, entry.validity_end)
-                    })
-                    .map(|((_, height), source)| (*height, *source))
-                    .max_by_key(|(height, _)| *height)
+                    .proven_anchors
+                    .newest_licensed(shard, |ts| licenses(probed, ts, entry.validity_end))
                 else {
                     continue;
                 };
@@ -3077,12 +3066,9 @@ impl ExecutionCoordinator {
         self.prune_execution_state();
         self.early.gc_stale_ecs(self.committed_ts);
         self.provisioning.gc_stale_provisions(self.committed_ts);
-        // Commit-proof marks age out with the ECs they gate: past the
-        // retention horizon no EC against the block is consumable anywhere.
-        // Deferred ECs likewise drop at their own deadline.
-        let horizon = self.committed_ts.minus(RETENTION_HORIZON);
-        self.proven_remote.retain(|_, source| source.ts >= horizon);
-
+        // Commit-proof marks age out with the ECs they gate, and the
+        // shard coordinator retires them: one mirror, one retirement.
+        // Deferred ECs drop at their own deadline.
         // Re-check gate-held finalizations against the advanced schedule:
         // emit any it now resolves, and drop any whose partner it has
         // evicted from every retained window. Runs every block so a settled
@@ -4648,7 +4634,7 @@ impl ExecutionCoordinator {
             pending_routing: self.early.pending_routing_len(),
             fulfilled_exec_certs: self.expected_certs.fulfilled_len(),
             outbound_certs: self.outbound_certs.memory_stats().tracked_certificates,
-            proven_remote_blocks: self.proven_remote.len(),
+            proven_remote_blocks: self.proven_anchors.len(),
             unproven_ecs: self.unproven_ecs.len(),
         }
     }
@@ -4689,10 +4675,10 @@ mod tests {
         AbortCharge, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
         ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed,
         EpochWindows, ExecutionOutcome, GlobalReceiptHash, Hash, LocalKey, MAX_FINALIZATION_DELAY,
-        MAX_VALIDITY_RANGE, NetworkDefinition, QuorumCertificate, Randomness, RecoveryCause,
-        SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateRoot,
-        StoredReceipt, SubstateKey, TickHalf, TransactionDecision, TxResolution, UnsettledTx,
-        ValidatorInfo, ValidatorSet, delivery_window_close,
+        MAX_VALIDITY_RANGE, NetworkDefinition, QuorumCertificate, RETENTION_HORIZON, Randomness,
+        RecoveryCause, SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer, SignerBitfield,
+        StateRoot, StoredReceipt, SubstateKey, TickHalf, TransactionDecision, TxResolution,
+        UnsettledTx, ValidatorInfo, ValidatorSet, delivery_window_close,
     };
     use hyperscale_vm_types::Seeded;
 
@@ -5939,13 +5925,13 @@ mod tests {
         );
 
         // The commit proof lands: the deferred EC replays into dispatch.
-        let actions = state.on_committed_remote_header(
-            &topo,
+        state.proven_anchors().record(
             remote_shard,
             BlockHeight::new(5),
-            WeightedTimestamp::ZERO,
             StateRoot::ZERO,
+            WeightedTimestamp::ZERO,
         );
+        let actions = state.on_committed_remote_header(&topo, remote_shard);
         assert!(
             actions
                 .iter()
@@ -6429,13 +6415,13 @@ mod tests {
 
         // The source block is commit-proven; the gate under test is verify
         // dispatch without a local tracker, not the commit-proof gate.
-        state.on_committed_remote_header(
-            &topo,
+        state.proven_anchors().record(
             remote_shard,
             BlockHeight::new(5),
-            WeightedTimestamp::ZERO,
             StateRoot::ZERO,
+            WeightedTimestamp::ZERO,
         );
+        state.on_committed_remote_header(&topo, remote_shard);
         let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(
             actions
@@ -7091,6 +7077,7 @@ mod tests {
             },
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
+            Arc::new(ProvenAnchors::new()),
         );
 
         // The first post-restart commit extends the tip and dates itself
@@ -7727,6 +7714,7 @@ mod tests {
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
+            Arc::new(ProvenAnchors::new()),
         );
 
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
@@ -7786,6 +7774,7 @@ mod tests {
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
+            Arc::new(ProvenAnchors::new()),
         );
         assert!(
             restarted.candidates.is_empty(),
@@ -8243,7 +8232,8 @@ mod tests {
     ) -> (StateProofBundle, Vec<Action>) {
         let (state_root, proof) = state_and_proof(shard, present, asked);
         let height = BlockHeight::new(height);
-        let opened = state.on_committed_remote_header(schedule, shard, height, ts, state_root);
+        state.proven_anchors().record(shard, height, state_root, ts);
+        let opened = state.on_committed_remote_header(schedule, shard);
         let anchor = StateAnchor {
             shard,
             height,
@@ -8353,13 +8343,13 @@ mod tests {
         let held: [(u64, WeightedTimestamp, &[u8]); 2] =
             [(3, deadline, b"deadline"), (4, lapse, b"at")];
         for (height, ts, tag) in held {
-            state.on_committed_remote_header(
-                &schedule,
+            state.proven_anchors().record(
                 PEER,
                 BlockHeight::new(height),
-                ts,
                 StateRoot::from_raw(Hash::from_bytes(tag)),
+                ts,
             );
+            state.on_committed_remote_header(&schedule, PEER);
         }
         let later = lapse.plus(Duration::from_secs(1));
         let (bundle, _) = proven_at(&mut state, &schedule, PEER, 5, later, &[], &[claim]);
@@ -8478,6 +8468,7 @@ mod tests {
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
+            Arc::new(ProvenAnchors::new()),
         );
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
 
@@ -8627,13 +8618,13 @@ mod tests {
         let held: [(u64, WeightedTimestamp, &[u8]); 2] =
             [(3, deadline, b"short"), (4, lapse, b"at")];
         for (height, ts, tag) in held {
-            state.on_committed_remote_header(
-                &schedule,
+            state.proven_anchors().record(
                 successor,
                 BlockHeight::new(height),
-                ts,
                 StateRoot::from_raw(Hash::from_bytes(tag)),
+                ts,
             );
+            state.on_committed_remote_header(&schedule, successor);
         }
         let later = lapse.plus(Duration::from_secs(1));
         let (bundle, _) = proven_at(&mut state, &schedule, successor, 5, later, &[], &[claim]);
@@ -8701,13 +8692,10 @@ mod tests {
             (4, deadline, b"at"),
         ];
         for (height, ts, tag) in held {
-            let actions = state.on_committed_remote_header(
-                &schedule,
-                PEER,
-                BlockHeight::new(height),
-                ts,
-                root(tag),
-            );
+            state
+                .proven_anchors()
+                .record(PEER, BlockHeight::new(height), root(tag), ts);
+            let actions = state.on_committed_remote_header(&schedule, PEER);
             assert!(
                 state_proof_fetches(&actions).is_empty(),
                 "before the deadline nothing is asked"

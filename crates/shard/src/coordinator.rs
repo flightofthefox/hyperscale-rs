@@ -18,7 +18,7 @@ use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
     AbandonmentRecord, BlockHash, ClaimProof, FinalizationHash, Hash, LocalTimestamp,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK,
-    PrincipalAddr, ProposerTimestamp, ProvisionHash, RETENTION_HORIZON, ReadySignal,
+    PrincipalAddr, ProposerTimestamp, ProvenAnchor, ProvenAnchors, ProvisionHash, ReadySignal,
     ReshapeThresholds, ReshapeTrigger, Resolutions, ScheduleLookup, SettledSetVerdict,
     SettledTxSet, ShardId, SplitAtBoundary, StateProofBundle, StoredReceipt, SubstateKey, TxClaim,
     TxOutcome, Unsettleable, UnsettledTx, WeightedTimestamp, WorkInFlight, derive_reshape_trigger,
@@ -482,24 +482,20 @@ pub struct ShardCoordinator {
     /// Commit-proven anchors of remote shards — the root and parent-QC
     /// clock each header carries — mirrored off `RemoteHeaderCommitted`
     /// for the state-proof check: a block's bundle names an anchor, and
-    /// the voter holds it to the header it has. Pruned on the retention
-    /// horizon, past which no probe anchors.
-    proven_anchors: HashMap<(ShardId, BlockHeight), ProvenAnchor>,
+    /// the voter holds it to the header it has.
+    ///
+    /// Owned here and shared with the execution coordinator, which asks
+    /// the same question of it — whether this node has proven a
+    /// counterpart's height — for the certificate gate and the probe
+    /// anchor. One mirror, so the fence cannot accept a bundle at an
+    /// anchor the prober would not have chosen.
+    proven_anchors: Arc<ProvenAnchors>,
 }
 
-/// One commit-proven remote header as the state-proof check reads it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProvenAnchor {
-    state_root: StateRoot,
-    ts: WeightedTimestamp,
-}
-
-impl ProvenAnchor {
-    /// Whether `bundle` names this header: the root its anchor claims
-    /// and the clock it dates the answer to are both the header's.
-    fn is_named_by(&self, bundle: &StateProofBundle) -> bool {
-        self.state_root == bundle.anchor.state_root && self.ts == bundle.anchor_ts
-    }
+/// Whether `bundle` names `held`: the root its anchor claims and the
+/// clock it dates the answer to are both the header's.
+fn names(held: ProvenAnchor, bundle: &StateProofBundle) -> bool {
+    held.state_root == bundle.anchor.state_root && held.ts == bundle.anchor_ts
 }
 
 impl std::fmt::Debug for ShardCoordinator {
@@ -643,7 +639,7 @@ impl ShardCoordinator {
             precut: Precut::succeeding(recovered.predecessors),
             settled_sets: HashMap::new(),
             presences: HashMap::new(),
-            proven_anchors: HashMap::new(),
+            proven_anchors: Arc::new(ProvenAnchors::new()),
             departure_parties: HashMap::new(),
             refusals: HashMap::new(),
             absences: HashMap::new(),
@@ -940,7 +936,8 @@ impl ShardCoordinator {
         self.absences.entry((tx_hash, shard)).or_insert(absence);
     }
 
-    /// Mirror a commit-proven remote header for the state-proof check.
+    /// Mirror a commit-proven remote header for everything that asks
+    /// whether this node has proven a counterpart's height.
     pub fn record_proven_anchor(
         &mut self,
         shard: ShardId,
@@ -948,8 +945,14 @@ impl ShardCoordinator {
         state_root: StateRoot,
         ts: WeightedTimestamp,
     ) {
-        self.proven_anchors
-            .insert((shard, height), ProvenAnchor { state_root, ts });
+        self.proven_anchors.record(shard, height, state_root, ts);
+    }
+
+    /// The mirror, for the execution coordinator to read the same bytes
+    /// this validator's vote fence reads.
+    #[must_use]
+    pub const fn proven_anchors(&self) -> &Arc<ProvenAnchors> {
+        &self.proven_anchors
     }
 
     /// Mirror a consumer's claim of a crossing a leg here issued for,
@@ -985,12 +988,9 @@ impl ShardCoordinator {
         self.presences.retain(|_, presence| {
             now < lapse_probe_ceiling(validity_end_of(presence.probed_wt)).max(presence.probed_wt)
         });
-        // An anchor lives as long as a probe can be taken against it,
-        // which is the horizon the execution coordinator keeps its own
-        // commit-proven sources to.
-        let anchor_floor = now.minus(RETENTION_HORIZON);
-        self.proven_anchors
-            .retain(|_, anchor| anchor.ts >= anchor_floor);
+        // An anchor lives as long as a probe can be taken against it.
+        // One retirement for both consumers, since there is one mirror.
+        self.proven_anchors.retire_below(now);
     }
 
     /// Whether the block's state proofs name anchors this voter can
@@ -1008,8 +1008,8 @@ impl ShardCoordinator {
         let mut wanted = Vec::new();
         for bundle in block.state_proofs() {
             let anchor = bundle.anchor;
-            match self.proven_anchors.get(&(anchor.shard, anchor.height)) {
-                Some(held) if held.is_named_by(bundle) => {}
+            match self.proven_anchors.at(anchor.shard, anchor.height) {
+                Some(held) if names(held, bundle) => {}
                 Some(held) => {
                     warn!(
                         validator = ?self.me,

@@ -178,25 +178,24 @@ impl NodeStateMachine {
             return Vec::new();
         };
 
-        let mut actions = s
-            .provisions_coordinator
-            .on_committed_remote_header(topology_schedule, certified_header);
-        actions.extend(s.execution_coordinator.on_committed_remote_header(
-            topology_schedule,
-            certified_header.shard_id(),
-            certified_header.header().height(),
-            certified_header.header().parent_qc().weighted_timestamp(),
-            certified_header.state_root(),
-        ));
-        // The vote fence holds a block's state proofs to the anchors
-        // this validator has commit-proven; a vote that deferred for
-        // want of this header is re-driven.
+        // The anchor lands first and in one place: the vote fence holds a
+        // block's state proofs to what this validator has commit-proven,
+        // and the certificate gate and the probe anchor read the same
+        // mirror, so nothing downstream may run before it is in.
         s.shard_coordinator.record_proven_anchor(
             certified_header.shard_id(),
             certified_header.header().height(),
             certified_header.state_root(),
             certified_header.header().parent_qc().weighted_timestamp(),
         );
+        let mut actions = s
+            .provisions_coordinator
+            .on_committed_remote_header(topology_schedule, certified_header);
+        actions.extend(
+            s.execution_coordinator
+                .on_committed_remote_header(topology_schedule, certified_header.shard_id()),
+        );
+        // A vote that deferred for want of this header is re-driven.
         actions.extend(s.shard_coordinator.redrive_pending_votes(topology_schedule));
         actions
     }

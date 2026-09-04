@@ -173,6 +173,7 @@ pub use shard::limits::{
 };
 pub use shard::load::ShardLoad;
 pub use shard::manifest::{BlockManifest, BlockMetadata};
+pub use shard::proven_anchors::{ProvenAnchor, ProvenAnchors};
 pub use shard::quorum_certificate::{QcContext, QcVerifyError, QuorumCertificate};
 pub use shard::reshape::{ReshapeThresholds, ReshapeTrigger};
 pub use shard::roots::{
