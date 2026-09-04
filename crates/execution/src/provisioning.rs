@@ -199,11 +199,14 @@ impl ProvisioningTracker {
     }
 
     /// Stamp `tx_hash` with a deadline of `self.now + RETENTION_HORIZON`,
-    /// taking the latest of any existing entry. Idempotent re-stamping
-    /// only ever extends the deadline forward, so a late-arriving
-    /// provision never causes earlier eviction than its predecessor.
-    fn stamp_deadline(&mut self, tx_hash: TxHash) {
-        let deadline = self.now.plus(RETENTION_HORIZON);
+    /// or `floor` where that is later. Idempotent re-stamping only ever
+    /// extends the deadline forward, so a late-arriving provision never
+    /// causes earlier eviction than its predecessor.
+    fn stamp_deadline(&mut self, tx_hash: TxHash, floor: Option<WeightedTimestamp>) {
+        let deadline = self
+            .now
+            .plus(RETENTION_HORIZON)
+            .max(floor.unwrap_or(WeightedTimestamp::ZERO));
         self.deadlines
             .entry(tx_hash)
             .and_modify(|d| {
@@ -220,9 +223,23 @@ impl ProvisioningTracker {
     /// callers set this once per tick creation. Arrival order does not
     /// matter: a bundle absorbed before its requirement is filed still
     /// answers it.
-    pub fn record_required(&mut self, tx_hash: TxHash, requirements: BTreeSet<Requirement>) {
+    ///
+    /// `floor` is the earliest the entry may be swept, for a member whose
+    /// wait outlives the retention horizon: a delivery is admissible to
+    /// the delivery window's close, which can sit a whole validity range
+    /// past the block that committed it, and a requirement swept before
+    /// then leaves a later bundle populating `present` against a
+    /// requirement nobody records — the delivery is abandoned at the
+    /// close and the issuer reclaims a crossing the deliverer could have
+    /// taken.
+    pub fn record_required(
+        &mut self,
+        tx_hash: TxHash,
+        requirements: BTreeSet<Requirement>,
+        floor: Option<WeightedTimestamp>,
+    ) {
         self.required.insert(tx_hash, requirements);
-        self.stamp_deadline(tx_hash);
+        self.stamp_deadline(tx_hash, floor);
     }
 
     /// Record the remote payer shard of a cross-shard transaction, so
@@ -301,7 +318,7 @@ impl ProvisioningTracker {
                 .entry(tx_hash)
                 .or_default()
                 .insert(source_shard, anchor);
-            self.stamp_deadline(tx_hash);
+            self.stamp_deadline(tx_hash, None);
             touched.push(tx_hash);
         }
         touched
@@ -394,7 +411,9 @@ impl ProvisioningTracker {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, ShardTrie};
+    use hyperscale_types::{
+        BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, ShardTrie, lapse_probe_anchor,
+    };
 
     use super::*;
     use crate::fixtures;
@@ -471,6 +490,7 @@ mod tests {
                 .into_iter()
                 .map(Requirement::CommittedState)
                 .collect(),
+            None,
         );
 
         assert!(!t.is_fully_provisioned(tx));
@@ -522,7 +542,7 @@ mod tests {
         // A stranger carrying the key answers nothing, and its bytes are
         // never the arrival.
         let mut planted = ProvisioningTracker::new();
-        planted.record_required(tx, BTreeSet::from([requirement]));
+        planted.record_required(tx, BTreeSet::from([requirement]), None);
         planted.absorb_provisions(&bundle(
             shard(3),
             vec![SubstateEntry::new(record, Some(vec![9]))],
@@ -539,7 +559,7 @@ mod tests {
             shard(1),
             vec![SubstateEntry::new(record, Some(vec![7]))],
         ));
-        early.record_required(tx, BTreeSet::from([requirement]));
+        early.record_required(tx, BTreeSet::from([requirement]), None);
         assert!(early.is_fully_provisioned(tx));
         assert_eq!(
             early.present_cell(tx, shard(1), record),
@@ -549,7 +569,7 @@ mod tests {
 
         // The named source, carrying the wrong cell or an absent value.
         let mut wrong = ProvisioningTracker::new();
-        wrong.record_required(tx, BTreeSet::from([requirement]));
+        wrong.record_required(tx, BTreeSet::from([requirement]), None);
         wrong.absorb_provisions(&bundle(
             shard(1),
             vec![SubstateEntry::new(other, Some(vec![7]))],
@@ -569,6 +589,7 @@ mod tests {
         both.record_required(
             tx,
             BTreeSet::from([requirement, Requirement::CommittedState(shard(2))]),
+            None,
         );
         both.absorb_provisions(&bundle(
             shard(1),
@@ -705,7 +726,7 @@ mod tests {
         // the empty set dispatch without any provision landing.
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"delta-only"));
-        t.record_required(tx, BTreeSet::new());
+        t.record_required(tx, BTreeSet::new(), None);
         assert!(t.is_fully_provisioned(tx));
     }
 
@@ -774,6 +795,7 @@ mod tests {
                 .into_iter()
                 .map(Requirement::CommittedState)
                 .collect(),
+            None,
         );
         t.record_payer_shard(tx, shard(2));
 
@@ -808,6 +830,7 @@ mod tests {
         t.record_required(
             tx,
             std::iter::once(Requirement::CommittedState(shard(1))).collect(),
+            None,
         );
         let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
         t.absorb_provisions(&provisions);
@@ -821,6 +844,36 @@ mod tests {
         assert_eq!(t.received_len(), 0);
     }
 
+    /// A delivery's requirement outlives the retention horizon: it is
+    /// admissible to the delivery window's close, which can sit a whole
+    /// validity range past the block that committed it, and a bundle
+    /// landing after a sweep would answer a requirement nobody records.
+    #[test]
+    fn a_delivery_requirement_stands_past_the_retention_horizon() {
+        let mut t = ProvisioningTracker::new();
+        let tx = TxHash::from(Hash::from_bytes(b"delivery"));
+        let validity_end = WeightedTimestamp::from_millis(100_000);
+        let floor = lapse_probe_anchor(validity_end);
+        t.advance_clock(WeightedTimestamp::from_millis(1_000));
+        t.record_required(
+            tx,
+            BTreeSet::from([Requirement::CommittedState(shard(1))]),
+            Some(floor),
+        );
+
+        assert_eq!(
+            t.gc_stale_provisions(WeightedTimestamp::from_millis(1_000).plus(RETENTION_HORIZON)),
+            0,
+            "the horizon is not what bounds a delivery",
+        );
+        assert_eq!(
+            t.gc_stale_provisions(floor.minus(std::time::Duration::from_millis(1))),
+            0,
+            "short of the anchor the issuer's lapse proof is taken at",
+        );
+        assert_eq!(t.gc_stale_provisions(floor), 1, "and gone at it");
+    }
+
     #[test]
     fn record_required_overwrites_existing_entry() {
         let mut t = ProvisioningTracker::new();
@@ -828,6 +881,7 @@ mod tests {
         t.record_required(
             tx,
             std::iter::once(Requirement::CommittedState(shard(1))).collect(),
+            None,
         );
         // Re-record with a different requirement set.
         t.record_required(
@@ -836,6 +890,7 @@ mod tests {
                 .into_iter()
                 .map(Requirement::CommittedState)
                 .collect(),
+            None,
         );
         assert_eq!(t.required.get(&tx).map_or(0, BTreeSet::len), 2);
     }
@@ -853,6 +908,7 @@ mod tests {
         t.record_required(
             tx_old,
             std::iter::once(Requirement::CommittedState(shard(1))).collect(),
+            None,
         );
         t.absorb_provisions(&make_provisions(
             shard(1),
@@ -865,6 +921,7 @@ mod tests {
         t.record_required(
             tx_fresh,
             std::iter::once(Requirement::CommittedState(shard(1))).collect(),
+            None,
         );
         t.absorb_provisions(&make_provisions(
             shard(1),

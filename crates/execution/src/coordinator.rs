@@ -308,6 +308,20 @@ fn counterpart_cells(entry: &Probeable, trie: &ShardTrie) -> Vec<CounterpartCell
     core.into_iter().chain(deliveries).chain(claims).collect()
 }
 
+/// The earliest a member's provisioning entry may be swept, where the
+/// member is a delivery.
+///
+/// A delivery is admissible to the delivery window's close and probed a
+/// finalization delay past it, which outlives the retention horizon the
+/// entry would otherwise take: a bundle landing after the sweep would
+/// populate `present` against a requirement nobody records, and the
+/// delivery would be abandoned at the close while the issuer reclaims a
+/// crossing its deliverer could have taken. Every other member waits
+/// inside the horizon and takes no floor.
+fn delivery_floor(side: Side, validity_end: WeightedTimestamp) -> Option<WeightedTimestamp> {
+    (side == Side::Delivering).then(|| lapse_probe_anchor(validity_end))
+}
+
 /// Whether a proposer offers `Claimed` records from the claims the
 /// chain has proved.
 ///
@@ -810,15 +824,12 @@ impl ExecutionCoordinator {
             // engagement exchange is filed, and it runs under its own
             // committing block's clock.
             if classified.decomposed().holds() {
+                let side = classified.first_side_at(local_shard);
+                let validity_end = tx.validity_range().end_timestamp_exclusive;
                 self.provisioning.record_required(
                     tx_hash,
-                    divided_requirements(
-                        tx.legs(),
-                        tx.crossings(),
-                        classified,
-                        local_shard,
-                        classified.first_side_at(local_shard),
-                    ),
+                    divided_requirements(tx.legs(), tx.crossings(), classified, local_shard, side),
+                    delivery_floor(side, validity_end),
                 );
                 continue;
             }
@@ -874,6 +885,7 @@ impl ExecutionCoordinator {
                     .into_iter()
                     .map(Requirement::CommittedState)
                     .collect(),
+                None,
             );
         }
 
@@ -1136,6 +1148,18 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Drop every delivering candidate the delivery window has closed on,
+    /// and the provisioning entry that was held for it.
+    ///
+    /// Past the close no tick can take the member, and a mixed shard's
+    /// delivering candidate is removed by nothing else — its ledger entry
+    /// is the leg's, and a leg is never abandoned.
+    fn retire_closed_deliveries(&mut self) {
+        for tx_hash in self.candidates.drop_closed_deliveries(self.committed_ts) {
+            self.provisioning.remove_tx(tx_hash);
+        }
+    }
+
     /// Admit into the tick being composed every reclaim a committed
     /// record has licensed: the leg entries whose core, the record says,
     /// can never claim what they issued.
@@ -1173,6 +1197,12 @@ impl ExecutionCoordinator {
             self.ticks.assign_tx(tx_hash, tick_id);
             self.unresolved.admit_reclaim(tx_hash);
             record_reclaim_admitted();
+            // A mixed shard's delivering member waits on what the core
+            // returns, and the evidence this reclaim is composed from is
+            // that the core never claimed. Nothing is coming, so the
+            // candidate goes with the leg it was registered beside.
+            self.candidates.remove(tx_hash);
+            self.provisioning.remove_tx(tx_hash);
             requests.push(CrossShardExecutionRequest {
                 tx_hash,
                 transaction,
@@ -1312,6 +1342,14 @@ impl ExecutionCoordinator {
                     classified,
                     local_shard,
                     Side::Delivering,
+                ),
+                delivery_floor(
+                    Side::Delivering,
+                    member
+                        .request
+                        .transaction
+                        .validity_range()
+                        .end_timestamp_exclusive,
                 ),
             );
             self.candidates.register_delivery(
@@ -3018,6 +3056,7 @@ impl ExecutionCoordinator {
             record_rebuilt_verdict_entry();
         }
         self.stamp_departures(topology_schedule);
+        self.retire_closed_deliveries();
         let unanswerable = self.unresolved.prune(self.committed_ts);
         actions.extend(self.persist_leg_entries());
         self.release_unanswerable(&unanswerable);
@@ -9899,6 +9938,7 @@ mod tests {
         state.provisioning.record_required(
             tx_hash,
             std::iter::once(Requirement::CommittedState(ShardId::leaf(1, 1))).collect(),
+            None,
         );
         // Drive finalize to populate the FinalizationStore naturally.
         let _ = state.finalize(&make_test_topology(), &tick_id);

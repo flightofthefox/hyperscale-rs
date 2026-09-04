@@ -355,6 +355,35 @@ impl TickCandidates {
         self.candidates.remove(&tx_hash);
     }
 
+    /// Drop every delivering candidate the delivery window has closed on.
+    ///
+    /// [`Self::compose`] already refuses one past the close, so it is a
+    /// candidate no tick can ever take again — and the shard that holds
+    /// it holds the transaction's body and walks it once per block for
+    /// as long as it does. Returns the hashes dropped.
+    ///
+    /// A mixed shard's delivering member is the one that reaches this:
+    /// registered beside its issuing member, and removed by nothing else,
+    /// since its ledger entry is the leg's and a leg is never abandoned.
+    pub fn drop_closed_deliveries(&mut self, now: WeightedTimestamp) -> Vec<TxHash> {
+        let closed: Vec<TxHash> = self
+            .candidates
+            .iter()
+            .filter(|(_, candidate)| {
+                candidate.side == Side::Delivering
+                    && now
+                        >= delivery_window_close(
+                            candidate.tx.validity_range().end_timestamp_exclusive,
+                        )
+            })
+            .map(|(tx_hash, _)| *tx_hash)
+            .collect();
+        for tx_hash in &closed {
+            self.candidates.remove(tx_hash);
+        }
+        closed
+    }
+
     /// Whether a transaction is still waiting for a tick.
     #[must_use]
     pub fn contains(&self, tx_hash: TxHash) -> bool {
@@ -451,11 +480,49 @@ mod tests {
         );
         assert!(candidates.contains(hash), "so it is still waiting");
 
-        provisioning.record_required(hash, BTreeSet::new());
+        provisioning.record_required(hash, BTreeSet::new(), None);
         let admitted =
             candidates.compose(&provisioning, &mut ProvisionalCells::default(), ms(1_000));
         assert_eq!(admitted.len(), 1);
         assert!(admitted[0].request.reaches_beyond);
+    }
+
+    /// A delivering candidate the window has closed on is dropped, not
+    /// merely skipped: no tick can take it again, and the shard holding
+    /// it holds the transaction's body and walks it once per block.
+    #[test]
+    fn a_delivering_candidate_goes_when_its_window_closes() {
+        let mut candidates = TickCandidates::new(LOCAL);
+        let remote = ShardId::leaf(1, 1);
+        let delivery = tx(6);
+        let delivered = delivery.hash();
+        let end = delivery.validity_range().end_timestamp_exclusive;
+        candidates.register_delivery(
+            delivery,
+            BTreeSet::from([LOCAL, remote]),
+            ms(1_000),
+            Classified::whole(),
+        );
+        let issuing = local_only(&mut candidates, tx(7));
+
+        assert!(
+            candidates
+                .drop_closed_deliveries(
+                    delivery_window_close(end).minus(std::time::Duration::from_millis(1))
+                )
+                .is_empty(),
+            "short of the close the delivery may still be admitted",
+        );
+
+        assert_eq!(
+            candidates.drop_closed_deliveries(delivery_window_close(end)),
+            vec![delivered],
+        );
+        assert!(!candidates.contains(delivered));
+        assert!(
+            candidates.contains(issuing),
+            "an issuing candidate is on its own clock",
+        );
     }
 
     /// The payer's leg does not execute until its counterparts have
@@ -476,7 +543,7 @@ mod tests {
         candidates.record_engagement_wait(hash, BTreeSet::from([remote]), ms(60_000));
 
         let mut provisioning = ProvisioningTracker::new();
-        provisioning.record_required(hash, BTreeSet::new());
+        provisioning.record_required(hash, BTreeSet::new(), None);
 
         assert!(
             candidates
@@ -504,7 +571,7 @@ mod tests {
         candidates.record_engagement_wait(hash, BTreeSet::from([remote]), ms(60_000));
 
         let mut provisioning = ProvisioningTracker::new();
-        provisioning.record_required(hash, BTreeSet::new());
+        provisioning.record_required(hash, BTreeSet::new(), None);
 
         let admitted =
             candidates.compose(&provisioning, &mut ProvisionalCells::default(), ms(60_000));
@@ -554,7 +621,7 @@ mod tests {
         let hash = tx.hash();
         candidates.register(tx, BTreeSet::from([local, venue]), ms(1_000), classified);
         let mut provisioning = ProvisioningTracker::new();
-        provisioning.record_required(hash, BTreeSet::new());
+        provisioning.record_required(hash, BTreeSet::new(), None);
 
         let admitted =
             candidates.compose(&provisioning, &mut ProvisionalCells::default(), ms(1_000));
@@ -599,7 +666,7 @@ mod tests {
         let mut provisioning = ProvisioningTracker::new();
         for seed in [1, 2] {
             let tx = contending(seed);
-            provisioning.record_required(tx.hash(), BTreeSet::new());
+            provisioning.record_required(tx.hash(), BTreeSet::new(), None);
             whole.register(tx, participating.clone(), ms(1_000), Classified::whole());
         }
         let mut held = ProvisionalCells::default();
