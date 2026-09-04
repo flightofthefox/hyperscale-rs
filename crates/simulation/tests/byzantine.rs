@@ -13,13 +13,14 @@
 mod support;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hyperscale_scenarios::query::{declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
     build_transfer_tx, cross_shard_cast, cross_shard_genesis_accounts, validity_around,
 };
 use hyperscale_scenarios::wait::await_tx_terminal;
-use hyperscale_scenarios::{Cluster, FaultableCluster, ScenarioConfig, epochs};
+use hyperscale_scenarios::{Cluster, FaultHandle, FaultableCluster, ScenarioConfig, epochs};
 use hyperscale_types::{
     ShardId, TransactionDecision, TransactionStatus, WeightedTimestamp, lapse_probe_anchor,
 };
@@ -132,6 +133,86 @@ fn a_forged_state_proof_convinces_nobody() {
             vault_balance(c, recipient_shard, to),
             recipient_before,
             "the recipient was never credited",
+        );
+    });
+}
+
+/// A host that answers provision fetches with rubbish is rotated past,
+/// and the crossing it was carrying still lands.
+///
+/// The delivery side's evidence seam, and the second thing a drop rule
+/// cannot reach: `cross_shard_provisions_drop_fetch_fallback` makes a
+/// responder silent, which the fetch already has a rotation for. A
+/// responder that answers is the case where a check has to do the work —
+/// a bundle is admitted only against the source header it names and the
+/// root that header carries, so one that decodes to nothing must be
+/// refused at the fetch rather than carried into a block.
+#[test]
+fn a_host_answering_provision_fetches_with_rubbish_is_rotated_past() {
+    let mut cluster =
+        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
+    let (payer_key, from, to) = cross_shard_cast();
+    let payer_shard = ShardId::leaf(1, 0);
+    let recipient_shard = ShardId::leaf(1, 1);
+
+    cluster.run_faultable(|c| {
+        let recipient_before = vault_balance(c, recipient_shard, to);
+
+        // The push is cut, so the recipient has to fetch — and one host
+        // of the shard it fetches from answers wrongly.
+        let broadcast_dropped = c.drop_type("provisions.broadcast");
+        // Every host of the shard the bundle is fetched from lies once
+        // and then answers honestly. Picking one host to lie always is
+        // the shape that reads better and measures nothing: the fetch
+        // chooses its peer, a committee this size offers two, and a run
+        // where it never chose the liar passes without an attack. Lying
+        // on the first answer, whoever gives it, puts the rubbish in
+        // front of the check every time.
+        let lies = Arc::new(AtomicUsize::new(0));
+        let forged: Vec<FaultHandle> = c
+            .committee_hosts(payer_shard)
+            .into_iter()
+            .map(|host| {
+                let lies = Arc::clone(&lies);
+                c.rewrite_responses(
+                    host,
+                    "provision.request",
+                    Arc::new(move |_asked: &[u8], honest: &[u8]| {
+                        if lies.fetch_add(1, Ordering::Relaxed) == 0 {
+                            vec![0x5A; 96]
+                        } else {
+                            honest.to_vec()
+                        }
+                    }),
+                )
+            })
+            .collect();
+
+        let tx = build_transfer_tx(&payer_key, from, to, 100, validity_around(c.now()));
+        let hash = tx.hash();
+        c.submit(Arc::new(tx));
+
+        let verdict = await_tx_terminal(c, hash, epochs(8));
+        assert!(
+            matches!(
+                verdict,
+                Some(TransactionStatus::Completed(TransactionDecision::Accept))
+            ),
+            "the payer's leg settles alone and accepts; verdict = {verdict:?}",
+        );
+        assert!(
+            c.run_until(epochs(10), |c| vault_balance(c, recipient_shard, to)
+                == recipient_before + 100),
+            "the delivery must claim from an honest peer's bundle; holds {}",
+            vault_balance(c, recipient_shard, to),
+        );
+        assert!(
+            broadcast_dropped.fired() > 0,
+            "the push has to be cut, or nothing fetched",
+        );
+        assert!(
+            forged.iter().any(|handle| handle.fired() > 0) && lies.load(Ordering::Relaxed) > 0,
+            "the rubbish has to have been served, or nothing was attacked",
         );
     });
 }
