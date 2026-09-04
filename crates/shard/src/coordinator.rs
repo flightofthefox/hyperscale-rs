@@ -11962,6 +11962,99 @@ mod tests {
         );
     }
 
+    /// A verdict claim the chain offers, against the certificate this
+    /// voter holds: matching passes, disagreeing refuses, absent defers.
+    ///
+    /// The deferral is what makes the claim safe to commit without the
+    /// bytes — a voter that never heard the broadcast withholds rather
+    /// than taking the proposer's word — and it is why the offer is
+    /// filtered to verdicts that license a record.
+    #[test]
+    fn a_verdict_claim_stands_on_the_certificate_this_voter_holds() {
+        let peer = ShardId::leaf(1, 1);
+        let tx_hash = TxHash::from(Hash::from_bytes(b"tx"));
+        let anchor = WeightedTimestamp::from_millis(7_000);
+        let digest = Hash::from_bytes(b"digest");
+        let claim = |anchor_ts, decision, digest| {
+            block_with_claims(vec![CounterpartClaim::Verdict(VerdictClaim {
+                shard: peer,
+                tx_hash,
+                anchor_ts,
+                decision,
+                digest,
+            })])
+        };
+
+        // Holding nothing: the vote is withheld, and there is no commit
+        // proof to ask for — the certificate arrives by broadcast.
+        let coord = fence_coordinator();
+        assert!(
+            coord
+                .fence_state_proofs(
+                    &claim(anchor, TransactionDecision::Reject, digest),
+                    BlockHash::ZERO
+                )
+                .is_some_and(|withheld| withheld.is_empty()),
+            "a claim naming a certificate this voter has not heard defers",
+        );
+
+        let mut coord = fence_coordinator();
+        coord.record_refusal(
+            peer,
+            tx_hash,
+            Refusal {
+                refused_wt: anchor,
+                deadline: WeightedTimestamp::from_millis(9_000),
+                decision: TransactionDecision::Reject,
+                digest,
+            },
+        );
+        assert!(
+            coord
+                .fence_state_proofs(
+                    &claim(anchor, TransactionDecision::Reject, digest),
+                    BlockHash::ZERO
+                )
+                .is_none(),
+            "the certificate this voter holds passes the claim",
+        );
+
+        // Each term is checked: a different anchor, a different word, or
+        // different bytes is a certificate this voter reads differently.
+        for (anchor_ts, decision, digest) in [
+            (
+                WeightedTimestamp::from_millis(7_001),
+                TransactionDecision::Reject,
+                digest,
+            ),
+            (anchor, TransactionDecision::Aborted, digest),
+            (
+                anchor,
+                TransactionDecision::Reject,
+                Hash::from_bytes(b"other"),
+            ),
+        ] {
+            assert!(
+                coord
+                    .fence_state_proofs(&claim(anchor_ts, decision, digest), BlockHash::ZERO)
+                    .is_some_and(|withheld| withheld.is_empty()),
+                "a claim restating the certificate differently is refused",
+            );
+        }
+
+        // An acceptance licenses no record, so it is refused rather than
+        // folded into an answer nothing reads.
+        assert!(
+            coord
+                .fence_state_proofs(
+                    &claim(anchor, TransactionDecision::Accept, digest),
+                    BlockHash::ZERO
+                )
+                .is_some_and(|withheld| withheld.is_empty()),
+            "an acceptance is not a verdict a block may claim",
+        );
+    }
+
     /// What abandoning `tx` takes, as the transaction fixes it.
     fn figures_of(tx: &[u8]) -> UnsettledTx {
         UnsettledTx {

@@ -8121,6 +8121,104 @@ mod tests {
         );
     }
 
+    /// A verdict the chain committed reaches the refusal mirror on a
+    /// replica that never heard the broadcast.
+    ///
+    /// This is the restart hole closing: the mirror is fed by
+    /// certificate broadcast and nothing rebuilds it at startup, so
+    /// before the chain carried the commitment a replica that came up
+    /// between a core's refusal and the record's proposal could neither
+    /// offer the record nor check one. Folding the claim gives it the
+    /// same answer its peers hold, from the block alone.
+    #[test]
+    fn a_committed_verdict_reaches_a_replica_that_heard_no_broadcast() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        state.unresolved.register_committed(
+            HOME,
+            WeightedTimestamp::ZERO,
+            std::iter::once(&transaction),
+        );
+        state.unresolved.mark_leg(
+            tx_hash,
+            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+            leg_classified(),
+            Vec::new(),
+            Vec::new(),
+        );
+        state.unresolved.certify(tx_hash);
+        assert!(
+            state.refusals.is_empty(),
+            "nothing was broadcast to this replica"
+        );
+
+        let anchor = WeightedTimestamp::from_millis(7_000);
+        let digest = Hash::from_bytes(b"digest");
+        let verdict = VerdictClaim {
+            shard: PEER,
+            tx_hash,
+            anchor_ts: anchor,
+            decision: TransactionDecision::Reject,
+            digest,
+        };
+        let actions = state.fold_verdict(&verdict);
+
+        assert_eq!(
+            state.refusals.get(&(tx_hash, PEER)).copied(),
+            Some(Refusal {
+                refused_wt: anchor,
+                deadline: UnsettledTx::for_transaction(&transaction).deadline,
+                decision: TransactionDecision::Reject,
+                digest,
+            }),
+            "the chain's own word reaches the mirror the record fence reads",
+        );
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::Continuation(ProtocolEvent::RefusalObserved { shard, .. })
+                    if *shard == PEER
+            )),
+            "and the vote fence is told, as a broadcast would have told it: {actions:?}",
+        );
+
+        // The fold is first-write-wins, as the chain's answer is: a
+        // second claim restates a decision already committed.
+        let again = state.fold_verdict(&VerdictClaim {
+            anchor_ts: WeightedTimestamp::from_millis(8_000),
+            ..verdict
+        });
+        assert!(again.is_empty(), "{again:?}");
+        assert_eq!(
+            state
+                .refusals
+                .get(&(tx_hash, PEER))
+                .map(|held| held.refused_wt),
+            Some(anchor),
+        );
+
+        // An acceptance settles the transaction and licenses no record,
+        // so it never reaches the mirror at all.
+        let mut fresh = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        fresh.unresolved.register_committed(
+            HOME,
+            WeightedTimestamp::ZERO,
+            std::iter::once(&transaction),
+        );
+        assert!(
+            fresh
+                .fold_verdict(&VerdictClaim {
+                    decision: TransactionDecision::Accept,
+                    ..verdict
+                })
+                .is_empty(),
+        );
+        assert!(fresh.refusals.is_empty());
+    }
+
     /// A core's refusal of a transaction a leg here issued for is
     /// mirrored off its certificate and handed to the vote fence, and a
     /// `Refused` record is offered from it under the certificate's own
