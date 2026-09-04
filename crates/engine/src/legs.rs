@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{Address, EscrowedValue, ShardId, ShardTrie};
 use hyperscale_vm_effects::{CrossingSite, StarShape, star_at};
-use hyperscale_vm_kernel::{Crossed, ExecutionScope, LegPlan, PlanTooWide, Reclaim, Retire};
+use hyperscale_vm_kernel::{Crossed, ExecutionScope, LegPlan, PlanFault, Reclaim, Retire};
 use hyperscale_vm_types::{Crossing, LegRole, LegShape, ProtocolHasher, SubstateKey};
 
 use crate::sharding::TrieShardResolver;
@@ -697,7 +697,7 @@ impl ShardPlan {
     #[must_use]
     pub fn whole() -> Self {
         Self {
-            legs: LegPlan::whole(),
+            legs: LegPlan::whole(0),
             scope: ExecutionScope::whole(),
         }
     }
@@ -736,9 +736,11 @@ pub enum PlanDefect {
     /// A retirement composed on a shard that issued nothing.
     #[error("this shard issued nothing to retire")]
     NothingToRetire,
-    /// More crossings than one outcome can state a verdict for.
+    /// What the plan itself refuses: an edge acted on twice, an action
+    /// disagreeing with who runs the node, or more crossings than one
+    /// outcome can state a verdict for.
     #[error(transparent)]
-    TooWide(#[from] PlanTooWide),
+    Fault(#[from] PlanFault),
 }
 
 /// What `local` runs of the transaction, what arrives for it, and what
@@ -764,13 +766,13 @@ pub fn plan_for_shard(
     }
     let star = Star::of(legs, classified);
     let runs_here = |node: u32| star.runs(node, local, side);
-    let mut plan = LegPlan::whole();
+    let mut plan = LegPlan::whole(legs.len());
     let mut participant = false;
     for node in 0..star.len() {
         if runs_here(node) {
             participant = true;
         } else {
-            plan.skip(node);
+            plan.skip(node)?;
         }
     }
     if !participant {
@@ -857,9 +859,9 @@ pub fn retire_for_shard(
     local: ShardId,
 ) -> Result<ShardPlan, PlanDefect> {
     let star = Star::of(legs, classified);
-    let mut plan = LegPlan::whole();
+    let mut plan = LegPlan::whole(legs.len());
     for node in 0..star.len() {
-        plan.skip(node);
+        plan.skip(node)?;
     }
     let mut retired = false;
     for crossing in crossings {
@@ -913,9 +915,9 @@ pub fn reclaim_for_shard(
     local: ShardId,
 ) -> Result<ShardPlan, PlanDefect> {
     let star = Star::of(legs, classified);
-    let mut plan = LegPlan::whole();
+    let mut plan = LegPlan::whole(legs.len());
     for node in 0..star.len() {
-        plan.skip(node);
+        plan.skip(node)?;
     }
     let mut reclaimed = false;
     for crossing in crossings {
@@ -1274,7 +1276,7 @@ mod tests {
         let sender = plan_for_shard(&legs, &crossings, &[], &divided, low(), Side::Issuing)
             .expect("the sender's legs need no arrival");
         assert!(sender.legs.runs(0) && sender.legs.runs(1) && !sender.legs.runs(2));
-        assert!(sender.legs.departing(1, 0).is_some());
+        assert!(sender.legs.departure(1, 0).is_some());
         assert!(sender.scope.covers(owner(0x11, false)));
         assert!(!sender.scope.covers(owner(0x22, true)));
 
@@ -1289,13 +1291,12 @@ mod tests {
         .expect("the recipient's leg has its arrival");
         assert!(!recipient.legs.runs(0) && !recipient.legs.runs(1) && recipient.legs.runs(2));
         assert_eq!(
-            recipient.legs.arrival(1, 0),
+            recipient.legs.arrival(1, 0).map(|arrival| arrival.crossed),
             Some(Crossed {
                 resource: RESOURCE,
                 amount: 100
             })
         );
-        assert!(recipient.legs.claim(1, 0).is_some());
         assert!(recipient.scope.covers(owner(0x22, true)));
         assert!(!recipient.scope.covers(owner(0x11, false)));
     }
@@ -1316,7 +1317,7 @@ mod tests {
             .expect("the caller's issuing legs take no arrival");
         assert!(issuing.legs.runs(0) && issuing.legs.runs(1));
         assert!(!issuing.legs.runs(2) && !issuing.legs.runs(3));
-        assert!(issuing.legs.departing(1, 0).is_some());
+        assert!(issuing.legs.departure(1, 0).is_some());
         assert!(issuing.legs.arrival(2, 0).is_none());
         let delivering = plan_for_shard(
             &legs,
@@ -1330,7 +1331,7 @@ mod tests {
         assert!(delivering.legs.runs(3));
         assert!(!delivering.legs.runs(0) && !delivering.legs.runs(1) && !delivering.legs.runs(2));
         assert!(delivering.legs.arrival(2, 0).is_some());
-        assert!(delivering.legs.departing(1, 0).is_none());
+        assert!(delivering.legs.departure(1, 0).is_none());
 
         let venue = plan_for_shard(
             &legs,
@@ -1344,7 +1345,7 @@ mod tests {
         assert!(venue.legs.runs(2));
         assert!(!venue.legs.runs(0) && !venue.legs.runs(1) && !venue.legs.runs(3));
         assert!(venue.legs.arrival(1, 0).is_some());
-        assert!(venue.legs.departing(2, 0).is_some());
+        assert!(venue.legs.departure(2, 0).is_some());
         assert!(venue.scope.covers(owner(0x33, true)));
         assert!(!venue.scope.covers(owner(0x11, false)));
     }
@@ -1380,7 +1381,7 @@ mod tests {
             Side::Issuing,
         )
         .expect("a core issues what it minted");
-        assert!(venue.legs.departing(2, 0).is_some());
+        assert!(venue.legs.departure(2, 0).is_some());
 
         let reclaimed: Vec<((u32, u32), Reclaim)> =
             reclaim_for_shard(&legs, &crossings, &divided, high())
@@ -1505,7 +1506,7 @@ mod tests {
         .expect("the core member runs the venue and the deposit");
         assert!(core.legs.runs(2) && core.legs.runs(3));
         assert!(
-            core.legs.departing(2, 0).is_none(),
+            core.legs.departure(2, 0).is_none(),
             "the venue's output stays in the execution"
         );
         assert_eq!(
@@ -1570,8 +1571,8 @@ mod tests {
             assert!(
                 plan.legs.runs(0) && plan.legs.runs(1) && plan.legs.runs(2) && plan.legs.runs(3)
             );
-            assert!(plan.legs.departing(1, 0).is_none());
-            assert!(plan.legs.departing(3, 0).is_some());
+            assert!(plan.legs.departure(1, 0).is_none());
+            assert!(plan.legs.departure(3, 0).is_some());
         }
     }
 
@@ -1611,8 +1612,8 @@ mod tests {
             .expect("the issuing member runs both withdraws and the local deposit");
         assert!(issuing.legs.runs(1) && issuing.legs.runs(4) && issuing.legs.runs(5));
         assert!(!issuing.legs.runs(3));
-        assert!(issuing.legs.departing(1, 0).is_some());
-        assert!(issuing.legs.departing(4, 0).is_none());
+        assert!(issuing.legs.departure(1, 0).is_some());
+        assert!(issuing.legs.departure(4, 0).is_none());
         let delivering = plan_for_shard(
             &legs,
             &crossings,

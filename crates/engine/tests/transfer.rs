@@ -1257,7 +1257,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
     .expect("the sender's legs take no arrival");
     assert!(!sender.legs.is_whole());
     assert!(
-        sender.legs.departing(edge.node, edge.output).is_some(),
+        sender.legs.departure(edge.node, edge.output).is_some(),
         "the withdraw departs",
     );
     assert!(sender.scope.covers(alice()) && !sender.scope.covers(far()));
@@ -1279,7 +1279,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
     )
     .expect("the recipient's leg has its arrival");
     assert!(recipient.legs.arrival(edge.node, edge.output).is_some());
-    assert!(recipient.legs.departing(edge.node, edge.output).is_none());
+    assert!(recipient.legs.departure(edge.node, edge.output).is_none());
     assert!(recipient.scope.covers(far()) && !recipient.scope.covers(alice()));
 
     assert!(matches!(

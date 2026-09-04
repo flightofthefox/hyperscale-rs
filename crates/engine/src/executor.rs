@@ -998,7 +998,7 @@ fn assemble_published_tx(
 
 /// The plan a member that ran the whole shape ran under, for a receipt
 /// with no prepared entry to read one off.
-static WHOLE_LEGS: LazyLock<LegPlan> = LazyLock::new(LegPlan::whole);
+static WHOLE_LEGS: LazyLock<LegPlan> = LazyLock::new(|| LegPlan::whole(0));
 
 /// Declare the record and claim cells a divided member's plan writes,
 /// as exclusive writes appended to its declaration.
@@ -1180,7 +1180,7 @@ fn assemble_executed_tx(
                 resource: crossed.resource,
                 amount: crossed.amount,
                 record: legs
-                    .departing(node, output)
+                    .departure(node, output)
                     .expect("the kernel issues only what the plan departs")
                     .site
                     .key(),
