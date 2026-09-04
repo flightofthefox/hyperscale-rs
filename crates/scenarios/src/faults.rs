@@ -5,12 +5,12 @@ use std::fmt::Write;
 use hyperscale_engine::XRD;
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, Epoch, HALT_THRESHOLD_EPOCHS, MAX_VALIDITY_RANGE,
-    PrincipalAddr, ShardId, StateRoot, TransactionDecision, TransactionStatus, TxHash,
+    PrincipalAddr, ShardId, StateRoot, SubstateKey, TransactionDecision, TransactionStatus, TxHash,
     WeightedTimestamp,
 };
 
 use crate::reshape::split_lifecycle;
-use crate::straddler::{STRADDLER_PAYMENT, chain_settled, submit_straddler};
+use crate::straddler::{STRADDLER_PAYMENT, chain_settled, submit_straddler_recording};
 use crate::support::conservation::{Charges, World, probe_world};
 use crate::support::faultable::FaultableCluster;
 use crate::support::query::{beacon_epoch, vault_balance};
@@ -460,6 +460,9 @@ struct Probe {
     payer_shard: ShardId,
     recipient_shard: ShardId,
     recipient: PrincipalAddr,
+    /// The record cells its crossings write, on the payer's shard —
+    /// where the value it escrowed sits until something disposes of it.
+    records: Vec<SubstateKey>,
     /// The last instant a delivery of it is admissible: the signed
     /// window's end plus the delivery allowance past it.
     delivery_closes: WeightedTimestamp,
@@ -474,12 +477,13 @@ fn submit_probe<C: Cluster>(
     // The same window the submission builds against the same clock, so
     // this is the transaction's own range rather than an estimate of it.
     let window = validity_around(c.now());
-    let hash = submit_straddler(c, charges, key, *from, *to);
+    let (hash, records) = submit_straddler_recording(c, charges, key, *from, *to);
     Probe {
         hash,
         payer_shard: account_shard(*from, 2),
         recipient_shard: account_shard(*to, 2),
         recipient: *to,
+        records,
         delivery_closes: window.end_timestamp_exclusive.plus(MAX_VALIDITY_RANGE),
     }
 }
@@ -595,6 +599,28 @@ fn assert_deliveries_agree<C: Cluster>(
         "the settling batch finalized on both children before any fault installed, \
          so nothing of it can strand; stranded probes = {stranded:?}",
     );
+    // What a strand is, read off the state rather than inferred from the
+    // balances: the value is in its record cell, on the shard that issued
+    // it, after a halt that outlasted every window the transaction had.
+    // A record is value, and value is not swept on a clock — before that
+    // was true the cell would be gone here and the strand would be a
+    // loss.
+    for &idx in &stranded {
+        let probe = &probes[idx];
+        assert!(
+            !probe.records.is_empty(),
+            "a probe that stranded a payment crossed to say it: probe {idx}",
+        );
+        for record in &probe.records {
+            assert!(
+                c.substate(probe.payer_shard, record.owner, record.local.0)
+                    .is_some(),
+                "a crossing nothing disposed of is still in its record cell, \
+                 however long the halt ran: probe {idx} on {:?}",
+                probe.payer_shard,
+            );
+        }
+    }
     u128::try_from(stranded.len()).expect("a handful of probes") * STRADDLER_PAYMENT
 }
 

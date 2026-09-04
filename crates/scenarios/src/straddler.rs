@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use hyperscale_engine::XRD;
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, Epoch, PrincipalAddr, ShardId, TransactionDecision,
-    TransactionStatus, TxHash, WeightedTimestamp, lapse_probe_anchor,
+    BlockHeight, Ed25519PrivateKey, Epoch, PrincipalAddr, ShardId, SubstateKey,
+    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, lapse_probe_anchor,
 };
 
 use crate::reshape::split_lifecycle;
@@ -751,6 +751,24 @@ pub fn submit_straddler<C: Cluster>(
     submit_straddler_reserving(c, charges, key, from, to).0
 }
 
+/// [`submit_straddler`], also reporting the record cells its crossings
+/// write — where the value it escrows sits until something disposes of
+/// it.
+///
+/// A record cell is value rather than derived state, so nothing sweeps
+/// it on a clock; a scenario that outlasts every window and reads the
+/// cell is reading whether that holds.
+pub fn submit_straddler_recording<C: Cluster>(
+    c: &mut C,
+    charges: &mut Charges,
+    key: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    to: PrincipalAddr,
+) -> (TxHash, Vec<SubstateKey>) {
+    let (hash, _, records) = submit_straddler_reserving(c, charges, key, from, to);
+    (hash, records)
+}
+
 /// [`submit_straddler`], also reporting what the transaction reserves
 /// against its shards' drains.
 ///
@@ -763,13 +781,18 @@ fn submit_straddler_reserving<C: Cluster>(
     key: &Ed25519PrivateKey,
     from: PrincipalAddr,
     to: PrincipalAddr,
-) -> (TxHash, u64) {
+) -> (TxHash, u64, Vec<SubstateKey>) {
     let tx = build_transfer_tx(key, from, to, STRADDLER_PAYMENT, validity_around(c.now()));
-    tx.try_derived(c.derivation().as_ref())
-        .expect("a scenario transfer derives");
+    let records = tx
+        .try_derived(c.derivation().as_ref())
+        .expect("a scenario transfer derives")
+        .crossings
+        .iter()
+        .map(|crossing| crossing.record)
+        .collect();
     let work = tx.work();
     let hash = charges.submit(c, tx);
-    (hash, work)
+    (hash, work, records)
 }
 
 /// Assert the settled-transaction fence held for `probes`: every straddler the
