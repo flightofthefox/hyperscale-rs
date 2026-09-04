@@ -818,15 +818,22 @@ fn assert_train_fates<C: Cluster>(
                     .1
                     .is_some_and(|(_, decision)| decision == TransactionDecision::Accept)
             });
-        let credited = match status {
-            Some(TransactionStatus::Completed(TransactionDecision::Accept)) if delivered => {
-                10 + STRADDLER_PAYMENT
-            }
-            Some(TransactionStatus::Completed(
-                TransactionDecision::Accept | TransactionDecision::Aborted,
-            )) if !included || !delivered => 10,
-            other => panic!(
-                "a transfer sent {phase:?} and {taken} by the leaving shard reached {other:?}",
+        let credited = match (fate_owed(*phase, included), status, delivered) {
+            (
+                Fate::Settled | Fate::CarriedOrReclaimed,
+                Some(TransactionStatus::Completed(TransactionDecision::Accept)),
+                true,
+            ) => 10 + STRADDLER_PAYMENT,
+            (
+                Fate::CarriedOrReclaimed,
+                Some(TransactionStatus::Completed(
+                    TransactionDecision::Accept | TransactionDecision::Aborted,
+                )),
+                false,
+            ) => 10,
+            (owed, other, delivered) => panic!(
+                "a transfer sent {phase:?} and {taken} by the leaving shard owes {owed:?} and \
+                 reached {other:?}, delivered = {delivered}",
             ),
         };
         assert!(
@@ -840,6 +847,33 @@ fn assert_train_fates<C: Cluster>(
         never_included > 0,
         "the train has to reach the leaving shard's coast, or nothing here crosses the cut",
     );
+}
+
+/// What a transfer's phase leaves open once the leaving shard has
+/// terminated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fate {
+    /// Settled on a chain that credited the recipient. The leaving shard
+    /// included it and settled it, whatever it was doing at the time.
+    Settled,
+    /// Carried by the successor that took the recipient's prefix, or, if
+    /// the delivery window closed before the successor could serve,
+    /// reclaimed on the successor's proof that it never delivered.
+    CarriedOrReclaimed,
+}
+
+/// The fate a phase owes a transfer the leaving shard did or did not
+/// include.
+///
+/// One shape takes two fates, and it is the one the reshape opens: a
+/// transfer the coasting shard never included races the delivery
+/// window's close. Everything else settles, so a run that crossed no cut
+/// satisfies no disjunction here.
+const fn fate_owed(phase: Phase, included: bool) -> Fate {
+    match (phase, included) {
+        (Phase::Live | Phase::Departing, _) | (Phase::Draining, true) => Fate::Settled,
+        (Phase::Draining, false) => Fate::CarriedOrReclaimed,
+    }
 }
 
 /// Submit one of the train's legs, recording the leaving shard's phase
