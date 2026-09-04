@@ -26,7 +26,8 @@ use hyperscale_scenarios::{
     Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
     a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed,
     a_delivery_cut_off_past_its_window_is_reclaimed, a_departing_venue_clears_swaps_and_carries_on,
-    a_failed_attempt_still_attests_work, a_leg_whose_core_never_answers_refuses_at_the_deadline,
+    a_failed_attempt_still_attests_work, a_healed_network_does_not_revive_a_closed_delivery,
+    a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_published_package_matures_before_it_runs,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
@@ -401,6 +402,10 @@ fn a_hot_venue_clears_swaps_no_slower_fanned_in_sim() {
     // single-caller queue alone reads two slices apart under the two
     // epoch clocks while the fanned-in queue reads the same on both, so
     // a bar tighter than that fails on the clock rather than on fan-in.
+    eprintln!(
+        "FANIN single elapsed={:?} p50={:?} | fanned elapsed={:?} p50={:?}",
+        single.elapsed, single.latency_p50, fanned.elapsed, fanned.latency_p50,
+    );
     assert!(
         fanned.elapsed <= single.elapsed + 2 * SLICE,
         "fan-in from three caller shards must be no worse than from one: \
@@ -482,6 +487,13 @@ fn a_delivery_cut_off_past_its_window_is_reclaimed_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
     cluster.run_faultable(a_delivery_cut_off_past_its_window_is_reclaimed);
+}
+
+#[test]
+fn a_healed_network_does_not_revive_a_closed_delivery_sim() {
+    let mut cluster =
+        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
+    cluster.run_faultable(a_healed_network_does_not_revive_a_closed_delivery);
 }
 
 #[test]

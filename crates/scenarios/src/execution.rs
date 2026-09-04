@@ -23,7 +23,8 @@ use hyperscale_engine::{
 use hyperscale_hbor::from_slice;
 use hyperscale_types::{
     AccountSigner, Address, BlockHeight, Epoch, Hash, SWEEP_BUCKET_MS, SchemeId, SeedLookup,
-    ShardId, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, lapse_probe_anchor,
+    ShardId, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp,
+    delivery_window_close, lapse_probe_anchor,
 };
 use hyperscale_vm_effects::{InstanceMeta, nullifier_key, package_hash};
 use hyperscale_vm_fixtures::lottery;
@@ -1633,6 +1634,126 @@ pub fn a_delivery_cut_off_past_its_window_is_reclaimed<C: FaultableCluster>(c: &
     );
     c.clear_drops();
     world.assert_settles_within(c, &charges, epochs(4), "a delivery cut off past its window");
+}
+
+/// A recipient whose network heals after the delivery window closed
+/// stops chasing the bundle, and the crossing is reclaimed instead.
+///
+/// The sibling of [`a_delivery_cut_off_past_its_window_is_reclaimed`],
+/// and the case that separates the window from the cut. There the cut
+/// stands the whole way, so a delivery that never landed might have been
+/// waiting on a channel rather than on a rule. Here the network is whole
+/// again between the window's close and the lapse — nothing is
+/// suppressed, every host can reach every other — and the delivery still
+/// never lands, because the close took it out of the candidate set: it
+/// is abandoned out of any tick holding it and composition refuses it
+/// past the close, so the shard neither admits it nor goes on asking for
+/// what it would need. That is what makes the issuer's reclaim safe;
+/// both dispositions of one crossing is the conservation break the
+/// window exists to prevent.
+///
+/// # Panics
+///
+/// Panics if the payer's leg does not accept, if the bundle channels are
+/// never exercised, if the cut cannot be lifted inside the window
+/// between the close and the lapse, if the delivery lands on the healed
+/// network, if the recipient goes on fetching for it, if the payment
+/// does not come back, or if the world does not conserve.
+pub fn a_healed_network_does_not_revive_a_closed_delivery<C: FaultableCluster>(c: &mut C) {
+    let (payer_key, from, to) = cross_shard_cast();
+    let payer_shard = ShardId::leaf(1, 0);
+    let recipient_shard = ShardId::leaf(1, 1);
+    let before = vault_balance(c, payer_shard, from);
+    let recipient_before = vault_balance(c, recipient_shard, to);
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
+
+    let broadcast_dropped = c.drop_type("provisions.broadcast");
+    let fetch_dropped = c.drop_type("provision.request");
+
+    let validity = validity_around(c.now());
+    let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
+    let price = declared_price(c, &tx);
+    let hash = charges.submit(c, tx);
+
+    let verdict = await_tx_terminal(c, hash, epochs(8));
+    assert!(
+        matches!(
+            verdict,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the payer's leg settles alone and accepts; verdict = {verdict:?}",
+    );
+    assert!(
+        c.run_until(epochs(4), |c| vault_balance(c, payer_shard, from)
+            == before - 100 - price),
+        "the leg pays the payment and the price",
+    );
+
+    // Past the close, with the cut standing the whole way: the window
+    // shuts on a delivery whose bundle never reached it.
+    let validity_end = validity.end_timestamp_exclusive;
+    let close = delivery_window_close(validity_end);
+    let lapse = lapse_probe_anchor(validity_end);
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    assert!(
+        c.run_until(epochs(12), |c| clock(c) >= close),
+        "the cut must stand past the delivery window's close",
+    );
+    assert!(
+        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
+        "both bundle channels must actually have been exercised and cut"
+    );
+    assert!(
+        c.chain_fate(recipient_shard, hash).0.is_none(),
+        "the delivery must never have landed while its bundle was cut off",
+    );
+
+    // The bundle flows again, inside the window between the close and
+    // the lapse: the recipient can now read the crossing's record and
+    // still must not claim it.
+    // The network is whole again, inside the window between the close
+    // and the lapse.
+    let carried = c.metric("fetch_items_received", Some("provision"));
+    c.clear_drops();
+    assert!(
+        clock(c) < lapse,
+        "the cut has to lift short of the lapse, or the reclaim is what \
+         kept the delivery out rather than the window",
+    );
+    assert!(
+        c.run_until(epochs(12), |c| clock(c) >= lapse),
+        "the run must reach the lapse the issuer proves against",
+    );
+    assert!(
+        c.chain_fate(recipient_shard, hash).0.is_none(),
+        "a delivery past its window is inadmissible on a whole network",
+    );
+    assert_eq!(
+        c.metric("fetch_items_received", Some("provision")),
+        carried,
+        "a shard that abandoned the delivery at the close stops asking for \
+         the bundle it would have claimed from",
+    );
+
+    // And the crossing comes back to its payer, once and to it alone.
+    assert!(
+        c.run_until(epochs(10), |c| vault_balance(c, payer_shard, from)
+            == before - price),
+        "the payer must get its payment back on the lapse; holds {}",
+        vault_balance(c, payer_shard, from),
+    );
+    assert_eq!(
+        vault_balance(c, recipient_shard, to),
+        recipient_before,
+        "the recipient was never credited",
+    );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "a delivery whose bundle arrived past its window",
+    );
 }
 
 /// What the deadline scenario stakes: well under its funding, so the
