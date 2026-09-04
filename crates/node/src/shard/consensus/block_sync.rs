@@ -452,10 +452,11 @@ mod tests {
     use hyperscale_types::test_utils::{stub_abort_charge, test_transaction};
     use hyperscale_types::{
         AbandonmentRecord, AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts,
-        CertificateRoot, ChainOrigin, ConsensusReceipt, ExecutionCertificate, ExecutionOutcome,
-        Finalization, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProposerTimestamp,
-        QuorumCertificate, Round, ShardId, SignerBitfield, TickHalf, TickId, TransactionRoot,
-        TxHash, TxOutcome, UnsettledTx, Verifiable, WeightedTimestamp, WitnessSources,
+        CertificateRoot, ChainOrigin, ConsensusReceipt, CounterpartClaim, ExecutionCertificate,
+        ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
+        ProposerTimestamp, QuorumCertificate, Round, ShardId, SignerBitfield, TickHalf, TickId,
+        TransactionRoot, TxHash, TxOutcome, UnsettledTx, Verifiable, WeightedTimestamp,
+        WitnessSources,
     };
 
     use super::*;
@@ -690,9 +691,12 @@ mod tests {
             WeightedTimestamp::from_millis(3_000),
             [stub_abort_charge(1).vault],
             MerkleInclusionProof::dummy(),
-        )];
+        )]
+        .into_iter()
+        .map(CounterpartClaim::Cells)
+        .collect::<Vec<_>>();
         let root = Verified::<StateProofsRoot>::compute(&bundles).into_inner();
-        let live = |state_proofs: Vec<StateProofBundle>| Block::Live {
+        let live = |state_proofs: Vec<CounterpartClaim>| Block::Live {
             header: BlockHeader::new(BlockHeaderParts {
                 height: HEIGHT,
                 parent_block_hash: BlockHash::ZERO,

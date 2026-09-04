@@ -48,17 +48,17 @@ use hyperscale_metrics::{
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
 use hyperscale_types::{
     AbandonmentRecord, Absence, Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader,
-    BlockHeight, BloomFilter, CertifiedBlock, ClaimProof, DeclaredKey, Derivation,
-    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome, ExecutionVote,
-    Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
-    LegEntry, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    MerkleInclusionProof, Mode, ProvenAnchors, Provisions, Refusal, ScheduleLookup,
-    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateAnchor, StateProofBundle,
-    StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot, Transaction,
-    TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp, absence_licenses_reclaim, derive_block_transactions,
-    lapse_licenses_reclaim, lapse_probe_anchor, lapse_probe_ceiling, reclaim_probe_anchor,
-    settled_set_verdict, tick_leader, tick_leader_at,
+    BlockHeight, BloomFilter, CertifiedBlock, ClaimProof, CounterpartClaim, DeclaredKey,
+    Derivation, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome,
+    ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
+    Hash, Inclusion, LegEntry, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Mode, ProvenAnchors, Provisions, Refusal,
+    ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateAnchor,
+    StateProofBundle, StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution, UnsettledTx,
+    ValidatorId, VerdictClaim, Verifiable, Verified, WeightedTimestamp, absence_licenses_reclaim,
+    derive_block_transactions, lapse_licenses_reclaim, lapse_probe_anchor, lapse_probe_ceiling,
+    reclaim_probe_anchor, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use tracing::instrument;
 
@@ -2666,20 +2666,48 @@ impl ExecutionCoordinator {
             .collect();
         let mut actions = Vec::new();
         let mut abandoned = Vec::new();
-        for bundle in block.state_proofs() {
-            let inclusions = match bundle.inclusions() {
-                Ok(inclusions) => inclusions,
-                Err(error) => {
-                    tracing::error!(
-                        shard = ?bundle.anchor.shard,
-                        height = bundle.anchor.height.inner(),
-                        %error,
-                        "A committed state proof does not answer for its keys"
-                    );
-                    continue;
+        for claim in block.state_proofs() {
+            // A verdict is the counterpart's own word, folded from the
+            // chain rather than from whatever this replica happened to
+            // hear broadcast — which is the whole point of committing it.
+            match claim {
+                CounterpartClaim::Verdict(verdict) => actions.extend(self.fold_verdict(verdict)),
+                CounterpartClaim::Cells(bundle) => {
+                    actions.extend(self.fold_cells(bundle, &cells, &mut abandoned));
                 }
-            };
-            for (entry, cells) in &cells {
+            }
+        }
+        if !abandoned.is_empty() {
+            actions.push(Action::AbandonFetch(FetchAbandon::StateProofs {
+                ids: abandoned,
+            }));
+        }
+        actions
+    }
+
+    /// Fold one bundle's answers into the questions the ledger is
+    /// waiting on.
+    fn fold_cells(
+        &mut self,
+        bundle: &StateProofBundle,
+        cells: &[(Probeable, Vec<CounterpartCell>)],
+        abandoned: &mut Vec<(StateAnchor, SubstateKey)>,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let inclusions = match bundle.inclusions() {
+            Ok(inclusions) => inclusions,
+            Err(error) => {
+                tracing::error!(
+                    shard = ?bundle.anchor.shard,
+                    height = bundle.anchor.height.inner(),
+                    %error,
+                    "A committed state proof does not answer for its keys"
+                );
+                return actions;
+            }
+        };
+        {
+            for (entry, cells) in cells {
                 for &(shard, key, floor, probed) in cells {
                     if shard != bundle.anchor.shard
                         || !licenses(probed, bundle.anchor_ts, entry.validity_end)
@@ -2747,23 +2775,89 @@ impl ExecutionCoordinator {
                 }
             }
         }
-        if !abandoned.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::StateProofs {
-                ids: abandoned,
-            }));
-        }
         actions
     }
 
-    /// The proofs this validator's fetches answered that no block has
-    /// carried yet, in the one order a block carries them, under the
-    /// block's cap.
+    /// Fold a verdict the chain committed into the refusal the record
+    /// arms are offered from.
+    ///
+    /// The mirror stays, as a cache in front of the fold rather than the
+    /// source of truth it was: what a replica heard broadcast is what
+    /// lets it check a claim before the claim commits, and what the chain
+    /// committed is what every replica holds afterwards, restart or no.
+    /// First write wins, as the fold itself is — a second claim for one
+    /// `(transaction, shard)` restates a decision that is already the
+    /// chain's.
+    fn fold_verdict(&mut self, verdict: &VerdictClaim) -> Vec<Action> {
+        if verdict.shard == self.local_shard || !verdict.refuses() {
+            return Vec::new();
+        }
+        let Some(figures) = self.unresolved.unsettled_leg_figures(verdict.tx_hash) else {
+            return Vec::new();
+        };
+        let refusal = Refusal {
+            refused_wt: verdict.anchor_ts,
+            deadline: figures.deadline,
+            decision: verdict.decision,
+            digest: verdict.digest,
+        };
+        let std::collections::btree_map::Entry::Vacant(slot) =
+            self.refusals.entry((verdict.tx_hash, verdict.shard))
+        else {
+            return Vec::new();
+        };
+        slot.insert(refusal);
+        let decision = if verdict.decision == TransactionDecision::Aborted {
+            TransactionDecision::Aborted
+        } else {
+            TransactionDecision::Reject
+        };
+        vec![
+            Action::Continuation(ProtocolEvent::RefusalObserved {
+                shard: verdict.shard,
+                tx_hash: verdict.tx_hash,
+                refusal,
+            }),
+            Action::Continuation(ProtocolEvent::TransactionsResolved {
+                resolutions: vec![(verdict.tx_hash, TxResolution::CoreDecided(decision))],
+            }),
+        ]
+    }
+
+    /// What this validator can claim about counterparts' chains that no
+    /// block has carried yet, in the one order a block carries them,
+    /// under the block's cap.
+    ///
+    /// The proofs its own fetches answered, and the verdicts its own
+    /// broadcasts delivered — the latter filtered to the transactions a
+    /// leg here still owes an outcome for, which is where a verdict
+    /// licenses a record at all. The filter is what keeps the vote
+    /// fence's deferral rare: it withholds the vote on the whole block,
+    /// so an unfiltered offer would couple every transaction in a block
+    /// to the slowest broadcast on the abort path.
     #[must_use]
-    pub fn pending_state_proofs(&self) -> Vec<StateProofBundle> {
-        self.fetched
-            .keys()
+    pub fn pending_state_proofs(&self) -> Vec<CounterpartClaim> {
+        let proofs = self.fetched.keys().cloned().map(CounterpartClaim::Cells);
+        let verdicts = self
+            .refusals
+            .iter()
+            .filter(|((tx_hash, shard), _)| {
+                self.unresolved
+                    .leg_core(*tx_hash)
+                    .is_some_and(|core| core.contains(shard))
+            })
+            .map(|((tx_hash, shard), refusal)| {
+                CounterpartClaim::Verdict(VerdictClaim {
+                    shard: *shard,
+                    tx_hash: *tx_hash,
+                    anchor_ts: refusal.refused_wt,
+                    decision: refusal.decision,
+                    digest: refusal.digest,
+                })
+            });
+        proofs
+            .chain(verdicts)
             .take(MAX_PROVISIONS_PER_BLOCK)
-            .cloned()
             .collect()
     }
 
@@ -3033,8 +3127,10 @@ impl ExecutionCoordinator {
         self.gc_mirrors();
         // A proof the chain now carries is everybody's: its answers are
         // folded here, and nothing offers it again.
-        for bundle in block.state_proofs() {
-            self.fetched.remove(bundle);
+        for claim in block.state_proofs() {
+            if let Some(bundle) = claim.cells() {
+                self.fetched.remove(bundle);
+            }
         }
         let mut actions = self.fold_state_proofs(topology_schedule, block);
         actions.extend(self.gc_probes());
@@ -3830,9 +3926,16 @@ impl ExecutionCoordinator {
             let Some(figures) = self.unresolved.unsettled_leg_figures(tx_hash) else {
                 continue;
             };
+            let decision = if outcome.is_aborted() {
+                TransactionDecision::Aborted
+            } else {
+                TransactionDecision::Reject
+            };
             let refusal = Refusal {
                 refused_wt: ec.vote_anchor_ts(),
                 deadline: figures.deadline,
+                decision,
+                digest: ec.attested_digest(),
             };
             if let std::collections::btree_map::Entry::Vacant(slot) =
                 self.refusals.entry((tx_hash, shard))
@@ -3843,11 +3946,6 @@ impl ExecutionCoordinator {
                     tx_hash,
                     refusal,
                 }));
-                let decision = if outcome.is_aborted() {
-                    TransactionDecision::Aborted
-                } else {
-                    TransactionDecision::Reject
-                };
                 resolutions.push((tx_hash, TxResolution::CoreDecided(decision)));
             }
         }
@@ -8074,6 +8172,8 @@ mod tests {
             Some(Refusal {
                 refused_wt: WeightedTimestamp::from_millis(7_000),
                 deadline: UnsettledTx::for_transaction(&transaction).deadline,
+                decision: TransactionDecision::Reject,
+                digest: observed.expect("observed above").digest,
             }),
             "the refusal reaches the vote fence"
         );
@@ -8278,7 +8378,7 @@ mod tests {
             certificates,
             provisions,
             abandonment_records,
-            state_proofs: Arc::new(bundles),
+            state_proofs: Arc::new(bundles.into_iter().map(CounterpartClaim::Cells).collect()),
             witness_sources,
         };
         state.on_block_committed(schedule, &test_certify(block, ts_ms))
@@ -8551,7 +8651,7 @@ mod tests {
         state.on_state_proof_verified(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
         assert_eq!(
             state.pending_state_proofs(),
-            vec![bundle.clone()],
+            vec![CounterpartClaim::Cells(bundle.clone())],
             "dated to the clock the probe read off the header"
         );
 
@@ -8559,7 +8659,7 @@ mod tests {
         commit_carrying(&mut state, &schedule, 1, deadline_ms, Vec::new());
         assert_eq!(
             state.pending_state_proofs(),
-            vec![bundle.clone()],
+            vec![CounterpartClaim::Cells(bundle.clone())],
             "a block carrying no proofs leaves the offer standing"
         );
         commit_carrying(&mut state, &schedule, 2, deadline_ms, vec![bundle]);

@@ -151,6 +151,7 @@ pub use shard::abandonment::{
 pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch, LinkageError};
 pub use shard::certified_header::{CertifiedBlockHeader, CertifiedHeaderVerifyError};
 pub use shard::chain_origin::{ChainOrigin, PredecessorTerminal};
+pub use shard::claim::{CounterpartClaim, VerdictClaim};
 pub use shard::commit_proof::{
     CommitProof, CommitProofVerifyError, MAX_COMMIT_PROOF_ANCESTRY, ResolvedCommittee,
 };

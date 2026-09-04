@@ -371,6 +371,10 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// chain committed.
     fn record_reclaim_admitted(&self) {}
 
+    /// A vote withheld because a block's verdict claim names a
+    /// certificate this validator does not hold.
+    fn record_verdict_claim_deferred(&self) {}
+
     /// Set the in-flight request slot count for a `MessageClass`.
     ///
     /// Sampled by the request manager whenever a slot is acquired or
@@ -836,6 +840,17 @@ pub fn record_reclaim_probe_answered(present: bool) {
 #[inline]
 pub fn record_reclaim_admitted() {
     recorder().record_reclaim_admitted();
+}
+
+/// Record a vote withheld for want of the certificate a block's verdict
+/// claim names.
+///
+/// A refusal that never reached this validator is invisible once the
+/// chain carries the commitment rather than the bytes, so the frequency
+/// of the deferral is what says the push is working.
+#[inline]
+pub fn record_verdict_claim_deferred() {
+    recorder().record_verdict_claim_deferred();
 }
 
 /// Set the in-flight request slot count for a class.

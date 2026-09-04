@@ -24,6 +24,10 @@ use crate::{
     verify_sparse_inclusion,
 };
 
+/// Domain tag separating a certificate's attested digest from every
+/// other preimage the codebase hashes.
+const CERTIFICATE_DIGEST_TAG: &[u8] = b"hyperscale.execution_certificate.attested.v1";
+
 /// Aggregated certificate for an execution tick.
 ///
 /// Contains the signature aggregated signature from 2f+1 validators plus per-tx
@@ -461,6 +465,28 @@ impl ExecutionCertificate {
             },
             |bytes| Hash::from_parts(&[bytes]),
         )
+    }
+
+    /// Digest over what the committee signed, and nothing a copy varies.
+    ///
+    /// [`Self::wire_hash`] deliberately separates different aggregations
+    /// and different projections of one logical certificate, which makes
+    /// it the wrong name for a fact two shards have to agree on: a copy
+    /// carries only the outcomes naming its receiver, and two assemblers
+    /// may aggregate different quorums of the same votes. What survives
+    /// both is the signed identity — the tick, the anchor the votes were
+    /// cast at, the receipt root they attest and the leaf count that root
+    /// covers — so that is what a claim to a counterpart's verdict names.
+    #[must_use]
+    pub fn attested_digest(&self) -> Hash {
+        Hash::from_parts(&[
+            CERTIFICATE_DIGEST_TAG,
+            &self.tick_id.shard_id().to_le_bytes(),
+            &self.tick_id.block_height().inner().to_le_bytes(),
+            &self.vote_anchor_ts.as_millis().to_le_bytes(),
+            self.global_receipt_root.as_raw().as_bytes(),
+            &self.tx_count.to_le_bytes(),
+        ])
     }
 
     fn populate_cached_bytes(&mut self) {

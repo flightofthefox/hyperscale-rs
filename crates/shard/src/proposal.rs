@@ -21,9 +21,9 @@ use std::sync::Arc;
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash,
-    LocalTimestamp, MAX_PROVISIONS_PER_BLOCK, ProposerTimestamp, ProvisionHash, Provisions,
-    ReadySignal, ReshapeTrigger, RevealChain, Round, ScheduleLookup, ShardId, StateProofBundle,
+    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, CounterpartClaim, Epoch,
+    Finalization, Hash, LocalTimestamp, MAX_PROVISIONS_PER_BLOCK, ProposerTimestamp, ProvisionHash,
+    Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round, ScheduleLookup, ShardId,
     TopologySchedule, TopologySnapshot, Transaction, TxHash, Unsettleable, UnsettledTx,
     ValidatorId, Verifiable, Verified, WeightedTimestamp, delivery_admissible, sweep_admits_block,
 };
@@ -60,7 +60,7 @@ pub struct ProposalPayload {
     pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
     pub provisions: Vec<Arc<Verifiable<Provisions>>>,
     pub abandonment_records: Vec<AbandonmentRecord>,
-    pub state_proofs: Vec<StateProofBundle>,
+    pub state_proofs: Vec<CounterpartClaim>,
 }
 
 #[derive(Debug, Clone)]
@@ -454,14 +454,18 @@ pub fn select_abandonment_records(
         .collect()
 }
 
-/// The state-proof bundles a block may carry, in the one order it
-/// carries them: ascending, without repeats, and no more than the
-/// block's cap, with the rest waiting a block.
+/// The claims a block may carry about counterparts' chains, in the one
+/// order it carries them: ascending, without repeats, and no more than
+/// the block's cap, with the rest waiting a block.
+///
+/// A claim that licenses nothing never reaches a block — a bundle
+/// naming no key, or a verdict naming an acceptance — so the cap is
+/// spent on answers a record arm can be offered from.
 #[must_use]
-pub fn select_state_proofs(state_proofs: Vec<StateProofBundle>) -> Vec<StateProofBundle> {
-    let mut selected: Vec<StateProofBundle> = state_proofs
+pub fn select_state_proofs(state_proofs: Vec<CounterpartClaim>) -> Vec<CounterpartClaim> {
+    let mut selected: Vec<CounterpartClaim> = state_proofs
         .into_iter()
-        .filter(StateProofBundle::is_well_formed)
+        .filter(CounterpartClaim::is_well_formed)
         .collect();
     selected.sort_unstable();
     selected.dedup();

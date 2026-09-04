@@ -13,7 +13,7 @@ use crate::BlockHeight;
 ///
 /// Decision priority: `Aborted > Reject > Accept`. If any shard reports
 /// `Aborted`, the TC decision is `Aborted` regardless of other shards' results.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Hbor)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
 pub enum TransactionDecision {
     /// All shards successfully executed the transaction.
     Accept,

@@ -13,10 +13,10 @@ use thiserror::Error;
 
 use crate::{
     AbandonmentRecord, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, CertificateRoot,
-    ChainOrigin, Derivation, Finalization, LocalReceiptRoot, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ShardId,
-    SharedWitnessSources, SplitChildRoots, StateProofBundle, StateRoot, Transaction,
+    ChainOrigin, CounterpartClaim, Derivation, Finalization, LocalReceiptRoot,
+    MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
+    QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots, StateRoot, Transaction,
     TransactionRoot, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
 };
 
@@ -120,11 +120,13 @@ pub enum Block {
         /// Committed via the header's `abandonment_root`.
         #[hbor(max = MAX_ABANDONMENT_RECORDS_PER_BLOCK)]
         abandonment_records: Arc<Vec<AbandonmentRecord>>,
-        /// Proofs of counterparts' cells the proposer's fetches answered,
-        /// committed via the header's `state_proofs_root` and folded by
-        /// every replica at commit. See [`StateProofBundle`].
+        /// What this block commits about counterparts' chains: cells
+        /// their commit-proven state holds, and verdicts their
+        /// certificates attest. Committed via the header's
+        /// `state_proofs_root` and folded by every replica at commit.
+        /// See [`CounterpartClaim`].
         #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
-        state_proofs: Arc<Vec<StateProofBundle>>,
+        state_proofs: Arc<Vec<CounterpartClaim>>,
         /// Proposer-supplied beacon-witness inputs. Committed via the
         /// header's `beacon_witness_root`; carried on the body so
         /// commit-time leaf derivation is identical on every node. See
@@ -162,7 +164,7 @@ pub enum Block {
         /// the records: a replay of any depth re-folds its answers off
         /// the block it reads, and the root binds at every stage.
         #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
-        state_proofs: Arc<Vec<StateProofBundle>>,
+        state_proofs: Arc<Vec<CounterpartClaim>>,
         /// Proposer-supplied beacon-witness inputs — retained through
         /// sealing (unlike provisions) because the beacon-witness fold
         /// consuming them can run well after the block sealed. See
@@ -433,7 +435,7 @@ impl Block {
     /// variant — what every replica folds at commit to answer the
     /// ledger's probes.
     #[must_use]
-    pub fn state_proofs(&self) -> &[StateProofBundle] {
+    pub fn state_proofs(&self) -> &[CounterpartClaim] {
         match self {
             Self::Live { state_proofs, .. } | Self::Sealed { state_proofs, .. } => state_proofs,
         }

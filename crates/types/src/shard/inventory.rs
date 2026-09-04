@@ -25,9 +25,9 @@ use hyperscale_hbor::Hbor;
 
 use crate::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock,
-    Finalization, FinalizationHash, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate,
-    StateProofBundle, Transaction, TxHash, Verifiable, WitnessSources,
+    CounterpartClaim, Finalization, FinalizationHash, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    Provisions, QuorumCertificate, Transaction, TxHash, Verifiable, WitnessSources,
 };
 
 /// Inventory of locally-known item hashes, grouped by category.
@@ -104,7 +104,7 @@ pub struct ElidedCertifiedBlock {
     /// folds them at commit, and no other source holds the proposer's
     /// bytes.
     #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
-    state_proofs: Vec<StateProofBundle>,
+    state_proofs: Vec<CounterpartClaim>,
     /// The block's beacon-witness inputs, always inline (never elided):
     /// they are small and the receiver needs them to reproduce the
     /// block's beacon-witness leaves at commit.

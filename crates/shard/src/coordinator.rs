@@ -15,14 +15,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
+use hyperscale_metrics::record_verdict_claim_deferred;
 use hyperscale_types::{
-    AbandonmentRecord, BlockHash, ClaimProof, FinalizationHash, Hash, LocalTimestamp,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK,
-    PrincipalAddr, ProposerTimestamp, ProvenAnchor, ProvenAnchors, ProvisionHash, ReadySignal,
-    ReshapeThresholds, ReshapeTrigger, Resolutions, ScheduleLookup, SettledSetVerdict,
-    SettledTxSet, ShardId, SplitAtBoundary, StateProofBundle, StoredReceipt, SubstateKey, TxClaim,
-    TxOutcome, Unsettleable, UnsettledTx, WeightedTimestamp, WorkInFlight, derive_reshape_trigger,
-    lapse_probe_ceiling, ready_signal_window, settled_set_verdict, verdict_window_close,
+    AbandonmentRecord, BlockHash, ClaimProof, CounterpartClaim, FinalizationHash, Hash,
+    LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, PrincipalAddr, ProposerTimestamp, ProvenAnchor, ProvenAnchors,
+    ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger, Resolutions, ScheduleLookup,
+    SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StateProofBundle, StoredReceipt,
+    SubstateKey, TxClaim, TxOutcome, Unsettleable, UnsettledTx, VerdictClaim, WeightedTimestamp,
+    WorkInFlight, derive_reshape_trigger, lapse_probe_ceiling, ready_signal_window,
+    settled_set_verdict, verdict_window_close,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -490,6 +492,15 @@ pub struct ShardCoordinator {
     /// anchor. One mirror, so the fence cannot accept a bundle at an
     /// anchor the prober would not have chosen.
     proven_anchors: Arc<ProvenAnchors>,
+}
+
+/// Whether the mirror `held` is the certificate `claim` names: the same
+/// anchor, the same decision, and the same signed identity.
+fn mirrors(held: &Refusal, claim: &VerdictClaim) -> bool {
+    let same_anchor = held.refused_wt == claim.anchor_ts;
+    let same_word = held.decision == claim.decision;
+    let same_bytes = held.digest == claim.digest;
+    same_anchor && same_word && same_bytes
 }
 
 /// Whether `bundle` names `held`: the root its anchor claims and the
@@ -1006,42 +1017,115 @@ impl ShardCoordinator {
     /// anchor reaches every voter in the ordinary course.
     fn fence_state_proofs(&self, block: &Block, block_hash: BlockHash) -> Option<Vec<Action>> {
         let mut wanted = Vec::new();
-        for bundle in block.state_proofs() {
-            let anchor = bundle.anchor;
-            match self.proven_anchors.at(anchor.shard, anchor.height) {
-                Some(held) if names(held, bundle) => {}
-                Some(held) => {
-                    warn!(
-                        validator = ?self.me,
-                        block_hash = ?block_hash,
-                        shard = ?anchor.shard,
-                        height = anchor.height.inner(),
-                        claimed_root = ?anchor.state_root,
-                        held_root = ?held.state_root,
-                        claimed_ts = ?bundle.anchor_ts,
-                        held_ts = ?held.ts,
-                        "State proof names an anchor this validator's commit-proven header \
-                         disagrees with — not voting"
-                    );
-                    return Some(vec![]);
+        for claim in block.state_proofs() {
+            match claim {
+                CounterpartClaim::Cells(bundle) => {
+                    if !self.anchor_stands(bundle, block_hash, &mut wanted) {
+                        return Some(vec![]);
+                    }
                 }
-                None => {
-                    trace!(
-                        validator = ?self.me,
-                        block_hash = ?block_hash,
-                        shard = ?anchor.shard,
-                        height = anchor.height.inner(),
-                        "State proof names a height this validator has not commit-proven; \
-                         deferring"
-                    );
-                    wanted.push(Action::Continuation(ProtocolEvent::CommitProofNeeded {
-                        source_shard: anchor.shard,
-                        block_height: anchor.height,
-                    }));
+                CounterpartClaim::Verdict(verdict) => {
+                    if !self.verdict_stands(verdict, block_hash) {
+                        return Some(vec![]);
+                    }
                 }
             }
         }
         (!wanted.is_empty()).then_some(wanted)
+    }
+
+    /// Whether a bundle's anchor is one this voter has commit-proven, and
+    /// whether it agrees with the header held for it.
+    fn anchor_stands(
+        &self,
+        bundle: &StateProofBundle,
+        block_hash: BlockHash,
+        wanted: &mut Vec<Action>,
+    ) -> bool {
+        let anchor = bundle.anchor;
+        match self.proven_anchors.at(anchor.shard, anchor.height) {
+            Some(held) if names(held, bundle) => true,
+            Some(held) => {
+                warn!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    shard = ?anchor.shard,
+                    height = anchor.height.inner(),
+                    claimed_root = ?anchor.state_root,
+                    held_root = ?held.state_root,
+                    claimed_ts = ?bundle.anchor_ts,
+                    held_ts = ?held.ts,
+                    "State proof names an anchor this validator's commit-proven header \
+                     disagrees with — not voting"
+                );
+                false
+            }
+            None => {
+                trace!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    shard = ?anchor.shard,
+                    height = anchor.height.inner(),
+                    "State proof names a height this validator has not commit-proven; \
+                     deferring"
+                );
+                wanted.push(Action::Continuation(ProtocolEvent::CommitProofNeeded {
+                    source_shard: anchor.shard,
+                    block_height: anchor.height,
+                }));
+                true
+            }
+        }
+    }
+
+    /// Whether a verdict claim stands on the certificate this voter
+    /// holds: the same anchor, the same decision, and the same signed
+    /// identity.
+    ///
+    /// A voter holding no certificate for the transaction defers, exactly
+    /// as it defers on an anchor it has not proven — and the deferral is
+    /// metered, since a lost broadcast is now invisible where the old
+    /// mirror at least held nothing. The certificate is re-fetchable from
+    /// anyone holding it, so the deferral resolves on the path that
+    /// already exists.
+    fn verdict_stands(&self, verdict: &VerdictClaim, block_hash: BlockHash) -> bool {
+        if !verdict.refuses() {
+            warn!(
+                validator = ?self.me,
+                block_hash = ?block_hash,
+                shard = ?verdict.shard,
+                tx_hash = ?verdict.tx_hash,
+                "Verdict claim names an acceptance, which licenses nothing — not voting"
+            );
+            return false;
+        }
+        match self.refusals.get(&(verdict.tx_hash, verdict.shard)) {
+            Some(held) if mirrors(held, verdict) => true,
+            Some(held) => {
+                warn!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    shard = ?verdict.shard,
+                    tx_hash = ?verdict.tx_hash,
+                    claimed_ts = ?verdict.anchor_ts,
+                    held_ts = ?held.refused_wt,
+                    "Verdict claim restates a certificate this validator reads differently \
+                     — not voting"
+                );
+                false
+            }
+            None => {
+                record_verdict_claim_deferred();
+                trace!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    shard = ?verdict.shard,
+                    tx_hash = ?verdict.tx_hash,
+                    "Verdict claim names a certificate this validator does not hold; deferring"
+                );
+                false
+            }
+        }
     }
 
     /// The settled-transaction set this validator has acquired for a terminated
@@ -2353,7 +2437,7 @@ impl ShardCoordinator {
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         abandonment_records: Vec<AbandonmentRecord>,
-        state_proofs: Vec<StateProofBundle>,
+        state_proofs: Vec<CounterpartClaim>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // not the committed block — this lets the chain grow while the
@@ -5184,7 +5268,7 @@ impl ShardCoordinator {
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         abandonment_records: Vec<AbandonmentRecord>,
-        state_proofs: Vec<StateProofBundle>,
+        state_proofs: Vec<CounterpartClaim>,
     ) -> Vec<Action> {
         let height = qc.height();
 
@@ -7320,9 +7404,9 @@ mod tests {
         CommittedTxsRoot, ConsensusSignature, Epoch, Hash, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
         NetworkDefinition, NetworkParams, SettledTxsRoot, ShardAnchor, ShardId, Signer,
         SignerBitfield, TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot,
-        Transaction, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
-        WeightedTimestamp, WitnessSources, abandonment_root_from_records, reclaim_probe_anchor,
-        test_utils,
+        Transaction, TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet,
+        VoteCount, WeightedTimestamp, WitnessSources, abandonment_root_from_records,
+        reclaim_probe_anchor, test_utils,
     };
 
     use super::*;
@@ -11780,6 +11864,11 @@ mod tests {
 
     /// A block carrying `bundles`, committed under their root.
     fn block_with_state_proofs(bundles: Vec<StateProofBundle>) -> Block {
+        block_with_claims(bundles.into_iter().map(CounterpartClaim::Cells).collect())
+    }
+
+    /// A block carrying `claims`, committed under their root.
+    fn block_with_claims(bundles: Vec<CounterpartClaim>) -> Block {
         use hyperscale_types::state_proofs_root_from_bundles;
         Block::Live {
             header: BlockHeader::new(BlockHeaderParts {
@@ -12108,6 +12197,8 @@ mod tests {
         let mirror = |refused_wt: WeightedTimestamp| Refusal {
             refused_wt,
             deadline: figures_of(b"tx").deadline,
+            decision: TransactionDecision::Reject,
+            digest: Hash::from_bytes(b"digest"),
         };
 
         let mut matching = fence_coordinator();

@@ -625,19 +625,16 @@ pub fn validate_state_proofs_well_formed(block: &Block) -> Result<(), String> {
             bundles.len()
         ));
     }
-    for (at, bundle) in bundles.iter().enumerate() {
-        if !bundle.is_well_formed() {
+    for (at, claim) in bundles.iter().enumerate() {
+        if !claim.is_well_formed() {
             return Err(format!(
-                "state proof against {:?} at {} is empty, over its cap, or out of order",
-                bundle.anchor.shard,
-                bundle.anchor.height.inner(),
+                "counterpart claim {at} is empty, over its cap, out of order, or names a \
+                 verdict that licenses nothing"
             ));
         }
-        if at > 0 && bundles[at - 1] >= *bundle {
+        if at > 0 && bundles[at - 1] >= *claim {
             return Err(format!(
-                "state proof against {:?} at {} repeats or precedes the one before it",
-                bundle.anchor.shard,
-                bundle.anchor.height.inner(),
+                "counterpart claim {at} repeats or precedes the one before it"
             ));
         }
     }
@@ -785,12 +782,13 @@ mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
-        BlockHeader, BlockHeaderParts, ChainOrigin, Finalization, Hash, LocalKey, MAX_SUBINTENTS,
-        MerkleInclusionProof, NetworkDefinition, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
-        Provisions, QuorumCertificate, Round, ShardId, ShardLoad, Signer, SignerBitfield,
-        StateAnchor, StateProofBundle, StateProofsRoot, StateRoot, SubstateKey, TimestampRange,
-        Transaction, TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet,
-        Verifiable, Verified, WeightedTimestamp, WitnessSources, test_utils,
+        BlockHeader, BlockHeaderParts, ChainOrigin, CounterpartClaim, Finalization, Hash, LocalKey,
+        MAX_SUBINTENTS, MerkleInclusionProof, NetworkDefinition, PrincipalAddr, ProposerTimestamp,
+        ProvisionEntry, Provisions, QuorumCertificate, Round, ShardId, ShardLoad, Signer,
+        SignerBitfield, StateAnchor, StateProofBundle, StateProofsRoot, StateRoot, SubstateKey,
+        TimestampRange, Transaction, TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo,
+        ValidatorSet, VerdictClaim, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+        test_utils,
     };
 
     use super::*;
@@ -1329,7 +1327,7 @@ mod tests {
     }
 
     /// A block carrying `bundles` under a header claiming `root`.
-    fn block_with_state_proofs(bundles: Vec<StateProofBundle>, root: StateProofsRoot) -> Block {
+    fn block_with_state_proofs(bundles: Vec<CounterpartClaim>, root: StateProofsRoot) -> Block {
         let base = header_at_height(BlockHeight::new(6), 100_000);
         Block::Live {
             header: BlockHeader::new(BlockHeaderParts {
@@ -1352,9 +1350,9 @@ mod tests {
         }
     }
 
-    /// A bundle against `ROOT` at `height`, answering for `keys`.
-    fn bundle_at(height: u64, keys: &[u8]) -> StateProofBundle {
-        StateProofBundle::new(
+    /// A cells claim against `ROOT` at `height`, answering for `keys`.
+    fn bundle_at(height: u64, keys: &[u8]) -> CounterpartClaim {
+        CounterpartClaim::Cells(StateProofBundle::new(
             StateAnchor {
                 shard: ShardId::ROOT,
                 height: BlockHeight::new(height),
@@ -1366,7 +1364,7 @@ mod tests {
                 local: LocalKey([*seed; 16]),
             }),
             MerkleInclusionProof::dummy(),
-        )
+        ))
     }
 
     /// The section is bound to the header's root and held to one form:
@@ -1389,7 +1387,7 @@ mod tests {
         .expect_err("a root that does not commit the bundles is refused");
         assert!(err.contains("does not commit"), "{err}");
 
-        let reversed: Vec<StateProofBundle> = bundles.iter().rev().cloned().collect();
+        let reversed: Vec<CounterpartClaim> = bundles.iter().rev().cloned().collect();
         let err = validate_state_proofs_well_formed(&block_with_state_proofs(
             reversed.clone(),
             state_proofs_root_from_bundles(&reversed),
@@ -1405,16 +1403,35 @@ mod tests {
         .expect_err("a repeated bundle is refused");
         assert!(err.contains("repeats or precedes"), "{err}");
 
-        let empty = vec![StateProofBundle {
+        let CounterpartClaim::Cells(cells) = bundle_at(3, &[1]) else {
+            unreachable!("a cells claim")
+        };
+        let empty = vec![CounterpartClaim::Cells(StateProofBundle {
             keys: Vec::new(),
-            ..bundle_at(3, &[1])
-        }];
+            ..cells
+        })];
         let err = validate_state_proofs_well_formed(&block_with_state_proofs(
             empty.clone(),
             state_proofs_root_from_bundles(&empty),
         ))
         .expect_err("a bundle naming no key is refused");
         assert!(err.contains("empty"), "{err}");
+
+        // A verdict that licenses nothing is as malformed as a bundle
+        // naming no key: both cost a leaf for an answer nothing reads.
+        let accepted = vec![CounterpartClaim::Verdict(VerdictClaim {
+            shard: ShardId::ROOT,
+            tx_hash: TxHash::from(Hash::from_bytes(b"tx")),
+            anchor_ts: WeightedTimestamp::from_millis(1),
+            decision: TransactionDecision::Accept,
+            digest: Hash::from_bytes(b"digest"),
+        })];
+        let err = validate_state_proofs_well_formed(&block_with_state_proofs(
+            accepted.clone(),
+            state_proofs_root_from_bundles(&accepted),
+        ))
+        .expect_err("an acceptance licenses no record");
+        assert!(err.contains("licenses nothing"), "{err}");
     }
 
     fn named(tx_hash: TxHash) -> UnsettledTx {

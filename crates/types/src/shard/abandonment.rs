@@ -46,8 +46,8 @@
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    MAX_UNSETTLED_PER_BLOCK, ShardId, SubstateKey, Transaction, TxHash, WeightedTimestamp,
-    reclaim_probe_anchor,
+    Hash, MAX_UNSETTLED_PER_BLOCK, ShardId, SubstateKey, Transaction, TransactionDecision, TxHash,
+    WeightedTimestamp, reclaim_probe_anchor,
 };
 
 /// What an abort of one transaction burns, and out of whose vault.
@@ -310,6 +310,13 @@ pub struct Refusal {
     pub refused_wt: WeightedTimestamp,
     /// The refused transaction's deadline, as the leg's ledger holds it.
     pub deadline: WeightedTimestamp,
+    /// What the certificate decided — a rejection or an abort, never an
+    /// acceptance, which settles the transaction and licenses nothing.
+    pub decision: TransactionDecision,
+    /// The certificate's attested digest: its signed identity, which is
+    /// what a claim to this verdict names and what a voter matches its
+    /// own copy against.
+    pub digest: Hash,
 }
 
 /// A counterpart's failure to take a transaction a leg here issued for,
