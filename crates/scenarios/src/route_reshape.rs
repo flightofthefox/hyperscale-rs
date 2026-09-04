@@ -1,14 +1,13 @@
 //! A divided shape meeting a reshape: the shard a leg or a core sits on
 //! leaving the trie while the shape is in flight.
 //!
-//! A shard scheduled to leave divides like any other until its final
-//! window: a record cell follows its prefix to the successor, and a
-//! claim or a delivery is a pull on whoever holds the prefix when it is
-//! made. In the window it leaves at the end of, shapes reaching it run
-//! whole, so what it never includes aborts at the deadline rather than
-//! waiting on a successor that may seat after the delivery window
-//! closes. What these scenarios pin is that nothing in flight across the
-//! cut is stranded by it — a transfer the leaving shard included settles
+//! A shard scheduled to leave divides like any other, to its terminal:
+//! classification is the shape's legs against the committing block's
+//! trie and nothing else, so a pending reshape changes what a member
+//! runs not at all. A record cell follows its prefix to the successor,
+//! and a claim or a delivery is a pull on whoever holds the prefix when
+//! it is made. What these scenarios pin is that nothing in flight across
+//! the cut is stranded by it — a transfer the leaving shard included settles
 //! there, one it never included is delivered by its successor or refused
 //! at the payer's deadline, and a call into a component on the leaving
 //! shard keeps clearing from admission through the cut and from the
@@ -604,9 +603,8 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
 /// The payers sit on the survivor and the recipients on the splitter.
 /// A transfer every few blocks from before the vote until the splitter
 /// has coasted, so the train holds every [`Phase`] — transfers the payer
-/// committed divided before the admission fold, ones every shard ran
-/// whole while the split pended, and ones the coasting splitter never
-/// included — and, around the fold, the pair whose payer committed on
+/// committed before the admission fold, ones committed while the split
+/// pended, and ones the coasting splitter never included — and, around the fold, the pair whose payer committed on
 /// one side of it and whose delivery landed on the other. A transfer the
 /// splitter included settles and credits its recipient once; one it
 /// never included credits its recipient exactly when the payer accepted
@@ -647,8 +645,8 @@ pub fn a_train_into_a_splitter_strands_nothing<C: Cluster>(c: &mut C) {
 /// merge-left child, which the grown topology's byte skew pairs with its
 /// sibling from the grow alone. A transfer every few blocks from before
 /// the pairing until the merging child has coasted, so the train holds
-/// every [`Phase`]: transfers divided before the pairing fold, ones run
-/// whole while the merge pended, and ones the coasting child never
+/// every [`Phase`]: transfers committed before the pairing fold, ones
+/// committed while the merge pended, and ones the coasting child never
 /// included, which the merged parent delivers once the cut has landed
 /// the recipient's prefix there. Requires the [`merge_train_setup`]
 /// funding on a config grown to four shards.
