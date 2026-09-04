@@ -1067,6 +1067,13 @@ impl ExecutionCoordinator {
             // The replay window came off the store, so nothing derived
             // these on the way in.
             derive_block_transactions(certified.block(), derivation);
+            // The whole of what a commit does to execution, in the order
+            // a commit does it. A finalization the replay recomposes but
+            // never releases leaves its members assigned to a tick that
+            // has already settled — and a leg's reclaim, which is admitted
+            // only where no tick speaks for the transaction, is then held
+            // out for as long as the entry lives.
+            self.cleanup_committed_finalizations(certified.block().certificates());
             actions.extend(self.on_block_committed(topology_schedule, certified));
         }
         actions
@@ -7671,6 +7678,65 @@ mod tests {
             .get_tick(&TickId::new(ShardId::ROOT, BlockHeight::new(height)))
             .map(|tick| tick.tx_hashes().to_vec())
             .unwrap_or_default()
+    }
+
+    /// A replay releases the ticks the blocks it re-drives finalized,
+    /// exactly as a commit does.
+    ///
+    /// A replay recomposes the tick that held a transaction *and* commits
+    /// the block whose finalization settled it, and the second is what
+    /// hands the transaction back. Skipping it leaves the transaction
+    /// assigned to a tick that has already settled, which nothing later
+    /// clears — and a leg's reclaim, admitted only where no tick speaks
+    /// for the transaction, is then held out for as long as its entry
+    /// lives.
+    #[test]
+    fn a_replay_releases_what_the_blocks_it_replays_finalized() {
+        let schedule = make_test_topology();
+        let held = test_transaction(2);
+        let held_hash = held.hash();
+        let committing = make_live_block(
+            BlockHeight::new(2),
+            2_000,
+            ValidatorId::new(0),
+            vec![Arc::new(held)],
+        );
+        let finalization: Arc<Verifiable<Finalization>> = Arc::new(
+            helpers_make_finalization(BlockHeight::new(2), held_hash, TransactionDecision::Accept)
+                .into(),
+        );
+        let settling = helpers_make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(3),
+            3_000,
+            ValidatorId::new(0),
+            vec![],
+            vec![finalization],
+        );
+
+        let recovered = RecoveredState {
+            committed_height: BlockHeight::new(3),
+            replay: ReplayWindow {
+                blocks: vec![replayable(committing, 2_000), replayable(settling, 3_000)],
+                anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
+            },
+            ..RecoveredState::default()
+        };
+        let mut restarted = ExecutionCoordinator::with_shared_stores(
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            &recovered,
+            Arc::new(ExecCertStore::new()),
+            Arc::new(FinalizationStore::new()),
+        );
+
+        restarted.on_committed_state_restored(&schedule, &StubVmStatics);
+        assert_eq!(
+            restarted.ticks.tick_assignment(held_hash),
+            None,
+            "the replayed finalization hands the transaction back, so nothing \
+             speaks for it",
+        );
     }
 
     /// A restart replays the chain it lost execution state for, so it
