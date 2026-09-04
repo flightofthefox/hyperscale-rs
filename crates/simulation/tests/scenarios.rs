@@ -26,7 +26,8 @@ use hyperscale_scenarios::{
     Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
     a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed,
     a_delivery_cut_off_past_its_window_is_reclaimed, a_departing_venue_clears_swaps_and_carries_on,
-    a_failed_attempt_still_attests_work, a_healed_network_does_not_revive_a_closed_delivery,
+    a_departing_venues_terminal_hands_on_what_it_never_took, a_failed_attempt_still_attests_work,
+    a_healed_network_does_not_revive_a_closed_delivery,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
@@ -1224,6 +1225,22 @@ fn a_leg_issued_on_a_departing_shard_reaches_its_venue_sim() {
         GenesisPackages::with_fixtures(),
     );
     a_leg_issued_on_a_departing_shard_reaches_its_venue(&mut cluster, epochs(12));
+}
+
+#[test]
+fn a_departing_venues_terminal_hands_on_what_it_never_took_sim() {
+    let mut accounts = departing_venue_ballast();
+    accounts.extend(venue_genesis_accounts_on(
+        STRADDLER_SPLITTER,
+        &[STRADDLER_SURVIVOR],
+    ));
+    let mut cluster = SimCluster::with_packages(
+        &departing_venue_config(),
+        11,
+        &accounts,
+        GenesisPackages::with_fixtures(),
+    );
+    a_departing_venues_terminal_hands_on_what_it_never_took(&mut cluster, epochs(24));
 }
 
 #[test]

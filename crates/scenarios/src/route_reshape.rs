@@ -269,28 +269,36 @@ struct DepartingCallers {
     units: World,
 }
 
-/// Stand the venue up on the survivor, the callers on the splitter, and
-/// vote the splitter down so the callers' shard alone is leaving.
+/// Stand a venue up on `venue_shard` with its callers on `caller_shard`,
+/// then vote the splitter down so one of the two is leaving.
+///
+/// Which one is the caller's choice of shards: the vote picks the
+/// splitter by bytes and knows nothing of the roles, so passing
+/// [`STRADDLER_SPLITTER`] as the venue's shard leaves the core and
+/// passing it as the callers' leaves the issuer.
 ///
 /// # Panics
 ///
 /// Panics if either shard is unserved, if the venue misses its budget
 /// standing up or is holding nothing, or if the split is not admitted on
-/// the callers' shard or is admitted on the venue's.
-fn departing_callers<C: Cluster>(c: &mut C) -> DepartingCallers {
-    let (venue_shard, caller_shard) = (STRADDLER_SURVIVOR, STRADDLER_SPLITTER);
+/// the splitter or is admitted on the survivor.
+fn departing_callers<C: Cluster>(
+    c: &mut C,
+    venue_shard: ShardId,
+    caller_shard: ShardId,
+) -> DepartingCallers {
     split_lifecycle(c);
     let set = stock_callers_against(c, venue_shard, caller_shard);
-    // The callers' shard is leaving from here to the cut; the venue's
-    // stays under the threshold with the flash on it.
+    // The splitter is leaving from here to the cut; the survivor stays
+    // under the threshold with the flash on it.
     vote_splitter_down_to(c, split_bytes_over(fixture_flash_bytes()));
     assert!(
-        await_split_admitted(c, caller_shard, epochs(20)),
-        "the callers' shard must admit the split",
+        await_split_admitted(c, STRADDLER_SPLITTER, epochs(20)),
+        "the splitter must admit the split",
     );
     assert!(
-        !split_admitted(c, venue_shard),
-        "the venue's shard must not split",
+        !split_admitted(c, STRADDLER_SURVIVOR),
+        "the survivor must not split",
     );
     set
 }
@@ -491,7 +499,7 @@ fn swaps_across_the_callers_cut<C: Cluster>(
 /// Panics as [`departing_callers`] and [`swaps_across_the_callers_cut`]
 /// do.
 pub fn a_leg_issued_on_a_departing_shard_reaches_its_venue(c: &mut impl Cluster, budget: Budget) {
-    let set = departing_callers(c);
+    let set = departing_callers(c, STRADDLER_SURVIVOR, STRADDLER_SPLITTER);
     swaps_across_the_callers_cut(c, set, |c| await_cut(c, STRADDLER_SPLITTER), budget);
 }
 
@@ -524,6 +532,119 @@ pub fn a_leg_issued_on_a_merging_shard_reaches_its_venue(c: &mut impl Cluster, b
             );
         },
         budget,
+    );
+}
+
+/// A departing venue's terminal cuts a stream of swaps in two, and both
+/// halves settle: what it took it settles, and the rest its successor
+/// runs.
+///
+/// The core-side cell the leg-local design leaves open. A single-shard
+/// core waits on no counterpart certificate — the leg settles alone and
+/// the core claims the crossing it delivered — so the only way a
+/// departing core leaves a swap unsettled is by never including it. That
+/// makes the shard's terminal the whole question: a swap on one side of
+/// it is settled by the venue, and a swap on the other is settled by the
+/// child that takes the venue's prefix, which runs the core the venue
+/// never ran. Nothing falls between the two.
+///
+/// # Panics
+///
+/// Panics as [`departing_callers`] does, and if the venue's gate never
+/// drains, if the terminal does not fall inside the stream, if any swap
+/// fails to accept, if an un-included swap is settled by anything but the
+/// child holding the venue's prefix, if a caller does not bank its
+/// output, if the reserve does not hold every input, or if either side of
+/// the pair is not conserved.
+pub fn a_departing_venues_terminal_hands_on_what_it_never_took<C: Cluster>(
+    c: &mut C,
+    budget: Budget,
+) {
+    let (venue_shard, caller_shard) = (STRADDLER_SPLITTER, STRADDLER_SURVIVOR);
+    let set = departing_callers(c, venue_shard, caller_shard);
+    let mut charges = Charges::default();
+
+    // From the drain the venue includes for a while, then coasts on empty
+    // blocks to its terminal — so a stream spaced across the coast lands
+    // on both sides of it.
+    assert!(
+        c.run_until(budget, |c| !split_admitted(c, venue_shard)),
+        "the venue's reshape gate must drain before the stream goes",
+    );
+    let mut stream: Vec<(TxHash, PrincipalAddr)> = Vec::new();
+    for (key, caller) in &set.swappers {
+        let swap = build_swap_tx(
+            key,
+            *caller,
+            &set.venue.meta,
+            *XRD,
+            SWAP_INPUT,
+            0,
+            validity_around(c.now()),
+        );
+        stream.push((charges.submit(c, swap), *caller));
+        c.run_until(epochs(1), |_| false);
+    }
+    await_cut(c, venue_shard);
+
+    let (left, right) = venue_shard.children();
+    let mut took = 0;
+    let mut handed_on = 0;
+    for (hash, caller) in &stream {
+        let status = await_tx_terminal(c, *hash, budget);
+        assert!(
+            matches!(
+                status,
+                Some(TransactionStatus::Completed(TransactionDecision::Accept))
+            ),
+            "every swap across the venue's terminal must settle; status = {status:?}",
+        );
+        let settled_by = |c: &C, shard| {
+            c.chain_fate(shard, *hash)
+                .1
+                .is_some_and(|(_, decision)| decision == TransactionDecision::Accept)
+        };
+        if c.chain_fate(venue_shard, *hash).0.is_some() {
+            assert!(
+                settled_by(c, venue_shard),
+                "a swap the venue included before its terminal must be settled there",
+            );
+            took += 1;
+        } else {
+            // Exactly one child holds the venue's prefix, and it is the
+            // one that runs the core the venue never ran.
+            assert!(
+                settled_by(c, left) != settled_by(c, right),
+                "an un-included swap must be settled by the one child holding the venue's \
+                 prefix, not by both and not by neither",
+            );
+            handed_on += 1;
+        }
+        assert!(
+            c.run_until(budget, |c| held(c, caller.address(), set.venue.unit) > 0),
+            "every caller must bank the output of a swap that settled",
+        );
+    }
+    assert!(
+        took > 0 && handed_on > 0,
+        "the venue's terminal has to fall inside the stream, or nothing here crosses it: \
+         {took} taken against {handed_on} handed on",
+    );
+
+    let claimed = set.stocked + SWAP_INPUT * u128::try_from(stream.len()).expect("a few swaps");
+    assert!(
+        c.run_until(budget, |c| held_at(c, set.reserve) == claimed),
+        "the venue and its successor between them must claim every input: reserve {} against \
+         {claimed}",
+        held_at(c, set.reserve),
+    );
+    set.xrd
+        .assert_settles_within(c, &charges, budget, "swaps across the venue's terminal");
+    set.units.assert_settles_within(
+        c,
+        &Charges::default(),
+        budget,
+        "swaps across the venue's terminal",
     );
 }
 
