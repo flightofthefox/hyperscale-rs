@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_metrics::record_verdict_claim_deferred;
 use hyperscale_types::{
-    AbandonmentRecord, BlockHash, ClaimProof, CounterpartClaim, CounterpartEvidence,
+    AbandonmentRecord, BlockHash, ClaimProof, CounterpartClaim, CounterpartEvidence, Epoch,
     FinalizationHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
     MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr, ProposerTimestamp, ProvenAnchor,
     ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger, Resolutions,
@@ -2763,10 +2763,17 @@ impl ShardCoordinator {
         topology_snapshot: &TopologySnapshot,
         substate_bytes: Option<u64>,
         window: &[Hash],
+        committee_anchor_epoch: Epoch,
     ) -> Option<ReshapeTrigger> {
         let count = substate_bytes?;
         let thresholds = topology_snapshot.reshape_thresholds();
-        derive_reshape_trigger(self.local_shard, count, &thresholds, window)
+        derive_reshape_trigger(
+            self.local_shard,
+            count,
+            &thresholds,
+            window,
+            committee_anchor_epoch,
+        )
     }
 
     /// Drain dwell-eligible ready signals and preview the beacon-witness
@@ -2791,6 +2798,7 @@ impl ShardCoordinator {
         proposal_wt: WeightedTimestamp,
         parent_block_hash: BlockHash,
         substate_bytes: Option<u64>,
+        committee_anchor_epoch: Epoch,
     ) -> WitnessCommitmentPreview {
         let mut ready_signals = self.ready_signal_pool.drain_eligible(
             proposal_wt,
@@ -2848,8 +2856,12 @@ impl ShardCoordinator {
             !parent_leaves.contains(&leaf.leaf_hash())
         });
 
-        let reshape_trigger =
-            self.derive_proposal_reshape_trigger(topology_snapshot, substate_bytes, &parent_leaves);
+        let reshape_trigger = self.derive_proposal_reshape_trigger(
+            topology_snapshot,
+            substate_bytes,
+            &parent_leaves,
+            committee_anchor_epoch,
+        );
         // The block's new leaves are derived and merkle-committed in the
         // `BuildProposal` handler, where the reveal is signed off the main
         // loop. The preview resolves only the inputs to that: the trimmed
@@ -2983,6 +2995,7 @@ impl ShardCoordinator {
             parent_qc.weighted_timestamp(),
             parent_block_hash,
             substate_bytes,
+            committee_anchor_epoch,
         );
 
         // Prior demand per candidate payer: in-flight holds plus the

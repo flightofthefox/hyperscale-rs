@@ -12,7 +12,7 @@
 
 use hyperscale_hbor::Hbor;
 
-use crate::{ShardId, ShardWitnessPayload};
+use crate::{Epoch, ShardId, ShardWitnessPayload};
 
 /// Substate-byte thresholds driving automatic shard reshaping.
 ///
@@ -56,20 +56,40 @@ impl Default for ReshapeThresholds {
 
 /// A block's reshape assertion, carried on the manifest.
 ///
-/// Only the kind rides the wire — the subject is always the asserting
-/// shard itself, so the full payload reconstructs from the shard id and
-/// cannot be pointed at another shard.
+/// The subject never rides the wire — it is always the asserting shard
+/// itself, so the payload cannot be pointed at another shard. The epoch
+/// does, because a reader reconstructing a past block's leaves has only
+/// the block, and recovering which epoch it asserted in from its
+/// ancestry would be a second derivation of a fact the block can simply
+/// state. A proposer stating it wrongly is refused the same way a
+/// proposer stating the wrong kind is: verifiers recompute the whole
+/// assertion and reject anything but equality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
 pub enum ReshapeTrigger {
     /// The shard's committed substate byte total reached the split threshold.
-    Split,
+    Split {
+        /// The epoch the assertion was made in — see
+        /// [`ShardWitnessPayload::ScheduleSplit`](crate::ShardWitnessPayload::ScheduleSplit).
+        epoch: Epoch,
+    },
     /// The shard's committed substate byte total fell below the merge
     /// threshold; the assertion targets the shard's parent (merging the
     /// shard with its sibling).
-    Merge,
+    Merge {
+        /// The epoch the assertion was made in.
+        epoch: Epoch,
+    },
 }
 
 impl ReshapeTrigger {
+    /// The epoch the assertion was made in.
+    #[must_use]
+    pub const fn epoch(self) -> Epoch {
+        match self {
+            Self::Split { epoch } | Self::Merge { epoch } => epoch,
+        }
+    }
+
     /// Project the assertion into its witness payload for `shard`.
     ///
     /// Returns `None` for a merge asserted by the root shard — it has
@@ -78,10 +98,10 @@ impl ReshapeTrigger {
     #[must_use]
     pub fn to_payload(self, shard: ShardId) -> Option<ShardWitnessPayload> {
         match self {
-            Self::Split => Some(ShardWitnessPayload::ScheduleSplit { shard }),
-            Self::Merge => shard
+            Self::Split { epoch } => Some(ShardWitnessPayload::ScheduleSplit { shard, epoch }),
+            Self::Merge { epoch } => shard
                 .parent()
-                .map(|parent| ShardWitnessPayload::ScheduleMerge { parent }),
+                .map(|parent| ShardWitnessPayload::ScheduleMerge { parent, epoch }),
         }
     }
 }
@@ -108,27 +128,56 @@ mod tests {
     #[test]
     fn split_payload_targets_the_asserting_shard() {
         let shard = ShardId::leaf(2, 0b10);
+        let epoch = Epoch::new(4);
         assert_eq!(
-            ReshapeTrigger::Split.to_payload(shard),
-            Some(ShardWitnessPayload::ScheduleSplit { shard }),
+            ReshapeTrigger::Split { epoch }.to_payload(shard),
+            Some(ShardWitnessPayload::ScheduleSplit { shard, epoch }),
         );
     }
 
     #[test]
     fn merge_payload_targets_the_parent_and_root_has_none() {
         let shard = ShardId::leaf(2, 0b10);
+        let epoch = Epoch::new(4);
         assert_eq!(
-            ReshapeTrigger::Merge.to_payload(shard),
+            ReshapeTrigger::Merge { epoch }.to_payload(shard),
             Some(ShardWitnessPayload::ScheduleMerge {
                 parent: shard.parent().unwrap(),
+                epoch,
             }),
         );
-        assert_eq!(ReshapeTrigger::Merge.to_payload(ShardId::ROOT), None);
+        assert_eq!(
+            ReshapeTrigger::Merge { epoch }.to_payload(ShardId::ROOT),
+            None
+        );
+    }
+
+    #[test]
+    fn one_assertion_per_epoch_is_a_distinct_leaf() {
+        let shard = ShardId::leaf(2, 0b10);
+        let at = |epoch: u64| {
+            ReshapeTrigger::Split {
+                epoch: Epoch::new(epoch),
+            }
+            .to_payload(shard)
+            .expect("a split always projects")
+            .leaf_hash()
+        };
+        assert_eq!(at(4), at(4), "one epoch's assertion is one leaf");
+        assert_ne!(
+            at(4),
+            at(5),
+            "an assertion the beacon did not act on must not silence the next epoch's",
+        );
     }
 
     #[test]
     fn reshape_trigger_hbor_round_trip() {
-        for t in [ReshapeTrigger::Split, ReshapeTrigger::Merge] {
+        let epoch = Epoch::new(4);
+        for t in [
+            ReshapeTrigger::Split { epoch },
+            ReshapeTrigger::Merge { epoch },
+        ] {
             let bytes = hbor_to_vec(&t).unwrap();
             assert_eq!(hbor_from_slice::<ReshapeTrigger>(&bytes).unwrap(), t);
         }

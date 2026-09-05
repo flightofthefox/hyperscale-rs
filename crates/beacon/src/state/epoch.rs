@@ -4330,7 +4330,10 @@ mod tests {
             &mut state,
             &net(),
             p,
-            &ShardWitnessPayload::ScheduleSplit { shard: p },
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
         );
         assert_lookahead_becomes_the_active_entry(&mut state, "a split admission");
 

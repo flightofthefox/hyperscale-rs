@@ -475,7 +475,10 @@ pub(super) fn apply_shard_payload(
             );
             Some(HostEvent::Jailed(*proposer_id))
         }
-        ShardWitnessPayload::ScheduleSplit { shard } => {
+        // The asserted epoch separates one assertion from the next on
+        // the shard's own window; what dates a pending record here is
+        // the beacon's own clock, so the fold reads the subject only.
+        ShardWitnessPayload::ScheduleSplit { shard, epoch: _ } => {
             // Source pinning: only the shard itself asserts its split.
             if source_shard != *shard {
                 return None;
@@ -561,7 +564,7 @@ pub(super) fn apply_shard_payload(
             );
             None
         }
-        ShardWitnessPayload::ScheduleMerge { parent } => {
+        ShardWitnessPayload::ScheduleMerge { parent, epoch: _ } => {
             // Source pinning: only a child asserts the merge under its
             // parent.
             if source_shard.parent() != Some(*parent) {
@@ -2550,7 +2553,10 @@ mod tests {
     }
 
     fn split_payload(shard: ShardId) -> ShardWitnessPayload {
-        ShardWitnessPayload::ScheduleSplit { shard }
+        ShardWitnessPayload::ScheduleSplit {
+            shard,
+            epoch: Epoch::GENESIS,
+        }
     }
 
     /// Admission records the pending split when the target is an active
@@ -2767,6 +2773,7 @@ mod tests {
             stranger,
             &ShardWitnessPayload::ScheduleMerge {
                 parent: ShardId::ROOT,
+                epoch: Epoch::GENESIS,
             },
         );
         assert!(state.pending_reshapes.is_empty());
@@ -2933,6 +2940,7 @@ mod tests {
         let mut state = reshape_state(&[left, right], 0);
         let payload = ShardWitnessPayload::ScheduleMerge {
             parent: ShardId::ROOT,
+            epoch: Epoch::GENESIS,
         };
 
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &payload);
@@ -2974,6 +2982,7 @@ mod tests {
         let (left, right) = ShardId::ROOT.children();
         let merge = ShardWitnessPayload::ScheduleMerge {
             parent: ShardId::ROOT,
+            epoch: Epoch::GENESIS,
         };
 
         // Only one child active: merge dropped.

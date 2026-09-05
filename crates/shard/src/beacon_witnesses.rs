@@ -613,7 +613,13 @@ mod tests {
 
         // Validator 2 holds an observer seat: its signal classifies as
         // `ReshapeReady` in the same ascending-id position.
-        let sources = WitnessSources::new(ready, Some(ReshapeTrigger::Split), VrfProof::ZERO);
+        let sources = WitnessSources::new(
+            ready,
+            Some(ReshapeTrigger::Split {
+                epoch: Epoch::GENESIS,
+            }),
+            VrfProof::ZERO,
+        );
         let leaves = derive_leaves(
             ShardId::ROOT,
             &topology_with_observer(2),
