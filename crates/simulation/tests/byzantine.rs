@@ -12,8 +12,8 @@
 
 mod support;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use hyperscale_scenarios::query::{declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
@@ -213,6 +213,107 @@ fn a_host_answering_provision_fetches_with_rubbish_is_rotated_past() {
         assert!(
             forged.iter().any(|handle| handle.fired() > 0) && lies.load(Ordering::Relaxed) > 0,
             "the rubbish has to have been served, or nothing was attacked",
+        );
+    });
+}
+
+/// The first honest exchange, kept so it can be served again: the bytes
+/// asked for, and the bytes answered.
+type Kept = Arc<Mutex<Option<(Vec<u8>, Vec<u8>)>>>;
+
+/// A bundle answered with a bundle for another transaction is refused,
+/// and the delivery it was carrying still lands.
+///
+/// The forgery worth checking at a fetch is a well-formed answer to a
+/// different question, and a delivery bundle is the one payload where
+/// that is free to build: the attacker needs no keys and no forging at
+/// all, only an earlier honest answer kept and served again. What refuses
+/// it is that a bundle is admitted against the source header it names and
+/// the transaction the requester asked about, so an answer that proves
+/// somebody else's crossing proves nothing here.
+///
+/// Two payments, and the second one's fetch is answered with the first
+/// one's bundle. Both must arrive: the recipient is credited twice, once
+/// for each, and never once or three times.
+#[test]
+fn a_bundle_replayed_from_another_transaction_is_refused() {
+    let mut cluster =
+        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
+    let (payer_key, from, to) = cross_shard_cast();
+    let payer_shard = ShardId::leaf(1, 0);
+    let recipient_shard = ShardId::leaf(1, 1);
+
+    cluster.run_faultable(|c| {
+        let recipient_before = vault_balance(c, recipient_shard, to);
+        let broadcast_dropped = c.drop_type("provisions.broadcast");
+
+        // The first honest answer is kept with the question it answered,
+        // and served once to whoever asks a different one. Lying on the
+        // first mismatched ask rather than always is what makes this a
+        // rotation: the fetch picks its peer from a committee of two, and
+        // a liar that never stops leaves the second payment unclaimable
+        // for reasons that are not the check's.
+        let kept: Kept = Arc::new(Mutex::new(None));
+        let lies = Arc::new(AtomicUsize::new(0));
+        let replayed: Vec<FaultHandle> = c
+            .committee_hosts(payer_shard)
+            .into_iter()
+            .map(|host| {
+                let kept = Arc::clone(&kept);
+                let lies = Arc::clone(&lies);
+                c.rewrite_responses(
+                    host,
+                    "provision.request",
+                    Arc::new(move |asked: &[u8], honest: &[u8]| {
+                        let mut held = kept.lock().unwrap_or_else(PoisonError::into_inner);
+                        let reply = match held.as_ref() {
+                            Some((earlier, reply))
+                                if earlier != asked
+                                    && lies.fetch_add(1, Ordering::Relaxed) == 0 =>
+                            {
+                                reply.clone()
+                            }
+                            Some(_) => honest.to_vec(),
+                            None => {
+                                *held = Some((asked.to_vec(), honest.to_vec()));
+                                honest.to_vec()
+                            }
+                        };
+                        drop(held);
+                        reply
+                    }),
+                )
+            })
+            .collect();
+
+        let mut hashes = Vec::new();
+        for amount in [100u128, 101] {
+            let tx = build_transfer_tx(&payer_key, from, to, amount, validity_around(c.now()));
+            hashes.push(tx.hash());
+            c.submit(Arc::new(tx));
+            assert!(
+                matches!(
+                    await_tx_terminal(c, *hashes.last().expect("just pushed"), epochs(8)),
+                    Some(TransactionStatus::Completed(TransactionDecision::Accept))
+                ),
+                "the payer's leg settles alone and accepts",
+            );
+        }
+
+        assert!(
+            c.run_until(epochs(12), |c| vault_balance(c, recipient_shard, to)
+                == recipient_before + 201),
+            "both deliveries must claim, each from a bundle that proves its own \
+             crossing; holds {}",
+            vault_balance(c, recipient_shard, to),
+        );
+        assert!(
+            broadcast_dropped.fired() > 0,
+            "the push has to be cut, or nothing fetched",
+        );
+        assert!(
+            replayed.iter().any(|handle| handle.fired() > 0) && lies.load(Ordering::Relaxed) > 0,
+            "the stale bundle has to have been served, or nothing was attacked",
         );
     });
 }
