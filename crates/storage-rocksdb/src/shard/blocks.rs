@@ -19,15 +19,15 @@ use std::time::Instant;
 
 use hyperscale_metrics::{record_storage_operation, record_storage_read};
 use hyperscale_types::{
-    BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, BlockMetadata, CertifiedBlock,
-    Finalization, FinalizationHash, Hash, ProvisionHash, QuorumCertificate, Transaction, TxHash,
-    Verifiable, Verified,
+    BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata,
+    CertifiedBlock, Finalization, FinalizationHash, Hash, ProvisionHash, QuorumCertificate,
+    Transaction, TxHash, Verifiable, Verified,
 };
 use rocksdb::{ColumnFamily, WriteBatch};
 
 use super::column_families::{
     BeaconWitnessesCf, BlocksCf, CertificatesCf, ConsensusReceiptsCf, ProvisionKeyCodec,
-    ProvisionsCf, TransactionsCf,
+    ProvisionsCf, TransactionsCf, VotedBlockKeyCodec, VotedBlocksCf,
 };
 use super::core::RocksDbShardStorage;
 use super::metadata::{read_committed_hash, read_committed_height, read_committed_qc};
@@ -140,6 +140,14 @@ impl RocksDbShardStorage {
             beacon_witness_leaf_count_at_block_end,
         );
         batch_put::<BlocksCf>(batch, blocks_cf, &block.height().inner(), &metadata);
+        // The chain now holds this height, so the vote justifications at
+        // or below it — this block and any fork sibling — have nothing
+        // left to justify. One range delete, in the commit's own batch.
+        batch.delete_range_cf(
+            VotedBlocksCf::handle(&cf),
+            VotedBlockKeyCodec.encode(&(BlockHeight::GENESIS, BlockHash::ZERO)),
+            VotedBlockKeyCodec.encode(&(block.height().next(), BlockHash::ZERO)),
+        );
         for tx in block.transactions().iter() {
             batch_put_raw::<TransactionsCf>(
                 batch,

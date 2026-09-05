@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, CommittedTip, Hash,
-    LegEntry, PredecessorTerminal, Provisions, QuorumCertificate, SafeVoteRegisters, ShardAnchor,
-    StateRoot, Transaction, ValidatorId, Verified, WeightedTimestamp,
+    BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, CommittedTip,
+    Hash, LegEntry, PredecessorTerminal, Provisions, QuorumCertificate, SafeVoteRegisters,
+    ShardAnchor, StateRoot, Transaction, ValidatorId, Verified, WeightedTimestamp,
 };
 
 use super::dedup_window::DedupWindow;
@@ -174,6 +174,18 @@ pub struct RecoveredState {
     /// whose body is gone is not handed over — nothing could compose a
     /// member for it.
     pub leg_entries: Vec<(LegEntry, Transaction)>,
+
+    /// The uncommitted blocks the store kept beside the safe-vote
+    /// registers, above the committed tip and in height order.
+    ///
+    /// The certificate a restored record carries names one of these, and
+    /// a proposer extends the block its high QC certifies — so without
+    /// them a committee that restarted together holds a lock no proposal
+    /// it can build satisfies. Seeded into the coordinator's pending
+    /// blocks, where verification re-derives the state each one left.
+    /// Empty on a fresh start and after snap-sync, where the store
+    /// carries no signing history.
+    pub voted_blocks: Vec<Arc<Block>>,
 }
 
 impl RecoveredState {
@@ -242,6 +254,7 @@ impl RecoveredState {
             },
             safe_vote_registers: BTreeMap::new(),
             leg_entries: Vec::new(),
+            voted_blocks: Vec::new(),
         }
     }
 

@@ -28,8 +28,8 @@ use hyperscale_types::{
     ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
     StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint,
     TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources, WorkInFlight,
-    compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
+    ValidatorId, Verifiable, Verified, VotePosition, WeightedTimestamp, WitnessSources,
+    WorkInFlight, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
 };
 
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
@@ -1624,13 +1624,20 @@ pub fn test_registers_recover_their_justification(
     recovered: impl Fn() -> RecoveredState,
 ) {
     let validator = ValidatorId::new(1);
-    let justification = make_test_qc(&make_test_block(BlockHeight::new(4)));
+    let certified = make_test_block(BlockHeight::new(4));
+    let justification = make_test_qc(&certified);
     let locked = SafeVoteRegisters {
         locked_round: Round::new(6),
         last_voted_round: Round::new(7),
         high_qc: Some((*justification).clone()),
     };
-    storage.persist_safe_vote_registers(validator, locked);
+    storage.persist_vote_position(
+        validator,
+        &VotePosition {
+            registers: locked,
+            justification: vec![Arc::new(certified.clone())],
+        },
+    );
 
     assert_eq!(
         storage
@@ -1639,15 +1646,31 @@ pub fn test_registers_recover_their_justification(
         Some((*justification).clone()),
         "the lock's justification is part of the record",
     );
+    assert_eq!(
+        storage
+            .voted_blocks_above(BlockHeight::new(3))
+            .iter()
+            .map(|b| b.hash())
+            .collect::<Vec<_>>(),
+        vec![certified.hash()],
+        "the certificate's block is stored beside the record that names it",
+    );
+    assert!(
+        storage.voted_blocks_above(BlockHeight::new(4)).is_empty(),
+        "a block the chain has committed is the chain's to keep",
+    );
 
     // A later write that raises nothing keeps the justification: the
     // certificate travels with the higher lock, not with the newer write.
-    storage.persist_safe_vote_registers(
+    storage.persist_vote_position(
         validator,
-        SafeVoteRegisters {
-            locked_round: Round::new(2),
-            last_voted_round: Round::new(9),
-            high_qc: None,
+        &VotePosition {
+            registers: SafeVoteRegisters {
+                locked_round: Round::new(2),
+                last_voted_round: Round::new(9),
+                high_qc: None,
+            },
+            justification: Vec::new(),
         },
     );
     let merged = recovered()
@@ -1661,6 +1684,15 @@ pub fn test_registers_recover_their_justification(
         merged.high_qc,
         Some((*justification).clone()),
         "a write that lowers the lock cannot strip the justification off it",
+    );
+    assert_eq!(
+        recovered()
+            .voted_blocks
+            .iter()
+            .map(|b| b.hash())
+            .collect::<Vec<_>>(),
+        vec![certified.hash()],
+        "recovery hands back what the record's certificate names",
     );
 }
 

@@ -236,22 +236,20 @@ fn a_restarted_committee_resumes_beside_a_live_sibling() {
 
 /// Every replica restarting at once, on a shard with no counterpart.
 ///
-/// The committee comes back holding its committed tip, and the certified
-/// block above it is gone from every replica at once. Each recovers a lock
-/// it cannot satisfy: the QC that justifies it certifies a block none of
-/// them holds, so every proposal they can build extends a lower QC and the
-/// safe-vote rule refuses it. They propose and vote and no quorum forms.
+/// The committee comes back holding its committed tip; the certified
+/// block above it goes down with every replica at once, and the lock each
+/// one recovers is on the QC certifying that block.
 ///
 /// The single shard is the whole of the condition — with a live sibling
-/// the shard resumes ([`a_restarted_committee_resumes_beside_a_live_sibling`]),
-/// so what is missing here is any counterpart holding what the committee
-/// dropped. Closing it means making certified-but-uncommitted blocks
-/// durable, since the lock cannot be lowered: nothing in a shard's own
-/// state distinguishes "nothing was committed above me" from "an absent
-/// replica committed and I would be forking away from it".
+/// the shard resumes on what the sibling's committee still holds
+/// ([`a_restarted_committee_resumes_beside_a_live_sibling`]), so what is
+/// absent here is any counterpart holding what the committee dropped. The
+/// lock cannot be lowered instead: nothing in a shard's own state
+/// distinguishes "nothing was committed above me" from "an absent replica
+/// committed and I would be forking away from it". So the block travels
+/// with the record that locks on it, and the committee comes back able to
+/// extend its own certificate.
 #[test]
-#[ignore = "known gap: a lone shard whose every replica restarts together \
-            recovers a lock no proposal it can build satisfies"]
 fn a_committee_advances_after_all_of_it_restarts() {
     restart_and_advance(4);
 }

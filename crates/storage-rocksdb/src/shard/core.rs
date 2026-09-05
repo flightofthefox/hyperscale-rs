@@ -91,7 +91,7 @@ pub struct RocksDbShardStorage {
 
     /// Write-path cache of the last-persisted safe-vote register record
     /// per validator. One guard spans the read-merge-write in
-    /// `persist_safe_vote_registers`, keeping concurrent writes monotone
+    /// `persist_vote_position`, keeping concurrent writes monotone
     /// and letting a write that raises nothing (e.g. a timeout
     /// retransmit) skip the fsync entirely.
     pub(crate) vote_registers: Mutex<HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>>,

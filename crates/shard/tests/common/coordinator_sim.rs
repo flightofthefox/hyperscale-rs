@@ -1318,12 +1318,12 @@ impl ShardCoordinatorSim {
                 round,
                 timestamp,
                 next_proposers,
-                registers,
+                position,
             } => {
                 self.votes_cast[emitter_idx].push((block_hash, round));
                 // Mirror the production sign handler: the registers
                 // are durable before the signature exists.
-                self.storages[emitter_idx].persist_safe_vote_registers(me, registers);
+                self.storages[emitter_idx].persist_vote_position(me, &position);
                 let verified = Verified::<BlockVote>::sign_local(
                     &self.network,
                     block_hash,
@@ -1364,11 +1364,11 @@ impl ShardCoordinatorSim {
                 round,
                 high_qc,
                 recipients,
-                registers,
+                position,
             } => {
                 // Mirror the production sign handler: the registers
                 // are durable before the signature exists.
-                self.storages[emitter_idx].persist_safe_vote_registers(me, registers);
+                self.storages[emitter_idx].persist_vote_position(me, &position);
                 let verified = Verified::<Timeout>::sign_local(
                     &self.network,
                     self.shard,

@@ -254,6 +254,15 @@ pub struct ConsensusState {
     /// The leg entries this shard holds beside its chain, keyed by
     /// transaction. See [`LegEntryStore`](hyperscale_storage::LegEntryStore).
     pub leg_entries: BTreeMap<TxHash, LegEntry>,
+    /// Blocks written beside a validator's safe-vote registers, keyed by
+    /// height then hash and tagged with the chain origin that wrote them.
+    /// Mirrors the production `voted_blocks` CF: the uncommitted chain
+    /// behind the certificate the record carries, so a restarted
+    /// validator can extend it. Dropped at or below the committed height
+    /// on every commit — the hash in the key keeps a fork sibling from
+    /// displacing its rival before then — and, like the registers,
+    /// ignored by reads once the tag no longer matches.
+    pub voted_blocks: BTreeMap<(BlockHeight, BlockHash), (ChainOrigin, Arc<Block>)>,
 }
 
 /// Maximum number of blocks worth of receipts to retain in simulation storage.
@@ -279,6 +288,7 @@ impl ConsensusState {
             chain_origin: ChainOrigin::ROOT,
             safe_vote_registers: HashMap::new(),
             leg_entries: BTreeMap::new(),
+            voted_blocks: BTreeMap::new(),
         }
     }
 
@@ -298,6 +308,13 @@ impl ConsensusState {
                 Arc::new(bundle.as_unverified().clone()),
             );
         }
+    }
+
+    /// Drop the vote-justification blocks the chain has now committed.
+    /// Everything at or below `committed` is durable as chain content,
+    /// and a fork sibling at that height can no longer be extended.
+    pub(crate) fn drop_voted_blocks_through(&mut self, committed: BlockHeight) {
+        self.voted_blocks.retain(|(at, _), _| *at > committed);
     }
 
     /// Insert a slice of stored receipts into the consensus + metadata maps.

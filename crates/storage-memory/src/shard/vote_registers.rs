@@ -6,23 +6,40 @@
 //! it over the same `SimShardStorage` models a crash that loses process
 //! memory but keeps disk.
 
+use std::sync::Arc;
+
 use hyperscale_storage::SafeVoteRegisterStore;
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
-use hyperscale_types::{SafeVoteRegisters, ValidatorId};
+use hyperscale_types::{
+    Block, BlockHash, BlockHeight, SafeVoteRegisters, ValidatorId, VotePosition,
+};
 
 use super::core::SimShardStorage;
 
 impl SafeVoteRegisterStore for SimShardStorage {
-    fn persist_safe_vote_registers(&self, validator: ValidatorId, registers: SafeVoteRegisters) {
+    fn persist_vote_position(&self, validator: ValidatorId, position: &VotePosition) {
         let mut c = write_or_recover(&self.consensus);
         let origin = c.chain_origin;
         let merged = match c.safe_vote_registers.get(&validator) {
             Some((stored_origin, stored_registers)) if *stored_origin == origin => {
-                registers.max(stored_registers.clone())
+                position.registers.clone().max(stored_registers.clone())
             }
-            _ => registers,
+            _ => position.registers.clone(),
         };
         c.safe_vote_registers.insert(validator, (origin, merged));
+        for block in &position.justification {
+            c.voted_blocks
+                .insert((block.height(), block.hash()), (origin, Arc::clone(block)));
+        }
+    }
+
+    fn voted_blocks_above(&self, committed_height: BlockHeight) -> Vec<Arc<Block>> {
+        let c = read_or_recover(&self.consensus);
+        c.voted_blocks
+            .range((committed_height.next(), BlockHash::ZERO)..)
+            .filter(|(_, (origin, _))| *origin == c.chain_origin)
+            .map(|(_, (_, block))| Arc::clone(block))
+            .collect()
     }
 
     fn safe_vote_registers(&self, validator: ValidatorId) -> Option<SafeVoteRegisters> {

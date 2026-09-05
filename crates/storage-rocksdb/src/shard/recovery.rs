@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use hyperscale_metrics::record_storage_operation;
 use hyperscale_storage::{
-    DedupWindow, LegEntryStore, RecoveredState, SubstateStore, replay_window,
+    DedupWindow, LegEntryStore, RecoveredState, SafeVoteRegisterStore, SubstateStore, replay_window,
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, CommittedTip, Hash,
@@ -108,6 +108,7 @@ impl RocksDbShardStorage {
             chain_origin,
             safe_vote_registers: self.load_safe_vote_registers(chain_origin),
             leg_entries: self.recovered_leg_entries(),
+            voted_blocks: self.voted_blocks_above(committed_height),
         }
     }
 

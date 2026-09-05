@@ -30,8 +30,8 @@ use hyperscale_types::{
     Finalization, FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey,
     ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, SafeVoteRegisters,
     SettledWrites, ShardId, SignerBitfield, StateRoot, StateWrites, StoredReceipt, SubstateKey,
-    SyncHint, TickHalf, TickId, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    WitnessSources,
+    SyncHint, TickHalf, TickId, TxHash, ValidatorId, Verifiable, Verified, VotePosition,
+    WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -1542,6 +1542,16 @@ fn registers(locked: u64, last_voted: u64) -> SafeVoteRegisters {
     }
 }
 
+/// A signing position carrying `r` and one justification block — a
+/// vote's shape, so a test over the record covers the blocks written
+/// beside it too.
+fn position(r: SafeVoteRegisters) -> VotePosition {
+    VotePosition {
+        registers: r,
+        justification: vec![Arc::new(make_test_block(BlockHeight::new(4)))],
+    }
+}
+
 #[test]
 fn safe_vote_registers_recover_their_justification() {
     let temp_dir = TempDir::new().unwrap();
@@ -1567,8 +1577,8 @@ fn safe_vote_registers_survive_reopen() {
     let v2 = ValidatorId::new(2);
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-        storage.persist_safe_vote_registers(v1, registers(3, 5));
-        storage.persist_safe_vote_registers(v2, registers(2, 2));
+        storage.persist_vote_position(v1, &position(registers(3, 5)));
+        storage.persist_vote_position(v2, &position(registers(2, 2)));
         assert_eq!(storage.safe_vote_registers(v1), Some(registers(3, 5)));
     }
 
@@ -1594,13 +1604,13 @@ fn safe_vote_registers_writes_are_monotone() {
     let v = ValidatorId::new(7);
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-        storage.persist_safe_vote_registers(v, registers(4, 6));
-        storage.persist_safe_vote_registers(v, registers(2, 9));
+        storage.persist_vote_position(v, &position(registers(4, 6)));
+        storage.persist_vote_position(v, &position(registers(2, 9)));
         assert_eq!(storage.safe_vote_registers(v), Some(registers(4, 9)));
     }
 
     let reopened = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    reopened.persist_safe_vote_registers(v, registers(3, 3));
+    reopened.persist_vote_position(v, &position(registers(3, 3)));
     assert_eq!(reopened.safe_vote_registers(v), Some(registers(4, 9)));
 }
 
@@ -1614,7 +1624,7 @@ fn safe_vote_registers_ignore_stale_chain_incarnation() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     let v = ValidatorId::new(1);
-    storage.persist_safe_vote_registers(v, registers(8, 8));
+    storage.persist_vote_position(v, &position(registers(8, 8)));
 
     let mut batch = WriteBatch::default();
     write_chain_origin(
@@ -1627,15 +1637,16 @@ fn safe_vote_registers_ignore_stale_chain_incarnation() {
     storage.db.write(batch).unwrap();
 
     assert_eq!(storage.safe_vote_registers(v), None);
+    let recovered = storage.load_recovered_state();
+    assert!(recovered.safe_vote_registers.is_empty());
     assert!(
-        storage
-            .load_recovered_state()
-            .safe_vote_registers
-            .is_empty()
+        recovered.voted_blocks.is_empty(),
+        "a block justifying a lock on another chain justifies nothing here",
     );
 
-    storage.persist_safe_vote_registers(v, registers(1, 2));
+    storage.persist_vote_position(v, &position(registers(1, 2)));
     assert_eq!(storage.safe_vote_registers(v), Some(registers(1, 2)));
+    assert_eq!(storage.voted_blocks_above(BlockHeight::new(3)).len(), 1);
 }
 
 #[test]

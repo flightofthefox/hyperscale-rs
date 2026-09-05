@@ -197,7 +197,7 @@ pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
-pub use shard::vote_registers::SafeVoteRegisters;
+pub use shard::vote_registers::{SafeVoteRegisters, VotePosition};
 pub use shard::{
     Block, SharedCertificates, SharedProvisions, SharedTransactions, SharedWitnessSources,
     TerminalRef, VerifiedBlockAssembleError, WitnessSources, derive_block_transactions,

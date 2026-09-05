@@ -211,6 +211,7 @@ fn build_prepared_commit(
             c.committed_hash = Some(block.hash());
             c.committed_qc = Some(qc.as_ref().clone());
             c.prune_receipts(block.height());
+            c.drop_voted_blocks_through(block.height());
 
             result_root
         },
@@ -294,6 +295,7 @@ impl SimShardStorage {
             c.committed_hash = Some(block.hash());
             c.committed_qc = Some(qc.as_ref().clone());
             c.prune_receipts(block.height());
+            c.drop_voted_blocks_through(block.height());
         }
 
         new_root

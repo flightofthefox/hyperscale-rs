@@ -22,7 +22,7 @@ use hyperscale_types::{
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, DeclaredRange, ExecutionCertificate,
     Finalization, FinalizationHash, Hash, LegEntry, PreparedCommit, Provisions, QuorumCertificate,
     SafeVoteRegisters, SettledWrites, ShardWitnessPayload, StateRoot, SubstateKey, SubstateLeaf,
-    SweepFrontier, TickId, Transaction, TxHash, ValidatorId, Verifiable, Verified,
+    SweepFrontier, TickId, Transaction, TxHash, ValidatorId, Verifiable, Verified, VotePosition,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -262,8 +262,12 @@ impl LegEntryStore for SharedStorage {
 }
 
 impl SafeVoteRegisterStore for SharedStorage {
-    fn persist_safe_vote_registers(&self, validator: ValidatorId, registers: SafeVoteRegisters) {
-        self.0.persist_safe_vote_registers(validator, registers);
+    fn persist_vote_position(&self, validator: ValidatorId, position: &VotePosition) {
+        self.0.persist_vote_position(validator, position);
+    }
+
+    fn voted_blocks_above(&self, committed_height: BlockHeight) -> Vec<Arc<Block>> {
+        self.0.voted_blocks_above(committed_height)
     }
 
     fn safe_vote_registers(&self, validator: ValidatorId) -> Option<SafeVoteRegisters> {

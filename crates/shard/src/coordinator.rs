@@ -101,9 +101,9 @@ use hyperscale_types::{
     QuorumCertificate, RecoveryCause, Refusal, Round, SafeVoteRegisters, StateRoot,
     StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, Transaction,
     TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier,
-    Verify, VoteCount, absence_licenses_reclaim, derive_leaves, lapse_licenses_reclaim,
-    lapse_probe_anchor, missed_proposals_since_prev_commit, ready_leaf_payload,
-    reclaim_probe_anchor, validity_end_of,
+    Verify, VoteCount, VotePosition, absence_licenses_reclaim, derive_leaves,
+    lapse_licenses_reclaim, lapse_probe_anchor, missed_proposals_since_prev_commit,
+    ready_leaf_payload, reclaim_probe_anchor, validity_end_of,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -319,6 +319,14 @@ pub struct ShardCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
     /// Pending blocks being assembled (hash -> pending block).
     pending_blocks: PendingBlocks,
+    /// Blocks the store handed back at startup, awaiting their first
+    /// verification drive. They are assembled already; what they lack is
+    /// the state each one left, which only re-running the verification
+    /// pipeline produces — and that needs a topology schedule, which
+    /// construction has no access to. Drained by
+    /// [`Self::resume_recovered_blocks`] on the first periodic entry that
+    /// carries one.
+    recovered_blocks: Vec<BlockHash>,
     /// In-flight fee reservations at this (payer) shard — committed VM
     /// transactions whose ticks have not yet finalized.
     fee_ledger: FeeReservationLedger,
@@ -527,6 +535,13 @@ impl ShardCoordinator {
     ///
     /// * `config` - Shard consensus configuration
     /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a block the store handed back cannot be assembled. The
+    /// store writes whole blocks, so an incomplete one is a corrupt
+    /// store rather than a missing delivery, and resuming on it would
+    /// build a chain no other replica agrees with.
     #[must_use]
     pub fn new(
         verifier: Arc<dyn Verifier>,
@@ -590,6 +605,26 @@ impl ShardCoordinator {
         if recovered.committed_hash.is_none() {
             dedup_index.cover_to_origin();
         }
+        // The uncommitted chain behind the restored certificate. Complete
+        // as stored — the store wrote whole blocks — so each goes back as
+        // an assembled pending block, needing no fetch. Their verification
+        // is driven from `resume_recovered_blocks`, which runs on the
+        // first periodic entry holding a topology schedule.
+        let mut pending_blocks = PendingBlocks::new();
+        let mut recovered_blocks = Vec::new();
+        for block in &recovered.voted_blocks {
+            recovered_blocks.push(block.header().hash());
+            let mut pending = PendingBlock::from_complete_block(
+                block,
+                block.certificates().iter().map(Arc::clone).collect(),
+                block.provisions().iter().map(Arc::clone).collect(),
+                LocalTimestamp::ZERO,
+            );
+            pending
+                .construct_block()
+                .expect("a stored block is complete by construction");
+            pending_blocks.insert(pending);
+        }
         Self {
             verifier,
             view_change: ViewChangeController::new(initial_view),
@@ -616,7 +651,8 @@ impl ShardCoordinator {
             latest_qc: high_qc,
             anchor_qc: recovered.anchor_qc,
             deferred_qc: DeferredQc::new(),
-            pending_blocks: PendingBlocks::new(),
+            pending_blocks,
+            recovered_blocks,
             fee_ledger: FeeReservationLedger::new(),
             votes: VoteKeeper::new(),
             timeouts: TimeoutKeeper::new(),
@@ -2308,7 +2344,17 @@ impl ShardCoordinator {
             self.locked_round = self.locked_round.max(qc_round);
             self.last_voted_round = self.last_voted_round.max(qc_round);
         }
-        self.latest_qc = qc;
+        // The high QC only rises, for the same reason the lock does.
+        // `Self::new` restored the higher of the committed tip's
+        // certificate and the durable record's, and the record's is the
+        // one above the tip. Assigning the committed one here would drop
+        // back to a certificate beneath this node's own lock, which is
+        // what it reports in a timeout — and a bound understated is a
+        // bound another replica may vote beneath.
+        let held = self.latest_qc.as_deref().map(QuorumCertificate::round);
+        if qc.as_deref().map(QuorumCertificate::round) > held {
+            self.latest_qc = qc;
+        }
 
         self.view_change.reset_for_height_advance();
 
@@ -4238,7 +4284,7 @@ impl ShardCoordinator {
             round,
             timestamp,
             next_proposers,
-            registers: self.safe_vote_registers(),
+            position: self.vote_position(Some(block_hash)),
         }]
     }
 
@@ -6430,7 +6476,7 @@ impl ShardCoordinator {
             round,
             high_qc: self.high_qc(),
             recipients,
-            registers: self.safe_vote_registers(),
+            position: self.vote_position(None),
         }]
     }
 
@@ -6993,6 +7039,38 @@ impl ShardCoordinator {
         orphaned.into_abandon_actions()
     }
 
+    /// Drive the verification of the blocks the store handed back at
+    /// startup, lowest first.
+    ///
+    /// A restored certificate names a block above the committed tip, and
+    /// a proposer extends the block its high QC certifies — which means
+    /// executing that block over its own uncommitted ancestors. Seeding
+    /// them as pending blocks restores the bodies; only the verification
+    /// pipeline restores the state each one left, which is what the
+    /// proposal builds on. The safe-vote rule declines every one of them
+    /// (their rounds are consumed), and that is the path already taken by
+    /// a block a validator verifies without voting for.
+    ///
+    /// Runs once — a second drive would re-enter verifications already in
+    /// flight. Blocks whose parent has not been prepared yet defer inside
+    /// the pipeline and resume when it is.
+    fn resume_recovered_blocks(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        if self.recovered_blocks.is_empty() {
+            return Vec::new();
+        }
+        let mut resuming: Vec<BlockHash> = std::mem::take(&mut self.recovered_blocks);
+        resuming.sort_by_key(|hash| {
+            self.pending_blocks
+                .get_header(*hash)
+                .map_or(BlockHeight::GENESIS, BlockHeader::height)
+        });
+        let mut actions = Vec::new();
+        for hash in resuming {
+            actions.extend(self.trigger_qc_verification_or_vote(topology_schedule, hash));
+        }
+        actions
+    }
+
     /// Check pending blocks and emit fetch requests for those that have been
     /// waiting longer than the configured timeout.
     ///
@@ -7023,6 +7101,7 @@ impl ShardCoordinator {
         // committee holds the parent QC for its first block even when no
         // peer signal ever supplies a higher one.
         let mut actions = self.try_adopt_anchor_qc(topology_schedule);
+        actions.extend(self.resume_recovered_blocks(topology_schedule));
 
         let next_needed_height = self.committed_height.next();
         let has_next_block = self.has_complete_block_at_height(next_needed_height);
@@ -7337,6 +7416,54 @@ impl ShardCoordinator {
             last_voted_round: self.last_voted_round,
             high_qc: self.latest_qc.as_deref().map(|qc| (*qc).clone()),
         }
+    }
+
+    /// The signing position a vote or timeout ratchets: the registers,
+    /// and the uncommitted chain behind the certificate they carry.
+    ///
+    /// The justification runs from the committed tip up to the block the
+    /// high QC certifies, oldest first — the blocks a proposer replays to
+    /// extend that certificate. A restarted committee holds the
+    /// certificate either way; what it cannot rebuild from a committed
+    /// chain alone is the state these blocks left.
+    #[must_use]
+    pub fn vote_position(&self, voted: Option<BlockHash>) -> VotePosition {
+        let tip = voted.or_else(|| self.latest_qc.as_deref().map(QuorumCertificate::block_hash));
+        VotePosition {
+            registers: self.safe_vote_registers(),
+            justification: tip
+                .map(|tip| self.uncommitted_suffix(tip))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The assembled uncommitted blocks from the committed tip up to
+    /// `tip` inclusive, oldest first.
+    ///
+    /// `tip` is the block a signature is about to name — the one this
+    /// vote extends the chain to, or the one the high QC certifies when
+    /// no vote is being cast. The vote itself is what turns the voted
+    /// block into the next certificate, so keeping it is what lets the
+    /// committee that produced that certificate still build on it.
+    ///
+    /// Empty when `tip` is the committed tip, and empty when any ancestor
+    /// above the committed tip is missing or unassembled — a suffix with
+    /// a hole in it is no use to a proposer, so it is not written down.
+    fn uncommitted_suffix(&self, tip: BlockHash) -> Vec<Arc<Block>> {
+        let mut suffix = Vec::new();
+        let mut hash = tip;
+        while let Some(pending) = self.pending_blocks.get(hash) {
+            if pending.header().height() <= self.committed_height {
+                break;
+            }
+            let Some(block) = pending.block() else {
+                return Vec::new();
+            };
+            suffix.push(Arc::clone(block));
+            hash = pending.header().parent_block_hash();
+        }
+        suffix.reverse();
+        suffix
     }
 
     /// Check if we have a COMPLETE block at the given height that can be committed.

@@ -18,12 +18,12 @@ use hyperscale_types::{
     PcVote3, PcVoteEquivocation, PrincipalAddr, ProposerTimestamp, ProvisionHash,
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
     RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain,
-    Round, RoutingCommittees, SafeVoteRegisters, ShardForkProof, ShardId, ShardLoad, ShardTrie,
-    ShardVoteEquivocation, SharedCertificates, SharedTransactions, SharedWitnessSources,
-    SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
-    StateRoot, SubstateEntry, SubstateKey, SweepFrontier, TerminalEvidence, TerminalRoots, TickId,
-    Timeout, TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
-    UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, WeightedTimestamp, WorkInFlight,
+    Round, RoutingCommittees, ShardForkProof, ShardId, ShardLoad, ShardTrie, ShardVoteEquivocation,
+    SharedCertificates, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
+    SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry,
+    SubstateKey, SweepFrontier, TerminalEvidence, TerminalRoots, TickId, Timeout, TopologySnapshot,
+    Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome, UnsettledTx, ValidatorId,
+    Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp, WorkInFlight,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -250,10 +250,12 @@ pub enum Action {
         /// Local-shard validators eligible to propose the next block; they
         /// need this vote to assemble the QC.
         next_proposers: Vec<ValidatorId>,
-        /// The safe-vote registers as ratcheted by this vote. The runner
-        /// persists them durably before the signature leaves the process,
-        /// so a crash-restarted validator can never re-vote this round.
-        registers: SafeVoteRegisters,
+        /// The signing position this vote ratchets — the registers and
+        /// the uncommitted chain justifying them. The runner persists it
+        /// durably before the signature leaves the process, so a
+        /// crash-restarted validator can never re-vote this round, and
+        /// comes back able to extend the certificate it locked on.
+        position: VotePosition,
     },
 
     /// Sign and broadcast a timeout to the local-shard committee.
@@ -271,11 +273,11 @@ pub enum Action {
         high_qc: QuorumCertificate,
         /// Local-shard committee members who tally timeouts for this round.
         recipients: Vec<ValidatorId>,
-        /// The safe-vote registers as ratcheted by this timeout. The runner
-        /// persists them durably before the signature leaves the process,
+        /// The signing position this timeout ratchets. The runner
+        /// persists it durably before the signature leaves the process,
         /// so a crash-restarted validator can never vote a round it
         /// already abandoned.
-        registers: SafeVoteRegisters,
+        position: VotePosition,
     },
 
     /// Sign and broadcast a "ready on shard" signal to the local committee.

@@ -21,8 +21,8 @@ use hyperscale_types::{
     CertifiedBlock, ChainOrigin, ConsensusReceipt, Finalization, GlobalReceiptHash, Hash, LocalKey,
     ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, SafeVoteRegisters,
     SettledWrites, ShardId, StateRoot, StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId,
-    TimestampRange, Transaction, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    WitnessSources, delivery_window_close,
+    TimestampRange, Transaction, TxHash, ValidatorId, Verifiable, Verified, VotePosition,
+    WeightedTimestamp, WitnessSources, delivery_window_close,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -1123,6 +1123,16 @@ fn registers(locked: u64, last_voted: u64) -> SafeVoteRegisters {
     }
 }
 
+/// A signing position carrying `r` and one justification block — a
+/// vote's shape, so a test over the record covers the blocks written
+/// beside it too.
+fn position(r: SafeVoteRegisters) -> VotePosition {
+    VotePosition {
+        registers: r,
+        justification: vec![Arc::new(make_test_block(BlockHeight::new(4)))],
+    }
+}
+
 #[test]
 fn safe_vote_registers_recover_their_justification() {
     let storage = SimShardStorage::default();
@@ -1145,8 +1155,8 @@ fn leg_entries_round_trip() {
 fn safe_vote_registers_are_monotone_and_recoverable() {
     let storage = SimShardStorage::default();
     let v = ValidatorId::new(1);
-    storage.persist_safe_vote_registers(v, registers(4, 6));
-    storage.persist_safe_vote_registers(v, registers(2, 9));
+    storage.persist_vote_position(v, &position(registers(4, 6)));
+    storage.persist_vote_position(v, &position(registers(2, 9)));
     assert_eq!(storage.safe_vote_registers(v), Some(registers(4, 9)));
 
     let recovered = storage.load_recovered_state();
@@ -1163,7 +1173,7 @@ fn safe_vote_registers_are_monotone_and_recoverable() {
 fn safe_vote_registers_ignore_stale_chain_incarnation() {
     let storage = SimShardStorage::default();
     let v = ValidatorId::new(1);
-    storage.persist_safe_vote_registers(v, registers(8, 8));
+    storage.persist_vote_position(v, &position(registers(8, 8)));
 
     storage.consensus.write().unwrap().chain_origin = ChainOrigin {
         genesis_height: BlockHeight::new(11),
@@ -1171,15 +1181,16 @@ fn safe_vote_registers_ignore_stale_chain_incarnation() {
     };
 
     assert_eq!(storage.safe_vote_registers(v), None);
+    let recovered = storage.load_recovered_state();
+    assert!(recovered.safe_vote_registers.is_empty());
     assert!(
-        storage
-            .load_recovered_state()
-            .safe_vote_registers
-            .is_empty()
+        recovered.voted_blocks.is_empty(),
+        "a block justifying a lock on another chain justifies nothing here",
     );
 
-    storage.persist_safe_vote_registers(v, registers(1, 2));
+    storage.persist_vote_position(v, &position(registers(1, 2)));
     assert_eq!(storage.safe_vote_registers(v), Some(registers(1, 2)));
+    assert_eq!(storage.voted_blocks_above(BlockHeight::new(3)).len(), 1);
 }
 
 // ─── Dedup window ───────────────────────────────────────────────────
