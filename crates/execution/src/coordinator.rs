@@ -58,9 +58,10 @@ use hyperscale_types::{
     StateProofBundle, StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot,
     Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution, UnsettledTx,
     ValidatorId, VerdictClaim, Verifiable, Verified, WeightedTimestamp, absence_licenses_reclaim,
-    derive_block_transactions, lapse_licenses_reclaim, lapse_probe_anchor, lapse_probe_ceiling,
-    reclaim_probe_anchor, settled_set_verdict, tick_leader, tick_leader_at,
+    claim_readable_at, derive_block_transactions, lapse_licenses_reclaim, lapse_probe_anchor,
+    lapse_probe_ceiling, reclaim_probe_anchor, settled_set_verdict, tick_leader, tick_leader_at,
 };
+use hyperscale_vm_effects::CrossingCell;
 use tracing::instrument;
 
 use crate::candidates::{Admitted, TickCandidates};
@@ -309,6 +310,22 @@ fn counterpart_cells(entry: &Probeable, trie: &ShardTrie) -> Vec<CounterpartCell
     core.into_iter().chain(deliveries).chain(claims).collect()
 }
 
+/// The name a housekeeping member over inherited records takes on the
+/// chain that inherited them.
+///
+/// Derived from the transaction that issued the crossings and the record
+/// cells being settled, so every replica at one frontier reaches the same
+/// name and no two members ever share one. It is not the issuing
+/// transaction's own hash: that transaction belongs to a chain that has
+/// ended, this one never committed it, and a receipt naming it would be a
+/// verdict this chain has no standing to reach.
+fn inherited_member_name(issued_by: TxHash, records: &[SubstateKey]) -> TxHash {
+    let keys: Vec<Vec<u8>> = records.iter().map(|key| key.to_bytes().to_vec()).collect();
+    let mut parts: Vec<&[u8]> = vec![b"hyperscale.inherited.records", &issued_by.0.0];
+    parts.extend(keys.iter().map(Vec::as_slice));
+    TxHash::from(Hash::from_parts(&parts))
+}
+
 /// The earliest a member's provisioning entry may be swept, where the
 /// member is a delivery.
 ///
@@ -415,6 +432,18 @@ pub struct ExecutionCoordinator {
     /// what this shard has in flight that can be rebuilt after losing
     /// that state.
     unresolved: UnresolvedTxs,
+
+    /// The escrow records this shard inherited with a prefix, each still
+    /// unresolved, by cell key.
+    ///
+    /// A merge successor's store arrives holding value its predecessors
+    /// escrowed, and nothing else names it: its ledger begins empty, no
+    /// body arrives with the leaves, and both children's chains have
+    /// ended, so no counterpart record will ever be composed about them.
+    /// What is left is the claim cell each record names — this shard's
+    /// to read, since the merge gave it both children's prefixes — and
+    /// an entry leaves here when a tick has taken it.
+    inherited: BTreeMap<SubstateKey, CrossingCell>,
 
     /// The blocks a restart has to replay before this coordinator's
     /// account of what is in flight matches its peers'. Construction has
@@ -692,6 +721,11 @@ impl ExecutionCoordinator {
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
             unresolved: UnresolvedTxs::default(),
+            inherited: recovered
+                .inherited_records
+                .iter()
+                .filter_map(|(key, value)| Some((*key, CrossingCell::from_bytes(value)?)))
+                .collect(),
             replay_blocks: recovered.replay.blocks.clone(),
             seed_entries: recovered.leg_entries.clone(),
             persisted: recovered
@@ -1243,6 +1277,84 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Admit into the tick being composed the records this shard
+    /// inherited with a prefix whose claim it can now read.
+    ///
+    /// One member per issuing transaction, under a name of this chain's
+    /// own ([`inherited_member_name`]) rather than the transaction's.
+    /// The transaction was decided on a chain that has ended, and this
+    /// one never committed it: naming it here would put a second verdict
+    /// on a transaction nothing local can speak for, and would offer the
+    /// chain a resolution its own pre-cut rule exists to refuse. What
+    /// this shard does decide is the housekeeping itself, which is
+    /// nobody else's.
+    ///
+    /// The member carries the records and no body; whether each is
+    /// credited back or deleted is the engine's to decide against the
+    /// claim cell, which is the only reader holding a snapshot.
+    ///
+    /// Two things bound what is admitted, and both are read off
+    /// committed content so every replica at one frontier admits the
+    /// same set. The claim must route here, or this shard cannot read
+    /// the answer at all and the record waits. And the block's clock
+    /// must be inside the window an absent claim means something in.
+    fn admit_inherited(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        tick_id: TickId,
+        tick_ts: WeightedTimestamp,
+        state: &mut TickState,
+        requests: &mut Vec<CrossShardExecutionRequest>,
+    ) {
+        if self.inherited.is_empty() {
+            return;
+        }
+        let Some(committee) = topology_schedule.at(tick_ts) else {
+            return;
+        };
+        let trie = committee.shard_trie();
+        let local_shard = self.local_shard;
+        let mut due: BTreeMap<TxHash, Vec<SubstateKey>> = BTreeMap::new();
+        for (key, record) in &self.inherited {
+            if trie.shard_for_prefix(record.consumer_claim.owner) != local_shard
+                || !claim_readable_at(record.expiry_ms, tick_ts)
+            {
+                continue;
+            }
+            due.entry(record.tx).or_default().push(*key);
+        }
+        for (issued_by, records) in due {
+            let tx_hash = inherited_member_name(issued_by, &records);
+            state.admit(
+                tx_hash,
+                Membership::whole(BTreeSet::from([local_shard])),
+                0,
+                Admission::Executes,
+            );
+            self.ticks.assign_tx(tx_hash, tick_id);
+            // Taken once: the credit deletes the cell, so a second
+            // member over the same record would read nothing and the
+            // records would be stranded behind a refusal.
+            for key in &records {
+                self.inherited.remove(key);
+            }
+            record_reclaim_admitted();
+            requests.push(CrossShardExecutionRequest {
+                tx_hash,
+                // No body reached this shard: the chain that issued the
+                // crossing ended at the cut, and the price it owed was
+                // settled there.
+                transaction: None,
+                provisions: Vec::new(),
+                clock: tick_ts,
+                reaches_beyond: false,
+                abortable: false,
+                runs: Runs::Inherited { records },
+                arrivals: Vec::new(),
+            });
+        }
+    }
+
     /// Admit into the tick being composed every retirement a committed
     /// record has licensed: a member running no node, awaiting nobody,
     /// reserving nothing, charged nothing, that deletes the records of
@@ -1417,6 +1529,13 @@ impl ExecutionCoordinator {
         self.admit_abandoned(topology_schedule, tick_id, &mut state);
         self.admit_reclaims(tick_id, block.ts, &mut state, &mut requests);
         self.admit_retirements(tick_id, block.ts, &mut state, &mut requests);
+        self.admit_inherited(
+            topology_schedule,
+            tick_id,
+            block.ts,
+            &mut state,
+            &mut requests,
+        );
 
         if state.is_empty() {
             return (None, Vec::new(), Vec::new());

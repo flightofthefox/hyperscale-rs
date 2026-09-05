@@ -1160,24 +1160,19 @@ fn merge_lifecycle_sim() {
     merge_lifecycle(&mut cluster);
 }
 
-/// A crossing this run leaves unclaimed across the merge strands its
-/// value, and nothing on the reunified parent takes it back.
+/// A pre-cut transaction neither child committed reaches an outcome on
+/// the reunified parent, and every crossing the merge carried over is
+/// accounted for.
 ///
-/// The scenario's own subject — a transaction that opened before the cut
-/// and neither child committed — still holds; what fails is the
-/// conservation probe beside it, by exactly one `PROBE_PAYMENT`. The
-/// payer's child ran the deciding member and issued a crossing to its
-/// sibling, the sibling never settled it, and both children merged. The
-/// record cell rides the payer's prefix into the parent, whose ledger is
-/// empty and whose store holds no body, so no reclaim is ever composed.
-///
-/// Reaching it takes a reshape that fires where this one now does, which
-/// is why the run went green before the assertion leaf carried its epoch.
-/// The stranding is older than that and is not the reshape's.
+/// Two things at once, and the second is why the cell is here. The
+/// scenario's own subject is the admission: a transaction that opened
+/// before the cut is admissible only once proven absent from both
+/// children. Beside it runs the conservation probe, which reads the
+/// crossings the merge inherited — seventeen at this seed, sixteen taken
+/// by their consumer and one never taken. The successor holds the record
+/// and the claim alike, so it retires the sixteen and credits the
+/// seventeenth back to the cell it left.
 #[test]
-#[ignore = "known gap: a crossing unclaimed across a merge is never \
-            reclaimed — the successor holds the record cell and no ledger \
-            row naming it"]
 fn merge_boundary_admits_an_uncommitted_precut_tx_sim() {
     // The merge's own ballast plus the probe train's funding: the
     // scenario needs both the reshape to fire and the train to pay.

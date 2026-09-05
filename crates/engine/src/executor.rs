@@ -31,7 +31,7 @@ use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EscrowedValue, Event,
     EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement,
     PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
-    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
+    Transaction, TxHash, Verified, WeightedTimestamp, claim_readable_at, compute_merkle_root,
     install_protocol_statics,
 };
 use hyperscale_vm_effects::{
@@ -595,6 +595,121 @@ impl Executor {
                     format!("reclaim cell contradicts the declaration: {conflict}")
                 })?;
             }
+        }
+        Ok(PreparedTx {
+            calls: Vec::new(),
+            declaration,
+            nullifiers: Vec::new(),
+            gas_limit: 0,
+            plan,
+        })
+    }
+
+    /// The entry an inherited record runs: the reclaim and the
+    /// retirement together, each record taking the arm its own claim
+    /// cell decides.
+    ///
+    /// The claim is the record's to name and this shard's to read: the
+    /// coordinator admitted only records whose claim routes here, so an
+    /// absent cell is an absence this shard is entitled to read. Present
+    /// means the crossing was taken and the record is a balance for a
+    /// claim that happened, which the retirement deletes. Absent, inside
+    /// the window [`claim_readable_at`] opens, means no consumer can
+    /// still take it and none did, which the reclaim credits back.
+    ///
+    /// A record already gone is skipped rather than refused: a member
+    /// admitted for several records is one member, and one of them
+    /// having been settled by the shard's own evidence path in between
+    /// is not a reason to strand the rest.
+    fn prepare_inherited(
+        records: &[SubstateKey],
+        ctx: &TickBatchContext<'_>,
+        snapshot: &(dyn Substates + Sync),
+    ) -> Result<PreparedTx, String> {
+        let mut plan = housekeeping_plan(ctx, records.len());
+        let mut declaration = Declaration::default();
+        let mut decided = 0usize;
+        for (at, key) in records.iter().enumerate() {
+            let Some(record) = read_record(snapshot, *key) else {
+                continue;
+            };
+            let claim = CrossingSite::claim(
+                &ProtocolHasher,
+                key.owner,
+                record.intent,
+                record.local,
+                record.output,
+                record.expiry_ms,
+            );
+            let slot = u32::try_from(at).map_err(|_| "a plan past its own width".to_string())?;
+            let mut declare_here = |effect, holds| {
+                declare(&mut declaration, effect, holds).map_err(|conflict| {
+                    format!("inherited cell contradicts the declaration: {conflict}")
+                })
+            };
+            declare_here(
+                Effect {
+                    target: EffectTarget::Point(*key),
+                    mode: Mode::Write { moves: Moves::Both },
+                },
+                None,
+            )?;
+            if snapshot.cell(record.consumer_claim).is_some() {
+                plan.legs
+                    .retires(
+                        slot,
+                        0,
+                        Retire {
+                            record: CrossingSite::record(
+                                &ProtocolHasher,
+                                key.owner,
+                                record.intent,
+                                record.local,
+                                record.output,
+                                record.expiry_ms,
+                            ),
+                        },
+                    )
+                    .map_err(|fault| format!("plan refuses record {key:?}: {fault}"))?;
+                decided = decided.saturating_add(1);
+                continue;
+            }
+            if !claim_readable_at(record.expiry_ms, ctx.tick_ts) {
+                return Err(format!(
+                    "record {key:?} is read outside the window its claim answers in"
+                ));
+            }
+            let origin = record
+                .origin
+                .ok_or_else(|| format!("reclaim of record {key:?} names no origin"))?;
+            declare_here(
+                Effect {
+                    target: EffectTarget::Point(claim.key()),
+                    mode: Mode::Write { moves: Moves::Both },
+                },
+                None,
+            )?;
+            declare_here(
+                Effect {
+                    target: EffectTarget::Point(origin),
+                    mode: Mode::Delta { moves: Moves::Both },
+                },
+                Some(record.resource),
+            )?;
+            plan.legs
+                .reclaims(
+                    slot,
+                    0,
+                    Reclaim {
+                        record: *key,
+                        claim,
+                    },
+                )
+                .map_err(|fault| format!("plan refuses record {key:?}: {fault}"))?;
+            decided = decided.saturating_add(1);
+        }
+        if decided == 0 {
+            return Err("every inherited record was settled already".to_string());
         }
         Ok(PreparedTx {
             calls: Vec::new(),
@@ -1354,7 +1469,7 @@ impl Executor {
             }
             // What this shard runs of the member: the whole shape unless
             // the coordinator froze a division, and then the legs its
-            // placement gives it — or, for a reclaim, no node at all. A
+            // placement gives it — or, for housekeeping, no node at all. A
             // plan that cannot be built is a deterministic refusal like a
             // derivation that cannot be — every replica reads the same
             // legs and the same arrivals.
@@ -1366,6 +1481,9 @@ impl Executor {
                     Self::prepare_reclaim(records, ctx, snapshot)
                 }
                 Some((Runs::Retire { records }, _)) => Self::prepare_retire(records, ctx, snapshot),
+                Some((Runs::Inherited { records }, _)) => {
+                    Self::prepare_inherited(records, ctx, snapshot)
+                }
                 Some((Runs::Shape(shape), arrivals)) => member
                     .body
                     .as_ref()
@@ -1479,7 +1597,11 @@ impl Executor {
                     Some(Runs::Reclaim { charged, .. }) => *charged,
                     // A retirement is housekeeping on a transaction whose
                     // price its leg settled: it charges nothing.
-                    Some(Runs::Retire { .. }) => true,
+                    // Housekeeping on a record this shard inherited:
+                    // the chain that debited the payer settled the price
+                    // before it dissolved, and this shard holds no body
+                    // to price it against.
+                    Some(Runs::Retire { .. } | Runs::Inherited { .. }) => true,
                     Some(Runs::Shape(member)) => member.is_second(),
                     None => false,
                 };

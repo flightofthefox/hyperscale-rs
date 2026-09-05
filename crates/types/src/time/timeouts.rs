@@ -124,6 +124,27 @@ const _: () = assert!(
     "a leg stops being answered for where the evidence that could decide it is swept",
 );
 
+/// Whether a shard holding both halves of a crossing may decide it at
+/// `clock` from the claim cell alone, for a record whose value carries
+/// `expiry_ms`.
+///
+/// The window is [`ESCROW_GRACE_MS`] read as the two spans it is made
+/// of. It opens one [`MAX_FINALIZATION_DELAY`] past the producing
+/// intent's own window end, which is where no consumer can still be
+/// claiming and no claim of one can still be in flight; it closes at the
+/// record's expiry, which is where the claim cell is swept and its
+/// absence stops meaning anything. Outside it an absent claim is not
+/// evidence: before the open the consumer may yet write one, and after
+/// the close a claim that was written has already gone.
+///
+/// Both bounds come off the leaf, so a reader holding the record and no
+/// body knows when it may read the answer.
+#[must_use]
+pub fn claim_readable_at(expiry_ms: u64, clock: WeightedTimestamp) -> bool {
+    let opens = expiry_ms.saturating_sub(LEG_ENTRY_HORIZON.as_secs().saturating_mul(1_000));
+    (opens..expiry_ms).contains(&clock.as_millis())
+}
+
 /// The last instant a verdict may be composed against `anchor`: one
 /// [`MAX_VALIDITY_RANGE`] past it.
 ///

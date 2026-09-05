@@ -379,6 +379,20 @@ pub enum Runs {
         /// The record cells to delete.
         records: Vec<SubstateKey>,
     },
+    /// No node at all: records this shard inherited with a prefix, each
+    /// decided against the claim cell it names — credited back where
+    /// that cell is absent inside the window an absence means something
+    /// in, deleted where it is there.
+    ///
+    /// The one housekeeping member whose evidence is this shard's own
+    /// state. The other two rest on a counterpart's committed record;
+    /// a record arriving with a prefix has no counterpart left to ask,
+    /// and the shard that inherited it holds both halves of the crossing
+    /// or cannot decide it at all.
+    Inherited {
+        /// The record cells to decide.
+        records: Vec<SubstateKey>,
+    },
     /// No node at all: the crossings a producer here issued, taken back
     /// on the evidence that no consumer ever claimed them.
     Reclaim {

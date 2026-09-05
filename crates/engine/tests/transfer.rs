@@ -32,12 +32,12 @@ use hyperscale_types::{
     DeclaredRange, Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt,
     EventRoot, GlobalReceipt, Hash, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PrincipalAddr,
     ProvisionalHolds, SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites,
-    SubstateKey, TimestampRange, Transaction, TransactionBody, TransactionEnvelope, Verified,
-    WeightedTimestamp, absorb_committed_cells, compute_merkle_root,
+    SubstateKey, TimestampRange, Transaction, TransactionBody, TransactionEnvelope, TxHash,
+    Verified, WeightedTimestamp, absorb_committed_cells, claim_readable_at, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
-    AbiParam, Composed, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader, PackageHash,
-    PackageMetadata, ResourceKind, Totality, Value, issued_resource, package_hash,
+    AbiParam, Composed, CrossingCell, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader,
+    PackageHash, PackageMetadata, ResourceKind, Totality, Value, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder};
@@ -1574,6 +1574,148 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
         matches!(again.consensus, ConsensusReceipt::Failed),
         "a second retirement finds no record and is refused: {:?}",
         again.metadata
+    );
+}
+
+/// A record a shard inherited with a prefix decides itself, against the
+/// claim cell the record names: absent, the value goes back to the cell
+/// it left; present, the record is deleted and nothing moves.
+///
+/// The member runs with no body at all, which is the point — a merge
+/// successor's store arrives as a prefix of leaves and its ledger begins
+/// empty, so the leaf is the whole of what a reclaim has to work from.
+#[test]
+#[allow(clippy::too_many_lines)] // one member over one fixture, in its three states
+fn an_inherited_record_decides_itself_against_its_claim() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let near_shard = trie.shard_for_prefix(alice());
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let classified = Classified::freeze(tx.legs(), tx.owners(), &trie);
+    let edge = crossings_of(tx.legs(), tx.crossings(), &classified).remove(0);
+
+    // The sending half, which writes the record the successor inherits.
+    let issued = |store: &MapDb| {
+        let ctx = TickBatchContext {
+            local_shard: near_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            reaches_beyond: true,
+            abortable: false,
+            runs: Runs::Shape(Member::of(
+                classified.clone(),
+                near_shard,
+                Side::Issuing,
+                std::iter::once(near_shard)
+                    .chain(edge.to.iter().copied())
+                    .collect(),
+            )),
+            arrivals: &[],
+        };
+        executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
+    };
+
+    // The housekeeping half: no body, and a clock inside the window an
+    // absent claim answers in.
+    let settle = |store: &MapDb, at: u64| {
+        let ctx = TickBatchContext {
+            local_shard: near_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(at),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            tx_hash: TxHash::from(Hash::from_bytes(b"housekeeping")),
+            transaction: None,
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(at),
+            reaches_beyond: false,
+            abortable: false,
+            runs: Runs::Inherited {
+                records: vec![edge.record],
+            },
+            arrivals: &[],
+        };
+        executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
+    };
+
+    let mut unclaimed = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+    let sent = issued(&unclaimed);
+    let ConsensusReceipt::Succeeded { writes, .. } = &sent.consensus else {
+        panic!("the sender's legs must succeed: {:?}", sent.metadata);
+    };
+    unclaimed.apply(writes);
+    let record = CrossingCell::from_bytes(
+        &Substates::cell(&unclaimed, edge.record).expect("the record is written"),
+    )
+    .expect("a record decodes");
+    // The window opens where the consumer can no longer claim and closes
+    // where the claim cell it names is swept.
+    let inside = record.expiry_ms - 1;
+    assert!(claim_readable_at(
+        record.expiry_ms,
+        WeightedTimestamp::from_millis(inside)
+    ));
+
+    // A store where the claim is present is the same store plus that one
+    // cell, so the two runs differ in nothing else.
+    let mut claimed = MapDb(unclaimed.0.clone());
+    claimed.0.insert(record.consumer_claim, vec![0xAA]);
+    let early_store = MapDb(unclaimed.0.clone());
+
+    let taken_back = settle(&unclaimed, inside);
+    let ConsensusReceipt::Succeeded { writes, .. } = &taken_back.consensus else {
+        panic!("the reclaim must succeed: {:?}", taken_back.metadata);
+    };
+    assert!(
+        taken_back.fee_receipt.is_none(),
+        "the chain that issued the crossing settled the price before it ended"
+    );
+    unclaimed.apply(writes);
+    assert_eq!(
+        Substates::cell(&unclaimed, vault_key(alice(), *XRD)),
+        Some(encode_amount(1_000).to_vec()),
+        "an unclaimed crossing returns to the cell it left"
+    );
+    assert!(
+        Substates::cell(&unclaimed, edge.record).is_none(),
+        "and the record goes with it"
+    );
+
+    let retired = settle(&claimed, inside);
+    let ConsensusReceipt::Succeeded { writes, .. } = &retired.consensus else {
+        panic!("the retirement must succeed: {:?}", retired.metadata);
+    };
+    claimed.apply(writes);
+    assert!(
+        Substates::cell(&claimed, edge.record).is_none(),
+        "a claimed crossing's record is deleted"
+    );
+    assert_eq!(
+        Substates::cell(&claimed, vault_key(alice(), *XRD)),
+        Some(encode_amount(900).to_vec()),
+        "and the value stays where the claim took it"
+    );
+
+    // Outside the window an absent claim says nothing, so the member is
+    // refused rather than crediting on a clock.
+    let early = settle(&early_store, 1_000);
+    assert!(
+        matches!(early.consensus, ConsensusReceipt::Failed),
+        "a record read before its window answers nothing: {:?}",
+        early.metadata
     );
 }
 
