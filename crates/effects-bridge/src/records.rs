@@ -968,6 +968,7 @@ mod tests {
             TxHash(Hash32([0xC0; 32])),
             ResourceAddr::new([0xE0; 31]),
             500,
+            claim_site.key(),
             None,
         );
         let claim = claim_site.claimed_by(TxHash(Hash32([0xC0; 32])));

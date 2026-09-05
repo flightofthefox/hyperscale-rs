@@ -27,7 +27,9 @@ use std::sync::Arc;
 
 use hyperscale_types::{Address, EscrowedValue, ShardId, ShardTrie};
 use hyperscale_vm_effects::{CrossingSite, StarShape, star_at};
-use hyperscale_vm_kernel::{Crossed, ExecutionScope, LegPlan, PlanFault, Reclaim, Retire};
+use hyperscale_vm_kernel::{
+    Crossed, Departure, ExecutionScope, LegPlan, PlanFault, Reclaim, Retire,
+};
 use hyperscale_vm_types::{Crossing, LegRole, LegShape, ProtocolHasher, SubstateKey};
 
 use crate::sharding::TrieShardResolver;
@@ -833,7 +835,28 @@ pub fn plan_for_shard(
             crossing.output,
             producer.expiry_ms,
         );
-        plan.departs(crossing.node, crossing.output, record)?;
+        // The consumer's claim, named here because this is the last
+        // reader of the manifest that holds both ends of the edge: the
+        // record travels with the prefix and the manifest does not, so
+        // a successor asking whether the crossing was taken has only
+        // what the leaf says.
+        let consumer_claim = CrossingSite::claim(
+            &ProtocolHasher,
+            star.leg(consumer)?.target,
+            producer.intent,
+            producer.local,
+            crossing.output,
+            producer.expiry_ms,
+        )
+        .key();
+        plan.departs(
+            crossing.node,
+            crossing.output,
+            Departure {
+                site: record,
+                consumer_claim,
+            },
+        )?;
     }
     Ok(ShardPlan {
         legs: plan,
