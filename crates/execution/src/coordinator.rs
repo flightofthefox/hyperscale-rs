@@ -343,15 +343,20 @@ fn delivery_floor(side: Side, validity_end: WeightedTimestamp) -> Option<Weighte
 /// Whether a proposer offers `Claimed` records from the claims the
 /// chain has proved.
 ///
-/// Turned on, the scenario suite is green but for one: the splitter
-/// train's split never admits. Its shard reads 77.6 KB against a
-/// threshold voted to 63.0 KB, its sibling reads 59.5 KB, so the
-/// threshold sits where it is meant to and the shard is 14.5 KB over it
-/// — and the beacon's pending reshapes stay empty for the length of the
-/// run. The byte readings are within 1 KB of the offer-off run, so the
-/// load the trigger reads is not what changed. Nothing else in the
-/// suite moves, the retirement machinery itself is live and pinned, and
-/// what the offer waits on is an explanation for that one shard.
+/// Off, and waiting on two things that are not the offer's own. A
+/// transfer sent `Departing` and included by the leaving shard reaches
+/// `Completed(Aborted)` where it owes `Settled`, which is the shape the
+/// train's fate map exists to refuse. And a retirement runs a member
+/// whose membership decides nothing, which is never cleared from what a
+/// proposer offers — clearing keys off resolution, and a member that
+/// resolves no transaction gives it nothing to key on. Measured on a
+/// shard composing them: the finalization is re-offered every block, the
+/// settlement frontier never advances, and block production falls to the
+/// view-change cadence.
+///
+/// The retirement machinery itself is live and pinned, and this is the
+/// only caller that would exercise it — which is why the second defect
+/// has never appeared in a simulation.
 const CLAIMED_RECORDS_OFFERED: bool = false;
 
 /// Whether an answer taken at `probed_wt` says anything about the
