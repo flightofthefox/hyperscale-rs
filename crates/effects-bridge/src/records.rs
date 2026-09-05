@@ -947,7 +947,12 @@ mod tests {
         let intent = SubintentHash(Hash32([0xB0; 32]));
         let record_site = CrossingSite::record(&ProtocolHasher, producer, intent, 1, 0, expiry_ms);
         let claim_site = CrossingSite::claim(&ProtocolHasher, taker, intent, 1, 0, expiry_ms);
-        let record = record_site.crossing(ResourceAddr::new([0xE0; 31]), 500, None);
+        let record = record_site.crossing(
+            TxHash(Hash32([0xC0; 32])),
+            ResourceAddr::new([0xE0; 31]),
+            500,
+            None,
+        );
         let claim = claim_site.claimed_by(TxHash(Hash32([0xC0; 32])));
 
         let claim_value = claim.to_bytes();
