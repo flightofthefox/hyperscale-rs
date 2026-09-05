@@ -305,7 +305,7 @@ impl TickCandidates {
             admitted.push(Admitted {
                 request: CrossShardExecutionRequest {
                     tx_hash,
-                    transaction: Arc::clone(&candidate.tx),
+                    transaction: Some(Arc::clone(&candidate.tx)),
                     provisions: if reaches_beyond {
                         provisioning
                             .provisions_for(tx_hash)

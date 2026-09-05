@@ -38,7 +38,8 @@ use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
 use hyperscale_engine::legs::{
-    Classified, Runs, Side, core_claims, crossings_of, delivered_claims,
+    Classified, Runs, Side, core_claims, crossings_of, delivered_claims, records_to_reclaim,
+    records_to_retire,
 };
 use hyperscale_engine::{TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{
@@ -148,9 +149,8 @@ impl PendingTick {
         self.requests.iter().any(|request| {
             request
                 .transaction
-                .packages()
-                .iter()
-                .any(|package| missing.contains(package))
+                .as_ref()
+                .is_some_and(|body| body.packages().iter().any(|p| missing.contains(p)))
         })
     }
 }
@@ -1220,14 +1220,22 @@ impl ExecutionCoordinator {
             self.candidates.remove(tx_hash);
             self.provisioning.remove_tx(tx_hash);
             requests.push(CrossShardExecutionRequest {
+                // The plan reads no body — every cell is the record's —
+                // but the price still follows the vault, and this is the
+                // shard that holds it.
+                transaction: Some(Arc::clone(&transaction)),
                 tx_hash,
-                transaction,
                 provisions: Vec::new(),
                 clock: tick_ts,
                 reaches_beyond: false,
                 abortable: false,
                 runs: Runs::Reclaim {
-                    classified,
+                    records: records_to_reclaim(
+                        transaction.legs(),
+                        transaction.crossings(),
+                        &classified,
+                        local_shard,
+                    ),
                     charged,
                 },
                 arrivals: Vec::new(),
@@ -1269,13 +1277,20 @@ impl ExecutionCoordinator {
             self.ticks.assign_tx(tx_hash, tick_id);
             self.unresolved.admit_retire(tx_hash);
             requests.push(CrossShardExecutionRequest {
+                transaction: Some(Arc::clone(&transaction)),
                 tx_hash,
-                transaction,
                 provisions: Vec::new(),
                 clock: tick_ts,
                 reaches_beyond: false,
                 abortable: false,
-                runs: Runs::Retire { classified },
+                runs: Runs::Retire {
+                    records: records_to_retire(
+                        transaction.legs(),
+                        transaction.crossings(),
+                        &classified,
+                        local_shard,
+                    ),
+                },
                 arrivals: Vec::new(),
             });
         }
@@ -1293,22 +1308,25 @@ impl ExecutionCoordinator {
         requests: &mut Vec<CrossShardExecutionRequest>,
     ) {
         let local_shard = self.local_shard;
+        // The shape and the body travel together or not at all: a
+        // housekeeping member has neither, and is admitted by its own
+        // pass rather than through here.
+        let shape = member
+            .request
+            .shape()
+            .map(|(shape, body)| (shape.clone(), Arc::clone(body)));
         // A mixed shard's delivering member is the second this shard
         // runs of the transaction: the issuing one returned the
         // reservation its block took and settled the price, so this
         // one reserves nothing and issues nothing.
-        let second_member = matches!(
-            &member.request.runs,
-            Runs::Shape(shape) if shape.is_second()
-        );
+        let second_member = shape.as_ref().is_some_and(|(shape, _)| shape.is_second());
         let reach = member.membership_reach();
         state.admit(
             member.request.tx_hash,
             member.membership,
-            if second_member {
-                0
-            } else {
-                member.request.transaction.work()
+            match &shape {
+                Some((_, body)) if !second_member => body.work(),
+                _ => 0,
             },
             member.admission,
         );
@@ -1316,17 +1334,15 @@ impl ExecutionCoordinator {
         // classification: the shards its outcome promises a bundle
         // to, if it issues anything. Only an issuing member issues;
         // a delivery and a reclaim promise nobody a bundle.
-        let targets: BTreeSet<ShardId> = match &member.request.runs {
-            Runs::Shape(shape) if shape.side() == Side::Issuing => crossings_of(
-                member.request.transaction.legs(),
-                member.request.transaction.crossings(),
-                shape.classified(),
-            )
-            .into_iter()
-            .filter(|edge| edge.from == local_shard)
-            .flat_map(|edge| edge.to)
-            .collect(),
-            Runs::Shape(_) | Runs::Reclaim { .. } | Runs::Retire { .. } => BTreeSet::new(),
+        let targets: BTreeSet<ShardId> = match &shape {
+            Some((shape, body)) if shape.side() == Side::Issuing => {
+                crossings_of(body.legs(), body.crossings(), shape.classified())
+                    .into_iter()
+                    .filter(|edge| edge.from == local_shard)
+                    .flat_map(|edge| edge.to)
+                    .collect()
+            }
+            _ => BTreeSet::new(),
         };
         state.record_crossing_targets(member.request.tx_hash, targets);
         self.ticks.assign_tx(member.request.tx_hash, tick_id);
@@ -1336,40 +1352,38 @@ impl ExecutionCoordinator {
         // that waits on what the core returns. Registered here, at the
         // issuing admission, so every replica composes it from the
         // same commit; it joins a later tick once its arrival lands.
-        if let Runs::Shape(shape) = &member.request.runs
+        if let Some((shape, body)) = &shape
             && shape.side() == Side::Issuing
             && shape.runs_both_sides()
         {
             self.provisioning.record_required(
                 member.request.tx_hash,
                 divided_requirements(
-                    member.request.transaction.legs(),
-                    member.request.transaction.crossings(),
+                    body.legs(),
+                    body.crossings(),
                     shape.classified(),
                     local_shard,
                     Side::Delivering,
                 ),
                 delivery_floor(
                     Side::Delivering,
-                    member
-                        .request
-                        .transaction
-                        .validity_range()
-                        .end_timestamp_exclusive,
+                    body.validity_range().end_timestamp_exclusive,
                 ),
             );
             self.candidates.register_delivery(
-                Arc::clone(&member.request.transaction),
+                Arc::clone(body),
                 reach,
                 member.request.clock,
                 shape.classified().clone(),
             );
         }
-        if member.request.abortable {
+        if let Some((_, body)) = &shape
+            && member.request.abortable
+        {
             ticked.legs.insert(member.request.tx_hash);
             ticked
                 .provisional_claims
-                .extend(member.request.transaction.routing().declared_modes.clone());
+                .extend(body.routing().declared_modes.clone());
         }
         requests.push(member.request);
     }

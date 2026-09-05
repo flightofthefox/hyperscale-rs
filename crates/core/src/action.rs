@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_engine::TickEnvironment;
-use hyperscale_engine::legs::Runs;
+use hyperscale_engine::legs::{Member, Runs};
 use hyperscale_storage::TickResolution;
 use hyperscale_types::{
     AbandonmentRecord, BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount,
@@ -33,8 +33,17 @@ use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
 pub struct CrossShardExecutionRequest {
     /// Transaction hash (for correlation).
     pub tx_hash: TxHash,
-    /// The transaction to execute.
-    pub transaction: Arc<Verified<Transaction>>,
+    /// The transaction to execute, or `None` where this shard holds no
+    /// body for it.
+    ///
+    /// A member running a shape always holds one. The two housekeeping
+    /// members read none — every cell they touch is named by the record
+    /// leaves `runs` carries — but they keep it where it is there,
+    /// because the price still follows the payer's vault and the vault
+    /// is the body's to name. `None` is a reshape successor's
+    /// housekeeping: its store arrives as a prefix of leaves, no body
+    /// arrives with it, and its predecessor's chain settled the price.
+    pub transaction: Option<Arc<Verified<Transaction>>>,
     /// State entries provisioned by other shards (one `Arc` per source shard
     /// contribution). Engine layers them on top of the local snapshot.
     pub provisions: Vec<Arc<Vec<SubstateEntry>>>,
@@ -73,6 +82,21 @@ pub struct CrossShardExecutionRequest {
     /// consume, read off the record cells they proved. Empty for a
     /// member that runs the whole shape.
     pub arrivals: Vec<EscrowedValue>,
+}
+
+impl CrossShardExecutionRequest {
+    /// The shape this member runs and the body it runs over, or `None`
+    /// for a housekeeping member.
+    ///
+    /// The pair travels together or not at all: `Runs::Shape` is the one
+    /// arm a body belongs to, and a reclaim or a retirement has neither.
+    #[must_use]
+    pub const fn shape(&self) -> Option<(&Member, &Arc<Verified<Transaction>>)> {
+        match (&self.runs, self.transaction.as_ref()) {
+            (Runs::Shape(member), Some(body)) => Some((member, body)),
+            _ => None,
+        }
+    }
 }
 
 /// A change to the local vnode's reshape-observer duty, carried on

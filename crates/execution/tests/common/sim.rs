@@ -443,15 +443,16 @@ impl ExecutionSim {
         let tick_id = TickId::new(self.local_shard, tick);
         let executed: Vec<ExecutedTx> = requests
             .iter()
-            .map(|request| {
-                stub_execute(
+            .filter_map(|request| {
+                let tx = request.transaction.as_ref()?;
+                Some(stub_execute(
                     &snapshot,
                     trie,
                     self.local_shard,
                     request.tx_hash,
-                    &request.transaction,
+                    tx,
                     request.abortable,
-                )
+                ))
             })
             .collect();
         let mut output = TickOutput::default();

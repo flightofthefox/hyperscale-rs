@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Epoch, EpochWindows, EscrowedValue, ProvisionalHolds, ShardId, ShardTrie, SubstateEntry,
-    TopologySnapshot, Transaction, Verified, WeightedTimestamp,
+    TopologySnapshot, Transaction, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::SeedWindow;
 
@@ -117,8 +117,14 @@ pub struct TickBatchContext<'a> {
 /// one batch, so the executor's canonical order and conflict groups
 /// sequence members across ticks.
 pub struct TickTxInput<'a> {
-    /// The transaction to execute.
-    pub transaction: &'a Arc<Verified<Transaction>>,
+    /// What names the member, and what its receipt is keyed by. Carried
+    /// rather than hashed off the body, because a housekeeping member
+    /// has no body: the record cell names the transaction that issued
+    /// the crossing, and that is the name its own receipt takes.
+    pub tx_hash: TxHash,
+    /// The transaction to execute, for a member that runs its shape.
+    /// `None` for a housekeeping member, whose cells `runs` names.
+    pub transaction: Option<&'a Arc<Verified<Transaction>>>,
     /// Verified provision entry lists, one per source shard contribution.
     /// Empty for a single-shard member.
     pub provisions: &'a [Arc<Vec<SubstateEntry>>],

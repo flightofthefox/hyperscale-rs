@@ -27,9 +27,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{Address, EscrowedValue, ShardId, ShardTrie};
 use hyperscale_vm_effects::{CrossingSite, StarShape, star_at};
-use hyperscale_vm_kernel::{
-    Crossed, Departure, ExecutionScope, LegPlan, PlanFault, Reclaim, Retire,
-};
+use hyperscale_vm_kernel::{Crossed, Departure, ExecutionScope, LegPlan, PlanFault};
 use hyperscale_vm_types::{Crossing, LegRole, LegShape, ProtocolHasher, SubstateKey};
 
 use crate::sharding::TrieShardResolver;
@@ -362,26 +360,30 @@ impl Member {
 }
 
 /// What a member runs of its transaction: the shape its committing
-/// block froze, or the reclaim of what a leg here issued.
+/// block froze, or housekeeping on the records a producer here left.
+///
+/// The two housekeeping arms name cells and not a manifest. That is what
+/// lets a shard holding the record and no body compose them — a reshape
+/// successor, whose store arrives as a prefix of leaves and whose ledger
+/// begins empty — and it is why neither carries the classification the
+/// shape arm does: the record leaf says which cells the member touches,
+/// and the transaction is a name on the receipt rather than an input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Runs {
     /// The transaction as classified at commit — whole, or the legs
     /// this shard's placement gives it on its side.
     Shape(Member),
     /// No node at all: the records of the crossings a producer here
-    /// issued, deleted on the evidence a committed record carries that
-    /// every consumer claimed them.
+    /// issued, deleted on the evidence that every consumer claimed them.
     Retire {
-        /// The classification the producer's committing block froze,
-        /// which the retirement reads its edges from.
-        classified: Classified,
+        /// The record cells to delete.
+        records: Vec<SubstateKey>,
     },
-    /// No node at all: the crossings an inbound leg here issued, taken
-    /// back on the evidence a committed record carries.
+    /// No node at all: the crossings a producer here issued, taken back
+    /// on the evidence that no consumer ever claimed them.
     Reclaim {
-        /// The classification the leg's committing block froze, which
-        /// the reclaim reads its edges and its scope from.
-        classified: Classified,
+        /// The record cells to credit back and delete.
+        records: Vec<SubstateKey>,
         /// Whether this shard's own certificate of the leg settled the
         /// price already. A leg that ran is determined, and burned it
         /// inside its writes at its own finalization; one that never ran
@@ -732,12 +734,6 @@ pub enum PlanDefect {
     /// This shard runs nothing of the transaction.
     #[error("this shard runs no leg of the transaction")]
     NotAParticipant,
-    /// This shard issued nothing it could take back.
-    #[error("this shard has no inbound crossing to reclaim")]
-    NothingToReclaim,
-    /// A retirement composed on a shard that issued nothing.
-    #[error("this shard issued nothing to retire")]
-    NothingToRetire,
     /// What the plan itself refuses: an edge acted on twice, an action
     /// disagreeing with who runs the node, or more crossings than one
     /// outcome can state a verdict for.
@@ -864,121 +860,77 @@ pub fn plan_for_shard(
     })
 }
 
-/// The plan that retires every record a producer here wrote for a
-/// consumer running elsewhere: no node, and each record deleted.
+/// Every record a producer here wrote for a consumer running elsewhere,
+/// in edge order.
 ///
-/// Composed only once a committed record says every such consumer
-/// claimed, so the plan names them all; which shards those were is the
-/// ledger's question, not this one's.
-///
-/// # Errors
-///
-/// [`PlanDefect`]: a crossing naming a node the legs do not have, or a
-/// shard that issued nothing to retire.
-pub fn retire_for_shard(
+/// What the retirement of this transaction deletes, once a committed
+/// record says every such consumer claimed. Which shards those were is
+/// the ledger's question, not this one's.
+#[must_use]
+pub fn records_to_retire(
     legs: &[LegShape],
     crossings: &[Crossing],
     classified: &Classified,
     local: ShardId,
-) -> Result<ShardPlan, PlanDefect> {
-    let star = Star::of(legs, classified);
-    let mut plan = LegPlan::whole(legs.len());
-    for node in 0..star.len() {
-        plan.skip(node)?;
-    }
-    let mut retired = false;
-    for crossing in crossings {
-        let producer = star.leg(crossing.node)?;
-        if star.role(crossing.node) == LegRole::Outbound || star.home(crossing.node) != local {
-            continue;
-        }
-        let Some(consumer) = star.consumer_of(crossing.node, crossing.output) else {
-            continue;
-        };
-        if star.running(consumer).contains(&local) {
-            continue;
-        }
-        let record = CrossingSite::record(
-            &ProtocolHasher,
-            producer.target,
-            producer.intent,
-            producer.local,
-            crossing.output,
-            producer.expiry_ms,
-        );
-        plan.retires(crossing.node, crossing.output, Retire { record })?;
-        retired = true;
-    }
-    if !retired {
-        return Err(PlanDefect::NothingToRetire);
-    }
-    Ok(ShardPlan {
-        legs: plan,
-        scope: star.scope_for(local),
-    })
+) -> Vec<SubstateKey> {
+    issued_from(legs, crossings, classified, local)
 }
 
-/// What `local` takes back of a transaction whose consumer will never
-/// claim it.
+/// Every record a producer here wrote whose consumer runs elsewhere, in
+/// edge order.
 ///
-/// Every crossing a node here issued to a consumer elsewhere, claimed by
-/// the producer's own target and credited to the cell its record names.
-/// An inbound leg's crossing is taken back when its core refuses or
-/// never answers; a core's, when the delivery it was issued to lapses.
-/// Both credit the cell the record names, so neither needs the body.
-///
-/// # Errors
-///
-/// [`PlanDefect`]: a crossing naming a node the legs do not have, or a
-/// shard that issued nothing it could take back.
-pub fn reclaim_for_shard(
+/// What the reclaim of this transaction credits back, once a committed
+/// record says no such consumer can still claim. An inbound leg's
+/// crossing is taken back when its core refuses or never answers; a
+/// core's, when the delivery it was issued to lapses. Both credit the
+/// cell the record names, so neither needs more than the key.
+#[must_use]
+pub fn records_to_reclaim(
     legs: &[LegShape],
     crossings: &[Crossing],
     classified: &Classified,
     local: ShardId,
-) -> Result<ShardPlan, PlanDefect> {
+) -> Vec<SubstateKey> {
+    issued_from(legs, crossings, classified, local)
+}
+
+/// The record cells this shard's producing nodes wrote for consumers
+/// running elsewhere.
+///
+/// One fold for both housekeeping members, because they name the same
+/// cells and differ only in what a committed record licensed doing with
+/// them.
+fn issued_from(
+    legs: &[LegShape],
+    crossings: &[Crossing],
+    classified: &Classified,
+    local: ShardId,
+) -> Vec<SubstateKey> {
     let star = Star::of(legs, classified);
-    let mut plan = LegPlan::whole(legs.len());
-    for node in 0..star.len() {
-        plan.skip(node)?;
-    }
-    let mut reclaimed = false;
-    for crossing in crossings {
-        let producer = star.leg(crossing.node)?;
-        if star.role(crossing.node) == LegRole::Outbound || star.home(crossing.node) != local {
-            continue;
-        }
-        let Some(consumer) = star.consumer_of(crossing.node, crossing.output) else {
-            continue;
-        };
-        if star.running(consumer).contains(&local) {
-            continue;
-        }
-        let claim = CrossingSite::claim(
-            &ProtocolHasher,
-            producer.target,
-            producer.intent,
-            producer.local,
-            crossing.output,
-            producer.expiry_ms,
-        );
-        plan.reclaims(
-            crossing.node,
-            crossing.output,
-            Reclaim {
-                record: crossing.record,
-                claim,
-            },
-        )?;
-        reclaimed = true;
-    }
-    if !reclaimed {
-        return Err(PlanDefect::NothingToReclaim);
-    }
-    Ok(ShardPlan {
-        legs: plan,
-        scope: star.scope_for(local),
-    })
+    crossings
+        .iter()
+        .filter_map(|crossing| {
+            let producer = star.leg(crossing.node).ok()?;
+            if star.role(crossing.node) == LegRole::Outbound || star.home(crossing.node) != local {
+                return None;
+            }
+            let consumer = star.consumer_of(crossing.node, crossing.output)?;
+            if star.running(consumer).contains(&local) {
+                return None;
+            }
+            Some(
+                CrossingSite::record(
+                    &ProtocolHasher,
+                    producer.target,
+                    producer.intent,
+                    producer.local,
+                    crossing.output,
+                    producer.expiry_ms,
+                )
+                .key(),
+            )
+        })
+        .collect()
 }
 
 /// The frozen star with the placement facts every question here reads:
@@ -1406,15 +1358,10 @@ mod tests {
         .expect("a core issues what it minted");
         assert!(venue.legs.departure(2, 0).is_some());
 
-        let reclaimed: Vec<((u32, u32), Reclaim)> =
-            reclaim_for_shard(&legs, &crossings, &divided, high())
-                .expect("the venue issued the return crossing")
-                .legs
-                .reclaimed()
-                .collect();
+        let reclaimed = records_to_reclaim(&legs, &crossings, &divided, high());
         assert_eq!(reclaimed.len(), 1);
-        assert_eq!(reclaimed[0].0, (2, 0));
-        assert_eq!(reclaimed[0].1.claim.key().owner, owner(0x33, true));
+        assert_eq!(reclaimed[0], crossings[1].record);
+        assert_eq!(reclaimed[0].owner, owner(0x33, true));
         assert_eq!(
             delivered_claims(&legs, &crossings, &divided, high())
                 .into_iter()
@@ -1473,21 +1420,19 @@ mod tests {
     fn a_reclaim_takes_back_the_inbound_crossing_alone() {
         let legs = swap();
         let crossings = vec![crossing(&legs, 1, 0), crossing(&legs, 2, 0)];
-        let caller = reclaim_for_shard(&legs, &crossings, &frozen(&legs), low())
-            .expect("the caller issued")
-            .legs;
-        let reclaimed: Vec<((u32, u32), Reclaim)> = caller.reclaimed().collect();
-        assert_eq!(reclaimed.len(), 1);
-        assert_eq!(reclaimed[0].0, (1, 0));
-        assert_eq!(reclaimed[0].1.record, crossings[0].record);
-        assert_eq!(reclaimed[0].1.claim.key().owner, owner(0x11, false));
-        assert!((0..4).all(|node| !caller.runs(node)));
+        let reclaimed = records_to_reclaim(&legs, &crossings, &frozen(&legs), low());
+        assert_eq!(
+            reclaimed.len(),
+            1,
+            "the venue's crossing is not the caller's"
+        );
+        assert_eq!(reclaimed[0], crossings[0].record);
+        assert_eq!(reclaimed[0].owner, owner(0x11, false));
 
         let legs = transfer();
         let crossings = vec![crossing(&legs, 1, 0)];
-        assert_eq!(
-            reclaim_for_shard(&legs, &crossings, &frozen(&legs), high()).err(),
-            Some(PlanDefect::NothingToReclaim),
+        assert!(
+            records_to_reclaim(&legs, &crossings, &frozen(&legs), high()).is_empty(),
             "the recipient's shard issued nothing"
         );
     }
@@ -1544,10 +1489,7 @@ mod tests {
             .err(),
             Some(PlanDefect::NotAParticipant),
         );
-        assert_eq!(
-            reclaim_for_shard(&legs, &crossings, &classified, high()).err(),
-            Some(PlanDefect::NothingToReclaim),
-        );
+        assert!(records_to_reclaim(&legs, &crossings, &classified, high()).is_empty());
     }
 
     /// An inbound leg on one shard of a multi-shard core is replicated

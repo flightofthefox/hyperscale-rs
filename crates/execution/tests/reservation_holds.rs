@@ -130,7 +130,7 @@ fn reserving_transaction(seed: u8) -> Arc<Verified<Transaction>> {
 fn request_for(tx: &Arc<Verified<Transaction>>) -> CrossShardExecutionRequest {
     CrossShardExecutionRequest {
         tx_hash: tx.hash(),
-        transaction: Arc::clone(tx),
+        transaction: Some(Arc::clone(tx)),
         provisions: Vec::new(),
         clock: WeightedTimestamp::from_millis(1_000),
         reaches_beyond: true,

@@ -14,6 +14,7 @@ use hyperscale_engine::genesis::{
 };
 use hyperscale_engine::legs::{
     Classified, Member, PlanDefect, Runs, Side, core_shards, crossings_of, plan_for_shard,
+    records_to_reclaim, records_to_retire,
 };
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
@@ -1327,7 +1328,8 @@ fn a_transfer_executes_divided_on_both_shards() {
             holds: &ProvisionalHolds::new(),
         };
         let input = TickTxInput {
-            transaction: &tx,
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
             reaches_beyond: true,
@@ -1423,7 +1425,8 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
             holds: &ProvisionalHolds::new(),
         };
         let input = TickTxInput {
-            transaction: &tx,
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
             reaches_beyond,
@@ -1459,7 +1462,7 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
     let reclaimed = run(
         &store,
         Runs::Reclaim {
-            classified,
+            records: records_to_reclaim(tx.legs(), tx.crossings(), &classified, near_shard),
             charged: true,
         },
         false,
@@ -1510,7 +1513,8 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
             holds: &ProvisionalHolds::new(),
         };
         let input = TickTxInput {
-            transaction: &tx,
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
             reaches_beyond,
@@ -1542,7 +1546,7 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
     let retired = run(
         &store,
         Runs::Retire {
-            classified: classified.clone(),
+            records: records_to_retire(tx.legs(), tx.crossings(), &classified, near_shard),
         },
         false,
     );
@@ -1559,7 +1563,13 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
         "and the value stays where the claim took it"
     );
 
-    let again = run(&store, Runs::Retire { classified }, false);
+    let again = run(
+        &store,
+        Runs::Retire {
+            records: records_to_retire(tx.legs(), tx.crossings(), &classified, near_shard),
+        },
+        false,
+    );
     assert!(
         matches!(again.consensus, ConsensusReceipt::Failed),
         "a second retirement finds no record and is refused: {:?}",
@@ -1594,13 +1604,19 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
             holds: &ProvisionalHolds::new(),
         };
         let input = TickTxInput {
-            transaction: &tx,
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
             reaches_beyond: false,
             abortable: false,
             runs: Runs::Reclaim {
-                classified: Classified::freeze(tx.legs(), tx.owners(), &trie),
+                records: records_to_reclaim(
+                    tx.legs(),
+                    tx.crossings(),
+                    &Classified::freeze(tx.legs(), tx.owners(), &trie),
+                    near_shard,
+                ),
                 charged,
             },
             arrivals: &[],
@@ -1662,7 +1678,8 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
             holds: &ProvisionalHolds::new(),
         };
         let input = TickTxInput {
-            transaction: &tx,
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
             reaches_beyond: true,
