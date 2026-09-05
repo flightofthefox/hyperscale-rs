@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arc_swap::ArcSwap;
 use hyperscale_hbor::from_slice as hbor_from_slice;
 use hyperscale_vm_effects::{
-    ChainRecords, ClaimCell, CommittedTxCell, Hasher, InstanceMeta, InstanceRegistry, Issuance,
-    MetadataCache, NullifierCell, PackageHash, PackageMetadata, ResourceMeta, Value,
-    committed_tx_key, escrow_claim_key, nullifier_key, package_hash,
+    ChainRecords, ClaimCell, CommittedTxCell, CrossingCell, Hasher, InstanceMeta, InstanceRegistry,
+    Issuance, MetadataCache, NullifierCell, PackageHash, PackageMetadata, ResourceMeta, Value,
+    committed_tx_key, escrow_claim_key, escrow_record_key, nullifier_key, package_hash,
 };
 use hyperscale_vm_types::{
     Address, CallTarget, ComponentAddr, LocalKey, ResourceAddr, SubstateKey, SweepBucket,
@@ -130,6 +130,23 @@ fn escrow_claim_expiry(owner: Address, local: [u8; 16], value: &[u8]) -> Option<
         cell.expiry_ms,
     );
     (key.local.0 == local).then_some(cell.expiry_ms)
+}
+
+/// Whether a committed cell is an escrow record.
+///
+/// Judged the way the three sweepable families are — the value
+/// re-derives the key under the record's own role — and answering a
+/// different question. A record's key carries no expiry bucket, which is
+/// what keeps every sweep off it, so this is the only thing that tells a
+/// reader holding the leaf that it is value the shard still owes an
+/// answer for.
+#[must_use]
+pub fn record_cell(owner: Address, local: [u8; 16], value: &[u8]) -> bool {
+    let Ok(cell) = hbor_from_slice::<CrossingCell>(value) else {
+        return false;
+    };
+    let key = escrow_record_key(&ProtocolHasher, owner, cell.intent, cell.local, cell.output);
+    key.local.0 == local
 }
 
 /// The instance a committed cell seals, or `None` for every other cell.

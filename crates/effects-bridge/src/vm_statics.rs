@@ -39,7 +39,8 @@ use hyperscale_vm_types::{
 use crate::ProtocolHasher;
 use crate::artifact::admit_package;
 use crate::records::{
-    InstanceCache, LocalCells, NodeRecords, PackageCache, committed_package, sweepable_cell,
+    InstanceCache, LocalCells, NodeRecords, PackageCache, committed_package, record_cell,
+    sweepable_cell,
 };
 
 /// The parties a transaction's routing declares beyond any node's
@@ -781,6 +782,10 @@ impl ProtocolStatics for BridgeStatics {
 
     fn sweepable_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> Option<u64> {
         sweepable_cell(Address::from_bytes(owner).ok()?, local, value)
+    }
+
+    fn record_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> bool {
+        Address::from_bytes(owner).is_ok_and(|owner| record_cell(owner, local, value))
     }
 
     fn rule_admits(

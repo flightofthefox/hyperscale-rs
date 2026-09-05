@@ -20,7 +20,8 @@ use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeK
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
     AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, SubstateStore, Substates, WitnessSeed,
-    entry_from_leaf, followed_block_writes, holds_state, package_of_cell, sweepable_expiry,
+    entry_from_leaf, followed_block_writes, holds_state, is_record_cell, package_of_cell,
+    sweepable_expiry,
 };
 use hyperscale_types::{Block, BlockHeight, ChainOrigin, StateRoot, SubstateKey, SubstateLeaf};
 use hyperscale_vm_types::{Address, CollectionId, SweepBucket};
@@ -541,6 +542,13 @@ impl Substates for CheckpointStore {
 impl BoundaryStore for RocksDbShardStorage {
     type Boundary = CheckpointStore;
 
+    fn escrow_records(&self) -> Vec<(SubstateKey, Vec<u8>)> {
+        let cf = self.cf();
+        iter_all::<StateCf>(&self.db, StateCf::handle(&cf))
+            .filter(|(key, value)| is_record_cell(*key, value))
+            .collect()
+    }
+
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
         self.checkpoints.create(height).map_err(|e| e.to_string())
     }
@@ -696,7 +704,8 @@ mod tests {
     use hyperscale_storage::test_helpers::{
         completed_import_progress, import_boundary_state, make_settled_writes,
         test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
-        test_boundary_unpinned_height_not_served, test_import_gate_reads_the_trie,
+        test_boundary_unpinned_height_not_served, test_escrow_records_are_read_off_the_state,
+        test_import_gate_reads_the_trie,
     };
     use hyperscale_storage::{BOUNDARY_RETAIN, SubstateStore};
     use hyperscale_types::AddressClass;
@@ -870,6 +879,17 @@ mod tests {
         let fresh_dir = TempDir::new().unwrap();
         let fresh = open_storage(fresh_dir.path());
         test_boundary_import_roundtrip(&storage, &fresh, |writes| storage.commit(writes).unwrap());
+    }
+
+    /// A store answers for the escrow records its state holds, which is
+    /// what a merge successor's adoption reads its obligations off.
+    #[test]
+    fn escrow_records_are_read_off_the_state() {
+        let temp = TempDir::new().unwrap();
+        let storage = open_storage(temp.path());
+        test_escrow_records_are_read_off_the_state(&storage, |writes| {
+            storage.commit(writes).unwrap();
+        });
     }
 
     #[test]

@@ -56,8 +56,8 @@ pub use shard::recovered_state::RecoveredState;
 pub use shard::store::{Anchored, SubstateStore, VersionedStore};
 pub use shard::sweep::{
     SweepIndex, block_settled_writes, committed_tx_cell_key, committed_tx_cells,
-    followed_block_writes, merge_sweep_overlay, sweep_for_block, sweep_through, sweepable_expiry,
-    with_sweep,
+    followed_block_writes, is_record_cell, merge_sweep_overlay, sweep_for_block, sweep_through,
+    sweepable_expiry, with_sweep,
 };
 pub use shard::tick_certs::{covers_strictly_more, widest_tick_copies};
 pub use shard::tick_chain::{

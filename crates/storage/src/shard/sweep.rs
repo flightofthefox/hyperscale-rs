@@ -46,6 +46,21 @@ pub fn sweepable_expiry(key: SubstateKey, value: &[u8]) -> Option<u64> {
     protocol_statics().sweepable_cell(key.owner.to_bytes(), key.local.0, value)
 }
 
+/// Whether a committed cell is an escrow record — value the shard holds
+/// for a crossing it issued.
+///
+/// The same seam as [`sweepable_expiry`] and its complement: a record is
+/// outside every sweep's reach by construction, so a store that inherits
+/// a prefix whole has nothing else to tell it that the leaf it just
+/// imported is an obligation. Lives here because both questions are the
+/// same question about a leaf — which family wrote it — asked of the one
+/// authority that can answer from the bytes.
+#[must_use]
+pub fn is_record_cell(key: SubstateKey, value: &[u8]) -> bool {
+    protocol_statics_installed()
+        && protocol_statics().record_cell(key.owner.to_bytes(), key.local.0, value)
+}
+
 /// Read access to the sweepable cells this store's committed state
 /// holds, in sweep order.
 ///

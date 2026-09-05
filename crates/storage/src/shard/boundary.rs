@@ -12,7 +12,7 @@
 use hyperscale_jmt::{Key, TreeReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHeight, ChainOrigin, ShardWitnessPayload, StateRoot,
-    SubstateLeaf,
+    SubstateKey, SubstateLeaf,
 };
 
 use crate::Substates;
@@ -256,4 +256,18 @@ pub trait BoundaryStore {
     /// The committed substate byte total at `version`, or `None` when the
     /// store's version line doesn't carry it.
     fn substate_bytes_at_version(&self, version: u64) -> Option<u64>;
+
+    /// Every escrow record the committed state holds, with its bytes.
+    ///
+    /// Derived on demand rather than indexed, because the state is the
+    /// authority and the one caller asks once: a reshape successor whose
+    /// adoption just filled its trie, and whose ledger begins empty
+    /// while the value its predecessors escrowed rides the prefix in.
+    /// Nothing else names those records — the row that would is the
+    /// predecessor's and is committed to nothing, and the cell is
+    /// outside every sweep's reach.
+    ///
+    /// A scan, and affordable for being one: it follows an import that
+    /// wrote every leaf it reads.
+    fn escrow_records(&self) -> Vec<(SubstateKey, Vec<u8>)>;
 }

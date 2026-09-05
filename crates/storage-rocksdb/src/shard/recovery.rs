@@ -108,6 +108,9 @@ impl RocksDbShardStorage {
             chain_origin,
             safe_vote_registers: self.load_safe_vote_registers(chain_origin),
             leg_entries: self.recovered_leg_entries(),
+            // Filled only by a reshape adoption, where a store inherits a
+            // prefix whole; an ordinary resume folds its own chain.
+            inherited_records: Vec::new(),
             voted_blocks: self.voted_blocks_above(committed_height),
         }
     }

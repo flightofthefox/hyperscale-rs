@@ -10,7 +10,7 @@
 //! rather than re-deriving any part of it.
 
 use hyperscale_storage::{AdoptSource, BoundaryStore, RecoveredState};
-use hyperscale_types::{Block, ChainOrigin, PredecessorTerminal, StateRoot};
+use hyperscale_types::{Block, ChainOrigin, PredecessorTerminal, StateRoot, SubstateKey};
 
 use super::orchestrator::AdoptKind;
 
@@ -52,12 +52,26 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
     let substate_bytes = storage
         .substate_bytes_at_version(origin.genesis_height.inner())
         .unwrap_or(0);
+    // A merged parent's store is opened fresh and filled by an import,
+    // so the value its predecessors escrowed arrives with the prefix and
+    // the rows naming it do not. Read the records off the state, which
+    // is the authority and is what every keeper imported.
+    //
+    // The split kinds take nothing: their store is a clone of the
+    // predecessor's and carries its ledger, and a child deriving
+    // obligations its clone-seeded peers already hold as rows would
+    // compose them twice.
+    let inherited_records = match kind {
+        AdoptKind::Merge => storage.escrow_records(),
+        AdoptKind::Split | AdoptKind::ParentHalf => Vec::new(),
+    };
     verified_recovered_state(
         adopted,
         genesis.header().state_root(),
         origin,
         substate_bytes,
         predecessors,
+        inherited_records,
     )
 }
 
@@ -72,6 +86,7 @@ fn verified_recovered_state(
     origin: ChainOrigin,
     substate_bytes: u64,
     predecessors: Vec<PredecessorTerminal>,
+    inherited_records: Vec<(SubstateKey, Vec<u8>)>,
 ) -> Result<RecoveredState, String> {
     if adopted != expected {
         return Err(format!(
@@ -82,6 +97,7 @@ fn verified_recovered_state(
         substate_bytes,
         chain_origin: origin,
         predecessors,
+        inherited_records,
         ..RecoveredState::default()
     })
 }
@@ -103,7 +119,8 @@ mod tests {
     fn matching_root_yields_the_seat_state() {
         let root = StateRoot::from_raw(Hash::from_bytes(b"adopted"));
         let recovered =
-            verified_recovered_state(root, root, origin(), 4_096, Vec::new()).expect("matches");
+            verified_recovered_state(root, root, origin(), 4_096, Vec::new(), Vec::new())
+                .expect("matches");
         assert_eq!(recovered.substate_bytes, 4_096);
         assert_eq!(recovered.chain_origin, origin());
     }
@@ -112,6 +129,9 @@ mod tests {
     fn diverged_root_fails_closed() {
         let adopted = StateRoot::from_raw(Hash::from_bytes(b"adopted"));
         let expected = StateRoot::from_raw(Hash::from_bytes(b"beacon"));
-        assert!(verified_recovered_state(adopted, expected, origin(), 0, Vec::new()).is_err());
+        assert!(
+            verified_recovered_state(adopted, expected, origin(), 0, Vec::new(), Vec::new())
+                .is_err()
+        );
     }
 }

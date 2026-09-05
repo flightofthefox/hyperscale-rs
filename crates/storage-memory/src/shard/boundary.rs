@@ -13,8 +13,8 @@ use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
     AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, SubstateStore, Substates,
-    WitnessSeed, entry_from_leaf, followed_block_writes, holds_state, package_of_cell,
-    sweepable_expiry,
+    WitnessSeed, entry_from_leaf, followed_block_writes, holds_state, is_record_cell,
+    package_of_cell, sweepable_expiry,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryKey, StateRoot, SubstateKey, SubstateLeaf,
@@ -94,6 +94,15 @@ impl Substates for SimBoundary {
 
 impl BoundaryStore for SimShardStorage {
     type Boundary = SimBoundary;
+
+    fn escrow_records(&self) -> Vec<(SubstateKey, Vec<u8>)> {
+        read_or_recover(&self.state)
+            .current_state
+            .iter()
+            .filter(|(key, value)| is_record_cell(**key, value))
+            .map(|(key, value)| (*key, value.clone()))
+            .collect()
+    }
 
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
         let mut pins = write_or_recover(&self.boundary_pins);
@@ -276,7 +285,7 @@ mod tests {
     use hyperscale_storage::test_helpers::{
         block_settling, make_settled_writes, make_state_writes, test_boundary_import_roundtrip,
         test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
-        test_import_gate_reads_the_trie,
+        test_escrow_records_are_read_off_the_state, test_import_gate_reads_the_trie,
     };
     use hyperscale_storage::{SubstateStore, Substates, committed_tx_cell_key};
     use hyperscale_types::test_utils::{
@@ -397,6 +406,16 @@ mod tests {
         let storage = SimShardStorage::default();
         let fresh = SimShardStorage::default();
         test_boundary_import_roundtrip(&storage, &fresh, |writes| storage.commit_shared(writes));
+    }
+
+    /// A store answers for the escrow records its state holds, which is
+    /// what a merge successor's adoption reads its obligations off.
+    #[test]
+    fn escrow_records_are_read_off_the_state() {
+        let storage = SimShardStorage::default();
+        test_escrow_records_are_read_off_the_state(&storage, |writes| {
+            storage.commit_shared(writes);
+        });
     }
 
     #[test]

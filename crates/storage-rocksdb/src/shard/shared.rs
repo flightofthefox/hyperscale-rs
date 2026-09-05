@@ -178,6 +178,10 @@ impl TreeReader for SharedStorage {
 impl BoundaryStore for SharedStorage {
     type Boundary = super::checkpoints::CheckpointStore;
 
+    fn escrow_records(&self) -> Vec<(SubstateKey, Vec<u8>)> {
+        self.0.escrow_records()
+    }
+
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
         self.0.pin_boundary(height)
     }

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use hyperscale_hbor::from_slice;
 use hyperscale_jmt::{KEY_BYTES, TreeReader};
 use hyperscale_types::test_utils::{
-    install_stub_protocol_statics, make_finalization, make_leg_finalization, stub_sweepable_cell,
-    test_transaction,
+    install_stub_protocol_statics, make_finalization, make_leg_finalization, stub_record_cell,
+    stub_sweepable_cell, test_transaction,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock,
@@ -1179,6 +1179,62 @@ where
     assert!(
         import_boundary_state(born, BlockHeight::new(6), &[], WitnessSeed::default()).is_err(),
         "the gate must not read the committed height"
+    );
+}
+
+/// Shared serve → import round trip: leaves enumerated and resolved
+/// from `serving`'s pinned boundary rebuild an identical store in
+/// `fresh`, with the raw substates readable and a second import
+/// rejected.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+/// Shared boundary test: a store answers for the escrow records its
+/// committed state holds, and for nothing else.
+///
+/// Read off the state rather than an index, which is why it does not
+/// matter how the cells arrived — a commit here, an import at a reshape
+/// successor's adoption. The one caller is that adoption, whose ledger
+/// begins empty while the value its predecessors escrowed rides the
+/// prefix in.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_escrow_records_are_read_off_the_state<S>(storage: &S, commit: impl Fn(&SettledWrites))
+where
+    S: BoundaryStore,
+{
+    install_stub_protocol_statics();
+    assert!(
+        storage.escrow_records().is_empty(),
+        "a store holding nothing owes nothing",
+    );
+
+    commit(&make_settled_writes(1, 1, vec![9, 9, 9]));
+    assert!(
+        storage.escrow_records().is_empty(),
+        "an ordinary cell is not a record, wherever it sits",
+    );
+
+    let record = state_key(2, 2);
+    commit(&SettledWrites::from_absolutes(BTreeMap::from([(
+        record,
+        Some(stub_record_cell(7)),
+    )])));
+    assert_eq!(
+        storage.escrow_records(),
+        vec![(record, stub_record_cell(7))],
+        "a record reads back with the bytes a reclaim composes from",
+    );
+
+    commit(&SettledWrites::from_absolutes(BTreeMap::from([(
+        record, None,
+    )])));
+    assert!(
+        storage.escrow_records().is_empty(),
+        "a record taken back is no longer owed",
     );
 }
 

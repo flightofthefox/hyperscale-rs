@@ -7,7 +7,7 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, CommittedTip,
     Hash, LegEntry, PredecessorTerminal, Provisions, QuorumCertificate, SafeVoteRegisters,
-    ShardAnchor, StateRoot, Transaction, ValidatorId, Verified, WeightedTimestamp,
+    ShardAnchor, StateRoot, SubstateKey, Transaction, ValidatorId, Verified, WeightedTimestamp,
 };
 
 use super::dedup_window::DedupWindow;
@@ -175,6 +175,24 @@ pub struct RecoveredState {
     /// member for it.
     pub leg_entries: Vec<(LegEntry, Transaction)>,
 
+    /// The escrow records this store inherited with a prefix it adopted
+    /// whole, and their committed bytes, for the cells that are still
+    /// live.
+    ///
+    /// A successor's ledger is a fold over its own chain, which begins
+    /// empty, while the value its predecessors escrowed rides the prefix
+    /// into it. Nothing else names those records: the row that would is
+    /// the predecessor's and is committed to nothing, and the cell is
+    /// outside every sweep's reach. So the adoption writes down what it
+    /// imported, from the leaves it wrote — the same argument the sweep
+    /// index's rebuild makes, and the same authority.
+    ///
+    /// Empty everywhere but a reshape successor's adoption. An ordinary
+    /// snap-sync joins a chain whose members hold the ledger, and a
+    /// joiner deriving obligations they do not would compose a tick they
+    /// cannot sign.
+    pub inherited_records: Vec<(SubstateKey, Vec<u8>)>,
+
     /// The uncommitted blocks the store kept beside the safe-vote
     /// registers, above the committed tip and in height order.
     ///
@@ -254,6 +272,7 @@ impl RecoveredState {
             },
             safe_vote_registers: BTreeMap::new(),
             leg_entries: Vec::new(),
+            inherited_records: Vec::new(),
             voted_blocks: Vec::new(),
         }
     }
