@@ -16,10 +16,11 @@ use std::time::Duration;
 
 use hyperscale_engine::XRD;
 use hyperscale_types::{
-    Address, ResourceAddr, SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    Address, ResourceAddr, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision,
+    TransactionStatus, TxHash,
 };
 
-use super::query::{assert_a_full_block_fits, declared_price, held, held_at, owning_shard};
+use super::query::{MAX_SEARCHED_DEPTH, assert_a_full_block_fits, declared_price, held, held_at};
 use super::tx::{recipient, sender};
 use super::{Budget, Cluster};
 
@@ -236,7 +237,7 @@ impl Charges {
     }
 
     /// Whether a receipt for `hash` has committed: a decision either way,
-    /// or an abort the payer's own chain finalized.
+    /// or an abort a chain that held the payer's prefix finalized.
     fn is_charged<C: Cluster + ?Sized>(&self, c: &C, hash: TxHash) -> bool {
         match c.tx_status(hash) {
             Some(TransactionStatus::Completed(TransactionDecision::Aborted)) => {
@@ -248,7 +249,8 @@ impl Charges {
                     .expect("a scenario fixture decodes")
                     .fee_payer
                     .address();
-                let finalized = c.chain_fate(owning_shard(c, payer), hash).1.is_some();
+                let finalized =
+                    covering_chains(payer).any(|shard| c.chain_fate(shard, hash).1.is_some());
                 if finalized {
                     self.finalized_aborts.borrow_mut().insert(hash);
                 }
@@ -263,4 +265,17 @@ impl Charges {
             | None => false,
         }
     }
+}
+
+/// Every chain that could have held `payer`'s prefix — one per depth,
+/// which is the line the prefix travels as the trie grows and shrinks.
+///
+/// The price of an abort is settled on the chain that held the payer
+/// when the abort finalized, which after a reshape is not the chain that
+/// holds it now: a split's parent and a merge's children keep serving
+/// their frozen stores, so the finalization stays readable where it was
+/// written while the beacon's live partition no longer names them. A
+/// depth no chain ever existed at answers nothing, so asking is inert.
+fn covering_chains(payer: Address) -> impl Iterator<Item = ShardId> {
+    (0..=MAX_SEARCHED_DEPTH).map(move |depth| ShardTrie::uniform(depth).shard_for_prefix(payer))
 }

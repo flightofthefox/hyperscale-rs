@@ -22,7 +22,7 @@ use super::Cluster;
 
 /// The deepest leaf [`served_shards`] looks for. A scenario that grows or
 /// splits reaches depth two; nothing here goes deeper.
-const MAX_SEARCHED_DEPTH: u32 = 3;
+pub(crate) const MAX_SEARCHED_DEPTH: u32 = 3;
 
 /// What a scenario transaction is charged, whatever refuses it.
 ///
