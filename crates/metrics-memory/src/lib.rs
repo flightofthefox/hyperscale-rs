@@ -271,6 +271,10 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("reclaims_admitted", None, 1);
     }
 
+    fn record_verdict_claim_deferred(&self) {
+        self.inc("verdict_claims_deferred", None, 1);
+    }
+
     // ── Sync ─────────────────────────────────────────────────────────
 
     fn set_sync_blocks_behind(&self, kind: &str, shard: u64, blocks_behind: u64) {

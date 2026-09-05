@@ -160,6 +160,9 @@ pub struct Metrics {
     /// Reclaims admitted into a tick — escrowed value taken back on
     /// committed evidence.
     pub reclaims_admitted: Counter,
+    /// Votes withheld because a block's verdict claim names a
+    /// certificate this validator does not hold.
+    pub verdict_claims_deferred: Counter,
 
     // === Network class accounting ===
     /// Per-class in-flight request slot count.
@@ -766,6 +769,12 @@ impl Metrics {
             )
             .unwrap(),
 
+            verdict_claims_deferred: register_counter!(
+                "hyperscale_verdict_claims_deferred_total",
+                "Votes withheld on a verdict claim whose certificate this validator lacks"
+            )
+            .unwrap(),
+
             request_slots_in_flight: register_gauge_vec!(
                 "hyperscale_request_slots_in_flight",
                 "In-flight request slots, broken down by message class",
@@ -1078,6 +1087,10 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_reclaim_admitted(&self) {
         self.metrics.reclaims_admitted.inc();
+    }
+
+    fn record_verdict_claim_deferred(&self) {
+        self.metrics.verdict_claims_deferred.inc();
     }
 
     fn set_request_slots_in_flight(&self, class: &str, count: usize) {
