@@ -997,6 +997,22 @@ impl<S: SubstateStore + VersionedStore + SweepIndex> SweepIndex for SubstateView
         // removal the chain owes goes unmade; a cell one retired reads
         // as live, so a removal is made twice and the second lands on a
         // key the tree no longer holds.
+        //
+        // The merge only closes the gap in one direction. The base's
+        // index answers at whatever the store has persisted, and the
+        // overlay carries the blocks from there up to the anchor — so a
+        // store *ahead* of the anchor by blocks the overlay does not hold
+        // has already retired rows this walk would still be told about,
+        // and the removal set comes out wrong. Refused here rather than
+        // computed: the alternative is a state root that differs from
+        // every peer's, which the commit path answers with the same
+        // fatality one block later and without naming the cause.
+        assert!(
+            self.base.jmt_height() <= self.anchor_height,
+            "BFT CRITICAL: a sweep walk anchored at {} reads an index persisted to {}",
+            self.anchor_height.inner(),
+            self.base.jmt_height().inner(),
+        );
         merge_sweep_overlay(
             |widened| self.base.sweep_candidates(frontier, ceiling, widened),
             self.pending_snapshots(),
@@ -1174,6 +1190,9 @@ mod tests {
         /// this to assert that `view_at(hash, height)` anchors base reads
         /// at the supplied height rather than the live JMT tip.
         recorded_snapshot_at: Mutex<Vec<BlockHeight>>,
+        /// What the store has persisted, for the sweep walk's guard —
+        /// the one question that compares the base against the anchor.
+        persisted: BlockHeight,
     }
 
     impl StubStore {
@@ -1236,7 +1255,7 @@ mod tests {
             StubSnapshot
         }
         fn jmt_height(&self) -> BlockHeight {
-            BlockHeight::GENESIS
+            self.persisted
         }
         fn state_root(&self) -> StateRoot {
             StateRoot::ZERO
@@ -1258,6 +1277,11 @@ mod tests {
             None
         }
     }
+
+    /// The empty index: what a store with nothing sweepable answers, and
+    /// enough for the walk's own guard, which reads the heights and not
+    /// the rows.
+    impl SweepIndex for StubStore {}
 
     impl VersionedStore for StubStore {
         fn retention_floor(&self) -> u64 {
@@ -2256,5 +2280,39 @@ mod tests {
         );
         // Back below the memo's coverage: full recompute, no leak of block 4.
         assert_eq!(at(3), BTreeSet::from([settled_tx(&w2), settled_tx(&w3)]));
+    }
+
+    /// The sweep walk merges a base index answering at what the store has
+    /// persisted with an overlay covering the blocks above it. A store
+    /// already ahead of the anchor has retired rows the base would still
+    /// report and the overlay does not carry, so the removal set comes
+    /// out wrong — refused here rather than computed into a state root
+    /// nobody else reaches.
+    #[test]
+    #[should_panic(expected = "a sweep walk anchored at")]
+    fn a_sweep_walk_refuses_an_index_ahead_of_its_anchor() {
+        let store = Arc::new(StubStore {
+            persisted: BlockHeight::new(9),
+            ..StubStore::default()
+        });
+        let view = SubstateView::base_only(store, BlockHeight::new(4));
+        let ceiling = SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(u64::MAX));
+        let _ = view.sweep_candidates(SweepFrontier::ZERO, ceiling, 10);
+    }
+
+    /// A store behind the anchor is what the overlay is for, and the walk
+    /// runs.
+    #[test]
+    fn a_sweep_walk_runs_where_the_overlay_covers_the_gap() {
+        let store = Arc::new(StubStore {
+            persisted: BlockHeight::new(4),
+            ..StubStore::default()
+        });
+        let view = SubstateView::base_only(store, BlockHeight::new(9));
+        let ceiling = SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(u64::MAX));
+        assert!(
+            view.sweep_candidates(SweepFrontier::ZERO, ceiling, 10)
+                .is_empty()
+        );
     }
 }
