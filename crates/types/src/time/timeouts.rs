@@ -97,22 +97,19 @@ const _: () = assert!(
     "the dedup walk covers every tier of the index it rebuilds",
 );
 
-/// How long a leg is still reported after its deadline.
+/// How long a leg entry stands past its deadline.
 ///
 /// The room a reclaim of what its deliveries never claimed needs: one
 /// validity range to the lapse, and one more for the reclaim to commit.
 /// Past it no evidence that could decide the leg survives — the claim
-/// cell it would be proved against is swept — so the mempool stops
-/// answering for one nothing has decided.
-///
-/// It does not bound the ledger's own leg entry, which stands until the
-/// record it would take back is consumed.
+/// cell both its members are proved against is swept — so the ledger
+/// drops the entry and the mempool stops answering for it.
 pub const LEG_ENTRY_HORIZON: Duration = Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() * 2);
 
-/// The moment a leg stops being answered for: [`LEG_ENTRY_HORIZON`]
-/// past the transaction's deadline.
+/// The moment a leg entry goes: [`LEG_ENTRY_HORIZON`] past the
+/// transaction's deadline.
 ///
-/// That is where the claim cell a lapse would be proved against is
+/// That is where the claim cell both its members are proved against is
 /// swept, so past it no evidence that could decide the leg can still be
 /// taken.
 #[must_use]

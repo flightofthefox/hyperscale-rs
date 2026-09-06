@@ -1396,10 +1396,10 @@ impl UnresolvedTxs {
     ///
     /// A leg entry has a clock of its own, and it is the transaction's:
     /// `deadline + 2 * MAX_VALIDITY_RANGE`, which is the validity end plus
-    /// the escrow grace — the moment the record cell it would reclaim
-    /// sweeps, one validity range past the lapse a delivery's absence is
-    /// proved at, so a lapse proved at the earliest has a validity range
-    /// to become a committed reclaim. Past it there is nothing to take
+    /// the escrow grace — the moment the claim cell both its members are
+    /// proved against sweeps, one validity range past the lapse a
+    /// delivery's absence is proved at, so a lapse proved at the earliest
+    /// has a validity range to become a committed reclaim. Past it there is nothing to take
     /// back, whatever evidence arrives, so the entry goes on that reading
     /// alone. Dropping gives a reclaim up; it never licenses one. A
     /// record's evidence does not extend it, and no counterpart's silence
@@ -1418,20 +1418,13 @@ impl UnresolvedTxs {
             std::mem::take(&mut self.owed)
                 .into_iter()
                 .partition(|(tx_hash, owed)| {
-                    // A leg entry stands until the record it would take
-                    // back is consumed, and a record is retired on a
-                    // counterpart's evidence rather than on a clock — so
-                    // nothing here reads a clock for one. What ends it is
-                    // the finalization that decides it: the reclaim's, the
-                    // retirement's, or a failed leg's own.
-                    //
-                    // Except one rebuilt from a record, which holds no body
-                    // and so can compose neither member. It stands for the
-                    // abandonable set alone, and once nothing can still name
-                    // it there is nothing left for it to stand for.
+                    // A leg entry goes at its horizon, where the claim
+                    // cell both its members are proved against is swept:
+                    // past it neither the reclaim nor the retirement can
+                    // be composed, whatever evidence lands. Short of it
+                    // only the finalization that decides it ends it.
                     if owed.kind.is_leg() {
-                        return self.kept.contains_key(tx_hash)
-                            || leg_entry_horizon(owed.deadline) > now;
+                        return leg_entry_horizon(owed.deadline) > now;
                     }
                     if let Some(shard) = owed.unsettled_by {
                         if self.departed.get(&shard).is_some_and(|departure| {
@@ -2659,15 +2652,14 @@ mod tests {
         assert_eq!(ledger.len(), 0, "gone at its horizon");
     }
 
-    /// A leg entry outlives every clock: the record it would take back
-    /// is retired on a counterpart's evidence, so a counterpart silent
-    /// for a day leaves both standing for a day. Only the finalization
-    /// that decides the transaction ends it.
+    /// A leg entry dies where its evidence does: at its horizon the claim
+    /// cell both its members are proved against is swept, so neither the
+    /// reclaim nor the retirement can be composed past it, whatever a
+    /// record says. Short of it only the finalization that decides it
+    /// ends it, and a record covering it neither extends nor shortens it.
     #[test]
-    fn a_leg_entry_outlives_every_clock() {
-        let far_past_any_horizon = ms(60_000)
-            .plus(MAX_FINALIZATION_DELAY)
-            .plus(MAX_VALIDITY_RANGE * 20);
+    fn a_leg_entry_dies_where_its_evidence_does() {
+        let horizon = leg_entry_horizon(ms(60_000).plus(MAX_FINALIZATION_DELAY));
         for covered in [false, true] {
             let mut ledger = UnresolvedTxs::default();
             let tx = tx(5, 60_000);
@@ -2681,20 +2673,24 @@ mod tests {
                     [names(&tx)],
                 )]);
             }
-            assert!(ledger.prune(far_past_any_horizon).is_empty());
+            assert!(
+                ledger
+                    .prune(horizon.minus(Duration::from_millis(1)))
+                    .is_empty()
+            );
             assert_eq!(
                 ledger.len(),
                 1,
-                "covered={covered}: it stands, and leaks no reservation standing"
+                "covered={covered}: it stands short of its horizon"
             );
-
-            let reclaim =
-                make_finalization(BlockHeight::new(9), tx.hash(), TransactionDecision::Aborted);
-            ledger.release_resolved(&[Arc::new(Verifiable::from(reclaim))]);
-            assert_eq!(
-                ledger.len(),
-                0,
-                "covered={covered}: the finalization that decides it is what ends it"
+            assert!(
+                ledger.prune(horizon).is_empty(),
+                "covered={covered}: and leaks no reservation going"
+            );
+            assert_eq!(ledger.len(), 0, "covered={covered}: gone at its horizon");
+            assert!(
+                ledger.kept.is_empty(),
+                "covered={covered}: and the body goes with it"
             );
         }
     }
