@@ -21,10 +21,10 @@ use hyperscale_types::{
     FinalizationHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
     MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr, Probed, ProposerTimestamp,
     ProvenAnchor, ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger,
-    Resolutions, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary,
-    StateProofBundle, StoredReceipt, SubstateKey, TxClaim, TxOutcome, UnsettledTx, VerdictClaim,
-    WeightedTimestamp, WorkInFlight, derive_reshape_trigger, lapse_probe_ceiling, licenses,
-    ready_signal_window, settled_set_verdict,
+    Resolutions, ScheduleLookup, SettledSetVerdict, ShardId, SplitAtBoundary, StateProofBundle,
+    StoredReceipt, SubstateKey, TxClaim, TxOutcome, UnsettledTx, VerdictClaim, WeightedTimestamp,
+    WorkInFlight, derive_reshape_trigger, lapse_probe_ceiling, licenses, ready_signal_window,
+    settled_set_verdict,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -452,19 +452,6 @@ pub struct ShardCoordinator {
     /// predates the cut.
     precut: Precut,
 
-    /// Settled-tick sets for shards that have terminated at a split,
-    /// keyed by the terminated shard. The split-boundary fence consults
-    /// this when voting on a block whose finalizations carry a
-    /// certificate from a past-terminal shard: a cross-shard tick names
-    /// that shard, so the vote may only commit if the shard actually
-    /// settled the tick. Populated by the settled-transaction acquisition via
-    /// [`Self::record_settled_txs`].
-    settled_sets: HashMap<ShardId, SettledTxSet>,
-    /// What this shard's own ledger says each departed shard was party
-    /// to, mirrored beside its settled set: a departure record may name
-    /// only these, since a record naming a stranger would abandon — and
-    /// charge, and reclaim — business the departed shard never had here.
-    departure_parties: HashMap<ShardId, BTreeSet<TxHash>>,
     /// What counterparts have said about the transactions legs here
     /// issued for, as the execution coordinator mirrored and folded
     /// them: a core's refusal, a proved absence, a consumer's claim.
@@ -671,10 +658,8 @@ impl ShardCoordinator {
             local_shard,
             chain_origin: recovered.chain_origin,
             precut: Precut::succeeding(recovered.predecessors),
-            settled_sets: HashMap::new(),
             evidence: Arc::new(CounterpartMirror::new()),
             proven_anchors: Arc::new(ProvenAnchors::new()),
-            departure_parties: HashMap::new(),
         }
     }
 
@@ -953,23 +938,6 @@ impl ShardCoordinator {
             && self.now.as_millis() < window_start.as_millis()
     }
 
-    /// Record a terminated shard's settled-transaction set for the
-    /// split-boundary fence. A one-shot acquisition fetches the complete
-    /// window list and verifies it against the beacon-attested
-    /// `settled_txs_root` before feeding it here; voting on a block
-    /// whose finalizations name `shard` then resolves against the set
-    /// instead of deferring. Pair with [`Self::redrive_pending_votes`] to
-    /// re-drive votes that deferred at the fence before the set was known.
-    pub fn record_settled_txs(
-        &mut self,
-        shard: ShardId,
-        settled: SettledTxSet,
-        parties: BTreeSet<TxHash>,
-    ) {
-        self.settled_sets.insert(shard, settled);
-        self.departure_parties.insert(shard, parties);
-    }
-
     /// Mirror a commit-proven remote header for everything that asks
     /// whether this node has proven a counterpart's height.
     pub fn record_proven_anchor(
@@ -996,21 +964,15 @@ impl ShardCoordinator {
         &self.proven_anchors
     }
 
-    /// Drop settled-transaction sets past their evidence window. Once the
-    /// committed chain advances beyond it, the fence rejects any tick
-    /// naming the shard regardless of the set, so retaining it only leaks
-    /// memory.
-    fn gc_settled_sets(&mut self, topology_schedule: &TopologySchedule) {
-        let now = self.committed_block_anchor_wt;
-        self.settled_sets
-            .retain(|shard, _| topology_schedule.terminal_evidence_readable(*shard, now));
-        self.departure_parties
-            .retain(|shard, _| topology_schedule.terminal_evidence_readable(*shard, now));
-        // What counterparts said is retired by the execution
-        // coordinator, against the ledger the evidence speaks for.
-        // An anchor lives as long as a probe can be taken against it.
-        // One retirement for both consumers, since there is one mirror.
-        self.proven_anchors.retire_below(now);
+    /// Retire the commit-proven anchors nothing can probe against any
+    /// more. One retirement for both consumers, since there is one
+    /// mirror.
+    ///
+    /// What counterparts said is retired by the execution coordinator
+    /// instead, against the ledger its entries speak for.
+    fn retire_proven_anchors(&self) {
+        self.proven_anchors
+            .retire_below(self.committed_block_anchor_wt);
     }
 
     /// Whether the block's state proofs name anchors this voter can
@@ -1137,12 +1099,12 @@ impl ShardCoordinator {
         }
     }
 
-    /// The settled-transaction set this validator has acquired for a terminated
-    /// shard, or `None` if it hasn't yet. The acquisition host populates
-    /// it; a test or RPC reads it to observe that the acquisition ran.
+    /// Whether this validator has acquired the settled-transaction set
+    /// for a terminated shard. The acquisition host fills the mirror; a
+    /// test or RPC reads this to observe that it ran.
     #[must_use]
-    pub fn settled_set(&self, shard: ShardId) -> Option<&SettledTxSet> {
-        self.settled_sets.get(&shard)
+    pub fn holds_settled_set(&self, shard: ShardId) -> bool {
+        self.evidence.with_settled(|sets| sets.contains_key(&shard))
     }
 
     /// Re-drive the vote path for every pending complete block. Called
@@ -1205,13 +1167,15 @@ impl ShardCoordinator {
                     .map(move |outcome| (shard, outcome.tx_hash(), TxClaim::Settled))
             })
         });
-        settled_set_verdict(
-            &self.settled_sets,
-            topology_schedule,
-            self.local_shard,
-            anchored_wt,
-            outcomes,
-        )
+        self.evidence.with_settled(|settled| {
+            settled_set_verdict(
+                settled,
+                topology_schedule,
+                self.local_shard,
+                anchored_wt,
+                outcomes,
+            )
+        })
     }
 
     /// Whether the block abandons a transaction some terminated shard
@@ -1239,7 +1203,7 @@ impl ShardCoordinator {
     /// gate defers until the set answers, so an honest proposer offers no
     /// abandonment this scan has yet to see the evidence for.
     fn abandons_a_settled_tx(&self, block: &Block) -> bool {
-        if self.settled_sets.is_empty() {
+        if self.evidence.with_settled(HashMap::is_empty) {
             return false;
         }
         block.certificates().iter().any(|fw| {
@@ -1256,9 +1220,9 @@ impl ShardCoordinator {
                 .map(TxOutcome::tx_hash)
                 .filter(|tx_hash| !attested_remotely.contains(tx_hash))
                 .any(|tx_hash| {
-                    self.settled_sets
-                        .values()
-                        .any(|settled| settled.txs.contains(&tx_hash))
+                    self.evidence.with_settled(|sets| {
+                        sets.values().any(|settled| settled.txs.contains(&tx_hash))
+                    })
                 })
         })
     }
@@ -1336,7 +1300,14 @@ impl ShardCoordinator {
                     );
                     return false;
                 }
-                let Some(parties) = self.departure_parties.get(&verdict.shard()) else {
+                let named = self.evidence.with_parties(verdict.shard(), |parties| {
+                    parties.map(|parties| {
+                        verdict
+                            .tx_hashes()
+                            .find(|tx_hash| !parties.contains(tx_hash))
+                    })
+                });
+                let Some(stranger) = named else {
                     trace!(
                         validator = ?self.me,
                         block_hash = ?block_hash,
@@ -1345,10 +1316,7 @@ impl ShardCoordinator {
                     );
                     return false;
                 };
-                if let Some(stranger) = verdict
-                    .tx_hashes()
-                    .find(|tx_hash| !parties.contains(tx_hash))
-                {
+                if let Some(stranger) = stranger {
                     warn!(
                         validator = ?self.me,
                         block_hash = ?block_hash,
@@ -1597,13 +1565,15 @@ impl ShardCoordinator {
                     .tx_hashes()
                     .map(move |tx_hash| (verdict.shard(), tx_hash, TxClaim::Abandoned))
             });
-        match settled_set_verdict(
-            &self.settled_sets,
-            topology_schedule,
-            self.local_shard,
-            anchored_wt,
-            claims,
-        ) {
+        match self.evidence.with_settled(|settled| {
+            settled_set_verdict(
+                settled,
+                topology_schedule,
+                self.local_shard,
+                anchored_wt,
+                claims,
+            )
+        }) {
             SettledSetVerdict::Pass => false,
             SettledSetVerdict::Reject => {
                 warn!(
@@ -5647,7 +5617,7 @@ impl ShardCoordinator {
         self.committed_block_anchor_wt = block.header().parent_qc().weighted_timestamp();
         self.committed_state_root = block.header().state_root();
         self.committed_tip = Some(block.header().committed_tip());
-        self.gc_settled_sets(topology_schedule);
+        self.retire_proven_anchors();
 
         // Retire the committed block's substate delta into the count
         // frontier. Sync commits carry no delta (QC-trusted, never
@@ -7588,11 +7558,11 @@ mod tests {
     use hyperscale_types::{
         Absence, AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeaderParts,
         ClaimProof, CommittedTxsRoot, ConsensusSignature, Epoch, Hash, MAX_TIMESTAMP_DELAY,
-        MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, SettledTxsRoot, ShardAnchor, ShardId,
-        Signer, SignerBitfield, TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot,
-        Transaction, TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet,
-        VoteCount, WeightedTimestamp, WitnessSources, abandonment_root_from_records,
-        reclaim_probe_anchor, test_utils,
+        MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, SettledTxSet, SettledTxsRoot,
+        ShardAnchor, ShardId, Signer, SignerBitfield, TerminalRoots, TimestampRange,
+        TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, UnsettledTx,
+        ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources,
+        abandonment_root_from_records, reclaim_probe_anchor, test_utils,
     };
 
     use super::*;
@@ -12300,7 +12270,7 @@ mod tests {
 
         assert_eq!(
             settled_set_verdict(
-                &coord.settled_sets,
+                &coord.evidence().with_settled(Clone::clone),
                 &sched,
                 coord.local_shard,
                 WeightedTimestamp::from_millis(AFTER_CUT_MS),
@@ -12354,9 +12324,11 @@ mod tests {
     /// own settled set does not.
     #[test]
     fn a_record_the_schedule_attests_is_voted_on() {
-        let mut coord = fence_coordinator();
+        let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(ShardId::ROOT, root_settled(b"other"), parties_of(b"tx"));
+        coord
+            .evidence()
+            .record_settled(ShardId::ROOT, root_settled(b"other"), parties_of(b"tx"));
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
         assert!(!coord.fence_abandonment_records(
             &sched,
@@ -12368,28 +12340,29 @@ mod tests {
     /// A record naming a transaction the departed shard was not party to
     /// is refused: its absence from the settled set is trivial, and
     /// abandoning it would charge a payer for a transaction a live
-    /// counterpart can still settle. Until the parties are mirrored the
-    /// vote defers.
+    /// counterpart can still settle. A voter holding no mirror of the
+    /// departure at all cannot say either way, and defers.
     #[test]
     fn a_record_naming_a_stranger_to_the_departed_shard_is_refused() {
         let sched = make_terminating_schedule(4);
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
         let block = block_with_records(AFTER_CUT_MS, records);
 
-        let mut stranger = fence_coordinator();
-        stranger.record_settled_txs(ShardId::ROOT, root_settled(b"other"), parties_of(b"other"));
+        let stranger = fence_coordinator();
+        stranger.evidence().record_settled(
+            ShardId::ROOT,
+            root_settled(b"other"),
+            parties_of(b"other"),
+        );
         assert!(
             stranger.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
             "a name the departed shard was not party to is not voted"
         );
 
-        let mut unmirrored = fence_coordinator();
-        unmirrored
-            .settled_sets
-            .insert(ShardId::ROOT, root_settled(b"other"));
+        let unmirrored = fence_coordinator();
         assert!(
             unmirrored.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
-            "and without the parties the vote defers"
+            "and a voter that has mirrored no departure defers"
         );
     }
 
@@ -12715,9 +12688,9 @@ mod tests {
     /// exists to let run.
     #[test]
     fn a_record_naming_what_the_departed_shard_settled_is_refused() {
-        let mut coord = fence_coordinator();
+        let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
@@ -12802,9 +12775,9 @@ mod tests {
     /// transaction or knowing which shards were party to it.
     #[test]
     fn fence_rejects_an_abandonment_a_terminated_shard_settled() {
-        let mut coord = fence_coordinator();
+        let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
@@ -12825,9 +12798,9 @@ mod tests {
     /// composing side defers rather than relying on this scan.
     #[test]
     fn fence_admits_an_abandonment_no_settled_set_names() {
-        let mut coord = fence_coordinator();
+        let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"other"))).collect(),
@@ -12848,9 +12821,9 @@ mod tests {
     /// would refuse the outcome the fence exists to admit.
     #[test]
     fn the_abandonment_scan_leaves_a_settlement_alone() {
-        let mut coord = fence_coordinator();
+        let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
@@ -12876,9 +12849,9 @@ mod tests {
     /// naming the transaction refuses nothing.
     #[test]
     fn the_abandonment_scan_leaves_a_verdict_that_awaited_nobody_alone() {
-        let mut coord = fence_coordinator();
+        let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
@@ -12914,9 +12887,9 @@ mod tests {
     /// the tick, the vote passes.
     #[test]
     fn fence_passes_when_tick_settled() {
-        let mut coord = fence_coordinator();
+        let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
@@ -12938,9 +12911,9 @@ mod tests {
     /// A tick the past-terminal shard did not settle is rejected.
     #[test]
     fn fence_rejects_unsettled_tick() {
-        let mut coord = fence_coordinator();
+        let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: BTreeSet::new(),
@@ -12964,9 +12937,9 @@ mod tests {
     /// set happens to contain it.
     #[test]
     fn fence_rejects_past_the_evidence_window() {
-        let mut coord = fence_coordinator();
+        let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
@@ -13093,7 +13066,7 @@ mod tests {
         // Record ROOT's settled set including the straddler's tick, then
         // re-drive: the fence now passes, so the block proceeds to
         // verification.
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),

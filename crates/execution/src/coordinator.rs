@@ -31,7 +31,7 @@
 //! Validators collect shard execution proofs from all participating shards. When all
 //! proofs are received, a `Finalization` is created.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 
 use hyperscale_core::{
@@ -535,13 +535,6 @@ pub struct ExecutionCoordinator {
     // ═══════════════════════════════════════════════════════════════════════
     // Split-boundary finalize gate
     // ═══════════════════════════════════════════════════════════════════════
-    /// Settled-tick sets of past-terminal shards, fed by the `io_loop`'s
-    /// settled-transaction acquisition (mirrors the shard coordinator's vote fence).
-    /// The finalize gate reads them so a tick naming a shard that didn't
-    /// settle it is never produced — the shared [`settled_set_verdict`]
-    /// keeps this verdict identical to the vote fence's.
-    settled_sets: HashMap<ShardId, SettledTxSet>,
-
     /// The proofs this validator's own fetches answered, each with the
     /// transactions whose probes it spoke to, held to offer in a block
     /// this validator proposes: a proof is committed content, folded by
@@ -677,7 +670,6 @@ impl ExecutionCoordinator {
             awaiting_finalizations: AwaitingTopologyBuffer::new(),
 
             unproven_ecs: AwaitingTopologyBuffer::new(),
-            settled_sets: HashMap::new(),
             fetched: BTreeMap::new(),
             gated_finalized: BTreeMap::new(),
             me,
@@ -3545,26 +3537,28 @@ impl ExecutionCoordinator {
         // refusals then for the shards still running, and the arms in
         // the order the block carries them.
         let mut records: BTreeMap<(ShardId, u8), AbandonmentRecord> = BTreeMap::new();
-        // `settled_sets` is a hash map, so the shards are walked in sorted
+        // The sets are a hash map, so the shards are walked in sorted
         // order rather than its own: which departures the budget reaches
         // must not turn on a per-process iteration order.
-        let mut shards: Vec<ShardId> = self.settled_sets.keys().copied().collect();
-        shards.sort_unstable();
-        for shard in shards {
-            if budget == 0 || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
-                break;
+        self.evidence.with_settled(|sets| {
+            let mut shards: Vec<ShardId> = sets.keys().copied().collect();
+            shards.sort_unstable();
+            for shard in shards {
+                if budget == 0 || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
+                    break;
+                }
+                let settled = &sets[&shard];
+                let mut unsettled = self.unresolved.outstanding_with(shard, settled.terminal_wt);
+                unsettled.retain(|entry| !settled.txs.contains(&entry.tx_hash));
+                unsettled.truncate(budget);
+                if unsettled.is_empty() {
+                    continue;
+                }
+                budget -= unsettled.len();
+                let record = AbandonmentRecord::departed(shard, settled.terminal_wt, unsettled);
+                records.insert((shard, record.evidence().discriminant()), record);
             }
-            let settled = &self.settled_sets[&shard];
-            let mut unsettled = self.unresolved.outstanding_with(shard, settled.terminal_wt);
-            unsettled.retain(|entry| !settled.txs.contains(&entry.tx_hash));
-            unsettled.truncate(budget);
-            if unsettled.is_empty() {
-                continue;
-            }
-            budget -= unsettled.len();
-            let record = AbandonmentRecord::departed(shard, settled.terminal_wt, unsettled);
-            records.insert((shard, record.evidence().discriminant()), record);
-        }
+        });
         // Mirrored refusals, grouped by shard and then by the anchor the
         // core refused at: one anchor per shard per block, earliest
         // first, because a record spanning two anchors satisfies the
@@ -4142,13 +4136,15 @@ impl ExecutionCoordinator {
             // Whether a shard is past-terminal is asked at the committed
             // frontier, which is what a node-local caller reads it at.
             let outcomes = self.fence_pairs(finalized_arc.as_unverified());
-            settled_set_verdict(
-                &self.settled_sets,
-                topology_schedule,
-                self.local_shard,
-                self.committed_ts,
-                outcomes,
-            )
+            self.evidence.with_settled(|settled| {
+                settled_set_verdict(
+                    settled,
+                    topology_schedule,
+                    self.local_shard,
+                    self.committed_ts,
+                    outcomes,
+                )
+            })
         };
         match verdict {
             SettledSetVerdict::Pass => {
@@ -4183,13 +4179,6 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// The transactions this ledger holds that `shard`, leaving at
-    /// `cut`, was party to — what a departure record naming it may name.
-    #[must_use]
-    pub fn party_to(&self, shard: ShardId, cut: WeightedTimestamp) -> BTreeSet<TxHash> {
-        self.unresolved.party_to(shard, cut)
-    }
-
     /// Record a past-terminal shard's settled-transaction set for the finalize
     /// gate (mirrors the shard coordinator's fence feed). Pair with
     /// [`Self::redrive_gated_finalizations`] to release ticks that the
@@ -4222,7 +4211,11 @@ impl ExecutionCoordinator {
             self.expected_certs.register(shard, tx_hash, now_ts);
         }
 
-        self.settled_sets.insert(shard, settled);
+        // What this shard's ledger says the departed shard was party to,
+        // taken beside the set: a departure record may name only these,
+        // and the fence reads it from the same mirror.
+        let parties = self.unresolved.party_to(shard, settled.terminal_wt);
+        self.evidence.record_settled(shard, settled, parties);
 
         let deferred = self.unproven_ecs.drain_shard(shard);
         let mut actions = Vec::new();
@@ -4244,22 +4237,24 @@ impl ExecutionCoordinator {
     /// shard never settled, and a certificate naming nothing gives the
     /// set nothing to vouch for.
     fn settled_set_admits(&self, shard: ShardId, cert: &Verifiable<ExecutionCertificate>) -> bool {
-        self.settled_sets.get(&shard).is_some_and(|settled| {
-            let outcomes = cert.tx_outcomes();
-            !outcomes.is_empty()
-                && outcomes
-                    .iter()
-                    .all(|outcome| settled.txs.contains(&outcome.tx_hash()))
+        self.evidence.with_settled(|sets| {
+            sets.get(&shard).is_some_and(|settled| {
+                let outcomes = cert.tx_outcomes();
+                !outcomes.is_empty()
+                    && outcomes
+                        .iter()
+                        .all(|outcome| settled.txs.contains(&outcome.tx_hash()))
+            })
         })
     }
 
     /// Drop settled sets past their evidence window. Past it the gate
     /// rejects any outcome naming the shard regardless of the set, so
     /// retaining it only leaks memory.
-    fn gc_settled_sets(&mut self, topology_schedule: &TopologySchedule) {
+    fn gc_settled_sets(&self, topology_schedule: &TopologySchedule) {
         let now = self.committed_ts;
-        self.settled_sets
-            .retain(|shard, _| topology_schedule.terminal_evidence_readable(*shard, now));
+        self.evidence
+            .retain_departures(&|shard| topology_schedule.terminal_evidence_readable(shard, now));
     }
 
     /// Re-check every gate-held finalization against the current settled
@@ -4769,7 +4764,7 @@ impl std::fmt::Debug for ExecutionCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::time::Duration;
 
     use hyperscale_crypto_bls::BlsSigner;

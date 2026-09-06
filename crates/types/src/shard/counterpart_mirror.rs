@@ -32,10 +32,10 @@
 //! clock in this file: a second retention rule stated against one would
 //! be a second answer to when a fact stops being true.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::RwLock;
 
-use crate::{Absence, ClaimProof, Probed, Refusal, ShardId, TxHash};
+use crate::{Absence, ClaimProof, Probed, Refusal, SettledTxSet, ShardId, TxHash};
 
 /// The facts, under one lock: they are written together at a commit and
 /// read together at a vote, so splitting them would buy contention
@@ -48,6 +48,15 @@ struct Mirrored {
     /// different records held to different floors.
     absences: HashMap<(TxHash, ShardId, Probed), Absence>,
     presences: HashMap<(TxHash, ShardId), ClaimProof>,
+    /// Complete settled-transaction sets of shards that have terminated,
+    /// each verified against its beacon-attested terminal root. Absence
+    /// from a set is proof, not ignorance.
+    settled: HashMap<ShardId, SettledTxSet>,
+    /// What this shard's own ledger says each departed shard was party
+    /// to, taken when its set arrived: a departure record may name only
+    /// these, since one naming a stranger would abandon business the
+    /// departed shard never had here.
+    parties: HashMap<ShardId, BTreeSet<TxHash>>,
 }
 
 /// Every counterpart's word this node holds, by transaction and shard.
@@ -186,6 +195,56 @@ impl CounterpartMirror {
             .iter()
             .map(|(&(tx_hash, shard), &presence)| (tx_hash, shard, presence))
             .collect()
+    }
+
+    /// Record a terminated shard's settled set, with what this shard's
+    /// ledger says it was party to.
+    ///
+    /// # Panics
+    ///
+    /// If the lock is poisoned.
+    pub fn record_settled(&self, shard: ShardId, settled: SettledTxSet, parties: BTreeSet<TxHash>) {
+        let mut mirrored = self.write();
+        mirrored.settled.insert(shard, settled);
+        mirrored.parties.insert(shard, parties);
+    }
+
+    /// Read the settled sets in place, without copying them.
+    ///
+    /// The sets are whole transaction sets of a departed chain, so every
+    /// consumer reads them behind the guard rather than taking one.
+    ///
+    /// # Panics
+    ///
+    /// If the lock is poisoned.
+    pub fn with_settled<R>(&self, read: impl FnOnce(&HashMap<ShardId, SettledTxSet>) -> R) -> R {
+        read(&self.read().settled)
+    }
+
+    /// Read in place what this shard's ledger said `shard` was party to
+    /// when its set arrived. `None` where no set is held, which is the
+    /// caller's cue to defer.
+    ///
+    /// # Panics
+    ///
+    /// If the lock is poisoned.
+    pub fn with_parties<R>(
+        &self,
+        shard: ShardId,
+        read: impl FnOnce(Option<&BTreeSet<TxHash>>) -> R,
+    ) -> R {
+        read(self.read().parties.get(&shard))
+    }
+
+    /// Drop the settled sets of shards `readable` no longer attests.
+    ///
+    /// # Panics
+    ///
+    /// If the lock is poisoned.
+    pub fn retain_departures(&self, readable: &dyn Fn(ShardId) -> bool) {
+        let mut mirrored = self.write();
+        mirrored.settled.retain(|&shard, _| readable(shard));
+        mirrored.parties.retain(|&shard, _| readable(shard));
     }
 
     /// Drop everything said about a transaction `held` does not name.

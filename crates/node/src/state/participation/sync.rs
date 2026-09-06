@@ -162,7 +162,7 @@ impl ShardParticipation {
             let Some(attested_root) = anchor.terminal_roots.map(|roots| roots.settled_txs) else {
                 continue;
             };
-            if self.shard_coordinator.settled_set(shard).is_some() {
+            if self.shard_coordinator.holds_settled_set(shard) {
                 continue;
             }
             let Some(terminal_wt) = sched.terminal_cut_wt(shard) else {
@@ -245,15 +245,9 @@ impl ShardParticipation {
         shard: ShardId,
         set: SettledTxSet,
     ) -> Vec<Action> {
-        // What this shard's ledger says the departed shard was party
-        // to, mirrored beside the set for the vote fence: a departure
-        // record names only the departed shard's own business here.
-        let parties = self.execution_coordinator.party_to(shard, set.terminal_wt);
         let mut actions =
             self.execution_coordinator
-                .record_settled_txs(topology_schedule, shard, set.clone());
-        self.shard_coordinator
-            .record_settled_txs(shard, set, parties);
+                .record_settled_txs(topology_schedule, shard, set);
         actions.extend(
             self.shard_coordinator
                 .redrive_pending_votes(topology_schedule),
