@@ -24,9 +24,9 @@ use std::sync::Arc;
 use hyperscale_engine::legs::{Classified, core_claims, delivered_claims};
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, CounterpartEvidence, Finalization, LegEntry,
-    LegEntryKind, LegEntryTaken, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision,
-    TxHash, TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp,
-    delivery_window_close, leg_entry_horizon, verdict_window_close,
+    LegEntryKind, LegEntryTaken, Refusal, ShardId, ShardTrie, SubstateKey, Transaction,
+    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
+    WeightedTimestamp, delivery_window_close, leg_entry_horizon, verdict_window_close,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -119,6 +119,28 @@ struct Owed {
     /// entry issued. Once every consumer has, the records here have
     /// nothing left to hold and the retirement is licensed.
     claimed_by: BTreeSet<ShardId>,
+    /// What this shard has heard from the counterparts of the
+    /// transaction, mirrored off their certificates as they arrive.
+    ///
+    /// Held on the entry rather than beside the ledger because that is
+    /// the lifetime: a mirror speaks only for a transaction still owed
+    /// an outcome here, and the entry going is what makes it moot. A
+    /// second home would have to be reclaimed on its own rule, and two
+    /// rules for one fact are two answers to when it stops being true.
+    heard: Heard,
+}
+
+/// What the counterparts of one transaction have said about it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Heard {
+    /// Core shards' refusals, by shard, first one winning: what a
+    /// `Refused` record is offered from.
+    refusals: BTreeMap<ShardId, Refusal>,
+    /// The core shards whose certificates accepted it. A core shard's
+    /// tick closes on every other core shard's certificate, so one
+    /// saying it succeeded is not the transaction accepted — that is
+    /// every core shard saying so, and this is the count.
+    accepted: BTreeSet<ShardId>,
 }
 
 /// What a tick of this shard's composed over a leg entry's records.
@@ -404,6 +426,7 @@ impl UnresolvedTxs {
                 unsettled_by: None,
                 evidence: None,
                 claimed_by: BTreeSet::new(),
+                heard: Heard::default(),
             };
             self.owed.entry(tx.hash()).or_insert(owed);
         }
@@ -481,6 +504,7 @@ impl UnresolvedTxs {
                     unsettled_by: entry.unsettled_by,
                     evidence: entry.evidence,
                     claimed_by: entry.claimed_by,
+                    heard: Heard::default(),
                 },
             );
             let deliveries =
@@ -594,6 +618,69 @@ impl UnresolvedTxs {
                 declared_work: owed.declared_work,
                 charge: owed.charge,
             })
+    }
+
+    /// Mirror a core shard's refusal of a transaction a leg here issued
+    /// for, off the certificate carrying it.
+    ///
+    /// First write wins: a second certificate for one `(transaction,
+    /// shard)` restates a decision already held. `false` says the
+    /// refusal was already known, or that no leg entry names the shard
+    /// as a core — nothing else is a counterpart whose refusal counts.
+    pub fn record_refusal(&mut self, tx_hash: TxHash, shard: ShardId, refusal: Refusal) -> bool {
+        if !self
+            .leg_core(tx_hash)
+            .is_some_and(|core| core.contains(&shard))
+        {
+            return false;
+        }
+        self.owed.get_mut(&tx_hash).is_some_and(|owed| {
+            let vacant = !owed.heard.refusals.contains_key(&shard);
+            if vacant {
+                owed.heard.refusals.insert(shard, refusal);
+            }
+            vacant
+        })
+    }
+
+    /// Mirror a core shard's acceptance, and say whether it was the last
+    /// the transaction was waiting on.
+    ///
+    /// A core shard's tick closes on every other core shard's
+    /// certificate, so one saying it succeeded is not the transaction
+    /// accepted: that is every core shard saying so.
+    pub fn record_acceptance(&mut self, tx_hash: TxHash, shard: ShardId) -> bool {
+        let Some(core_len) = self
+            .leg_core(tx_hash)
+            .filter(|core| core.contains(&shard))
+            .map(BTreeSet::len)
+        else {
+            return false;
+        };
+        self.owed.get_mut(&tx_hash).is_some_and(|owed| {
+            owed.heard.accepted.insert(shard) && owed.heard.accepted.len() == core_len
+        })
+    }
+
+    /// Every mirrored refusal this ledger holds, with the transaction
+    /// and the core shard that made it.
+    pub fn refusals(&self) -> impl Iterator<Item = (TxHash, ShardId, Refusal)> + '_ {
+        self.owed.iter().flat_map(|(&tx_hash, owed)| {
+            owed.heard
+                .refusals
+                .iter()
+                .map(move |(&shard, &refusal)| (tx_hash, shard, refusal))
+        })
+    }
+
+    /// A mirrored refusal of `tx_hash` by `shard`, if one is held.
+    #[cfg(test)]
+    #[must_use]
+    pub fn refusal(&self, tx_hash: TxHash, shard: ShardId) -> Option<Refusal> {
+        self.owed
+            .get(&tx_hash)
+            .and_then(|owed| owed.heard.refusals.get(&shard))
+            .copied()
     }
 
     /// The leg entries whose counterparts may now be asked whether they
@@ -823,6 +910,7 @@ impl UnresolvedTxs {
                         unsettled_by: Some(verdict.shard()),
                         evidence: Some(verdict.evidence()),
                         claimed_by: BTreeSet::new(),
+                        heard: Heard::default(),
                     },
                 );
             }

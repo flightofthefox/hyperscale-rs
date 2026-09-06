@@ -591,20 +591,6 @@ pub struct ExecutionCoordinator {
     /// keeps this verdict identical to the vote fence's.
     settled_sets: HashMap<ShardId, SettledTxSet>,
 
-    /// Core shards' refusals of transactions legs here issued for,
-    /// mirrored off their verified certificates as they arrive: what a
-    /// `Refused` abandonment record is offered from. Each is handed to
-    /// the vote fence the moment it is mirrored, so nothing here is
-    /// collected before it is drained. Each lives to its leg entry.
-    refusals: BTreeMap<(TxHash, ShardId), Refusal>,
-
-    /// The core shards whose certificates accepted a transaction a leg
-    /// here issued for. A core shard's tick closes on every other core
-    /// shard's certificate, so one saying it succeeded is not the
-    /// transaction accepted: that is every core shard saying so, and
-    /// this is where the count is kept. Each lives to its leg entry.
-    accepted: BTreeMap<TxHash, BTreeSet<ShardId>>,
-
     /// What this shard has asked a silent counterpart about a
     /// transaction a leg here issued for, keyed like the refusals: the
     /// fetch out or answered, kept so one header is asked once. Each
@@ -753,8 +739,6 @@ impl ExecutionCoordinator {
 
             unproven_ecs: AwaitingTopologyBuffer::new(),
             settled_sets: HashMap::new(),
-            refusals: BTreeMap::new(),
-            accepted: BTreeMap::new(),
             probes: BTreeMap::new(),
             answers: BTreeMap::new(),
             fetched: BTreeMap::new(),
@@ -2941,12 +2925,12 @@ impl ExecutionCoordinator {
             decision: verdict.decision,
             digest: verdict.digest,
         };
-        let std::collections::btree_map::Entry::Vacant(slot) =
-            self.refusals.entry((verdict.tx_hash, verdict.shard))
-        else {
+        if !self
+            .unresolved
+            .record_refusal(verdict.tx_hash, verdict.shard, refusal)
+        {
             return Vec::new();
-        };
-        slot.insert(refusal);
+        }
         let decision = if verdict.decision == TransactionDecision::Aborted {
             TransactionDecision::Aborted
         } else {
@@ -2969,32 +2953,26 @@ impl ExecutionCoordinator {
     /// under the block's cap.
     ///
     /// The proofs its own fetches answered, and the verdicts its own
-    /// broadcasts delivered — the latter filtered to the transactions a
-    /// leg here still owes an outcome for, which is where a verdict
-    /// licenses a record at all. The filter is what keeps the vote
-    /// fence's deferral rare: it withholds the vote on the whole block,
-    /// so an unfiltered offer would couple every transaction in a block
-    /// to the slowest broadcast on the abort path.
+    /// broadcasts delivered. A verdict is offered only where a leg here
+    /// still owes an outcome and the shard that made it is one of the
+    /// transaction's core — which is where a verdict licenses a record
+    /// at all — and the ledger keeps none that does not, so nothing is
+    /// filtered here. That bound is what keeps the vote fence's deferral
+    /// rare: it withholds the vote on the whole block, so an unbounded
+    /// offer would couple every transaction in a block to the slowest
+    /// broadcast on the abort path.
     #[must_use]
     pub fn pending_state_proofs(&self) -> Vec<CounterpartClaim> {
         let proofs = self.fetched.keys().cloned().map(CounterpartClaim::Cells);
-        let verdicts = self
-            .refusals
-            .iter()
-            .filter(|((tx_hash, shard), _)| {
-                self.unresolved
-                    .leg_core(*tx_hash)
-                    .is_some_and(|core| core.contains(shard))
+        let verdicts = self.unresolved.refusals().map(|(tx_hash, shard, refusal)| {
+            CounterpartClaim::Verdict(VerdictClaim {
+                shard,
+                tx_hash,
+                anchor_ts: refusal.refused_wt,
+                decision: refusal.decision,
+                digest: refusal.digest,
             })
-            .map(|((tx_hash, shard), refusal)| {
-                CounterpartClaim::Verdict(VerdictClaim {
-                    shard: *shard,
-                    tx_hash: *tx_hash,
-                    anchor_ts: refusal.refused_wt,
-                    decision: refusal.decision,
-                    digest: refusal.digest,
-                })
-            });
+        });
         proofs
             .chain(verdicts)
             .take(MAX_PROVISIONS_PER_BLOCK)
@@ -3264,7 +3242,6 @@ impl ExecutionCoordinator {
         }
         self.provisioning.advance_clock(self.committed_ts);
         self.gc_settled_sets(topology_schedule);
-        self.gc_mirrors();
         // A proof the chain now carries is everybody's: its answers are
         // folded here, and nothing offers it again.
         for claim in block.state_proofs() {
@@ -3679,9 +3656,9 @@ impl ExecutionCoordinator {
         // first, because a record spanning two anchors satisfies the
         // fence's equality check for neither.
         let refused = self
-            .refusals
-            .iter()
-            .map(|((tx_hash, shard), refusal)| (*tx_hash, *shard, refusal.refused_wt));
+            .unresolved
+            .refusals()
+            .map(|(tx_hash, shard, refusal)| (tx_hash, shard, refusal.refused_wt));
         self.offer_at_earliest_anchor(
             &mut records,
             &mut budget,
@@ -4046,16 +4023,15 @@ impl ExecutionCoordinator {
         let mut resolutions = Vec::new();
         for outcome in ec.tx_outcomes() {
             let tx_hash = outcome.tx_hash();
-            let Some(core) = self
+            if !self
                 .unresolved
                 .leg_core(tx_hash)
-                .filter(|core| core.contains(&shard))
-            else {
+                .is_some_and(|core| core.contains(&shard))
+            {
                 continue;
-            };
+            }
             if matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }) {
-                let accepted = self.accepted.entry(tx_hash).or_default();
-                if accepted.insert(shard) && accepted.len() == core.len() {
+                if self.unresolved.record_acceptance(tx_hash, shard) {
                     resolutions.push((
                         tx_hash,
                         TxResolution::CoreDecided(TransactionDecision::Accept),
@@ -4077,10 +4053,7 @@ impl ExecutionCoordinator {
                 decision,
                 digest: ec.attested_digest(),
             };
-            if let std::collections::btree_map::Entry::Vacant(slot) =
-                self.refusals.entry((tx_hash, shard))
-            {
-                slot.insert(refusal);
+            if self.unresolved.record_refusal(tx_hash, shard, refusal) {
                 actions.push(Action::Continuation(ProtocolEvent::RefusalObserved {
                     shard,
                     tx_hash,
@@ -4095,16 +4068,6 @@ impl ExecutionCoordinator {
             }));
         }
         actions
-    }
-
-    /// Drop the mirrored refusals and acceptances whose leg entries are
-    /// gone — released by the reclaim, or dropped at their horizon.
-    fn gc_mirrors(&mut self) {
-        let unresolved = &self.unresolved;
-        self.refusals
-            .retain(|(tx_hash, _), _| unresolved.contains(*tx_hash));
-        self.accepted
-            .retain(|tx_hash, _| unresolved.contains(*tx_hash));
     }
 
     /// Handle a tick-level attestation (execution certificate) from any shard.
@@ -8291,7 +8254,7 @@ mod tests {
         );
         state.unresolved.certify(tx_hash);
         assert!(
-            state.refusals.is_empty(),
+            state.unresolved.refusals().next().is_none(),
             "nothing was broadcast to this replica"
         );
 
@@ -8307,7 +8270,7 @@ mod tests {
         let actions = state.fold_verdict(&verdict);
 
         assert_eq!(
-            state.refusals.get(&(tx_hash, PEER)).copied(),
+            state.unresolved.refusal(tx_hash, PEER),
             Some(Refusal {
                 refused_wt: anchor,
                 deadline: UnsettledTx::for_transaction(&transaction).deadline,
@@ -8334,8 +8297,8 @@ mod tests {
         assert!(again.is_empty(), "{again:?}");
         assert_eq!(
             state
-                .refusals
-                .get(&(tx_hash, PEER))
+                .unresolved
+                .refusal(tx_hash, PEER)
                 .map(|held| held.refused_wt),
             Some(anchor),
         );
@@ -8356,7 +8319,7 @@ mod tests {
                 })
                 .is_empty(),
         );
-        assert!(fresh.refusals.is_empty());
+        assert!(fresh.unresolved.refusals().next().is_none());
     }
 
     /// A core's refusal of a transaction a leg here issued for is
