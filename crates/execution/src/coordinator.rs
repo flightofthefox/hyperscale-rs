@@ -49,7 +49,7 @@ use hyperscale_types::{
     BlockHeight, BloomFilter, CertifiedBlock, ClaimProof, CounterpartClaim, CounterpartMirror,
     DeclaredKey, Derivation, ExecutionCertificate, ExecutionCertificateVerifyError,
     ExecutionOutcome, ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError,
-    GlobalReceiptRoot, Hash, Inclusion, LegEntry, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
+    GlobalReceiptRoot, Hash, Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
     MAX_PROVISIONS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Mode, Probed,
     ProvenAnchors, Provisions, Refusal, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
     ShardTrie, StateAnchor, StateProofBundle, StoredReceipt, SubstateKey, TickId, TopologySchedule,
@@ -395,16 +395,6 @@ pub struct ExecutionCoordinator {
     /// and are empty from then on.
     replay_blocks: Vec<Verified<CertifiedBlock>>,
 
-    /// The leg entries the store held, seeded into the ledger before the
-    /// replay folds on top. A leg entry outlives the replay window, so
-    /// these are the ones the fold alone would lose; inside the window
-    /// the fold is what decides, and it overwrites what it reaches.
-    seed_entries: Vec<(LegEntry, Transaction)>,
-
-    /// The rows the store holds, as this coordinator last wrote them:
-    /// what says which rows a commit changed and which it released.
-    persisted: BTreeMap<TxHash, LegEntry>,
-
     /// Tick fates known but not yet emittable, each with the tick that
     /// carries its entries. Drained whenever a tick completes or a block
     /// commits.
@@ -647,12 +637,6 @@ impl ExecutionCoordinator {
                 .filter_map(|(key, value)| Some((*key, CrossingCell::from_bytes(value)?)))
                 .collect(),
             replay_blocks: recovered.replay.blocks.clone(),
-            seed_entries: recovered.leg_entries.clone(),
-            persisted: recovered
-                .leg_entries
-                .iter()
-                .map(|(entry, _)| (entry.tx_hash, entry.clone()))
-                .collect(),
             pending_tick_resolutions: Vec::new(),
             candidates: TickCandidates::new(local_shard),
             ticks: TickRegistry::new(),
@@ -983,31 +967,6 @@ impl ExecutionCoordinator {
         topology_schedule: &TopologySchedule,
         derivation: &dyn Derivation,
     ) -> Vec<Action> {
-        // The entries the store carried past the window, before the
-        // replay: a row the fold reaches is overwritten by it, and one
-        // it does not reach is the reason the store exists.
-        let seeded: Vec<(LegEntry, Arc<Verified<Transaction>>)> =
-            std::mem::take(&mut self.seed_entries)
-                .into_iter()
-                .filter_map(|(entry, body)| {
-                    // A body nothing here can derive composes no member,
-                    // so its row is dropped rather than seeded blind.
-                    body.try_derived(derivation).ok()?;
-                    Some((
-                        entry,
-                        Arc::new(Verified::<Transaction>::from_persisted(body)),
-                    ))
-                })
-                .collect();
-        if !seeded.is_empty() {
-            tracing::info!(
-                shard = %self.local_shard,
-                entries = seeded.len(),
-                "Seeding the leg entries the restart's replay does not reach"
-            );
-            self.unresolved.seed(self.local_shard, seeded);
-        }
-
         let blocks = std::mem::take(&mut self.replay_blocks);
         if blocks.is_empty() {
             return Vec::new();
@@ -2888,33 +2847,6 @@ impl ExecutionCoordinator {
             .collect()
     }
 
-    /// Write down what this commit changed about what the ledger holds.
-    ///
-    /// The ledger's answer is read whole every commit, since what a
-    /// commit changed is spread across the fold above it and reading it
-    /// back out would be a second answer to the same question. What is
-    /// written is the difference against the rows this coordinator last
-    /// wrote: a leg entry's account moves only when it is certified,
-    /// charged or named by a record, so a shard with legs outstanding
-    /// and nothing happening to them writes nothing.
-    fn persist_leg_entries(&mut self) -> Vec<Action> {
-        let held: Vec<TxHash> = self.persisted.keys().copied().collect();
-        let (rows, released) = self.unresolved.persistable(&held);
-        let entries: Vec<LegEntry> = rows
-            .iter()
-            .filter(|entry| self.persisted.get(&entry.tx_hash) != Some(entry))
-            .cloned()
-            .collect();
-        if entries.is_empty() && released.is_empty() {
-            return Vec::new();
-        }
-        self.persisted = rows
-            .into_iter()
-            .map(|entry| (entry.tx_hash, entry))
-            .collect();
-        vec![Action::PersistLegEntries { entries, released }]
-    }
-
     /// Drop the bundles no transaction they answered for still needs,
     /// and release every fetch the ledger let go — a question the chain
     /// answered first, or one whose entry is gone — so a counterpart
@@ -3166,7 +3098,6 @@ impl ExecutionCoordinator {
         self.stamp_departures(topology_schedule);
         self.retire_closed_deliveries();
         let unanswerable = self.unresolved.prune(self.committed_ts);
-        actions.extend(self.persist_leg_entries());
         self.release_unanswerable(&unanswerable);
         actions.extend(self.release_answered_fetches());
         // The committed clock is what opens a leg's deadline, so the
@@ -8570,142 +8501,6 @@ mod tests {
             vec![AbandonmentRecord::lapsed(PEER, later, [figures])],
             "offered as a lapse, under the anchor it was proved at"
         );
-    }
-
-    /// The write is a difference, not the set: a commit that changed
-    /// nothing about a leg entry writes nothing, one that changed it
-    /// writes only it, and a release names the row to drop.
-    #[test]
-    fn a_leg_entry_is_written_only_when_it_changes() {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
-        let tx_hash = transaction.hash();
-        let figures = UnsettledTx::for_transaction(&transaction);
-        let mut state = leg_state(&transaction);
-
-        let written = |actions: &[Action]| -> Option<(Vec<TxHash>, Vec<TxHash>)> {
-            actions.iter().find_map(|action| match action {
-                Action::PersistLegEntries { entries, released } => Some((
-                    entries.iter().map(|entry| entry.tx_hash).collect(),
-                    released.clone(),
-                )),
-                _ => None,
-            })
-        };
-
-        assert_eq!(
-            written(&state.persist_leg_entries()),
-            Some((vec![tx_hash], Vec::new())),
-            "the entry is written down once"
-        );
-        assert!(
-            written(&state.persist_leg_entries()).is_none(),
-            "and not again while nothing about it moves"
-        );
-
-        // A record names it, which moves the account.
-        state
-            .unresolved
-            .record_abandonment_records(&[AbandonmentRecord::unclaimed(
-                PEER,
-                figures.deadline,
-                [figures],
-            )]);
-        assert_eq!(
-            written(&state.persist_leg_entries()),
-            Some((vec![tx_hash], Vec::new())),
-            "a moved account is written again"
-        );
-
-        let reclaimed: Arc<Verifiable<Finalization>> = Arc::new(Verifiable::from(
-            helpers_make_finalization(BlockHeight::new(3), tx_hash, TransactionDecision::Aborted),
-        ));
-        state.unresolved.release_resolved(&[reclaimed]);
-        assert_eq!(
-            written(&state.persist_leg_entries()),
-            Some((Vec::new(), vec![tx_hash])),
-            "and a released entry names the row to drop"
-        );
-    }
-
-    /// A leg entry outlives the window a restart replays, so the store
-    /// is what carries it: a coordinator rebuilt with no replay at all
-    /// holds the same entry, composes the same reclaim from it, and
-    /// stops holding a row for what it released.
-    #[test]
-    fn a_leg_entry_survives_a_restart_the_replay_does_not_reach() {
-        let schedule = two_shard_topology();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
-        let tx_hash = transaction.hash();
-        let figures = UnsettledTx::for_transaction(&transaction);
-        let live = leg_state(&transaction);
-
-        let (rows, released) = live.unresolved.persistable(&[]);
-        assert!(released.is_empty(), "nothing was released");
-        let row = match rows.as_slice() {
-            [row] => row.clone(),
-            other => panic!("one leg entry is held, not {}", other.len()),
-        };
-        assert_eq!(row.tx_hash, tx_hash);
-        assert!(row.certified, "the account rides the row");
-
-        // The restart reaches no block at all: the entry is the store's
-        // to supply or it is lost.
-        let recovered = RecoveredState {
-            committed_height: BlockHeight::new(2),
-            leg_entries: vec![(row, (**transaction).clone())],
-            ..RecoveredState::default()
-        };
-        let mut restarted = ExecutionCoordinator::with_shared_stores(
-            ValidatorId::new(0),
-            HOME,
-            &recovered,
-            Arc::new(ExecCertStore::new()),
-            Arc::new(FinalizationStore::new()),
-            Arc::new(ProvenAnchors::new()),
-            Arc::new(CounterpartMirror::new()),
-        );
-        restarted.on_committed_state_restored(&schedule, &StubVmStatics);
-
-        assert!(
-            restarted.unresolved.contains(tx_hash),
-            "the entry the replay never reached is held"
-        );
-        assert_eq!(
-            restarted.unresolved.unsettled_leg_figures(tx_hash),
-            Some(figures),
-            "and states the same terms a record would restate for it"
-        );
-
-        // A record licenses the reclaim, and the rebuilt entry composes
-        // it — which is what the body on the row is for.
-        restarted
-            .unresolved
-            .record_abandonment_records(&[AbandonmentRecord::unclaimed(
-                PEER,
-                figures.deadline,
-                [figures],
-            )]);
-        let reclaimable = restarted.unresolved.reclaimable();
-        assert_eq!(
-            reclaimable.len(),
-            1,
-            "the rebuilt entry is the one a reclaim is composed from"
-        );
-        assert_eq!(reclaimable[0].tx_hash, tx_hash);
-
-        // Released by the finalization that decides it — the reclaim's —
-        // the row goes, and the store is told which to drop.
-        let reclaimed: Arc<Verifiable<Finalization>> = Arc::new(Verifiable::from(
-            helpers_make_finalization(BlockHeight::new(3), tx_hash, TransactionDecision::Aborted),
-        ));
-        restarted.unresolved.release_resolved(&[reclaimed]);
-        let (rows, released) = restarted.unresolved.persistable(&[tx_hash]);
-        assert!(rows.is_empty(), "nothing is held");
-        assert_eq!(released, vec![tx_hash], "and its row is dropped");
     }
 
     /// A proof this validator's fetch answered is committed content

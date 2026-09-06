@@ -336,16 +336,18 @@ fn a_restarted_member_agrees_on_the_state_it_rebuilt() {
 /// A leg's reclaim survives its committee restarting between the leg's
 /// own finalization and the core's refusal.
 ///
-/// The window this opens is exactly the one the ledger's leg entry
-/// exists to carry. The caller's shard runs the swap's withdraw as a
-/// leg: it pays, issues the crossing and certifies, and its own
-/// finalization decides nothing — the venue's does, later. A restart in
-/// between loses everything execution held in memory, so the entry that
-/// names what the reclaim would take back has to come off the chain and
-/// its own store rather than off a replay of transactions the chain has
-/// already resolved. Without it the refusal arrives to a shard holding
-/// nothing for the transaction, no reclaim is composed, and the caller's
-/// input sits in a record cell until its grace sweeps it.
+/// The window this opens is the one the replay fold has to reach. The
+/// caller's shard runs the swap's withdraw as a leg: it pays, issues the
+/// crossing and certifies, and its own finalization decides nothing —
+/// the venue's does, later. A restart in between loses everything
+/// execution held in memory, so the entry that names what the reclaim
+/// would take back has to come back off the chain: a leg's own
+/// finalization retires nothing from the replay floor, and the fold
+/// reads to a leg entry's horizon rather than to a whole entry's
+/// deadline. A replay that stopped at either would come back to a
+/// refusal holding nothing for the transaction, no reclaim would be
+/// composed, and the caller's input would sit in a record cell until
+/// its grace sweeps it.
 ///
 /// The whole committee restarts, not one member: a single replica would
 /// be carried by its peers, and what is under test is the entry rather
@@ -398,7 +400,7 @@ fn a_restarted_payer_still_reclaims_its_refused_leg() {
     }
 
     // The refusal arrives to a restarted shard, and the reclaim it
-    // licenses is composed from the entry the store carried across.
+    // licenses is composed from the entry the replay rebuilt.
     assert!(
         cluster.run_until(epochs(24), |c| vault_balance(c, SWAPPER_SHARD, caller)
             == funded - price),

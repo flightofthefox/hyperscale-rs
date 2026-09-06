@@ -14,11 +14,11 @@ use hyperscale_types::{
     CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, CounterpartClaim, DeclaredRange, Epoch,
     EscrowedValue, ExecutionCertificate, ExecutionVote, Finalization, GlobalReceiptRoot, Hash,
-    HeaderFetchCount, LegEntry, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2,
-    PcVote3, PcVoteEquivocation, PrincipalAddr, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
-    RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain,
-    Round, RoutingCommittees, ShardForkProof, ShardId, ShardLoad, ShardTrie, ShardVoteEquivocation,
+    HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
+    PcVoteEquivocation, PrincipalAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap,
+    Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote,
+    ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round,
+    RoutingCommittees, ShardForkProof, ShardId, ShardLoad, ShardTrie, ShardVoteEquivocation,
     SharedCertificates, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
     SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry,
     SubstateKey, SweepFrontier, TerminalEvidence, TerminalRoots, TickId, Timeout, TopologySnapshot,
@@ -1263,22 +1263,6 @@ pub enum Action {
         tx_hashes: Vec<TxHash>,
     },
 
-    /// Write this commit's leg entries down, and drop the rows for the
-    /// entries it released.
-    ///
-    /// A leg entry stands until the record cell it would take back is
-    /// retired, which is a counterpart's evidence rather than a clock,
-    /// so it outlives the window a restart replays and the fold alone
-    /// would lose it. The store is not the authority inside that window
-    /// — the fold is — so this needs no atomicity with the block that
-    /// prompts it: a write lost to a crash is one the fold redoes.
-    PersistLegEntries {
-        /// Every leg entry the ledger now holds.
-        entries: Vec<LegEntry>,
-        /// The transactions whose rows are to go.
-        released: Vec<TxHash>,
-    },
-
     // ═══════════════════════════════════════════════════════════════════════
     // Topology
     // ═══════════════════════════════════════════════════════════════════════
@@ -1915,7 +1899,6 @@ impl Action {
             | Self::CommitBlockByQcOnly { .. }
             | Self::EmitTransactionStatus { .. }
             | Self::RecordTxEcCreated { .. }
-            | Self::PersistLegEntries { .. }
             | Self::TopologyChanged { .. }
             | Self::ReconfigureParticipation(_)
             | Self::StartBlockSync { .. }

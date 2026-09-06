@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, CommittedTip,
-    Hash, LegEntry, PredecessorTerminal, Provisions, QuorumCertificate, SafeVoteRegisters,
-    ShardAnchor, StateRoot, SubstateKey, Transaction, ValidatorId, Verified, WeightedTimestamp,
+    Hash, PredecessorTerminal, Provisions, QuorumCertificate, SafeVoteRegisters, ShardAnchor,
+    StateRoot, SubstateKey, ValidatorId, Verified, WeightedTimestamp,
 };
 
 use super::dedup_window::DedupWindow;
@@ -158,34 +158,18 @@ pub struct RecoveredState {
     /// snap-sync, where the imported store carries no signing history.
     pub safe_vote_registers: BTreeMap<ValidatorId, SafeVoteRegisters>,
 
-    /// The leg entries the store held, which seed the execution ledger
-    /// before it replays.
-    ///
-    /// A leg entry outlives the replay window — it stands until the
-    /// record cell it would take back is retired, and a record is
-    /// retired on a counterpart's evidence rather than on a clock — so
-    /// the fold alone would lose one whose block sits below the floor.
-    /// The replay folds on top of these, and inside its window the fold
-    /// is what decides.
-    ///
-    /// Each carries the body its members are composed from: a row holds
-    /// the account and the trie alone, and the legs, owners and
-    /// crossings read back off the transaction the store kept. A row
-    /// whose body is gone is not handed over — nothing could compose a
-    /// member for it.
-    pub leg_entries: Vec<(LegEntry, Transaction)>,
-
     /// The escrow records this store inherited with a prefix it adopted
     /// whole, and their committed bytes, for the cells that are still
     /// live.
     ///
     /// A successor's ledger is a fold over its own chain, which begins
     /// empty, while the value its predecessors escrowed rides the prefix
-    /// into it. Nothing else names those records: the row that would is
-    /// the predecessor's and is committed to nothing, and the cell is
-    /// outside every sweep's reach. So the adoption writes down what it
-    /// imported, from the leaves it wrote — the same argument the sweep
-    /// index's rebuild makes, and the same authority.
+    /// into it. Nothing else names those records: the entry that would
+    /// is the predecessor's ledger's, a fold over a chain the successor
+    /// never replays, and the cell is outside every sweep's reach. So
+    /// the adoption writes down what it imported, from the leaves it
+    /// wrote — the same argument the sweep index's rebuild makes, and
+    /// the same authority.
     ///
     /// Empty everywhere but a reshape successor's adoption. An ordinary
     /// snap-sync joins a chain whose members hold the ledger, and a
@@ -271,7 +255,6 @@ impl RecoveredState {
                 ChainOrigin::ROOT
             },
             safe_vote_registers: BTreeMap::new(),
-            leg_entries: Vec::new(),
             inherited_records: Vec::new(),
             voted_blocks: Vec::new(),
         }

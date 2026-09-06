@@ -47,7 +47,6 @@ pub use shard::chain_reader::{BlockForSync, ShardChainReader};
 pub use shard::chain_writer::{ParentAnchor, ShardChainWriter};
 pub use shard::dedup_window::DedupWindow;
 pub use shard::genesis::GenesisCommit;
-pub use shard::leg_entries::LegEntryStore;
 pub use shard::packages::{PackageArtifactStore, package_of_cell};
 pub use shard::pending_chain::{
     BaseReadCache, ChainEntry, PendingChain, SubstateView, TerminalWindow,
@@ -90,7 +89,6 @@ pub trait ShardStorage:
     + BoundaryStore
     + PackageArtifactStore
     + SafeVoteRegisterStore
-    + LegEntryStore
     + SweepIndex
     + Send
     + Sync
@@ -107,7 +105,6 @@ impl<S> ShardStorage for S where
         + BoundaryStore
         + PackageArtifactStore
         + SafeVoteRegisterStore
-        + LegEntryStore
         + SweepIndex
         + Send
         + Sync

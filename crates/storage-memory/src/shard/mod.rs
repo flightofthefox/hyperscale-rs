@@ -9,7 +9,6 @@ pub(crate) mod boundary;
 pub(crate) mod chain_reader;
 pub(crate) mod chain_writer;
 pub(crate) mod core;
-pub(crate) mod leg_entries;
 pub(crate) mod snapshot;
 pub(crate) mod split;
 pub(crate) mod state;

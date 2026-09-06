@@ -10,7 +10,7 @@ use hyperscale_storage::{JmtSnapshot, entry_leaf_rows, package_of_cell, sweepabl
 use hyperscale_types::{
     Address, Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt,
     EntryKey, ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash,
-    LegEntry, ProvisionHash, Provisions, QuorumCertificate, RETENTION_HORIZON, SafeVoteRegisters,
+    ProvisionHash, Provisions, QuorumCertificate, RETENTION_HORIZON, SafeVoteRegisters,
     SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, SweepBucket, TickId,
     Transaction, TxHash, ValidatorId, WeightedTimestamp,
 };
@@ -251,9 +251,6 @@ pub struct ConsensusState {
     /// production `safe_vote_registers` CF; reads ignore records whose
     /// tag differs from the current `chain_origin`.
     pub safe_vote_registers: HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>,
-    /// The leg entries this shard holds beside its chain, keyed by
-    /// transaction. See [`LegEntryStore`](hyperscale_storage::LegEntryStore).
-    pub leg_entries: BTreeMap<TxHash, LegEntry>,
     /// Blocks written beside a validator's safe-vote registers, keyed by
     /// height then hash and tagged with the chain origin that wrote them.
     /// Mirrors the production `voted_blocks` CF: the uncommitted chain
@@ -287,7 +284,6 @@ impl ConsensusState {
             provisions: BTreeMap::new(),
             chain_origin: ChainOrigin::ROOT,
             safe_vote_registers: HashMap::new(),
-            leg_entries: BTreeMap::new(),
             voted_blocks: BTreeMap::new(),
         }
     }

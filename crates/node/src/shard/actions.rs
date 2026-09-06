@@ -264,9 +264,6 @@ where
                 let now = self.now;
                 self.io.tx_phase_times.record_ec_created(&tx_hashes, now);
             }
-            Action::PersistLegEntries { entries, released } => {
-                self.io.storage.persist_leg_entries(&entries, &released);
-            }
             Action::TopologyChanged {
                 epoch,
                 topology_snapshot,

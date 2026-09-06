@@ -54,13 +54,15 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
         .unwrap_or(0);
     // A merged parent's store is opened fresh and filled by an import,
     // so the value its predecessors escrowed arrives with the prefix and
-    // the rows naming it do not. Read the records off the state, which
-    // is the authority and is what every keeper imported.
+    // nothing naming it does: a ledger is a fold over its own chain, and
+    // a merged parent's chain begins at the import. Read the records off
+    // the state, which is the authority and is what every keeper
+    // imported.
     //
     // The split kinds take nothing: their store is a clone of the
-    // predecessor's and carries its ledger, and a child deriving
-    // obligations its clone-seeded peers already hold as rows would
-    // compose them twice.
+    // predecessor's and carries its chain, so the fold rebuilds the
+    // ledger its clone-seeded peers already hold, and a child deriving
+    // obligations on top of it would compose them twice.
     let inherited_records = match kind {
         AdoptKind::Merge => storage.escrow_records(),
         AdoptKind::Split | AdoptKind::ParentHalf => Vec::new(),

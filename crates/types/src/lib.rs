@@ -166,7 +166,6 @@ pub use shard::header::{
     CommittedTip,
 };
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
-pub use shard::leg_entry::{LegEntry, LegEntryKind, LegEntryTaken};
 pub use shard::limits::{
     MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_COMMITTED_TX_QUERY, MAX_DRAIN_WORK,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_GAS_LIMIT, MAX_PROVISION_TARGET_SHARDS,
