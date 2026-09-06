@@ -15,14 +15,17 @@ mod support;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_scenarios::query::{declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
     build_transfer_tx, cross_shard_cast, cross_shard_genesis_accounts, validity_around,
 };
 use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{Cluster, FaultHandle, FaultableCluster, ScenarioConfig, epochs};
+use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{
-    ShardId, TransactionDecision, TransactionStatus, WeightedTimestamp, lapse_probe_anchor,
+    Provisions, ShardId, TransactionDecision, TransactionStatus, WeightedTimestamp,
+    lapse_probe_anchor,
 };
 use support::SimCluster;
 
@@ -335,6 +338,123 @@ fn a_bundle_replayed_from_another_transaction_is_refused() {
         assert!(
             c.metric("fetch_responses_refused", Some("provision:scope_mismatch")) > refused_before,
             "the replayed bundle was never refused on its scope",
+        );
+    });
+}
+
+/// A bundle whose entries its own proof does not cover is refused, and
+/// the delivery it was carrying still lands.
+///
+/// The third shape a responder can take, and the one the other cases
+/// cannot reach: a well-formed answer to the right question, carrying
+/// values the source chain never held. The tx-root the source header
+/// commits is over the transaction hashes, so tampering with an entry's
+/// bytes leaves it intact and every check short of the merkle proof
+/// passes. What refuses it is that a bundle's entries are held to the
+/// state root of the block that issued them, which runs off
+/// `Action::VerifyProvisions` rather than at the fetch.
+///
+/// One byte of one entry, rather than a decoded and inflated
+/// `EscrowedValue`: the proof covers the whole value either way, so both
+/// reach the same check, and the cheaper forgery needs nothing of the
+/// engine's encoding.
+#[test]
+fn a_bundle_whose_entries_its_proof_does_not_cover_is_refused() {
+    let mut cluster =
+        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
+    let (payer_key, from, to) = cross_shard_cast();
+    let payer_shard = ShardId::leaf(1, 0);
+    let recipient_shard = ShardId::leaf(1, 1);
+
+    cluster.run_faultable(|c| {
+        let recipient_before = vault_balance(c, recipient_shard, to);
+        let refused_before = c.metric(
+            "fetch_responses_refused",
+            Some("provision:unproven_entries"),
+        );
+        let broadcast_dropped = c.drop_type("provisions.broadcast");
+
+        // Every host tampers with the first bundle it is asked for and
+        // answers honestly after, so the check runs whichever peer the
+        // fetch picked and the retry still has somewhere to land.
+        let tampered = Arc::new(AtomicUsize::new(0));
+        let forged: Vec<FaultHandle> = c
+            .committee_hosts(payer_shard)
+            .into_iter()
+            .map(|host| {
+                let tampered = Arc::clone(&tampered);
+                c.rewrite_responses(
+                    host,
+                    "provision.request",
+                    Arc::new(move |_asked: &[u8], honest: &[u8]| {
+                        let Ok(response) = hbor_from_slice::<GetProvisionResponse>(honest) else {
+                            return honest.to_vec();
+                        };
+                        let Some(bundle) = response.provisions.as_deref() else {
+                            return honest.to_vec();
+                        };
+                        let mut entries = bundle.transactions().clone();
+                        let Some(value) = entries
+                            .iter_mut()
+                            .flat_map(|entry| entry.entries.iter_mut())
+                            .find_map(|entry| entry.value.as_mut())
+                            .and_then(|bytes| bytes.first_mut())
+                        else {
+                            return honest.to_vec();
+                        };
+                        if tampered.fetch_add(1, Ordering::Relaxed) > 0 {
+                            return honest.to_vec();
+                        }
+                        *value = value.wrapping_add(1);
+                        let forged = Provisions::new(
+                            bundle.source_shard(),
+                            bundle.target_shard(),
+                            bundle.block_height(),
+                            bundle.source_block_ts(),
+                            bundle.proof().clone(),
+                            entries,
+                        );
+                        hbor_to_vec(&GetProvisionResponse {
+                            provisions: Some(Arc::new(forged)),
+                        })
+                        .unwrap_or_else(|_| honest.to_vec())
+                    }),
+                )
+            })
+            .collect();
+
+        let tx = build_transfer_tx(&payer_key, from, to, 100, validity_around(c.now()));
+        let hash = tx.hash();
+        c.submit(Arc::new(tx));
+
+        let verdict = await_tx_terminal(c, hash, epochs(8));
+        assert!(
+            matches!(
+                verdict,
+                Some(TransactionStatus::Completed(TransactionDecision::Accept))
+            ),
+            "the payer's leg settles alone and accepts; verdict = {verdict:?}",
+        );
+        assert!(
+            c.run_until(epochs(10), |c| vault_balance(c, recipient_shard, to)
+                == recipient_before + 100),
+            "the delivery must claim from a bundle whose proof covers it; holds {}",
+            vault_balance(c, recipient_shard, to),
+        );
+        assert!(
+            broadcast_dropped.fired() > 0,
+            "the push has to be cut, or nothing fetched",
+        );
+        assert!(
+            forged.iter().any(|handle| handle.fired() > 0) && tampered.load(Ordering::Relaxed) > 0,
+            "the tampered bundle has to have been served, or nothing was attacked",
+        );
+        assert!(
+            c.metric(
+                "fetch_responses_refused",
+                Some("provision:unproven_entries")
+            ) > refused_before,
+            "the tampered bundle was never refused on its proof",
         );
     });
 }
