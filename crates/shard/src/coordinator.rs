@@ -2435,9 +2435,13 @@ impl ShardCoordinator {
         abandonment_records: Vec<AbandonmentRecord>,
     ) -> (Vec<Arc<Verifiable<Finalization>>>, Vec<AbandonmentRecord>) {
         let qc_chain_resolved_txs = self.chain_view().ancestor_resolved_txs(parent_block_hash);
+        let qc_chain_finalizations = self
+            .chain_view()
+            .ancestor_finalization_ids(parent_block_hash);
         let (finalizations, _finalized_tx_count) = select_finalizations(
             finalizations,
             &qc_chain_resolved_txs,
+            &qc_chain_finalizations,
             &self.dedup_index,
             self.chain_view().parent_settled_frontier(parent_block_hash),
             MAX_FINALIZED_TX_PER_BLOCK,
@@ -4258,12 +4262,14 @@ impl ShardCoordinator {
         let parent = block.header().parent_block_hash();
         let (qc_chain_tx_hashes, qc_chain_provision_hashes) = self.collect_qc_chain_hashes(parent);
         let qc_chain_resolved_txs = self.chain_view().ancestor_resolved_txs(parent);
+        let qc_chain_finalizations = self.chain_view().ancestor_finalization_ids(parent);
         if let Err(e) = validate_block_for_vote(
             topology_snapshot,
             self.local_shard,
             block,
             &qc_chain_tx_hashes,
             &qc_chain_resolved_txs,
+            &qc_chain_finalizations,
             &qc_chain_provision_hashes,
             &self.dedup_index,
             coasting,

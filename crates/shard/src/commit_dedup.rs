@@ -34,8 +34,8 @@ use std::sync::Arc;
 
 use hyperscale_storage::DedupWindow;
 use hyperscale_types::{
-    DEDUP_WINDOW, Finalization, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId, Transaction,
-    TxHash, Verifiable, WeightedTimestamp, delivery_window_close,
+    DEDUP_WINDOW, Finalization, FinalizationHash, ProvisionHash, Provisions, RETENTION_HORIZON,
+    ShardId, Transaction, TxHash, Verifiable, WeightedTimestamp, delivery_window_close,
 };
 
 #[allow(clippy::struct_field_names)] // shared `_retention` postfix is the artifact-tier convention
@@ -50,6 +50,10 @@ pub struct CommitDedupIndex {
     /// that have to agree, and what a tick key could never express, since
     /// a tick can settle in more than one part.
     resolved_tx_retention: HashMap<TxHash, WeightedTimestamp>,
+    /// `receipt_hash → deadline` of every finalization a committed block
+    /// carried. The question `resolved_tx_retention` cannot answer for a
+    /// certificate that resolves nothing.
+    finalization_retention: HashMap<FinalizationHash, WeightedTimestamp>,
     /// `provision_hash → local_committed_ts + RETENTION_HORIZON`. Pruned
     /// when `deadline <= current_committed_ts`. Past the horizon, every tx
     /// the batch carried has expired its `validity_range` and terminated
@@ -88,6 +92,7 @@ impl CommitDedupIndex {
         Self {
             tx_retention: HashMap::new(),
             resolved_tx_retention: HashMap::new(),
+            finalization_retention: HashMap::new(),
             provision_retention: HashMap::new(),
             provision_tx_retention: HashMap::new(),
             covered_from: None,
@@ -110,6 +115,9 @@ impl CommitDedupIndex {
         index
             .resolved_tx_retention
             .extend(window.resolved.iter().copied());
+        index
+            .finalization_retention
+            .extend(window.finalizations.iter().copied());
         index
             .provision_retention
             .extend(window.provisions.iter().copied());
@@ -176,9 +184,19 @@ impl CommitDedupIndex {
     /// The deciding outcomes only: a leg's finalization names its hash
     /// without resolving it, and the reclaim's finalization naming the
     /// hash later is the one this index must not refuse.
+    ///
+    /// The certificate's own identity is recorded beside them, because
+    /// the deciding set is empty for a tick whose every member reaches no
+    /// verdict — a retirement's, which settles records under a
+    /// transaction whose verdict belongs to another chain. Keyed on the
+    /// deciding names alone, such a certificate is never seen as already
+    /// carried, and the proposer offers it again on every block.
     pub fn register_committed_certs(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
         for fw in finalizations {
             let deadline = fw.local_ec().deadline();
+            self.finalization_retention
+                .entry(fw.receipt_hash())
+                .or_insert(deadline);
             for tx_hash in fw.deciding_tx_hashes() {
                 self.resolved_tx_retention
                     .entry(tx_hash)
@@ -231,6 +249,8 @@ impl CommitDedupIndex {
         self.tx_retention.retain(|_, end| *end > now);
         self.resolved_tx_retention
             .retain(|_, deadline| *deadline > now);
+        self.finalization_retention
+            .retain(|_, deadline| *deadline > now);
         self.provision_retention
             .retain(|_, deadline| *deadline > now);
         self.provision_tx_retention
@@ -245,6 +265,12 @@ impl CommitDedupIndex {
     /// `tx_hash`, within the retention window.
     pub fn contains_resolved_tx(&self, tx_hash: &TxHash) -> bool {
         self.resolved_tx_retention.contains_key(tx_hash)
+    }
+
+    /// Whether the chain already carries this exact finalization, within
+    /// the retention window.
+    pub fn contains_finalization(&self, receipt_hash: &FinalizationHash) -> bool {
+        self.finalization_retention.contains_key(receipt_hash)
     }
 
     pub fn contains_provision(&self, provision_hash: &ProvisionHash) -> bool {

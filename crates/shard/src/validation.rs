@@ -17,8 +17,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, LocalTimestamp, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP,
-    MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
+    Block, BlockHeader, BlockHeight, FinalizationHash, LocalTimestamp, MAX_PROVISIONS_PER_BLOCK,
+    MAX_ROUND_GAP, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
     MAX_UNSETTLED_PER_BLOCK, ProvisionHash, QuorumCertificate, ShardId, ShardLoad,
     TopologySnapshot, Transaction, TxHash, Verifiable, VoteCount, abandonment_root_from_records,
     state_proofs_root_from_bundles, sweep_admits_block,
@@ -311,10 +311,32 @@ pub fn validate_no_duplicate_transactions(
 pub fn validate_no_duplicate_resolutions(
     block: &Block,
     qc_chain_resolved_txs: &HashSet<TxHash>,
+    qc_chain_finalizations: &HashSet<FinalizationHash>,
     dedup_index: &CommitDedupIndex,
 ) -> Result<(), String> {
     let mut resolved_here: HashSet<TxHash> = HashSet::new();
+    let mut carried_here: HashSet<FinalizationHash> = HashSet::new();
     for fw in block.certificates().iter() {
+        // The certificate's own identity, held to once per block and once
+        // per chain. A tick whose members reach no verdict names nothing
+        // the per-transaction rule below can hold it to, so without this
+        // the same certificate rides every block.
+        let receipt_hash = fw.receipt_hash();
+        if !carried_here.insert(receipt_hash) {
+            return Err(format!(
+                "finalization {receipt_hash:?} appears twice in the same block"
+            ));
+        }
+        if qc_chain_finalizations.contains(&receipt_hash) {
+            return Err(format!(
+                "finalization {receipt_hash:?} is already carried by a QC chain ancestor"
+            ));
+        }
+        if dedup_index.contains_finalization(&receipt_hash) {
+            return Err(format!(
+                "finalization {receipt_hash:?} was already committed within its retention window"
+            ));
+        }
         // Every name is held to once per block; only a deciding one is
         // held against what the chain already resolved, since a leg's
         // finalization resolves nothing and the reclaim's may follow it.
@@ -578,6 +600,7 @@ pub fn validate_block_for_vote(
     block: &Block,
     qc_chain_tx_hashes: &HashSet<TxHash>,
     qc_chain_resolved_txs: &HashSet<TxHash>,
+    qc_chain_finalizations: &HashSet<FinalizationHash>,
     qc_chain_provision_hashes: &HashSet<ProvisionHash>,
     dedup_index: &CommitDedupIndex,
     coasting: bool,
@@ -590,7 +613,12 @@ pub fn validate_block_for_vote(
     validate_transactions_verified(block)?;
     validate_transaction_ordering(block)?;
     validate_no_duplicate_transactions(block, qc_chain_tx_hashes, dedup_index)?;
-    validate_no_duplicate_resolutions(block, qc_chain_resolved_txs, dedup_index)?;
+    validate_no_duplicate_resolutions(
+        block,
+        qc_chain_resolved_txs,
+        qc_chain_finalizations,
+        dedup_index,
+    )?;
     validate_no_duplicate_provisions(block, qc_chain_provision_hashes, dedup_index)?;
     validate_provisions_not_fenced(topology_snapshot, block)?;
     validate_packages_usable(topology_snapshot, block)?;
@@ -778,7 +806,8 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::test_utils::{
-        TestCommittee, make_finalization, stub_abort_charge, test_principal,
+        TestCommittee, make_finalization, make_undecided_finalization, stub_abort_charge,
+        test_principal,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
@@ -1720,7 +1749,7 @@ mod tests {
     }
 
     fn no_resolutions(block: &Block, dedup_index: &CommitDedupIndex) -> Result<(), String> {
-        validate_no_duplicate_resolutions(block, &HashSet::new(), dedup_index)
+        validate_no_duplicate_resolutions(block, &HashSet::new(), &HashSet::new(), dedup_index)
     }
 
     #[test]
@@ -1735,6 +1764,10 @@ mod tests {
         assert!(no_resolutions(&block, &CommitDedupIndex::new()).is_ok());
     }
 
+    /// The same certificate again is refused on its identity, which is
+    /// the rule that answers whether or not its members reach a verdict.
+    /// The transaction rule below covers the other shape — a *different*
+    /// certificate reaching a second verdict for one name.
     #[test]
     fn validate_no_duplicate_resolutions_rejects_retention_dup() {
         let fw = finalization_at(1);
@@ -1742,7 +1775,31 @@ mod tests {
         let mut dedup_index = CommitDedupIndex::new();
         dedup_index.register_committed_certs(&[Arc::new((*fw).clone().into())]);
         let err = no_resolutions(&block, &dedup_index).unwrap_err();
-        assert!(err.contains("already resolved within its retention window"));
+        assert!(
+            err.contains("was already committed within its retention window"),
+            "{err}"
+        );
+    }
+
+    /// A certificate whose members reach no verdict is held to the chain
+    /// exactly like one that does. Nothing about its names can refuse it
+    /// — it resolves none — so identity is the only thing that can.
+    #[test]
+    fn a_committed_certificate_deciding_nothing_cannot_ride_a_second_block() {
+        let fw = Arc::new(make_undecided_finalization(
+            BlockHeight::new(1),
+            TxHash::from(Hash::from_bytes(b"retired")),
+            TransactionDecision::Accept,
+        ));
+        assert_eq!(fw.deciding_tx_hashes().count(), 0);
+        let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
+        let mut dedup_index = CommitDedupIndex::new();
+        dedup_index.register_committed_certs(&[Arc::new((*fw).clone().into())]);
+        let err = no_resolutions(&block, &dedup_index).unwrap_err();
+        assert!(
+            err.contains("was already committed within its retention window"),
+            "{err}"
+        );
     }
 
     /// A second verdict for one transaction is refused however it is
@@ -1839,9 +1896,13 @@ mod tests {
 
         let block =
             block_with_certificates(BlockHeight::new(6), vec![finalization_over(9, tx_hash)]);
-        let err =
-            validate_no_duplicate_resolutions(&block, &ancestor_resolved, &CommitDedupIndex::new())
-                .unwrap_err();
+        let err = validate_no_duplicate_resolutions(
+            &block,
+            &ancestor_resolved,
+            &HashSet::new(),
+            &CommitDedupIndex::new(),
+        )
+        .unwrap_err();
         assert!(
             err.contains("already resolved by a QC chain ancestor"),
             "{err}"
@@ -2056,6 +2117,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashSet::new(),
             &CommitDedupIndex::new(),
             false,
             Some(ShardLoad::ZERO),
@@ -2074,6 +2136,7 @@ mod tests {
             &topo,
             local_shard(),
             &with_tx,
+            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
@@ -2098,6 +2161,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashSet::new(),
             &CommitDedupIndex::new(),
             true,
             Some(ShardLoad::ZERO),
@@ -2111,6 +2175,7 @@ mod tests {
                 &topo,
                 local_shard(),
                 &empty,
+                &HashSet::new(),
                 &HashSet::new(),
                 &HashSet::new(),
                 &HashSet::new(),

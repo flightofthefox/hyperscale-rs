@@ -21,8 +21,8 @@
 //! one here, so the gap is reported instead of erasing the window.
 
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, ProvisionHash, RETENTION_HORIZON, TxHash,
-    WeightedTimestamp, delivery_window_close,
+    Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, FinalizationHash, ProvisionHash,
+    RETENTION_HORIZON, TxHash, WeightedTimestamp, delivery_window_close,
 };
 
 use super::chain_reader::ShardChainReader;
@@ -46,6 +46,15 @@ pub struct DedupWindow {
     /// `(provision_hash, deadline)` for every batch the window's blocks
     /// committed.
     pub provisions: Vec<(ProvisionHash, WeightedTimestamp)>,
+    /// `(receipt_hash, deadline)` for every finalization the window's
+    /// blocks committed.
+    ///
+    /// Separate from [`Self::resolved`] because the two answer different
+    /// questions. That tier says a transaction has a verdict, which is
+    /// what refuses a second one; this says the chain already carries
+    /// *this certificate*, which is the only thing that refuses one whose
+    /// members reach no verdict at all.
+    pub finalizations: Vec<(FinalizationHash, WeightedTimestamp)>,
     /// The oldest block anchor the walk folded, or `None` when it folded
     /// nothing.
     ///
@@ -147,6 +156,8 @@ impl DedupWindow {
         }
         for finalization in block.certificates().iter() {
             let deadline = finalization.local_ec().deadline();
+            self.finalizations
+                .push((finalization.receipt_hash(), deadline));
             for tx_hash in finalization.tx_hashes() {
                 self.resolved.push((tx_hash, deadline));
             }

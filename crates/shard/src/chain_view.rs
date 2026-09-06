@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin, CommittedTip,
-    ProvisionHash, QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot, SweepFrontier,
-    TxHash, Verified, WorkInFlight,
+    FinalizationHash, ProvisionHash, QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot,
+    SweepFrontier, TxHash, Verified, WorkInFlight,
 };
 use tracing::warn;
 
@@ -295,6 +295,30 @@ impl<'a> ChainView<'a> {
             current_hash = pending.header().parent_block_hash();
         }
         resolved
+    }
+
+    /// The finalizations the QC chain's uncommitted ancestors already
+    /// carry, from `parent_block_hash` back to committed height.
+    ///
+    /// The identity half of [`Self::ancestor_resolved_txs`], and the only
+    /// one that answers for a certificate whose members reach no verdict.
+    /// Read from the manifest, which names every certificate a block
+    /// carries whether or not its body has assembled here — the same
+    /// reason [`Self::collect_ancestor_hashes`] reads it.
+    pub fn ancestor_finalization_ids(
+        &self,
+        parent_block_hash: BlockHash,
+    ) -> HashSet<FinalizationHash> {
+        let mut carried: HashSet<FinalizationHash> = HashSet::new();
+        let mut current_hash = parent_block_hash;
+        while let Some(pending) = self.pending.get(current_hash) {
+            if pending.header().height() <= self.committed_height {
+                break;
+            }
+            carried.extend(pending.manifest().cert_ids().iter().copied());
+            current_hash = pending.header().parent_block_hash();
+        }
+        carried
     }
 }
 

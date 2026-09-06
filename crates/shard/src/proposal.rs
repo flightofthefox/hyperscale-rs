@@ -22,10 +22,11 @@ use hyperscale_core::{Action, FeeDemand};
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, CounterpartClaim,
-    CounterpartEvidence, Epoch, Finalization, Hash, LocalTimestamp, MAX_PROVISIONS_PER_BLOCK,
-    ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round,
-    ScheduleLookup, ShardId, TopologySchedule, TopologySnapshot, Transaction, TxHash, UnsettledTx,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp, delivery_admissible, sweep_admits_block,
+    CounterpartEvidence, Epoch, Finalization, FinalizationHash, Hash, LocalTimestamp,
+    MAX_PROVISIONS_PER_BLOCK, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal,
+    ReshapeTrigger, RevealChain, Round, ScheduleLookup, ShardId, TopologySchedule,
+    TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, delivery_admissible, sweep_admits_block,
 };
 use tracing::debug;
 
@@ -336,6 +337,7 @@ pub fn late_deliveries<T: Deref<Target = Transaction>>(
 pub fn select_finalizations(
     finalizations: Vec<Arc<Verifiable<Finalization>>>,
     qc_chain_resolved_txs: &HashSet<TxHash>,
+    qc_chain_finalizations: &HashSet<FinalizationHash>,
     dedup_index: &CommitDedupIndex,
     parent_settled_frontier: BlockHeight,
     max_finalized_txs: usize,
@@ -370,9 +372,19 @@ pub fn select_finalizations(
             true
         })
         .filter(|fw| {
-            let unresolved = fw
-                .tx_hashes()
-                .all(|tx_hash| !resolved_here.contains(&tx_hash))
+            // Two questions, because the deciding set answers only one of
+            // them. Whether the chain already reached a verdict for these
+            // names is what refuses a second verdict; whether it already
+            // carries *this certificate* is what refuses a tick whose
+            // members reach no verdict at all, whose deciding set is
+            // empty and so satisfies the first question vacuously.
+            let receipt_hash = fw.receipt_hash();
+            let uncarried = !qc_chain_finalizations.contains(&receipt_hash)
+                && !dedup_index.contains_finalization(&receipt_hash);
+            let unresolved = uncarried
+                && fw
+                    .tx_hashes()
+                    .all(|tx_hash| !resolved_here.contains(&tx_hash))
                 && fw.deciding_tx_hashes().all(|tx_hash| {
                     !qc_chain_resolved_txs.contains(&tx_hash)
                         && !dedup_index.contains_resolved_tx(&tx_hash)
@@ -721,8 +733,9 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_types::test_utils::{
-        install_stub_protocol_statics, make_finalization, stub_abort_charge, stub_transaction,
-        stub_transaction_binding, test_prefix, test_principal, test_transaction_running,
+        install_stub_protocol_statics, make_finalization, make_undecided_finalization,
+        stub_abort_charge, stub_transaction, stub_transaction_binding, test_prefix, test_principal,
+        test_transaction_running,
     };
     use hyperscale_types::{
         CommittedTxsRoot, Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_SUBINTENTS,
@@ -896,6 +909,7 @@ mod tests {
         let (selected, count) = select_finalizations(
             vec![Arc::clone(&settled), abandoned],
             &HashSet::new(),
+            &HashSet::new(),
             &CommitDedupIndex::new(),
             BlockHeight::GENESIS,
             MAX_FINALIZED_TX_PER_BLOCK,
@@ -904,6 +918,47 @@ mod tests {
         assert_eq!(selected.len(), 1, "the second verdict is dropped");
         assert_eq!(selected[0].tick_id(), settled.tick_id());
         assert_eq!(count, 1);
+    }
+
+    /// A finalization whose members decide nothing is offered once, and
+    /// the block that commits it keeps it out of the next proposal.
+    ///
+    /// The offer's dedup asks whether the chain already resolved the
+    /// names a finalization carries a verdict on. A member that reaches
+    /// no verdict — a retirement, whose `Membership::housekeeping`
+    /// decides nothing — contributes no such name, so a certificate
+    /// carrying only those asks the question of an empty set. `all()` over
+    /// an empty iterator is true, and the proposer re-offers the same
+    /// certificate on every block while the settlement frontier stands
+    /// still.
+    #[test]
+    fn select_finalizations_drops_a_committed_offer_that_decided_nothing() {
+        let tx_hash = TxHash::from(Hash::from_bytes(b"retired"));
+        let committed: Arc<Verifiable<Finalization>> = Arc::new(
+            make_undecided_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept)
+                .into(),
+        );
+        assert_eq!(
+            committed.deciding_tx_hashes().count(),
+            0,
+            "the fixture has to decide nothing, or it tests the ordinary path",
+        );
+        let mut dedup_index = CommitDedupIndex::new();
+        dedup_index.register_committed_certs(&[Arc::clone(&committed)]);
+
+        let (selected, _) = select_finalizations(
+            vec![committed],
+            &HashSet::new(),
+            &HashSet::new(),
+            &dedup_index,
+            BlockHeight::GENESIS,
+            MAX_FINALIZED_TX_PER_BLOCK,
+            WeightedTimestamp::ZERO,
+        );
+        assert!(
+            selected.is_empty(),
+            "a certificate the chain already carries was offered again",
+        );
     }
 
     /// A transaction a committed block already resolved keeps its
@@ -923,6 +978,7 @@ mod tests {
         );
         let (selected, count) = select_finalizations(
             vec![abandoned],
+            &HashSet::new(),
             &HashSet::new(),
             &dedup_index,
             BlockHeight::GENESIS,
