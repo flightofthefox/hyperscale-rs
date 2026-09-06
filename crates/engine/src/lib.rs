@@ -32,12 +32,14 @@ mod receipt;
 mod records;
 
 /// Genesis seeding: the stdlib world and funded-account cells.
+pub mod committed;
 pub mod genesis;
 pub mod legs;
 /// Shard assignment and write filtering for `StateWrites`.
 pub mod sharding;
 
 pub use batch::{TickBatchContext, TickEnvironment, TickTxInput};
+pub use committed::{committed_cells, writes_committed_cell};
 pub use executor::{
     Executor, artifact_package, build_fee_receipt, instance_of_record, protocol_hash, publish_work,
 };

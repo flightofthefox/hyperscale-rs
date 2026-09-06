@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use hyperscale_engine::committed_cells;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_node::reshape::PreparedStore;
@@ -29,8 +30,8 @@ use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{GetRemoteHeadersRequest, GetStateRangeRequest};
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, PredecessorTerminal, ReshapeSeat, ShardAnchor, ShardId,
-    StateRoot, SubstateLeaf, ValidatorId,
+    Block, BlockHeight, ChainOrigin, EpochWindows, PredecessorTerminal, ReshapeSeat, ShardAnchor,
+    ShardId, StateRoot, SubstateLeaf, ValidatorId,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -581,15 +582,40 @@ impl ShardSupervisor {
             warn!(shard = ?shard, "Reshape follow apply for an unopened store; dropped");
             return;
         };
+        // The block is the parent's, classified under the parent's own
+        // window: once the cut has landed the current snapshot places the
+        // parent's owners on its children, and no core would contain it.
+        // A block carrying no transactions creates nothing and needs no
+        // window.
+        let creations = if block.transactions().is_empty() {
+            Vec::new()
+        } else {
+            let anchor = block.header().parent_qc().weighted_timestamp();
+            let epoch = EpochWindows::new(self.epoch_duration_ms).epoch_for(anchor);
+            let Some(topology) = self.process.topology_at(epoch) else {
+                warn!(
+                    shard = ?shard,
+                    ?epoch,
+                    "Reshape follow apply for a window this host holds no topology for; dropped"
+                );
+                return;
+            };
+            committed_cells(
+                block.header().shard_id(),
+                topology.shard_trie(),
+                block.transactions().iter().map(|tx| tx.as_unverified()),
+            )
+        };
         let events = self.events_tx.clone();
-        self.tokio_handle
-            .spawn_blocking(move || match storage.follow_block_writes(&block) {
+        self.tokio_handle.spawn_blocking(move || {
+            match storage.follow_block_writes(&block, &creations) {
                 Ok(root) => {
                     let _ =
                         events.send(SupervisorEvent::Reshape(ReshapeIo::Applied { shard, root }));
                 }
                 Err(error) => warn!(shard = ?shard, %error, "Reshape follow apply failed"),
-            });
+            }
+        });
     }
 
     /// Sign `validator`'s ready signal attesting the sync of `child`,

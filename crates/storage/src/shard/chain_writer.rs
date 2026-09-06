@@ -108,20 +108,19 @@ pub trait ShardChainWriter: Send + Sync + 'static {
     /// beacon-witness leaves to fold into the same atomic batch. Used when
     /// no `PreparedCommit` is available.
     ///
-    /// The committed-transaction cells are derived here from the block
-    /// itself, which this path holds whole. `removals` is what the
-    /// block's sweep retires, on the same terms as
-    /// [`Self::prepare_block_commit`]: a caller that walked the frontier
-    /// interval supplies it, and one whose block sweeps nothing passes an
-    /// empty slice. It is a parameter rather than something derived here
-    /// because this path does not know the parent's frontier and cannot
-    /// establish that the store sits at the parent — the two things the
-    /// walk needs. Deriving it under those assumptions would produce a
-    /// state that silently differs from every node that prepared the
-    /// block, which is the one failure a commit path must not have.
+    /// `creations` and `removals` are the caller's, on the same terms as
+    /// [`Self::prepare_block_commit`]. The committed cells the block
+    /// writes are decided by placement, which the store does not hold;
+    /// the removals need the parent's frontier and a store known to sit
+    /// at the parent, which this path cannot establish. Deriving either
+    /// here under assumptions would produce a state that silently differs
+    /// from every node that prepared the block, which is the one failure
+    /// a commit path must not have. A block that writes or sweeps nothing
+    /// passes an empty slice.
     fn commit_block(
         &self,
         certified: &Arc<Verified<CertifiedBlock>>,
+        creations: &[(SubstateKey, Vec<u8>)],
         removals: &[SubstateKey],
         witness: &BeaconWitnessCommit,
     ) -> StateRoot;

@@ -165,7 +165,7 @@ fn run_tick(
         receipts.push(StoredReceipt::from(tx));
     }
     let after = storage
-        .follow_block_writes(&block_settling(BlockHeight::new(height), receipts))
+        .follow_block_writes(&block_settling(BlockHeight::new(height), receipts), &[])
         .expect("committed receipts apply");
     assert_ne!(before, after, "a settling tick moves the state root");
     executed

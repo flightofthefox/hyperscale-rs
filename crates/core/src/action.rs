@@ -720,10 +720,9 @@ pub enum Action {
         /// the committed-transaction window a terminating boundary header
         /// roots. Carried as hashes because that is all the root needs.
         block_tx_hashes: Vec<TxHash>,
-        /// The committed-transaction cells the block itself writes, one
-        /// per transaction it carries, derived by the coordinator that
-        /// holds the block. They fold with the receipts' writes under the
-        /// root being verified.
+        /// The committed cells the block writes, derived by the
+        /// coordinator under the block's own window. They fold with the
+        /// receipts' writes under the root being verified.
         creations: Vec<(SubstateKey, Vec<u8>)>,
         /// Block height being verified.
         block_height: BlockHeight,
@@ -1207,6 +1206,11 @@ pub enum Action {
         /// Where the parent's sweep stopped — the lower end of the
         /// interval this block's removals fill.
         parent_sweep_frontier: SweepFrontier,
+        /// The committed cells the block writes, derived by the
+        /// coordinator under the block's own window — the one placement
+        /// fact the recomputation reads beyond the block, resolved where
+        /// the schedule is.
+        creations: Vec<(SubstateKey, Vec<u8>)>,
         /// How this node learned the certifying QC (aggregator vs header).
         source: CommitSource,
         /// Beacon-witness leaves to persist alongside the block in the
@@ -1286,6 +1290,12 @@ pub enum Action {
         epoch: Epoch,
         /// New topology snapshot to propagate.
         topology_snapshot: Arc<TopologySnapshot>,
+        /// The snapshot the schedule holds for `epoch.next()`, derived a
+        /// full epoch ahead. A block can be anchored inside a window
+        /// before the beacon commit that opens it is folded here; a
+        /// reshape follow classifying such a block reads its window from
+        /// the history this entry fills ahead of the head.
+        lookahead: Arc<TopologySnapshot>,
         /// Terminal-clamped per-shard routing committees, covering every
         /// shard the schedule still retains — including a split parent
         /// draining out of the head, whose committee the head snapshot no

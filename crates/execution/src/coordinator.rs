@@ -231,14 +231,24 @@ type CounterpartCell = (ShardId, SubstateKey, WeightedTimestamp, Probed);
 /// commit-time fold both read, so what is asked and what is answered
 /// are the same cells.
 fn counterpart_cells(entry: &Probeable, trie: &ShardTrie) -> Vec<CounterpartCell> {
-    let core = entry.core.iter().next().map(|&shard| {
-        (
-            shard,
-            committed_tx_cell_key(shard, entry.tx_hash, entry.validity_end),
-            entry.deadline,
-            Probed::Core,
-        )
-    });
+    // Only a core of more than one shard writes the committed cell, and
+    // only it is asked for one: its shards settle on each other's
+    // certificates with no clock, so its claim absent past the deadline
+    // may be pending. A core of one shard answers through its claim,
+    // which the deadline fences.
+    let core = entry
+        .core
+        .iter()
+        .next()
+        .filter(|_| entry.core.len() > 1)
+        .map(|&shard| {
+            (
+                shard,
+                committed_tx_cell_key(shard, entry.tx_hash, entry.validity_end),
+                entry.deadline,
+                Probed::Core,
+            )
+        });
     let deliveries = entry.deliveries.iter().flat_map(|&(delivered_by, claim)| {
         BTreeSet::from([delivered_by, trie.shard_for_prefix(claim.owner)])
             .into_iter()
@@ -2517,11 +2527,13 @@ impl ExecutionCoordinator {
     ///
     /// The deadline gates the probe and never the reclaim: absence at a
     /// block past the floor is the evidence, and before it the
-    /// counterpart may still legitimately act. A core is asked about the
-    /// transaction's committed cell past the deadline, and the probe
-    /// goes to the core's lowest shard — any one core shard's absence
-    /// suffices, and the choice has to be the same on every validator or
-    /// a voter's mirror would name a shard the record does not. A
+    /// counterpart may still legitimately act. A core of more than one
+    /// shard is asked about the transaction's committed cell past the
+    /// deadline, and the probe goes to the core's lowest shard — any one
+    /// core shard's absence suffices, and the choice has to be the same
+    /// on every validator or a voter's mirror would name a shard the
+    /// record does not. A core of one shard writes no cell and is asked
+    /// about its consumer's claim instead. A
     /// delivering shard is asked about the crossing's claim cell past
     /// the lapse, the delivery window's close plus the finalization
     /// delay, since a delivery admitted under the close has claimed by
@@ -2731,6 +2743,11 @@ impl ExecutionCoordinator {
                         // core of more it says only that a sibling is
                         // pending, and the committed cell answers.
                         (Inclusion::Absent, Probed::Claim) if entry.core.len() != 1 => continue,
+                        // And a committed cell absent on a core of one
+                        // shard proves nothing: such a core writes none.
+                        // The probe is never sent, but a proof carried
+                        // in a block is read here whoever fetched it.
+                        (Inclusion::Absent, Probed::Core) if entry.core.len() == 1 => continue,
                         (Inclusion::Absent, Probed::Core | Probed::Delivery | Probed::Claim) => {
                             Answer::Absent(Absence {
                                 probed_wt: bundle.anchor_ts,
@@ -8324,9 +8341,14 @@ mod tests {
             .collect()
     }
 
-    /// A state on [`HOME`] holding `transaction` as a leg whose core is
-    /// [`PEER`], certified and never resolved.
-    fn leg_state(transaction: &Arc<Verifiable<Transaction>>) -> ExecutionCoordinator {
+    /// A state on [`HOME`] holding `transaction` as a leg, certified and
+    /// never resolved, with the shape frozen as `classified` says: what
+    /// fixes how many shards the core spans, and so whether its
+    /// committed cell is ever asked about.
+    fn leg_state(
+        transaction: &Arc<Verifiable<Transaction>>,
+        classified: Classified,
+    ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         state.unresolved.register_committed(
             HOME,
@@ -8336,7 +8358,7 @@ mod tests {
         state.unresolved.mark_leg(
             transaction.hash(),
             Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            leg_classified(),
+            classified,
             Vec::new(),
             Vec::new(),
         );
@@ -8661,9 +8683,10 @@ mod tests {
         );
     }
 
-    /// A leg whose core has fallen silent: the core's three headers held,
-    /// none asked about while the committed clock was short of the
-    /// deadline, and the clock now at it.
+    /// A leg whose core, spanning two shards, has fallen silent: the
+    /// core's three headers held, none asked about while the committed
+    /// clock was short of the deadline, and the clock now at it. Only
+    /// such a core writes the committed cell a leg asks about.
     struct SilentCore {
         schedule: TopologySchedule,
         state: ExecutionCoordinator,
@@ -8674,7 +8697,7 @@ mod tests {
     }
 
     fn silent_core() -> SilentCore {
-        let schedule = two_shard_topology();
+        let schedule = two_shard_core_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
@@ -8682,12 +8705,12 @@ mod tests {
         let figures = UnsettledTx::for_transaction(&transaction);
         let deadline = figures.deadline;
         let key = committed_tx_cell_key(
-            PEER,
+            CORE,
             tx_hash,
             transaction.validity_range().end_timestamp_exclusive,
         );
         let root = |tag: &[u8]| StateRoot::from_raw(Hash::from_bytes(tag));
-        let mut state = leg_state(&transaction);
+        let mut state = leg_state(&transaction, two_shard_core_classified());
         let held: [(u64, WeightedTimestamp, &[u8]); 3] = [
             (3, deadline.minus(Duration::from_millis(1)), b"short"),
             (5, deadline.plus(Duration::from_secs(1)), b"later"),
@@ -8696,8 +8719,8 @@ mod tests {
         for (height, ts, tag) in held {
             state
                 .proven_anchors()
-                .record(PEER, BlockHeight::new(height), root(tag), ts);
-            let actions = state.on_committed_remote_header(&schedule, PEER);
+                .record(CORE, BlockHeight::new(height), root(tag), ts);
+            let actions = state.on_committed_remote_header(&schedule, CORE);
             assert!(
                 state_proof_fetches(&actions).is_empty(),
                 "before the deadline nothing is asked"
@@ -8730,7 +8753,7 @@ mod tests {
             deadline,
         } = silent_core();
         let later = deadline.plus(Duration::from_secs(1));
-        let (bundle, opened) = proven_at(&mut state, &schedule, PEER, 5, later, &[], &[key]);
+        let (bundle, opened) = proven_at(&mut state, &schedule, CORE, 5, later, &[], &[key]);
         assert_eq!(
             state_proof_fetches(&opened),
             vec![(bundle.anchor, vec![key])],
@@ -8744,7 +8767,7 @@ mod tests {
         let (early, _) = proven_at(
             &mut state,
             &schedule,
-            PEER,
+            CORE,
             2,
             deadline.minus(Duration::from_millis(1)),
             &[],
@@ -8752,7 +8775,7 @@ mod tests {
         );
         let _ = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![early]);
         assert!(
-            absences_observed(&state, tx_hash).is_empty(),
+            absences_observed_at(&state, CORE, tx_hash).is_empty(),
             "a proof taken before the deadline says nothing: the core may still commit"
         );
 
@@ -8771,7 +8794,7 @@ mod tests {
             "the fence is told the absence landed"
         );
         assert_eq!(
-            absences_observed(&state, tx_hash),
+            absences_observed_at(&state, CORE, tx_hash),
             vec![Absence {
                 probed_wt: later,
                 floor: deadline
@@ -8780,7 +8803,7 @@ mod tests {
         );
         assert_eq!(
             state.pending_abandonment_records(),
-            vec![AbandonmentRecord::unclaimed(PEER, later, [figures])],
+            vec![AbandonmentRecord::unclaimed(CORE, later, [figures])],
             "and a record is offered under the anchor it was proved at"
         );
 
@@ -8794,25 +8817,26 @@ mod tests {
         );
     }
 
-    /// A core that turns out to have committed the transaction is not
-    /// absent: the presence answers the question, offers nothing, and
-    /// the core is not asked again — its own certificate speaks next.
+    /// A core of two shards that turns out to have committed the
+    /// transaction is not absent: the presence answers the question,
+    /// offers nothing, and the core is not asked again — its own
+    /// certificate speaks next.
     #[test]
     fn a_core_that_committed_the_transaction_is_not_probed_again() {
-        let schedule = two_shard_topology();
+        let schedule = two_shard_core_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
         let deadline = UnsettledTx::for_transaction(&transaction).deadline;
         let key = committed_tx_cell_key(
-            PEER,
+            CORE,
             tx_hash,
             transaction.validity_range().end_timestamp_exclusive,
         );
-        let mut state = leg_state(&transaction);
+        let mut state = leg_state(&transaction, two_shard_core_classified());
         state.committed_ts = deadline;
-        let (bundle, opened) = proven_at(&mut state, &schedule, PEER, 4, deadline, &[key], &[key]);
+        let (bundle, opened) = proven_at(&mut state, &schedule, CORE, 4, deadline, &[key], &[key]);
         assert_eq!(
             state_proof_fetches(&opened),
             vec![(bundle.anchor, vec![key])]
@@ -8820,14 +8844,14 @@ mod tests {
 
         let folded = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert!(
-            absences_observed(&state, tx_hash).is_empty(),
+            absences_observed_at(&state, CORE, tx_hash).is_empty(),
             "a core that committed it is not absent"
         );
         assert!(
             folded.iter().any(|action| matches!(
                 action,
                 Action::Fetch(FetchRequest::ExecutionCerts { source_shard, tx_hash: fetched, .. })
-                    if *source_shard == PEER && *fetched == tx_hash
+                    if *source_shard == CORE && *fetched == tx_hash
             )),
             "and its certificate is fetched, since a refusal there licenses the reclaim"
         );
@@ -8897,19 +8921,11 @@ mod tests {
             local: LocalKey([0x7C; 16]),
         };
         let mut state = claimed_leg_state(&transaction, claim);
-        let (bundle, opened) = proven_at(
-            &mut state,
-            &schedule,
-            PEER,
-            4,
-            deadline,
-            &[core_key],
-            &[core_key, claim],
-        );
+        let (bundle, opened) = proven_at(&mut state, &schedule, PEER, 4, deadline, &[], &[claim]);
         assert_eq!(
             state_proof_fetches(&opened),
-            vec![(bundle.anchor, vec![core_key, claim])],
-            "the core's committed cell and the consumer's claim are asked about together"
+            vec![(bundle.anchor, vec![claim])],
+            "a core of one shard writes no committed cell, so only its consumer's claim is asked"
         );
 
         state.on_state_proof_verified(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
@@ -8933,12 +8949,12 @@ mod tests {
             PEER,
             5,
             deadline.plus(Duration::from_secs(2)),
-            &[core_key],
+            &[],
             &[claim],
         );
         assert!(
             state_proof_fetches(&opened).is_empty(),
-            "and neither question is asked again: both answered"
+            "and the claim is not asked again: it answered"
         );
     }
 
@@ -8949,14 +8965,14 @@ mod tests {
     /// answered. That cell is what answers for such a core.
     #[test]
     fn a_multi_shard_cores_claim_proved_absent_is_asked_again() {
-        let schedule = two_shard_topology();
+        let schedule = two_shard_core_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
         let deadline = UnsettledTx::for_transaction(&transaction).deadline;
         let core_key = committed_tx_cell_key(
-            PEER,
+            CORE,
             tx_hash,
             transaction.validity_range().end_timestamp_exclusive,
         );
@@ -8965,14 +8981,19 @@ mod tests {
             local: LocalKey([0x7C; 16]),
         };
         let mut state = claimed_leg_state_under(&transaction, claim, two_shard_core_classified());
-        let (bundle, _) = proven_at(
+        let (bundle, opened) = proven_at(
             &mut state,
             &schedule,
-            PEER,
+            CORE,
             4,
             deadline,
             &[core_key],
             &[core_key, claim],
+        );
+        assert_eq!(
+            state_proof_fetches(&opened),
+            vec![(bundle.anchor, vec![core_key, claim])],
+            "the committed cell and the claim are asked together"
         );
 
         state.on_state_proof_verified(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
@@ -8989,7 +9010,7 @@ mod tests {
         let (later, opened) = proven_at(
             &mut state,
             &schedule,
-            PEER,
+            CORE,
             5,
             deadline.plus(Duration::from_secs(2)),
             &[core_key],
@@ -9262,6 +9283,11 @@ mod tests {
     const HOME: ShardId = ShardId::leaf(1, 0);
     const PEER: ShardId = ShardId::leaf(1, 1);
 
+    /// The two leaves a core of two shards spans, [`PEER`]'s children.
+    /// A leg names the lower for the committed cell.
+    const CORE: ShardId = ShardId::leaf(2, 2);
+    const CORE_SIBLING: ShardId = ShardId::leaf(2, 3);
+
     /// A shape frozen divided with an inbound leg on `HOME` feeding a
     /// core on `PEER`.
     fn leg_classified() -> Classified {
@@ -9277,8 +9303,10 @@ mod tests {
         classified
     }
 
-    /// A shape frozen divided with a core spanning two leaves, so a claim
-    /// absent on either says only that the other is pending.
+    /// A shape frozen divided under [`two_shard_core_topology`] with an
+    /// inbound leg on [`HOME`] feeding a core spanning [`CORE`] and
+    /// [`CORE_SIBLING`], so a claim absent on either says only that the
+    /// other is pending.
     fn two_shard_core_classified() -> Classified {
         use hyperscale_vm_types::LegRole;
 
@@ -9288,11 +9316,9 @@ mod tests {
             leg(2, LegRole::Core, &[(0, 0)]),
             leg(3, LegRole::Core, &[(1, 0)]),
         ];
-        let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(2));
-        assert_eq!(
-            classified.core(),
-            &BTreeSet::from([ShardId::leaf(2, 2), ShardId::leaf(2, 3)])
-        );
+        let trie = ShardTrie::from_leaves([HOME, CORE, CORE_SIBLING]);
+        let classified = Classified::freeze(&legs, &[], &trie);
+        assert_eq!(classified.core(), &BTreeSet::from([CORE, CORE_SIBLING]));
         assert!(classified.decomposed().holds());
         classified
     }
@@ -9310,6 +9336,12 @@ mod tests {
         let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(2));
         assert_eq!(classified.core(), &BTreeSet::from([ShardId::leaf(2, 3)]));
         classified
+    }
+
+    /// [`HOME`] beside [`CORE`] and [`CORE_SIBLING`], all live: the
+    /// topology a leg on `HOME` probes a two-shard core under.
+    fn two_shard_core_topology() -> TopologySchedule {
+        TopologySchedule::single(leaves_snap(&[HOME, CORE, CORE_SIBLING], &[]))
     }
 
     /// [`HOME`] and [`PEER`] both live, both crewed — the topology a

@@ -285,10 +285,15 @@ where
             Action::TopologyChanged {
                 epoch,
                 topology_snapshot,
+                lookahead,
                 routing_committees,
             } => {
-                self.process
-                    .apply_topology(epoch, &topology_snapshot, routing_committees);
+                self.process.apply_topology(
+                    epoch,
+                    &topology_snapshot,
+                    lookahead,
+                    routing_committees,
+                );
             }
             Action::ReconfigureParticipation(change) => {
                 self.pending_participation_changes.push(change);

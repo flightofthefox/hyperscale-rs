@@ -1094,7 +1094,9 @@ impl ShardCoordinatorSim {
     /// re-enter `try_propose` once if any path latched a retry.
     fn drain_post_dispatch(&mut self, to_idx: usize) -> Vec<Action> {
         let mut actions = Vec::new();
-        for ready in self.coordinators[to_idx].drain_ready_state_root_verifications() {
+        for ready in
+            self.coordinators[to_idx].drain_ready_state_root_verifications(&self.topology_schedule)
+        {
             actions.push(Action::VerifyStateRoot {
                 block_hash: ready.block_hash,
                 parent_block_hash: ready.parent_block_hash,
@@ -1935,6 +1937,7 @@ impl ShardCoordinatorSim {
                 parent_state_root: _,
                 parent_block_height: _,
                 parent_sweep_frontier: _,
+                creations: _,
                 source: _,
                 witness,
             } => {

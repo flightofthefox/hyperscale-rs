@@ -138,6 +138,7 @@ impl ShardChainWriter for RocksDbShardStorage {
     fn commit_block(
         &self,
         certified: &Arc<Verified<CertifiedBlock>>,
+        creations: &[(SubstateKey, Vec<u8>)],
         removals: &[SubstateKey],
         witness: &BeaconWitnessCommit,
     ) -> StateRoot {
@@ -154,7 +155,7 @@ impl ShardChainWriter for RocksDbShardStorage {
         // and this node's own persistence depth move a live read out
         // from under it.
         let _commit_guard = self.commit_lock.lock().unwrap();
-        let merged_writes = block_settled_writes(block, &self.snapshot(), removals);
+        let merged_writes = block_settled_writes(block, &self.snapshot(), creations, removals);
         self.commit_block_inner_locked(&merged_writes, block, qc, &receipts, witness)
     }
 }

@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_engine::legs::Classified;
+use hyperscale_engine::writes_committed_cell;
 use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, CounterpartClaim,
     CounterpartEvidence, Epoch, Finalization, FinalizationHash, Hash, LocalTimestamp,
@@ -257,8 +258,17 @@ pub fn select_transactions(
                 return false;
             }
             // What the transaction's execution creates on this shard, and
-            // the committed cell the chain writes for it.
-            let with_this = sweepable.saturating_add(tx.sweepable_writes_on(trie, local_shard) + 1);
+            // the committed cell the chain writes for one whose core
+            // spans more than one shard.
+            let with_this = sweepable.saturating_add(
+                tx.sweepable_writes_on(trie, local_shard)
+                    + usize::from(writes_committed_cell(
+                        tx.legs(),
+                        tx.owners(),
+                        trie,
+                        local_shard,
+                    )),
+            );
             if !sweep_admits_block(with_this) {
                 oversweeping += 1;
                 return false;
@@ -1297,9 +1307,9 @@ mod tests {
         // by one that can. Skipping rather than stopping is what keeps a
         // large composition from starving the small ones behind it.
         // Each fully composed transaction creates its subintents'
-        // nullifiers, all on this one shard, and the committed cell the
-        // chain writes for it.
-        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / (MAX_SUBINTENTS + 1);
+        // nullifiers, all on this one shard; its core is this shard
+        // alone, so the chain writes no committed cell for it.
+        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / MAX_SUBINTENTS;
         let mut txs: Vec<Arc<Verified<Transaction>>> = (0..full)
             .map(|i| {
                 binding(

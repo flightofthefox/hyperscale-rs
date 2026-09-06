@@ -839,9 +839,9 @@ mod tests {
             )];
             let block = block_settling(BlockHeight::new(u64::from(seed)), receipts.to_vec());
             roots = (
-                whole.follow_block_writes(&block).unwrap(),
-                left.follow_block_writes(&block).unwrap(),
-                right.follow_block_writes(&block).unwrap(),
+                whole.follow_block_writes(&block, &[]).unwrap(),
+                left.follow_block_writes(&block, &[]).unwrap(),
+                right.follow_block_writes(&block, &[]).unwrap(),
             );
             // The leaf key is the owner prefix by identity, so the side a
             // write lands on is that prefix's leading bit.

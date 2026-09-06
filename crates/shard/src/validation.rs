@@ -16,6 +16,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use hyperscale_engine::writes_committed_cell;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, FinalizationHash, LocalTimestamp, MAX_PROVISIONS_PER_BLOCK,
     MAX_ROUND_GAP, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
@@ -544,7 +545,15 @@ pub fn validate_sweepable_creation(
 ) -> Result<(), String> {
     let trie = topology_snapshot.shard_trie();
     let created = block.transactions().iter().fold(0usize, |total, tx| {
-        total.saturating_add(tx.sweepable_writes_on(trie, local_shard) + 1)
+        total.saturating_add(
+            tx.sweepable_writes_on(trie, local_shard)
+                + usize::from(writes_committed_cell(
+                    tx.legs(),
+                    tx.owners(),
+                    trie,
+                    local_shard,
+                )),
+        )
     });
     if !sweep_admits_block(created) {
         return Err(format!(
@@ -1297,9 +1306,9 @@ mod tests {
     #[test]
     fn a_block_may_create_sweepable_cells_up_to_the_cap() {
         // Each fully composed transaction creates its subintents'
-        // nullifiers, all on this one shard, and the one committed cell
-        // the chain writes for it.
-        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / (MAX_SUBINTENTS + 1);
+        // nullifiers, all on this one shard; its core is this shard
+        // alone, so the chain writes no committed cell for it.
+        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / MAX_SUBINTENTS;
         let mut txs: Vec<Arc<Verifiable<Transaction>>> = (0..full)
             .map(|i| {
                 Arc::new(Verifiable::from(test_utils::stub_transaction_binding(

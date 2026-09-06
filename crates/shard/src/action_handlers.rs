@@ -8,12 +8,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
+use hyperscale_engine::committed_cells;
 use hyperscale_engine::legs::Classified;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
     JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage, SubstateStore, SubstateView,
-    SweepIndex, TerminalWindow, VersionedStore, committed_tx_cells, sweep_for_block,
+    SweepIndex, TerminalWindow, VersionedStore, sweep_for_block,
 };
 use hyperscale_types::network::gossip::{CertifiedBlockHeaderGossip, ShardForkProofGossip};
 use hyperscale_types::network::notification::{
@@ -256,9 +257,14 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         parent_sweep_frontier,
         parent_qc.weighted_timestamp(),
     );
-    // What the chain writes of its own accord: one committed-transaction
-    // cell per transaction the block carries.
-    let creations = committed_tx_cells(local_shard, transactions.iter().map(|tx| &***tx));
+    // What the chain writes of its own accord: a committed-transaction
+    // cell for each transaction whose core spans more than one shard,
+    // this one among them.
+    let creations = committed_cells(
+        local_shard,
+        topology_snapshot.shard_trie(),
+        transactions.iter().map(|tx| &***tx),
+    );
     let (state_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
         ParentAnchor {
             state_root: parent_state_root,

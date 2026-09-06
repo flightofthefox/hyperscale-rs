@@ -37,10 +37,11 @@ pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 ///
 /// Three families are sweepable and share that capacity — the nullifier,
 /// the escrow claim (a reclaim's included) and the committed-transaction
-/// cell the chain writes for every transaction it carries — because the
-/// removal capacity they draw on is one capacity. A budget per family
-/// would cost throughput as well as counters: a block could be invalid
-/// on one family's peak while the shared walk had room.
+/// cell a core spanning more than one shard writes for each transaction
+/// it carries — because the removal capacity they draw on is one
+/// capacity. A budget per family would cost throughput as well as
+/// counters: a block could be invalid on one family's peak while the
+/// shared walk had room.
 ///
 /// The count has a fourth term that is not one of them. An escrow record
 /// is a balance, retired by whoever consumes it and reachable by no
@@ -51,21 +52,22 @@ pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 ///
 /// Counted per shard, since that is where a cell lands and where the
 /// sweep that retires it runs: a transaction's kernel cells whose owner
-/// the shard holds, plus the committed cell. Sized at four times
-/// [`MAX_TXS_PER_BLOCK`] so a full block of any shape the corpus
-/// produces stays admissible on its busiest shard — a transfer's payer
-/// writes the record and the committed cell, two; a swap's caller adds
-/// the claim of what the venue issued, three; a liquidity provider
-/// paying two resources writes two records, one claim and the committed
-/// cell, four. A bound subintent adds its nullifier on its signer's
-/// shard, so a subintent-heavy block packs fewer transactions, which is
-/// the trade the figure already made when nullifiers were the only
-/// family. Nothing else in the block budget reaches this: a nullifier
-/// costs its transaction a footprint unit and a signature, so the work
-/// budget admits thirty-two of them per transaction and the creation
-/// ceiling would otherwise sit two orders of magnitude above any
-/// removal count a block can carry.
-pub const MAX_SWEEPABLE_CREATED_PER_BLOCK: usize = 4 * MAX_TXS_PER_BLOCK;
+/// the shard holds, plus the committed cell where the shard is one of a
+/// multi-shard core. Sized at three times [`MAX_TXS_PER_BLOCK`] so a
+/// full block of any shape the corpus produces stays admissible on its
+/// busiest shard — a transfer's payer writes the record, one; a swap's
+/// caller adds the claim of what the venue issued, two; a liquidity
+/// provider paying two resources writes two records and one claim,
+/// three; a venue on a route's two-shard core writes the claim of what
+/// arrived and the committed cell, two. A bound subintent adds its
+/// nullifier on its signer's shard, so a subintent-heavy block packs
+/// fewer transactions, which is the trade the figure already made when
+/// nullifiers were the only family. Nothing else in the block budget
+/// reaches this: a nullifier costs its transaction a footprint unit and
+/// a signature, so the work budget admits thirty-two of them per
+/// transaction and the creation ceiling would otherwise sit two orders
+/// of magnitude above any removal count a block can carry.
+pub const MAX_SWEEPABLE_CREATED_PER_BLOCK: usize = 3 * MAX_TXS_PER_BLOCK;
 
 /// Hard cap on the cells one block's sweep may remove.
 ///

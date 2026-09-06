@@ -197,6 +197,7 @@ mod tests {
         storage.commit_block(
             &make_test_certified(block),
             &[],
+            &[],
             &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
         );
         hash

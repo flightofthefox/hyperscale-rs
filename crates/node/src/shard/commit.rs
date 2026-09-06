@@ -24,13 +24,12 @@ use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
 use hyperscale_storage::{
-    ChainEntry, ParentAnchor, PendingChain, ShardStorage, SubstateStore, committed_tx_cells,
-    sweep_for_block,
+    ChainEntry, ParentAnchor, PendingChain, ShardStorage, SubstateStore, sweep_for_block,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, Derivation,
-    EpochWindows, Finalization, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SweepFrontier,
-    SyncHint, Verifiable, Verified, WeightedTimestamp, absorb_committed_cells,
+    EpochWindows, Finalization, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SubstateKey,
+    SweepFrontier, SyncHint, Verifiable, Verified, WeightedTimestamp, absorb_committed_cells,
     local_settled_tx_hashes,
 };
 use tracing::debug;
@@ -63,6 +62,26 @@ pub enum QcOnlyKind {
     NeedsPrep,
 }
 
+/// What `Action::CommitBlockByQcOnly` carries: the certified block and
+/// every input its JMT recomputation reads, as the coordinator that
+/// admitted the block derived them.
+pub struct QcOnlyCommit {
+    /// Block + certifying QC; see [`QcOnlyPending::certified`].
+    pub certified: Arc<Verified<CertifiedBlock>>,
+    /// Parent's state root, the base for the recomputation.
+    pub parent_state_root: StateRoot,
+    /// Parent's height, the JMT parent version.
+    pub parent_block_height: BlockHeight,
+    /// Where the parent's sweep stopped.
+    pub parent_sweep_frontier: SweepFrontier,
+    /// The committed cells the block writes, derived under its window.
+    pub creations: Vec<(SubstateKey, Vec<u8>)>,
+    /// How this node learned the certifying QC.
+    pub source: CommitSource,
+    /// Beacon-witness leaves to fold into the commit.
+    pub witness: BeaconWitnessCommit,
+}
+
 /// A QC-only commit waiting on the single in-flight slot. Every
 /// `Action::CommitBlockByQcOnly` other than the already-persisted skip
 /// path enters the FIFO so preps run one at a time in commit order —
@@ -83,6 +102,10 @@ pub struct QcOnlyPending {
     /// this block's removals fill. Unused when
     /// `kind == AlreadyPrepared`.
     pub parent_sweep_frontier: SweepFrontier,
+    /// The committed cells the block writes, derived by the coordinator
+    /// under the block's own window. Unused when
+    /// `kind == AlreadyPrepared`.
+    pub creations: Vec<(SubstateKey, Vec<u8>)>,
     /// How this node learned the certifying QC.
     pub source: CommitSource,
     /// Whether this entry needs the pool to run JMT prep or can
@@ -187,10 +210,7 @@ where
         pending.parent_sweep_frontier,
         block.header().parent_qc().weighted_timestamp(),
     );
-    let creations = committed_tx_cells(
-        block.header().shard_id(),
-        block.transactions().iter().map(|tx| tx.as_unverified()),
-    );
+    let creations = &pending.creations;
     let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
         ParentAnchor {
             state_root: pending.parent_state_root,
@@ -200,7 +220,7 @@ where
             base_reads: None,
         },
         &finalizations,
-        &creations,
+        creations,
         &removals,
         height,
     );

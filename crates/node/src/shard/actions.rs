@@ -15,9 +15,8 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    BeaconProposal, BeaconWitnessCommit, BlockHeight, CertifiedBlock, Epoch, PredecessorTerminal,
-    RoutingCommittees, StateRoot, SweepFrontier, TopologySnapshot, TransactionStatus, TxHash,
-    ValidatorId, Verified,
+    BeaconProposal, BeaconWitnessCommit, CertifiedBlock, Epoch, PredecessorTerminal,
+    RoutingCommittees, TopologySnapshot, TransactionStatus, TxHash, ValidatorId, Verified,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -26,8 +25,8 @@ use crate::beacon;
 use crate::beacon::{BeaconProposalBinding, ShardWitnessBinding};
 use crate::fetch::{FetchBinding, FetchInput};
 use crate::shard::commit::{
-    AccumulateDecision, PendingCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind, QcOnlyPending,
-    make_commit_prepared, run_qc_only_prep,
+    AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind,
+    QcOnlyPending, make_commit_prepared, run_qc_only_prep,
 };
 use crate::shard::consensus::BlockSyncInput;
 use crate::shard::cross_shard::{
@@ -220,17 +219,19 @@ where
                 parent_state_root,
                 parent_block_height,
                 parent_sweep_frontier,
+                creations,
                 source,
                 witness,
             } => {
-                self.accept_qc_only_commit(
+                self.accept_qc_only_commit(QcOnlyCommit {
                     certified,
                     parent_state_root,
                     parent_block_height,
                     parent_sweep_frontier,
+                    creations,
                     source,
                     witness,
-                );
+                });
             }
             Action::AttachCertifiedUncommitted { certified } => {
                 let block_hash = certified.block().hash();
@@ -267,9 +268,15 @@ where
             Action::TopologyChanged {
                 epoch,
                 topology_snapshot,
+                lookahead,
                 routing_committees,
             } => {
-                self.handle_topology_changed(epoch, &topology_snapshot, routing_committees);
+                self.handle_topology_changed(
+                    epoch,
+                    &topology_snapshot,
+                    lookahead,
+                    routing_committees,
+                );
             }
             Action::ReconfigureParticipation(change) => {
                 self.pending_participation_changes.push(change);
@@ -391,15 +398,16 @@ where
     /// commit order instead of holding the pipeline open across a
     /// reordered burst. `try_apply_verified_synced_blocks` can emit a
     /// burst of these for consecutive heights in a single shard step.
-    fn accept_qc_only_commit(
-        &mut self,
-        certified: Arc<Verified<CertifiedBlock>>,
-        parent_state_root: StateRoot,
-        parent_block_height: BlockHeight,
-        parent_sweep_frontier: SweepFrontier,
-        source: CommitSource,
-        witness: BeaconWitnessCommit,
-    ) {
+    fn accept_qc_only_commit(&mut self, commit: QcOnlyCommit) {
+        let QcOnlyCommit {
+            certified,
+            parent_state_root,
+            parent_block_height,
+            parent_sweep_frontier,
+            creations,
+            source,
+            witness,
+        } = commit;
         let block_hash = certified.block().hash();
         let height = certified.block().height();
 
@@ -421,6 +429,7 @@ where
             parent_state_root,
             parent_block_height,
             parent_sweep_frontier,
+            creations,
             source,
             kind,
             witness,
@@ -918,10 +927,11 @@ where
         &self,
         epoch: Epoch,
         topology_snapshot: &Arc<TopologySnapshot>,
+        lookahead: Arc<TopologySnapshot>,
         routing_committees: Arc<RoutingCommittees>,
     ) {
         self.process
-            .apply_topology(epoch, topology_snapshot, routing_committees);
+            .apply_topology(epoch, topology_snapshot, lookahead, routing_committees);
 
         tracing::info!(
             local_shard = self.shard.inner(),

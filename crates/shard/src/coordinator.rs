@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
+use hyperscale_engine::committed_cells;
 use hyperscale_metrics::record_verdict_claim_deferred;
 use hyperscale_types::{
     AbandonmentRecord, BlockHash, CounterpartClaim, CounterpartEvidence, CounterpartMirror, Epoch,
@@ -134,7 +135,7 @@ use crate::validation::{
 };
 use crate::verification::{
     InFlightCheck, ReadyStateRootVerification, SubstateCountBlocked, SubstateCountSource,
-    VerificationKind, VerificationPipeline,
+    VerificationKind, VerificationPipeline, anchor_trie,
 };
 use crate::view_change::ViewChangeController;
 use crate::vote_keeper::VoteKeeper;
@@ -5961,6 +5962,18 @@ impl ShardCoordinator {
                 parent_state_root,
                 parent_block_height,
                 parent_sweep_frontier,
+                creations: committed_cells(
+                    self.local_shard,
+                    &anchor_trie(
+                        topology_schedule,
+                        certified.block().header().parent_qc().weighted_timestamp(),
+                    ),
+                    certified
+                        .block()
+                        .transactions()
+                        .iter()
+                        .map(|tx| tx.as_unverified()),
+                ),
                 source,
                 witness,
             }
@@ -7192,7 +7205,10 @@ impl ShardCoordinator {
     /// [`VerificationPipeline::take_ready_state_root_verifications`] and
     /// resolves each against the chain view via
     /// [`VerificationPipeline::resolve_ready_state_root_verification`].
-    pub fn drain_ready_state_root_verifications(&mut self) -> Vec<ReadyStateRootVerification> {
+    pub fn drain_ready_state_root_verifications(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+    ) -> Vec<ReadyStateRootVerification> {
         let taken = self.verification.take_ready_state_root_verifications();
         if taken.is_empty() {
             return Vec::new();
@@ -7201,7 +7217,11 @@ impl ShardCoordinator {
         taken
             .into_iter()
             .filter_map(|pending| {
-                VerificationPipeline::resolve_ready_state_root_verification(&pending, &chain)
+                VerificationPipeline::resolve_ready_state_root_verification(
+                    &pending,
+                    &chain,
+                    topology_schedule,
+                )
             })
             .collect()
     }

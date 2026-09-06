@@ -213,9 +213,10 @@ pub trait BoundaryStore {
     /// the parent's full roots from a half store), and partition
     /// independence keeps the resulting root exactly the parent tree's
     /// subtree node at the prefix. The block is applied as the chain
-    /// applied it — the receipts its ticks settled, the committed cell of
-    /// every transaction it carries, and the sweep its header names — so
-    /// the follower's half reads exactly as the parent's. A block that
+    /// applied it — the receipts its ticks settled, the committed cells
+    /// its committer derived under the block's own window, `creations`,
+    /// and the sweep its header names — so the follower's half reads
+    /// exactly as the parent's. A block that
     /// touches nothing under the prefix is a no-op: the version does not
     /// advance, so the store's version line stays sparse on the parent's
     /// heights.
@@ -226,7 +227,11 @@ pub trait BoundaryStore {
     ///
     /// Returns a description of the failure — a height at or below the
     /// store's current version, or a backend write failure.
-    fn follow_block_writes(&self, block: &Block) -> Result<StateRoot, String>;
+    fn follow_block_writes(
+        &self,
+        block: &Block,
+        creations: &[(SubstateKey, Vec<u8>)],
+    ) -> Result<StateRoot, String>;
 
     /// Install a reshape successor's derived `genesis` as this store's
     /// chain origin and committed tip, returning the adopted state root.

@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::ProtocolEvent;
+use hyperscale_engine::committed_cells;
 use hyperscale_network::Network;
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::replicate_engine_bootstrap;
@@ -39,8 +40,8 @@ use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{GetBlockRequest, GetRemoteHeadersRequest};
 use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, ChainOrigin, LocalTimestamp, PredecessorTerminal, ShardId,
-    ValidatorId, Verified, shard_prefix_path,
+    Block, BlockHeight, CertifiedBlock, ChainOrigin, EpochWindows, LocalTimestamp,
+    PredecessorTerminal, ShardId, SubstateKey, ValidatorId, Verified, shard_prefix_path,
 };
 use tracing::error;
 
@@ -106,6 +107,35 @@ impl SimulationRunner {
         self.reshape[host as usize] = orch;
     }
 
+    /// The committed cells a followed parent `block` creates, classified
+    /// under the parent's own window as the production driver does: the
+    /// current snapshot places a cut parent's owners on its children. A
+    /// block carrying no transactions creates nothing and needs no window.
+    fn followed_block_creations(
+        &self,
+        host: NodeIndex,
+        block: &Block,
+    ) -> Option<Vec<(SubstateKey, Vec<u8>)>> {
+        if block.transactions().is_empty() {
+            return Some(Vec::new());
+        }
+        let anchor = block.header().parent_qc().weighted_timestamp();
+        let epoch = EpochWindows::new(self.epoch_duration_ms).epoch_for(anchor);
+        let topology = self
+            .hosts
+            .get(host as usize)?
+            .process()
+            .topology_at(epoch)
+            .unwrap_or_else(|| {
+                panic!("a followed block's window, epoch {epoch:?}, is in the host's history")
+            });
+        Some(committed_cells(
+            block.header().shard_id(),
+            topology.shard_trie(),
+            block.transactions().iter().map(|tx| tx.as_unverified()),
+        ))
+    }
+
     /// Perform one reshape request, answering with the [`ReshapeEvent`] the
     /// orchestrator consumes (or `None` for the fire-and-forget broadcast and
     /// the terminal seat).
@@ -152,11 +182,12 @@ impl SimulationRunner {
                 Some(ReshapeEvent::Imported { shard, root })
             }
             ReshapeRequest::ApplyFollow { shard, block } => {
+                let creations = self.followed_block_creations(host, &block)?;
                 let root = self
                     .reshape_stores
                     .get(&(host, shard))?
                     .storage
-                    .follow_block_writes(&block)
+                    .follow_block_writes(&block, &creations)
                     .expect("reshape follow apply into the opened store");
                 Some(ReshapeEvent::Applied { shard, root })
             }

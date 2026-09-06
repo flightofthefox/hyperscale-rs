@@ -519,7 +519,11 @@ impl StateMachine for NodeStateMachine {
         // event, then re-enter `try_propose` once if a proposal-retry latched.
         // Both touch shard state, so they only run on a seated vnode.
         if let Some(s) = self.shard.as_mut() {
-            for ready in s.shard_coordinator.drain_ready_state_root_verifications() {
+            let topology_schedule = self.beacon_coordinator.topology_schedule();
+            for ready in s
+                .shard_coordinator
+                .drain_ready_state_root_verifications(topology_schedule)
+            {
                 actions.push(Action::VerifyStateRoot {
                     block_hash: ready.block_hash,
                     parent_block_hash: ready.parent_block_hash,

@@ -214,8 +214,12 @@ impl BoundaryStore for SharedStorage {
         self.0.finalize_boundary_import(height, witnesses)
     }
 
-    fn follow_block_writes(&self, block: &Block) -> Result<StateRoot, String> {
-        self.0.follow_block_writes(block)
+    fn follow_block_writes(
+        &self,
+        block: &Block,
+        creations: &[(SubstateKey, Vec<u8>)],
+    ) -> Result<StateRoot, String> {
+        self.0.follow_block_writes(block, creations)
     }
 
     fn adopt_genesis(
@@ -248,10 +252,11 @@ impl ShardChainWriter for SharedStorage {
     fn commit_block(
         &self,
         certified: &Arc<Verified<CertifiedBlock>>,
+        creations: &[(SubstateKey, Vec<u8>)],
         removals: &[SubstateKey],
         witness: &BeaconWitnessCommit,
     ) -> StateRoot {
-        self.0.commit_block(certified, removals, witness)
+        self.0.commit_block(certified, creations, removals, witness)
     }
 }
 

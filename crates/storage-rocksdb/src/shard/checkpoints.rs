@@ -622,7 +622,11 @@ impl BoundaryStore for RocksDbShardStorage {
         self.finalize_staged(height, &witnesses, IMPORT_BATCH_BYTES, None)
     }
 
-    fn follow_block_writes(&self, block: &Block) -> Result<StateRoot, String> {
+    fn follow_block_writes(
+        &self,
+        block: &Block,
+        creations: &[(SubstateKey, Vec<u8>)],
+    ) -> Result<StateRoot, String> {
         let height = block.height();
         let _commit_guard = self
             .commit_lock
@@ -641,7 +645,8 @@ impl BoundaryStore for RocksDbShardStorage {
         // of it. A follow that skips a height resolves its movements
         // against a baseline missing what the gap left, and fails against
         // the child roots rather than committing quietly.
-        let filtered = followed_block_writes(self, &self.snapshot(), block, &self.root_path);
+        let filtered =
+            followed_block_writes(self, &self.snapshot(), block, creations, &self.root_path);
         if filtered.is_empty() {
             return Ok(base_root);
         }

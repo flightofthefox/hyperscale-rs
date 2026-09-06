@@ -189,6 +189,14 @@ where
     /// `apply_topology` holds this lock across the epoch check and the publish,
     /// so the highest epoch's snapshot wins and the stores never reorder.
     apply_topology_epoch: Mutex<Epoch>,
+    /// The snapshots of the last [`TOPOLOGY_HISTORY_EPOCHS`] epochs
+    /// applied, by epoch, plus the lookahead for the epoch after the
+    /// last. What a reshape follow classifies a followed parent block
+    /// under: the parent's own window, which the current snapshot no
+    /// longer describes once its cut has landed, and which the parent's
+    /// committee can anchor into before this host folds the commit that
+    /// opens it.
+    topology_history: Mutex<BTreeMap<Epoch, Arc<TopologySnapshot>>>,
 
     /// See [`DispatchHandles`]. Cloned once per delegated-action dispatch.
     pub(crate) dispatch_handles: Arc<DispatchHandles<S, N>>,
@@ -255,6 +263,7 @@ where
         dispatch_handles: Arc<DispatchHandles<S, N>>,
         beacon_storage: Arc<dyn BeaconStorage>,
     ) -> Self {
+        let genesis_topology = topology_snapshot.load_full();
         Self {
             network,
             verifier,
@@ -264,6 +273,10 @@ where
             beacon_route_active: Arc::new(AtomicBool::new(false)),
             topology_snapshot,
             apply_topology_epoch: Mutex::new(Epoch::GENESIS),
+            // The snapshot a process starts on is its genesis epoch's, on the
+            // watermark's own terms: `apply_topology` admits only epochs past
+            // `GENESIS`, so this one never arrives through it.
+            topology_history: Mutex::new(BTreeMap::from([(Epoch::GENESIS, genesis_topology)])),
             dispatch_handles,
             beacon_storage,
             beacon_commit: BeaconCommitCoordinator::new(),
@@ -369,6 +382,22 @@ where
     #[must_use]
     pub const fn network(&self) -> &Arc<N> {
         &self.network
+    }
+
+    /// The topology for `epoch`, if it is among the last
+    /// [`TOPOLOGY_HISTORY_EPOCHS`] this host applied or the lookahead
+    /// past them.
+    ///
+    /// # Panics
+    ///
+    /// If the history lock is poisoned.
+    #[must_use]
+    pub fn topology_at(&self, epoch: Epoch) -> Option<Arc<TopologySnapshot>> {
+        self.topology_history
+            .lock()
+            .expect("topology history lock")
+            .get(&epoch)
+            .cloned()
     }
 
     /// Shared lock-free topology snapshot handle, refreshed on every
@@ -579,6 +608,7 @@ where
         &self,
         epoch: Epoch,
         topology_snapshot: &Arc<TopologySnapshot>,
+        lookahead: Arc<TopologySnapshot>,
         routing_committees: Arc<RoutingCommittees>,
     ) {
         let mut applied = self
@@ -591,10 +621,22 @@ where
         // Publish under the lock so the highest epoch's stores never reorder
         // behind a slower thread that admitted an earlier epoch.
         self.topology_snapshot.store(Arc::clone(topology_snapshot));
+        {
+            let mut history = self.topology_history.lock().expect("topology history lock");
+            history.insert(epoch, Arc::clone(topology_snapshot));
+            history.insert(epoch.next(), lookahead);
+            let floor = epoch.inner().saturating_sub(TOPOLOGY_HISTORY_EPOCHS);
+            history.retain(|held, _| held.inner() >= floor);
+        }
         self.network.update_topology(Arc::clone(topology_snapshot));
         self.network.update_routing_committees(routing_committees);
     }
 }
+
+/// How many applied epochs' snapshots a host keeps behind the current
+/// one. A reshape follow reads the parent's window, at most a cut behind
+/// the current epoch; the rest is slack for a follow that lags.
+const TOPOLOGY_HISTORY_EPOCHS: u64 = 8;
 
 /// Advance the highest-applied topology epoch to `incoming`, returning whether
 /// it supersedes what was already applied. An epoch at or below `applied` is

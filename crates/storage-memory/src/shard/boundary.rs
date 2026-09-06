@@ -241,7 +241,11 @@ impl BoundaryStore for SimShardStorage {
         Ok(root)
     }
 
-    fn follow_block_writes(&self, block: &Block) -> Result<StateRoot, String> {
+    fn follow_block_writes(
+        &self,
+        block: &Block,
+        creations: &[(SubstateKey, Vec<u8>)],
+    ) -> Result<StateRoot, String> {
         let height = block.height();
         let prefix = read_or_recover(&self.state).tree_store.root_path();
         // Anchored at this store's own tip, which the check above holds
@@ -249,7 +253,7 @@ impl BoundaryStore for SimShardStorage {
         // of it. A follow that skips a height resolves its movements
         // against a baseline missing what the gap left, and fails against
         // the child roots rather than committing quietly.
-        let filtered = followed_block_writes(self, &self.snapshot(), block, &prefix);
+        let filtered = followed_block_writes(self, &self.snapshot(), block, creations, &prefix);
         let mut state = write_or_recover(&self.state);
         if height <= state.current_block_height {
             return Err(format!(
@@ -287,7 +291,7 @@ mod tests {
         test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
         test_escrow_records_are_read_off_the_state, test_import_gate_reads_the_trie,
     };
-    use hyperscale_storage::{SubstateStore, Substates, committed_tx_cell_key};
+    use hyperscale_storage::{SubstateStore, Substates, committed_tx_cell_key, committed_tx_cells};
     use hyperscale_types::test_utils::{
         install_stub_protocol_statics, stub_sweepable_cell, test_key, test_transaction,
     };
@@ -478,8 +482,8 @@ mod tests {
             let left_before = left_store.state_root();
             let right_before = right_store.state_root();
             let block = block_settling(height, receipts.to_vec());
-            let left_after = left_store.follow_block_writes(&block).unwrap();
-            let right_after = right_store.follow_block_writes(&block).unwrap();
+            let left_after = left_store.follow_block_writes(&block, &[]).unwrap();
+            let right_after = right_store.follow_block_writes(&block, &[]).unwrap();
 
             // Exactly the routed side's root moves; the other side's
             // follow is a no-op.
@@ -571,10 +575,11 @@ mod tests {
         } else {
             (&right_store, &left_store)
         };
+        let creations = committed_tx_cells(ShardId::ROOT, std::iter::once(&tx));
         let carrying = followed_block(1, SweepFrontier::ZERO, vec![tx], Vec::new());
         let other_before = other.state_root();
-        routed.follow_block_writes(&carrying).unwrap();
-        other.follow_block_writes(&carrying).unwrap();
+        routed.follow_block_writes(&carrying, &creations).unwrap();
+        other.follow_block_writes(&carrying, &creations).unwrap();
         assert!(
             routed.cell(cell).is_some(),
             "the committed cell lands on its half"
@@ -611,19 +616,17 @@ mod tests {
             }),
         );
         store
-            .follow_block_writes(&followed_block(
-                1,
-                SweepFrontier::ZERO,
-                Vec::new(),
-                vec![receipt],
-            ))
+            .follow_block_writes(
+                &followed_block(1, SweepFrontier::ZERO, Vec::new(), vec![receipt]),
+                &[],
+            )
             .unwrap();
         assert!(store.cell(sweepable).is_some());
 
         let bucket = SweepFrontier::of_leaf(sweepable).bucket();
         let short = SweepFrontier::start_of(bucket);
         store
-            .follow_block_writes(&followed_block(2, short, Vec::new(), Vec::new()))
+            .follow_block_writes(&followed_block(2, short, Vec::new(), Vec::new()), &[])
             .unwrap();
         assert!(
             store.cell(sweepable).is_some(),
@@ -632,7 +635,7 @@ mod tests {
 
         let past = SweepFrontier::start_of(SweepBucket(bucket.0 + 1));
         store
-            .follow_block_writes(&followed_block(3, past, Vec::new(), Vec::new()))
+            .follow_block_writes(&followed_block(3, past, Vec::new(), Vec::new()), &[])
             .unwrap();
         assert!(
             store.cell(sweepable).is_none(),
@@ -647,7 +650,7 @@ mod tests {
         let store = SimShardStorage::new(shard_prefix_path(child_of(1)));
         let (_, receipt) = follow_receipt(1);
         let block = block_settling(BlockHeight::new(5), vec![receipt]);
-        store.follow_block_writes(&block).unwrap();
-        assert!(store.follow_block_writes(&block).is_err());
+        store.follow_block_writes(&block, &[]).unwrap();
+        assert!(store.follow_block_writes(&block, &[]).is_err());
     }
 }

@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use hyperscale_engine::genesis::vault_key;
-use hyperscale_engine::{XRD, publish_work};
+use hyperscale_engine::{XRD, publish_work, writes_committed_cell};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
     Address, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, MAX_SWEEPABLE_CREATED_PER_BLOCK,
@@ -80,10 +80,13 @@ pub fn assert_a_full_block_fits<C: Cluster + ?Sized>(c: &C, tx: &Transaction) {
     };
     let busiest = shards
         .iter()
-        .map(|shard| tx.sweepable_writes_on(&trie, *shard))
+        .map(|shard| {
+            tx.sweepable_writes_on(&trie, *shard)
+                + usize::from(writes_committed_cell(tx.legs(), tx.owners(), &trie, *shard))
+        })
         .max()
         .unwrap_or(0);
-    let full_block = MAX_TXS_PER_BLOCK * (busiest + 1);
+    let full_block = MAX_TXS_PER_BLOCK * busiest;
     assert!(
         sweep_admits_block(full_block),
         "a full block of this shape creates {full_block} sweepable cells on its busiest \

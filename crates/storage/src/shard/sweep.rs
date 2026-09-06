@@ -274,12 +274,15 @@ pub fn sweep_through(
 /// What a block writes, composed once for every path that commits one.
 ///
 /// The receipts its ticks settled, resolved against `prior`; the
-/// committed cell of every transaction it carries; and the `removals`
-/// its sweep names.
+/// committed cells the block's committer derived, `creations`; and the
+/// `removals` its sweep names. Both lists are the caller's: which
+/// transactions write a cell is a fact of placement the store does not
+/// hold, and which cells the sweep retires needs the parent's frontier.
 #[must_use]
 pub fn block_settled_writes(
     block: &Block,
     prior: &dyn Anchored,
+    creations: &[(SubstateKey, Vec<u8>)],
     removals: &[SubstateKey],
 ) -> SettledWrites {
     let settling: Vec<StoredReceipt> = block
@@ -287,30 +290,29 @@ pub fn block_settled_writes(
         .iter()
         .flat_map(|fw| fw.settling_receipts())
         .collect();
-    let creations = committed_tx_cells(
-        block.header().shard_id(),
-        block.transactions().iter().map(|tx| tx.as_unverified()),
-    );
     with_sweep(
         merge_writes_from_receipts(&settling, prior),
-        &creations,
+        creations,
         removals,
     )
 }
 
 /// What a followed block writes under `prefix`, composed as the chain
-/// composed it: the receipts its ticks settled, the committed cell of
-/// every transaction it carries, and the sweep its header names.
+/// composed it: the receipts its ticks settled, the committed cells its
+/// committer derived, and the sweep its header names.
 ///
 /// The removals read `store` as it stands before the block, from the
 /// bottom of the sweep order: a follower mirrors the chain's state, so
 /// every live cell at or below the header's frontier is one the block
-/// removed, and one the block created sits far above it.
+/// removed, and one the block created sits far above it. The creations
+/// are the caller's, derived under the block's own window as the
+/// committer derived them.
 #[must_use]
 pub fn followed_block_writes(
     store: &(impl SweepIndex + ?Sized),
     prior: &dyn Anchored,
     block: &Block,
+    creations: &[(SubstateKey, Vec<u8>)],
     prefix: &NibblePath,
 ) -> SettledWrites {
     let settling: Vec<StoredReceipt> = block
@@ -325,23 +327,21 @@ pub fn followed_block_writes(
         &filter_state_writes_to_prefix(&merge_receipts(&settling), prefix),
         prior,
     );
-    let creations = committed_tx_cells(
-        block.header().shard_id(),
-        block.transactions().iter().map(|tx| tx.as_unverified()),
-    );
     let removals = sweep_through(store, SweepFrontier::ZERO, block.header().sweep_frontier());
-    filter_writes_to_prefix(&with_sweep(merged, &creations, &removals), prefix)
+    filter_writes_to_prefix(&with_sweep(merged, creations, &removals), prefix)
 }
 
-/// The committed-transaction cells a block of `local_shard` creates: one
-/// per transaction it carries, under the shard's own owner, expiring at
+/// The committed-transaction cells `local_shard` writes for
+/// `transactions`: one each, under the shard's own owner, expiring at
 /// the transaction's validity end plus the grace.
 ///
 /// What makes a shard's committed set provable and refutable against the
-/// state root every header carries. Derived from the block's own
-/// transactions and the shard's identity, so the proposer and every
-/// verifier fold the same cells, and a prober holding the transaction
-/// derives the same key from nothing else.
+/// state root every header carries. Derived from the transactions and
+/// the shard's identity, so every replica folds the same cells and a
+/// prober holding the transaction derives the same key from nothing
+/// else. Which of a block's transactions are given is the engine's to
+/// say, off placement: only a core spanning more than one shard is ever
+/// asked about its committed set.
 #[must_use]
 pub fn committed_tx_cells<'a>(
     local_shard: ShardId,
@@ -523,10 +523,10 @@ mod tests {
         assert_eq!(settled.cells().get(&removed), Some(&None));
     }
 
-    /// One committed cell per transaction, under the shard's own owner,
-    /// self-describing as sweepable at the transaction's validity end
-    /// plus the grace — the same cells whether a proposer or a verifier
-    /// derives them.
+    /// One committed cell per transaction given, under the shard's own
+    /// owner, self-describing as sweepable at the transaction's validity
+    /// end plus the grace — the same cells whether a proposer or a
+    /// verifier derives them.
     #[test]
     fn a_block_creates_one_committed_cell_per_transaction() {
         use hyperscale_hbor::from_slice;

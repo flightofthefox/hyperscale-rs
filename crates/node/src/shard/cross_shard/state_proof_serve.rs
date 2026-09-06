@@ -51,7 +51,7 @@ mod tests {
 
     use hyperscale_storage::test_helpers::make_test_certified;
     use hyperscale_storage::{
-        PendingChain, ShardChainWriter, SubstateStore, committed_tx_cell_key,
+        PendingChain, ShardChainWriter, SubstateStore, committed_tx_cell_key, committed_tx_cells,
     };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::test_transaction;
@@ -107,8 +107,13 @@ mod tests {
                 state_proofs: Arc::new(Vec::new()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             };
+            let creations = committed_tx_cells(
+                SHARD,
+                block.transactions().iter().map(|tx| tx.as_unverified()),
+            );
             storage.commit_block(
                 &make_test_certified(block),
+                &creations,
                 &[],
                 &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
             );

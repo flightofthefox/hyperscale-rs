@@ -145,6 +145,9 @@ pub enum ReshapeRequest {
         shard: ShardId,
         /// The followed block, whole: its settled receipts, the
         /// transactions it committed, and the sweep its header names.
+        /// The driver derives the committed cells it wrote under the
+        /// block's own window, which it holds and this orchestrator
+        /// does not.
         block: Arc<Block>,
     },
     /// Sign a ready signal for `validator` attesting the sync of `child`,

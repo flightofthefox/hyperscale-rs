@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
-use hyperscale_storage::committed_tx_cells;
+use hyperscale_engine::committed_cells;
 use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
     BlockManifest, CertificateRoot, CertifiedBlock, ChainOrigin, ExecutionOutcome, Finalization,
@@ -76,7 +76,7 @@ fn resolutions_to_check(block: &Block) -> bool {
 /// The trie of `anchor`'s window, which a delivered body is classified
 /// against. A block anchored in a window nobody retains is refused on
 /// other grounds, and its deliveries go unchecked under the root trie.
-fn anchor_trie(schedule: &TopologySchedule, anchor: WeightedTimestamp) -> ShardTrie {
+pub fn anchor_trie(schedule: &TopologySchedule, anchor: WeightedTimestamp) -> ShardTrie {
     match schedule.lookup(anchor) {
         ScheduleLookup::Committee(snapshot) => snapshot.shard_trie().clone(),
         _ => ShardTrie::single(),
@@ -171,8 +171,8 @@ pub struct ReadyStateRootVerification {
     /// Hashes of the block's own transactions — its contribution to the
     /// committed-transaction window a terminating boundary header roots.
     pub block_tx_hashes: Vec<TxHash>,
-    /// The committed-transaction cells the block itself writes, one per
-    /// transaction it carries, folded under the root being verified.
+    /// The committed cells the block writes, derived under its window,
+    /// folded under the root being verified.
     pub creations: Vec<(SubstateKey, Vec<u8>)>,
     /// Height of the block being verified.
     pub block_height: BlockHeight,
@@ -2262,6 +2262,7 @@ impl VerificationPipeline {
     pub(crate) fn resolve_ready_state_root_verification(
         pending: &PendingStateRootVerification,
         chain: &ChainView<'_>,
+        topology_schedule: &TopologySchedule,
     ) -> Option<ReadyStateRootVerification> {
         let block = chain.get_block(pending.block_hash).or_else(|| {
             debug!(
@@ -2275,8 +2276,16 @@ impl VerificationPipeline {
             block.certificates().iter().cloned().collect();
         let block_tx_hashes: Vec<TxHash> =
             block.transactions().iter().map(|tx| tx.hash()).collect();
-        let creations = committed_tx_cells(
+        // Under the block's own window: which transactions write a cell
+        // is a fact of placement, and the root a voter recomputes has to
+        // be the one the proposer derived under the same trie.
+        let trie = anchor_trie(
+            topology_schedule,
+            block.header().parent_qc().weighted_timestamp(),
+        );
+        let creations = committed_cells(
             block.header().shard_id(),
+            &trie,
             block.transactions().iter().map(|tx| tx.as_unverified()),
         );
         Some(ReadyStateRootVerification {
@@ -2599,7 +2608,7 @@ impl VerificationPipeline {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::test_utils::{
-        make_finalization, make_finalization_awaiting, make_leg_finalization,
+        TestCommittee, make_finalization, make_finalization_awaiting, make_leg_finalization,
         make_settling_finalization, test_transaction,
     };
     use hyperscale_types::{AggregateSignature, TransactionDecision, Verifiable, WitnessSources};
@@ -3042,7 +3051,11 @@ mod tests {
         let out: Vec<_> = taken
             .into_iter()
             .filter_map(|pending| {
-                VerificationPipeline::resolve_ready_state_root_verification(&pending, &chain)
+                VerificationPipeline::resolve_ready_state_root_verification(
+                    &pending,
+                    &chain,
+                    &dummy_schedule(&TestCommittee::new(4, 7).topology_snapshot(1)),
+                )
             })
             .collect();
         assert_eq!(out.len(), 1);
@@ -3104,7 +3117,11 @@ mod tests {
             .take_ready_state_root_verifications()
             .into_iter()
             .filter_map(|pending| {
-                VerificationPipeline::resolve_ready_state_root_verification(&pending, &chain)
+                VerificationPipeline::resolve_ready_state_root_verification(
+                    &pending,
+                    &chain,
+                    &dummy_schedule(&TestCommittee::new(4, 7).topology_snapshot(1)),
+                )
             })
             .collect();
         assert_eq!(resolved.len(), 1);
@@ -3142,7 +3159,11 @@ mod tests {
             .take_ready_state_root_verifications()
             .into_iter()
             .filter_map(|pending| {
-                VerificationPipeline::resolve_ready_state_root_verification(&pending, &chain)
+                VerificationPipeline::resolve_ready_state_root_verification(
+                    &pending,
+                    &chain,
+                    &dummy_schedule(&TestCommittee::new(4, 7).topology_snapshot(1)),
+                )
             })
             .count();
         assert_eq!(
@@ -3273,8 +3294,6 @@ mod tests {
     /// emitted) and park itself on the missing ancestor's hash.
     #[test]
     fn beacon_witness_verification_defers_on_missing_ancestor() {
-        use hyperscale_types::test_utils::TestCommittee;
-
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
@@ -3316,8 +3335,6 @@ mod tests {
     /// otherwise resolved) is the caller's responsibility.
     #[test]
     fn deferred_beacon_witness_children_drain_by_parent_hash() {
-        use hyperscale_types::test_utils::TestCommittee;
-
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
@@ -3365,8 +3382,6 @@ mod tests {
     /// matching leaves through a parent whose own root was wrong.
     #[test]
     fn failed_beacon_witness_clears_dependent_children() {
-        use hyperscale_types::test_utils::TestCommittee;
-
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
