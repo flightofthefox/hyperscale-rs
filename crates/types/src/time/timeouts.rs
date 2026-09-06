@@ -16,6 +16,7 @@
 //! Sub-state-machine-local timeouts (fallback fetch, IO retry backoff, etc.)
 //! stay in their owning crate.
 
+use std::ops::Range;
 use std::time::Duration;
 
 use hyperscale_vm_types::{ESCROW_GRACE_MS, NULLIFIER_GRACE_MS};
@@ -167,36 +168,6 @@ pub fn validity_end_of(deadline: WeightedTimestamp) -> WeightedTimestamp {
     deadline.minus(MAX_FINALIZATION_DELAY)
 }
 
-/// The core-shard anchor from which a transaction's committed cell may
-/// have been swept: its validity end plus [`RETENTION_HORIZON`].
-///
-/// That is the cell's own grace. A proof against a block at or past it
-/// comes to a cell that may be gone, and its absence says nothing.
-#[must_use]
-pub fn absence_probe_ceiling(validity_end: WeightedTimestamp) -> WeightedTimestamp {
-    validity_end.plus(RETENTION_HORIZON)
-}
-
-/// Whether an absence proof taken against a core-shard block at
-/// `probe_wt` licenses reclaiming a transaction's escrow.
-///
-/// A half-open window. Absence at or past the anchor says the core did
-/// not commit it and, by its own admission rule, never can; absence
-/// before the anchor says nothing, since a core block admitted at
-/// `validity_end - 1ms` may still be on its way. And absence at or past
-/// the cell's own sweep says nothing either: the committed cell is
-/// retired on time, so a proof there is a true proof of a cell that was
-/// present. Misreading either end by one term is a double spend, so
-/// both inequalities are stated once, here, rather than at each
-/// consumer.
-#[must_use]
-pub fn absence_licenses_reclaim(
-    probe_wt: WeightedTimestamp,
-    validity_end: WeightedTimestamp,
-) -> bool {
-    probe_wt >= reclaim_probe_anchor(validity_end) && probe_wt < absence_probe_ceiling(validity_end)
-}
-
 /// Which counterpart a probe asks, and so which record its absence is
 /// offered as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -211,18 +182,34 @@ pub enum Probed {
     Claim,
 }
 
-/// Whether an answer taken at `probed_wt` says anything about the
-/// question `probed` asks of a transaction ending at `validity_end`.
-#[must_use]
-pub fn licenses(
-    probed: Probed,
-    probed_wt: WeightedTimestamp,
-    validity_end: WeightedTimestamp,
-) -> bool {
-    match probed {
-        Probed::Core => absence_licenses_reclaim(probed_wt, validity_end),
-        Probed::Delivery => lapse_licenses_reclaim(probed_wt, validity_end),
-        Probed::Claim => probed_wt < lapse_probe_ceiling(validity_end),
+impl Probed {
+    /// The half-open window an answer to this question is read in: at or
+    /// past the anchor, and short of the probed cell's own sweep.
+    ///
+    /// Both ends are stated once, here, rather than at each consumer.
+    /// An absence before the anchor says nothing, since a block admitted
+    /// at the last moment may still be on its way; an absence at or past
+    /// the sweep says nothing either, since the cell is retired on time
+    /// and a proof there is a true proof of a cell that was present.
+    /// Misreading either end by one term is a double spend.
+    ///
+    /// A claim has no anchor: presence says the consumer took the
+    /// crossing whenever it is proved, and its absence is read as
+    /// nothing at all rather than as evidence.
+    #[must_use]
+    pub fn window(self, validity_end: WeightedTimestamp) -> Range<WeightedTimestamp> {
+        match self {
+            Self::Core => reclaim_probe_anchor(validity_end)..validity_end.plus(RETENTION_HORIZON),
+            Self::Delivery => lapse_probe_anchor(validity_end)..lapse_probe_ceiling(validity_end),
+            Self::Claim => WeightedTimestamp::ZERO..lapse_probe_ceiling(validity_end),
+        }
+    }
+
+    /// Whether an answer taken at `probed_wt` says anything about what
+    /// this question asks of a transaction ending at `validity_end`.
+    #[must_use]
+    pub fn licenses(self, probed_wt: WeightedTimestamp, validity_end: WeightedTimestamp) -> bool {
+        self.window(validity_end).contains(&probed_wt)
     }
 }
 
@@ -277,23 +264,6 @@ pub fn lapse_probe_ceiling(validity_end: WeightedTimestamp) -> WeightedTimestamp
     validity_end
         .plus(RETENTION_HORIZON)
         .plus(MAX_VALIDITY_RANGE)
-}
-
-/// Whether an absence proof of a crossing's claim cell, taken against a
-/// delivering-shard block at `probe_wt`, licenses reclaiming the
-/// crossing.
-///
-/// A half-open window, as the core's is. Absence at or past the anchor
-/// says the delivery never claimed it and, the window having closed,
-/// never can; absence before it says nothing, since a delivery admitted
-/// at the last moment may still be committing; absence at or past the
-/// claim cell's sweep says nothing, since the cell is retired on time.
-#[must_use]
-pub fn lapse_licenses_reclaim(
-    probe_wt: WeightedTimestamp,
-    validity_end: WeightedTimestamp,
-) -> bool {
-    probe_wt >= lapse_probe_anchor(validity_end) && probe_wt < lapse_probe_ceiling(validity_end)
 }
 
 /// A nullifier's life and every other tx-derived artifact's are the same
@@ -422,9 +392,9 @@ mod tests {
     use hyperscale_vm_types::ESCROW_GRACE_MS;
 
     use super::{
-        MAX_FINALIZATION_DELAY, RETENTION_HORIZON, absence_licenses_reclaim, absence_probe_ceiling,
-        delivery_admissible, delivery_window_close, lapse_licenses_reclaim, lapse_probe_anchor,
-        lapse_probe_ceiling, reclaim_probe_anchor, validity_end_of, verdict_window_close,
+        MAX_FINALIZATION_DELAY, Probed, RETENTION_HORIZON, delivery_admissible,
+        delivery_window_close, lapse_probe_anchor, lapse_probe_ceiling, reclaim_probe_anchor,
+        validity_end_of, verdict_window_close,
     };
     use crate::{MAX_VALIDITY_RANGE, WeightedTimestamp};
 
@@ -462,15 +432,9 @@ mod tests {
         let anchor = reclaim_probe_anchor(validity_end);
         assert_eq!(anchor, validity_end.plus(MAX_FINALIZATION_DELAY));
 
-        assert!(!absence_licenses_reclaim(
-            anchor.minus(Duration::from_millis(1)),
-            validity_end
-        ));
-        assert!(absence_licenses_reclaim(anchor, validity_end));
-        assert!(absence_licenses_reclaim(
-            anchor.plus(Duration::from_millis(1)),
-            validity_end
-        ));
+        assert!(!Probed::Core.licenses(anchor.minus(Duration::from_millis(1)), validity_end));
+        assert!(Probed::Core.licenses(anchor, validity_end));
+        assert!(Probed::Core.licenses(anchor.plus(Duration::from_millis(1)), validity_end));
         assert_eq!(validity_end_of(anchor), validity_end);
     }
 
@@ -482,21 +446,15 @@ mod tests {
     #[test]
     fn an_absence_licenses_nothing_once_the_cell_it_asks_about_may_be_swept() {
         let validity_end = WeightedTimestamp::from_millis(60_000);
-        let ceiling = absence_probe_ceiling(validity_end);
+        let ceiling = Probed::Core.window(validity_end).end;
         assert_eq!(ceiling, validity_end.plus(RETENTION_HORIZON));
         assert_eq!(
             ceiling.elapsed_since(reclaim_probe_anchor(validity_end)),
             MAX_VALIDITY_RANGE,
         );
-        assert!(absence_licenses_reclaim(
-            ceiling.minus(Duration::from_millis(1)),
-            validity_end
-        ));
-        assert!(!absence_licenses_reclaim(ceiling, validity_end));
-        assert!(!absence_licenses_reclaim(
-            ceiling.plus(Duration::from_secs(60)),
-            validity_end
-        ));
+        assert!(Probed::Core.licenses(ceiling.minus(Duration::from_millis(1)), validity_end));
+        assert!(!Probed::Core.licenses(ceiling, validity_end));
+        assert!(!Probed::Core.licenses(ceiling.plus(Duration::from_secs(60)), validity_end));
 
         let lapse_ceiling = lapse_probe_ceiling(validity_end);
         assert_eq!(
@@ -508,11 +466,10 @@ mod tests {
             lapse_ceiling.elapsed_since(lapse_probe_anchor(validity_end)),
             MAX_VALIDITY_RANGE,
         );
-        assert!(lapse_licenses_reclaim(
-            lapse_ceiling.minus(Duration::from_millis(1)),
-            validity_end
-        ));
-        assert!(!lapse_licenses_reclaim(lapse_ceiling, validity_end));
+        assert!(
+            Probed::Delivery.licenses(lapse_ceiling.minus(Duration::from_millis(1)), validity_end)
+        );
+        assert!(!Probed::Delivery.licenses(lapse_ceiling, validity_end));
     }
 
     /// Every absence window is one verdict window wide: it closes where a
@@ -522,7 +479,7 @@ mod tests {
     fn an_absence_window_is_one_verdict_window_past_its_anchor() {
         let validity_end = WeightedTimestamp::from_millis(60_000);
         assert_eq!(
-            absence_probe_ceiling(validity_end),
+            Probed::Core.window(validity_end).end,
             verdict_window_close(reclaim_probe_anchor(validity_end))
         );
         assert_eq!(
@@ -539,7 +496,7 @@ mod tests {
     fn a_probe_at_the_validity_end_is_inside_the_propagation_budget() {
         let validity_end = WeightedTimestamp::from_millis(60_000);
         let latest_core_admission = validity_end.minus(Duration::from_millis(1));
-        assert!(!absence_licenses_reclaim(validity_end, validity_end));
+        assert!(!Probed::Core.licenses(validity_end, validity_end));
         assert!(
             reclaim_probe_anchor(validity_end).elapsed_since(latest_core_admission)
                 > MAX_FINALIZATION_DELAY,
@@ -565,17 +522,11 @@ mod tests {
             anchor,
             delivery_window_close(validity_end).plus(MAX_FINALIZATION_DELAY)
         );
-        assert!(!lapse_licenses_reclaim(
-            anchor.minus(Duration::from_millis(1)),
-            validity_end
-        ));
-        assert!(lapse_licenses_reclaim(anchor, validity_end));
-        assert!(lapse_licenses_reclaim(
-            anchor.plus(Duration::from_secs(1)),
-            validity_end
-        ));
+        assert!(!Probed::Delivery.licenses(anchor.minus(Duration::from_millis(1)), validity_end));
+        assert!(Probed::Delivery.licenses(anchor, validity_end));
+        assert!(Probed::Delivery.licenses(anchor.plus(Duration::from_secs(1)), validity_end));
         assert!(
-            !lapse_licenses_reclaim(delivery_window_close(validity_end), validity_end),
+            !Probed::Delivery.licenses(delivery_window_close(validity_end), validity_end),
             "the close itself is not the lapse: a claim admitted under it may still commit",
         );
     }

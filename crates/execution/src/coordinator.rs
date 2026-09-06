@@ -55,8 +55,8 @@ use hyperscale_types::{
     ShardTrie, StateAnchor, StateProofBundle, StoredReceipt, SubstateKey, TickId, TopologySchedule,
     TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution,
     UnsettledTx, ValidatorId, VerdictClaim, Verifiable, Verified, WeightedTimestamp,
-    claim_readable_at, derive_block_transactions, lapse_probe_anchor, licenses,
-    reclaim_probe_anchor, settled_set_verdict, tick_leader, tick_leader_at,
+    claim_readable_at, derive_block_transactions, lapse_probe_anchor, reclaim_probe_anchor,
+    settled_set_verdict, tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::CrossingCell;
 use tracing::instrument;
@@ -2601,7 +2601,7 @@ impl ExecutionCoordinator {
                 // a bounded history behind its tip.
                 let Some((height, source)) = self
                     .proven_anchors
-                    .newest_licensed(shard, |ts| licenses(probed, ts, entry.validity_end))
+                    .newest_licensed(shard, |ts| probed.licenses(ts, entry.validity_end))
                 else {
                     continue;
                 };
@@ -2749,7 +2749,7 @@ impl ExecutionCoordinator {
             for (entry, cells) in cells {
                 for &(shard, key, floor, probed) in cells {
                     if shard != bundle.anchor.shard
-                        || !licenses(probed, bundle.anchor_ts, entry.validity_end)
+                        || !probed.licenses(bundle.anchor_ts, entry.validity_end)
                     {
                         continue;
                     }

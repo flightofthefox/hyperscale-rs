@@ -833,7 +833,7 @@ pub enum ProtocolEvent {
     /// asked. The execution coordinator keeps the bytes to offer in a
     /// block it proposes; nothing reads an answer off a fetch, since
     /// the answer is the chain's once a block carries the proof.
-    StateProofVerified {
+    FetchedStateProofVerified {
         /// The state the proof was checked against.
         anchor: StateAnchor,
         /// The keys the proof was asked about.

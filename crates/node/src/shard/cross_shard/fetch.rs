@@ -542,7 +542,7 @@ impl FetchBinding for StateProofBinding {
                     push_protocol_event(
                         &es,
                         local_shard,
-                        ProtocolEvent::StateProofVerified {
+                        ProtocolEvent::FetchedStateProofVerified {
                             anchor,
                             keys,
                             proof,

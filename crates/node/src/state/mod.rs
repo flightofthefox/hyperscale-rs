@@ -464,7 +464,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::RemoteHeaderSyncComplete { .. }
             | ProtocolEvent::SettledTxsReconstructed { .. }
             | ProtocolEvent::CounterpartEvidenceObserved
-            | ProtocolEvent::StateProofVerified { .. }
+            | ProtocolEvent::FetchedStateProofVerified { .. }
             | ProtocolEvent::PrecutResolutionsReceived { .. }) => {
                 self.with_shard(move |s, sched| s.handle_sync(sched, evt))
             }

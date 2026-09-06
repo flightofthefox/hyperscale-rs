@@ -23,7 +23,7 @@ use hyperscale_types::{
     ProvenAnchor, ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger,
     Resolutions, ScheduleLookup, SettledSetVerdict, ShardId, SplitAtBoundary, StateProofBundle,
     StoredReceipt, SubstateKey, TxClaim, TxOutcome, UnsettledTx, VerdictClaim, WeightedTimestamp,
-    WorkInFlight, derive_reshape_trigger, lapse_probe_ceiling, licenses, ready_signal_window,
+    WorkInFlight, derive_reshape_trigger, lapse_probe_ceiling, ready_signal_window,
     settled_set_verdict,
 };
 
@@ -1395,7 +1395,7 @@ impl ShardCoordinator {
         block_hash: BlockHash,
     ) -> bool {
         let validity_end = validity_end_of(entry.deadline);
-        if !licenses(probed, probed_wt, validity_end) {
+        if !probed.licenses(probed_wt, validity_end) {
             warn!(
                 validator = ?self.me,
                 block_hash = ?block_hash,

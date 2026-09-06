@@ -84,7 +84,7 @@ impl ShardParticipation {
             // A state proof against a core's commit-proven header
             // verified: the execution coordinator reads its probes off
             // it and hands each absence on.
-            ProtocolEvent::StateProofVerified {
+            ProtocolEvent::FetchedStateProofVerified {
                 anchor,
                 keys,
                 proof,

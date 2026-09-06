@@ -458,7 +458,7 @@ pub enum ShardScopedInput {
     /// A state-proof query was answered and verified: release the fetch
     /// slots. Keyed by the *request* ids, so a peer's payload can't
     /// leave a slot pinned. The answers themselves ride the
-    /// accompanying `ProtocolEvent::StateProofVerified`.
+    /// accompanying `ProtocolEvent::FetchedStateProofVerified`.
     StateProofFetchFulfilled {
         /// `(anchor, key)` pairs the response answered.
         ids: Vec<(StateAnchor, SubstateKey)>,
