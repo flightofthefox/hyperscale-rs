@@ -4320,8 +4320,18 @@ impl ShardCoordinator {
         // Falls back to the head where the schedule cannot answer at all:
         // genesis has no anchor, and an evicted window is far enough back that
         // the head is the better guess.
+        // A snapshot that seats nobody for this shard answers the routing
+        // question no better than one the schedule could not resolve at
+        // all, so it falls through the same way rather than naming an
+        // empty rotation.
+        let seats_anyone = |snapshot: &Arc<TopologySnapshot>| {
+            !snapshot
+                .consensus_committee_for_shard(self.local_shard)
+                .is_empty()
+        };
         let governing = self
             .committee_for_child_of(topology_schedule, block_hash)
+            .filter(|snapshot| seats_anyone(snapshot))
             .or_else(|| {
                 // Past a terminal cut the live windows carry the shard no
                 // longer, so the coast blocks certifying the crossing route
@@ -4329,6 +4339,7 @@ impl ShardCoordinator {
                 anchored_wt
                     .and_then(|wt| topology_schedule.at_for_shard(self.local_shard, wt))
                     .map(|(snapshot, _)| snapshot)
+                    .filter(|snapshot| seats_anyone(snapshot))
             })
             .map_or_else(|| topology_schedule.head().as_ref(), Arc::as_ref);
         let next_proposers = vote_recipients(governing, self.local_shard, self.me, round);

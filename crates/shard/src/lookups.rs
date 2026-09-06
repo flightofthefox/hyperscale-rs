@@ -25,6 +25,14 @@ pub fn vote_recipients(
 ) -> Vec<ValidatorId> {
     const K: usize = 2;
     let committee_len = topology_snapshot.consensus_committee_for_shard(shard).len();
+    // A snapshot that seats nobody for the shard names no proposer to hint
+    // at. The caller resolves this one through a fallback chain ending at
+    // the schedule head, which answers for a shard it no longer carries
+    // with an empty committee — a hint it cannot form, not a reason to
+    // stop the vote.
+    if committee_len == 0 {
+        return Vec::new();
+    }
     let mut recipients = Vec::with_capacity(K + 1);
 
     let block_proposer = topology_snapshot.proposer_for(shard, round);
