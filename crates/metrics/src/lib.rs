@@ -375,6 +375,17 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// certificate this validator does not hold.
     fn record_verdict_claim_deferred(&self) {}
 
+    /// A fetch response the requester's own check refused, by fetch kind
+    /// and the check that refused it.
+    ///
+    /// Every evidence seam is a payload held against something the
+    /// checker already has, and the refusal is the only place the check
+    /// is observable: what the caller sees afterwards is the value
+    /// arriving from an honest peer instead, which an unattacked run
+    /// produces too. A rate above zero here is a responder answering
+    /// wrongly.
+    fn record_fetch_response_refused(&self, kind: &str, reason: &str) {}
+
     /// Set the in-flight request slot count for a `MessageClass`.
     ///
     /// Sampled by the request manager whenever a slot is acquired or
@@ -840,6 +851,12 @@ pub fn record_reclaim_probe_answered(present: bool) {
 #[inline]
 pub fn record_reclaim_admitted() {
     recorder().record_reclaim_admitted();
+}
+
+/// Record a fetch response refused by the requester's own check.
+#[inline]
+pub fn record_fetch_response_refused(kind: &str, reason: &str) {
+    recorder().record_fetch_response_refused(kind, reason);
 }
 
 /// Record a vote withheld for want of the certificate a block's verdict

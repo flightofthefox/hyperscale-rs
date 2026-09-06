@@ -163,6 +163,9 @@ pub struct Metrics {
     /// Votes withheld because a block's verdict claim names a
     /// certificate this validator does not hold.
     pub verdict_claims_deferred: Counter,
+    /// Fetch responses a requester's own check refused, by fetch kind and
+    /// the check that refused them.
+    pub fetch_responses_refused: CounterVec,
 
     // === Network class accounting ===
     /// Per-class in-flight request slot count.
@@ -775,6 +778,13 @@ impl Metrics {
             )
             .unwrap(),
 
+            fetch_responses_refused: register_counter_vec!(
+                "hyperscale_fetch_responses_refused_total",
+                "Fetch responses refused by the requester's own check",
+                &["kind", "reason"]
+            )
+            .unwrap(),
+
             request_slots_in_flight: register_gauge_vec!(
                 "hyperscale_request_slots_in_flight",
                 "In-flight request slots, broken down by message class",
@@ -1091,6 +1101,13 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_verdict_claim_deferred(&self) {
         self.metrics.verdict_claims_deferred.inc();
+    }
+
+    fn record_fetch_response_refused(&self, kind: &str, reason: &str) {
+        self.metrics
+            .fetch_responses_refused
+            .with_label_values(&[kind, reason])
+            .inc();
     }
 
     fn set_request_slots_in_flight(&self, class: &str, count: usize) {

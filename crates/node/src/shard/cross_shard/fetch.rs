@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
-use hyperscale_network::{Network, ResponseVerdict};
+use hyperscale_metrics::record_fetch_response_refused;
+use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
     GetCommittedTxsRequest, GetExecutionCertsRequest, GetFinalizationsRequest,
@@ -486,13 +487,22 @@ impl FetchBinding for StateProofBinding {
                 request,
                 class,
                 Box::new(move |result| {
-                    let Ok(response) = result else {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::StateProofFetchFailed { ids: requested },
-                        );
-                        return ResponseVerdict::Accept;
+                    let response = match result {
+                        Ok(response) => response,
+                        Err(error) => {
+                            // A peer that answered with something that is
+                            // not an answer is a refusal; a timeout or an
+                            // exhausted rotation is not.
+                            if matches!(error, RequestError::PeerError(_)) {
+                                record_fetch_response_refused("state_proof", "unusable_answer");
+                            }
+                            push_shard_input(
+                                &es,
+                                local_shard,
+                                ShardScopedInput::StateProofFetchFailed { ids: requested },
+                            );
+                            return ResponseVerdict::Accept;
+                        }
                     };
                     // This peer doesn't hold the height — rotate.
                     let Some(proof) = response.proof else {
@@ -513,6 +523,7 @@ impl FetchBinding for StateProofBinding {
                             %error,
                             "Dropping state-proof response: unusable proof"
                         );
+                        record_fetch_response_refused("state_proof", "unusable_proof");
                         push_shard_input(
                             &es,
                             local_shard,
@@ -600,9 +611,15 @@ impl FetchBinding for ProvisionBinding {
                         },
                     );
                 };
-                let Ok(response) = result else {
-                    push_fetch_failed();
-                    return ResponseVerdict::Accept;
+                let response = match result {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if matches!(error, RequestError::PeerError(_)) {
+                            record_fetch_response_refused("provision", "unusable_answer");
+                        }
+                        push_fetch_failed();
+                        return ResponseVerdict::Accept;
+                    }
                 };
                 let Some(provisions) = response.provisions else {
                     push_fetch_failed();
@@ -621,6 +638,7 @@ impl FetchBinding for ProvisionBinding {
                         got_height = provisions.block_height().inner(),
                         "Dropping provision fetch response: scope mismatch"
                     );
+                    record_fetch_response_refused("provision", "scope_mismatch");
                     push_fetch_failed();
                     return ResponseVerdict::Reject;
                 }

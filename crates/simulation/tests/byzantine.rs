@@ -68,6 +68,7 @@ fn a_forged_state_proof_convinces_nobody() {
     cluster.run_faultable(|c| {
         let before = vault_balance(c, payer_shard, from);
         let recipient_before = vault_balance(c, recipient_shard, to);
+        let refused_before = c.metric("fetch_responses_refused", Some("state_proof"));
 
         // One host of the shard the proof is asked of answers with bytes
         // that decode to nothing usable. Its peers answer honestly, which
@@ -129,6 +130,12 @@ fn a_forged_state_proof_convinces_nobody() {
             forged.fired() > 0,
             "the forgery has to have been served, or nothing was attacked",
         );
+        // What the reclaim landing shows is a value arriving, which an
+        // unattacked run shows too. The refusal is the defence itself.
+        assert!(
+            c.metric("fetch_responses_refused", Some("state_proof")) > refused_before,
+            "no state-proof answer was refused, so the check never ran",
+        );
         assert_eq!(
             vault_balance(c, recipient_shard, to),
             recipient_before,
@@ -157,6 +164,7 @@ fn a_host_answering_provision_fetches_with_rubbish_is_rotated_past() {
 
     cluster.run_faultable(|c| {
         let recipient_before = vault_balance(c, recipient_shard, to);
+        let refused_before = c.metric("fetch_responses_refused", Some("provision"));
 
         // The push is cut, so the recipient has to fetch — and one host
         // of the shard it fetches from answers wrongly.
@@ -214,6 +222,10 @@ fn a_host_answering_provision_fetches_with_rubbish_is_rotated_past() {
             forged.iter().any(|handle| handle.fired() > 0) && lies.load(Ordering::Relaxed) > 0,
             "the rubbish has to have been served, or nothing was attacked",
         );
+        assert!(
+            c.metric("fetch_responses_refused", Some("provision:unusable_answer")) > refused_before,
+            "the rubbish was never refused, so the delivery landing says nothing",
+        );
     });
 }
 
@@ -245,6 +257,7 @@ fn a_bundle_replayed_from_another_transaction_is_refused() {
 
     cluster.run_faultable(|c| {
         let recipient_before = vault_balance(c, recipient_shard, to);
+        let refused_before = c.metric("fetch_responses_refused", Some("provision:scope_mismatch"));
         let broadcast_dropped = c.drop_type("provisions.broadcast");
 
         // The first honest answer is kept with the question it answered,
@@ -314,6 +327,14 @@ fn a_bundle_replayed_from_another_transaction_is_refused() {
         assert!(
             replayed.iter().any(|handle| handle.fired() > 0) && lies.load(Ordering::Relaxed) > 0,
             "the stale bundle has to have been served, or nothing was attacked",
+        );
+        // Both deliveries landing is what an unattacked run shows too.
+        // The bundle admitted against the transaction the requester asked
+        // about is the rule under test, and refusing the replay is where
+        // it runs.
+        assert!(
+            c.metric("fetch_responses_refused", Some("provision:scope_mismatch")) > refused_before,
+            "the replayed bundle was never refused on its scope",
         );
     });
 }
