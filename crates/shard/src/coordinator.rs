@@ -363,6 +363,14 @@ pub struct ShardCoordinator {
     /// emits at most one timeout per round (the timer itself retransmits).
     last_timed_out_round: Option<Round>,
 
+    /// The highest certified height a retained ex-member has offered
+    /// across a halt recovery — read off the timeouts
+    /// [`Self::harvest_retained_tip`] harvests, which is the only signal
+    /// carrying the halted tip to an incomer seated at the beacon's
+    /// frontier. Gates this member's proposals until its own `high_qc`
+    /// reaches it; see [`Self::recovery_behind_retained_tip`].
+    retained_tip_offered: Option<BlockHeight>,
+
     /// HotStuff-2 safe-vote lock: the highest `parent_qc` round we have ever
     /// voted to extend. We refuse to vote for a block whose `parent_qc` round
     /// is below this — the entire fork-safety mechanism, kept local (no
@@ -657,6 +665,7 @@ impl ShardCoordinator {
             votes: VoteKeeper::new(),
             timeouts: TimeoutKeeper::new(),
             last_timed_out_round: None,
+            retained_tip_offered: None,
             // Recover the registers from the durable record (which holds
             // every position this validator signed — persisted before each
             // signature left the process), floored at the high QC's round
@@ -2614,6 +2623,38 @@ impl ShardCoordinator {
         )
     }
 
+    /// Whether this member is still short of the halted tip a retained
+    /// ex-member offered it.
+    ///
+    /// A halt recovery seats its fresh committee from a snap-synced
+    /// anchor at the beacon-attested frontier — the last boundary the
+    /// beacon folded, which sits well below the tip the old committee
+    /// certified before it stopped. The suffix between them is what the
+    /// incomers adopt, and until one of them holds a certificate over it,
+    /// the highest QC each of them has names the frontier. A whole fresh
+    /// committee proposing from there builds a second chain across
+    /// heights the halted one already holds; every replica that took the
+    /// suffix then refuses it, and the shard splits at the first
+    /// collision.
+    ///
+    /// The offer is the retained ex-members' own timeouts, which
+    /// [`Self::harvest_retained_tip`] already reads for exactly this
+    /// purpose. Holding until `high_qc` reaches the highest one seen
+    /// terminates on its own: the harvest drives the fetch that supplies
+    /// the block, and adopting the carried QC closes the gap. A shard
+    /// whose retained cohort offers nothing — no suffix above the
+    /// frontier, or no ex-member left to answer — is never held, which is
+    /// the case where extending the frontier is the only move there is.
+    fn recovery_behind_retained_tip(&self) -> bool {
+        self.retained_tip_offered.is_some_and(|offered| {
+            offered
+                > self
+                    .latest_qc
+                    .as_ref()
+                    .map_or(BlockHeight::GENESIS, |qc| qc.height())
+        })
+    }
+
     /// Pre-build gate: we must be the proposer for this round, must not have
     /// voted at it yet, and must not already be building (or parked on the
     /// verification pipeline for) the same height/round.
@@ -2626,6 +2667,12 @@ impl ShardCoordinator {
         // A terminated chain proposes nothing — the crossing is committed
         // and the post-split children carry on from it.
         if self.dissolved(topology_schedule) {
+            return false;
+        }
+
+        // A recovery's incomers extend the halted tip, not the frontier
+        // they seeded at.
+        if self.recovery_behind_retained_tip() {
             return false;
         }
 
@@ -6713,6 +6760,14 @@ impl ShardCoordinator {
             carried_height = carried.height().inner(),
             committed_height = self.committed_height.inner(),
             "Harvesting the halted tip from a retained ex-member's timeout"
+        );
+        // Remember what was offered even when the QC cannot be adopted
+        // yet: the block it certifies is still being fetched, and until
+        // this member's own `high_qc` reaches it, proposing would build
+        // over heights the halted chain already holds.
+        self.retained_tip_offered = Some(
+            self.retained_tip_offered
+                .map_or_else(|| carried.height(), |seen| seen.max(carried.height())),
         );
         if carried.round() > self.high_qc_round()
             && let Some(verified) = self.verify_qc_sync(topology_schedule, carried)
