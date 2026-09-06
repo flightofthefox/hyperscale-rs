@@ -23,10 +23,11 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::{Classified, core_claims, delivered_claims};
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Address, CounterpartEvidence, Finalization, LegEntry,
-    LegEntryKind, LegEntryTaken, Refusal, ShardId, ShardTrie, SubstateKey, Transaction,
-    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
-    WeightedTimestamp, delivery_window_close, leg_entry_horizon, verdict_window_close,
+    AbandonmentRecord, AbortCharge, Absence, Address, BlockHeight, ClaimProof, CounterpartEvidence,
+    Finalization, LegEntry, LegEntryKind, LegEntryTaken, Refusal, ShardId, ShardTrie, StateAnchor,
+    SubstateKey, Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable,
+    Verified, WeightedTimestamp, absence_licenses_reclaim, delivery_window_close,
+    lapse_licenses_reclaim, lapse_probe_ceiling, leg_entry_horizon, verdict_window_close,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -41,6 +42,81 @@ pub struct Abandonable {
     pub declared_work: u64,
     /// The burn to settle, on the shard holding the vault it names.
     pub charge: AbortCharge,
+}
+
+/// Which counterpart a probe asks, and so which record its absence is
+/// offered as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Probed {
+    /// A core's committed cell, past the transaction's deadline.
+    Core,
+    /// A delivering shard's claim cell, past the crossing's lapse.
+    Delivery,
+    /// A core consumer's claim cell, past the transaction's deadline:
+    /// present says the core took the crossing, and the record here is
+    /// retired on it; absent says only that it has not yet.
+    Claim,
+}
+
+/// What this shard has asked a silent counterpart about one transaction:
+/// a proof of `key` against `anchor`, whose block sits at `probed_wt`;
+/// `floor` is the anchor the answer is held to, kept beside it so the
+/// answer can be dated without the ledger.
+///
+/// A probe is the fetch and nothing more. Its answer is read off the
+/// block that carries the proof, by every replica alike, so the probe
+/// stays only to keep the question from being asked twice of one
+/// header: `answered` once the fetch returned and its bytes are waiting
+/// to be offered in a block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Probe {
+    pub anchor: StateAnchor,
+    pub key: SubstateKey,
+    pub probed_wt: WeightedTimestamp,
+    pub floor: WeightedTimestamp,
+    pub probed: Probed,
+    pub answered: bool,
+}
+
+/// What a proof the chain committed said about one counterpart cell of
+/// one transaction — the fold every replica reaches at the same height,
+/// and what the record arms are offered from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// The core took it: its certificate is what speaks next.
+    Committed,
+    /// The counterpart had not taken it past the floor: what an
+    /// `Unclaimed` or `Lapsed` record is offered from.
+    Absent(Absence),
+    /// The consumer's claim is present: what a `Claimed` record is
+    /// offered from, licensing the retirement of the record here.
+    Present(ClaimProof),
+}
+
+/// Whether an answer taken at `probed_wt` says anything about the
+/// question `probed` asks of a transaction ending at `validity_end`.
+pub fn licenses(
+    probed: Probed,
+    probed_wt: WeightedTimestamp,
+    validity_end: WeightedTimestamp,
+) -> bool {
+    match probed {
+        Probed::Core => absence_licenses_reclaim(probed_wt, validity_end),
+        Probed::Delivery => lapse_licenses_reclaim(probed_wt, validity_end),
+        Probed::Claim => probed_wt < lapse_probe_ceiling(validity_end),
+    }
+}
+
+/// Let go of every fetch `owed` still has out, so a counterpart that
+/// never serves the height does not pin the slot.
+fn release_fetches(released: &mut Vec<(StateAnchor, SubstateKey)>, owed: &Owed) {
+    released.extend(
+        owed.heard
+            .probes
+            .values()
+            .filter(|probe| !probe.answered)
+            .map(|probe| (probe.anchor, probe.key)),
+    );
 }
 
 /// One committed transaction's outstanding account.
@@ -141,6 +217,12 @@ struct Heard {
     /// saying it succeeded is not the transaction accepted — that is
     /// every core shard saying so, and this is the count.
     accepted: BTreeSet<ShardId>,
+    /// What this validator has asked a silent counterpart, by cell: its
+    /// own fetch and nothing more, so one header is asked once.
+    probes: BTreeMap<(ShardId, Probed), Probe>,
+    /// What the proofs the chain committed said about those cells,
+    /// folded by every replica at the same height, first proof winning.
+    answers: BTreeMap<(ShardId, Probed), Answer>,
 }
 
 /// What a tick of this shard's composed over a leg entry's records.
@@ -381,6 +463,14 @@ pub struct UnresolvedTxs {
     /// the schedule window that proves the terminal, which is retained on
     /// a frontier of its own.
     departed: BTreeMap<ShardId, Departure>,
+    /// Fetches that were still out when the question they asked stopped
+    /// mattering — the entry released, or the chain answering first.
+    ///
+    /// A probe is this validator's own fetch, so releasing it is an
+    /// action rather than a fact, and the ledger states which ones it
+    /// let go rather than leaving the caller to diff for them. Drained
+    /// each commit; nothing reads it twice.
+    released_fetches: Vec<(StateAnchor, SubstateKey)>,
 }
 
 impl UnresolvedTxs {
@@ -681,6 +771,136 @@ impl UnresolvedTxs {
             .get(&tx_hash)
             .and_then(|owed| owed.heard.refusals.get(&shard))
             .copied()
+    }
+
+    /// Whether the chain has already answered what `probed` asks of
+    /// `shard` about `tx_hash`. An answered question is never asked
+    /// again.
+    #[must_use]
+    pub fn answered(&self, tx_hash: TxHash, shard: ShardId, probed: Probed) -> bool {
+        self.owed
+            .get(&tx_hash)
+            .is_some_and(|owed| owed.heard.answers.contains_key(&(shard, probed)))
+    }
+
+    /// Whether a probe of that cell is already out, or already answered
+    /// at `height` or newer.
+    ///
+    /// A question in flight is left alone: a core's header lands every
+    /// block, and moving the probe to each new one abandons the fetch
+    /// before its answer returns. One whose fetch has answered is moved
+    /// on, which is how a cell the chain read absent is asked again — at
+    /// a newer header, not at the same one every block.
+    #[must_use]
+    pub fn probe_stands(
+        &self,
+        tx_hash: TxHash,
+        shard: ShardId,
+        probed: Probed,
+        height: BlockHeight,
+    ) -> bool {
+        self.owed
+            .get(&tx_hash)
+            .and_then(|owed| owed.heard.probes.get(&(shard, probed)))
+            .is_some_and(|probe| !probe.answered || probe.anchor.height >= height)
+    }
+
+    /// Put a question to a counterpart, replacing whatever stood.
+    pub fn record_probe(&mut self, tx_hash: TxHash, shard: ShardId, probe: Probe) {
+        if let Some(owed) = self.owed.get_mut(&tx_hash) {
+            owed.heard.probes.insert((shard, probe.probed), probe);
+        }
+    }
+
+    /// Mark every probe this proof spoke to as answered, and name the
+    /// transactions it answered for with the clock its header sat at.
+    ///
+    /// The fetch is only how the proposer comes by the bytes: nothing is
+    /// decided here, since the answer is the chain's once a block carries
+    /// the proof.
+    pub fn mark_probes_answered(
+        &mut self,
+        anchor: StateAnchor,
+        keys: &[SubstateKey],
+    ) -> (BTreeSet<TxHash>, Option<WeightedTimestamp>) {
+        let mut answered = BTreeSet::new();
+        let mut anchor_ts = None;
+        for (&tx_hash, owed) in &mut self.owed {
+            for probe in owed.heard.probes.values_mut() {
+                if probe.anchor == anchor && keys.contains(&probe.key) {
+                    probe.answered = true;
+                    answered.insert(tx_hash);
+                    anchor_ts = Some(probe.probed_wt);
+                }
+            }
+        }
+        (answered, anchor_ts)
+    }
+
+    /// Fold what a committed proof said about one cell, releasing any
+    /// fetch of this validator's still out for it.
+    ///
+    /// First proof wins: `false` says the cell was already answered, and
+    /// a later proof adds nothing.
+    pub fn record_answer(
+        &mut self,
+        tx_hash: TxHash,
+        shard: ShardId,
+        probed: Probed,
+        answer: Answer,
+    ) -> bool {
+        let Some(owed) = self.owed.get_mut(&tx_hash) else {
+            return false;
+        };
+        if let Some(probe) = owed.heard.probes.remove(&(shard, probed))
+            && !probe.answered
+        {
+            self.released_fetches.push((probe.anchor, probe.key));
+        }
+        let owed = &mut self.owed.get_mut(&tx_hash).expect("held above").heard;
+        if owed.answers.contains_key(&(shard, probed)) {
+            return false;
+        }
+        owed.answers.insert((shard, probed), answer);
+        true
+    }
+
+    /// Every absence the chain has proved of the kind `probed` asks,
+    /// with the transaction and the counterpart it was proved of.
+    pub fn absences(
+        &self,
+        probed: Probed,
+    ) -> impl Iterator<Item = (TxHash, ShardId, Absence)> + '_ {
+        self.answers()
+            .filter_map(move |(tx_hash, shard, kind, answer)| match answer {
+                Answer::Absent(absence) if kind == probed => Some((tx_hash, shard, absence)),
+                Answer::Absent(_) | Answer::Committed | Answer::Present(_) => None,
+            })
+    }
+
+    /// Every consumer's claim the chain has proved of a crossing a leg
+    /// here issued.
+    pub fn claims(&self) -> impl Iterator<Item = (TxHash, ShardId, ClaimProof)> + '_ {
+        self.answers()
+            .filter_map(|(tx_hash, shard, _, answer)| match answer {
+                Answer::Present(presence) => Some((tx_hash, shard, presence)),
+                Answer::Absent(_) | Answer::Committed => None,
+            })
+    }
+
+    /// Every answer this ledger holds, with the cell it speaks for.
+    fn answers(&self) -> impl Iterator<Item = (TxHash, ShardId, Probed, Answer)> + '_ {
+        self.owed.iter().flat_map(|(&tx_hash, owed)| {
+            owed.heard
+                .answers
+                .iter()
+                .map(move |(&(shard, probed), &answer)| (tx_hash, shard, probed, answer))
+        })
+    }
+
+    /// The fetches the ledger has let go since this was last asked.
+    pub fn take_released_fetches(&mut self) -> Vec<(StateAnchor, SubstateKey)> {
+        std::mem::take(&mut self.released_fetches)
     }
 
     /// The leg entries whose counterparts may now be asked whether they
@@ -1196,7 +1416,9 @@ impl UnresolvedTxs {
                     owed.kind = Kind::Remainder;
                     owed.charged = true;
                 } else {
-                    self.owed.remove(&tx_hash);
+                    if let Some(gone) = self.owed.remove(&tx_hash) {
+                        release_fetches(&mut self.released_fetches, &gone);
+                    }
                     self.kept.remove(&tx_hash);
                 }
             }
@@ -1291,61 +1513,64 @@ impl UnresolvedTxs {
     /// back with its own finalization, so nothing leaks with it.
     pub fn prune(&mut self, now: WeightedTimestamp) -> Vec<Unanswerable> {
         let mut unanswerable = Vec::new();
-        let kept: BTreeMap<TxHash, Owed> = std::mem::take(&mut self.owed)
-            .into_iter()
-            .filter(|(tx_hash, owed)| {
-                // A leg entry stands until the record it would take
-                // back is consumed, and a record is retired on a
-                // counterpart's evidence rather than on a clock — so
-                // nothing here reads a clock for one. What ends it is
-                // the finalization that decides it: the reclaim's, the
-                // retirement's, or a failed leg's own.
-                //
-                // Except one rebuilt from a record, which holds no body
-                // and so can compose neither member. It stands for the
-                // abandonable set alone, and once nothing can still name
-                // it there is nothing left for it to stand for.
-                if owed.kind.is_leg() {
-                    return self.kept.contains_key(tx_hash)
-                        || leg_entry_horizon(owed.deadline) > now;
-                }
-                if let Some(shard) = owed.unsettled_by {
-                    if self.departed.get(&shard).is_some_and(|departure| {
-                        departure.readable_until.is_none_or(|until| now <= until)
-                    }) {
-                        return true;
+        let (kept, dropped): (BTreeMap<TxHash, Owed>, BTreeMap<TxHash, Owed>) =
+            std::mem::take(&mut self.owed)
+                .into_iter()
+                .partition(|(tx_hash, owed)| {
+                    // A leg entry stands until the record it would take
+                    // back is consumed, and a record is retired on a
+                    // counterpart's evidence rather than on a clock — so
+                    // nothing here reads a clock for one. What ends it is
+                    // the finalization that decides it: the reclaim's, the
+                    // retirement's, or a failed leg's own.
+                    //
+                    // Except one rebuilt from a record, which holds no body
+                    // and so can compose neither member. It stands for the
+                    // abandonable set alone, and once nothing can still name
+                    // it there is nothing left for it to stand for.
+                    if owed.kind.is_leg() {
+                        return self.kept.contains_key(tx_hash)
+                            || leg_entry_horizon(owed.deadline) > now;
                     }
-                    unanswerable.push(Unanswerable {
-                        tx_hash: *tx_hash,
-                        covered_by_record: true,
+                    if let Some(shard) = owed.unsettled_by {
+                        if self.departed.get(&shard).is_some_and(|departure| {
+                            departure.readable_until.is_none_or(|until| now <= until)
+                        }) {
+                            return true;
+                        }
+                        unanswerable.push(Unanswerable {
+                            tx_hash: *tx_hash,
+                            covered_by_record: true,
+                        });
+                        return false;
+                    }
+                    let answerable = owed.remote_prefixes.iter().any(|prefix| {
+                        self.departure_over(owed, *prefix).is_none_or(|departure| {
+                            departure.readable_until.is_none_or(|until| now <= until)
+                        })
                     });
-                    return false;
-                }
-                let answerable = owed.remote_prefixes.iter().any(|prefix| {
-                    self.departure_over(owed, *prefix).is_none_or(|departure| {
-                        departure.readable_until.is_none_or(|until| now <= until)
-                    })
+                    // Having counterparts at all is what makes silence mean
+                    // something: a transaction that never left this shard has
+                    // nobody to fall silent, and its own deadline decides it
+                    // as it decides any other.
+                    if owed.certified && !owed.remote_prefixes.is_empty() {
+                        if answerable {
+                            return true;
+                        }
+                        // Our certificate is out there and no shard is left to
+                        // combine it with.
+                        unanswerable.push(Unanswerable {
+                            tx_hash: *tx_hash,
+                            covered_by_record: false,
+                        });
+                        return false;
+                    }
+                    verdict_window_close(owed.deadline) > now
                 });
-                // Having counterparts at all is what makes silence mean
-                // something: a transaction that never left this shard has
-                // nobody to fall silent, and its own deadline decides it
-                // as it decides any other.
-                if owed.certified && !owed.remote_prefixes.is_empty() {
-                    if answerable {
-                        return true;
-                    }
-                    // Our certificate is out there and no shard is left to
-                    // combine it with.
-                    unanswerable.push(Unanswerable {
-                        tx_hash: *tx_hash,
-                        covered_by_record: false,
-                    });
-                    return false;
-                }
-                verdict_window_close(owed.deadline) > now
-            })
-            .collect();
         self.owed = kept;
+        for owed in dropped.values() {
+            release_fetches(&mut self.released_fetches, owed);
+        }
         let owed = &self.owed;
         self.kept.retain(|tx_hash, _| owed.contains_key(tx_hash));
 

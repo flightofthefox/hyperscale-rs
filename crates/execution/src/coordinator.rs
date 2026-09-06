@@ -57,9 +57,9 @@ use hyperscale_types::{
     ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateAnchor,
     StateProofBundle, StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot,
     Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution, UnsettledTx,
-    ValidatorId, VerdictClaim, Verifiable, Verified, WeightedTimestamp, absence_licenses_reclaim,
-    claim_readable_at, derive_block_transactions, lapse_licenses_reclaim, lapse_probe_anchor,
-    lapse_probe_ceiling, reclaim_probe_anchor, settled_set_verdict, tick_leader, tick_leader_at,
+    ValidatorId, VerdictClaim, Verifiable, Verified, WeightedTimestamp, claim_readable_at,
+    derive_block_transactions, lapse_probe_anchor, reclaim_probe_anchor, settled_set_verdict,
+    tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::CrossingCell;
 use tracing::instrument;
@@ -79,7 +79,8 @@ use crate::provisioning::{ProvisioningTracker, Requirement, divided_requirements
 use crate::tick_state::{Admission, Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
 use crate::unresolved::{
-    Abandonable, Probeable, Reclaimable, Retirable, Unanswerable, UnresolvedTxs,
+    Abandonable, Answer, Probe, Probeable, Probed, Reclaimable, Retirable, Unanswerable,
+    UnresolvedTxs, licenses,
 };
 use crate::vote_tracker::VoteTracker;
 
@@ -223,55 +224,6 @@ pub struct ExecutionMemoryStats {
     pub unproven_ecs: usize,
 }
 
-/// Which counterpart a probe asks, and so which record its absence is
-/// offered as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Probed {
-    /// A core's committed cell, past the transaction's deadline.
-    Core,
-    /// A delivering shard's claim cell, past the crossing's lapse.
-    Delivery,
-    /// A core consumer's claim cell, past the transaction's deadline:
-    /// present says the core took the crossing, and the record here is
-    /// retired on it; absent says only that it has not yet.
-    Claim,
-}
-
-/// What this shard has asked a silent counterpart about one transaction:
-/// a proof of `key` against `anchor`, whose block sits at `probed_wt`;
-/// `floor` is the anchor the answer is held to, kept beside it so the
-/// answer can be dated without the ledger.
-///
-/// A probe is the fetch and nothing more. Its answer is read off the
-/// block that carries the proof, by every replica alike, so the probe
-/// stays only to keep the question from being asked twice of one
-/// header: `answered` once the fetch returned and the bytes wait in
-/// `fetched` for a block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Probe {
-    anchor: StateAnchor,
-    key: SubstateKey,
-    probed_wt: WeightedTimestamp,
-    floor: WeightedTimestamp,
-    probed: Probed,
-    answered: bool,
-}
-
-/// What a proof the chain committed said about one counterpart cell of
-/// one transaction — the fold every replica reaches at the same height,
-/// and what the record arms are offered from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Answer {
-    /// The core took it: its certificate is what speaks next.
-    Committed,
-    /// The counterpart had not taken it past the floor: what an
-    /// `Unclaimed` or `Lapsed` record is offered from.
-    Absent(Absence),
-    /// The consumer's claim is present: what a `Claimed` record is
-    /// offered from, licensing the retirement of the record here.
-    Present(ClaimProof),
-}
-
 /// One counterpart cell a leg entry asks about: the shard holding it,
 /// the cell, the anchor an answer is held to, and which question it is.
 type CounterpartCell = (ShardId, SubstateKey, WeightedTimestamp, Probed);
@@ -358,16 +310,6 @@ fn delivery_floor(side: Side, validity_end: WeightedTimestamp) -> Option<Weighte
 /// only caller that would exercise it — which is why the second defect
 /// has never appeared in a simulation.
 const CLAIMED_RECORDS_OFFERED: bool = false;
-
-/// Whether an answer taken at `probed_wt` says anything about the
-/// question `probed` asks of a transaction ending at `validity_end`.
-fn licenses(probed: Probed, probed_wt: WeightedTimestamp, validity_end: WeightedTimestamp) -> bool {
-    match probed {
-        Probed::Core => absence_licenses_reclaim(probed_wt, validity_end),
-        Probed::Delivery => lapse_licenses_reclaim(probed_wt, validity_end),
-        Probed::Claim => probed_wt < lapse_probe_ceiling(validity_end),
-    }
-}
 
 /// Execution state machine.
 ///
@@ -591,21 +533,6 @@ pub struct ExecutionCoordinator {
     /// keeps this verdict identical to the vote fence's.
     settled_sets: HashMap<ShardId, SettledTxSet>,
 
-    /// What this shard has asked a silent counterpart about a
-    /// transaction a leg here issued for, keyed like the refusals: the
-    /// fetch out or answered, kept so one header is asked once. Each
-    /// lives to its leg entry.
-    probes: BTreeMap<(TxHash, ShardId, Probed), Probe>,
-
-    /// What proofs the chain committed said about the counterpart cells
-    /// of transactions legs here issued for, keyed like the probes:
-    /// folded at commit by every replica, first proof winning, so every
-    /// replica holds the same answer at the same height. What the
-    /// `Unclaimed`, `Lapsed` and `Claimed` records are offered from, and
-    /// what is handed to the vote fence the moment it is folded. Each
-    /// lives to its leg entry.
-    answers: BTreeMap<(TxHash, ShardId, Probed), Answer>,
-
     /// The proofs this validator's own fetches answered, each with the
     /// transactions whose probes it spoke to, held to offer in a block
     /// this validator proposes: a proof is committed content, folded by
@@ -739,8 +666,6 @@ impl ExecutionCoordinator {
 
             unproven_ecs: AwaitingTopologyBuffer::new(),
             settled_sets: HashMap::new(),
-            probes: BTreeMap::new(),
-            answers: BTreeMap::new(),
             fetched: BTreeMap::new(),
             gated_finalized: BTreeMap::new(),
             me,
@@ -2661,9 +2586,8 @@ impl ExecutionCoordinator {
         let mut wanted: BTreeMap<StateAnchor, Vec<SubstateKey>> = BTreeMap::new();
         for entry in self.unresolved.probeable(self.committed_ts) {
             for (shard, key, floor, probed) in counterpart_cells(&entry, trie) {
-                let slot = (entry.tx_hash, shard, probed);
                 // The chain has answered: nothing is asked again.
-                if self.answers.contains_key(&slot) {
+                if self.unresolved.answered(entry.tx_hash, shard, probed) {
                     continue;
                 }
                 // The newest licensed header held: the one the shard is
@@ -2682,9 +2606,8 @@ impl ExecutionCoordinator {
                 // how a claim the chain read absent is asked again —
                 // at a newer header, not of the same one every block.
                 if self
-                    .probes
-                    .get(&slot)
-                    .is_some_and(|probe| !probe.answered || probe.anchor.height >= height)
+                    .unresolved
+                    .probe_stands(entry.tx_hash, shard, probed, height)
                 {
                     continue;
                 }
@@ -2693,8 +2616,9 @@ impl ExecutionCoordinator {
                     height,
                     state_root: source.state_root,
                 };
-                self.probes.insert(
-                    slot,
+                self.unresolved.record_probe(
+                    entry.tx_hash,
+                    shard,
                     Probe {
                         anchor,
                         key,
@@ -2735,15 +2659,7 @@ impl ExecutionCoordinator {
         keys: Vec<SubstateKey>,
         proof: MerkleInclusionProof,
     ) {
-        let mut answered: BTreeSet<TxHash> = BTreeSet::new();
-        let mut anchor_ts = None;
-        for (&(tx_hash, _, _), probe) in &mut self.probes {
-            if probe.anchor == anchor && keys.contains(&probe.key) {
-                probe.answered = true;
-                answered.insert(tx_hash);
-                anchor_ts = Some(probe.probed_wt);
-            }
-        }
+        let (answered, anchor_ts) = self.unresolved.mark_probes_answered(anchor, &keys);
         // An answer nothing here asked about is nobody's to commit.
         if let Some(anchor_ts) = anchor_ts {
             self.fetched
@@ -2789,7 +2705,6 @@ impl ExecutionCoordinator {
             })
             .collect();
         let mut actions = Vec::new();
-        let mut abandoned = Vec::new();
         for claim in block.state_proofs() {
             // A verdict is the counterpart's own word, folded from the
             // chain rather than from whatever this replica happened to
@@ -2797,14 +2712,9 @@ impl ExecutionCoordinator {
             match claim {
                 CounterpartClaim::Verdict(verdict) => actions.extend(self.fold_verdict(verdict)),
                 CounterpartClaim::Cells(bundle) => {
-                    actions.extend(self.fold_cells(bundle, &cells, &mut abandoned));
+                    actions.extend(self.fold_cells(bundle, &cells));
                 }
             }
-        }
-        if !abandoned.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::StateProofs {
-                ids: abandoned,
-            }));
         }
         actions
     }
@@ -2815,7 +2725,6 @@ impl ExecutionCoordinator {
         &mut self,
         bundle: &StateProofBundle,
         cells: &[(Probeable, Vec<CounterpartCell>)],
-        abandoned: &mut Vec<(StateAnchor, SubstateKey)>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let inclusions = match bundle.inclusions() {
@@ -2842,7 +2751,6 @@ impl ExecutionCoordinator {
                     else {
                         continue;
                     };
-                    let slot = (entry.tx_hash, shard, probed);
                     let answer = match (inclusion, probed) {
                         (Inclusion::Present(_), Probed::Core) => Answer::Committed,
                         (Inclusion::Present(_), Probed::Claim | Probed::Delivery) => {
@@ -2858,17 +2766,14 @@ impl ExecutionCoordinator {
                             })
                         }
                     };
-                    // The question is answered; a fetch still out for it
-                    // is released.
-                    if let Some(probe) = self.probes.remove(&slot)
-                        && !probe.answered
+                    // The question is answered, and a fetch still out
+                    // for it is released with it.
+                    if !self
+                        .unresolved
+                        .record_answer(entry.tx_hash, shard, probed, answer)
                     {
-                        abandoned.push((probe.anchor, probe.key));
-                    }
-                    if self.answers.contains_key(&slot) {
                         continue;
                     }
-                    self.answers.insert(slot, answer);
                     record_reclaim_probe_answered(inclusion.is_present());
                     let tx_hash = entry.tx_hash;
                     actions.push(match answer {
@@ -3006,32 +2911,19 @@ impl ExecutionCoordinator {
         vec![Action::PersistLegEntries { entries, released }]
     }
 
-    /// Drop the probes whose leg entries are gone — released by the
-    /// reclaim, or dropped at their horizon — and release the fetch slot
-    /// of any still in flight, so a core that never serves the height
-    /// does not pin it.
-    fn gc_probes(&mut self) -> Vec<Action> {
+    /// Drop the bundles no transaction they answered for still needs,
+    /// and release every fetch the ledger let go — a question the chain
+    /// answered first, or one whose entry is gone — so a counterpart
+    /// that never serves the height does not pin the slot.
+    fn release_answered_fetches(&mut self) -> Vec<Action> {
         let unresolved = &self.unresolved;
         self.fetched
             .retain(|_, answered| answered.iter().any(|tx_hash| unresolved.contains(*tx_hash)));
-        self.answers
-            .retain(|(tx_hash, _, _), _| unresolved.contains(*tx_hash));
-        let mut abandoned = Vec::new();
-        self.probes.retain(|(tx_hash, _, _), probe| {
-            if unresolved.contains(*tx_hash) {
-                return true;
-            }
-            if !probe.answered {
-                abandoned.push((probe.anchor, probe.key));
-            }
-            false
-        });
-        if abandoned.is_empty() {
+        let ids = self.unresolved.take_released_fetches();
+        if ids.is_empty() {
             Vec::new()
         } else {
-            vec![Action::AbandonFetch(FetchAbandon::StateProofs {
-                ids: abandoned,
-            })]
+            vec![Action::AbandonFetch(FetchAbandon::StateProofs { ids })]
         }
     }
 
@@ -3250,7 +3142,6 @@ impl ExecutionCoordinator {
             }
         }
         let mut actions = self.fold_state_proofs(topology_schedule, block);
-        actions.extend(self.gc_probes());
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
         // could still carry one is nobody's to resolve.
@@ -3268,6 +3159,7 @@ impl ExecutionCoordinator {
         let unanswerable = self.unresolved.prune(self.committed_ts);
         actions.extend(self.persist_leg_entries());
         self.release_unanswerable(&unanswerable);
+        actions.extend(self.release_answered_fetches());
         // The committed clock is what opens a leg's deadline, so the
         // cores gone silent past it are asked here.
         actions.extend(self.probe_silent_counterparts(topology_schedule));
@@ -3677,14 +3569,9 @@ impl ExecutionCoordinator {
             (Probed::Delivery, AbandonmentRecord::lapsed),
         ] {
             let absent = self
-                .answers
-                .iter()
-                .filter_map(|((tx_hash, shard, kind), answer)| match answer {
-                    Answer::Absent(absence) if *kind == probed => {
-                        Some((*tx_hash, *shard, absence.probed_wt))
-                    }
-                    Answer::Absent(_) | Answer::Committed | Answer::Present(_) => None,
-                });
+                .unresolved
+                .absences(probed)
+                .map(|(tx_hash, shard, absence)| (tx_hash, shard, absence.probed_wt));
             self.offer_at_earliest_anchor(&mut records, &mut budget, absent, record);
         }
         // Proved claims, under the one settling arm: a consumer's claim
@@ -3692,12 +3579,9 @@ impl ExecutionCoordinator {
         // at, licensing the record's retirement rather than a reclaim.
         if CLAIMED_RECORDS_OFFERED {
             let claimed = self
-                .answers
-                .iter()
-                .filter_map(|((tx_hash, shard, _), answer)| match answer {
-                    Answer::Present(presence) => Some((*tx_hash, *shard, presence.probed_wt)),
-                    Answer::Absent(_) | Answer::Committed => None,
-                });
+                .unresolved
+                .claims()
+                .map(|(tx_hash, shard, presence)| (tx_hash, shard, presence.probed_wt));
             self.offer_at_earliest_anchor(
                 &mut records,
                 &mut budget,
