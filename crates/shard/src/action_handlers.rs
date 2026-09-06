@@ -35,7 +35,7 @@ use hyperscale_types::{
     Verifiable, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
     WorkInFlight, absorb_committed_cells, commit_witness_window, derive_leaves, lapse_probe_anchor,
     local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
-    protocol_statics, shard_reveal_sign, signed_bytes, vrf_output_from_proof,
+    protocol_statics, reclaim_probe_anchor, shard_reveal_sign, signed_bytes, vrf_output_from_proof,
     work_over_certificates,
 };
 
@@ -718,6 +718,7 @@ where
             block_hash,
             entries,
             deliveries,
+            successes,
             anchor,
             trie,
         } => {
@@ -731,6 +732,7 @@ where
                 .iter()
                 .map(|entry| entry.tx_hash)
                 .chain(deliveries.iter().copied())
+                .chain(successes.iter().copied())
                 .collect();
             let derivation = ctx.executor.derivation();
             let held: HashMap<TxHash, Verified<Transaction>> = ctx
@@ -753,6 +755,15 @@ where
                     Classified::freeze(tx.legs(), tx.owners(), &trie).delivers_at(ctx.shard)
                         && anchor >= lapse_probe_anchor(tx.validity_range().end_timestamp_exclusive)
                 })
+            })
+            .and_successes(successes, |tx_hash| {
+                // A success at or past the deadline is one a leg may
+                // already have reclaimed against. That the members held
+                // to it awaited nobody is the outcome's own attestation,
+                // read where the names were gathered.
+                held.get(&tx_hash).map(|tx| {
+                    anchor >= reclaim_probe_anchor(tx.validity_range().end_timestamp_exclusive)
+                })
             });
             match verdict {
                 Resolutions::Wrong(tx_hash) => tracing::warn!(
@@ -764,6 +775,11 @@ where
                     ?block_hash,
                     ?tx_hash,
                     "Resolutions verification FAILED: a finalization delivers past the lapse"
+                ),
+                Resolutions::Overdue(tx_hash) => tracing::warn!(
+                    ?block_hash,
+                    ?tx_hash,
+                    "Resolutions verification FAILED: a finalization succeeds past the deadline"
                 ),
                 Resolutions::Exact | Resolutions::Unknown(_) => {}
             }

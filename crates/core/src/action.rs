@@ -965,7 +965,13 @@ pub enum Action {
         /// deciding — a delivery or a leg — checked against the lapse
         /// where the body says this shard delivers for it.
         deliveries: Vec<TxHash>,
-        /// The block's own anchor, which the lapse is read against.
+        /// Every transaction the block's finalizations decide with
+        /// success by its own execution, for a member that awaits
+        /// nobody, checked against the deadline: past it a leg may
+        /// already have taken its crossing back.
+        successes: Vec<TxHash>,
+        /// The block's own anchor, which the lapse and the deadline are
+        /// read against.
         anchor: WeightedTimestamp,
         /// The trie of the anchor's window, which the body is classified
         /// against.

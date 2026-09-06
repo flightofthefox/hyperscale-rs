@@ -84,6 +84,8 @@ pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
         &targets,
         b"DECIDES:",
         &[u8::from(outcome.decides())],
+        b"EXECUTES:",
+        &[u8::from(outcome.executes())],
     ])
 }
 
@@ -205,6 +207,27 @@ mod tests {
         assert_ne!(
             tx_outcome_leaf(&outcome),
             tx_outcome_leaf(&outcome.clone().deciding(false)),
+        );
+    }
+
+    /// Whether an outcome is the transaction's own execution is under
+    /// the signed leaf: a reclaim's success and a single-shard core's
+    /// are otherwise identical bytes.
+    #[test]
+    fn a_member_that_settles_leafs_differently() {
+        let outcome = TxOutcome::new(
+            TxHash::from(Hash::from_bytes(b"reclaim")),
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        );
+        assert!(
+            outcome.executes(),
+            "an outcome executes unless told otherwise"
+        );
+        assert_ne!(
+            tx_outcome_leaf(&outcome),
+            tx_outcome_leaf(&outcome.clone().executing(false)),
         );
     }
 

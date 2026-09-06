@@ -803,15 +803,55 @@ pub fn make_finalization(
     tx_hash: TxHash,
     decision: TransactionDecision,
 ) -> Finalization {
-    let outcome = match decision {
+    finalization_of(
+        block_height,
+        vec![TxOutcome::new(tx_hash, outcome_of(decision))],
+    )
+}
+
+/// A finalization at `block_height` deciding `tx_hash` a success whose
+/// settlement awaits `counterparts`: what a member of a multi-shard core
+/// attests, and the one success the deadline does not bound.
+#[must_use]
+pub fn make_finalization_awaiting(
+    block_height: BlockHeight,
+    tx_hash: TxHash,
+    counterparts: impl IntoIterator<Item = ShardId>,
+) -> Finalization {
+    finalization_of(
+        block_height,
+        vec![
+            TxOutcome::new(tx_hash, outcome_of(TransactionDecision::Accept)).awaiting(counterparts),
+        ],
+    )
+}
+
+/// A finalization at `block_height` deciding `tx_hash` a success that is
+/// no execution of it — a reclaim's, an abandonment's — which settles
+/// past the deadline by construction and is not held to it.
+#[must_use]
+pub fn make_settling_finalization(block_height: BlockHeight, tx_hash: TxHash) -> Finalization {
+    finalization_of(
+        block_height,
+        vec![TxOutcome::new(tx_hash, outcome_of(TransactionDecision::Accept)).executing(false)],
+    )
+}
+
+/// The outcome a decision reads back as, for a fixture that states the
+/// decision and nothing else about the execution.
+const fn outcome_of(decision: TransactionDecision) -> ExecutionOutcome {
+    match decision {
         TransactionDecision::Accept => ExecutionOutcome::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
         },
         TransactionDecision::Reject => ExecutionOutcome::Failed,
         TransactionDecision::Aborted => ExecutionOutcome::Aborted,
-    };
+    }
+}
+
+/// A single-certificate finalization at `block_height` over `outcomes`.
+fn finalization_of(block_height: BlockHeight, outcomes: Vec<TxOutcome>) -> Finalization {
     let tick_id = TickId::new(ShardId::ROOT, block_height);
-    let outcomes = vec![TxOutcome::new(tx_hash, outcome)];
     let ec = ExecutionCertificate::new(
         tick_id,
         WeightedTimestamp::from_millis(block_height.inner() + 1),
@@ -842,24 +882,10 @@ pub fn make_undecided_finalization(
     tx_hash: TxHash,
     decision: TransactionDecision,
 ) -> Finalization {
-    let outcome = match decision {
-        TransactionDecision::Accept => ExecutionOutcome::Succeeded {
-            receipt_hash: GlobalReceiptHash::ZERO,
-        },
-        TransactionDecision::Reject => ExecutionOutcome::Failed,
-        TransactionDecision::Aborted => ExecutionOutcome::Aborted,
-    };
-    let tick_id = TickId::new(ShardId::ROOT, block_height);
-    let outcomes = vec![TxOutcome::new(tx_hash, outcome).deciding(false)];
-    let ec = ExecutionCertificate::new(
-        tick_id,
-        WeightedTimestamp::from_millis(block_height.inner() + 1),
-        compute_global_receipt_root(&outcomes),
-        outcomes,
-        AggregateSignature::new([0u8; 96]),
-        SignerBitfield::new(4),
-    );
-    Finalization::new(tick_id, TickHalf::Determined, vec![Arc::new(ec)], vec![])
+    finalization_of(
+        block_height,
+        vec![TxOutcome::new(tx_hash, outcome_of(decision)).deciding(false)],
+    )
 }
 
 /// The one synthetic cell the stub declares per owner. All of an

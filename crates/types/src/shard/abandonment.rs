@@ -116,13 +116,14 @@ impl UnsettledTx {
 ///
 /// The voter's answer, read off committed bodies. A validator whose
 /// store holds a transaction answers for it — a figure exactly or
-/// wrongly, a delivery inside its window or past the lapse — and one
-/// whose store never held it, having synced past its block, cannot say,
+/// wrongly, a delivery inside its window or past the lapse, a success
+/// inside its deadline or past it — and one whose store never held it,
+/// having synced past its block, cannot say,
 /// which is a third answer and not a pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolutions {
-    /// Every figure of every name is the one its transaction fixes, and
-    /// no delivery has lapsed.
+    /// Every figure of every name is the one its transaction fixes, no
+    /// delivery has lapsed, and no success is overdue.
     Exact,
     /// A figure of this name differs from the one its transaction fixes:
     /// the block is refused.
@@ -132,6 +133,14 @@ pub enum Resolutions {
     /// proved the claim absent and taken the crossing back: the block is
     /// refused.
     Lapsed(TxHash),
+    /// A finalization decides this transaction with success, by its own
+    /// execution, at an anchor at or past its deadline, where a leg that
+    /// issued for it may already have read the claim absent and taken
+    /// the crossing back.
+    /// Only a member that awaits nobody is held to it: one with a sibling
+    /// to stay atomic with settles on the sibling's clock. The block is
+    /// refused.
+    Overdue(TxHash),
     /// This validator does not hold this name's transaction, so it cannot
     /// say: the vote is deferred.
     Unknown(TxHash),
@@ -173,14 +182,42 @@ impl Resolutions {
         deliveries: impl IntoIterator<Item = TxHash>,
         lapsed: impl Fn(TxHash) -> Option<bool>,
     ) -> Self {
+        self.and_each(deliveries, lapsed, Self::Lapsed)
+    }
+
+    /// This answer folded with the successes the block's finalizations
+    /// decide for members that await nobody, `overdue` saying whether
+    /// each sits at or past its deadline at the block's anchor, `None`
+    /// for one this validator does not hold.
+    ///
+    /// A refusal answers over a deferral, as a lapsed delivery does.
+    #[must_use]
+    pub fn and_successes(
+        self,
+        successes: impl IntoIterator<Item = TxHash>,
+        overdue: impl Fn(TxHash) -> Option<bool>,
+    ) -> Self {
+        self.and_each(successes, overdue, Self::Overdue)
+    }
+
+    /// One fold for every name a finalization is held to: a refusal
+    /// already reached stands, the first name `judge` answers `true` for
+    /// is refused as `refuse` names it, and a name it cannot answer for
+    /// defers unless something refuses.
+    fn and_each(
+        self,
+        names: impl IntoIterator<Item = TxHash>,
+        judge: impl Fn(TxHash) -> Option<bool>,
+        refuse: fn(TxHash) -> Self,
+    ) -> Self {
         let mut unknown = match self {
-            Self::Wrong(_) | Self::Lapsed(_) => return self,
+            Self::Wrong(_) | Self::Lapsed(_) | Self::Overdue(_) => return self,
             Self::Unknown(tx_hash) => Some(tx_hash),
             Self::Exact => None,
         };
-        for tx_hash in deliveries {
-            match lapsed(tx_hash) {
-                Some(true) => return Self::Lapsed(tx_hash),
+        for tx_hash in names {
+            match judge(tx_hash) {
+                Some(true) => return refuse(tx_hash),
                 Some(false) => {}
                 None => {
                     unknown.get_or_insert(tx_hash);
@@ -631,6 +668,29 @@ mod tests {
         assert_eq!(
             Resolutions::Wrong(tx(1).tx_hash).and_deliveries([tx(3).tx_hash], lapsed),
             Resolutions::Wrong(tx(1).tx_hash)
+        );
+
+        // Successes fold the same way, and a refusal already reached
+        // stands over one: the first refusal is the answer.
+        assert_eq!(
+            Resolutions::Exact.and_successes([tx(1).tx_hash], lapsed),
+            Resolutions::Exact
+        );
+        assert_eq!(
+            Resolutions::Exact.and_successes([tx(2).tx_hash], lapsed),
+            Resolutions::Unknown(tx(2).tx_hash)
+        );
+        assert_eq!(
+            Resolutions::Unknown(tx(2).tx_hash).and_successes([tx(3).tx_hash], lapsed),
+            Resolutions::Overdue(tx(3).tx_hash)
+        );
+        assert_eq!(
+            Resolutions::Lapsed(tx(1).tx_hash).and_successes([tx(3).tx_hash], lapsed),
+            Resolutions::Lapsed(tx(1).tx_hash)
+        );
+        assert_eq!(
+            Resolutions::Overdue(tx(3).tx_hash).and_deliveries([tx(3).tx_hash], lapsed),
+            Resolutions::Overdue(tx(3).tx_hash)
         );
     }
 

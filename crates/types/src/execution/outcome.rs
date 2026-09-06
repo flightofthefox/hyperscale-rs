@@ -139,6 +139,17 @@ pub struct TxOutcome {
     /// member that answers to nobody leaves no other trace of the shards
     /// that will ask.
     reaches_beyond: bool,
+    /// Whether this outcome is the transaction's own execution, rather
+    /// than a member settling what one left — a reclaim, a retirement,
+    /// an abandonment, or an inherited record's.
+    ///
+    /// Attested rather than derived because it cannot be: a reclaim and
+    /// a single-shard core both decide, both await nobody and both
+    /// succeed, and only the tick that admitted the member knows which
+    /// it composed. What reads it is the deadline: a success that
+    /// executes past it is one a leg may already have reclaimed against,
+    /// where a settling member is past it by construction.
+    executes: bool,
 }
 
 impl TxOutcome {
@@ -162,6 +173,7 @@ impl TxOutcome {
             crossing_targets: Vec::new(),
             decides: true,
             reaches_beyond: false,
+            executes: true,
         }
     }
 
@@ -235,6 +247,20 @@ impl TxOutcome {
         self.decides
     }
 
+    /// State whether this outcome is the transaction's own execution.
+    #[must_use]
+    pub const fn executing(mut self, executes: bool) -> Self {
+        self.executes = executes;
+        self
+    }
+
+    /// Whether this outcome is the transaction's own execution, rather
+    /// than a member settling what one left.
+    #[must_use]
+    pub const fn executes(&self) -> bool {
+        self.executes
+    }
+
     /// Create a `TxOutcome` that settles the payer's charge through the
     /// named fee receipt.
     ///
@@ -262,6 +288,7 @@ impl TxOutcome {
             crossing_targets: Vec::new(),
             decides: true,
             reaches_beyond: false,
+            executes: true,
         }
     }
 

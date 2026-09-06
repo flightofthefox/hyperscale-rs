@@ -1048,7 +1048,7 @@ impl ExecutionCoordinator {
             participating.insert(local_shard);
             state.admit(
                 tx_hash,
-                Membership::whole(participating),
+                Membership::whole(participating).settling(),
                 declared_work,
                 Admission::Aborted,
             );
@@ -1117,7 +1117,7 @@ impl ExecutionCoordinator {
             }
             state.admit(
                 tx_hash,
-                Membership::whole(BTreeSet::from([local_shard])),
+                Membership::whole(BTreeSet::from([local_shard])).settling(),
                 0,
                 Admission::Executes,
             );
@@ -1201,7 +1201,7 @@ impl ExecutionCoordinator {
             let tx_hash = inherited_member_name(issued_by, &records);
             state.admit(
                 tx_hash,
-                Membership::whole(BTreeSet::from([local_shard])),
+                Membership::whole(BTreeSet::from([local_shard])).settling(),
                 0,
                 Admission::Executes,
             );

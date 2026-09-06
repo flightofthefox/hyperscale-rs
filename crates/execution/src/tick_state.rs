@@ -88,13 +88,18 @@ pub struct Divergence {
 /// from that set. And whether the member only **delivers**: a leg that
 /// failed is the transaction's end on its shard, since it could not
 /// issue, but a delivery that failed decides nothing either way — the
-/// value it claims stays in its cell for a later claim.
+/// value it claims stays in its cell for a later claim. And whether the
+/// member **executes** the transaction or settles what an execution left:
+/// a reclaim, an abandonment, an inherited record's member or a
+/// retirement runs no execution of the transaction's own, and the
+/// deadline holds only what does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Membership {
     awaited: BTreeSet<ShardId>,
     reach: BTreeSet<ShardId>,
     decides: bool,
     delivers: bool,
+    executes: bool,
 }
 
 impl Membership {
@@ -112,6 +117,7 @@ impl Membership {
             reach: member.reach().clone(),
             decides: member.decides(),
             delivers: member.delivers(),
+            executes: true,
         }
     }
 
@@ -124,14 +130,15 @@ impl Membership {
             reach: participating,
             decides: true,
             delivers: false,
+            executes: true,
         }
     }
 
     /// A member that settles nothing about the transaction: a retirement,
-    /// deleting records whose claims committed elsewhere. Awaits nobody
-    /// and decides nothing — the verdict was reached where the claims
-    /// were, and a name that decided here would be a second verdict on
-    /// a chain that may already hold the first.
+    /// deleting records whose claims committed elsewhere. Awaits nobody,
+    /// decides nothing — the verdict was reached where the claims were,
+    /// and a name that decided here would be a second verdict on a chain
+    /// that may already hold the first — and executes nothing.
     #[must_use]
     pub fn housekeeping(local: ShardId) -> Self {
         Self {
@@ -139,7 +146,24 @@ impl Membership {
             reach: BTreeSet::from([local]),
             decides: false,
             delivers: false,
+            executes: false,
         }
+    }
+
+    /// This membership for a member that settles what an execution left
+    /// rather than executing the transaction: a reclaim, an abandonment,
+    /// an inherited record's. The verdict and the awaited set stay as
+    /// stated; only the attestation that it executed is withdrawn.
+    #[must_use]
+    pub const fn settling(mut self) -> Self {
+        self.executes = false;
+        self
+    }
+
+    /// Whether this member executes the transaction itself.
+    #[must_use]
+    pub const fn executes(&self) -> bool {
+        self.executes
     }
 
     /// Whether this shard's certificate bears the verdict on the
@@ -805,6 +829,7 @@ impl TickState {
                 .crossing_to(targets)
                 .deciding(decides)
                 .reaching_beyond(membership.is_some_and(|m| m.reaches_beyond(local)))
+                .executing(membership.is_none_or(Membership::executes))
             })
             .collect();
 

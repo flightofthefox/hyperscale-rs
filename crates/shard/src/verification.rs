@@ -15,12 +15,12 @@ use hyperscale_core::{Action, FeeDemand};
 use hyperscale_storage::committed_tx_cells;
 use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-    BlockManifest, CertificateRoot, CertifiedBlock, ChainOrigin, Finalization, LinkageError,
-    LocalReceiptRoot, ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ReshapeThresholds,
-    RevealChain, ScheduleLookup, ShardId, ShardTrie, SplitChildRoots, StateRoot, SubstateKey,
-    SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot, TransactionRoot, TxHash,
-    TxOutcome, UnsettledTx, Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp,
-    WorkInFlight,
+    BlockManifest, CertificateRoot, CertifiedBlock, ChainOrigin, ExecutionOutcome, Finalization,
+    LinkageError, LocalReceiptRoot, ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate,
+    ReshapeThresholds, RevealChain, ScheduleLookup, ShardId, ShardTrie, SplitChildRoots, StateRoot,
+    SubstateKey, SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot, TransactionRoot,
+    TxHash, TxOutcome, UnsettledTx, Verifiable, Verified, VerifiedBlockAssembleError,
+    WeightedTimestamp, WorkInFlight,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -68,7 +68,9 @@ pub enum VerificationKind {
 /// record's figures, or a finalization resolving a name it does not
 /// decide, which is a delivery or a leg.
 fn resolutions_to_check(block: &Block) -> bool {
-    !block.abandonment_records().is_empty() || !undecided_names(block).is_empty()
+    !block.abandonment_records().is_empty()
+        || !undecided_names(block).is_empty()
+        || !successes_decided_alone(block).is_empty()
 }
 
 /// The trie of `anchor`'s window, which a delivered body is classified
@@ -88,6 +90,26 @@ fn undecided_names(block: &Block) -> Vec<TxHash> {
         .iter()
         .flat_map(|fw| fw.local_ec().tx_outcomes().iter())
         .filter(|outcome| !outcome.decides())
+        .map(TxOutcome::tx_hash)
+        .collect()
+}
+
+/// Every transaction the block's finalizations decide with success by
+/// its own execution, for a member that awaits nobody — the only
+/// successes the deadline bounds. One with a sibling to stay atomic with
+/// settles on the sibling's clock, however late; a member settling what
+/// an execution left is past the deadline by construction.
+fn successes_decided_alone(block: &Block) -> Vec<TxHash> {
+    block
+        .certificates()
+        .iter()
+        .flat_map(|fw| fw.local_ec().tx_outcomes().iter())
+        .filter(|outcome| {
+            outcome.decides()
+                && outcome.executes()
+                && outcome.counterparts().is_empty()
+                && matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. })
+        })
         .map(TxOutcome::tx_hash)
         .collect()
 }
@@ -1354,10 +1376,12 @@ impl VerificationPipeline {
             .copied()
             .collect();
         let deliveries = undecided_names(block);
+        let successes = successes_decided_alone(block);
         debug!(
             ?block_hash,
             names = entries.len(),
             deliveries = deliveries.len(),
+            successes = successes.len(),
             "Initiating resolutions verification"
         );
         self.mark_root_in_flight(block_hash, VerificationKind::Resolutions);
@@ -1365,6 +1389,7 @@ impl VerificationPipeline {
             block_hash,
             entries,
             deliveries,
+            successes,
             anchor,
             trie,
         }]
@@ -2573,8 +2598,11 @@ impl VerificationPipeline {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::test_utils::test_transaction;
-    use hyperscale_types::{AggregateSignature, WitnessSources};
+    use hyperscale_types::test_utils::{
+        make_finalization, make_finalization_awaiting, make_leg_finalization,
+        make_settling_finalization, test_transaction,
+    };
+    use hyperscale_types::{AggregateSignature, TransactionDecision, Verifiable, WitnessSources};
 
     fn disabled_count_source() -> SubstateCountSource<'static> {
         static EMPTY: std::sync::OnceLock<HashMap<BlockHash, i64>> = std::sync::OnceLock::new();
@@ -2593,6 +2621,46 @@ mod tests {
 
     use super::*;
     use crate::pending::PendingBlock;
+
+    /// The deadline holds only an execution's success decided alone. A
+    /// member with a sibling to stay atomic with settles on the sibling's
+    /// clock, a refusal writes no claim to reclaim against, a member
+    /// settling what an execution left is past the deadline by
+    /// construction, and a leg's own success decides nothing — that one
+    /// is a delivery's question.
+    #[test]
+    fn only_an_executions_success_decided_alone_is_held_to_the_deadline() {
+        let alone = test_transaction(1).hash();
+        let with_sibling = test_transaction(2).hash();
+        let refused = test_transaction(3).hash();
+        let leg = test_transaction(4).hash();
+        let settled = test_transaction(5).hash();
+        let height = BlockHeight::new(3);
+        let certificates: Vec<Arc<Verifiable<Finalization>>> = vec![
+            Arc::new(make_finalization(height, alone, TransactionDecision::Accept).into()),
+            Arc::new(
+                make_finalization_awaiting(height, with_sibling, [ShardId::leaf(1, 1)]).into(),
+            ),
+            Arc::new(make_finalization(height, refused, TransactionDecision::Reject).into()),
+            Arc::new(make_leg_finalization(height, leg).into()),
+            Arc::new(make_settling_finalization(height, settled).into()),
+        ];
+        let block = Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                height,
+                ..Default::default()
+            }),
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(certificates),
+            provisions: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+
+        assert_eq!(successes_decided_alone(&block), vec![alone]);
+        assert_eq!(undecided_names(&block), vec![leg]);
+    }
 
     /// A single-entry schedule wrapping `snapshot` — the deferral tests
     /// never reach a per-ancestor committee resolution (the walk stops at

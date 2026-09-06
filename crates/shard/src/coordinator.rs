@@ -4768,6 +4768,14 @@ impl ShardCoordinator {
                     "Finalization delivers a crossing at or past its lapse — not voting"
                 );
             }
+            Resolutions::Overdue(tx_hash) => {
+                warn!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    ?tx_hash,
+                    "Finalization succeeds at or past its deadline — not voting"
+                );
+            }
             Resolutions::Unknown(tx_hash) => {
                 trace!(
                     validator = ?self.me,
@@ -12421,6 +12429,17 @@ mod tests {
         assert!(
             coord.pending_blocks.get(block_hash).is_none(),
             "a delivery past its lapse refuses the block"
+        );
+
+        let mut coord = fence_coordinator();
+        install_complete_block(&mut coord, &block);
+        coord
+            .verification
+            .initiate_resolutions_verification(block_hash, &block, &sched);
+        coord.on_resolutions_verified(&sched, block_hash, Resolutions::Overdue(tx_hash));
+        assert!(
+            coord.pending_blocks.get(block_hash).is_none(),
+            "a success past its deadline refuses the block"
         );
 
         let mut coord = fence_coordinator();
