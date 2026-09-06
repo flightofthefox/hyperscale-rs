@@ -831,7 +831,17 @@ impl ShardCoordinator {
 
     /// The committee lookup itself, for the callers that hold an anchor
     /// rather than a parent hash. Terminal-clamped and recovery-bridged;
-    /// `None` is a beacon-behind stall or an evicted window.
+    /// `None` is a beacon-behind stall, an evicted window, or a window
+    /// that seats nobody.
+    ///
+    /// That last one reads as a stall for the same reason the other two
+    /// do: a snapshot whose ready-filtered committee for this shard is
+    /// empty answers no committee question. Its quorum threshold is zero,
+    /// which `VoteCount::has_quorum` satisfies with a single vote, and its
+    /// proposer rotation has nothing to rotate over — so a caller handed
+    /// one either asserts or proceeds on a quorum that means nothing.
+    /// Stalling until a window that seats somebody governs the work is the
+    /// same discipline as stalling on a beacon that has not caught up.
     ///
     /// `anchor` must be a *committee* anchor — [`Self::committee_anchor`] of
     /// the block in question, or equivalently [`Self::block_anchor`] of its
@@ -846,6 +856,11 @@ impl ShardCoordinator {
         topology_schedule
             .at_for_shard_live(self.local_shard, anchor)
             .map(|(snapshot, _)| snapshot)
+            .filter(|snapshot| {
+                !snapshot
+                    .consensus_committee_for_shard(self.local_shard)
+                    .is_empty()
+            })
     }
 
     /// Committee anchor of the height in progress / our next proposal: the
