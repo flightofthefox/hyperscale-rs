@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::slice::from_ref;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyperscale_hbor::from_slice;
 use hyperscale_jmt::{KEY_BYTES, TreeReader};
@@ -20,14 +21,14 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts,
     BlockHeight, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId, ConsensusReceipt,
     EntryKey, EntryLeaf, Epoch, Event, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome,
-    FeeSummary, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LegEntry, LegEntryKind,
-    LocalKey, LogLevel, MerkleInclusionProof, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof,
-    ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions,
-    QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, Round,
-    SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId, ShardTrie,
-    ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
-    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint,
-    TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx,
+    FeeSummary, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LEG_ENTRY_HORIZON,
+    LegEntry, LegEntryKind, LocalKey, LogLevel, MerkleInclusionProof, PcQc2, PcQc3,
+    PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp, ProtocolHasher, ProvisionEntry,
+    ProvisionHash, Provisions, QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert,
+    RatifyRound, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId,
+    ShardTrie, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId,
+    StateRoot, StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier,
+    SyncHint, TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx,
     ValidatorId, Verifiable, Verified, VotePosition, WeightedTimestamp, WitnessSources,
     WorkInFlight, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
 };
@@ -2040,6 +2041,57 @@ pub fn test_undischarged_record_holds_the_floor(
         unresolved_replay_floor(storage, BlockHeight::new(4), WeightedTimestamp::ZERO),
         None,
         "a discharged record holds nothing down",
+    );
+}
+
+/// Shared rebuild test: a leg entry holds the replay floor to its own
+/// horizon.
+///
+/// A whole entry's fate is decided inside [`RETENTION_HORIZON`] of its
+/// commit, and that is as far as a rebuild reads for one. A leg entry
+/// stands [`LEG_ENTRY_HORIZON`] past its deadline, so its commit sits
+/// below that reach while the entry is still live — and the fold has to
+/// reach it, or a restart drops a reclaim the ledger was still owed.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_leg_entry_holds_the_floor_to_its_horizon(
+    storage: &(impl ShardChainReader + ShardChainWriter),
+) {
+    let leg = test_transaction(5);
+    let committed_ms = 1_000;
+
+    commit_empty_blocks_up_to(storage, BlockHeight::new(1));
+    let committing = with_transactions(
+        make_test_block_with_anchor_wt(BlockHeight::new(1), committed_ms),
+        vec![Arc::new(Verifiable::from(leg.clone()))],
+    );
+    storage.commit_block(&make_test_certified(committing), &[], &empty_witness());
+    let settling = push_certificate(
+        make_test_block_with_anchor_wt(BlockHeight::new(2), committed_ms + 1_000),
+        Arc::new(Verifiable::from(make_leg_finalization(
+            BlockHeight::new(2),
+            leg.hash(),
+        ))),
+    );
+    storage.commit_block(&make_test_certified(settling), &[], &empty_witness());
+
+    let committed = WeightedTimestamp::from_millis(committed_ms);
+    let past_retention = committed
+        .plus(RETENTION_HORIZON)
+        .plus(Duration::from_secs(1));
+    assert_eq!(
+        unresolved_replay_floor(storage, BlockHeight::new(2), past_retention),
+        Some(BlockHeight::new(1)),
+        "past the retention horizon a whole entry is gone, but a leg entry \
+         stands, so its commit still holds the floor",
+    );
+    let past_horizon = past_retention.plus(LEG_ENTRY_HORIZON);
+    assert_eq!(
+        unresolved_replay_floor(storage, BlockHeight::new(2), past_horizon),
+        None,
+        "and past its own horizon nothing is owed, so nothing holds it down",
     );
 }
 

@@ -769,6 +769,12 @@ fn a_replay_keeps_a_leg_its_own_finalization_settled() {
 }
 
 #[test]
+fn a_leg_entry_holds_the_floor_to_its_horizon() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_a_leg_entry_holds_the_floor_to_its_horizon(&storage);
+}
+
+#[test]
 fn recovery_carries_the_tip_drain_total() {
     let storage = SimShardStorage::default();
     test_helpers::test_recovery_carries_the_tip_drain_total(&storage, || {

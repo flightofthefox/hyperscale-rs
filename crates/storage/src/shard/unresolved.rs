@@ -18,31 +18,31 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, EPOCH_DURATION, Provisions, RETENTION_HORIZON,
+    BlockHeight, CertifiedBlock, EPOCH_DURATION, LEG_ENTRY_HORIZON, Provisions, RETENTION_HORIZON,
     TERMINAL_EVIDENCE_EPOCHS, TxHash, Verifiable, Verified, WeightedTimestamp,
 };
 
 use super::chain_reader::ShardChainReader;
 
-/// How far back a rebuild reads for a transaction its own deadline
-/// decides.
+/// How far back a rebuild reads for a transaction its own clock decides.
 ///
 /// A transaction committed at time `T` states a deadline at most
 /// [`RETENTION_HORIZON`] beyond it — a validity end at most one range
-/// on, and the reclaim probe anchor one finalization delay past that —
-/// so this spans every entry whose fate is its deadline's to settle.
+/// on, and the reclaim probe anchor one finalization delay past that. A
+/// whole entry goes at its deadline; a leg entry stands
+/// [`LEG_ENTRY_HORIZON`] past it, to where the claim cell both its
+/// members are proved against is swept. So this spans every entry whose
+/// fate is its own clock's to settle, leg entries included.
 ///
-/// It does **not** span every entry the ledger holds, and two kinds sit
-/// outside it. One a certificate of this shard's covers lives while some
-/// counterpart can still answer, which is the counterpart's clock rather
-/// than the transaction's: a counterpart may run for hours past the
-/// commit and only then depart, and the entry survives to that
-/// departure's terminal-evidence expiry — [`RECORD_WINDOW`] is what
-/// reaches those. And a leg entry stands until the record it would take
-/// back is consumed, which is evidence rather than any clock, so no span
-/// reaches it at all; the leg-entry store is what carries those, and the
-/// fold decides only the ones this window reaches.
-const FOLD_WINDOW: Duration = RETENTION_HORIZON;
+/// It does **not** span every entry the ledger holds. One a certificate
+/// of this shard's covers lives while some counterpart can still answer,
+/// which is the counterpart's clock rather than the transaction's: a
+/// counterpart may run for hours past the commit and only then depart,
+/// and the entry survives to that departure's terminal-evidence expiry —
+/// [`RECORD_WINDOW`] is what reaches those. It is the wider of the two,
+/// so the scan's reach is the record's and this window costs it nothing.
+const FOLD_WINDOW: Duration =
+    Duration::from_secs(RETENTION_HORIZON.as_secs() + LEG_ENTRY_HORIZON.as_secs());
 
 /// How far back a rebuild reads for a transaction a committed boundary
 /// record decides.
