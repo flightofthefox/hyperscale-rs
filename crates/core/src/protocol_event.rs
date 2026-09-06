@@ -9,22 +9,22 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Absence, BeaconBlockHash, BeaconProposal, BeaconWitnessRoot, BeaconWitnessRootVerifyError,
-    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
+    BeaconBlockHash, BeaconProposal, BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block,
+    BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
     CandidateBeaconBlockVerifyError, CertRootVerifyError, CertificateRoot, CertifiedBeaconBlock,
     CertifiedBeaconBlockVerifyError, CertifiedBlock, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, ClaimProof, Epoch, ExecutionCertificate,
-    ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationVerifyError, Hash,
-    LeafIndex, LocalReceiptRoot, LocalReceiptRootVerifyError, MerkleInclusionProof, PcVote1,
-    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
-    ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
-    ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate, RatifyPhase,
-    RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal, Refusal, Resolutions, Round,
-    ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg,
-    SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
-    SpcProposalObjectVerifyError, SpcView, StateAnchor, StateRoot, StateRootVerifyError,
-    StoredReceipt, SubstateKey, TickId, Timeout, Transaction, TransactionRoot, TxHash, TxOutcome,
-    TxResolution, TxRootVerifyError, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    CertifiedHeaderVerifyError, Epoch, ExecutionCertificate, ExecutionCertificateVerifyError,
+    ExecutionVote, Finalization, FinalizationVerifyError, Hash, LeafIndex, LocalReceiptRoot,
+    LocalReceiptRootVerifyError, MerkleInclusionProof, PcVote1, PcVote1VerifyError, PcVote2,
+    PcVote2VerifyError, PcVote3, PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap,
+    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError,
+    QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal,
+    Resolutions, Round, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
+    SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
+    SpcProposalObject, SpcProposalObjectVerifyError, SpcView, StateAnchor, StateRoot,
+    StateRootVerifyError, StoredReceipt, SubstateKey, TickId, Timeout, Transaction,
+    TransactionRoot, TxHash, TxOutcome, TxResolution, TxRootVerifyError, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp,
 };
 
 /// What one tick's batch produced.
@@ -818,49 +818,15 @@ pub enum ProtocolEvent {
         block_height: BlockHeight,
     },
 
-    /// The execution coordinator mirrored a core shard's refusal of a
-    /// transaction a leg here issued for, off its verified certificate.
-    /// The shard coordinator records it for the vote fence, which checks
-    /// a `Refused` abandonment record against exactly this, and re-drives
-    /// the votes that deferred for want of it.
-    RefusalObserved {
-        /// The refusing core shard.
-        shard: ShardId,
-        /// The transaction it refused.
-        tx_hash: TxHash,
-        /// The refusal as mirrored.
-        refusal: Refusal,
-    },
-
-    /// A state proof the chain committed proved a counterpart had not
-    /// taken a transaction a leg here issued for — a core's committed
-    /// cell absent past the deadline, a delivery's claim absent past the
-    /// lapse — folded by the execution coordinator at commit. The shard
-    /// coordinator records it for the vote fence, which checks an
-    /// `Unclaimed` or `Lapsed` abandonment record against exactly this,
-    /// and re-drives the votes that deferred for want of it.
-    AbsenceObserved {
-        /// The core shard that did not commit it.
-        shard: ShardId,
-        /// The transaction it did not commit.
-        tx_hash: TxHash,
-        /// The absence as proved.
-        absence: Absence,
-    },
-
-    /// A state proof the chain committed proved a consumer had claimed
-    /// a crossing a leg here issued for, folded by the execution
-    /// coordinator at commit. The shard coordinator records it for the
-    /// vote fence, which checks a `Claimed` record against exactly this,
-    /// and re-drives the votes that deferred for want of it.
-    ClaimObserved {
-        /// The consuming shard whose claim was proved.
-        shard: ShardId,
-        /// The transaction whose crossing it claimed.
-        tx_hash: TxHash,
-        /// The presence as proved.
-        presence: ClaimProof,
-    },
+    /// The execution coordinator wrote a counterpart's word into the
+    /// shared mirror the vote fence reads — a core's refusal off its
+    /// certificate, or an absence or a claim folded off a committed
+    /// state proof.
+    ///
+    /// It carries nothing: both sides read one mirror, so there is no
+    /// evidence to hand over. What it says is that a vote which deferred
+    /// for want of evidence may now stand, so the fence is re-driven.
+    CounterpartEvidenceObserved,
 
     /// A state proof fetched against a commit-proven remote header
     /// verified: it reconstructs the anchor's root and claims every key

@@ -17,14 +17,14 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_metrics::record_verdict_claim_deferred;
 use hyperscale_types::{
-    AbandonmentRecord, BlockHash, ClaimProof, CounterpartClaim, CounterpartEvidence, Epoch,
+    AbandonmentRecord, BlockHash, CounterpartClaim, CounterpartEvidence, CounterpartMirror, Epoch,
     FinalizationHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
-    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr, ProposerTimestamp, ProvenAnchor,
-    ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger, Resolutions,
-    ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StateProofBundle,
-    StoredReceipt, SubstateKey, TxClaim, TxOutcome, UnsettledTx, VerdictClaim, WeightedTimestamp,
-    WorkInFlight, derive_reshape_trigger, lapse_probe_ceiling, ready_signal_window,
-    settled_set_verdict, verdict_window_close,
+    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr, Probed, ProposerTimestamp,
+    ProvenAnchor, ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger,
+    Resolutions, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary,
+    StateProofBundle, StoredReceipt, SubstateKey, TxClaim, TxOutcome, UnsettledTx, VerdictClaim,
+    WeightedTimestamp, WorkInFlight, derive_reshape_trigger, lapse_probe_ceiling, licenses,
+    ready_signal_window, settled_set_verdict,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -92,29 +92,20 @@ use std::time::Duration;
 
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
-    Absence, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
-    BeaconWitnessRootVerifyError, Block, BlockHeader, BlockHeight, BlockManifest, BlockVote,
-    CertRootVerifyError, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
-    CommittedTip, Finalization, LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP,
-    MAX_VALIDITY_RANGE, PredecessorTerminal, ProvisionRootVerifyError, ProvisionTxRootsMap,
+    BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootVerifyError,
+    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError,
+    CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
+    LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, MAX_VALIDITY_RANGE,
+    PredecessorTerminal, ProvisionRootVerifyError, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext, QcVerifyError,
     QuorumCertificate, RecoveryCause, Refusal, Round, SafeVoteRegisters, StateRoot,
     StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, Transaction,
     TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier,
-    Verify, VoteCount, VotePosition, absence_licenses_reclaim, derive_leaves,
-    lapse_licenses_reclaim, lapse_probe_anchor, missed_proposals_since_prev_commit,
-    ready_leaf_payload, reclaim_probe_anchor, validity_end_of,
+    Verify, VoteCount, VotePosition, derive_leaves, missed_proposals_since_prev_commit,
+    ready_leaf_payload, validity_end_of,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
-
-/// The window an absence proof is held to, for one probed cell family:
-/// the anchor the proof must sit at or past, derived from the name's
-/// validity end, and the half-open licence read against the same end.
-type AbsenceWindow = (
-    fn(WeightedTimestamp) -> WeightedTimestamp,
-    fn(WeightedTimestamp, WeightedTimestamp) -> bool,
-);
 
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::block_sync::{
@@ -474,28 +465,15 @@ pub struct ShardCoordinator {
     /// only these, since a record naming a stranger would abandon — and
     /// charge, and reclaim — business the departed shard never had here.
     departure_parties: HashMap<ShardId, BTreeSet<TxHash>>,
-    /// Core shards' refusals of transactions legs here issued for, as
-    /// the execution coordinator mirrored them off verified
-    /// certificates. A `Refused` abandonment record is checked against
-    /// this and nothing else: equality on the anchor, and a voter holding
-    /// no mirror defers. Each lives to its transaction's horizon.
-    refusals: HashMap<(TxHash, ShardId), Refusal>,
-    /// Counterparts' proved absences of transactions legs here issued
-    /// for, as the execution coordinator folded them off the state
-    /// proofs the chain committed. An `Unclaimed` or `Lapsed`
-    /// abandonment record is checked against this and nothing else:
-    /// equality on the anchor, since every replica folds the same
-    /// committed proofs, and a voter that has not folded it defers.
-    /// Each lives to its transaction's horizon.
-    absences: HashMap<(TxHash, ShardId), Absence>,
-
-    /// The consumers' claims of crossings legs here issued for, as the
-    /// execution coordinator folded them off the state proofs the chain
-    /// committed. A `Claimed` record is checked against this and nothing
-    /// else: equality on the anchor, as an absence is, and a voter that
-    /// has not folded it defers. Each lives to its transaction's
-    /// horizon.
-    presences: HashMap<(TxHash, ShardId), ClaimProof>,
+    /// What counterparts have said about the transactions legs here
+    /// issued for, as the execution coordinator mirrored and folded
+    /// them: a core's refusal, a proved absence, a consumer's claim.
+    ///
+    /// A record's arm is checked against this and nothing else —
+    /// equality on the anchor — and a voter that does not hold the
+    /// evidence defers. One mirror rather than a copy, so a record
+    /// cannot pass here that its own composer would not have offered.
+    evidence: Arc<CounterpartMirror>,
 
     /// Commit-proven anchors of remote shards — the root and parent-QC
     /// clock each header carries — mirrored off `RemoteHeaderCommitted`
@@ -694,11 +672,9 @@ impl ShardCoordinator {
             chain_origin: recovered.chain_origin,
             precut: Precut::succeeding(recovered.predecessors),
             settled_sets: HashMap::new(),
-            presences: HashMap::new(),
+            evidence: Arc::new(CounterpartMirror::new()),
             proven_anchors: Arc::new(ProvenAnchors::new()),
             departure_parties: HashMap::new(),
-            refusals: HashMap::new(),
-            absences: HashMap::new(),
         }
     }
 
@@ -994,19 +970,6 @@ impl ShardCoordinator {
         self.departure_parties.insert(shard, parties);
     }
 
-    /// Record a core shard's refusal for the vote fence. First-write-wins:
-    /// a core refuses a transaction once, under one certificate.
-    pub fn record_refusal(&mut self, shard: ShardId, tx_hash: TxHash, refusal: Refusal) {
-        self.refusals.entry((tx_hash, shard)).or_insert(refusal);
-    }
-
-    /// Record a counterpart's proved absence for the vote fence.
-    /// First-write-wins, as the fold itself is: the first committed
-    /// proof to answer a cell is the answer every replica holds.
-    pub fn record_absence(&mut self, shard: ShardId, tx_hash: TxHash, absence: Absence) {
-        self.absences.entry((tx_hash, shard)).or_insert(absence);
-    }
-
     /// Mirror a commit-proven remote header for everything that asks
     /// whether this node has proven a counterpart's height.
     pub fn record_proven_anchor(
@@ -1019,18 +982,18 @@ impl ShardCoordinator {
         self.proven_anchors.record(shard, height, state_root, ts);
     }
 
+    /// The counterpart mirror the vote fence reads, for the execution
+    /// coordinator to write.
+    #[must_use]
+    pub const fn evidence(&self) -> &Arc<CounterpartMirror> {
+        &self.evidence
+    }
+
     /// The mirror, for the execution coordinator to read the same bytes
     /// this validator's vote fence reads.
     #[must_use]
     pub const fn proven_anchors(&self) -> &Arc<ProvenAnchors> {
         &self.proven_anchors
-    }
-
-    /// Mirror a consumer's claim of a crossing a leg here issued for,
-    /// proved present by a state proof the chain committed. First proof
-    /// wins, as the fold itself is.
-    pub fn record_presence(&mut self, shard: ShardId, tx_hash: TxHash, presence: ClaimProof) {
-        self.presences.entry((tx_hash, shard)).or_insert(presence);
     }
 
     /// Drop settled-transaction sets past their evidence window. Once the
@@ -1043,22 +1006,8 @@ impl ShardCoordinator {
             .retain(|shard, _| topology_schedule.terminal_evidence_readable(*shard, now));
         self.departure_parties
             .retain(|shard, _| topology_schedule.terminal_evidence_readable(*shard, now));
-        // A refusal lives as long as the leg entry it licenses a reclaim
-        // of: the transaction's deadline plus the room to commit the
-        // record, past which nothing is offered against it.
-        self.refusals
-            .retain(|_, refusal| now < verdict_window_close(refusal.deadline));
-        // An absence lives as long as the entry it licenses a reclaim of
-        // lives past its floor: the same room, measured from the
-        // deadline for a core's and from the lapse for a delivery's.
-        self.absences
-            .retain(|_, absence| now < verdict_window_close(absence.floor));
-        // A presence lives as long as the record it licenses the
-        // retirement of can still be read: to the claim cell's own
-        // sweep, past which nothing is offered against it.
-        self.presences.retain(|_, presence| {
-            now < lapse_probe_ceiling(validity_end_of(presence.probed_wt)).max(presence.probed_wt)
-        });
+        // What counterparts said is retired by the execution
+        // coordinator, against the ledger the evidence speaks for.
         // An anchor lives as long as a probe can be taken against it.
         // One retirement for both consumers, since there is one mirror.
         self.proven_anchors.retire_below(now);
@@ -1159,8 +1108,8 @@ impl ShardCoordinator {
             );
             return false;
         }
-        match self.refusals.get(&(verdict.tx_hash, verdict.shard)) {
-            Some(held) if mirrors(held, verdict) => true,
+        match self.evidence.refusal(verdict.tx_hash, verdict.shard) {
+            Some(held) if mirrors(&held, verdict) => true,
             Some(held) => {
                 warn!(
                     validator = ?self.me,
@@ -1437,26 +1386,15 @@ impl ShardCoordinator {
             // restates, so the voter needs no body to find them.
             CounterpartEvidence::Unclaimed { probed_wt } => {
                 for entry in verdict.unsettled() {
-                    if !self.absence_stands(
-                        verdict,
-                        entry,
-                        probed_wt,
-                        (reclaim_probe_anchor, absence_licenses_reclaim),
-                        block_hash,
-                    ) {
+                    if !self.absence_stands(verdict, entry, probed_wt, Probed::Core, block_hash) {
                         return false;
                     }
                 }
             }
             CounterpartEvidence::Lapsed { probed_wt } => {
                 for entry in verdict.unsettled() {
-                    if !self.absence_stands(
-                        verdict,
-                        entry,
-                        probed_wt,
-                        (lapse_probe_anchor, lapse_licenses_reclaim),
-                        block_hash,
-                    ) {
+                    if !self.absence_stands(verdict, entry, probed_wt, Probed::Delivery, block_hash)
+                    {
                         return false;
                     }
                 }
@@ -1485,11 +1423,11 @@ impl ShardCoordinator {
         verdict: &AbandonmentRecord,
         entry: &UnsettledTx,
         probed_wt: WeightedTimestamp,
-        (floor, licenses): AbsenceWindow,
+        probed: Probed,
         block_hash: BlockHash,
     ) -> bool {
         let validity_end = validity_end_of(entry.deadline);
-        if !licenses(probed_wt, validity_end) {
+        if !licenses(probed, probed_wt, validity_end) {
             warn!(
                 validator = ?self.me,
                 block_hash = ?block_hash,
@@ -1501,17 +1439,11 @@ impl ShardCoordinator {
             );
             return false;
         }
-        // The mirror is keyed by transaction and shard and not by what
-        // was probed, so the floor it carries is what says which cell
-        // it asked about: a core's committed cell proved absent is not
-        // a delivery's claim proved absent, whatever the anchor.
-        let proved = self
-            .absences
-            .get(&(entry.tx_hash, verdict.shard()))
-            .is_some_and(|absence| {
-                absence.floor == floor(validity_end) && absence.probed_wt == probed_wt
-            });
-        if !proved {
+        let folded = self
+            .evidence
+            .absence(entry.tx_hash, verdict.shard(), probed)
+            .is_some_and(|absence| absence.probed_wt == probed_wt);
+        if !folded {
             trace!(
                 validator = ?self.me,
                 block_hash = ?block_hash,
@@ -1535,7 +1467,7 @@ impl ShardCoordinator {
         refused_wt: WeightedTimestamp,
         block_hash: BlockHash,
     ) -> bool {
-        match self.refusals.get(&(entry.tx_hash, verdict.shard())) {
+        match self.evidence.refusal(entry.tx_hash, verdict.shard()) {
             Some(mirrored) if mirrored.refused_wt == refused_wt => true,
             Some(mirrored) => {
                 warn!(
@@ -1587,11 +1519,11 @@ impl ShardCoordinator {
             );
             return false;
         }
-        let proved = self
-            .presences
-            .get(&(entry.tx_hash, verdict.shard()))
+        let claimed = self
+            .evidence
+            .presence(entry.tx_hash, verdict.shard())
             .is_some_and(|presence| presence.probed_wt == probed_wt);
-        if !proved {
+        if !claimed {
             trace!(
                 validator = ?self.me,
                 block_hash = ?block_hash,
@@ -7654,10 +7586,10 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeaderParts,
-        CommittedTxsRoot, ConsensusSignature, Epoch, Hash, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
-        NetworkDefinition, NetworkParams, SettledTxsRoot, ShardAnchor, ShardId, Signer,
-        SignerBitfield, TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot,
+        Absence, AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeaderParts,
+        ClaimProof, CommittedTxsRoot, ConsensusSignature, Epoch, Hash, MAX_TIMESTAMP_DELAY,
+        MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, SettledTxsRoot, ShardAnchor, ShardId,
+        Signer, SignerBitfield, TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot,
         Transaction, TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet,
         VoteCount, WeightedTimestamp, WitnessSources, abandonment_root_from_records,
         reclaim_probe_anchor, test_utils,
@@ -12252,10 +12184,10 @@ mod tests {
             "a claim naming a certificate this voter has not heard defers",
         );
 
-        let mut coord = fence_coordinator();
-        coord.record_refusal(
-            peer,
+        let coord = fence_coordinator();
+        coord.evidence().record_refusal(
             tx_hash,
+            peer,
             Refusal {
                 refused_wt: anchor,
                 deadline: WeightedTimestamp::from_millis(9_000),
@@ -12548,17 +12480,19 @@ mod tests {
             digest: Hash::from_bytes(b"digest"),
         };
 
-        let mut matching = fence_coordinator();
-        matching.record_refusal(ShardId::ROOT, tx_hash, mirror(refused_wt));
+        let matching = fence_coordinator();
+        matching
+            .evidence()
+            .record_refusal(tx_hash, ShardId::ROOT, mirror(refused_wt));
         assert!(
             !matching.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
             "a matching mirror passes it"
         );
 
-        let mut mismatched = fence_coordinator();
-        mismatched.record_refusal(
-            ShardId::ROOT,
+        let mismatched = fence_coordinator();
+        mismatched.evidence().record_refusal(
             tx_hash,
+            ShardId::ROOT,
             mirror(WeightedTimestamp::from_millis(6_000)),
         );
         assert!(
@@ -12599,8 +12533,10 @@ mod tests {
             )
         };
 
-        let mut matching = fence_coordinator();
-        matching.record_absence(ShardId::ROOT, tx_hash, mirror(deadline));
+        let matching = fence_coordinator();
+        matching
+            .evidence()
+            .record_absence(tx_hash, ShardId::ROOT, Probed::Core, mirror(deadline));
         assert!(
             !matching.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
             "a proof at the deadline passes a record at the deadline"
@@ -12626,8 +12562,9 @@ mod tests {
             matching.fence_abandonment_records(&sched, &record(sweep), BlockHash::ZERO),
             "a record probed where the committed cell may be swept is refused"
         );
-        let mut late = fence_coordinator();
-        late.record_absence(ShardId::ROOT, tx_hash, mirror(sweep));
+        let late = fence_coordinator();
+        late.evidence()
+            .record_absence(tx_hash, ShardId::ROOT, Probed::Core, mirror(sweep));
         assert!(
             late.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
             "a mirror taken past the sweep proves nothing and defers"
@@ -12667,8 +12604,10 @@ mod tests {
             )
         };
 
-        let mut matching = fence_coordinator();
-        matching.record_absence(ShardId::ROOT, tx_hash, mirror(lapse));
+        let matching = fence_coordinator();
+        matching
+            .evidence()
+            .record_absence(tx_hash, ShardId::ROOT, Probed::Delivery, mirror(lapse));
         assert!(
             !matching.fence_abandonment_records(&sched, &record(lapse), BlockHash::ZERO),
             "a proof at the lapse passes a record at the lapse"
@@ -12686,10 +12625,11 @@ mod tests {
             "a lapse record anchored where the claim cell may be swept is refused"
         );
 
-        let mut short = fence_coordinator();
-        short.record_absence(
-            ShardId::ROOT,
+        let short = fence_coordinator();
+        short.evidence().record_absence(
             tx_hash,
+            ShardId::ROOT,
+            Probed::Delivery,
             Absence {
                 probed_wt: deadline,
                 floor: deadline,
@@ -12700,10 +12640,11 @@ mod tests {
             "a proof short of the lapse defers it"
         );
 
-        let mut cores = fence_coordinator();
-        cores.record_absence(
-            ShardId::ROOT,
+        let cores = fence_coordinator();
+        cores.evidence().record_absence(
             tx_hash,
+            ShardId::ROOT,
+            Probed::Core,
             Absence {
                 probed_wt: lapse,
                 floor: deadline,
@@ -12736,10 +12677,10 @@ mod tests {
             )
         };
 
-        let mut matching = fence_coordinator();
-        matching.record_presence(
-            ShardId::ROOT,
+        let matching = fence_coordinator();
+        matching.evidence().record_presence(
             figures.tx_hash,
+            ShardId::ROOT,
             ClaimProof {
                 probed_wt: figures.deadline,
             },

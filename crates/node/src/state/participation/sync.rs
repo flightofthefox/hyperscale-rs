@@ -75,39 +75,12 @@ impl ShardParticipation {
                 shard,
                 SettledTxSet { txs, terminal_wt },
             ),
-            // Evidence the execution coordinator mirrored about a
-            // transaction a leg here issued for — a core's refusal, a
-            // core's absence, a consumer's claim: the vote fence checks
-            // the matching record arm against exactly this mirror, so
-            // each is recorded and the votes that deferred without it
-            // re-driven.
-            ProtocolEvent::RefusalObserved {
-                shard,
-                tx_hash,
-                refusal,
-            } => {
-                self.shard_coordinator
-                    .record_refusal(shard, tx_hash, refusal);
-                self.redrive_fence(topology_schedule)
-            }
-            ProtocolEvent::AbsenceObserved {
-                shard,
-                tx_hash,
-                absence,
-            } => {
-                self.shard_coordinator
-                    .record_absence(shard, tx_hash, absence);
-                self.redrive_fence(topology_schedule)
-            }
-            ProtocolEvent::ClaimObserved {
-                shard,
-                tx_hash,
-                presence,
-            } => {
-                self.shard_coordinator
-                    .record_presence(shard, tx_hash, presence);
-                self.redrive_fence(topology_schedule)
-            }
+            // The execution coordinator wrote a counterpart's word into
+            // the mirror the vote fence reads. Nothing to record — both
+            // sides read one mirror — so all this does is re-drive the
+            // votes that deferred without it.
+            ProtocolEvent::CounterpartEvidenceObserved => self.redrive_fence(topology_schedule),
+
             // A state proof against a core's commit-proven header
             // verified: the execution coordinator reads its probes off
             // it and hands each absence on.

@@ -140,10 +140,10 @@ impl ShardParticipation {
             shard_config.clone(),
             recovered.clone(),
         );
-        // One mirror of the commit-proven remote anchors, owned by the
-        // shard coordinator: the vote fence and the certificate gate ask
-        // the same question of it, and two copies could answer
-        // differently.
+        // One mirror of the commit-proven remote anchors and one of what
+        // counterparts have said, both owned by the shard coordinator:
+        // the vote fence and the execution coordinator ask the same
+        // questions of them, and two copies could answer differently.
         let execution_coordinator = ExecutionCoordinator::with_shared_stores(
             me,
             local_shard,
@@ -151,6 +151,7 @@ impl ShardParticipation {
             exec_cert_store,
             finalization_store,
             Arc::clone(shard_coordinator.proven_anchors()),
+            Arc::clone(shard_coordinator.evidence()),
         );
         Self {
             local_shard,

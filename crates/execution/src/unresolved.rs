@@ -24,10 +24,9 @@ use std::sync::Arc;
 use hyperscale_engine::legs::{Classified, core_claims, delivered_claims};
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Absence, Address, BlockHeight, ClaimProof, CounterpartEvidence,
-    Finalization, LegEntry, LegEntryKind, LegEntryTaken, Refusal, ShardId, ShardTrie, StateAnchor,
+    Finalization, LegEntry, LegEntryKind, LegEntryTaken, Probed, ShardId, ShardTrie, StateAnchor,
     SubstateKey, Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable,
-    Verified, WeightedTimestamp, absence_licenses_reclaim, delivery_window_close,
-    lapse_licenses_reclaim, lapse_probe_ceiling, leg_entry_horizon, verdict_window_close,
+    Verified, WeightedTimestamp, delivery_window_close, leg_entry_horizon, verdict_window_close,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -42,20 +41,6 @@ pub struct Abandonable {
     pub declared_work: u64,
     /// The burn to settle, on the shard holding the vault it names.
     pub charge: AbortCharge,
-}
-
-/// Which counterpart a probe asks, and so which record its absence is
-/// offered as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Probed {
-    /// A core's committed cell, past the transaction's deadline.
-    Core,
-    /// A delivering shard's claim cell, past the crossing's lapse.
-    Delivery,
-    /// A core consumer's claim cell, past the transaction's deadline:
-    /// present says the core took the crossing, and the record here is
-    /// retired on it; absent says only that it has not yet.
-    Claim,
 }
 
 /// What this shard has asked a silent counterpart about one transaction:
@@ -91,20 +76,6 @@ pub enum Answer {
     /// The consumer's claim is present: what a `Claimed` record is
     /// offered from, licensing the retirement of the record here.
     Present(ClaimProof),
-}
-
-/// Whether an answer taken at `probed_wt` says anything about the
-/// question `probed` asks of a transaction ending at `validity_end`.
-pub fn licenses(
-    probed: Probed,
-    probed_wt: WeightedTimestamp,
-    validity_end: WeightedTimestamp,
-) -> bool {
-    match probed {
-        Probed::Core => absence_licenses_reclaim(probed_wt, validity_end),
-        Probed::Delivery => lapse_licenses_reclaim(probed_wt, validity_end),
-        Probed::Claim => probed_wt < lapse_probe_ceiling(validity_end),
-    }
 }
 
 /// Let go of every fetch `owed` still has out, so a counterpart that
@@ -206,12 +177,16 @@ struct Owed {
     heard: Heard,
 }
 
-/// What the counterparts of one transaction have said about it.
+/// What this coordinator holds of its own about one transaction's
+/// counterparts.
+///
+/// What a counterpart *said* is not here: a refusal, an absence and a
+/// claim are each asked about by the vote fence too, so they live in the
+/// [`CounterpartMirror`] both consumers read. What is here is this
+/// coordinator's own working state around them — who has answered, what
+/// it has asked, and which questions are closed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Heard {
-    /// Core shards' refusals, by shard, first one winning: what a
-    /// `Refused` record is offered from.
-    refusals: BTreeMap<ShardId, Refusal>,
     /// The core shards whose certificates accepted it. A core shard's
     /// tick closes on every other core shard's certificate, so one
     /// saying it succeeded is not the transaction accepted — that is
@@ -220,9 +195,10 @@ struct Heard {
     /// What this validator has asked a silent counterpart, by cell: its
     /// own fetch and nothing more, so one header is asked once.
     probes: BTreeMap<(ShardId, Probed), Probe>,
-    /// What the proofs the chain committed said about those cells,
-    /// folded by every replica at the same height, first proof winning.
-    answers: BTreeMap<(ShardId, Probed), Answer>,
+    /// The cells the chain has answered, whichever way. A closed
+    /// question is never asked again, and what the answer *was* is the
+    /// mirror's to say.
+    answered: BTreeSet<(ShardId, Probed)>,
 }
 
 /// What a tick of this shard's composed over a leg entry's records.
@@ -710,27 +686,12 @@ impl UnresolvedTxs {
             })
     }
 
-    /// Mirror a core shard's refusal of a transaction a leg here issued
-    /// for, off the certificate carrying it.
-    ///
-    /// First write wins: a second certificate for one `(transaction,
-    /// shard)` restates a decision already held. `false` says the
-    /// refusal was already known, or that no leg entry names the shard
-    /// as a core — nothing else is a counterpart whose refusal counts.
-    pub fn record_refusal(&mut self, tx_hash: TxHash, shard: ShardId, refusal: Refusal) -> bool {
-        if !self
-            .leg_core(tx_hash)
+    /// Whether `shard` is one of the transaction's core — whose refusal
+    /// is the transaction's, and whose word is worth mirroring at all.
+    #[must_use]
+    pub fn core_holds(&self, tx_hash: TxHash, shard: ShardId) -> bool {
+        self.leg_core(tx_hash)
             .is_some_and(|core| core.contains(&shard))
-        {
-            return false;
-        }
-        self.owed.get_mut(&tx_hash).is_some_and(|owed| {
-            let vacant = !owed.heard.refusals.contains_key(&shard);
-            if vacant {
-                owed.heard.refusals.insert(shard, refusal);
-            }
-            vacant
-        })
     }
 
     /// Mirror a core shard's acceptance, and say whether it was the last
@@ -752,27 +713,6 @@ impl UnresolvedTxs {
         })
     }
 
-    /// Every mirrored refusal this ledger holds, with the transaction
-    /// and the core shard that made it.
-    pub fn refusals(&self) -> impl Iterator<Item = (TxHash, ShardId, Refusal)> + '_ {
-        self.owed.iter().flat_map(|(&tx_hash, owed)| {
-            owed.heard
-                .refusals
-                .iter()
-                .map(move |(&shard, &refusal)| (tx_hash, shard, refusal))
-        })
-    }
-
-    /// A mirrored refusal of `tx_hash` by `shard`, if one is held.
-    #[cfg(test)]
-    #[must_use]
-    pub fn refusal(&self, tx_hash: TxHash, shard: ShardId) -> Option<Refusal> {
-        self.owed
-            .get(&tx_hash)
-            .and_then(|owed| owed.heard.refusals.get(&shard))
-            .copied()
-    }
-
     /// Whether the chain has already answered what `probed` asks of
     /// `shard` about `tx_hash`. An answered question is never asked
     /// again.
@@ -780,7 +720,7 @@ impl UnresolvedTxs {
     pub fn answered(&self, tx_hash: TxHash, shard: ShardId, probed: Probed) -> bool {
         self.owed
             .get(&tx_hash)
-            .is_some_and(|owed| owed.heard.answers.contains_key(&(shard, probed)))
+            .is_some_and(|owed| owed.heard.answered.contains(&(shard, probed)))
     }
 
     /// Whether a probe of that cell is already out, or already answered
@@ -837,18 +777,12 @@ impl UnresolvedTxs {
         (answered, anchor_ts)
     }
 
-    /// Fold what a committed proof said about one cell, releasing any
-    /// fetch of this validator's still out for it.
+    /// Close the question `probed` asks of `shard` about `tx_hash`,
+    /// releasing any fetch of this validator's still out for it.
     ///
     /// First proof wins: `false` says the cell was already answered, and
     /// a later proof adds nothing.
-    pub fn record_answer(
-        &mut self,
-        tx_hash: TxHash,
-        shard: ShardId,
-        probed: Probed,
-        answer: Answer,
-    ) -> bool {
+    pub fn close_question(&mut self, tx_hash: TxHash, shard: ShardId, probed: Probed) -> bool {
         let Some(owed) = self.owed.get_mut(&tx_hash) else {
             return false;
         };
@@ -857,45 +791,12 @@ impl UnresolvedTxs {
         {
             self.released_fetches.push((probe.anchor, probe.key));
         }
-        let owed = &mut self.owed.get_mut(&tx_hash).expect("held above").heard;
-        if owed.answers.contains_key(&(shard, probed)) {
-            return false;
-        }
-        owed.answers.insert((shard, probed), answer);
-        true
-    }
-
-    /// Every absence the chain has proved of the kind `probed` asks,
-    /// with the transaction and the counterpart it was proved of.
-    pub fn absences(
-        &self,
-        probed: Probed,
-    ) -> impl Iterator<Item = (TxHash, ShardId, Absence)> + '_ {
-        self.answers()
-            .filter_map(move |(tx_hash, shard, kind, answer)| match answer {
-                Answer::Absent(absence) if kind == probed => Some((tx_hash, shard, absence)),
-                Answer::Absent(_) | Answer::Committed | Answer::Present(_) => None,
-            })
-    }
-
-    /// Every consumer's claim the chain has proved of a crossing a leg
-    /// here issued.
-    pub fn claims(&self) -> impl Iterator<Item = (TxHash, ShardId, ClaimProof)> + '_ {
-        self.answers()
-            .filter_map(|(tx_hash, shard, _, answer)| match answer {
-                Answer::Present(presence) => Some((tx_hash, shard, presence)),
-                Answer::Absent(_) | Answer::Committed => None,
-            })
-    }
-
-    /// Every answer this ledger holds, with the cell it speaks for.
-    fn answers(&self) -> impl Iterator<Item = (TxHash, ShardId, Probed, Answer)> + '_ {
-        self.owed.iter().flat_map(|(&tx_hash, owed)| {
-            owed.heard
-                .answers
-                .iter()
-                .map(move |(&(shard, probed), &answer)| (tx_hash, shard, probed, answer))
-        })
+        self.owed
+            .get_mut(&tx_hash)
+            .expect("held above")
+            .heard
+            .answered
+            .insert((shard, probed))
     }
 
     /// The fetches the ledger has let go since this was last asked.

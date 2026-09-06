@@ -197,6 +197,35 @@ pub fn absence_licenses_reclaim(
     probe_wt >= reclaim_probe_anchor(validity_end) && probe_wt < absence_probe_ceiling(validity_end)
 }
 
+/// Which counterpart a probe asks, and so which record its absence is
+/// offered as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Probed {
+    /// A core's committed cell, past the transaction's deadline.
+    Core,
+    /// A delivering shard's claim cell, past the crossing's lapse.
+    Delivery,
+    /// A core consumer's claim cell, past the transaction's deadline:
+    /// present says the core took the crossing, and the record here is
+    /// retired on it; absent says only that it has not yet.
+    Claim,
+}
+
+/// Whether an answer taken at `probed_wt` says anything about the
+/// question `probed` asks of a transaction ending at `validity_end`.
+#[must_use]
+pub fn licenses(
+    probed: Probed,
+    probed_wt: WeightedTimestamp,
+    validity_end: WeightedTimestamp,
+) -> bool {
+    match probed {
+        Probed::Core => absence_licenses_reclaim(probed_wt, validity_end),
+        Probed::Delivery => lapse_licenses_reclaim(probed_wt, validity_end),
+        Probed::Claim => probed_wt < lapse_probe_ceiling(validity_end),
+    }
+}
+
 /// The moment past which a delivery of a transaction's outbound value
 /// is no longer admissible: its validity end plus [`MAX_VALIDITY_RANGE`].
 ///

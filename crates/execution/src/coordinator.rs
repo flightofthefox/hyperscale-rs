@@ -49,17 +49,17 @@ use hyperscale_metrics::{
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
 use hyperscale_types::{
     AbandonmentRecord, Absence, Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader,
-    BlockHeight, BloomFilter, CertifiedBlock, ClaimProof, CounterpartClaim, DeclaredKey,
-    Derivation, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome,
-    ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
-    Hash, Inclusion, LegEntry, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Mode, ProvenAnchors, Provisions, Refusal,
-    ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateAnchor,
-    StateProofBundle, StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution, UnsettledTx,
-    ValidatorId, VerdictClaim, Verifiable, Verified, WeightedTimestamp, claim_readable_at,
-    derive_block_transactions, lapse_probe_anchor, reclaim_probe_anchor, settled_set_verdict,
-    tick_leader, tick_leader_at,
+    BlockHeight, BloomFilter, CertifiedBlock, ClaimProof, CounterpartClaim, CounterpartMirror,
+    DeclaredKey, Derivation, ExecutionCertificate, ExecutionCertificateVerifyError,
+    ExecutionOutcome, ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError,
+    GlobalReceiptRoot, Hash, Inclusion, LegEntry, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
+    MAX_PROVISIONS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Mode, Probed,
+    ProvenAnchors, Provisions, Refusal, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
+    ShardTrie, StateAnchor, StateProofBundle, StoredReceipt, SubstateKey, TickId, TopologySchedule,
+    TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution,
+    UnsettledTx, ValidatorId, VerdictClaim, Verifiable, Verified, WeightedTimestamp,
+    claim_readable_at, derive_block_transactions, lapse_probe_anchor, licenses,
+    reclaim_probe_anchor, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::CrossingCell;
 use tracing::instrument;
@@ -79,8 +79,7 @@ use crate::provisioning::{ProvisioningTracker, Requirement, divided_requirements
 use crate::tick_state::{Admission, Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
 use crate::unresolved::{
-    Abandonable, Answer, Probe, Probeable, Probed, Reclaimable, Retirable, Unanswerable,
-    UnresolvedTxs, licenses,
+    Abandonable, Answer, Probe, Probeable, Reclaimable, Retirable, Unanswerable, UnresolvedTxs,
 };
 use crate::vote_tracker::VoteTracker;
 
@@ -502,6 +501,16 @@ pub struct ExecutionCoordinator {
     // ═══════════════════════════════════════════════════════════════════════
     // Commit-proof gate
     // ═══════════════════════════════════════════════════════════════════════
+    /// What counterparts have said about the transactions legs here
+    /// issued for, shared with the shard coordinator's vote fence: a
+    /// core's refusal, a proved absence, a consumer's claim. This
+    /// coordinator is the only writer, and the only one that says what
+    /// to drop — the ledger below is what an entry there speaks for.
+    ///
+    /// One mirror, because the fence checks a record against exactly
+    /// what was offered from, and two copies could answer differently.
+    evidence: Arc<CounterpartMirror>,
+
     /// Commit-proven remote source blocks, shared with the shard
     /// coordinator, which owns the mirror and feeds it off
     /// `RemoteHeaderCommitted`.
@@ -571,6 +580,7 @@ impl ExecutionCoordinator {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
+            Arc::new(CounterpartMirror::new()),
         )
     }
 
@@ -603,6 +613,7 @@ impl ExecutionCoordinator {
         exec_certs: Arc<ExecCertStore>,
         finalized: Arc<FinalizationStore>,
         proven_anchors: Arc<ProvenAnchors>,
+        evidence: Arc<CounterpartMirror>,
     ) -> Self {
         // Execution resumes below the first block it replays, so the
         // replay carries the frontier up to the tip rather than starting
@@ -629,6 +640,7 @@ impl ExecutionCoordinator {
         };
         Self {
             proven_anchors,
+            evidence,
             finalized,
             committed_height,
             committed_ts: committed_block_anchor_wt,
@@ -2512,6 +2524,13 @@ impl ExecutionCoordinator {
     // Expected Execution Certificate Tracking
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /// The counterpart mirror this coordinator writes, for the vote
+    /// fence to read.
+    #[must_use]
+    pub const fn evidence(&self) -> &Arc<CounterpartMirror> {
+        &self.evidence
+    }
+
     /// The shared mirror of commit-proven remote anchors, which the shard
     /// coordinator owns and fills.
     #[must_use]
@@ -2768,11 +2787,19 @@ impl ExecutionCoordinator {
                     };
                     // The question is answered, and a fetch still out
                     // for it is released with it.
-                    if !self
-                        .unresolved
-                        .record_answer(entry.tx_hash, shard, probed, answer)
-                    {
+                    if !self.unresolved.close_question(entry.tx_hash, shard, probed) {
                         continue;
+                    }
+                    match answer {
+                        Answer::Committed => {}
+                        Answer::Absent(absence) => {
+                            self.evidence
+                                .record_absence(entry.tx_hash, shard, probed, absence);
+                        }
+                        Answer::Present(presence) => {
+                            self.evidence
+                                .record_presence(entry.tx_hash, shard, presence);
+                        }
                     }
                     record_reclaim_probe_answered(inclusion.is_present());
                     let tx_hash = entry.tx_hash;
@@ -2786,19 +2813,8 @@ impl ExecutionCoordinator {
                             preferred: None,
                             class: None,
                         }),
-                        Answer::Present(presence) => {
-                            Action::Continuation(ProtocolEvent::ClaimObserved {
-                                shard,
-                                tx_hash,
-                                presence,
-                            })
-                        }
-                        Answer::Absent(absence) => {
-                            Action::Continuation(ProtocolEvent::AbsenceObserved {
-                                shard,
-                                tx_hash,
-                                absence,
-                            })
+                        Answer::Present(_) | Answer::Absent(_) => {
+                            Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
                         }
                     });
                 }
@@ -2817,7 +2833,7 @@ impl ExecutionCoordinator {
     /// First write wins, as the fold itself is — a second claim for one
     /// `(transaction, shard)` restates a decision that is already the
     /// chain's.
-    fn fold_verdict(&mut self, verdict: &VerdictClaim) -> Vec<Action> {
+    fn fold_verdict(&self, verdict: &VerdictClaim) -> Vec<Action> {
         if verdict.shard == self.local_shard || !verdict.refuses() {
             return Vec::new();
         }
@@ -2830,9 +2846,10 @@ impl ExecutionCoordinator {
             decision: verdict.decision,
             digest: verdict.digest,
         };
-        if !self
-            .unresolved
-            .record_refusal(verdict.tx_hash, verdict.shard, refusal)
+        if !self.unresolved.core_holds(verdict.tx_hash, verdict.shard)
+            || !self
+                .evidence
+                .record_refusal(verdict.tx_hash, verdict.shard, refusal)
         {
             return Vec::new();
         }
@@ -2842,11 +2859,7 @@ impl ExecutionCoordinator {
             TransactionDecision::Reject
         };
         vec![
-            Action::Continuation(ProtocolEvent::RefusalObserved {
-                shard: verdict.shard,
-                tx_hash: verdict.tx_hash,
-                refusal,
-            }),
+            Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved),
             Action::Continuation(ProtocolEvent::TransactionsResolved {
                 resolutions: vec![(verdict.tx_hash, TxResolution::CoreDecided(decision))],
             }),
@@ -2869,15 +2882,19 @@ impl ExecutionCoordinator {
     #[must_use]
     pub fn pending_state_proofs(&self) -> Vec<CounterpartClaim> {
         let proofs = self.fetched.keys().cloned().map(CounterpartClaim::Cells);
-        let verdicts = self.unresolved.refusals().map(|(tx_hash, shard, refusal)| {
-            CounterpartClaim::Verdict(VerdictClaim {
-                shard,
-                tx_hash,
-                anchor_ts: refusal.refused_wt,
-                decision: refusal.decision,
-                digest: refusal.digest,
-            })
-        });
+        let verdicts = self
+            .evidence
+            .refusals()
+            .into_iter()
+            .map(|(tx_hash, shard, refusal)| {
+                CounterpartClaim::Verdict(VerdictClaim {
+                    shard,
+                    tx_hash,
+                    anchor_ts: refusal.refused_wt,
+                    decision: refusal.decision,
+                    digest: refusal.digest,
+                })
+            });
         proofs
             .chain(verdicts)
             .take(MAX_PROVISIONS_PER_BLOCK)
@@ -2919,6 +2936,11 @@ impl ExecutionCoordinator {
         let unresolved = &self.unresolved;
         self.fetched
             .retain(|_, answered| answered.iter().any(|tx_hash| unresolved.contains(*tx_hash)));
+        // The one retention rule for what counterparts said: an entry
+        // there speaks for a transaction this ledger still owes an
+        // outcome for, and the ledger is here.
+        self.evidence
+            .retain(&|tx_hash| unresolved.contains(tx_hash));
         let ids = self.unresolved.take_released_fetches();
         if ids.is_empty() {
             Vec::new()
@@ -3548,8 +3570,9 @@ impl ExecutionCoordinator {
         // first, because a record spanning two anchors satisfies the
         // fence's equality check for neither.
         let refused = self
-            .unresolved
+            .evidence
             .refusals()
+            .into_iter()
             .map(|(tx_hash, shard, refusal)| (tx_hash, shard, refusal.refused_wt));
         self.offer_at_earliest_anchor(
             &mut records,
@@ -3569,8 +3592,9 @@ impl ExecutionCoordinator {
             (Probed::Delivery, AbandonmentRecord::lapsed),
         ] {
             let absent = self
-                .unresolved
+                .evidence
                 .absences(probed)
+                .into_iter()
                 .map(|(tx_hash, shard, absence)| (tx_hash, shard, absence.probed_wt));
             self.offer_at_earliest_anchor(&mut records, &mut budget, absent, record);
         }
@@ -3579,8 +3603,9 @@ impl ExecutionCoordinator {
         // at, licensing the record's retirement rather than a reclaim.
         if CLAIMED_RECORDS_OFFERED {
             let claimed = self
-                .unresolved
-                .claims()
+                .evidence
+                .presences()
+                .into_iter()
                 .map(|(tx_hash, shard, presence)| (tx_hash, shard, presence.probed_wt));
             self.offer_at_earliest_anchor(
                 &mut records,
@@ -3937,12 +3962,10 @@ impl ExecutionCoordinator {
                 decision,
                 digest: ec.attested_digest(),
             };
-            if self.unresolved.record_refusal(tx_hash, shard, refusal) {
-                actions.push(Action::Continuation(ProtocolEvent::RefusalObserved {
-                    shard,
-                    tx_hash,
-                    refusal,
-                }));
+            if self.evidence.record_refusal(tx_hash, shard, refusal) {
+                actions.push(Action::Continuation(
+                    ProtocolEvent::CounterpartEvidenceObserved,
+                ));
                 resolutions.push((tx_hash, TxResolution::CoreDecided(decision)));
             }
         }
@@ -7163,6 +7186,7 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
+            Arc::new(CounterpartMirror::new()),
         );
 
         // The first post-restart commit extends the tip and dates itself
@@ -7800,6 +7824,7 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
+            Arc::new(CounterpartMirror::new()),
         );
 
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
@@ -7860,6 +7885,7 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
+            Arc::new(CounterpartMirror::new()),
         );
         assert!(
             restarted.candidates.is_empty(),
@@ -8138,7 +8164,7 @@ mod tests {
         );
         state.unresolved.certify(tx_hash);
         assert!(
-            state.unresolved.refusals().next().is_none(),
+            state.evidence.refusals().is_empty(),
             "nothing was broadcast to this replica"
         );
 
@@ -8154,7 +8180,7 @@ mod tests {
         let actions = state.fold_verdict(&verdict);
 
         assert_eq!(
-            state.unresolved.refusal(tx_hash, PEER),
+            state.evidence.refusal(tx_hash, PEER),
             Some(Refusal {
                 refused_wt: anchor,
                 deadline: UnsettledTx::for_transaction(&transaction).deadline,
@@ -8166,8 +8192,7 @@ mod tests {
         assert!(
             actions.iter().any(|action| matches!(
                 action,
-                Action::Continuation(ProtocolEvent::RefusalObserved { shard, .. })
-                    if *shard == PEER
+                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
             )),
             "and the vote fence is told, as a broadcast would have told it: {actions:?}",
         );
@@ -8181,7 +8206,7 @@ mod tests {
         assert!(again.is_empty(), "{again:?}");
         assert_eq!(
             state
-                .unresolved
+                .evidence
                 .refusal(tx_hash, PEER)
                 .map(|held| held.refused_wt),
             Some(anchor),
@@ -8203,7 +8228,7 @@ mod tests {
                 })
                 .is_empty(),
         );
-        assert!(fresh.unresolved.refusals().next().is_none());
+        assert!(fresh.evidence.refusals().is_empty());
     }
 
     /// A core's refusal of a transaction a leg here issued for is
@@ -8244,23 +8269,23 @@ mod tests {
             )))
         };
         let actions = state.handle_attestation(&schedule, &certificate(ExecutionOutcome::Failed));
-        let observed = actions.iter().find_map(|action| match action {
-            Action::Continuation(ProtocolEvent::RefusalObserved {
-                shard,
-                tx_hash: observed,
-                refusal,
-            }) if *shard == PEER && *observed == tx_hash => Some(*refusal),
-            _ => None,
-        });
+        let mirrored = state.evidence.refusal(tx_hash, PEER);
         assert_eq!(
-            observed,
+            mirrored,
             Some(Refusal {
                 refused_wt: WeightedTimestamp::from_millis(7_000),
                 deadline: UnsettledTx::for_transaction(&transaction).deadline,
                 decision: TransactionDecision::Reject,
-                digest: observed.expect("observed above").digest,
+                digest: mirrored.expect("mirrored above").digest,
             }),
-            "the refusal reaches the vote fence"
+            "the refusal reaches the mirror the vote fence reads"
+        );
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
+            )),
+            "and the fence is told to re-drive the votes that deferred without it"
         );
         assert_eq!(
             state.pending_abandonment_records(),
@@ -8331,7 +8356,7 @@ mod tests {
         assert!(
             !actions.iter().any(|action| matches!(
                 action,
-                Action::Continuation(ProtocolEvent::RefusalObserved { .. })
+                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
             )),
             "a success is not a refusal"
         );
@@ -8470,24 +8495,21 @@ mod tests {
     }
 
     /// The absences of `tx_hash` at [`PEER`] handed to the fence among
-    /// `actions`.
-    fn absences_observed(actions: &[Action], tx_hash: TxHash) -> Vec<Absence> {
-        absences_observed_at(actions, PEER, tx_hash)
+    /// mirror.
+    fn absences_observed(state: &ExecutionCoordinator, tx_hash: TxHash) -> Vec<Absence> {
+        absences_observed_at(state, PEER, tx_hash)
     }
 
-    /// The absences of `tx_hash` at `at` handed to the fence among
-    /// `actions`.
-    fn absences_observed_at(actions: &[Action], at: ShardId, tx_hash: TxHash) -> Vec<Absence> {
-        actions
-            .iter()
-            .filter_map(|action| match action {
-                Action::Continuation(ProtocolEvent::AbsenceObserved {
-                    shard,
-                    tx_hash: named,
-                    absence,
-                }) if *shard == at && *named == tx_hash => Some(*absence),
-                _ => None,
-            })
+    /// The absences of `tx_hash` at `at` the mirror holds, whichever
+    /// question proved them.
+    fn absences_observed_at(
+        state: &ExecutionCoordinator,
+        at: ShardId,
+        tx_hash: TxHash,
+    ) -> Vec<Absence> {
+        [Probed::Core, Probed::Delivery, Probed::Claim]
+            .into_iter()
+            .filter_map(|probed| state.evidence.absence(tx_hash, at, probed))
             .collect()
     }
 
@@ -8545,9 +8567,9 @@ mod tests {
             "the newest header inside the lapse window is the anchor, and the claim cell the key"
         );
 
-        let folded = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
+        let _ = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert_eq!(
-            absences_observed(&folded, tx_hash),
+            absences_observed(&state, tx_hash),
             vec![Absence {
                 probed_wt: later,
                 floor: lapse
@@ -8654,6 +8676,7 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
+            Arc::new(CounterpartMirror::new()),
         );
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
 
@@ -8829,9 +8852,9 @@ mod tests {
             "the shard that was to deliver is asked wherever it has a header past the lapse"
         );
 
-        let folded = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
+        let _ = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert_eq!(
-            absences_observed_at(&folded, successor, tx_hash),
+            absences_observed_at(&state, successor, tx_hash),
             vec![Absence {
                 probed_wt: later,
                 floor: lapse
@@ -8933,9 +8956,9 @@ mod tests {
             &[],
             &[key],
         );
-        let ignored = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![early]);
+        let _ = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![early]);
         assert!(
-            absences_observed(&ignored, tx_hash).is_empty(),
+            absences_observed(&state, tx_hash).is_empty(),
             "a proof taken before the deadline says nothing: the core may still commit"
         );
 
@@ -8946,13 +8969,20 @@ mod tests {
             deadline.as_millis(),
             vec![bundle.clone()],
         );
+        assert!(
+            folded.iter().any(|action| matches!(
+                action,
+                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
+            )),
+            "the fence is told the absence landed"
+        );
         assert_eq!(
-            absences_observed(&folded, tx_hash),
+            absences_observed(&state, tx_hash),
             vec![Absence {
                 probed_wt: later,
                 floor: deadline
             }],
-            "the absence reaches the vote fence"
+            "the absence reaches the mirror the vote fence reads"
         );
         assert_eq!(
             state.pending_abandonment_records(),
@@ -8962,7 +8992,10 @@ mod tests {
 
         let again = commit_carrying(&mut state, &schedule, 3, deadline.as_millis(), vec![bundle]);
         assert!(
-            absences_observed(&again, tx_hash).is_empty(),
+            !again.iter().any(|action| matches!(
+                action,
+                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
+            )),
             "a second copy adds nothing"
         );
     }
@@ -8993,7 +9026,7 @@ mod tests {
 
         let folded = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert!(
-            absences_observed(&folded, tx_hash).is_empty(),
+            absences_observed(&state, tx_hash).is_empty(),
             "a core that committed it is not absent"
         );
         assert!(
@@ -9079,7 +9112,7 @@ mod tests {
         assert!(
             !folded.iter().any(|action| matches!(
                 action,
-                Action::Continuation(ProtocolEvent::ClaimObserved { .. })
+                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
             )),
             "an absent claim proves nothing"
         );
@@ -9151,10 +9184,12 @@ mod tests {
         assert!(
             folded.iter().any(|action| matches!(
                 action,
-                Action::Continuation(ProtocolEvent::ClaimObserved { shard, tx_hash: observed, presence })
-                    if *shard == PEER && *observed == tx_hash && presence.probed_wt == probed_wt
-            )),
-            "a present claim reaches the vote fence"
+                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
+            )) && state
+                .evidence
+                .presence(tx_hash, PEER)
+                .is_some_and(|presence| presence.probed_wt == probed_wt),
+            "a present claim reaches the mirror the vote fence reads"
         );
         assert!(
             state.pending_abandonment_records().is_empty(),

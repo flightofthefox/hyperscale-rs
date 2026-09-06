@@ -155,6 +155,7 @@ pub use shard::claim::{CounterpartClaim, VerdictClaim};
 pub use shard::commit_proof::{
     CommitProof, CommitProofVerifyError, MAX_COMMIT_PROOF_ANCESTRY, ResolvedCommittee,
 };
+pub use shard::counterpart_mirror::CounterpartMirror;
 pub use shard::evidence::{
     ShardForkProof, ShardForkProofVerifyError, ShardVoteEquivocation, ShardVoteEquivocationContext,
     ShardVoteEquivocationVerifyError, verify_shard_vote_equivocation,
@@ -220,11 +221,11 @@ pub use time::range::{MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, Timestam
 pub use time::stopwatch::Stopwatch;
 pub use time::timeouts::{
     DEDUP_WINDOW, EPOCH_DURATION, LEG_ENTRY_HORIZON, MAX_FINALIZATION_DELAY, MAX_PROGRESS_WAIT,
-    RATIFY_ROUND_TIMEOUT, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, SKIP_TIMEOUT,
+    Probed, RATIFY_ROUND_TIMEOUT, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, SKIP_TIMEOUT,
     VIEW_CHANGE_TIMEOUT, VIEW_CHANGE_TIMEOUT_INCREMENT, VIEW_CHANGE_TIMEOUT_MAX,
     absence_licenses_reclaim, absence_probe_ceiling, claim_readable_at, delivery_admissible,
     delivery_window_close, lapse_licenses_reclaim, lapse_probe_anchor, lapse_probe_ceiling,
-    leg_entry_horizon, reclaim_probe_anchor, validity_end_of, verdict_window_close,
+    leg_entry_horizon, licenses, reclaim_probe_anchor, validity_end_of, verdict_window_close,
 };
 pub use time::timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
 pub use topology::awaiting::AwaitingTopologyBuffer;

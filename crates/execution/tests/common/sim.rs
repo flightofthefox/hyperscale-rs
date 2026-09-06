@@ -41,12 +41,13 @@ use hyperscale_storage::{
 use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, certify, make_live_block};
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, CertifiedBlock,
-    ConsensusReceipt, DeclaredRange, EventRoot, ExecutionCertificate, ExecutionMetadata,
-    ExecutionOutcome, Finalization, GlobalReceipt, LocalKey, MerkleInclusionProof, Movement,
-    ProvenAnchors, ProvisionEntry, Provisions, ResourceAddr, SettledWrites, ShardId, ShardTrie,
-    SignerBitfield, StateRoot, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp, compute_global_receipt_root, read_amount,
+    ConsensusReceipt, CounterpartMirror, DeclaredRange, EventRoot, ExecutionCertificate,
+    ExecutionMetadata, ExecutionOutcome, Finalization, GlobalReceipt, LocalKey,
+    MerkleInclusionProof, Movement, ProvenAnchors, ProvisionEntry, Provisions, ResourceAddr,
+    SettledWrites, ShardId, ShardTrie, SignerBitfield, StateRoot, StateWrites, StoredReceipt,
+    SubstateKey, TickHalf, TickId, TopologySchedule, TopologySnapshot, Transaction, TxHash,
+    TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp, compute_global_receipt_root,
+    read_amount,
 };
 use hyperscale_vm_types::CollectionId;
 
@@ -529,6 +530,7 @@ impl ExecutionSim {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
+            Arc::new(CounterpartMirror::new()),
         );
         self.chain = Arc::new(TickChain::new(Arc::clone(&self.base)));
         self.pending.clear();
