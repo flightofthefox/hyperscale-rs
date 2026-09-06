@@ -12,10 +12,7 @@ use hyperscale_effects_bridge::{
 use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
 };
-use hyperscale_engine::legs::{
-    Classified, Member, PlanDefect, Runs, Side, core_shards, crossings_of, plan_for_shard,
-    records_to_reclaim, records_to_retire,
-};
+use hyperscale_engine::legs::{Classified, Member, PlanDefect, Runs, Side};
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PreviewGrants, PreviewInputs, PreviewOutcome,
@@ -1243,23 +1240,18 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
     derived_through(&executor, std::slice::from_ref(&tx));
     let divided = Classified::freeze(tx.legs(), tx.owners(), &trie);
     assert!(divided.decomposed().holds(), "a transfer decomposes");
-    assert_eq!(core_shards(tx.legs(), &trie), BTreeSet::from([near_shard]));
+    assert_eq!(divided.core(), &BTreeSet::from([near_shard]));
 
-    let edges = crossings_of(tx.legs(), tx.crossings(), &divided);
+    let edges = divided.shape(tx.legs(), tx.crossings()).edges();
     assert_eq!(edges.len(), 1, "one value edge crosses");
     let edge = &edges[0];
     assert_eq!(edge.from, near_shard);
     assert_eq!(edge.to, BTreeSet::from([far_shard]));
 
-    let sender = plan_for_shard(
-        tx.legs(),
-        tx.crossings(),
-        &[],
-        &divided,
-        near_shard,
-        Side::Issuing,
-    )
-    .expect("the sender's legs take no arrival");
+    let sender = divided
+        .shape(tx.legs(), tx.crossings())
+        .plan(&[], near_shard, Side::Issuing)
+        .expect("the sender's legs take no arrival");
     assert!(!sender.legs.is_whole());
     assert!(
         sender.legs.departure(edge.node, edge.output).is_some(),
@@ -1274,28 +1266,18 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
         amount: 100,
         record: edge.record,
     };
-    let recipient = plan_for_shard(
-        tx.legs(),
-        tx.crossings(),
-        std::slice::from_ref(&arrived),
-        &divided,
-        far_shard,
-        Side::Delivering,
-    )
-    .expect("the recipient's leg has its arrival");
+    let recipient = divided
+        .shape(tx.legs(), tx.crossings())
+        .plan(std::slice::from_ref(&arrived), far_shard, Side::Delivering)
+        .expect("the recipient's leg has its arrival");
     assert!(recipient.legs.arrival(edge.node, edge.output).is_some());
     assert!(recipient.legs.departure(edge.node, edge.output).is_none());
     assert!(recipient.scope.covers(far()) && !recipient.scope.covers(alice()));
 
     assert!(matches!(
-        plan_for_shard(
-            tx.legs(),
-            tx.crossings(),
-            &[],
-            &divided,
-            far_shard,
-            Side::Delivering
-        ),
+        divided
+            .shape(tx.legs(), tx.crossings())
+            .plan(&[], far_shard, Side::Delivering),
         Err(PlanDefect::MissingArrival { .. }),
     ));
 }
@@ -1316,7 +1298,10 @@ fn a_transfer_executes_divided_on_both_shards() {
     derived_through(&executor, std::slice::from_ref(&tx));
     let classified = Classified::freeze(tx.legs(), tx.owners(), &trie);
     assert!(classified.decomposed().holds());
-    let edge = crossings_of(tx.legs(), tx.crossings(), &classified).remove(0);
+    let edge = classified
+        .shape(tx.legs(), tx.crossings())
+        .edges()
+        .remove(0);
 
     let run = |local_shard: ShardId, arrivals: &[EscrowedValue]| {
         let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
@@ -1413,7 +1398,10 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
     derived_through(&executor, std::slice::from_ref(&tx));
     let classified = Classified::freeze(tx.legs(), tx.owners(), &trie);
     assert!(classified.decomposed().holds());
-    let edge = crossings_of(tx.legs(), tx.crossings(), &classified).remove(0);
+    let edge = classified
+        .shape(tx.legs(), tx.crossings())
+        .edges()
+        .remove(0);
 
     let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
     let run = |store: &MapDb, runs: Runs, reaches_beyond: bool| {
@@ -1462,7 +1450,9 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
     let reclaimed = run(
         &store,
         Runs::Reclaim {
-            records: records_to_reclaim(tx.legs(), tx.crossings(), &classified, near_shard),
+            records: classified
+                .shape(tx.legs(), tx.crossings())
+                .records_issued(near_shard),
             charged: true,
         },
         false,
@@ -1501,7 +1491,10 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
     let classified = Classified::freeze(tx.legs(), tx.owners(), &trie);
-    let edge = crossings_of(tx.legs(), tx.crossings(), &classified).remove(0);
+    let edge = classified
+        .shape(tx.legs(), tx.crossings())
+        .edges()
+        .remove(0);
 
     let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
     let run = |store: &MapDb, runs: Runs, reaches_beyond: bool| {
@@ -1546,7 +1539,9 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
     let retired = run(
         &store,
         Runs::Retire {
-            records: records_to_retire(tx.legs(), tx.crossings(), &classified, near_shard),
+            records: classified
+                .shape(tx.legs(), tx.crossings())
+                .records_issued(near_shard),
         },
         false,
     );
@@ -1566,7 +1561,9 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
     let again = run(
         &store,
         Runs::Retire {
-            records: records_to_retire(tx.legs(), tx.crossings(), &classified, near_shard),
+            records: classified
+                .shape(tx.legs(), tx.crossings())
+                .records_issued(near_shard),
         },
         false,
     );
@@ -1595,7 +1592,10 @@ fn an_inherited_record_decides_itself_against_its_claim() {
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
     let classified = Classified::freeze(tx.legs(), tx.owners(), &trie);
-    let edge = crossings_of(tx.legs(), tx.crossings(), &classified).remove(0);
+    let edge = classified
+        .shape(tx.legs(), tx.crossings())
+        .edges()
+        .remove(0);
 
     // The sending half, which writes the record the successor inherits.
     let issued = |store: &MapDb| {
@@ -1753,12 +1753,9 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
             reaches_beyond: false,
             abortable: false,
             runs: Runs::Reclaim {
-                records: records_to_reclaim(
-                    tx.legs(),
-                    tx.crossings(),
-                    &Classified::freeze(tx.legs(), tx.owners(), &trie),
-                    near_shard,
-                ),
+                records: Classified::freeze(tx.legs(), tx.owners(), &trie)
+                    .shape(tx.legs(), tx.crossings())
+                    .records_issued(near_shard),
                 charged,
             },
             arrivals: &[],

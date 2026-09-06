@@ -37,10 +37,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::{
-    Classified, Runs, Side, core_claims, crossings_of, delivered_claims, records_to_reclaim,
-    records_to_retire,
-};
+use hyperscale_engine::legs::{Classified, Runs, Side};
 use hyperscale_engine::{TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{
     record_rebuilt_verdict_entry, record_reclaim_admitted, record_reclaim_probe_answered,
@@ -926,12 +923,13 @@ impl ExecutionCoordinator {
                     self.unresolved
                         .mark_delivery(tx.hash(), tx.validity_range().end_timestamp_exclusive);
                 } else {
+                    let shape = classified.shape(tx.legs(), tx.crossings());
                     self.unresolved.mark_leg(
                         tx.hash(),
                         Arc::clone(&verified),
                         classified.clone(),
-                        delivered_claims(tx.legs(), tx.crossings(), &classified, local_shard),
-                        core_claims(tx.legs(), tx.crossings(), &classified, local_shard),
+                        shape.delivered_claims(local_shard),
+                        shape.core_claims(local_shard),
                     );
                 }
             } else if classified.decomposed().holds() {
@@ -942,7 +940,9 @@ impl ExecutionCoordinator {
                     tx.hash(),
                     Arc::clone(&verified),
                     classified.clone(),
-                    delivered_claims(tx.legs(), tx.crossings(), &classified, local_shard),
+                    classified
+                        .shape(tx.legs(), tx.crossings())
+                        .delivered_claims(local_shard),
                 );
             }
             self.candidates
@@ -1182,12 +1182,9 @@ impl ExecutionCoordinator {
                 reaches_beyond: false,
                 abortable: false,
                 runs: Runs::Reclaim {
-                    records: records_to_reclaim(
-                        transaction.legs(),
-                        transaction.crossings(),
-                        &classified,
-                        local_shard,
-                    ),
+                    records: classified
+                        .shape(transaction.legs(), transaction.crossings())
+                        .records_issued(local_shard),
                     charged,
                 },
                 arrivals: Vec::new(),
@@ -1314,12 +1311,9 @@ impl ExecutionCoordinator {
                 reaches_beyond: false,
                 abortable: false,
                 runs: Runs::Retire {
-                    records: records_to_retire(
-                        transaction.legs(),
-                        transaction.crossings(),
-                        &classified,
-                        local_shard,
-                    ),
+                    records: classified
+                        .shape(transaction.legs(), transaction.crossings())
+                        .records_issued(local_shard),
                 },
                 arrivals: Vec::new(),
             });
@@ -1365,13 +1359,14 @@ impl ExecutionCoordinator {
         // to, if it issues anything. Only an issuing member issues;
         // a delivery and a reclaim promise nobody a bundle.
         let targets: BTreeSet<ShardId> = match &shape {
-            Some((shape, body)) if shape.side() == Side::Issuing => {
-                crossings_of(body.legs(), body.crossings(), shape.classified())
-                    .into_iter()
-                    .filter(|edge| edge.from == local_shard)
-                    .flat_map(|edge| edge.to)
-                    .collect()
-            }
+            Some((shape, body)) if shape.side() == Side::Issuing => shape
+                .classified()
+                .shape(body.legs(), body.crossings())
+                .edges()
+                .into_iter()
+                .filter(|edge| edge.from == local_shard)
+                .flat_map(|edge| edge.to)
+                .collect(),
             _ => BTreeSet::new(),
         };
         state.record_crossing_targets(member.request.tx_hash, targets);

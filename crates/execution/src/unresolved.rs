@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use hyperscale_engine::legs::{Classified, core_claims, delivered_claims};
+use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Absence, Address, BlockHeight, ClaimProof, CounterpartEvidence,
     Finalization, LegEntry, LegEntryKind, LegEntryTaken, Probed, ShardId, ShardTrie, StateAnchor,
@@ -573,9 +573,9 @@ impl UnresolvedTxs {
                     heard: Heard::default(),
                 },
             );
-            let deliveries =
-                delivered_claims(body.legs(), body.crossings(), &classified, local_shard);
-            let claims = core_claims(body.legs(), body.crossings(), &classified, local_shard);
+            let shape = classified.shape(body.legs(), body.crossings());
+            let deliveries = shape.delivered_claims(local_shard);
+            let claims = shape.core_claims(local_shard);
             self.kept.insert(
                 entry.tx_hash,
                 Kept {

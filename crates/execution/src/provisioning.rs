@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use hyperscale_engine::legs::{Classified, Side, crossings_of};
+use hyperscale_engine::legs::{Classified, Side};
 use hyperscale_types::{
     Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, SubstateKey, TxHash, Verified,
     WeightedTimestamp,
@@ -106,7 +106,9 @@ pub fn divided_requirements(
     // waits on nothing at all — which is what lets the core's arrival
     // exist in the first place.
     requirements.extend(
-        crossings_of(legs, crossings, classified)
+        classified
+            .shape(legs, crossings)
+            .edges()
             .into_iter()
             .filter(|edge| edge.to.contains(&local) && edge.delivers == (side == Side::Delivering))
             .map(|edge| Requirement::Crossing {

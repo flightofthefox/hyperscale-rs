@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
-use hyperscale_engine::legs::{Classified, Member, Runs, Side, crossings_of};
+use hyperscale_engine::legs::{Classified, Member, Runs, Side};
 use hyperscale_types::{
     EscrowedValue, ShardId, Transaction, TxHash, Verified, WeightedTimestamp, delivery_window_close,
 };
@@ -81,7 +81,9 @@ fn arrivals_for(
     if !classified.decomposed().holds() {
         return Vec::new();
     }
-    crossings_of(tx.legs(), tx.crossings(), classified)
+    classified
+        .shape(tx.legs(), tx.crossings())
+        .edges()
         .into_iter()
         .filter(|edge| edge.to.contains(&local) && edge.delivers == (side == Side::Delivering))
         .filter_map(|edge| {

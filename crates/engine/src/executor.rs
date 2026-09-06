@@ -49,7 +49,7 @@ use hyperscale_vm_types::{
 
 use crate::backend::EngineBackend;
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
-use crate::legs::{Member, Runs, ShardPlan, plan_for_shard};
+use crate::legs::{Member, Runs, ShardPlan};
 use crate::records::BatchRecords;
 use crate::sharding::writes_root;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
@@ -493,15 +493,11 @@ impl Executor {
         arrivals: &[EscrowedValue],
     ) -> Result<PreparedTx, String> {
         let mut entry = Self::prepare(tx, records)?;
-        entry.plan = plan_for_shard(
-            tx.legs(),
-            tx.crossings(),
-            arrivals,
-            member.classified(),
-            member.local(),
-            member.side(),
-        )
-        .map_err(|defect| format!("no plan for this shard: {defect}"))?;
+        entry.plan = member
+            .classified()
+            .shape(tx.legs(), tx.crossings())
+            .plan(arrivals, member.local(), member.side())
+            .map_err(|defect| format!("no plan for this shard: {defect}"))?;
         // The second member a shard runs of one transaction commits no
         // nullifier: the issuing one did, and a second spend of the same
         // cell would refuse this one before it ran.
