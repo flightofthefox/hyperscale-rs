@@ -142,8 +142,9 @@ pub const MAX_ABANDONMENT_RECORDS_PER_BLOCK: usize =
     MAX_PROVISION_TARGET_SHARDS * UNSETTLEABLE_ARMS;
 
 /// The arms of the record vocabulary: departed, refused, unclaimed,
-/// lapsed and claimed. Stated beside the cap that multiplies by it.
-pub const UNSETTLEABLE_ARMS: usize = 5;
+/// lapsed, claimed and untaken. Stated beside the cap that multiplies
+/// by it.
+pub const UNSETTLEABLE_ARMS: usize = 6;
 
 /// Cap on the number of shards a block can name as provision targets, at
 /// decode time.

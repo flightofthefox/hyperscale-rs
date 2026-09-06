@@ -4,7 +4,7 @@
 //! A cross-shard transaction needs every certificate its settlement
 //! waits on, so one whose counterpart can never certify it can never
 //! settle anywhere. That is the fact this shard needs in order to abandon
-//! it, and four things establish it. The counterpart left without
+//! it, and five things establish it. The counterpart left without
 //! settling: its settled set is complete and beacon-attested, so absence
 //! from it is proof, but the set can only be fetched while the terminal
 //! it belongs to is still served. The core refused: its certificate says
@@ -15,9 +15,13 @@
 //! since the core may still legitimately commit, nor past the cell's own
 //! sweep, where the cell is gone either way. Or the delivery never
 //! claimed it, as of one of the delivering shard's blocks inside the
-//! lapse window, on the same terms against the claim cell.
+//! lapse window, on the same terms against the claim cell. Or the core,
+//! being one shard, never took it, as of one of its blocks past the
+//! deadline: a non-inclusion proof of its consumer's claim cell says so,
+//! since a block carrying that core's success past the deadline is
+//! refused.
 //!
-//! A fifth establishes the opposite and is written down the same way:
+//! A sixth establishes the opposite and is written down the same way:
 //! that a consumer *did* claim what a leg here issued. A record cell is
 //! a balance held for that claim, and the claim proved present is what
 //! lets the issuer retire it — the family's one settling arm.
@@ -33,7 +37,7 @@
 //! What is never recorded is a settlement. That a counterpart *did*
 //! settle a transaction changes nothing this shard can act on — the
 //! transaction stays owed and unabandonable either way. Every arm here
-//! licenses something: four an abort, the fifth a retirement.
+//! licenses something: five an abort, the sixth a retirement.
 //!
 //! Each name carries the figures composing the abort takes: the deadline
 //! it opens at, the reservation it returns, and the charge it settles.
@@ -72,7 +76,8 @@ pub struct UnsettledTx {
     /// The moment past which it can no longer finalize anywhere:
     /// `validity_range.end_timestamp_exclusive + MAX_FINALIZATION_DELAY`.
     ///
-    /// Also the anchor an [`CounterpartEvidence::Unclaimed`] probe has to sit at
+    /// Also the anchor an [`CounterpartEvidence::Unclaimed`] or
+    /// [`CounterpartEvidence::Untaken`] probe has to sit at
     /// or past, so a voter checks the proof's block against this figure
     /// rather than against a clock.
     pub deadline: WeightedTimestamp,
@@ -295,6 +300,22 @@ pub enum CounterpartEvidence {
         /// the proof says nothing.
         probed_wt: WeightedTimestamp,
     },
+    /// The core never took it, as of one of its blocks inside the
+    /// absence window. A non-inclusion proof of the core consumer's
+    /// claim cell against that block's state root is the proof, for a
+    /// core that is one shard: its one execution writes the claim at or
+    /// before the deadline or never, since a block carrying its success
+    /// past the deadline is refused. A core of more shards is not asked
+    /// this way — its execution settles on its siblings' clock, and a
+    /// claim absent past the deadline may be pending — so its answer is
+    /// [`Self::Unclaimed`], off the committed cell. The fact is the same
+    /// at every anchor from the deadline to the claim cell's sweep.
+    Untaken {
+        /// The weighted timestamp of the block the absence was proved
+        /// against. At or past every named transaction's deadline and
+        /// short of the claim cell's sweep, or the proof says nothing.
+        probed_wt: WeightedTimestamp,
+    },
 }
 
 impl CounterpartEvidence {
@@ -306,7 +327,8 @@ impl CounterpartEvidence {
             Self::Refused { refused_wt } => *refused_wt,
             Self::Unclaimed { probed_wt }
             | Self::Lapsed { probed_wt }
-            | Self::Claimed { probed_wt } => *probed_wt,
+            | Self::Claimed { probed_wt }
+            | Self::Untaken { probed_wt } => *probed_wt,
         }
     }
 
@@ -322,6 +344,7 @@ impl CounterpartEvidence {
             Self::Unclaimed { .. } => 2,
             Self::Lapsed { .. } => 3,
             Self::Claimed { .. } => 4,
+            Self::Untaken { .. } => 5,
         }
     }
 
@@ -482,6 +505,17 @@ impl AbandonmentRecord {
         unsettled: impl IntoIterator<Item = UnsettledTx>,
     ) -> Self {
         Self::new(shard, CounterpartEvidence::Lapsed { probed_wt }, unsettled)
+    }
+
+    /// A record over what `shard`, a core of one shard, had not taken as
+    /// of its block at `probed_wt`, past the deadline.
+    #[must_use]
+    pub fn untaken(
+        shard: ShardId,
+        probed_wt: WeightedTimestamp,
+        unsettled: impl IntoIterator<Item = UnsettledTx>,
+    ) -> Self {
+        Self::new(shard, CounterpartEvidence::Untaken { probed_wt }, unsettled)
     }
 
     /// A record over what `shard`, consuming, had claimed as of its
@@ -752,6 +786,8 @@ mod tests {
             CounterpartEvidence::Refused { refused_wt: wt() },
             CounterpartEvidence::Unclaimed { probed_wt: wt() },
             CounterpartEvidence::Lapsed { probed_wt: wt() },
+            CounterpartEvidence::Claimed { probed_wt: wt() },
+            CounterpartEvidence::Untaken { probed_wt: wt() },
         ];
         let mut bytes: Vec<u8> = arms.iter().map(CounterpartEvidence::discriminant).collect();
         bytes.dedup();

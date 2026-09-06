@@ -380,7 +380,9 @@ pub struct Probeable {
     pub deliveries: Vec<(ShardId, SubstateKey)>,
     /// The claim cells core consumers write for what this leg issued,
     /// each under the shard holding the consumer's target. Asked about
-    /// past the deadline: present says the core took it.
+    /// past the deadline, there and on whatever shard holds the cell's
+    /// prefix by then: present says the core took it, and absent, where
+    /// the core is one shard, that it never will.
     pub claims: Vec<(ShardId, SubstateKey)>,
 }
 
@@ -1128,7 +1130,8 @@ impl UnresolvedTxs {
                         }
                         Some(
                             CounterpartEvidence::Departed { .. }
-                            | CounterpartEvidence::Unclaimed { .. },
+                            | CounterpartEvidence::Unclaimed { .. }
+                            | CounterpartEvidence::Untaken { .. },
                         ) => TxResolution::Decided(TransactionDecision::Aborted),
                         Some(
                             CounterpartEvidence::Lapsed { .. }

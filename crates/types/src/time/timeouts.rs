@@ -175,7 +175,10 @@ pub enum Probed {
     Delivery,
     /// A core consumer's claim cell, past the transaction's deadline:
     /// present says the core took the crossing, and the record here is
-    /// retired on it; absent says only that it has not yet.
+    /// retired on it. Absent says the core never took it where the core
+    /// is one shard, whose one execution wrote the claim by the deadline
+    /// or never will; where the core is more, only that a sibling is
+    /// pending, and the committed cell answers instead.
     Claim,
 }
 
@@ -190,15 +193,18 @@ impl Probed {
     /// and a proof there is a true proof of a cell that was present.
     /// Misreading either end by one term is a double spend.
     ///
-    /// A claim has no anchor: presence says the consumer took the
-    /// crossing whenever it is proved, and its absence is read as
-    /// nothing at all rather than as evidence.
+    /// A claim is asked from the deadline, as the committed cell is.
+    /// Presence says the consumer took the crossing wherever it is
+    /// proved. Absence past the deadline is the core never taking it,
+    /// for a core of one shard, whose success the deadline fences; a
+    /// core of more settles on its siblings' clock, and the fold reads
+    /// its claim's absence as nothing.
     #[must_use]
     pub fn window(self, validity_end: WeightedTimestamp) -> Range<WeightedTimestamp> {
         match self {
             Self::Core => reclaim_probe_anchor(validity_end)..validity_end.plus(RETENTION_HORIZON),
             Self::Delivery => lapse_probe_anchor(validity_end)..lapse_probe_ceiling(validity_end),
-            Self::Claim => WeightedTimestamp::ZERO..lapse_probe_ceiling(validity_end),
+            Self::Claim => reclaim_probe_anchor(validity_end)..lapse_probe_ceiling(validity_end),
         }
     }
 

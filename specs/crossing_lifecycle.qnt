@@ -14,11 +14,12 @@
 // attested chain clock as monotone.
 //
 // Code anchors:
-//   - The four evidence forms a reclaim is licensed by, and nothing else:
+//   - The five evidence forms a reclaim is licensed by, and nothing else:
 //     a refusal certificate of the core's, a departure record, an absence
 //     proof of the core's committed cell anchored no earlier than the
-//     probe anchor, or an absence proof of the delivery's claim cell
-//     anchored no earlier than the lapse —
+//     probe anchor, an absence proof of a one-shard core consumer's claim
+//     cell anchored no earlier than the same, or an absence proof of the
+//     delivery's claim cell anchored no earlier than the lapse —
 //     `reclaimable` / `probe_silent_counterparts` in crates/execution/src/coordinator.rs,
 //     `Unsettleable` in crates/types/src/shard/abandonment.rs. The
 //     departure arm is Model D's and is not modelled here.
@@ -33,7 +34,13 @@
 //     `MerkleInclusionProof::inclusions` in crates/types/src/provisioning/proof.rs.
 //     A block is admitted at an anchor inside the validity window and
 //     commits within MAX_FINALIZATION_DELAY of it, which is what puts every
-//     commit before D.
+//     commit before D. Or, for a core of one shard, the consumer's claim
+//     cell, written when the block carrying the core's success commits —
+//     a block that would do so at or past D is refused
+//     (`Resolutions::Overdue`, crates/shard/src/action_handlers.rs), which
+//     is `FENCED` here, and what lets the claim's absence past D be read.
+//     A core of more shards settles on its siblings' clock and is not
+//     fenced, so its answer stays the committed cell (`LICENCE_CLAIM`).
 //   - Once-only disposal on one shard — the claim-cell checks in
 //     vm/crates/kernel/src/executor.rs (`crossing_committed`). Across two
 //     shards nothing reads the other's cell, so exclusivity rests on the
@@ -87,10 +94,11 @@
 // MAX_CLOCK = 5 in `exclusivity`, 8 in `delivery`):
 //   quint typecheck specs/crossing_lifecycle.qnt
 //   # twin floors, each confirmed clean at floor-1 and violating at floor:
-//   quint verify --main=clock_fenced_reclaim --invariant=invExclusive  --max-steps=6  specs/crossing_lifecycle.qnt
-//   quint verify --main=early_absence_probe  --invariant=invExclusive  --max-steps=10 specs/crossing_lifecycle.qnt
-//   quint verify --main=late_absence_probe   --invariant=invExclusive  --max-steps=12 specs/crossing_lifecycle.qnt
+//   quint verify --main=clock_fenced_reclaim --invariant=invExclusive  --max-steps=7  specs/crossing_lifecycle.qnt
+//   quint verify --main=early_absence_probe  --invariant=invExclusive  --max-steps=11 specs/crossing_lifecycle.qnt
+//   quint verify --main=late_absence_probe   --invariant=invExclusive  --max-steps=13 specs/crossing_lifecycle.qnt
 //   quint verify --main=no_reclaim           --invariant=invDisposable --max-steps=9  specs/crossing_lifecycle.qnt
+//   quint verify --main=unfenced_claim_commit --invariant=invExclusive --max-steps=11 specs/crossing_lifecycle.qnt
 //   quint verify --main=deadline_on_delivery --invariant=invDelivered  --max-steps=11 specs/crossing_lifecycle.qnt
 //   quint verify --main=early_lapse_probe    --invariant=invExclusive  --max-steps=12 specs/crossing_lifecycle.qnt
 //   quint verify --main=late_lapse_probe     --invariant=invExclusive  --max-steps=12 specs/crossing_lifecycle.qnt
@@ -99,6 +107,7 @@
 //   # on an Apple M-series laptop: exclusivity 6s at 10, 12s at 12, 26s at
 //   # 14, 109s at 16; delivery about 5s through 14, 5s at 16):
 //   quint verify --main=exclusivity_ok --invariant=invAll --max-steps=16 specs/crossing_lifecycle.qnt
+//   quint verify --main=claim_licence_ok --invariant=invAll --max-steps=16 specs/crossing_lifecycle.qnt
 //   quint verify --main=delivery_ok    --invariant=invAll --max-steps=16 specs/crossing_lifecycle.qnt
 //   # random search walks a twin up to its floor sub-second per point:
 //   quint run --main=<twin> --invariant=<inv> --max-steps=N --max-samples=20000 --seed=7 specs/crossing_lifecycle.qnt
@@ -129,6 +138,17 @@ module exclusivity_core {
   const RECLAIM_ON_CLOCK: bool
   // Twin `no_reclaim`: the producer never reclaims.
   const RECLAIM_ENABLED: bool
+  // The licence the producer reads. False: the core's committed cell,
+  // absent past the anchor — what a core of more than one shard answers
+  // with, since its claim commits on its siblings' clock. True: the core
+  // consumer's claim cell, absent past the anchor — what a core of one
+  // shard answers with, whose one execution wrote the claim by the
+  // deadline or never will.
+  const LICENCE_CLAIM: bool
+  // Whether a block committing the core's claim at or past PROBE_ANCHOR
+  // is refused. What makes the claim licence sound. Twin
+  // `unfenced_claim_commit`: the claim licence without the fence.
+  const FENCED: bool
   // How far the two chains' attested clocks may drift apart. The absence
   // license has a ceiling, so a producer whose core's chain has already
   // run past the window never gets to ask: the crossing strands, which is
@@ -155,8 +175,11 @@ module exclusivity_core {
   // The core clock at which that block committed (NONE before): the
   // committed cell the probe reads exists from here.
   var committedAt: int
-  // The core's verdict on the crossing: claimed or refused (once).
+  // The core's verdict on the crossing: claimed or refused (once). A
+  // claim is the execution's; its cell is in the core's committed state
+  // only from claimCommittedAt.
   var claimed: bool
+  var claimCommittedAt: int
   var refused: bool
   // The refusal certificate reached the producer.
   var refusalDelivered: bool
@@ -179,12 +202,14 @@ module exclusivity_core {
     swept' = false,
     absenceProved' = false,
     reclaimed' = false,
+    claimCommittedAt' = NONE,
   }
 
   action unchangedButClock = all {
     issued' = issued, proposedAt' = proposedAt, committedAt' = committedAt,
     claimed' = claimed, refused' = refused, refusalDelivered' = refusalDelivered,
     swept' = swept, absenceProved' = absenceProved, reclaimed' = reclaimed,
+    claimCommittedAt' = claimCommittedAt,
   }
 
   action tick = {
@@ -199,8 +224,9 @@ module exclusivity_core {
       // producer holds, and the core produces one every block — so the
       // core's clock does not leave the absence window with the proof
       // untaken.
-      not(issued) or absenceProved or cellPresent or claimed or refused
-        or s != CORE or clock.get(CORE) + d < PROBE_CEILING,
+      not(issued) or absenceProved or refused or s != CORE
+        or (if (LICENCE_CLAIM) claimCellPresent else (cellPresent or claimed))
+        or clock.get(CORE) + d < PROBE_CEILING,
       clock' = clock.setBy(s, c => c + d),
       unchangedButClock,
     }
@@ -215,6 +241,7 @@ module exclusivity_core {
     clock' = clock, proposedAt' = proposedAt, committedAt' = committedAt,
     claimed' = claimed, refused' = refused, refusalDelivered' = refusalDelivered,
     swept' = swept, absenceProved' = absenceProved, reclaimed' = reclaimed,
+    claimCommittedAt' = claimCommittedAt,
   }
 
   // The core's chain admits the block carrying the transaction, at an
@@ -226,6 +253,7 @@ module exclusivity_core {
     clock' = clock, issued' = issued, committedAt' = committedAt,
     claimed' = claimed, refused' = refused, refusalDelivered' = refusalDelivered,
     swept' = swept, absenceProved' = absenceProved, reclaimed' = reclaimed,
+    claimCommittedAt' = claimCommittedAt,
   }
 
   // That block commits, within the finalization delay of its anchor: the
@@ -239,6 +267,7 @@ module exclusivity_core {
     clock' = clock, issued' = issued, proposedAt' = proposedAt,
     claimed' = claimed, refused' = refused, refusalDelivered' = refusalDelivered,
     swept' = swept, absenceProved' = absenceProved, reclaimed' = reclaimed,
+    claimCommittedAt' = claimCommittedAt,
   }
 
   // The core's verdict, once it holds the crossing: it claims, or it
@@ -252,6 +281,21 @@ module exclusivity_core {
     committedAt' = committedAt, refused' = refused,
     refusalDelivered' = refusalDelivered, swept' = swept,
     absenceProved' = absenceProved, reclaimed' = reclaimed,
+    claimCommittedAt' = claimCommittedAt,
+  }
+  // The block carrying the core's success commits, and the claim cell
+  // is in its state from here. Fenced at the probe anchor: past it the
+  // block is refused, the core's tick aborts, and the claim never
+  // commits — which is what lets its absence past the anchor be read.
+  val canCommitClaim = claimed and claimCommittedAt == NONE
+    and (not(FENCED) or clock.get(CORE) < PROBE_ANCHOR)
+  action commitClaim = all {
+    canCommitClaim,
+    claimCommittedAt' = clock.get(CORE),
+    clock' = clock, issued' = issued, proposedAt' = proposedAt,
+    committedAt' = committedAt, claimed' = claimed, refused' = refused,
+    refusalDelivered' = refusalDelivered, swept' = swept,
+    absenceProved' = absenceProved, reclaimed' = reclaimed,
   }
   val canRefuse = committedAt != NONE and not(claimed) and not(refused)
   action refuse = all {
@@ -261,6 +305,7 @@ module exclusivity_core {
     committedAt' = committedAt, claimed' = claimed,
     refusalDelivered' = refusalDelivered, swept' = swept,
     absenceProved' = absenceProved, reclaimed' = reclaimed,
+    claimCommittedAt' = claimCommittedAt,
   }
 
   // The refusal certificate reaches the producer, whenever the network
@@ -272,6 +317,7 @@ module exclusivity_core {
     clock' = clock, issued' = issued, proposedAt' = proposedAt,
     committedAt' = committedAt, claimed' = claimed, refused' = refused,
     swept' = swept, absenceProved' = absenceProved, reclaimed' = reclaimed,
+    claimCommittedAt' = claimCommittedAt,
   }
 
   // The core's frontier retires the committed cell at its expiry. Past
@@ -285,6 +331,7 @@ module exclusivity_core {
     committedAt' = committedAt, claimed' = claimed, refused' = refused,
     refusalDelivered' = refusalDelivered, absenceProved' = absenceProved,
     reclaimed' = reclaimed,
+    claimCommittedAt' = claimCommittedAt,
   }
 
   // The producer, past D on its own clock, reads the core's committed set
@@ -293,17 +340,21 @@ module exclusivity_core {
   // is absent when the core never committed the transaction — and, once
   // the sweep has run, when it did, which is what the ceiling is for.
   val cellPresent = committedAt != NONE and not(swept)
+  val claimCellPresent = claimCommittedAt != NONE
+  // What the probe reads present, under the licence in force.
+  val answerPresent = if (LICENCE_CLAIM) claimCellPresent else cellPresent
   val canProbe = issued and not(absenceProved)
     and clock.get(PRODUCER) >= DEADLINE + FINALIZATION_DELAY
     and clock.get(CORE) >= PROBE_ANCHOR
     and clock.get(CORE) < PROBE_CEILING
-    and not(cellPresent)
+    and not(answerPresent)
   action probe = all {
     canProbe,
     absenceProved' = true,
     clock' = clock, issued' = issued, proposedAt' = proposedAt,
     committedAt' = committedAt, claimed' = claimed, refused' = refused,
     refusalDelivered' = refusalDelivered, swept' = swept, reclaimed' = reclaimed,
+    claimCommittedAt' = claimCommittedAt,
   }
 
   // The reclaim, on the evidence the rule licenses and nothing else. The
@@ -318,12 +369,13 @@ module exclusivity_core {
     committedAt' = committedAt, claimed' = claimed, refused' = refused,
     refusalDelivered' = refusalDelivered, swept' = swept,
     absenceProved' = absenceProved,
+    claimCommittedAt' = claimCommittedAt,
   }
 
   // Nothing but the clocks can move, and the clocks have stopped.
   val quiescent = SHARDS.forall(s => clock.get(s) == MAX_CLOCK)
     and not(canIssue) and not(canPropose) and not(canCommit)
-    and not(canClaim) and not(canRefuse) and not(canDeliverRefusal)
+    and not(canClaim) and not(canCommitClaim) and not(canRefuse) and not(canDeliverRefusal)
     and not(canSweep) and not(canProbe) and not(canReclaim)
 
   // A terminal state stutters: the model ends there, not in a deadlock.
@@ -334,15 +386,17 @@ module exclusivity_core {
   }
 
   action step = any {
-    tick, issue, propose, commit, claim, refuse, deliverRefusal, sweep, probe,
-    reclaim, idle
+    tick, issue, propose, commit, claim, commitClaim, refuse, deliverRefusal,
+    sweep, probe, reclaim, idle
   }
 
-  // INV-EXEC-11: a crossing is disposed at most once.
-  val invExclusive = not(claimed and reclaimed)
+  // INV-EXEC-11: a crossing is disposed at most once. A claim the core
+  // executed but never committed disposed of nothing: its block was
+  // refused, and the value stays in the record for the reclaim.
+  val invExclusive = not(claimCellPresent and reclaimed)
 
   // INV-EXEC-12: at a terminal state an issued crossing is disposed.
-  val invDisposable = quiescent implies (not(issued) or claimed or reclaimed)
+  val invDisposable = quiescent implies (not(issued) or claimCellPresent or reclaimed)
 
   val invAll = invExclusive and invDisposable
 }
@@ -575,6 +629,30 @@ module exclusivity_ok {
   import exclusivity_core(
     DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 3, PROBE_CEILING = 5,
     SWEEP_AT = 5, RECLAIM_ON_CLOCK = false, RECLAIM_ENABLED = true,
+    LICENCE_CLAIM = false, FENCED = false,
+    MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
+  ).*
+}
+
+// Healthy claim licence: a core of one shard, whose claim commits under
+// the fence or never. The producer reads the claim cell absent past D.
+module claim_licence_ok {
+  import exclusivity_core(
+    DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 3, PROBE_CEILING = 5,
+    SWEEP_AT = 5, RECLAIM_ON_CLOCK = false, RECLAIM_ENABLED = true,
+    LICENCE_CLAIM = true, FENCED = true,
+    MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
+  ).*
+}
+
+// Twin: the claim licence without the fence. The core claims under the
+// deadline, its block commits past the anchor, and the producer — having
+// read the claim absent in between — has reclaimed what the core took.
+module unfenced_claim_commit {
+  import exclusivity_core(
+    DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 3, PROBE_CEILING = 5,
+    SWEEP_AT = 5, RECLAIM_ON_CLOCK = false, RECLAIM_ENABLED = true,
+    LICENCE_CLAIM = true, FENCED = false,
     MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
@@ -585,6 +663,7 @@ module clock_fenced_reclaim {
   import exclusivity_core(
     DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 3, PROBE_CEILING = 5,
     SWEEP_AT = 5, RECLAIM_ON_CLOCK = true, RECLAIM_ENABLED = true,
+    LICENCE_CLAIM = false, FENCED = false,
     MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
@@ -596,6 +675,7 @@ module early_absence_probe {
   import exclusivity_core(
     DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 2, PROBE_CEILING = 5,
     SWEEP_AT = 5, RECLAIM_ON_CLOCK = false, RECLAIM_ENABLED = true,
+    LICENCE_CLAIM = false, FENCED = false,
     MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
@@ -608,6 +688,7 @@ module late_absence_probe {
   import exclusivity_core(
     DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 3, PROBE_CEILING = 6,
     SWEEP_AT = 5, RECLAIM_ON_CLOCK = false, RECLAIM_ENABLED = true,
+    LICENCE_CLAIM = false, FENCED = false,
     MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
@@ -618,6 +699,7 @@ module no_reclaim {
   import exclusivity_core(
     DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 3, PROBE_CEILING = 5,
     SWEEP_AT = 5, RECLAIM_ON_CLOCK = false, RECLAIM_ENABLED = false,
+    LICENCE_CLAIM = false, FENCED = false,
     MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }

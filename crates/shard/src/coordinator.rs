@@ -1367,6 +1367,13 @@ impl ShardCoordinator {
                     }
                 }
             }
+            CounterpartEvidence::Untaken { probed_wt } => {
+                for entry in verdict.unsettled() {
+                    if !self.absence_stands(verdict, entry, probed_wt, Probed::Claim, block_hash) {
+                        return false;
+                    }
+                }
+            }
             // A claim is checked against the proof the chain committed:
             // the record's anchor short of the claim cell's sweep, and
             // the one this validator folded. A voter that has not folded
@@ -12566,6 +12573,46 @@ mod tests {
         assert!(
             absent.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
             "no proof defers it"
+        );
+    }
+
+    /// An untaken record — a one-shard core's claim absent — stands on
+    /// the claim's own mirror: a folded claim absence at the record's
+    /// anchor passes it, and a committed-cell absence at the same anchor
+    /// does not, since the arms are different proofs.
+    #[test]
+    fn an_untaken_record_stands_on_the_claims_own_mirror() {
+        let sched = make_terminating_schedule(4);
+        let deadline = figures_of(b"tx").deadline;
+        let tx_hash = figures_of(b"tx").tx_hash;
+        let absence = Absence {
+            probed_wt: deadline,
+            floor: deadline,
+        };
+        let record = block_with_records(
+            AFTER_CUT_MS,
+            vec![AbandonmentRecord::untaken(
+                ShardId::ROOT,
+                deadline,
+                [figures_of(b"tx")],
+            )],
+        );
+
+        let claim = fence_coordinator();
+        claim
+            .evidence()
+            .record_absence(tx_hash, ShardId::ROOT, Probed::Claim, absence);
+        assert!(
+            !claim.fence_abandonment_records(&sched, &record, BlockHash::ZERO),
+            "a folded claim absence at the anchor passes it"
+        );
+
+        let cell = fence_coordinator();
+        cell.evidence()
+            .record_absence(tx_hash, ShardId::ROOT, Probed::Core, absence);
+        assert!(
+            cell.fence_abandonment_records(&sched, &record, BlockHash::ZERO),
+            "a committed-cell absence is another arm's proof, and defers"
         );
     }
 

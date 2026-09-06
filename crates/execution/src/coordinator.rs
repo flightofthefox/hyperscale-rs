@@ -251,10 +251,11 @@ fn counterpart_cells(entry: &Probeable, trie: &ShardTrie) -> Vec<CounterpartCell
                 )
             })
     });
-    let claims = entry
-        .claims
-        .iter()
-        .map(|&(shard, claim)| (shard, claim, entry.deadline, Probed::Claim));
+    let claims = entry.claims.iter().flat_map(|&(shard, claim)| {
+        BTreeSet::from([shard, trie.shard_for_prefix(claim.owner)])
+            .into_iter()
+            .map(move |shard| (shard, claim, entry.deadline, Probed::Claim))
+    });
     core.into_iter().chain(deliveries).chain(claims).collect()
 }
 
@@ -2723,8 +2724,14 @@ impl ExecutionCoordinator {
                                 probed_wt: bundle.anchor_ts,
                             })
                         }
-                        (Inclusion::Absent, Probed::Claim) => continue,
-                        (Inclusion::Absent, Probed::Core | Probed::Delivery) => {
+                        // A claim absent on a core of one shard is the
+                        // core never taking the crossing: its one
+                        // execution wrote the claim by the deadline or
+                        // never will, and the window opens there. On a
+                        // core of more it says only that a sibling is
+                        // pending, and the committed cell answers.
+                        (Inclusion::Absent, Probed::Claim) if entry.core.len() != 1 => continue,
+                        (Inclusion::Absent, Probed::Core | Probed::Delivery | Probed::Claim) => {
                             Answer::Absent(Absence {
                                 probed_wt: bundle.anchor_ts,
                                 floor,
@@ -3502,7 +3509,8 @@ impl ExecutionCoordinator {
         );
         // Answers the chain committed, grouped the same way, one arm per
         // kind of counterpart: a record states the one anchor every name
-        // in it was proved at, and a core's absence and a delivery's are
+        // in it was proved at, and a core's committed cell absent, a
+        // delivery's claim absent and a one-shard core's claim absent are
         // different claims held to different floors.
         for (probed, record) in [
             (
@@ -3510,6 +3518,7 @@ impl ExecutionCoordinator {
                 AbandonmentRecord::unclaimed as fn(_, _, _) -> _,
             ),
             (Probed::Delivery, AbandonmentRecord::lapsed),
+            (Probed::Claim, AbandonmentRecord::untaken),
         ] {
             let absent = self
                 .evidence
@@ -8836,6 +8845,16 @@ mod tests {
         transaction: &Arc<Verifiable<Transaction>>,
         claim: SubstateKey,
     ) -> ExecutionCoordinator {
+        claimed_leg_state_under(transaction, claim, leg_classified())
+    }
+
+    /// [`claimed_leg_state`] with the shape frozen as `classified` says:
+    /// what fixes how many shards the core spans.
+    fn claimed_leg_state_under(
+        transaction: &Arc<Verifiable<Transaction>>,
+        claim: SubstateKey,
+        classified: Classified,
+    ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         state.unresolved.register_committed(
             HOME,
@@ -8845,7 +8864,7 @@ mod tests {
         state.unresolved.mark_leg(
             transaction.hash(),
             Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            leg_classified(),
+            classified,
             Vec::new(),
             vec![(PEER, claim)],
         );
@@ -8855,18 +8874,19 @@ mod tests {
     }
 
     /// A core consumer's claim is asked about beside the core's
-    /// committed cell, and a claim proved absent says only "not yet":
-    /// nothing reaches the fence, nothing is offered, and the question
-    /// is asked again at the next header — alone, since the committed
-    /// cell answered.
+    /// committed cell. On a core of one shard a claim proved absent
+    /// past the deadline is the core never taking the crossing: it
+    /// reaches the fence, is offered as an `Untaken` record, and neither
+    /// question is asked again.
     #[test]
-    fn a_claim_proved_absent_is_asked_again() {
+    fn a_single_shard_cores_claim_proved_absent_is_its_answer() {
         let schedule = two_shard_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let deadline = UnsettledTx::for_transaction(&transaction).deadline;
+        let figures = UnsettledTx::for_transaction(&transaction);
+        let deadline = figures.deadline;
         let core_key = committed_tx_cell_key(
             PEER,
             tx_hash,
@@ -8895,11 +8915,74 @@ mod tests {
         state.on_state_proof_verified(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
         let folded = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert!(
+            folded.iter().any(|action| matches!(
+                action,
+                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
+            )),
+            "an absent claim on a core of one shard is evidence"
+        );
+        assert_eq!(
+            state.pending_abandonment_records(),
+            vec![AbandonmentRecord::untaken(PEER, deadline, [figures])],
+            "offered as untaken, under the anchor it was proved at"
+        );
+
+        let (_, opened) = proven_at(
+            &mut state,
+            &schedule,
+            PEER,
+            5,
+            deadline.plus(Duration::from_secs(2)),
+            &[core_key],
+            &[claim],
+        );
+        assert!(
+            state_proof_fetches(&opened).is_empty(),
+            "and neither question is asked again: both answered"
+        );
+    }
+
+    /// On a core of more than one shard the same absence says only that
+    /// a sibling is pending: the core settles on its siblings' clock, so
+    /// nothing reaches the fence, nothing is offered, and the claim is
+    /// asked again at the next header — alone, since the committed cell
+    /// answered. That cell is what answers for such a core.
+    #[test]
+    fn a_multi_shard_cores_claim_proved_absent_is_asked_again() {
+        let schedule = two_shard_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let deadline = UnsettledTx::for_transaction(&transaction).deadline;
+        let core_key = committed_tx_cell_key(
+            PEER,
+            tx_hash,
+            transaction.validity_range().end_timestamp_exclusive,
+        );
+        let claim = SubstateKey {
+            owner: core_key.owner,
+            local: LocalKey([0x7C; 16]),
+        };
+        let mut state = claimed_leg_state_under(&transaction, claim, two_shard_core_classified());
+        let (bundle, _) = proven_at(
+            &mut state,
+            &schedule,
+            PEER,
+            4,
+            deadline,
+            &[core_key],
+            &[core_key, claim],
+        );
+
+        state.on_state_proof_verified(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
+        let folded = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
+        assert!(
             !folded.iter().any(|action| matches!(
                 action,
                 Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
             )),
-            "an absent claim proves nothing"
+            "an absent claim on a core of two shards proves nothing"
         );
         assert!(state.pending_abandonment_records().is_empty());
 
@@ -9191,6 +9274,26 @@ mod tests {
         ];
         let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(1));
         assert_eq!(classified.core(), &BTreeSet::from([PEER]));
+        classified
+    }
+
+    /// A shape frozen divided with a core spanning two leaves, so a claim
+    /// absent on either says only that the other is pending.
+    fn two_shard_core_classified() -> Classified {
+        use hyperscale_vm_types::LegRole;
+
+        use crate::fixtures::leg;
+        let legs = [
+            leg(0, LegRole::Inbound, &[]),
+            leg(2, LegRole::Core, &[(0, 0)]),
+            leg(3, LegRole::Core, &[(1, 0)]),
+        ];
+        let classified = Classified::freeze(&legs, &[], &ShardTrie::uniform(2));
+        assert_eq!(
+            classified.core(),
+            &BTreeSet::from([ShardId::leaf(2, 2), ShardId::leaf(2, 3)])
+        );
+        assert!(classified.decomposed().holds());
         classified
     }
 
