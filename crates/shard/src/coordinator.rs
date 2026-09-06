@@ -5519,6 +5519,33 @@ impl ShardCoordinator {
             parent_hash = parent.block().header().parent_block_hash();
             chain.push(parent);
         }
+        // The walk has to land *on* the committed tip, not merely at the
+        // height above it. A branch that reaches the right height by a
+        // different parent is a sibling of what this node committed, and
+        // splicing it would fork the chain at the tip — which is what
+        // `record_block_committed` asserts against, one step too late to
+        // do anything but abort.
+        //
+        // Two certified siblings at one height is a shape block sync
+        // already serves (`take_next_verified`), on the reasoning that
+        // only one of them can gather a round-contiguous two-chain. That
+        // holds under one committee. It does not hold while a halt
+        // recovery has two of them live — the retained committee is
+        // disarmed only once it folds the record — so the branch this
+        // node is not on arrives certified, commit-driving, and at
+        // exactly the next height.
+        if parent_hash != self.committed_hash {
+            warn!(
+                validator = ?self.me,
+                shard = ?self.local_shard,
+                height = committable.block().height().inner(),
+                committable = ?committable.block().hash(),
+                extends = ?parent_hash,
+                committed_tip = ?self.committed_hash,
+                "Refusing a commit whose prefix leaves the committed tip"
+            );
+            return None;
+        }
         chain.reverse();
         Some(chain)
     }
