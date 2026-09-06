@@ -112,12 +112,29 @@ impl Classified {
     /// where the shard leaving it commits nothing more — so every shard
     /// and every replica committing the transaction under one trie
     /// freezes one shape.
+    ///
+    /// Dividing takes two conjuncts. The classifier's own asks whether
+    /// the shape's value edges can be cut at all. The planner's asks
+    /// whether the cut leaves every sink a member that can run it: a
+    /// sink fed from both sides of its own shard has none, since the
+    /// issuing member could only hand it the local edge through a bundle
+    /// to itself, and the delivering member waits on an arrival that
+    /// edge never produces. Running whole is always correct, so such a
+    /// shape takes that.
+    ///
+    /// Neither conjunct reads a window. A shard scheduled to leave the
+    /// trie divides like any other, in its final window too: a record
+    /// cell follows its prefix to the successor, a claim or a delivery
+    /// is a pull on whoever holds the prefix when it is made, and a
+    /// crossing the delivery window closes on unclaimed is reclaimed on
+    /// the successor's own proof of its absence. A rule that read the
+    /// block's window here would flip at the boundary into that window
+    /// while the trie did not, and two shards committing one transaction
+    /// on either side of it would freeze different shapes.
     #[must_use]
     pub fn freeze(legs: &[LegShape], owners: &[Address], trie: &ShardTrie) -> Self {
         let trie = Arc::new(trie.clone());
         let star = star_of(legs, &trie);
-        let decomposed =
-            Decomposed(star.decomposes(legs, owners, &TrieShardResolver { trie: &trie }));
         let core: BTreeSet<ShardId> = star
             .core
             .iter()
@@ -125,9 +142,13 @@ impl Classified {
             .collect();
         let consumers = consumers_of(legs);
         let roles = fold_beside_the_core(legs, &star.roles, &core, &trie, &consumers);
+        let placed = Star::view(legs, &roles, &core, &trie, consumers);
+        let decomposed = Decomposed(
+            star.decomposes(legs, owners, &TrieShardResolver { trie: &trie })
+                && placed.no_sink_is_fed_from_both_sides(),
+        );
         let (delivering, mixed) = if decomposed.holds() {
-            let star = Star::view(legs, &roles, &core, &trie, consumers);
-            let (delivers, settles) = star.delivery_sides();
+            let (delivers, settles) = placed.delivery_sides();
             (
                 delivers.difference(&settles).copied().collect(),
                 delivers.intersection(&settles).copied().collect(),
@@ -485,65 +506,6 @@ fn leg_outputs(legs: &[LegShape], node: u32) -> impl Iterator<Item = u32> + '_ {
         .flat_map(|leg| leg.edges.iter())
         .filter(move |edge| edge.source == node)
         .map(|edge| edge.output)
-}
-
-/// Whether this transaction's legs run where their state lives: the
-/// classifier's verdict over `trie`, and nothing about when.
-///
-/// A shard scheduled to leave the trie divides like any other, in its
-/// final window too: a record cell follows its prefix to the successor,
-/// a claim or a delivery is a pull on whoever holds the prefix when it is
-/// made, and a crossing the delivery window closes on unclaimed is
-/// reclaimed on the successor's own proof of its absence. A rule that
-/// read the block's window here would flip at the boundary into that
-/// window while the trie did not, and two shards committing one
-/// transaction on either side of it froze different shapes.
-///
-/// One conjunct is the planner's own: a sink's edges all come from its
-/// own shard or none do, since a sink fed from both sides would need an
-/// arrival its own shard's issuing member could only hand it through a
-/// bundle to itself. Running whole is always correct, so such a shape
-/// takes that.
-#[must_use]
-pub fn decomposes(legs: &[LegShape], owners: &[Address], trie: &ShardTrie) -> Decomposed {
-    let resolver = TrieShardResolver { trie };
-    let star = star_at(legs, &resolver);
-    Decomposed(
-        star.decomposes(legs, owners, &resolver)
-            && no_sink_is_fed_from_both_sides(legs, &star, trie),
-    )
-}
-
-/// Whether every outbound leg's producers all run where it does, or none
-/// do.
-fn no_sink_is_fed_from_both_sides(legs: &[LegShape], star: &StarShape, trie: &ShardTrie) -> bool {
-    let core: BTreeSet<ShardId> = star
-        .core
-        .iter()
-        .map(|shard| ShardId::from_heap_index(shard.0))
-        .collect();
-    let running = |node: u32| -> BTreeSet<ShardId> {
-        match star.roles.get(node as usize).copied().unwrap_or_default() {
-            LegRole::Core => core.clone(),
-            LegRole::Inbound | LegRole::Outbound | LegRole::Attesting => legs
-                .get(node as usize)
-                .map(|leg| trie.shard_for_prefix(leg.target))
-                .into_iter()
-                .collect(),
-        }
-    };
-    legs.iter().zip(&star.roles).all(|(leg, role)| {
-        if *role != LegRole::Outbound {
-            return true;
-        }
-        let home = trie.shard_for_prefix(leg.target);
-        let beside: BTreeSet<bool> = leg
-            .edges
-            .iter()
-            .map(|edge| running(edge.source).contains(&home))
-            .collect();
-        beside.len() <= 1
-    })
 }
 
 /// One value edge whose producer and consumer do not run together.
@@ -1063,6 +1025,29 @@ impl<'a> Star<'a> {
 
     fn consumer_of(&self, node: u32, output: u32) -> Option<u32> {
         self.consumers.get(&(node, output)).copied()
+    }
+
+    /// Whether every sink's producers all run where it does, or none do.
+    ///
+    /// A sink fed from both sides has no member that can run it: its
+    /// shard's issuing member would have to hand it the local edge
+    /// through a bundle to itself, and its delivering member waits on an
+    /// arrival that edge never produces. Read off the settled roles, so
+    /// a leg folded into the core is asked about where the core runs
+    /// rather than where its own prefix sits.
+    fn no_sink_is_fed_from_both_sides(&self) -> bool {
+        (0u32..).zip(self.legs).all(|(node, leg)| {
+            if self.role(node) != LegRole::Outbound {
+                return true;
+            }
+            let home = self.home(node);
+            let beside: BTreeSet<bool> = leg
+                .edges
+                .iter()
+                .map(|edge| self.running(edge.source).contains(&home))
+                .collect();
+            beside.len() <= 1
+        })
     }
 
     /// What `local` judges: the core set if it is in it, itself
@@ -1619,10 +1604,19 @@ mod tests {
             leg(alice, LegRole::Inbound, &[], 3),
             leg(alice, LegRole::Outbound, &[(2, 0), (3, 0)], 4),
         ];
-        assert!(!decomposes(&legs, &[], &trie()).holds());
+        let whole = Classified::freeze(&legs, &[], &trie());
+        assert!(!whole.decomposed().holds());
+        assert!(
+            !whole.delivers_at(low()) && !whole.mixed_at(low()),
+            "a whole shape gives the sink's shard no second member to wait on it"
+        );
         let mut one_sided = legs;
         one_sided[4] = leg(alice, LegRole::Outbound, &[(2, 0)], 4);
         one_sided[3] = leg(alice, LegRole::Outbound, &[], 3);
-        assert!(decomposes(&one_sided, &[], &trie()).holds());
+        assert!(
+            Classified::freeze(&one_sided, &[], &trie())
+                .decomposed()
+                .holds()
+        );
     }
 }
