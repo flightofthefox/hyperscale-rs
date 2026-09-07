@@ -16,12 +16,10 @@
 use std::sync::{Arc, RwLock};
 
 use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
+use hyperscale_storage::AdoptSource;
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::Jmt;
-use hyperscale_storage::{AdoptSource, key_under_prefix};
-use hyperscale_types::{
-    Block, CertifiedBlock, ChainOrigin, Hash, LocalKey, StateRoot, SubstateKey, Verified,
-};
+use hyperscale_types::{Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified};
 
 use super::core::{SimImportStaging, SimShardStorage};
 use super::state::{ConsensusState, SharedState};
@@ -156,7 +154,8 @@ impl SimShardStorage {
                     ));
                 }
                 install_adoption(&mut shared, origin, node, root)?;
-                drop_foreign_sweep_rows(&mut shared);
+                let prefix = shared.tree_store.root_path();
+                shared.sweep_index.retain_under(&prefix);
                 root
             }
         };
@@ -187,32 +186,6 @@ impl SimShardStorage {
         consensus.committed_qc = None;
         consensus.chain_origin = origin;
     }
-}
-
-/// Drop the sweep-index rows of owners outside this store's prefix — the
-/// sibling half a split clone carries as dead weight.
-///
-/// Every other index over the cells is read owner-scoped, and a
-/// transaction on a child names only owners the child holds; the sweep
-/// enumerates the whole shard, so a foreign row would put the sibling's
-/// cells into the child's removals and move its root against a replica
-/// that snap-synced the same child, whose index holds only what it
-/// imported. Rows are keyed by owner, which makes the drop exact: an
-/// owner is wholly one child's or the other's, and the counts of what
-/// remains are untouched. The `RocksDB` backend prunes the same rows at
-/// the same point.
-fn drop_foreign_sweep_rows(shared: &mut SharedState) {
-    let prefix = shared.tree_store.root_path();
-    if prefix.is_empty() {
-        return;
-    }
-    shared.sweep_index.retain(|&(_, owner), _| {
-        let leaf = SubstateKey {
-            owner,
-            local: LocalKey([0; 16]),
-        };
-        key_under_prefix(&leaf.to_bytes(), &prefix)
-    });
 }
 
 /// Shared adoption tail: copy the child root node (when the side is
@@ -448,7 +421,7 @@ mod tests {
             WitnessSeed::default(),
         )
         .unwrap();
-        let all = SweepFrontier::start_of(SweepBucket(u32::MAX));
+        let all = SweepBucket(u32::MAX);
         assert_eq!(
             parent.sweep_candidates(SweepFrontier::ZERO, all, 10).len(),
             2,

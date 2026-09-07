@@ -12,7 +12,6 @@
 //! dot-prefixed temporary name and a rename, so a crash mid-create
 //! leaves only a `.tmp-*` directory, swept on the next creation.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -20,19 +19,19 @@ use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeK
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
     AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, LeafRows, SubstateStore, Substates,
-    WitnessSeed, followed_block_writes, holds_state, is_record_cell,
+    SweepRows, WitnessSeed, followed_block_writes, holds_state, is_record_cell,
 };
 use hyperscale_types::{Block, BlockHeight, ChainOrigin, StateRoot, SubstateKey, SubstateLeaf};
-use hyperscale_vm_types::{Address, CollectionId, SweepBucket};
+use hyperscale_vm_types::{Address, CollectionId};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{ColumnFamily, DB, Options, WriteBatch};
 use tracing::warn;
 
 use super::column_families::{
     ALL_COLUMN_FAMILIES, BeaconWitnessesCf, CfHandles, EntriesCf, ImportStagingCf, JmtNodesCf,
-    PackageArtifactsCf, StateCf, SubstateBytesCf, SweepIndexCf,
+    PackageArtifactsCf, StateCf, SubstateBytesCf,
 };
-use super::core::RocksDbShardStorage;
+use super::core::{RocksDbShardStorage, fold_sweep_rows};
 use super::entry_key::scan_entries;
 use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::jmt_stored::{StoredNode, StoredNodeKey, VersionedStoredNode};
@@ -40,7 +39,7 @@ use super::metadata::{read_jmt_metadata, write_jmt_metadata};
 use crate::StorageError;
 use crate::typed_cf::{
     ImportProgressEntry, TypedCf, batch_delete, batch_put, get, iter_all, meta_delete, meta_read,
-    meta_write, multi_get,
+    meta_write,
 };
 
 /// Write one import batch's leaves and re-derive every index that hangs
@@ -55,11 +54,11 @@ fn index_imported_leaves(
     batch: &mut WriteBatch,
     cf: &CfHandles<'_>,
     leaves: &[SubstateLeaf],
-) -> BTreeMap<(SweepBucket, Address), u32> {
+) -> SweepRows {
     let state_cf = StateCf::handle(cf);
     let entries_cf = EntriesCf::handle(cf);
     let artifacts_cf = PackageArtifactsCf::handle(cf);
-    let mut sweep_rows: BTreeMap<(SweepBucket, Address), u32> = BTreeMap::new();
+    let mut sweep_rows = SweepRows::default();
     for leaf in leaves {
         batch_put::<StateCf>(batch, state_cf, &leaf.key, &leaf.value);
         let LeafRows {
@@ -76,36 +75,9 @@ fn index_imported_leaves(
         if let Some(package) = package {
             batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, &leaf.value);
         }
-        if let Some(expiry) = sweep {
-            *sweep_rows
-                .entry((SweepBucket::of(expiry), leaf.key.owner))
-                .or_default() += 1;
-        }
+        sweep_rows.delta(leaf.key.owner, None, sweep);
     }
     sweep_rows
-}
-
-/// Add an import batch's sweepable-leaf counts to the sweep index.
-///
-/// Rows survive across batches — one owner's bucket can span several —
-/// so each fold reads what earlier batches left. Every batch is written
-/// before the next is built, so the read sees them.
-fn fold_sweep_rows(
-    db: &DB,
-    batch: &mut WriteBatch,
-    cf: &CfHandles<'_>,
-    rows: &BTreeMap<(SweepBucket, Address), u32>,
-) {
-    if rows.is_empty() {
-        return;
-    }
-    let sweep_cf = SweepIndexCf::handle(cf);
-    let keys: Vec<(SweepBucket, Address)> = rows.keys().copied().collect();
-    let held: Vec<Option<u32>> = multi_get::<SweepIndexCf>(db, sweep_cf, &keys);
-    for ((row, added), current) in rows.iter().zip(held) {
-        let count = current.unwrap_or(0).saturating_add(*added);
-        batch_put::<SweepIndexCf>(batch, sweep_cf, row, &count);
-    }
 }
 
 /// Queue the staging CF's full range and the progress record for
@@ -708,6 +680,8 @@ fn parse_entry_name(name: &str) -> Option<BlockHeight> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use blake3::hash as blake3_hash;
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{

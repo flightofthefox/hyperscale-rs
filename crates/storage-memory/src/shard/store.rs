@@ -5,11 +5,10 @@ use std::sync::Arc;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::lock_recover::read_or_recover;
 use hyperscale_storage::{
-    PackageArtifactStore, SubstateStore, Substates, SweepIndex, VersionedStore, sweepable_expiry,
+    PackageArtifactStore, SubstateStore, Substates, SweepIndex, SweepRows, VersionedStore,
 };
 use hyperscale_types::{
-    Address, BlockHeight, DeclaredRange, Hash, LocalKey, SWEEP_BUCKET_BYTES, StateRoot,
-    SubstateKey, SweepBucket, SweepFrontier,
+    BlockHeight, DeclaredRange, Hash, StateRoot, SubstateKey, SweepBucket, SweepFrontier,
 };
 
 use super::core::SimShardStorage;
@@ -128,53 +127,25 @@ impl TreeReader for SimShardStorage {
 impl SweepIndex for SimShardStorage {
     fn sweep_candidates(
         &self,
-        frontier: SweepFrontier,
-        ceiling: SweepFrontier,
+        after: SweepFrontier,
+        below: SweepBucket,
         limit: usize,
     ) -> Vec<(SubstateKey, u64)> {
-        if limit == 0 || frontier >= ceiling {
-            return Vec::new();
-        }
         let state = read_or_recover(&self.state);
-        let mut found = Vec::new();
-        // The index rows in (bucket, owner) order, then that pair's
-        // leaves in local order — the two walks composed are already
-        // sweep order, exactly as the RocksDB backend walks them.
-        for (&(bucket, owner), _) in state
-            .sweep_index
-            .range((SweepBucket(frontier.bucket().0), Address::MIN)..)
-        {
-            if bucket >= ceiling.bucket() || found.len() >= limit {
-                break;
-            }
-            let (lo, hi) = leaf_bucket_span(owner, bucket);
-            for (&key, value) in state.current_state.range(lo..=hi) {
-                if found.len() >= limit {
-                    break;
+        SweepRows::walk(
+            after,
+            below,
+            limit,
+            |bucket| state.sweep_index.from_bucket(bucket),
+            |lo, hi, each| {
+                for (&key, value) in state.current_state.range(lo..=hi) {
+                    if !each(key, value) {
+                        break;
+                    }
                 }
-                if SweepFrontier::of_leaf(key) > frontier
-                    && let Some(expiry) = sweepable_expiry(key, value)
-                {
-                    found.push((key, expiry));
-                }
-            }
-        }
-        found
+            },
+        )
     }
-}
-
-/// The lowest and highest keys one owner's cells in one bucket can take,
-/// the `BTreeMap` spelling of the `RocksDB` backend's raw-key bounds.
-fn leaf_bucket_span(owner: Address, bucket: SweepBucket) -> (SubstateKey, SubstateKey) {
-    let bounded = |fill: u8| {
-        let mut local = [fill; 16];
-        local[..SWEEP_BUCKET_BYTES].copy_from_slice(&bucket.to_bytes());
-        SubstateKey {
-            owner,
-            local: LocalKey(local),
-        }
-    };
-    (bounded(0x00), bounded(0xFF))
 }
 
 impl PackageArtifactStore for SimShardStorage {

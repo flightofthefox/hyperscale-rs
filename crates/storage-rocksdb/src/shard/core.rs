@@ -13,7 +13,7 @@
 //! On each commit, the JMT is updated and a new state root hash is
 //! computed.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -22,7 +22,7 @@ use hyperscale_hbor::from_slice;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_metrics::record_storage_read;
 use hyperscale_storage::{
-    BaseReadCache, GenesisCommit, JmtSnapshot, LeafRows, SubstateStore, Substates,
+    BaseReadCache, GenesisCommit, JmtSnapshot, LeafRows, SubstateStore, Substates, SweepRows,
     entry_leaf_value, pending_write, sweepable_expiry, tree,
 };
 use hyperscale_types::{
@@ -97,31 +97,33 @@ pub struct RocksDbShardStorage {
     pub(crate) vote_registers: Mutex<HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>>,
 }
 
-/// Move one cell's write across the sweep index's rows.
+/// Fold what a batch `moved` in the sweep index into the rows it holds.
 ///
-/// The index counts live sweepable cells per owner and bucket, so what
-/// matters is the expiry the cell carried before, `was`, and the one it
-/// carries after, `now`. A value equal to its prior is sweepable in
-/// exactly the same row, which is why the no-op writes the caller skips
-/// need no entry here either.
-fn record_sweep_delta(
-    deltas: &mut BTreeMap<(SweepBucket, Address), i64>,
-    key: SubstateKey,
-    was: Option<u64>,
-    now: Option<u64>,
-) {
-    if was == now {
+/// One read-modify-write per touched row, which is at most one per
+/// distinct owner a batch writes a sweepable cell for — never one per
+/// cell. A row that reaches zero is deleted, so the index holds exactly
+/// the pairs that have something in them and a sweep's walk skips
+/// nothing and visits nothing empty.
+///
+/// The read is against the persisted store rather than any pending
+/// overlay because the rows are a total over what has *committed*, and
+/// every batch that moved one has already been applied by the time this
+/// one is built.
+pub fn fold_sweep_rows(db: &DB, batch: &mut WriteBatch, cf: &CfHandles<'_>, moved: &SweepRows) {
+    if moved.is_empty() {
         return;
     }
-    if let Some(expiry) = was {
-        *deltas
-            .entry((SweepBucket::of(expiry), key.owner))
-            .or_default() -= 1;
-    }
-    if let Some(expiry) = now {
-        *deltas
-            .entry((SweepBucket::of(expiry), key.owner))
-            .or_default() += 1;
+    let sweep_cf = SweepIndexCf::handle(cf);
+    let rows: Vec<(SweepBucket, Address)> = moved.iter().map(|(row, _)| row).collect();
+    let held: Vec<Option<u32>> = multi_get::<SweepIndexCf>(db, sweep_cf, &rows);
+    for ((row, delta), held) in moved.iter().zip(held) {
+        let count = SweepRows::fold_row(row, i64::from(held.unwrap_or(0)), delta);
+        if count == 0 {
+            batch_delete::<SweepIndexCf>(batch, sweep_cf, &row);
+        } else {
+            let count = u32::try_from(count).expect("a sweep-index count fits its column");
+            batch_put::<SweepIndexCf>(batch, sweep_cf, &row, &count);
+        }
     }
 }
 
@@ -537,7 +539,7 @@ impl RocksDbShardStorage {
         // stale-set entry for this version in one shot.
         let history_key_codec = VersionedSubstateKeyCodec;
         let mut stale_history_keys: Vec<Vec<u8>> = Vec::new();
-        let mut sweep_deltas: BTreeMap<(SweepBucket, Address), i64> = BTreeMap::new();
+        let mut sweep_rows = SweepRows::default();
         let artifacts_cf = PackageArtifactsCf::handle(&cf);
         for ((key, change), prior_slot) in writes.cells().iter().zip(priors) {
             let prior =
@@ -555,7 +557,7 @@ impl RocksDbShardStorage {
             } = change
                 .as_deref()
                 .map_or_else(LeafRows::default, |bytes| LeafRows::of(*key, bytes));
-            record_sweep_delta(&mut sweep_deltas, *key, was, now);
+            sweep_rows.delta(key.owner, was, now);
             // A cell that self-identifies as a package lands its artifact
             // in the content-addressed index, in the same atomic batch as
             // the state that carries it.
@@ -602,7 +604,7 @@ impl RocksDbShardStorage {
             pending,
         );
 
-        self.append_sweep_rows_to_batch(batch, &cf, &sweep_deltas);
+        fold_sweep_rows(&self.db, batch, &cf, &sweep_rows);
 
         // Index the history keys by version so GC can delete them without
         // scanning StateHistoryCf. Skipped when write_history is false
@@ -614,52 +616,6 @@ impl RocksDbShardStorage {
                 &version,
                 &stale_history_keys,
             );
-        }
-    }
-
-    /// Fold this batch's sweep-index deltas into the rows they touch.
-    ///
-    /// One read-modify-write per touched `(bucket, owner)` pair, which
-    /// is at most one per distinct owner a block writes a sweepable cell
-    /// for — never one per cell. A row that reaches zero is deleted, so
-    /// the index holds exactly the pairs that have something in them and
-    /// a sweep's walk skips nothing and visits nothing empty.
-    ///
-    /// The read is against the persisted store rather than the pending
-    /// overlay because the rows are a total over what has *committed*,
-    /// and every batch that moved one has already been applied by the
-    /// time this one is built.
-    ///
-    /// # Panics
-    ///
-    /// If a row would go negative, which means the index disagrees with
-    /// the leaves it is derived from — the same class of fault as the
-    /// byte total's checked add, and caught here rather than allowed to
-    /// under-report a sweep's candidates.
-    fn append_sweep_rows_to_batch(
-        &self,
-        batch: &mut WriteBatch,
-        cf: &CfHandles<'_>,
-        deltas: &BTreeMap<(SweepBucket, Address), i64>,
-    ) {
-        if deltas.is_empty() {
-            return;
-        }
-        let sweep_cf = SweepIndexCf::handle(cf);
-        let rows: Vec<(SweepBucket, Address)> = deltas.keys().copied().collect();
-        let current: Vec<Option<u32>> = multi_get::<SweepIndexCf>(&*self.db, sweep_cf, &rows);
-        for ((row, delta), held) in deltas.iter().zip(current) {
-            let count = i64::from(held.unwrap_or(0))
-                .checked_add(*delta)
-                .expect("a sweep-index count stays inside i64");
-            let count = u32::try_from(count).unwrap_or_else(|_| {
-                panic!("sweep index for {row:?} went to {count}, so it disagrees with the leaves")
-            });
-            if count == 0 {
-                batch_delete::<SweepIndexCf>(batch, sweep_cf, row);
-            } else {
-                batch_put::<SweepIndexCf>(batch, sweep_cf, row, &count);
-            }
         }
     }
 

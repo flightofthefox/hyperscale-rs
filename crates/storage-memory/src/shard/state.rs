@@ -6,13 +6,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
-use hyperscale_storage::{JmtSnapshot, LeafRows, entry_leaf_rows, sweepable_expiry};
+use hyperscale_storage::{JmtSnapshot, LeafRows, SweepRows, entry_leaf_rows, sweepable_expiry};
 use hyperscale_types::{
-    Address, Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt,
-    EntryKey, ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash,
-    ProvisionHash, Provisions, QuorumCertificate, RETENTION_HORIZON, SafeVoteRegisters,
-    SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, SweepBucket, TickId,
-    Transaction, TxHash, ValidatorId, WeightedTimestamp,
+    Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, EntryKey,
+    ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash,
+    Provisions, QuorumCertificate, RETENTION_HORIZON, SafeVoteRegisters, SettledWrites,
+    ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, TickId, Transaction, TxHash,
+    ValidatorId, WeightedTimestamp,
 };
 
 use super::tree_store::SimTreeStore;
@@ -65,12 +65,10 @@ pub struct SharedState {
     /// cell that self-identifies as a package lands its bytes here in
     /// the same application that lands the cell.
     pub package_artifacts: BTreeMap<Hash, Vec<u8>>,
-    /// How many live sweepable cells each owner holds in each expiry
-    /// bucket — the mirror of the `RocksDB` backend's sweep index, fed
+    /// The sweep index — the mirror of the `RocksDB` backend's, fed
     /// from the same judgement so both backends enumerate the same
-    /// candidates. Bucket-major, because a sweep walks by expiry and
-    /// `current_state` is owner-major.
-    pub sweep_index: BTreeMap<(SweepBucket, Address), u32>,
+    /// candidates.
+    pub sweep_index: SweepRows,
 }
 
 impl SharedState {
@@ -119,7 +117,7 @@ impl SharedState {
             retention_floor: 0,
             substate_bytes: BTreeMap::new(),
             package_artifacts: BTreeMap::new(),
-            sweep_index: BTreeMap::new(),
+            sweep_index: SweepRows::default(),
         }
     }
 
@@ -361,6 +359,7 @@ pub fn apply_writes(
     // Each entry's leaf row rides the same state/history pipeline a
     // cell does; the index rows beside them keep range scans native.
     let leaf_rows = entry_leaf_rows(writes.entries());
+    let mut sweep_rows = SweepRows::default();
     for (key, change) in writes.cells().iter().chain(&leaf_rows) {
         let prior = state.current_state.get(key).cloned();
         // Of the prior's rows only the sweep row moves: the package
@@ -379,30 +378,7 @@ pub fn apply_writes(
         if let (Some(package), Some(value)) = (package, change) {
             state.package_artifacts.insert(package, value.clone());
         }
-        // The sweep index counts live sweepable cells per owner and
-        // bucket, moved by whatever the write changes the cell into.
-        if was != now {
-            if let Some(expiry) = was {
-                let row = (SweepBucket::of(expiry), key.owner);
-                let count = state
-                    .sweep_index
-                    .get(&row)
-                    .copied()
-                    .expect("a sweepable cell was counted when it was written")
-                    - 1;
-                if count == 0 {
-                    state.sweep_index.remove(&row);
-                } else {
-                    state.sweep_index.insert(row, count);
-                }
-            }
-            if let Some(expiry) = now {
-                *state
-                    .sweep_index
-                    .entry((SweepBucket::of(expiry), key.owner))
-                    .or_default() += 1;
-            }
-        }
+        sweep_rows.delta(key.owner, was, now);
         if write_history {
             state.state_history.insert((*key, version), prior);
         }
@@ -415,6 +391,7 @@ pub fn apply_writes(
             }
         }
     }
+    state.sweep_index.fold(&sweep_rows);
     for (key, change) in writes.entries() {
         let prior = state.current_entries.get(key).cloned();
         if write_history {

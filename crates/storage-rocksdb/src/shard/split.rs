@@ -20,10 +20,9 @@ use std::sync::Arc;
 
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::Jmt;
-use hyperscale_storage::{AdoptSource, key_under_prefix};
+use hyperscale_storage::{AdoptSource, SweepRows};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, CertifiedBlock, ChainOrigin, Hash, LocalKey, StateRoot,
-    SubstateKey, Verified,
+    BeaconWitnessLeafCount, Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified,
 };
 use rocksdb::WriteBatch;
 use rocksdb::checkpoint::Checkpoint;
@@ -190,41 +189,16 @@ impl RocksDbShardStorage {
         Ok(adopted)
     }
 
-    /// Drop the sweep-index rows this store no longer owns.
-    ///
-    /// Adoption re-roots the tree at a subtree but leaves the cell
-    /// column whole, so a child's `StateCf` is a superset of its own
-    /// leaves — the sibling's cells are still sitting in it. Every other
-    /// index survives that because every other index is read
-    /// owner-scoped, and a transaction on a child names only owners the
-    /// child holds. A sweep is the first walk that enumerates the whole
-    /// shard, so it is the first to meet them.
-    ///
-    /// Rows are keyed by owner, which makes the fix exact: a row whose
-    /// owner is outside this store's prefix belongs wholly to a sibling,
-    /// so dropping it drops the sibling's cells from the walk and leaves
-    /// the counts of what remains untouched. Nothing has to filter
-    /// afterwards — a surviving row's owner is one whose every cell is
-    /// this store's.
-    ///
-    /// A replica that snap-syncs the same child instead of cloning it
-    /// rebuilds the index from the leaves it imported and so holds these
-    /// rows and no others. That the two agree is what makes the removal
-    /// set a function of committed state rather than of how a node got
-    /// there.
+    /// Drop the sweep-index rows of owners outside this store's prefix —
+    /// the sibling half a split clone carries as dead weight; see
+    /// [`SweepRows::retain_under`].
     fn drop_foreign_sweep_rows(&self, cf: &CfHandles, batch: &mut WriteBatch) {
-        if self.root_path.is_empty() {
-            return;
-        }
         let sweep_cf = SweepIndexCf::handle(cf);
-        for ((bucket, owner), _) in iter_all::<SweepIndexCf>(&self.db, sweep_cf) {
-            let leaf = SubstateKey {
-                owner,
-                local: LocalKey([0; 16]),
-            };
-            if !key_under_prefix(&leaf.to_bytes(), &self.root_path) {
-                batch_delete::<SweepIndexCf>(batch, sweep_cf, &(bucket, owner));
-            }
+        let mut rows: SweepRows = iter_all::<SweepIndexCf>(&self.db, sweep_cf)
+            .map(|(row, count)| (row, i64::from(count)))
+            .collect();
+        for row in rows.retain_under(&self.root_path) {
+            batch_delete::<SweepIndexCf>(batch, sweep_cf, &row);
         }
     }
 
@@ -524,7 +498,7 @@ mod tests {
         )
         .unwrap();
         let (parent_version, _) = parent.read_jmt_metadata();
-        let all = SweepFrontier::start_of(SweepBucket(u32::MAX));
+        let all = SweepBucket(u32::MAX);
         assert_eq!(
             parent.sweep_candidates(SweepFrontier::ZERO, all, 10).len(),
             2,

@@ -1042,7 +1042,7 @@ where
     let (low_owner, high_owner, late) = (cells[1], cells[0], cells[2]);
     let expected = vec![low_owner, high_owner, late];
 
-    let all = SweepFrontier::start_of(SweepBucket(u32::MAX));
+    let all = SweepBucket(u32::MAX);
     assert_eq!(
         storage.sweep_candidates(SweepFrontier::ZERO, all, 10),
         expected,
@@ -1052,7 +1052,11 @@ where
     // The ceiling excludes the clock's own bucket and everything above.
     let clock = WeightedTimestamp::from_millis(4 * bucket_ms);
     assert_eq!(
-        storage.sweep_candidates(SweepFrontier::ZERO, SweepFrontier::ceiling_at(clock), 10),
+        storage.sweep_candidates(
+            SweepFrontier::ZERO,
+            SweepFrontier::ceiling_at(clock).bucket(),
+            10
+        ),
         vec![low_owner, high_owner],
     );
 

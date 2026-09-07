@@ -22,7 +22,8 @@ use hyperscale_types::{
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, DeclaredRange, ExecutionCertificate,
     Finalization, FinalizationHash, Hash, PreparedCommit, Provisions, QuorumCertificate,
     SafeVoteRegisters, SettledWrites, ShardWitnessPayload, StateRoot, SubstateKey, SubstateLeaf,
-    SweepFrontier, TickId, Transaction, TxHash, ValidatorId, Verifiable, Verified, VotePosition,
+    SweepBucket, SweepFrontier, TickId, Transaction, TxHash, ValidatorId, Verifiable, Verified,
+    VotePosition,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -66,11 +67,11 @@ impl std::ops::Deref for SharedStorage {
 impl SweepIndex for SharedStorage {
     fn sweep_candidates(
         &self,
-        frontier: SweepFrontier,
-        ceiling: SweepFrontier,
+        after: SweepFrontier,
+        below: SweepBucket,
         limit: usize,
     ) -> Vec<(SubstateKey, u64)> {
-        self.0.sweep_candidates(frontier, ceiling, limit)
+        self.0.sweep_candidates(after, below, limit)
     }
 }
 

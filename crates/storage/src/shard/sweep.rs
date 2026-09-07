@@ -12,17 +12,17 @@ use std::sync::Arc;
 
 use hyperscale_jmt::NibblePath;
 use hyperscale_types::{
-    Block, MAX_SWEEP_PER_BLOCK, SettledWrites, ShardId, ShardTrie, StoredReceipt, SubstateKey,
-    SweepBucket, SweepFrontier, Transaction, TxHash, WeightedTimestamp, protocol_statics,
-    protocol_statics_installed,
+    Address, Block, LocalKey, MAX_SWEEP_PER_BLOCK, SWEEP_BUCKET_BYTES, SettledWrites, ShardId,
+    ShardTrie, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, Transaction, TxHash,
+    WeightedTimestamp, protocol_statics, protocol_statics_installed,
 };
 use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
 use hyperscale_vm_types::ARTIFACT_GRACE_MS;
 
 use crate::tree::JmtSnapshot;
 use crate::{
-    Anchored, filter_state_writes_to_prefix, filter_writes_to_prefix, merge_receipts,
-    merge_writes_from_receipts, settle_writes,
+    Anchored, filter_state_writes_to_prefix, filter_writes_to_prefix, key_under_prefix,
+    merge_receipts, merge_writes_from_receipts, settle_writes,
 };
 
 /// When a committed cell stops being needed, or `None` for every cell a
@@ -61,38 +61,241 @@ pub fn is_record_cell(key: SubstateKey, value: &[u8]) -> bool {
         && protocol_statics().record_cell(key.owner.to_bytes(), key.local.0, value)
 }
 
+/// One row of the sweep index: an owner holding sweepable cells in a
+/// bucket.
+pub type SweepRow = (SweepBucket, Address);
+
+/// The sweep index's rows: how many live sweepable cells each owner
+/// holds in each expiry bucket, bucket-major so a sweep walks by expiry
+/// over a keyspace that is owner-major.
+///
+/// Derived state — the leaves are the authority — kept because nothing
+/// about a leaf key lets a walk find the next cell to expire. What a
+/// row answers is which owners hold cells in which bucket; which cells
+/// is the leaves' own answer, since the bucket leads a sweepable cell's
+/// local half and one row's cells are a contiguous leaf-key range.
+///
+/// Signed, because one shape carries both what a batch moves and what a
+/// store holds: the movement folds into the total through
+/// [`SweepRows::fold`], which is where a row that would go negative —
+/// an index disagreeing with the leaves it derives from — is caught.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepRows(BTreeMap<SweepRow, i64>);
+
+impl SweepRows {
+    /// Move one cell's write across the rows: `was` is the expiry the
+    /// prior value carried, `now` the one the written value carries. A
+    /// value sweepable in the same row as its prior moves nothing, which
+    /// is why the no-op writes a backend skips need no entry here either.
+    pub fn delta(&mut self, owner: Address, was: Option<u64>, now: Option<u64>) {
+        if was == now {
+            return;
+        }
+        if let Some(expiry) = was {
+            self.add((SweepBucket::of(expiry), owner), -1);
+        }
+        if let Some(expiry) = now {
+            self.add((SweepBucket::of(expiry), owner), 1);
+        }
+    }
+
+    fn add(&mut self, row: SweepRow, by: i64) {
+        let count = self.0.entry(row).or_default();
+        *count += by;
+        if *count == 0 {
+            self.0.remove(&row);
+        }
+    }
+
+    /// Whether no row moved, or none is held.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The rows in walk order, each with its count.
+    pub fn iter(&self) -> impl Iterator<Item = (SweepRow, i64)> + '_ {
+        self.0.iter().map(|(row, count)| (*row, *count))
+    }
+
+    /// The rows from `bucket` on, in walk order.
+    pub fn from_bucket(&self, bucket: SweepBucket) -> impl Iterator<Item = SweepRow> + '_ {
+        self.0.range((bucket, Address::MIN)..).map(|(row, _)| *row)
+    }
+
+    /// Fold what a batch `moved` into this total. A row that empties is
+    /// dropped, so the index holds exactly the pairs that have something
+    /// in them and a walk visits nothing empty.
+    ///
+    /// # Panics
+    ///
+    /// If a row would go negative; see [`SweepRows::fold_row`].
+    pub fn fold(&mut self, moved: &Self) {
+        for (row, delta) in moved.iter() {
+            let held = self.0.get(&row).copied().unwrap_or(0);
+            match Self::fold_row(row, held, delta) {
+                0 => {
+                    self.0.remove(&row);
+                }
+                count => {
+                    self.0.insert(row, count);
+                }
+            }
+        }
+    }
+
+    /// The count `row` holds once `delta` moves `held`; zero means the
+    /// row empties.
+    ///
+    /// # Panics
+    ///
+    /// If the count would go negative, which means the index disagrees
+    /// with the leaves it is derived from — the same class of fault as
+    /// the byte total's checked add, and caught here rather than allowed
+    /// to under-report a sweep's candidates.
+    #[must_use]
+    pub fn fold_row(row: SweepRow, held: i64, delta: i64) -> i64 {
+        let count = held
+            .checked_add(delta)
+            .expect("a sweep-index count stays inside i64");
+        assert!(
+            count >= 0,
+            "sweep index for {row:?} went to {count}, so it disagrees with the leaves"
+        );
+        count
+    }
+
+    /// Keep the rows of owners under `prefix`, returning the rows
+    /// dropped.
+    ///
+    /// A reshape adoption re-roots the tree at a subtree but leaves the
+    /// cell column whole, so a split child's cells are a superset of its
+    /// own leaves — the sibling's are still sitting in it. Every other
+    /// index survives that because every other index is read
+    /// owner-scoped, and a transaction on a child names only owners the
+    /// child holds. A sweep is the one walk that enumerates the whole
+    /// shard, so it is the one to meet them.
+    ///
+    /// Rows are keyed by owner, which makes the drop exact: an owner is
+    /// wholly one child's or the other's, so dropping its row drops the
+    /// sibling's cells from the walk and leaves the counts of what
+    /// remains untouched. A replica that snap-syncs the same child
+    /// instead of cloning it rebuilds the index from the leaves it
+    /// imported and so holds these rows and no others; that the two
+    /// agree is what makes a removal set a function of committed state
+    /// rather than of how a node got there.
+    pub fn retain_under(&mut self, prefix: &NibblePath) -> Vec<SweepRow> {
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+        let (kept, dropped): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut self.0)
+            .into_iter()
+            .partition(|((_, owner), _)| owner_under(*owner, prefix));
+        self.0 = kept;
+        dropped.into_keys().collect()
+    }
+
+    /// The sweep walk, over rows and leaves read however a backend reads
+    /// them: the sweepable cells strictly after `after` and in buckets
+    /// strictly below `below`, in sweep order, at most `limit` of them,
+    /// each with the expiry its value carries.
+    ///
+    /// Index rows from `after`'s bucket in `(bucket, owner)` order, then
+    /// that pair's leaves in local order. The two walks composed are
+    /// already sweep order, so nothing sorts and stopping at `limit` is
+    /// stopping rather than discarding — what makes the cap a bound on
+    /// work and not only on output. `rows_from(bucket)` reads the rows
+    /// from `bucket` on; `leaves_between(lo, hi, each)` visits one row's
+    /// leaves in `lo..=hi` until `each` answers `false`.
+    pub fn walk<Rows>(
+        after: SweepFrontier,
+        below: SweepBucket,
+        limit: usize,
+        rows_from: impl FnOnce(SweepBucket) -> Rows,
+        mut leaves_between: impl FnMut(
+            SubstateKey,
+            SubstateKey,
+            &mut dyn FnMut(SubstateKey, &[u8]) -> bool,
+        ),
+    ) -> Vec<(SubstateKey, u64)>
+    where
+        Rows: IntoIterator<Item = SweepRow>,
+    {
+        if limit == 0 || after.bucket() >= below {
+            return Vec::new();
+        }
+        let mut found = Vec::new();
+        for (bucket, owner) in rows_from(after.bucket()) {
+            if bucket >= below || found.len() >= limit {
+                break;
+            }
+            let (lo, hi) = leaf_span(owner, bucket);
+            leaves_between(lo, hi, &mut |key, value| {
+                if SweepFrontier::of_leaf(key) > after
+                    && let Some(expiry) = sweepable_expiry(key, value)
+                {
+                    found.push((key, expiry));
+                }
+                found.len() < limit
+            });
+        }
+        found
+    }
+}
+
+impl FromIterator<(SweepRow, i64)> for SweepRows {
+    fn from_iter<I: IntoIterator<Item = (SweepRow, i64)>>(rows: I) -> Self {
+        Self(rows.into_iter().filter(|(_, count)| *count != 0).collect())
+    }
+}
+
+/// Whether every cell of `owner` sits under `prefix`: a leaf key leads
+/// with its owner, so an owner is wholly one prefix's.
+fn owner_under(owner: Address, prefix: &NibblePath) -> bool {
+    let leaf = SubstateKey {
+        owner,
+        local: LocalKey([0; 16]),
+    };
+    key_under_prefix(&leaf.to_bytes(), prefix)
+}
+
+/// The lowest and highest keys one owner's cells in one bucket can
+/// take: the bucket leads a sweepable cell's local half, so the pair is
+/// a prefix of the leaf key and the span is that prefix with the rest of
+/// the local half at its two extremes.
+fn leaf_span(owner: Address, bucket: SweepBucket) -> (SubstateKey, SubstateKey) {
+    let bounded = |fill: u8| {
+        let mut local = [fill; 16];
+        local[..SWEEP_BUCKET_BYTES].copy_from_slice(&bucket.to_bytes());
+        SubstateKey {
+            owner,
+            local: LocalKey(local),
+        }
+    };
+    (bounded(0x00), bounded(0xFF))
+}
+
 /// Read access to the sweepable cells this store's committed state
 /// holds, in sweep order.
-///
-/// Derived state — the leaves are the authority — kept because the
-/// keyspace is owner-major and always will be, so nothing about a leaf
-/// key lets a walk find the next cell to expire. What the index answers
-/// is which owners hold cells in which bucket; which cells is a question
-/// the leaves answer for themselves, since the bucket leads a sweepable
-/// cell's local half and one owner's bucket is a contiguous range.
 ///
 /// The default is the empty index, for stores that never commit one
 /// (test doubles, ephemeral views).
 pub trait SweepIndex {
-    /// The sweepable cells strictly after `frontier` and strictly below
-    /// `ceiling`, in sweep order, at most `limit` of them, each with the
-    /// expiry its value carries.
+    /// The sweepable cells strictly after `after` and in buckets
+    /// strictly below `below`, in sweep order, at most `limit` of them,
+    /// each with the expiry its value carries — [`SweepRows::walk`] over
+    /// this store's rows and leaves.
     ///
-    /// Ascending in [`SweepFrontier`] order, which is the order the
-    /// index and the leaves are already stored in, so the walk sorts
-    /// nothing and stopping at `limit` is stopping rather than
-    /// discarding. That is what makes the cap a bound on work and not
-    /// only on output.
-    ///
-    /// `ceiling` is exclusive and is a bucket boundary, so every cell
-    /// this returns is in a bucket wholly in the past.
+    /// `below` is a bucket rather than a position because a block's
+    /// ceiling is always a bucket boundary: every cell this returns is
+    /// in a bucket wholly in the past.
     fn sweep_candidates(
         &self,
-        frontier: SweepFrontier,
-        ceiling: SweepFrontier,
+        after: SweepFrontier,
+        below: SweepBucket,
         limit: usize,
     ) -> Vec<(SubstateKey, u64)> {
-        let _ = (frontier, ceiling, limit);
+        let _ = (after, below, limit);
         Vec::new()
     }
 }
@@ -132,7 +335,7 @@ pub fn sweep_for_block(
     if parent_frontier >= ceiling {
         return (Vec::new(), parent_frontier);
     }
-    let found = store.sweep_candidates(parent_frontier, ceiling, MAX_SWEEP_PER_BLOCK);
+    let found = store.sweep_candidates(parent_frontier, ceiling.bucket(), MAX_SWEEP_PER_BLOCK);
     let capped = found.len() >= MAX_SWEEP_PER_BLOCK;
     let frontier = match found.last() {
         Some((key, _)) if capped => SweepFrontier::of_leaf(*key),
@@ -159,11 +362,11 @@ pub fn sweep_for_block(
 pub fn merge_sweep_overlay(
     base: impl FnOnce(usize) -> Vec<(SubstateKey, u64)>,
     overlay: &[Arc<JmtSnapshot>],
-    frontier: SweepFrontier,
-    ceiling: SweepFrontier,
+    after: SweepFrontier,
+    below: SweepBucket,
     limit: usize,
 ) -> Vec<(SubstateKey, u64)> {
-    if limit == 0 || frontier >= ceiling {
+    if limit == 0 || after.bucket() >= below {
         return Vec::new();
     }
     // What the unpersisted chain says about cells in the interval, latest
@@ -172,7 +375,7 @@ pub fn merge_sweep_overlay(
     for snapshot in overlay {
         for (key, change) in snapshot.settled.cells() {
             let position = SweepFrontier::of_leaf(*key);
-            if position <= frontier || position >= ceiling {
+            if position <= after || position.bucket() >= below {
                 continue;
             }
             touched.insert(
@@ -262,7 +465,7 @@ pub fn sweep_through(
     if parent_frontier >= frontier {
         return Vec::new();
     }
-    let past = SweepFrontier::start_of(SweepBucket(frontier.bucket().0.saturating_add(1)));
+    let past = SweepBucket(frontier.bucket().0.saturating_add(1));
     store
         .sweep_candidates(parent_frontier, past, usize::MAX)
         .into_iter()
@@ -393,9 +596,7 @@ const fn committed_tx_expiry_ms(validity_end: WeightedTimestamp) -> u64 {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
-    use hyperscale_types::{
-        Address, AddressClass, BlockHeight, SWEEP_BUCKET_MS, StateRoot, SweepBucket,
-    };
+    use hyperscale_types::{AddressClass, BlockHeight, SWEEP_BUCKET_MS, StateRoot};
 
     use super::*;
     use crate::CollectedWrites;
@@ -430,8 +631,106 @@ mod tests {
         ))
     }
 
-    fn all() -> SweepFrontier {
-        SweepFrontier::start_of(SweepBucket(u32::MAX))
+    fn all() -> SweepBucket {
+        SweepBucket(u32::MAX)
+    }
+
+    /// The span covers exactly the bucket's leaves of one owner: every
+    /// body inside, neither neighbouring bucket, and no other owner —
+    /// which is what makes the pair the unit the index rows count.
+    #[test]
+    fn a_leaf_span_covers_a_buckets_leaves_and_no_others() {
+        let (lo, hi) = leaf_span(owner(3), SweepBucket(9));
+        let leaf = |bucket: u32, body: u8| {
+            let mut local = [body; 16];
+            local[..SWEEP_BUCKET_BYTES].copy_from_slice(&bucket.to_be_bytes());
+            SubstateKey {
+                owner: owner(3),
+                local: LocalKey(local),
+            }
+        };
+        for body in [0x00, 0x7F, 0xFF] {
+            let inside = leaf(9, body);
+            assert!(lo <= inside && inside <= hi, "body {body:02x}");
+        }
+        assert!(leaf(8, 0xFF) < lo);
+        assert!(leaf(10, 0x00) > hi);
+        let elsewhere = SubstateKey {
+            owner: owner(4),
+            local: LocalKey([0; 16]),
+        };
+        assert!(elsewhere > hi);
+    }
+
+    /// One shape carries a batch's movement and a store's total: a
+    /// cell's write moves a row by one, a rewrite in the same row moves
+    /// nothing, and folding the movement empties the row it drains.
+    #[test]
+    fn rows_move_by_what_a_write_changes_and_fold_into_the_total() {
+        let mut total = SweepRows::default();
+        let mut moved = SweepRows::default();
+        moved.delta(owner(1), None, Some(3 * SWEEP_BUCKET_MS));
+        moved.delta(owner(1), None, Some(3 * SWEEP_BUCKET_MS + 1));
+        moved.delta(
+            owner(2),
+            Some(5 * SWEEP_BUCKET_MS),
+            Some(5 * SWEEP_BUCKET_MS + 9),
+        );
+        assert_eq!(
+            moved.iter().collect::<Vec<_>>(),
+            vec![((SweepBucket(3), owner(1)), 2)],
+            "a rewrite inside one bucket moves nothing",
+        );
+        total.fold(&moved);
+
+        let mut retired = SweepRows::default();
+        retired.delta(owner(1), Some(3 * SWEEP_BUCKET_MS), None);
+        total.fold(&retired);
+        assert_eq!(
+            total.from_bucket(SweepBucket(0)).collect::<Vec<_>>(),
+            vec![(SweepBucket(3), owner(1))],
+        );
+        total.fold(&retired);
+        assert!(total.is_empty(), "the row that drained is gone");
+    }
+
+    #[test]
+    #[should_panic(expected = "disagrees with the leaves")]
+    fn a_row_folding_below_zero_is_a_fault() {
+        let mut retired = SweepRows::default();
+        retired.delta(owner(1), Some(3 * SWEEP_BUCKET_MS), None);
+        SweepRows::default().fold(&retired);
+    }
+
+    /// Rows keep or go by their owner's prefix alone, and the rows that
+    /// went are handed back for a store whose index lives elsewhere.
+    #[test]
+    fn rows_outside_the_prefix_are_dropped_and_named() {
+        let mut left = NibblePath::empty();
+        left.push_bits(0, 1);
+        let under = Address::new([0x00; 31], AddressClass::Principal);
+        let outside = Address::new([0x80; 31], AddressClass::Principal);
+        let mut rows: SweepRows = [
+            ((SweepBucket(1), under), 1),
+            ((SweepBucket(1), outside), 1),
+            ((SweepBucket(2), outside), 3),
+        ]
+        .into_iter()
+        .collect();
+        let dropped = rows.retain_under(&left);
+        assert_eq!(
+            dropped,
+            vec![(SweepBucket(1), outside), (SweepBucket(2), outside)]
+        );
+        assert_eq!(
+            rows.iter().collect::<Vec<_>>(),
+            vec![((SweepBucket(1), under), 1)]
+        );
+        assert!(
+            SweepRows::default()
+                .retain_under(&NibblePath::empty())
+                .is_empty()
+        );
     }
 
     /// A cell an unpersisted ancestor created is one this block owes a
@@ -503,7 +802,7 @@ mod tests {
                 (above, Some(above_value)),
             ])],
             SweepFrontier::start_of(SweepBucket(3)),
-            SweepFrontier::start_of(SweepBucket(9)),
+            SweepBucket(9),
             10,
         );
         assert!(merged.is_empty());

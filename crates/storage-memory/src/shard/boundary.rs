@@ -13,12 +13,12 @@ use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
     AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, LeafRows, SubstateStore,
-    Substates, WitnessSeed, followed_block_writes, holds_state, is_record_cell,
+    Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state, is_record_cell,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryKey, StateRoot, SubstateKey, SubstateLeaf,
 };
-use hyperscale_vm_types::{Address, CollectionId, SweepBucket};
+use hyperscale_vm_types::{Address, CollectionId};
 
 use super::core::SimShardStorage;
 use super::snapshot::{entries_in_range_at, value_at_version};
@@ -192,6 +192,7 @@ impl BoundaryStore for SimShardStorage {
         for (key, node) in result.batch.new_nodes {
             state.tree_store.insert(key, Arc::new(node));
         }
+        let mut sweep_rows = SweepRows::default();
         for leaf in leaves {
             // Every index is derived state, rebuilt from the leaves
             // themselves: a row exists exactly where a leaf re-derives
@@ -211,14 +212,10 @@ impl BoundaryStore for SimShardStorage {
             if let Some(package) = package {
                 state.package_artifacts.insert(package, leaf.value.clone());
             }
-            if let Some(expiry) = sweep {
-                *state
-                    .sweep_index
-                    .entry((SweepBucket::of(expiry), leaf.key.owner))
-                    .or_default() += 1;
-            }
+            sweep_rows.delta(leaf.key.owner, None, sweep);
             state.current_state.insert(leaf.key, leaf.value);
         }
+        state.sweep_index.fold(&sweep_rows);
 
         // Seed the substate byte total: a fresh-tree import's byte delta IS
         // the imported leaves' value bytes.

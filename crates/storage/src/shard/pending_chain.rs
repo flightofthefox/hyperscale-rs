@@ -13,9 +13,9 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
     ConsensusReceipt, DeclaredRange, EntryKey, ExecutionCertificate, Finalization,
     FinalizationHash, QuorumCertificate, RETENTION_HORIZON, ShardId, ShardWitnessPayload,
-    StateRoot, SubstateKey, SweepFrontier, TerminalRoots, TickId, Transaction, TxHash, Verifiable,
-    Verified, WeightedTimestamp, committed_txs_root_from_hashes, local_settled_tx_hashes,
-    settled_txs_root_from_hashes,
+    StateRoot, SubstateKey, SweepBucket, SweepFrontier, TerminalRoots, TickId, Transaction, TxHash,
+    Verifiable, Verified, WeightedTimestamp, committed_txs_root_from_hashes,
+    local_settled_tx_hashes, settled_txs_root_from_hashes,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -987,8 +987,8 @@ impl<Snap: Substates> Anchored for ViewSnapshot<Snap> {
 impl<S: SubstateStore + VersionedStore + SweepIndex> SweepIndex for SubstateView<S> {
     fn sweep_candidates(
         &self,
-        frontier: SweepFrontier,
-        ceiling: SweepFrontier,
+        after: SweepFrontier,
+        below: SweepBucket,
         limit: usize,
     ) -> Vec<(SubstateKey, u64)> {
         // Resolved through the overlay, never against the persisted
@@ -1014,10 +1014,10 @@ impl<S: SubstateStore + VersionedStore + SweepIndex> SweepIndex for SubstateView
             self.base.jmt_height().inner(),
         );
         merge_sweep_overlay(
-            |widened| self.base.sweep_candidates(frontier, ceiling, widened),
+            |widened| self.base.sweep_candidates(after, below, widened),
             self.pending_snapshots(),
-            frontier,
-            ceiling,
+            after,
+            below,
             limit,
         )
     }
@@ -2297,7 +2297,7 @@ mod tests {
         });
         let view = SubstateView::base_only(store, BlockHeight::new(4));
         let ceiling = SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(u64::MAX));
-        let _ = view.sweep_candidates(SweepFrontier::ZERO, ceiling, 10);
+        let _ = view.sweep_candidates(SweepFrontier::ZERO, ceiling.bucket(), 10);
     }
 
     /// A store behind the anchor is what the overlay is for, and the walk
@@ -2311,7 +2311,7 @@ mod tests {
         let view = SubstateView::base_only(store, BlockHeight::new(9));
         let ceiling = SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(u64::MAX));
         assert!(
-            view.sweep_candidates(SweepFrontier::ZERO, ceiling, 10)
+            view.sweep_candidates(SweepFrontier::ZERO, ceiling.bucket(), 10)
                 .is_empty()
         );
     }
