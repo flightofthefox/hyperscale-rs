@@ -2705,16 +2705,18 @@ impl ExecutionCoordinator {
                     self.released_fetches.extend(released);
                     record_reclaim_probe_answered(inclusion.is_present());
                     let tx_hash = entry.tx_hash;
-                    actions.push(match inclusion {
+                    match inclusion {
                         // The counterpart took it, and its certificate
                         // says how. Its broadcast may have missed this
                         // shard, so it is fetched rather than waited for.
-                        Inclusion::Present(_) => Action::Fetch(FetchRequest::ExecutionCerts {
-                            source_shard: shard,
-                            tx_hash,
-                            preferred: None,
-                            class: None,
-                        }),
+                        Inclusion::Present(_) => {
+                            actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
+                                source_shard: shard,
+                                tx_hash,
+                                preferred: None,
+                                class: None,
+                            }));
+                        }
                         Inclusion::Absent => {
                             self.evidence.record(
                                 tx_hash,
@@ -2725,9 +2727,8 @@ impl ExecutionCoordinator {
                                     at: bundle.anchor.ts,
                                 },
                             );
-                            Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
                         }
-                    });
+                    }
                 }
             }
         }
@@ -2774,10 +2775,8 @@ impl ExecutionCoordinator {
         let mut actions = Vec::new();
         match heard.word {
             Word::Accepted { .. } => {
-                if consumes && self.evidence.record(tx_hash, shard, heard) {
-                    actions.push(Action::Continuation(
-                        ProtocolEvent::CounterpartEvidenceObserved,
-                    ));
+                if consumes {
+                    self.evidence.record(tx_hash, shard, heard);
                 }
                 if in_core && self.unresolved.record_acceptance(tx_hash, shard) {
                     actions.push(Action::Continuation(ProtocolEvent::TransactionsResolved {
@@ -2793,9 +2792,6 @@ impl ExecutionCoordinator {
                     && self.unresolved.unsettled_leg_figures(tx_hash).is_some()
                     && self.evidence.record(tx_hash, shard, heard)
                 {
-                    actions.push(Action::Continuation(
-                        ProtocolEvent::CounterpartEvidenceObserved,
-                    ));
                     actions.push(Action::Continuation(ProtocolEvent::TransactionsResolved {
                         resolutions: vec![(tx_hash, TxResolution::CoreDecided(decision))],
                     }));
@@ -7930,7 +7926,8 @@ mod tests {
         let anchor = WeightedTimestamp::from_millis(7_000);
         let digest = Hash::from_bytes(b"digest");
         let verdict = refused(anchor, digest);
-        let actions = state.fold_verdict(PEER, tx_hash, verdict);
+        let before = state.evidence.generation();
+        state.fold_verdict(PEER, tx_hash, verdict);
 
         assert_eq!(
             state.evidence.heard(tx_hash, PEER, Question::Verdict),
@@ -7938,11 +7935,8 @@ mod tests {
             "the chain's own word reaches the mirror the record fence reads",
         );
         assert!(
-            actions.iter().any(|action| matches!(
-                action,
-                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
-            )),
-            "and the vote fence is told, as a broadcast would have told it: {actions:?}",
+            state.evidence.generation() > before,
+            "and the mirror's generation moves, which is what re-drives the vote fence"
         );
 
         // The fold is first-write-wins, as the chain's answer is: a
@@ -8019,6 +8013,7 @@ mod tests {
                 SignerBitfield::new(4),
             )))
         };
+        let before = state.evidence.generation();
         let actions = state.handle_attestation(&schedule, &certificate(ExecutionOutcome::Failed));
         let word = refused(
             WeightedTimestamp::from_millis(7_000),
@@ -8030,11 +8025,8 @@ mod tests {
             "the refusal reaches the mirror the vote fence reads"
         );
         assert!(
-            actions.iter().any(|action| matches!(
-                action,
-                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
-            )),
-            "and the fence is told to re-drive the votes that deferred without it"
+            state.evidence.generation() > before,
+            "and the mirror's generation moves, re-driving the votes that deferred without it"
         );
         assert_eq!(
             state.pending_abandonment_records(),
@@ -8098,17 +8090,16 @@ mod tests {
                 Vec::new(),
             ),
         );
+        let before = accepting.evidence.generation();
         let actions = accepting.handle_attestation(
             &schedule,
             &certificate(ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
             }),
         );
-        assert!(
-            !actions.iter().any(|action| matches!(
-                action,
-                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
-            )),
+        assert_eq!(
+            accepting.evidence.generation(),
+            before,
             "a success is not a refusal"
         );
         assert!(accepting.pending_abandonment_records().is_empty());
@@ -8643,7 +8634,8 @@ mod tests {
             "a proof taken before the deadline says nothing: the core may still commit"
         );
 
-        let folded = commit_carrying(
+        let before = state.evidence.generation();
+        commit_carrying(
             &mut state,
             &schedule,
             2,
@@ -8651,11 +8643,8 @@ mod tests {
             vec![bundle.clone()],
         );
         assert!(
-            folded.iter().any(|action| matches!(
-                action,
-                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
-            )),
-            "the fence is told the absence landed"
+            state.evidence.generation() > before,
+            "the absence lands in the mirror the fence reads"
         );
         assert_eq!(
             absences_observed_at(&state, CORE, tx_hash),
@@ -8672,12 +8661,11 @@ mod tests {
             "and a record is offered under the anchor it was proved at"
         );
 
-        let again = commit_carrying(&mut state, &schedule, 3, deadline.as_millis(), vec![bundle]);
-        assert!(
-            !again.iter().any(|action| matches!(
-                action,
-                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
-            )),
+        let before = state.evidence.generation();
+        commit_carrying(&mut state, &schedule, 3, deadline.as_millis(), vec![bundle]);
+        assert_eq!(
+            state.evidence.generation(),
+            before,
             "a second copy adds nothing"
         );
     }
@@ -8796,12 +8784,10 @@ mod tests {
         );
 
         state.on_state_proof_verified(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
-        let folded = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
+        let before = state.evidence.generation();
+        commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert!(
-            folded.iter().any(|action| matches!(
-                action,
-                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
-            )),
+            state.evidence.generation() > before,
             "an absent claim on a core of one shard is evidence"
         );
         assert_eq!(
@@ -8868,12 +8854,11 @@ mod tests {
         );
 
         state.on_state_proof_verified(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
-        let folded = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
-        assert!(
-            !folded.iter().any(|action| matches!(
-                action,
-                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
-            )),
+        let before = state.evidence.generation();
+        commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
+        assert_eq!(
+            state.evidence.generation(),
+            before,
             "an absent claim on a core of two shards proves nothing"
         );
         assert!(state.pending_abandonment_records().is_empty());
@@ -8995,13 +8980,11 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         )));
-        let heard = state.handle_attestation(&schedule, &certificate);
+        let before = state.evidence.generation();
+        state.handle_attestation(&schedule, &certificate);
         assert!(
-            heard.iter().any(|action| matches!(
-                action,
-                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
-            )),
-            "the fence is told the acceptance landed"
+            state.evidence.generation() > before,
+            "the acceptance lands in the mirror the fence reads"
         );
         let word = accepted(probed_wt, certificate.attested_digest());
         assert_eq!(

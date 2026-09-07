@@ -75,11 +75,6 @@ impl ShardParticipation {
                 shard,
                 SettledTxSet { txs, terminal_wt },
             ),
-            // The execution coordinator wrote a counterpart's word into
-            // the mirror the vote fence reads. Nothing to record — both
-            // sides read one mirror — so all this does is re-drive the
-            // votes that deferred without it.
-            ProtocolEvent::CounterpartEvidenceObserved => self.redrive_fence(topology_schedule),
 
             // A state proof against a core's commit-proven header
             // verified: the execution coordinator reads its probes off
@@ -94,9 +89,9 @@ impl ShardParticipation {
                 Vec::new()
             }
             // A predecessor answered which of the queried transactions it
-            // committed. Record the answers, then re-drive the votes that
-            // deferred for want of them and the proposal that was
-            // filtering them out.
+            // committed. Record the answers and re-drive the proposal
+            // that was filtering them out; the votes that deferred for
+            // want of them re-drive off the fence's evidence.
             ProtocolEvent::PrecutResolutionsReceived {
                 predecessor,
                 answers,
@@ -105,11 +100,8 @@ impl ShardParticipation {
                     self.shard_coordinator
                         .record_precut_resolution(predecessor, tx_hash, absent);
                 }
-                let actions = self
-                    .shard_coordinator
-                    .redrive_pending_votes(topology_schedule);
                 self.shard_coordinator.queue_ready_proposal();
-                actions
+                Vec::new()
             }
             _ => unreachable!("non-sync event routed to handle_sync"),
         }
@@ -237,8 +229,8 @@ impl ShardParticipation {
     }
 
     /// Record a past-terminal shard's settled set on both coordinators,
-    /// then re-drive the votes and the gate-held finalizations that
-    /// deferred for want of it.
+    /// then re-drive the gate-held finalizations that deferred for want
+    /// of it; the votes that deferred re-drive off the fence's evidence.
     fn on_settled_txs_reconstructed(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -249,21 +241,10 @@ impl ShardParticipation {
             self.execution_coordinator
                 .record_settled_txs(topology_schedule, shard, set);
         actions.extend(
-            self.shard_coordinator
-                .redrive_pending_votes(topology_schedule),
-        );
-        actions.extend(
             self.execution_coordinator
                 .redrive_gated_finalizations(topology_schedule),
         );
         actions
-    }
-
-    /// Re-drive the votes the fence deferred for want of a mirror that
-    /// has just landed.
-    fn redrive_fence(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
-        self.shard_coordinator
-            .redrive_pending_votes(topology_schedule)
     }
 }
 

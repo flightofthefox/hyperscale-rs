@@ -32,6 +32,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Anchor, BlockHeight, RETENTION_HORIZON, ShardId, WeightedTimestamp};
 
@@ -40,6 +41,9 @@ use crate::{Anchor, BlockHeight, RETENTION_HORIZON, ShardId, WeightedTimestamp};
 #[derive(Debug, Default)]
 pub struct ProvenAnchors {
     by_height: RwLock<BTreeMap<(ShardId, BlockHeight), Anchor>>,
+    /// Advanced by every anchor recorded, so a vote deferred for want
+    /// of one is re-driven when the count has moved.
+    generation: AtomicU64,
 }
 
 impl ProvenAnchors {
@@ -60,6 +64,13 @@ impl ProvenAnchors {
             .write()
             .expect("proven anchors lock poisoned")
             .insert((anchor.shard, anchor.height), anchor);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// How many anchors have been recorded, ever.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// The anchor at `(shard, height)`, if this node has proven it.

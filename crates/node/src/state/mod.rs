@@ -463,7 +463,6 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::BlockSyncComplete { .. }
             | ProtocolEvent::RemoteHeaderSyncComplete { .. }
             | ProtocolEvent::SettledTxsReconstructed { .. }
-            | ProtocolEvent::CounterpartEvidenceObserved
             | ProtocolEvent::FetchedStateProofVerified { .. }
             | ProtocolEvent::PrecutResolutionsReceived { .. }) => {
                 self.with_shard(move |s, sched| s.handle_sync(sched, evt))
@@ -554,6 +553,15 @@ impl StateMachine for NodeStateMachine {
                 let proposal =
                     s.try_event_driven_proposal(self.beacon_coordinator.topology_schedule());
                 actions.extend(proposal);
+            }
+
+            // Whatever this dispatch wrote into the evidence the vote
+            // fence reads — a counterpart's word, a settled set, a proven
+            // anchor, a predecessor's answer — re-drives the votes that
+            // deferred for want of it, once, here, so no writer has to
+            // know which votes were waiting.
+            if s.shard_coordinator.take_fence_evidence_advanced() {
+                actions.extend(s.shard_coordinator.redrive_pending_votes(topology_schedule));
             }
         }
 

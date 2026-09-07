@@ -193,8 +193,6 @@ impl NodeStateMachine {
             s.execution_coordinator
                 .on_committed_remote_header(topology_schedule, certified_header.shard_id()),
         );
-        // A vote that deferred for want of this header is re-driven.
-        actions.extend(s.shard_coordinator.redrive_pending_votes(topology_schedule));
         actions
     }
 }

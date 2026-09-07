@@ -31,9 +31,17 @@
 //! says what to drop, through [`CounterpartMirror::retain`]. There is no
 //! clock in this file: a second retention rule stated against one would
 //! be a second answer to when a fact stops being true.
+//!
+//! # Generation
+//!
+//! Every write advances a generation counter. A vote the fence deferred
+//! for want of a fact here is re-driven whenever the generation has
+//! moved since the last drain, so no writer has to know which votes
+//! were waiting on it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Heard, Question, SettledTxSet, ShardId, TxHash};
 
@@ -66,6 +74,8 @@ struct Mirrored {
 #[derive(Debug, Default)]
 pub struct CounterpartMirror {
     inner: RwLock<Mirrored>,
+    /// Advanced by every write that adds a fact.
+    generation: AtomicU64,
 }
 
 impl CounterpartMirror {
@@ -85,13 +95,32 @@ impl CounterpartMirror {
     /// If the lock is poisoned, which means a consumer panicked holding
     /// it — the node is already unsound at that point.
     pub fn record(&self, tx_hash: TxHash, shard: ShardId, heard: Heard) -> bool {
-        let mut mirrored = self.write();
         let key = (tx_hash, shard, heard.question);
-        let vacant = !mirrored.heard.contains_key(&key);
+        let vacant = {
+            let mut mirrored = self.write();
+            let vacant = !mirrored.heard.contains_key(&key);
+            if vacant {
+                mirrored.heard.insert(key, heard);
+            }
+            vacant
+        };
         if vacant {
-            mirrored.heard.insert(key, heard);
+            self.advance();
         }
         vacant
+    }
+
+    /// How many facts have been added, ever. A reader that remembers the
+    /// value it last drained at knows whether anything is new.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Advanced after the write's guard is released, so a reader that
+    /// sees the new generation reads the fact it counts.
+    fn advance(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// What `shard` said to `question` about `tx_hash`, if anything.
@@ -125,9 +154,12 @@ impl CounterpartMirror {
     ///
     /// If the lock is poisoned.
     pub fn record_settled(&self, shard: ShardId, settled: SettledTxSet, parties: BTreeSet<TxHash>) {
-        let mut mirrored = self.write();
-        mirrored.settled.insert(shard, settled);
-        mirrored.parties.insert(shard, parties);
+        {
+            let mut mirrored = self.write();
+            mirrored.settled.insert(shard, settled);
+            mirrored.parties.insert(shard, parties);
+        }
+        self.advance();
     }
 
     /// Record that a committed record covers `tx_hash`: no counterpart
@@ -137,7 +169,10 @@ impl CounterpartMirror {
     ///
     /// If the lock is poisoned.
     pub fn cover(&self, tx_hash: TxHash) {
-        self.write().covered.insert(tx_hash);
+        let inserted = self.write().covered.insert(tx_hash);
+        if inserted {
+            self.advance();
+        }
     }
 
     /// Whether a committed record covers `tx_hash`.

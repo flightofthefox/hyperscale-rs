@@ -448,6 +448,16 @@ pub struct ShardCoordinator {
     /// predates the cut.
     precut: Precut,
 
+    /// Advanced by every change to the predecessors' answers, beside the
+    /// generations the two mirrors keep for themselves.
+    precut_generation: u64,
+
+    /// The three generations — the counterpart mirror's, the proven
+    /// anchors', the pre-cut answers' — at the last re-drive of the
+    /// votes the fence deferred. Compared once per dispatch, so a vote
+    /// deferred on any of them is re-driven by whatever advanced it.
+    fence_seen: (u64, u64, u64),
+
     /// What counterparts have said about the transactions legs here
     /// issued for, as the execution coordinator mirrored and folded
     /// them: a core's refusal, a proved absence, a consumer's claim.
@@ -639,6 +649,8 @@ impl ShardCoordinator {
             local_shard,
             chain_origin: recovered.chain_origin,
             precut: Precut::succeeding(recovered.predecessors),
+            precut_generation: 0,
+            fence_seen: (0, 0, 0),
             evidence: Arc::new(CounterpartMirror::new()),
             proven_anchors: Arc::new(ProvenAnchors::new()),
         }
@@ -969,12 +981,28 @@ impl ShardCoordinator {
         self.evidence.with_settled(|sets| sets.contains_key(&shard))
     }
 
-    /// Re-drive the vote path for every pending complete block. Called
-    /// after a settled set is recorded ([`Self::record_settled_txs`]):
-    /// blocks that deferred at the split-boundary fence for want of that
-    /// set can now resolve. `trigger_qc_verification_or_vote` is
-    /// idempotent (already-verified / already-voted short-circuit), so
-    /// re-driving every pending block is safe.
+    /// Whether anything the vote fence reads has been written since the
+    /// last time this answered `true`: a counterpart's word, a settled
+    /// set, a record's cover, a proven anchor, a predecessor's answer.
+    /// The state machine asks once per dispatch and re-drives the
+    /// pending votes on `true`, so no writer has to know which votes
+    /// were deferred on what it wrote.
+    pub fn take_fence_evidence_advanced(&mut self) -> bool {
+        let now = (
+            self.evidence.generation(),
+            self.proven_anchors.generation(),
+            self.precut_generation,
+        );
+        let advanced = now != self.fence_seen;
+        self.fence_seen = now;
+        advanced
+    }
+
+    /// Re-drive the vote path for every pending complete block, for the
+    /// votes the fence deferred on evidence that has since arrived.
+    /// `trigger_qc_verification_or_vote` is idempotent (already-verified
+    /// / already-voted short-circuit), so re-driving every pending block
+    /// is safe.
     pub fn redrive_pending_votes(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let pending: Vec<BlockHash> = self
             .pending_blocks
@@ -1090,6 +1118,7 @@ impl ShardCoordinator {
             "Adopted this chain's predecessors from the topology projection"
         );
         self.precut = Precut::succeeding(predecessors);
+        self.precut_generation += 1;
         true
     }
 
@@ -1107,6 +1136,7 @@ impl ShardCoordinator {
         absent: bool,
     ) {
         self.precut.record(predecessor, tx_hash, absent);
+        self.precut_generation += 1;
     }
 
     /// The `(predecessor, transaction)` pairs still owed an answer — what
@@ -1174,6 +1204,7 @@ impl ShardCoordinator {
             return false;
         }
         self.precut.retire();
+        self.precut_generation += 1;
         true
     }
 
@@ -5480,9 +5511,7 @@ impl ShardCoordinator {
         // The same fold is what carries this chain's predecessors to a seat
         // the flip never reached, so a boot that lands mid-window picks
         // them up at the first beacon block it commits.
-        if self.adopt_precut_predecessors(topology_schedule) {
-            actions.extend(self.redrive_pending_votes(topology_schedule));
-        }
+        self.adopt_precut_predecessors(topology_schedule);
         if !self.is_block_syncing() {
             actions.extend(self.maybe_emit_ready_signal(topology_schedule));
         }

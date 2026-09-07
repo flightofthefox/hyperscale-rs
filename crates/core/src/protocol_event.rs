@@ -817,16 +817,6 @@ pub enum ProtocolEvent {
         block_height: BlockHeight,
     },
 
-    /// The execution coordinator wrote a counterpart's word into the
-    /// shared mirror the vote fence reads — a core's refusal off its
-    /// certificate, or an absence or a claim folded off a committed
-    /// state proof.
-    ///
-    /// It carries nothing: both sides read one mirror, so there is no
-    /// evidence to hand over. What it says is that a vote which deferred
-    /// for want of evidence may now stand, so the fence is re-driven.
-    CounterpartEvidenceObserved,
-
     /// A state proof fetched against a commit-proven remote header
     /// verified: it reconstructs the anchor's root and claims every key
     /// asked. The execution coordinator keeps the bytes to offer in a
