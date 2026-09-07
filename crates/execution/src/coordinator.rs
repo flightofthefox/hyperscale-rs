@@ -46,16 +46,16 @@ use hyperscale_metrics::{
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader,
-    BlockHeight, BloomFilter, CertifiedBlock, CounterpartEvidence, CounterpartMirror, Deadline,
-    DeclaredKey, Derivation, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
-    Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Heard,
-    Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Mode, Probed, ProvenAnchors, Provisions,
-    Question, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie,
-    StateProofBundle, StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp, Window, Word, derive_block_transactions,
-    settled_set_verdict, tick_leader, tick_leader_at,
+    BlockHeight, BloomFilter, CertifiedBlock, ConsensusPublicKey, CounterpartEvidence,
+    CounterpartMirror, Deadline, DeclaredKey, Derivation, ExecutionCertificate,
+    ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationHash,
+    FinalizationVerifyError, GlobalReceiptRoot, Hash, Heard, Inclusion,
+    MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+    MerkleInclusionProof, Mode, Probed, ProvenAnchors, Provisions, Question, SettledSetVerdict,
+    SettledTxSet, ShardId, ShardTrie, StateProofBundle, StoredReceipt, SubstateKey, TickId,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
+    TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, Window, Word,
+    derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::CrossingCell;
 use tracing::instrument;
@@ -65,9 +65,10 @@ use crate::early_arrivals::{EARLY_VOTE_RETENTION, EarlyArrivalBuffer};
 use crate::exec_cert_store::ExecCertStore;
 use crate::expected_certs::ExpectedCertTracker;
 use crate::finalizations::FinalizationStore;
+use crate::gate::{Attested, Gated, gate_certificate};
 use crate::lookups::{
-    assign_participants, build_provision_requests, committee_public_keys_for_shard,
-    ec_has_shard_quorum_power, fetch_keys_covered, peers_excluding_self,
+    assign_participants, build_provision_requests, ec_has_shard_quorum_power, fetch_keys_covered,
+    peers_excluding_self,
 };
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::provisional::ProvisionalCells;
@@ -213,6 +214,17 @@ pub struct ExecutionMemoryStats {
     /// sustained rise means a source shard certifies without proving
     /// commits — the fork/withholding signature.
     pub unproven_ecs: usize,
+}
+
+/// Why [`ExecutionCoordinator::gate`] did not hand back keys.
+enum Gate {
+    /// A byte-identical dispatch is already running.
+    InFlight,
+    /// A contained certificate's committee epoch is ahead of this
+    /// node's beacon; the caller parks the artifact for replay.
+    BeaconBehind,
+    /// Refused for good; the caller abandons the fetch.
+    Refused,
 }
 
 /// One counterpart cell a leg entry asks about: the shard holding it,
@@ -431,18 +443,10 @@ pub struct ExecutionCoordinator {
     /// `remove_finalization` once the containing block commits.
     exec_certs: Arc<ExecCertStore>,
 
-    /// In-flight EC verifications, keyed by a content hash over the
-    /// cached wire bytes. A flooding peer would otherwise re-trigger a
-    /// dispatch on every byte-identical retransmit. Different aggregations
-    /// of the same logical EC produce distinct wire bytes and so still
-    /// dispatch — important when a first aggregation's signature is bad and
-    /// a peer follows up with a valid one.
-    pending_ec_verifications: HashSet<Hash>,
-
-    /// In-flight `Finalization` verifications, keyed by `TickId`. The
-    /// tick is content-addressed by id (one tick per `TickId`), so a second
-    /// fetch arrival for the same tick can short-circuit the crypto pool.
-    pending_finalization_verifications: HashSet<FinalizationHash>,
+    /// In-flight verifications, keyed by each artifact's
+    /// [`Attested::slot`]. A flooding peer would otherwise re-trigger a
+    /// dispatch on every byte-identical retransmit.
+    pending_verifications: HashSet<Hash>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Beacon-sync-lag buffers
@@ -624,8 +628,7 @@ impl ExecutionCoordinator {
             expected_certs: ExpectedCertTracker::new(),
             outbound_certs: OutboundExecutionCertificateTracker::new(),
             exec_certs,
-            pending_ec_verifications: HashSet::new(),
-            pending_finalization_verifications: HashSet::new(),
+            pending_verifications: HashSet::new(),
             awaiting_certs: AwaitingTopologyBuffer::new(),
             awaiting_finalizations: AwaitingTopologyBuffer::new(),
 
@@ -2154,6 +2157,49 @@ impl ExecutionCoordinator {
         actions
     }
 
+    /// Hold a fetched artifact at the one gate every certificate passes
+    /// before its signature is verified: once per content, and each
+    /// contained certificate to [`gate_certificate`].
+    ///
+    /// `Ok` carries one key set per certificate, in the artifact's
+    /// order, and the in-flight slot stays taken until the verification
+    /// result releases it. Anything else has released the slot: a
+    /// retransmit while the first dispatch runs, an artifact whose
+    /// committee the beacon has not reached (the caller parks it), or a
+    /// refusal, logged here with its reason.
+    fn gate<T: Attested>(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        item: &T,
+    ) -> Result<Vec<Vec<ConsensusPublicKey>>, Gate> {
+        let slot = item.slot();
+        if !self.pending_verifications.insert(slot) {
+            tracing::debug!(tick = %item.tick_id(), "Duplicate verification dispatch suppressed");
+            return Err(Gate::InFlight);
+        }
+        let mut keys = Vec::new();
+        for ec in item.certificates() {
+            match gate_certificate(topology_schedule, ec) {
+                Gated::Keys(public_keys) => keys.push(public_keys),
+                Gated::BeaconBehind => {
+                    self.pending_verifications.remove(&slot);
+                    return Err(Gate::BeaconBehind);
+                }
+                Gated::Refused(why) => {
+                    tracing::warn!(
+                        tick = %item.tick_id(),
+                        shard = ec.shard_id().inner(),
+                        height = ec.block_height().inner(),
+                        "Refusing a fetched certificate: {why}"
+                    );
+                    self.pending_verifications.remove(&slot);
+                    return Err(Gate::Refused);
+                }
+            }
+        }
+        Ok(keys)
+    }
+
     /// Handle an execution certificate received from another validator.
     ///
     /// Always dispatches signature verification before the cert can
@@ -2168,7 +2214,6 @@ impl ExecutionCoordinator {
         cert: Verifiable<ExecutionCertificate>,
     ) -> Vec<Action> {
         let shard = cert.shard_id();
-        let wire_hash = cert.wire_hash();
 
         // Cached-verified short-circuit. `exec_certs` is shared across
         // same-shard vnodes (one `Arc<ExecCertStore>` per shard), so a
@@ -2178,7 +2223,7 @@ impl ExecutionCoordinator {
         // verified and routed; a mismatch is a different aggregation
         // of the same logical EC and still needs its own signature check.
         if let Some(cached) = self.exec_certs.get(cert.tick_id())
-            && cached.wire_hash() == wire_hash
+            && cached.wire_hash() == cert.wire_hash()
         {
             tracing::debug!(
                 shard = shard.inner(),
@@ -2186,39 +2231,6 @@ impl ExecutionCoordinator {
                 "Cached verified EC matches incoming wire hash — skipping verify dispatch"
             );
             return vec![];
-        }
-
-        // Skip verify dispatch for byte-identical retransmits while a
-        // verification is already in flight. Different aggregations of the
-        // same logical EC produce distinct wire bytes, so the legitimate
-        // case of "first aggregation invalid, second valid" is preserved.
-        if !self.pending_ec_verifications.insert(wire_hash) {
-            tracing::debug!(
-                shard = shard.inner(),
-                tick = %cert.tick_id(),
-                "Duplicate EC verification dispatch suppressed"
-            );
-            return vec![];
-        }
-
-        // The halt-recovery freeze: an EC from a recovering shard above the
-        // beacon-attested frontier is one the retained beyond-f committee
-        // could only have produced after the halt. It resolves the old
-        // committee at its stale anchor and its signatures verify, so
-        // without this fence a forged finalization would export
-        // cross-shard. Drop it — the fence is the same authenticated cutoff
-        // every consumer folds.
-        if topology_schedule.recovery_fences(shard, cert.block_height()) {
-            tracing::warn!(
-                shard = shard.inner(),
-                tick = %cert.tick_id(),
-                height = cert.block_height().inner(),
-                "Dropping EC from a recovering shard past the freeze frontier"
-            );
-            self.pending_ec_verifications.remove(&wire_hash);
-            return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                ids: fetch_keys_covered(&cert),
-            })];
         }
 
         // Commit-proof gate: a cross-shard EC is consumable only against a
@@ -2242,7 +2254,6 @@ impl ExecutionCoordinator {
                 height = height.inner(),
                 "Deferring EC until its source block is commit-proven"
             );
-            self.pending_ec_verifications.remove(&wire_hash);
             self.unproven_ecs.push(shard, cert);
             // At or below the shard's attested boundary the height sits
             // under the remote-header sync anchor — a joiner or a fresh
@@ -2264,49 +2275,18 @@ impl ExecutionCoordinator {
             return vec![];
         }
 
-        let committee = match topology_schedule.lookup(cert.vote_anchor_ts()) {
-            ScheduleLookup::Committee(committee) => committee,
-            ScheduleLookup::NotYetCommitted => {
-                // Beacon hasn't reached this EC's epoch — buffer for replay on
-                // catch-up rather than abandoning and re-fetching. Release the
-                // in-flight slot so the replay re-dispatches.
-                self.pending_ec_verifications.remove(&wire_hash);
-                self.awaiting_certs.push(cert.shard_id(), cert);
-                return vec![];
+        match self.gate(topology_schedule, &cert) {
+            Ok(mut keys) => vec![Action::VerifyExecutionCertificateSignature {
+                public_keys: keys.pop().unwrap_or_default(),
+                certificate: cert,
+            }],
+            Err(Gate::InFlight) => vec![],
+            Err(Gate::BeaconBehind) => {
+                self.awaiting_certs.push(shard, cert);
+                vec![]
             }
-            ScheduleLookup::Evicted => {
-                // Below the schedule floor the EC is past its retention
-                // horizon — provably terminal everywhere, never resolvable
-                // again. Drop instead of buffering, releasing the in-flight
-                // slot and the fetch binding.
-                tracing::warn!(
-                    shard = shard.inner(),
-                    tick = %cert.tick_id(),
-                    "EC's committee epoch is below the schedule floor — dropping"
-                );
-                self.pending_ec_verifications.remove(&wire_hash);
-                return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                    ids: fetch_keys_covered(&cert),
-                })];
-            }
-        };
-        let Some(public_keys) = committee_public_keys_for_shard(committee, shard) else {
-            tracing::warn!(
-                shard = shard.inner(),
-                "Could not resolve EC committee keys — snapshot incomplete"
-            );
-            // Verification will never complete; release the in-flight slot
-            // so a subsequent arrival isn't permanently shadowed.
-            self.pending_ec_verifications.remove(&wire_hash);
-            return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                ids: fetch_keys_covered(&cert),
-            })];
-        };
-
-        vec![Action::VerifyExecutionCertificateSignature {
-            certificate: cert,
-            public_keys,
-        }]
+            Err(Gate::Refused) => vec![Action::AbandonFetch(cert.abandon())],
+        }
     }
 
     /// Handle execution certificate signature verification result.
@@ -2330,11 +2310,11 @@ impl ExecutionCoordinator {
         // and aren't gated by this slot.
         let ec_arc = match result {
             Ok(verified) => {
-                self.pending_ec_verifications.remove(&verified.wire_hash());
+                self.pending_verifications.remove(&verified.wire_hash());
                 verified
             }
             Err((raw, err)) => {
-                self.pending_ec_verifications.remove(&raw.wire_hash());
+                self.pending_verifications.remove(&raw.wire_hash());
                 tracing::warn!(
                     shard = raw.shard_id().inner(),
                     tick = %raw.tick_id(),
@@ -4020,9 +4000,9 @@ impl ExecutionCoordinator {
     /// Admission entry point for fetch-delivered (or otherwise externally
     /// sourced) finalizations.
     ///
-    /// Runs the cheap synchronous gates inline (per-EC quorum power and
-    /// committee-key resolution) and dispatches signature verification to the
-    /// crypto pool via [`Action::VerifyFinalization`]. The matching
+    /// Runs [`Self::gate`] over every contained certificate and
+    /// dispatches signature verification to the crypto pool via
+    /// [`Action::VerifyFinalization`]. The matching
     /// [`ProtocolEvent::FinalizationVerified`] feeds
     /// [`Self::on_finalization_verified`], which emits
     /// `Continuation(FinalizationsAdmitted)` only when every EC's
@@ -4041,116 +4021,30 @@ impl ExecutionCoordinator {
         topology_schedule: &TopologySchedule,
         tick: Arc<Verifiable<Finalization>>,
     ) -> Vec<Action> {
-        let tick_id = *tick.tick_id();
-        // A tick can settle in more than one part, so identity is the
-        // finalization's own content — both here and in the fetch this
-        // may abandon.
-        let id = tick.receipt_hash();
-
         // Already-finalized short-circuit — a second fetch arrival for a
         // finalization we've already admitted is wasted verification work.
-        if self.finalized.get(&id).is_some() {
+        if self.finalized.get(&tick.receipt_hash()).is_some() {
             tracing::debug!(
-                tick = %tick_id,
+                tick = %tick.tick_id(),
                 "Finalization already in canonical store — skipping verification"
             );
             return Vec::new();
         }
-
-        // In-flight dedup — guards against a peer flooding the same
-        // fetched finalization while the first dispatch is still running.
-        if !self.pending_finalization_verifications.insert(id) {
-            tracing::debug!(
-                tick = %tick_id,
-                "Duplicate Finalization verification dispatch suppressed"
-            );
-            return Vec::new();
-        }
-
-        let ecs = tick.execution_certificates();
-        let mut ec_public_keys = Vec::with_capacity(ecs.len());
-        let mut beacon_behind = false;
-        for ec in ecs {
-            let shard = ec.shard_id();
-            // The recovery freeze fences a contained EC from a recovering
-            // source shard past its attested frontier — a forged orphan the
-            // beyond-f retained committee produced after the halt, which would
-            // otherwise resolve the old committee and carry a false tick
-            // finalization into this consumer's state.
-            if topology_schedule.recovery_fences(shard, ec.block_height()) {
-                tracing::warn!(
-                    tick = %tick.tick_id(),
-                    shard = shard.inner(),
-                    height = ec.block_height().inner(),
-                    "Rejecting fetched Finalization: contained EC from a recovering \
-                     shard past the freeze frontier"
-                );
-                self.pending_finalization_verifications.remove(&id);
-                return vec![Action::AbandonFetch(FetchAbandon::Finalizations {
-                    ids: vec![id],
-                })];
+        match self.gate(topology_schedule, &tick) {
+            Ok(ec_public_keys) => vec![Action::VerifyFinalization {
+                finalization: tick,
+                ec_public_keys,
+            }],
+            Err(Gate::InFlight) => Vec::new(),
+            Err(Gate::BeaconBehind) => {
+                // Buffer the whole tick; replayed on `BeaconBlockPersisted`
+                // once the beacon reaches the deferred EC's epoch.
+                self.awaiting_finalizations
+                    .push(tick.tick_id().shard_id(), tick);
+                Vec::new()
             }
-            // Each contained EC is verified against the committee seated at its
-            // own anchor on its own shard. A not-yet-committed epoch (our
-            // beacon behind) defers the whole tick for replay once the beacon
-            // catches up, rather than abandoning and re-fetching; a below-floor
-            // epoch rejects it — the EC is past its retention horizon and can
-            // never resolve again.
-            let committee = match topology_schedule.lookup(ec.vote_anchor_ts()) {
-                ScheduleLookup::Committee(committee) => committee,
-                ScheduleLookup::NotYetCommitted => {
-                    beacon_behind = true;
-                    break;
-                }
-                ScheduleLookup::Evicted => {
-                    tracing::warn!(
-                        tick = %tick.tick_id(),
-                        shard = shard.inner(),
-                        "Rejecting fetched Finalization: contained EC's committee epoch is \
-                         below the schedule floor"
-                    );
-                    self.pending_finalization_verifications.remove(&id);
-                    return vec![Action::AbandonFetch(FetchAbandon::Finalizations {
-                        ids: vec![id],
-                    })];
-                }
-            };
-            if !ec_has_shard_quorum_power(committee, ec.as_unverified()) {
-                tracing::warn!(
-                    tick = %tick.tick_id(),
-                    shard = shard.inner(),
-                    "Rejecting fetched Finalization: contained EC lacks quorum power"
-                );
-                self.pending_finalization_verifications.remove(&id);
-                return vec![Action::AbandonFetch(FetchAbandon::Finalizations {
-                    ids: vec![id],
-                })];
-            }
-            let Some(public_keys) = committee_public_keys_for_shard(committee, shard) else {
-                tracing::warn!(
-                    tick = %tick.tick_id(),
-                    shard = shard.inner(),
-                    "Rejecting fetched Finalization: cannot resolve EC committee keys"
-                );
-                self.pending_finalization_verifications.remove(&id);
-                return vec![Action::AbandonFetch(FetchAbandon::Finalizations {
-                    ids: vec![id],
-                })];
-            };
-            ec_public_keys.push(public_keys);
+            Err(Gate::Refused) => vec![Action::AbandonFetch(tick.abandon())],
         }
-        if beacon_behind {
-            // Buffer the whole tick; replayed on `BeaconBlockPersisted` once the
-            // beacon reaches the deferred EC's epoch.
-            self.pending_finalization_verifications.remove(&id);
-            self.awaiting_finalizations
-                .push(tick.tick_id().shard_id(), tick);
-            return Vec::new();
-        }
-        vec![Action::VerifyFinalization {
-            finalization: tick,
-            ec_public_keys,
-        }]
     }
 
     /// Re-attempt every buffered cross-shard EC and finalization now that the
@@ -4182,13 +4076,13 @@ impl ExecutionCoordinator {
         // arrivals can dispatch again.
         let tick = match result {
             Ok(verified) => {
-                self.pending_finalization_verifications
-                    .remove(&verified.receipt_hash());
+                self.pending_verifications
+                    .remove(&verified.receipt_hash().into_raw());
                 verified
             }
             Err((raw, err)) => {
-                self.pending_finalization_verifications
-                    .remove(&raw.receipt_hash());
+                self.pending_verifications
+                    .remove(&raw.receipt_hash().into_raw());
                 tracing::warn!(
                     tick = %raw.tick_id(),
                     error = ?err,
@@ -4599,6 +4493,16 @@ mod tests {
     /// Lift a test transaction into the verified form a tick holds.
     fn verified_arc(tx: &Arc<Transaction>) -> Arc<Verified<Transaction>> {
         Arc::new(Verified::new_unchecked_for_test((**tx).clone()))
+    }
+
+    /// Three of four signers: the quorum the admission gate holds a
+    /// fetched certificate to before its signature is verified.
+    fn quorum_signers() -> SignerBitfield {
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        signers
     }
 
     fn make_test_state() -> ExecutionCoordinator {
@@ -5752,7 +5656,7 @@ mod tests {
                 ExecutionOutcome::Aborted,
             )],
             AggregateSignature::ZERO,
-            SignerBitfield::new(4),
+            quorum_signers(),
         );
 
         let actions = state.on_execution_certificate(&topo, cert.into());
@@ -5796,7 +5700,7 @@ mod tests {
                 GlobalReceiptRoot::ZERO,
                 vec![TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)],
                 AggregateSignature::ZERO,
-                SignerBitfield::new(4),
+                quorum_signers(),
             )
         };
 
@@ -5841,7 +5745,7 @@ mod tests {
             GlobalReceiptRoot::ZERO,
             vec![TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)],
             AggregateSignature::ZERO,
-            SignerBitfield::new(4),
+            quorum_signers(),
         );
 
         let actions = state.on_execution_certificate(&topo, cert.into());
@@ -5888,7 +5792,7 @@ mod tests {
                     ExecutionOutcome::Aborted,
                 )],
                 AggregateSignature::ZERO,
-                SignerBitfield::new(4),
+                quorum_signers(),
             )
         };
 
@@ -6198,7 +6102,7 @@ mod tests {
                 },
             )],
             AggregateSignature::ZERO,
-            SignerBitfield::new(4),
+            quorum_signers(),
         );
         let _ = state.on_execution_certificate(&topo, cert.clone().into());
         assert_eq!(
@@ -6247,7 +6151,7 @@ mod tests {
                 ExecutionOutcome::Aborted,
             )],
             AggregateSignature::ZERO,
-            SignerBitfield::new(4),
+            quorum_signers(),
         );
 
         // The source block is commit-proven; the gate under test is verify
@@ -6393,7 +6297,7 @@ mod tests {
             GlobalReceiptRoot::ZERO,
             vec![],
             AggregateSignature::ZERO,
-            SignerBitfield::new(4),
+            quorum_signers(),
         );
 
         let actions = coord.on_execution_certificate(&schedule, Verifiable::from(cert));
@@ -6499,7 +6403,7 @@ mod tests {
             GlobalReceiptRoot::ZERO,
             vec![],
             AggregateSignature::ZERO,
-            SignerBitfield::new(4),
+            quorum_signers(),
         );
 
         let actions = coord.on_execution_certificate(&behind, Verifiable::from(cert));

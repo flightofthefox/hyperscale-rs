@@ -27,6 +27,7 @@ mod expected_certs;
 mod finalizations;
 #[cfg(test)]
 mod fixtures;
+mod gate;
 mod lookups;
 mod outbound_certs;
 mod provisional;
