@@ -77,6 +77,7 @@ mod config;
 mod coordinator;
 mod deferred_qc;
 mod fee_ledger;
+mod fence;
 mod lookups;
 mod pending;
 mod precut;

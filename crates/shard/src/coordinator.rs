@@ -15,15 +15,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
-use hyperscale_metrics::record_verdict_claim_deferred;
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, BlockHash, CounterpartEvidence, CounterpartMirror, Epoch,
-    FinalizationHash, Hash, Heard, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
-    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr, ProposerTimestamp,
-    ProvenAnchors, ProvisionHash, Question, ReadySignal, ReshapeThresholds, ReshapeTrigger,
-    Resolutions, ScheduleLookup, SettledSetVerdict, ShardId, SplitAtBoundary, StateProofBundle,
-    StoredReceipt, SubstateKey, UnsettledTx, WeightedTimestamp, WorkInFlight,
-    derive_reshape_trigger, ready_signal_window, settled_set_verdict,
+    AbandonmentRecord, Anchor, BlockHash, CounterpartMirror, Epoch, FinalizationHash, Hash,
+    LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal,
+    ReshapeThresholds, ReshapeTrigger, Resolutions, ScheduleLookup, ShardId, SplitAtBoundary,
+    StateProofBundle, StoredReceipt, SubstateKey, WeightedTimestamp, WorkInFlight,
+    derive_reshape_trigger, ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -114,9 +112,10 @@ use crate::commit_pipeline::CommitPipeline;
 use crate::config::ShardConsensusConfig;
 use crate::deferred_qc::DeferredQc;
 use crate::fee_ledger::FeeReservationLedger;
+use crate::fence::{VoteFence, Withheld};
 use crate::lookups::{committee_public_keys, vote_recipients};
 use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
-use crate::precut::{Precut, PrecutStatus, PrecutVerdict};
+use crate::precut::Precut;
 use crate::proposal::{
     AdmissionWindows, ProposalKind, ProposalPayload, ProposalTracker, TakeResult,
     assemble_build_action, dispatch_or_defer, filter_engaged_transactions, late_deliveries,
@@ -951,69 +950,14 @@ impl ShardCoordinator {
             .retire_below(self.committed_block_anchor_wt);
     }
 
-    /// Whether the block's state proofs name anchors this voter can
-    /// check, and so whether voting on it must be withheld.
-    ///
-    /// A bundle claims a root and a clock for a counterpart's height.
-    /// Both are read off the commit-proven header this voter holds for
-    /// it: one that agrees passes to the delegated proof walk, one that
-    /// disagrees is refused, and a voter holding no proven header for
-    /// the height defers and asks for its commit proof — the same
-    /// deferral a provision takes on a source block not yet proven.
-    /// The proposer probed at a header it held, so an honest bundle's
-    /// anchor reaches every voter in the ordinary course.
-    fn fence_state_proofs(&self, block: &Block, block_hash: BlockHash) -> Option<Vec<Action>> {
-        let mut wanted = Vec::new();
-        for bundle in block.state_proofs() {
-            if !self.anchor_stands(bundle, block_hash, &mut wanted) {
-                return Some(vec![]);
-            }
-        }
-        (!wanted.is_empty()).then_some(wanted)
-    }
-
-    /// Whether a bundle's anchor is one this voter has commit-proven, and
-    /// whether every term of it — the root and the clock — agrees with
-    /// the header held for it.
-    fn anchor_stands(
-        &self,
-        bundle: &StateProofBundle,
-        block_hash: BlockHash,
-        wanted: &mut Vec<Action>,
-    ) -> bool {
-        let anchor = bundle.anchor;
-        match self.proven_anchors.at(anchor.shard, anchor.height) {
-            Some(held) if held == anchor => true,
-            Some(held) => {
-                warn!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    shard = ?anchor.shard,
-                    height = anchor.height.inner(),
-                    claimed_root = ?anchor.state_root,
-                    held_root = ?held.state_root,
-                    claimed_ts = ?anchor.ts,
-                    held_ts = ?held.ts,
-                    "State proof names an anchor this validator's commit-proven header \
-                     disagrees with — not voting"
-                );
-                false
-            }
-            None => {
-                trace!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    shard = ?anchor.shard,
-                    height = anchor.height.inner(),
-                    "State proof names a height this validator has not commit-proven; \
-                     deferring"
-                );
-                wanted.push(Action::Continuation(ProtocolEvent::CommitProofNeeded {
-                    source_shard: anchor.shard,
-                    block_height: anchor.height,
-                }));
-                true
-            }
+    /// The evidence a vote is fenced on, borrowed for one judgment.
+    fn vote_fence(&self) -> VoteFence<'_> {
+        VoteFence {
+            evidence: &self.evidence,
+            proven_anchors: &self.proven_anchors,
+            precut: &self.precut,
+            cut: self.chain_origin.anchor_wt,
+            local_shard: self.local_shard,
         }
     }
 
@@ -1043,298 +987,6 @@ impl ShardCoordinator {
             actions.extend(self.trigger_qc_verification_or_vote(topology_schedule, block_hash));
         }
         actions
-    }
-
-    /// The split-boundary fence over a block's committed finalizations.
-    ///
-    /// Each finalization's claims on its counterparts' settled sets —
-    /// a settlement on every shard whose certificate it carries, an
-    /// abandonment on every shard a local outcome awaited and never
-    /// heard from — are the ones [`Finalization::claims`] derives, so a
-    /// voter judges a tick by the rule its proposer's gate composed it
-    /// under. Record coverage is read off the mirror the execution
-    /// coordinator writes at the record's commit, so a replica that came
-    /// up between the record and the abandonment holds the same answer
-    /// its peers do.
-    ///
-    /// Past-terminal-ness is read off the **anchored** snapshot at
-    /// `anchored_wt` (the block's `parent_qc` weighted timestamp), never
-    /// the head, so every replica voting this block reaches the same
-    /// verdict. A shard evicted from every retained window is so far past
-    /// its terminal that any claim naming it is unreachable everywhere —
-    /// reject. A past-terminal shard whose settled set isn't known yet
-    /// defers the vote; past the set's evidence window the claim is
-    /// categorically unprovable and rejects.
-    fn fence_finalizations(
-        &self,
-        topology_schedule: &TopologySchedule,
-        block: &Block,
-        anchored_wt: WeightedTimestamp,
-    ) -> SettledSetVerdict {
-        let claims = block
-            .certificates()
-            .iter()
-            .flat_map(|fw| fw.claims(self.local_shard, |tx_hash| self.evidence.covers(tx_hash)));
-        self.evidence.with_settled(|settled| {
-            settled_set_verdict(
-                settled,
-                topology_schedule,
-                self.local_shard,
-                anchored_wt,
-                claims,
-            )
-        })
-    }
-
-    /// Apply the split-boundary fence at vote time; returns `true` (and
-    /// logs) when the vote must not proceed. `Reject` declines the vote
-    /// outright (the block can never commit here); `Defer` holds the
-    /// block pending until the settled set is acquired (the vote
-    /// re-drives on [`Self::record_settled_txs`]).
-    fn fence_blocks_vote(
-        &self,
-        topology_schedule: &TopologySchedule,
-        block: &Block,
-        block_hash: BlockHash,
-    ) -> bool {
-        match self.fence_finalizations(
-            topology_schedule,
-            block,
-            block.header().parent_qc().weighted_timestamp(),
-        ) {
-            SettledSetVerdict::Pass => false,
-            SettledSetVerdict::Reject => {
-                warn!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    "Finalization names a past-terminal shard that didn't settle it — not voting"
-                );
-                true
-            }
-            SettledSetVerdict::Defer => {
-                trace!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    "Settled set for a past-terminal shard unknown at vote; deferring"
-                );
-                true
-            }
-        }
-    }
-
-    /// Whether one record's evidence stands for this validator, on the
-    /// arm it carries. A departure is checked against the schedule,
-    /// this validator's own ledger, and the departed shard's settled
-    /// set; what a shard was heard to say is checked against this
-    /// validator's own mirror of it, equality on the word and the moment.
-    /// A voter that cannot check defers, which is the same answer as a
-    /// refusal here: not this vote.
-    fn record_evidence_stands(
-        &self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        anchored_wt: WeightedTimestamp,
-        verdict: &AbandonmentRecord,
-    ) -> bool {
-        match verdict.evidence() {
-            CounterpartEvidence::Departed { terminal_wt } => self.departure_stands(
-                topology_schedule,
-                block_hash,
-                anchored_wt,
-                verdict,
-                terminal_wt,
-            ),
-            CounterpartEvidence::Heard(heard) => verdict
-                .unsettled()
-                .iter()
-                .all(|entry| self.heard_stands(verdict.shard(), entry, heard, block_hash)),
-        }
-    }
-
-    /// Whether a departure record stands: the schedule attests the cut
-    /// it names, this validator's own ledger says the departed shard was
-    /// party to every name, and the shard's settled set names none of
-    /// them.
-    ///
-    /// The set says what the departed shard settled; the ledger says
-    /// what it was party to, and a record may name only that — a
-    /// stranger to the departed shard is absent from its set trivially,
-    /// and abandoning it would charge a payer for a transaction a live
-    /// counterpart can still settle. The set is complete and
-    /// beacon-attested, so absence from it is proof rather than
-    /// ignorance; a voter that has not acquired it defers, since the
-    /// record is only proposable inside the window the set can be read
-    /// in, so a voter inside it either has the set or is about to.
-    fn departure_stands(
-        &self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        anchored_wt: WeightedTimestamp,
-        verdict: &AbandonmentRecord,
-        terminal_wt: WeightedTimestamp,
-    ) -> bool {
-        let shard = verdict.shard();
-        let scheduled = topology_schedule.terminal_cut_for_shard(shard, anchored_wt);
-        if scheduled != Some(terminal_wt) {
-            warn!(
-                validator = ?self.me,
-                block_hash = ?block_hash,
-                shard = ?shard,
-                claimed = ?terminal_wt,
-                ?scheduled,
-                "Abandonment record names a departure the schedule does not attest — not voting"
-            );
-            return false;
-        }
-        // The evidence window, read off the judging anchor's own
-        // snapshot: a record anchored after the beacon closed and swept
-        // the departure's boundary record claims what nobody can check.
-        if !topology_schedule.terminal_evidence_readable(shard, anchored_wt) {
-            warn!(
-                validator = ?self.me,
-                block_hash = ?block_hash,
-                shard = ?shard,
-                "Abandonment record names a departure whose evidence window has closed — not \
-                 voting"
-            );
-            return false;
-        }
-        let stranger = self.evidence.with_parties(shard, |parties| {
-            parties.map(|parties| {
-                verdict
-                    .tx_hashes()
-                    .find(|tx_hash| !parties.contains(tx_hash))
-            })
-        });
-        let Some(stranger) = stranger else {
-            trace!(
-                validator = ?self.me,
-                block_hash = ?block_hash,
-                shard = ?shard,
-                "Departure record's parties not yet mirrored; deferring"
-            );
-            return false;
-        };
-        if let Some(stranger) = stranger {
-            warn!(
-                validator = ?self.me,
-                block_hash = ?block_hash,
-                shard = ?shard,
-                tx_hash = ?stranger,
-                "Abandonment record names a transaction the departed shard was not party to — \
-                 not voting"
-            );
-            return false;
-        }
-        let settled = self.evidence.with_settled(|sets| {
-            sets.get(&shard).map(|settled| {
-                verdict
-                    .tx_hashes()
-                    .find(|tx_hash| settled.txs.contains(tx_hash))
-            })
-        });
-        match settled {
-            None => {
-                trace!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    shard = ?shard,
-                    "Settled set for an abandonment record unknown at vote; deferring"
-                );
-                false
-            }
-            Some(Some(tx_hash)) => {
-                warn!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    shard = ?shard,
-                    tx_hash = ?tx_hash,
-                    "Abandonment record names a transaction its shard settled — not voting"
-                );
-                false
-            }
-            Some(None) => true,
-        }
-    }
-
-    /// Whether one name's word stands for this validator: an answer to a
-    /// cell question sits inside the window the question is meaningful
-    /// in for the name's deadline, and the word and the moment are the
-    /// ones this validator itself mirrored — off the counterpart's
-    /// certificate, or off the proof the chain committed, which every
-    /// replica folds at the same height. A voter holding no mirror
-    /// cannot say and defers; one whose mirror disagrees refuses.
-    fn heard_stands(
-        &self,
-        shard: ShardId,
-        entry: &UnsettledTx,
-        heard: Heard,
-        block_hash: BlockHash,
-    ) -> bool {
-        if let Question::Cell(probed) = heard.question
-            && !probed.licenses(heard.at, entry.deadline)
-        {
-            warn!(
-                validator = ?self.me,
-                block_hash = ?block_hash,
-                shard = ?shard,
-                tx_hash = ?entry.tx_hash,
-                probed = ?heard.at,
-                deadline = ?entry.deadline,
-                "Abandonment record probes an absence outside its window — not voting"
-            );
-            return false;
-        }
-        match self.evidence.heard(entry.tx_hash, shard, heard.question) {
-            Some(mirrored) if mirrored == heard => true,
-            Some(mirrored) => {
-                warn!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    shard = ?shard,
-                    tx_hash = ?entry.tx_hash,
-                    claimed = ?heard,
-                    ?mirrored,
-                    "Abandonment record restates an answer this validator reads differently — \
-                     not voting"
-                );
-                false
-            }
-            None => {
-                if heard.question == Question::Verdict {
-                    record_verdict_claim_deferred();
-                }
-                trace!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    shard = ?shard,
-                    tx_hash = ?entry.tx_hash,
-                    "Abandonment record restates an answer this validator has not mirrored; \
-                     deferring"
-                );
-                false
-            }
-        }
-    }
-
-    /// Whether the block's abandonment records are ones this voter
-    /// can attest to, and so whether voting on it must be withheld.
-    ///
-    /// Each record is held to the evidence it claims, on the arm it
-    /// carries. The figures each name restates are not this fence's to
-    /// check: they are read off the committed body, which lives in the
-    /// store, and so are checked by the delegated verification the vote
-    /// also waits on ([`Self::on_resolutions_verified`]).
-    fn fence_abandonment_records(
-        &self,
-        topology_schedule: &TopologySchedule,
-        block: &Block,
-        block_hash: BlockHash,
-    ) -> bool {
-        let anchored_wt = block.header().parent_qc().weighted_timestamp();
-        block.abandonment_records().iter().any(|verdict| {
-            !self.record_evidence_stands(topology_schedule, block_hash, anchored_wt, verdict)
-        })
     }
 
     /// Whether `wt` lands past this shard's terminal window — the coast
@@ -1380,67 +1032,6 @@ impl ShardCoordinator {
     #[must_use]
     pub fn dissolved(&self, topology_schedule: &TopologySchedule) -> bool {
         self.quiescent(topology_schedule) && topology_schedule.successors_live(self.local_shard)
-    }
-
-    /// What in `block` belongs to the chain that ran before this one, if
-    /// anything: a transaction whose validity window opened before the
-    /// cut, or a certificate anchored before it.
-    ///
-    /// The two classes part company here. A **certificate** anchored
-    /// before the cut is refused outright and always: it names a tick on
-    /// the predecessor, resolves transactions this chain never committed,
-    /// and carries receipts computed against a state this genesis never
-    /// held. There is no harmless subset to separate out.
-    ///
-    /// A **transaction** is different. The hazard is only what the
-    /// predecessor actually *committed*; one submitted before the cut and
-    /// never committed is harmless, and landing it here is its first
-    /// inclusion. Refusing the whole class is the safe default a
-    /// successor runs under until it can ask the finer question, and
-    /// [`PrecutResolutions`] is the answer: per-predecessor, each
-    /// absence proven against a `committed_txs_root` this chain
-    /// commit-proved.
-    ///
-    /// Unresolved defers rather than refuses. Every honest validator
-    /// reaches the same verdict once the answer lands, so a slow answer
-    /// costs a wait; refusing would spend a round on it instead and make
-    /// the block look bad rather than early.
-    ///
-    /// Provisions are left out. A batch carries its *source* shard's
-    /// weighted timestamp where the cut is in this chain's, so a rule
-    /// written on that comparison would refuse honest batches near the
-    /// boundary — and a pre-cut batch can only provision transactions the
-    /// rule above already refuses, so it is inert here.
-    ///
-    /// The chains this can match at all are bounded by
-    /// [`Self::precut_window_open`].
-    fn precut_verdict(&self, block: &Block) -> PrecutVerdict {
-        let cut = self.chain_origin.anchor_wt;
-        if let Some(fw) = block
-            .certificates()
-            .iter()
-            .find(|fw| fw.local_ec().vote_anchor_ts() < cut)
-        {
-            return PrecutVerdict::Reject(format!("certificate for tick {:?}", fw.tick_id()));
-        }
-        // A proven replay refuses the block whatever else is outstanding,
-        // so the scan runs to the end rather than deferring on the first
-        // unresolved transaction it meets.
-        let mut deferred = None;
-        for tx in block
-            .transactions()
-            .iter()
-            .filter(|tx| tx.validity_range().start_timestamp_inclusive < cut)
-        {
-            match self.precut.status(&tx.hash()) {
-                PrecutStatus::Absent => {}
-                PrecutStatus::Committed => {
-                    return PrecutVerdict::Reject(format!("transaction {}", tx.hash()));
-                }
-                PrecutStatus::Unresolved => deferred = Some(tx.hash()),
-            }
-        }
-        deferred.map_or(PrecutVerdict::Pass, PrecutVerdict::Defer)
     }
 
     /// Whether content from before this chain began can still be offered
@@ -3685,46 +3276,29 @@ impl ShardCoordinator {
                 return vec![];
             };
 
-            // Split-boundary fence over the block's finalizations.
-            if self.fence_blocks_vote(topology_schedule, block, block_hash) {
-                return vec![];
-            }
-
-            // And over the records it writes down about departed shards,
-            // which the same sets answer for.
-            if self.fence_abandonment_records(topology_schedule, block, block_hash) {
-                return vec![];
-            }
-
-            // And over the proofs it carries of counterparts' cells,
-            // which this voter's commit-proven headers answer for.
-            if let Some(withheld) = self.fence_state_proofs(block, block_hash) {
-                return withheld;
-            }
-
-            // Content from before this chain's origin. A certificate is
-            // refused outright; a transaction only once a predecessor is
-            // known to have committed it. Unresolved waits for the
-            // answer rather than spending a round refusing the block.
-            match self.precut_verdict(block) {
-                PrecutVerdict::Pass => {}
-                PrecutVerdict::Reject(what) => {
+            // The claims the block makes on other chains, held to what
+            // this validator has mirrored: a refusal never votes, a
+            // deferral leaves the block pending and asks for what would
+            // let the vote proceed.
+            match self.vote_fence().judge(topology_schedule, block) {
+                Ok(()) => {}
+                Err(Withheld::Refused(why)) => {
                     warn!(
                         validator = ?self.me,
                         block_hash = ?block_hash,
-                        %what,
-                        "Block carries content predating this chain's origin; not voting"
+                        %why,
+                        "The vote fence refuses the block — not voting"
                     );
                     return vec![];
                 }
-                PrecutVerdict::Defer(tx_hash) => {
+                Err(Withheld::Deferred { why, wanted }) => {
                     trace!(
                         validator = ?self.me,
                         block_hash = ?block_hash,
-                        ?tx_hash,
-                        "Pre-cut transaction unresolved against the predecessors; deferring"
+                        %why,
+                        "The vote fence cannot yet judge the block — deferring"
                     );
-                    return vec![];
+                    return wanted;
                 }
             }
             let block_fees = self.local_payer_fees(
@@ -7318,11 +6892,11 @@ mod tests {
         AbandonmentRoot, AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot,
         BlockHeaderParts, CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash, Heard,
         LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams,
-        Probed, Question, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId, Signer,
-        SignerBitfield, StateProofsRoot, TerminalRoots, TimestampRange, TopologySchedule,
+        Probed, Question, SettledSetVerdict, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId,
+        Signer, SignerBitfield, StateProofsRoot, TerminalRoots, TimestampRange, TopologySchedule,
         TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxOutcome, UnsettledTx,
         ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources,
-        Word, test_utils,
+        Word, settled_set_verdict, test_utils,
     };
 
     use super::*;
@@ -11819,18 +11393,18 @@ mod tests {
         let coord = fence_coordinator();
         let peer = ShardId::leaf(1, 1);
         let block = block_with_state_proofs(vec![bundle_against(peer, b"root", 5_000)]);
-        let withheld = coord
-            .fence_state_proofs(&block, BlockHash::ZERO)
-            .expect("the vote is withheld");
+        let Err(Withheld::Deferred { wanted, .. }) = coord.vote_fence().state_proofs(&block) else {
+            panic!("the vote is withheld");
+        };
         assert!(
             matches!(
-                withheld.as_slice(),
+                wanted.as_slice(),
                 [Action::Continuation(ProtocolEvent::CommitProofNeeded {
                     source_shard,
                     block_height,
                 })] if *source_shard == peer && *block_height == BlockHeight::new(5)
             ),
-            "{withheld:?}"
+            "{wanted:?}"
         );
     }
 
@@ -11851,23 +11425,21 @@ mod tests {
 
         let other_root = block_with_state_proofs(vec![bundle_against(peer, b"other", 5_000)]);
         assert!(
-            coord
-                .fence_state_proofs(&other_root, BlockHash::ZERO)
-                .is_some_and(|withheld| withheld.is_empty()),
+            matches!(
+                coord.vote_fence().state_proofs(&other_root),
+                Err(Withheld::Refused(_))
+            ),
             "refused, with nothing to wait for"
         );
         let other_clock = block_with_state_proofs(vec![bundle_against(peer, b"root", 5_001)]);
-        assert!(
-            coord
-                .fence_state_proofs(&other_clock, BlockHash::ZERO)
-                .is_some_and(|withheld| withheld.is_empty()),
-        );
+        assert!(matches!(
+            coord.vote_fence().state_proofs(&other_clock),
+            Err(Withheld::Refused(_))
+        ),);
 
         let agreeing = block_with_state_proofs(vec![bundle_against(peer, b"root", 5_000)]);
         assert!(
-            coord
-                .fence_state_proofs(&agreeing, BlockHash::ZERO)
-                .is_none(),
+            coord.vote_fence().state_proofs(&agreeing).is_ok(),
             "the anchor the chain committed passes to the proof walk"
         );
     }
@@ -11944,11 +11516,12 @@ mod tests {
             SettledSetVerdict::Pass,
             "the delegate passes over a live shard, so the fence must ask first",
         );
-        assert!(coord.fence_abandonment_records(
-            &sched,
-            &block_with_records(AFTER_CUT_MS, records),
-            BlockHash::ZERO,
-        ));
+        assert!(
+            coord
+                .vote_fence()
+                .records(&sched, &block_with_records(AFTER_CUT_MS, records))
+                .is_err()
+        );
     }
 
     /// And one against this shard itself, which the delegate skips for the
@@ -11958,11 +11531,12 @@ mod tests {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         let records = vec![record_naming(coord.local_shard, ROOT_CUT_MS, b"tx")];
-        assert!(coord.fence_abandonment_records(
-            &sched,
-            &block_with_records(AFTER_CUT_MS, records),
-            BlockHash::ZERO,
-        ));
+        assert!(
+            coord
+                .vote_fence()
+                .records(&sched, &block_with_records(AFTER_CUT_MS, records))
+                .is_err()
+        );
     }
 
     /// The stated cut is held to the schedule's own. It dates the record
@@ -11973,11 +11547,12 @@ mod tests {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS + 1, b"tx")];
-        assert!(coord.fence_abandonment_records(
-            &sched,
-            &block_with_records(AFTER_CUT_MS, records),
-            BlockHash::ZERO,
-        ));
+        assert!(
+            coord
+                .vote_fence()
+                .records(&sched, &block_with_records(AFTER_CUT_MS, records))
+                .is_err()
+        );
     }
 
     /// The honest record still passes: a departure the schedule attests,
@@ -11991,11 +11566,12 @@ mod tests {
             .evidence()
             .record_settled(ShardId::ROOT, root_settled(b"other"), parties_of(b"tx"));
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
-        assert!(!coord.fence_abandonment_records(
-            &sched,
-            &block_with_records(AFTER_CUT_MS, records),
-            BlockHash::ZERO,
-        ));
+        assert!(
+            coord
+                .vote_fence()
+                .records(&sched, &block_with_records(AFTER_CUT_MS, records))
+                .is_ok()
+        );
     }
 
     /// A record naming a transaction the departed shard was not party to
@@ -12016,13 +11592,13 @@ mod tests {
             parties_of(b"other"),
         );
         assert!(
-            stranger.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
+            stranger.vote_fence().records(&sched, &block).is_err(),
             "a name the departed shard was not party to is not voted"
         );
 
         let unmirrored = fence_coordinator();
         assert!(
-            unmirrored.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
+            unmirrored.vote_fence().records(&sched, &block).is_err(),
             "and a voter that has mirrored no departure defers"
         );
     }
@@ -12162,7 +11738,7 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, verdict(refused_wt, false));
         assert!(
-            !matching.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
+            matching.vote_fence().records(&sched, &block).is_ok(),
             "a matching mirror passes it"
         );
 
@@ -12188,14 +11764,14 @@ mod tests {
             let mismatched = fence_coordinator();
             mismatched.evidence().record(tx_hash, ShardId::ROOT, held);
             assert!(
-                mismatched.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
+                mismatched.vote_fence().records(&sched, &block).is_err(),
                 "a mirror of {why} refuses it"
             );
         }
 
         let absent = fence_coordinator();
         assert!(
-            absent.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
+            absent.vote_fence().records(&sched, &block).is_err(),
             "no mirror defers it"
         );
     }
@@ -12219,41 +11795,50 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Core, deadline));
         assert!(
-            !matching.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
+            matching
+                .vote_fence()
+                .records(&sched, &record(deadline))
+                .is_ok(),
             "a proof at the deadline passes a record at the deadline"
         );
         assert!(
-            matching.fence_abandonment_records(
-                &sched,
-                &record(deadline.plus(Duration::from_secs(5))),
-                BlockHash::ZERO
-            ),
+            matching
+                .vote_fence()
+                .records(&sched, &record(deadline.plus(Duration::from_secs(5))))
+                .is_err(),
             "a record at an anchor this validator has not folded defers"
         );
         assert!(
-            matching.fence_abandonment_records(
-                &sched,
-                &record(deadline.minus(Duration::from_millis(1))),
-                BlockHash::ZERO
-            ),
+            matching
+                .vote_fence()
+                .records(&sched, &record(deadline.minus(Duration::from_millis(1))))
+                .is_err(),
             "a record probed before the deadline is refused whatever the mirror holds"
         );
         let sweep = deadline.plus(MAX_VALIDITY_RANGE);
         assert!(
-            matching.fence_abandonment_records(&sched, &record(sweep), BlockHash::ZERO),
+            matching
+                .vote_fence()
+                .records(&sched, &record(sweep))
+                .is_err(),
             "a record probed where the committed cell may be swept is refused"
         );
         let late = fence_coordinator();
         late.evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Core, sweep));
         assert!(
-            late.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
+            late.vote_fence()
+                .records(&sched, &record(deadline))
+                .is_err(),
             "a mirror taken past the sweep proves nothing and defers"
         );
 
         let absent_mirror = fence_coordinator();
         assert!(
-            absent_mirror.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
+            absent_mirror
+                .vote_fence()
+                .records(&sched, &record(deadline))
+                .is_err(),
             "no proof defers it"
         );
     }
@@ -12274,7 +11859,7 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Claim, deadline));
         assert!(
-            !claim.fence_abandonment_records(&sched, &record, BlockHash::ZERO),
+            claim.vote_fence().records(&sched, &record).is_ok(),
             "a folded claim absence at the anchor passes it"
         );
 
@@ -12282,7 +11867,7 @@ mod tests {
         cell.evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Core, deadline));
         assert!(
-            cell.fence_abandonment_records(&sched, &record, BlockHash::ZERO),
+            cell.vote_fence().records(&sched, &record).is_err(),
             "a committed-cell absence is another question's proof, and defers"
         );
     }
@@ -12306,19 +11891,24 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Delivery, lapse));
         assert!(
-            !matching.fence_abandonment_records(&sched, &record(lapse), BlockHash::ZERO),
+            matching
+                .vote_fence()
+                .records(&sched, &record(lapse))
+                .is_ok(),
             "a proof at the lapse passes a record at the lapse"
         );
         assert!(
-            matching.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
+            matching
+                .vote_fence()
+                .records(&sched, &record(deadline))
+                .is_err(),
             "a lapse record anchored at the deadline is refused whatever the mirror holds"
         );
         assert!(
-            matching.fence_abandonment_records(
-                &sched,
-                &record(lapse.plus(MAX_VALIDITY_RANGE)),
-                BlockHash::ZERO
-            ),
+            matching
+                .vote_fence()
+                .records(&sched, &record(lapse.plus(MAX_VALIDITY_RANGE)))
+                .is_err(),
             "a lapse record anchored where the claim cell may be swept is refused"
         );
 
@@ -12327,7 +11917,7 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Delivery, deadline));
         assert!(
-            short.fence_abandonment_records(&sched, &record(lapse), BlockHash::ZERO),
+            short.vote_fence().records(&sched, &record(lapse)).is_err(),
             "a proof short of the lapse defers it"
         );
 
@@ -12336,7 +11926,7 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Core, lapse));
         assert!(
-            cores.fence_abandonment_records(&sched, &record(lapse), BlockHash::ZERO),
+            cores.vote_fence().records(&sched, &record(lapse)).is_err(),
             "a core's cell proved absent at the lapse is not the claim proved absent: it defers"
         );
     }
@@ -12357,21 +11947,26 @@ mod tests {
             .evidence()
             .record(figures.tx_hash, ShardId::ROOT, verdict(accepted_wt, true));
         assert!(
-            !matching.fence_abandonment_records(&sched, &record(accepted_wt), BlockHash::ZERO),
+            matching
+                .vote_fence()
+                .records(&sched, &record(accepted_wt))
+                .is_ok(),
             "the mirrored word passes"
         );
         assert!(
-            matching.fence_abandonment_records(
-                &sched,
-                &record(accepted_wt.plus(Duration::from_millis(1))),
-                BlockHash::ZERO
-            ),
+            matching
+                .vote_fence()
+                .records(&sched, &record(accepted_wt.plus(Duration::from_millis(1))))
+                .is_err(),
             "another anchor is refused"
         );
 
         let absent = fence_coordinator();
         assert!(
-            absent.fence_abandonment_records(&sched, &record(accepted_wt), BlockHash::ZERO),
+            absent
+                .vote_fence()
+                .records(&sched, &record(accepted_wt))
+                .is_err(),
             "no mirror defers it"
         );
     }
@@ -12393,11 +11988,12 @@ mod tests {
             parties_of(b"tx"),
         );
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
-        assert!(coord.fence_abandonment_records(
-            &sched,
-            &block_with_records(AFTER_CUT_MS, records),
-            BlockHash::ZERO,
-        ));
+        assert!(
+            coord
+                .vote_fence()
+                .records(&sched, &block_with_records(AFTER_CUT_MS, records))
+                .is_err()
+        );
     }
 
     fn block_with_certs(certs: Vec<Arc<Verifiable<Finalization>>>) -> Block {
@@ -12480,10 +12076,12 @@ mod tests {
             parties_of(b"tx"),
         );
         let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Reject,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Err(Withheld::Refused(_))
+        ));
     }
 
     /// The same abandonment passes when the awaited shard's set is held
@@ -12502,10 +12100,12 @@ mod tests {
             parties_of(b"tx"),
         );
         let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Pass,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Ok(())
+        ));
     }
 
     /// An abandonment whose awaited shard's set is not yet held defers,
@@ -12517,10 +12117,12 @@ mod tests {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Defer,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Err(Withheld::Deferred { .. })
+        ));
     }
 
     /// An abandonment a committed record covers claims nothing of any
@@ -12536,10 +12138,12 @@ mod tests {
             .evidence()
             .cover(TxHash::from(Hash::from_bytes(b"tx")));
         let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Pass,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Ok(())
+        ));
         coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
@@ -12548,10 +12152,12 @@ mod tests {
             },
             parties_of(b"tx"),
         );
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Pass,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Ok(())
+        ));
     }
 
     /// A settlement is judged on the certificates it carries, not by this
@@ -12575,10 +12181,12 @@ mod tests {
             ShardId::ROOT,
             1,
         )]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Pass,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Ok(())
+        ));
     }
 
     /// A verdict that awaited nobody is left alone too: a leg's own
@@ -12599,10 +12207,12 @@ mod tests {
             parties_of(b"tx"),
         );
         let block = block_with_certs(vec![lone_verdict_tick(ShardId::leaf(1, 0), 1)]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Pass,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Ok(())
+        ));
     }
 
     /// A finalization naming a past-terminal shard whose settled set is
@@ -12616,10 +12226,12 @@ mod tests {
             ShardId::ROOT,
             1,
         )]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Defer,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Err(Withheld::Deferred { .. })
+        ));
     }
 
     /// Once the past-terminal shard's settled set is known and contains
@@ -12641,10 +12253,12 @@ mod tests {
             ShardId::ROOT,
             1,
         )]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Pass,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Ok(())
+        ));
     }
 
     /// A tick the past-terminal shard did not settle is rejected.
@@ -12665,10 +12279,12 @@ mod tests {
             ShardId::ROOT,
             1,
         )]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Reject,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Err(Withheld::Refused(_))
+        ));
     }
 
     /// Past its evidence window, a tick naming the terminated shard is
@@ -12692,10 +12308,10 @@ mod tests {
             1,
         )]);
         let beyond = WeightedTimestamp::from_millis(6_001);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, beyond),
-            SettledSetVerdict::Reject,
-        );
+        assert!(matches!(
+            coord.vote_fence().finalizations(&sched, &block, beyond),
+            Err(Withheld::Refused(_))
+        ));
     }
 
     /// A tick with no past-terminal-shard certificate passes regardless of
@@ -12711,10 +12327,12 @@ mod tests {
             ShardId::leaf(1, 1),
             1,
         )]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Pass,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Ok(())
+        ));
     }
 
     /// A height-1 block on `leaf(1,0)` anchored in epoch 1 (`parent_qc`
