@@ -870,8 +870,10 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
     // Neither venue may hold the other's certificate. Provisions and
     // headers still flow, so each venue commits the route and runs its
     // own core leg, which is the state under test.
-    let _ = isolate_ec_intake(c, departing, survivor);
-    let _ = isolate_ec_intake(c, survivor, departing);
+    let cut = [
+        isolate_ec_intake(c, departing, survivor),
+        isolate_ec_intake(c, survivor, departing),
+    ];
     let mut charges = Charges::default();
     let (hash, baseline, paid, ..) = submit_departing_route(c, &route, &mut charges);
 
@@ -898,6 +900,11 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
          against {}",
         held(c, route.trader.address(), *XRD),
         paid + ROUTE_INPUT,
+    );
+    assert!(
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the certificate channel must actually have been exercised and cut, or the venues \
+         were never held apart",
     );
     // The trader's own leg accepted and stays accepted; the core it
     // fed is abandoned on both shards, never settled one-sided.
@@ -963,7 +970,7 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
 ) {
     let (departing, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
     let route = departing_route(c);
-    let _ = isolate_ec_intake(c, survivor, departing);
+    let cut = isolate_ec_intake(c, survivor, departing);
     let mut charges = Charges::default();
     let (hash, baseline, paid, validity_end) = submit_departing_route(c, &route, &mut charges);
     assert!(
@@ -979,6 +986,11 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
     );
 
     await_departed(c);
+    assert!(
+        cut.fired() > 0,
+        "the survivor's certificate intake must actually have been exercised and cut, or it \
+         held the departed venue's certificate all along",
+    );
     c.clear_drops();
     assert!(
         c.run_until(epochs(12), |c| matches!(
@@ -1244,7 +1256,12 @@ fn assert_train_fates<C: Cluster>(
     let mut never_included = 0;
     for (hash, to, phase) in sent {
         let (included, settled) = c.chain_fate(terminating, *hash);
-        let settled = settled.is_some();
+        // Settled means settled in the recipient's favour. An abort on
+        // the leaving shard leaves the transfer exactly where a transfer
+        // it never settled is left — no credit given, the payment to
+        // come back — so it owes `CarriedOrReclaimed`, and reading the
+        // decision is what tells the two apart.
+        let settled = settled.is_some_and(|(_, decision)| decision != TransactionDecision::Aborted);
         assert!(
             settled || *phase != Phase::Live,
             "a transfer sent {phase:?} must be settled by the leaving shard",
@@ -1252,7 +1269,7 @@ fn assert_train_fates<C: Cluster>(
         never_included += usize::from(included.is_none());
         let taken = match (included.is_some(), settled) {
             (_, true) => "settled",
-            (true, false) => "included but never settled",
+            (true, false) => "included but never settled in the recipient's favour",
             (false, false) => "never included",
         };
         let status = await_tx_terminal(c, *hash, epochs(12));

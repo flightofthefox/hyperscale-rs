@@ -22,10 +22,10 @@ use hyperscale_scenarios::tx::{
 };
 use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{Cluster, FaultHandle, FaultableCluster, ScenarioConfig, epochs};
-use hyperscale_types::network::response::GetProvisionResponse;
+use hyperscale_types::network::response::{GetProvisionResponse, GetStateProofResponse};
 use hyperscale_types::{
-    Deadline, Provisions, ShardId, TransactionDecision, TransactionStatus, WeightedTimestamp,
-    Window,
+    Deadline, MerkleInclusionProof, Provisions, ShardId, TransactionDecision, TransactionStatus,
+    WeightedTimestamp, Window,
 };
 use support::SimCluster;
 
@@ -71,19 +71,31 @@ fn a_forged_state_proof_convinces_nobody() {
     cluster.run_faultable(|c| {
         let before = vault_balance(c, payer_shard, from);
         let recipient_before = vault_balance(c, recipient_shard, to);
-        let refused_before = c.metric("fetch_responses_refused", Some("state_proof"));
+        let refused_before = c.metric(
+            "fetch_responses_refused",
+            Some("state_proof:unusable_proof"),
+        );
 
-        // One host of the shard the proof is asked of answers with bytes
-        // that decode to nothing usable. Its peers answer honestly, which
-        // is what makes this a rotation rather than an outage.
+        // One host of the shard the proof is asked of answers with a
+        // well-formed response carrying a proof that reconstructs
+        // nothing. Well-formed is the whole point: rubbish bytes are
+        // refused at the decode as an unusable *answer*, which says
+        // nothing about the proof check, so the forgery is built as the
+        // response type and the rubbish put where the multiproof goes.
+        // Its peers answer honestly, which is what makes this a rotation
+        // rather than an outage.
         let liar = *c
             .committee_hosts(recipient_shard)
             .first()
             .expect("the recipient's shard has a seated committee");
+        let unreconstructable = hbor_to_vec(&GetStateProofResponse::found(
+            MerkleInclusionProof::new(vec![0xFF; 64]),
+        ))
+        .expect("a state-proof response encodes");
         let forged = c.rewrite_responses(
             liar,
             "state_proof.request",
-            Arc::new(|_asked: &[u8], _honest: &[u8]| vec![0xFF; 64]),
+            Arc::new(move |_asked: &[u8], _honest: &[u8]| unreconstructable.clone()),
         );
 
         // The bundle never reaches the recipient, so the delivery lapses
@@ -136,10 +148,14 @@ fn a_forged_state_proof_convinces_nobody() {
             "the forgery has to have been served, or nothing was attacked",
         );
         // What the reclaim landing shows is a value arriving, which an
-        // unattacked run shows too. The refusal is the defence itself.
+        // unattacked run shows too. The refusal is the defence itself,
+        // and the reason is what says which check did the refusing.
         assert!(
-            c.metric("fetch_responses_refused", Some("state_proof")) > refused_before,
-            "no state-proof answer was refused, so the check never ran",
+            c.metric(
+                "fetch_responses_refused",
+                Some("state_proof:unusable_proof")
+            ) > refused_before,
+            "no state-proof answer was refused on its proof, so the reconstruction never ran",
         );
         assert_eq!(
             vault_balance(c, recipient_shard, to),

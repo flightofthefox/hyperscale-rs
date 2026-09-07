@@ -140,10 +140,17 @@ pub fn split_straddler_atomic(c: &mut impl Cluster) {
 /// Panics if the choreography misses its budget or any straddler resolves
 /// one-sided (the survivor applies one the splitter never settled).
 pub fn split_straddler_ec_partition_atomic(c: &mut impl FaultableCluster) {
+    let mut cut = None;
     let run = split_straddler_run(c, |c| {
-        let _ = isolate_ec_intake(c, STRADDLER_SPLITTER, STRADDLER_SURVIVOR);
+        cut = Some(isolate_ec_intake(c, STRADDLER_SPLITTER, STRADDLER_SURVIVOR));
     });
+    let cut = cut.expect("the fault seam runs before any straddler is submitted");
     let one_sided = straddler_one_sided_count(c, run.splitter, run.terminal_b, &run.probes);
+    assert!(
+        cut.fired() > 0,
+        "the splitter's certificate intake must actually have been exercised and cut, or no \
+         straddler was ever held one-sided to begin with",
+    );
     assert_eq!(
         one_sided, 0,
         "the survivor applied {one_sided} straddler(s) one-sided the splitter never settled",
