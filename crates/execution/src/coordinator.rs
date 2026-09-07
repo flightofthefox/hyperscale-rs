@@ -747,7 +747,7 @@ impl ExecutionCoordinator {
             // its counterpart's commitment, so neither half of the
             // engagement exchange is filed, and it runs under its own
             // committing block's clock.
-            if classified.decomposed().holds() {
+            if classified.decomposed() {
                 let member = Member::of(
                     classified.clone(),
                     local_shard,
@@ -756,7 +756,7 @@ impl ExecutionCoordinator {
                 );
                 self.provisioning.record_required(
                     tx_hash,
-                    requirements_of(&member, tx.legs(), tx.crossings()),
+                    requirements_of(&member, tx.legs()),
                     floor_of(&member, tx.validity_range().end_timestamp_exclusive),
                 );
                 continue;
@@ -1084,9 +1084,7 @@ impl ExecutionCoordinator {
             // candidate goes with the leg it was registered beside.
             self.candidates.remove(tx_hash);
             self.provisioning.remove_tx(tx_hash);
-            let records = classified
-                .shape(transaction.legs(), transaction.crossings())
-                .records_issued(local_shard);
+            let records = classified.records_issued(local_shard);
             // The plan reads no body — every cell is the record's — but
             // the price still follows the vault, and this is the shard
             // that holds it.
@@ -1204,9 +1202,7 @@ impl ExecutionCoordinator {
                 continue;
             }
             self.unresolved.admit_retire(tx_hash);
-            let records = classified
-                .shape(transaction.legs(), transaction.crossings())
-                .records_issued(local_shard);
+            let records = classified.records_issued(local_shard);
             self.seat_settling(
                 tick_id,
                 tick_ts,
@@ -1305,13 +1301,12 @@ impl ExecutionCoordinator {
         // to, if it issues anything. Only an issuing member issues;
         // a delivery and a reclaim promise nobody a bundle.
         let targets: BTreeSet<ShardId> = match &shape {
-            Some((shape, body)) if shape.side() == Side::Issuing => shape
+            Some((shape, _)) if shape.side() == Side::Issuing => shape
                 .classified()
-                .shape(body.legs(), body.crossings())
                 .edges()
-                .into_iter()
+                .iter()
                 .filter(|edge| edge.from == local_shard)
-                .flat_map(|edge| edge.to)
+                .flat_map(|edge| edge.to.iter().copied())
                 .collect(),
             _ => BTreeSet::new(),
         };
@@ -1335,7 +1330,7 @@ impl ExecutionCoordinator {
             );
             self.provisioning.record_required(
                 member.request.tx_hash,
-                requirements_of(&delivering, body.legs(), body.crossings()),
+                requirements_of(&delivering, body.legs()),
                 floor_of(&delivering, body.validity_range().end_timestamp_exclusive),
             );
             self.candidates
@@ -9299,7 +9294,7 @@ mod tests {
         let trie = ShardTrie::from_leaves([HOME, CORE, CORE_SIBLING]);
         let classified = Classified::freeze(&legs, &[], &trie);
         assert_eq!(classified.core(), &BTreeSet::from([CORE, CORE_SIBLING]));
-        assert!(classified.decomposed().holds());
+        assert!(classified.decomposed());
         classified
     }
 

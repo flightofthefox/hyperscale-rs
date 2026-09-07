@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 
 use blake3::Hasher;
 use hyperscale_hbor::{Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
-use hyperscale_vm_types::{Crossing, LegShape, price_attos};
+use hyperscale_vm_types::{LegShape, price_attos};
 use thiserror::Error;
 
 use crate::transaction::vm::{Derivation, ProtocolVerifier, SchemeVerifier};
@@ -222,16 +222,6 @@ impl Transaction {
     #[must_use]
     pub fn owners(&self) -> &[Address] {
         &self.derived().owners
-    }
-
-    /// The record cell of every value edge, in (node, output) order.
-    ///
-    /// # Panics
-    ///
-    /// As [`Self::work`], on a transaction that was never derived.
-    #[must_use]
-    pub fn crossings(&self) -> &[Crossing] {
-        &self.derived().crossings
     }
 
     /// The cells the kernel writes of its own accord.
@@ -766,7 +756,6 @@ mod tests {
                 work: declared_work(0, 0, 0),
                 footprint: 0,
                 legs: Vec::new(),
-                crossings: Vec::new(),
                 nullifiers: Vec::new(),
                 packages: Vec::new(),
             })

@@ -32,9 +32,7 @@ pub fn writes_committed_cell(
     local: ShardId,
 ) -> bool {
     let classified = Classified::freeze(legs, owners, trie);
-    classified.decomposed().holds()
-        && classified.core().len() > 1
-        && classified.core().contains(&local)
+    classified.decomposed() && classified.core().len() > 1 && classified.core().contains(&local)
 }
 
 /// The committed cells a block of `shard` writes under `trie`.

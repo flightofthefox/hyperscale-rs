@@ -24,7 +24,7 @@ use hyperscale_types::{
     Deadline, Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, SubstateKey, TxHash, Verified,
     WeightedTimestamp, Window,
 };
-use hyperscale_vm_types::{AddressClass, Crossing, LegShape};
+use hyperscale_vm_types::{AddressClass, LegShape};
 
 /// One thing a cross-shard member waits for before it can run.
 ///
@@ -57,22 +57,12 @@ pub enum Requirement {
     },
 }
 
-/// What `member`, a divided member of a transaction with these `legs`
-/// and `crossings`, files before it can run: its execution scope minus
-/// itself, and the crossings the legs it runs consume.
+/// What `member`, a divided member of a transaction with these `legs`,
+/// files before it can run: its execution scope minus itself, and the
+/// crossings the legs it runs consume.
 #[must_use]
-pub fn requirements_of(
-    member: &Member,
-    legs: &[LegShape],
-    crossings: &[Crossing],
-) -> BTreeSet<Requirement> {
-    divided_requirements(
-        legs,
-        crossings,
-        member.classified(),
-        member.local(),
-        member.side(),
-    )
+pub fn requirements_of(member: &Member, legs: &[LegShape]) -> BTreeSet<Requirement> {
+    divided_requirements(legs, member.classified(), member.local(), member.side())
 }
 
 /// The earliest `member`'s provisioning entry may be swept, where the
@@ -104,7 +94,6 @@ pub fn floor_of(member: &Member, validity_end: WeightedTimestamp) -> Option<Weig
 #[must_use]
 pub fn divided_requirements(
     legs: &[LegShape],
-    crossings: &[Crossing],
     classified: &Classified,
     local: ShardId,
     side: Side,
@@ -141,13 +130,12 @@ pub fn divided_requirements(
     // exist in the first place.
     requirements.extend(
         classified
-            .shape(legs, crossings)
             .edges()
-            .into_iter()
+            .iter()
             .filter(|edge| edge.to.contains(&local) && edge.delivers == (side == Side::Delivering))
             .map(|edge| Requirement::Crossing {
                 source: edge.from,
-                key: edge.record,
+                key: edge.record.key(),
             }),
     );
     requirements
@@ -636,24 +624,12 @@ mod tests {
         assert!(both.is_fully_provisioned(tx));
     }
 
-    fn record_of(legs: &[LegShape], node: u32) -> Crossing {
+    /// The record cell the edge `node` leaves on its first output.
+    fn record_of(legs: &[LegShape], node: u32) -> SubstateKey {
         use hyperscale_vm_effects::CrossingSite;
         use hyperscale_vm_types::ProtocolHasher;
 
-        let producer = &legs[node as usize];
-        Crossing {
-            node,
-            output: 0,
-            record: CrossingSite::record(
-                &ProtocolHasher,
-                producer.target,
-                producer.intent,
-                producer.local,
-                0,
-                producer.expiry_ms,
-            )
-            .key(),
-        }
+        CrossingSite::record_of(&ProtocolHasher, &legs[node as usize], 0).key()
     }
 
     /// A divided member files its scope minus itself, the records of the
@@ -669,41 +645,40 @@ mod tests {
         // A swap: sign-in, withdraw and deposit on the low shard, the
         // venue on the high one. The core is the venue alone.
         let swap = fixtures::swap();
-        let crossings = vec![record_of(&swap, 1), record_of(&swap, 2)];
+        let crossings = [record_of(&swap, 1), record_of(&swap, 2)];
         let classified = Classified::freeze(&swap, &[], &trie);
-        assert!(classified.decomposed().holds());
+        assert!(classified.decomposed());
 
         // The caller's issuing member waits on the venue's record and no
         // crossing: its withdraw is what the venue waits for. Its
         // delivering member waits on the venue's output as well.
         assert!(classified.mixed_at(low));
-        let issuing = divided_requirements(&swap, &crossings, &classified, low, Side::Issuing);
+        let issuing = divided_requirements(&swap, &classified, low, Side::Issuing);
         assert_eq!(
             issuing,
             BTreeSet::from([Requirement::CommittedState(high)]),
             "the caller's issuing member waits on the venue's record and no crossing",
         );
-        let delivering =
-            divided_requirements(&swap, &crossings, &classified, low, Side::Delivering);
+        let delivering = divided_requirements(&swap, &classified, low, Side::Delivering);
         assert_eq!(
             delivering,
             BTreeSet::from([
                 Requirement::CommittedState(high),
                 Requirement::Crossing {
                     source: high,
-                    key: crossings[1].record,
+                    key: crossings[1],
                 },
             ]),
             "the caller's delivering member waits on the venue's output",
         );
-        let venue = divided_requirements(&swap, &crossings, &classified, high, Side::Issuing);
+        let venue = divided_requirements(&swap, &classified, high, Side::Issuing);
         assert_eq!(
             venue,
             BTreeSet::from([
                 Requirement::CommittedState(low),
                 Requirement::Crossing {
                     source: low,
-                    key: crossings[0].record,
+                    key: crossings[0],
                 },
             ]),
             "a single-shard core waits on its arrival and its caller's records",
@@ -722,16 +697,16 @@ mod tests {
             ShardId::leaf(2, 2),
         );
         let route = fixtures::route();
-        let crossings = vec![record_of(&route, 0), record_of(&route, 1)];
+        let crossings = [record_of(&route, 0), record_of(&route, 1)];
         let classified = Classified::freeze(&route, &[], &trie);
-        assert!(classified.decomposed().holds());
+        assert!(classified.decomposed());
         assert_eq!(classified.core(), &BTreeSet::from([high, third]));
         let arrival = Requirement::Crossing {
             source: low,
-            key: crossings[0].record,
+            key: crossings[0],
         };
         assert_eq!(
-            divided_requirements(&route, &crossings, &classified, high, Side::Issuing),
+            divided_requirements(&route, &classified, high, Side::Issuing),
             BTreeSet::from([
                 Requirement::CommittedState(third),
                 Requirement::CommittedState(low),
@@ -739,7 +714,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            divided_requirements(&route, &crossings, &classified, third, Side::Issuing),
+            divided_requirements(&route, &classified, third, Side::Issuing),
             BTreeSet::from([
                 Requirement::CommittedState(high),
                 Requirement::CommittedState(low),
@@ -747,7 +722,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            divided_requirements(&route, &crossings, &classified, low, Side::Issuing),
+            divided_requirements(&route, &classified, low, Side::Issuing),
             BTreeSet::from([
                 Requirement::CommittedState(high),
                 Requirement::CommittedState(third),

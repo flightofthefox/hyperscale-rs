@@ -97,7 +97,6 @@ impl Derivation for ReservingStatics {
             work: declared_work(4, vm.gas_limit, vm.signature_work()),
             footprint: 4,
             legs: Vec::new(),
-            crossings: Vec::new(),
             nullifiers: Vec::new(),
             packages: Vec::new(),
         })

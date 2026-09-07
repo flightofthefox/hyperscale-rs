@@ -110,7 +110,7 @@ impl Membership {
             awaited.is_subset(member.reach()),
             "a member awaits only shards the transaction reaches"
         );
-        let role = if !member.classified().decomposed().holds() {
+        let role = if !member.classified().decomposed() {
             Role::Whole
         } else if member.in_core() {
             Role::Core
@@ -1558,7 +1558,7 @@ mod tests {
         let (low, high, third) = (leaf(0), leaf(1), leaf(2));
 
         let swap = Classified::freeze(&swap(), &[], &trie);
-        assert!(swap.decomposed().holds());
+        assert!(swap.decomposed());
         let participating = BTreeSet::from([low, high]);
         let member_of = |classified: &Classified, local, participating: &BTreeSet<ShardId>| {
             Member::of(
@@ -1629,7 +1629,7 @@ mod tests {
             &[],
             placement,
         );
-        assert!(transfer.decomposed().holds());
+        assert!(transfer.decomposed());
         assert!(transfer.delivers_at(recipient));
         assert!(!transfer.delivers_at(sender), "the core bears the verdict");
         let swap = Classified::freeze(&swap(), &[], placement);

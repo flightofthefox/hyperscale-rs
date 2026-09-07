@@ -14,7 +14,7 @@ pub use hyperscale_vm_types::{
     AccountSigner, MAX_MESSAGE_LEN, MAX_SUBINTENTS, Mode, SchemeId, SchemeVerifier, SubintentSig,
     TransactionBody, TransactionEnvelope,
 };
-use hyperscale_vm_types::{Crossing, LegShape, SubstateKey};
+use hyperscale_vm_types::{LegShape, SubstateKey};
 use thiserror::Error;
 
 use crate::crypto::{
@@ -288,20 +288,14 @@ pub struct Derived {
     /// fee payer and every signer — which the classifier holds to some
     /// member's scope before it divides the shape. Sorted and unique.
     pub owners: Vec<Address>,
-    /// The record cell of every value edge, in (node, output) order.
-    ///
-    /// Every edge, not only the ones that turn out to cross: which cross
-    /// is a placement fact read at an anchor, while the declaration is
-    /// fixed when the envelope is composed.
-    pub crossings: Vec<Crossing>,
     /// The nullifier cell of every bound subintent, in tree order, each
     /// under its own signer.
     ///
     /// One of the cells the kernel writes of its own accord; the others
     /// — the record and claim of every value edge that crosses — are
-    /// read off `legs` and `crossings` at a placement, since which edges
-    /// cross is a fact of the anchor while this list is fixed when the
-    /// envelope is composed. Together they are what
+    /// read off `legs` at a placement, since which edges cross is a fact
+    /// of the anchor while this list is fixed when the envelope is
+    /// composed. Together they are what
     /// [`Transaction::sweepable_writes_on`](crate::Transaction::sweepable_writes_on)
     /// counts for a shard against
     /// [`MAX_SWEEPABLE_CREATED_PER_BLOCK`](crate::MAX_SWEEPABLE_CREATED_PER_BLOCK).

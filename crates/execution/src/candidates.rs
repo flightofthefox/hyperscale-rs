@@ -78,23 +78,23 @@ fn arrivals_for(
     local: ShardId,
     side: Side,
 ) -> Vec<EscrowedValue> {
-    if !classified.decomposed().holds() {
+    if !classified.decomposed() {
         return Vec::new();
     }
     classified
-        .shape(tx.legs(), tx.crossings())
         .edges()
-        .into_iter()
+        .iter()
         .filter(|edge| edge.to.contains(&local) && edge.delivers == (side == Side::Delivering))
         .filter_map(|edge| {
-            let bytes = provisioning.present_cell(tx.hash(), edge.from, edge.record)?;
+            let key = edge.record.key();
+            let bytes = provisioning.present_cell(tx.hash(), edge.from, key)?;
             let record = CrossingCell::from_bytes(bytes)?;
             Some(EscrowedValue {
-                node: edge.node,
+                node: edge.producer,
                 output: edge.output,
                 resource: record.resource,
                 amount: record.amount,
-                record: edge.record,
+                record: key,
             })
         })
         .collect()
@@ -599,7 +599,7 @@ mod tests {
         let trie = trie();
         let (local, venue) = (leaf(0), leaf(1));
         let classified = Classified::freeze(&swap(), &[], &trie);
-        assert!(classified.decomposed().holds());
+        assert!(classified.decomposed());
 
         let mut candidates = TickCandidates::new(local);
         let tx = tx(5);

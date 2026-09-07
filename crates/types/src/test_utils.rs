@@ -1017,7 +1017,6 @@ impl Derivation for StubVmStatics {
             // its payer is the one party its routing declares.
             legs: Vec::new(),
             owners: vec![vm.fee_payer.address()],
-            crossings: Vec::new(),
             // One per bound signature, which is what a real derivation
             // files: a subintent's signature and its nullifier come in a
             // pair. Under the payer, since the stub cannot derive the

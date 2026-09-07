@@ -32,8 +32,8 @@ use hyperscale_vm_effects::{
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
-    Address, Crossing, Effect, EffectSet, EffectTarget, LegShape, Mode, Moves, PrincipalAddr,
-    ResourceAddr, SchemeId, SubstateKey,
+    Address, Effect, EffectSet, EffectTarget, LegShape, Mode, Moves, PrincipalAddr, ResourceAddr,
+    SchemeId, SubstateKey,
 };
 
 use crate::ProtocolHasher;
@@ -65,20 +65,45 @@ fn route_owners(
         .collect()
 }
 
+/// The record cell of every value edge among `legs`, in `(producer,
+/// output)` order.
+///
+/// Every edge, not only the ones that turn out to cross: which cross is
+/// a placement fact read at an anchor, while the cells are fixed by what
+/// each producing node's own signer signed — the intent, the node's index
+/// within it, and that intent's expiry — so two compositions of one
+/// subintent derive the same record for its nodes.
+#[must_use]
+pub fn crossing_records(legs: &[LegShape]) -> Vec<SubstateKey> {
+    let mut records: Vec<((u32, u32), SubstateKey)> = legs
+        .iter()
+        .flat_map(|consumer| &consumer.edges)
+        .filter_map(|edge| {
+            let producer = legs.get(edge.source as usize)?;
+            let record = CrossingSite::record_of(&ProtocolHasher, producer, edge.output).key();
+            Some(((edge.source, edge.output), record))
+        })
+        .collect();
+    records.sort_unstable_by_key(|(edge, _)| *edge);
+    records.into_iter().map(|(_, record)| record).collect()
+}
+
 /// The footprint of the cells a transaction's value edges write.
 ///
 /// The record under the producer and the claim under the consumer, each
 /// a point write on the effects schedule, for every edge whether or not
 /// it crosses at any placement.
 #[must_use]
-pub fn crossing_cells_footprint(crossings: &[Crossing]) -> u64 {
-    crossings.iter().fold(0u64, |total, crossing| {
-        let cell = effect_units(Effect {
-            target: EffectTarget::Point(crossing.record),
-            mode: Mode::Write { moves: Moves::Both },
-        });
-        total.saturating_add(cell.saturating_mul(2))
-    })
+pub fn crossing_cells_footprint(legs: &[LegShape]) -> u64 {
+    crossing_records(legs)
+        .into_iter()
+        .fold(0u64, |total, record| {
+            let cell = effect_units(Effect {
+                target: EffectTarget::Point(record),
+                mode: Mode::Write { moves: Moves::Both },
+            });
+            total.saturating_add(cell.saturating_mul(2))
+        })
 }
 
 /// The protocol fee and transfer resource: the genesis publisher's
@@ -534,7 +559,6 @@ impl BridgeStatics {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect(),
-            crossings: Vec::new(),
             nullifiers: Vec::new(),
             signer,
             routing: Routing {
@@ -556,57 +580,6 @@ impl BridgeStatics {
             packages: Vec::new(),
         })
     }
-}
-
-/// The placement-free half of a transaction's division: its legs, the
-/// record cell of every value edge, and every cell the kernel will write
-/// of its own accord.
-struct Division {
-    legs: Vec<LegShape>,
-    crossings: Vec<Crossing>,
-}
-
-/// Divide an admitted tree.
-///
-/// Keys are made of what each node's own signer signed — the intent, the
-/// node's index within it, and that intent's expiry — so two compositions
-/// of one subintent derive the same record for its nodes, and nothing
-/// here consults placement.
-///
-/// The record sits under the producing node's target; the claim beside
-/// it, under the consuming node's, is the engine's to derive where the
-/// edge turns out to cross. Walked from the consumer side because that
-/// is where an edge is named, and admission has already refused an edge
-/// with two consumers.
-fn divide(admitted: &AdmittedTree) -> Result<Division, DerivationError> {
-    let legs = legs_of(&admitted.admitted);
-    let mut crossings = Vec::new();
-    for consumer in &legs {
-        for edge in &consumer.edges {
-            let Some(producer) = legs.get(edge.source as usize) else {
-                return Err(DerivationError::Refused(format!(
-                    "edge names node {} past the manifest",
-                    edge.source
-                )));
-            };
-            let record = CrossingSite::record(
-                &ProtocolHasher,
-                producer.target,
-                producer.intent,
-                producer.local,
-                edge.output,
-                producer.expiry_ms,
-            )
-            .key();
-            crossings.push(Crossing {
-                node: edge.source,
-                output: edge.output,
-                record,
-            });
-        }
-    }
-    crossings.sort_unstable_by_key(|crossing| (crossing.node, crossing.output));
-    Ok(Division { legs, crossings })
 }
 
 impl Derivation for BridgeStatics {
@@ -707,7 +680,7 @@ impl Derivation for BridgeStatics {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let Division { legs, crossings } = divide(&admitted)?;
+        let legs = legs_of(&admitted.admitted);
         // What this transaction costs a block, on the engine's own
         // schedule: the fixed charge for carrying it, what it declared it
         // would touch, and the ceiling it signed for its own execution.
@@ -721,14 +694,13 @@ impl Derivation for BridgeStatics {
             .per_shard
             .values()
             .fold(0u64, |total, set| total.saturating_add(footprint(set)))
-            .saturating_add(crossing_cells_footprint(&crossings));
+            .saturating_add(crossing_cells_footprint(&legs));
         let work = declared_work(declared_footprint, vm.gas_limit, vm.signature_work());
         Ok(Derived {
             effective_window,
             work,
             footprint: declared_footprint,
             legs,
-            crossings,
             nullifiers: admitted
                 .subintents
                 .iter()
@@ -1029,11 +1001,10 @@ mod tests {
             roles,
             vec![LegRole::Attesting, LegRole::Inbound, LegRole::Outbound]
         );
-        assert_eq!(derived.crossings.len(), 1);
-        let crossing = derived.crossings[0];
-        assert_eq!((crossing.node, crossing.output), (1, 0));
+        let records = crossing_records(&derived.legs);
+        assert_eq!(records.len(), 1);
         assert_eq!(
-            crossing.record.owner,
+            records[0].owner,
             composer_addr().address(),
             "the record sits under the producing node's target"
         );
@@ -1046,11 +1017,11 @@ mod tests {
         // The footprint is the term of the price the declaration fixes,
         // carried whole beside the sum it feeds — and it prices the
         // crossing's record and claim beside what the routing declares.
-        let cells = crossing_cells_footprint(&derived.crossings);
+        let cells = crossing_cells_footprint(&derived.legs);
         assert_eq!(
             cells,
             2 * effect_units(Effect {
-                target: EffectTarget::Point(crossing.record),
+                target: EffectTarget::Point(records[0]),
                 mode: Mode::Write { moves: Moves::Both },
             }),
             "one record and one claim, each a point write"
@@ -1088,22 +1059,17 @@ mod tests {
         assert_eq!(one.legs[3].local, 1);
         assert_eq!(one.legs[1].intent, first.root.hash(&ProtocolHasher));
 
-        let produced_by = |derived: &Derived, node: u32| {
-            derived
-                .crossings
-                .iter()
-                .find(|crossing| crossing.node == node)
-                .copied()
-                .expect("the edge crosses")
+        let record_of = |derived: &Derived, node: usize| {
+            CrossingSite::record_of(&ProtocolHasher, &derived.legs[node], 0).key()
         };
         assert_eq!(
-            produced_by(&one, 3).record,
-            produced_by(&other, 3).record,
+            record_of(&one, 3),
+            record_of(&other, 3),
             "Bob's record is fixed by Bob's signature"
         );
         assert_ne!(
-            produced_by(&one, 1).record,
-            produced_by(&other, 1).record,
+            record_of(&one, 1),
+            record_of(&other, 1),
             "the root's record moves with the root's window"
         );
         assert_eq!(

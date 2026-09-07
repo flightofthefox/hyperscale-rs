@@ -484,7 +484,6 @@ impl Executor {
         let mut entry = Self::prepare(tx, records)?;
         entry.plan = member
             .classified()
-            .shape(tx.legs(), tx.crossings())
             .plan(arrivals, member.local(), member.side())
             .map_err(|defect| format!("no plan for this shard: {defect}"))?;
         // The second member a shard runs of one transaction commits no

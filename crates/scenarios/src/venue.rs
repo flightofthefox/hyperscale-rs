@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::XRD;
 use hyperscale_engine::genesis::stake_unit;
 use hyperscale_types::{
@@ -414,13 +415,12 @@ pub fn a_swap_by_a_caller_on_the_venues_shard_runs_whole<C: Cluster>(c: &mut C, 
         validity_around(c.now()),
     );
     let price = declared_price(c, &swap);
-    let records: Vec<SubstateKey> = swap
-        .try_derived(c.derivation().as_ref())
-        .expect("a scenario fixture derives")
-        .crossings
-        .iter()
-        .map(|crossing| crossing.record)
-        .collect();
+    let records = crossing_records(
+        &swap
+            .try_derived(c.derivation().as_ref())
+            .expect("a scenario fixture derives")
+            .legs,
+    );
     assert!(
         !records.is_empty(),
         "the shape has value edges whatever the placement: the record is derived, and \
@@ -629,13 +629,15 @@ pub fn a_swap_refused_at_its_inbound_leg_never_reaches_the_venue<C: Cluster>(
         validity_around(c.now()),
     );
     let price = declared_price(c, &overdrawn);
-    let record = overdrawn
-        .try_derived(c.derivation().as_ref())
-        .expect("a scenario fixture derives")
-        .crossings
-        .first()
-        .expect("a swap crosses to its venue")
-        .record;
+    let record = crossing_records(
+        &overdrawn
+            .try_derived(c.derivation().as_ref())
+            .expect("a scenario fixture derives")
+            .legs,
+    )
+    .first()
+    .copied()
+    .expect("a swap crosses to its venue");
     let reserve = reserve_cell(&venue.meta, *XRD);
     let stocked = held_at(c, reserve);
     assert!(

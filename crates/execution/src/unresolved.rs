@@ -332,7 +332,7 @@ impl Part {
     /// freeze is a function of the block and the placement it committed
     /// under, and the replay re-freezes both.
     fn of(local: ShardId, tx: &Arc<Verifiable<Transaction>>, classified: &Classified) -> Self {
-        if !classified.decomposed().holds() {
+        if !classified.decomposed() {
             return Self::Whole;
         }
         let in_core = classified.core().contains(&local);
@@ -347,8 +347,7 @@ impl Part {
             Ok(verified) => Arc::new(verified),
             Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
         };
-        let shape = classified.shape(tx.legs(), tx.crossings());
-        let deliveries = shape.delivered_claims(local);
+        let deliveries = classified.delivered_claims(local);
         if in_core {
             Self::Issuer(Kept {
                 body,
@@ -363,7 +362,7 @@ impl Part {
                 classified: classified.clone(),
                 core: classified.core().clone(),
                 deliveries,
-                claims: shape.core_claims(local),
+                claims: classified.core_claims(local),
             })
         }
     }

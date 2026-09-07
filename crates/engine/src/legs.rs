@@ -1,6 +1,6 @@
 //! Which legs of a transaction this shard runs.
 //!
-//! Turns a transaction's derived legs plus a placement into the
+//! Turns a transaction's frozen star plus a placement into the
 //! [`LegPlan`] the kernel executes. Pure and node-independent: nothing
 //! here consults the executing node, because two shards divide one
 //! manifest separately and their answers have to agree, or a crossing is
@@ -22,40 +22,23 @@
 //! own shard would otherwise be departed into a record its consumer, on
 //! the same shard, could never be handed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use hyperscale_types::{Address, EscrowedValue, ShardId, ShardTrie};
-use hyperscale_vm_effects::{CrossingSite, star_at};
+use hyperscale_types::{Address, EscrowedValue, ShardId, ShardTrie, SubstateKey};
+use hyperscale_vm_effects::{CrossingEdge as StarEdge, Star, star_at};
 use hyperscale_vm_kernel::{Crossed, Departure, ExecutionScope, LegPlan, PlanFault};
-use hyperscale_vm_types::{Crossing, LegRole, LegShape, ProtocolHasher, SubstateKey};
+use hyperscale_vm_types::{LegRole, LegShape, ProtocolHasher};
 
 use crate::sharding::TrieShardResolver;
 
-/// Whether a transaction's legs run where their state lives.
-///
-/// Frozen onto the transaction when its block commits and carried from
-/// there, never re-derived downstream. Only [`decomposes`] says yes, so a
-/// bare answer cannot be passed where a frozen one belongs; [`Self::WHOLE`]
-/// is always correct and is what every execution ran before anything
-/// else could run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Decomposed(bool);
-
-impl Decomposed {
-    /// The whole shape on every participant.
-    pub const WHOLE: Self = Self(false);
-
-    /// Whether the legs run where their state lives.
-    #[must_use]
-    pub const fn holds(self) -> bool {
-        self.0
-    }
-}
+/// One value edge whose producer and consumer do not run together, under
+/// the protocol's shard identifiers.
+pub type CrossingEdge = StarEdge<ShardId>;
 
 /// The classification frozen onto a transaction when its block
-/// committed: whether it divides, each node's settled role, the shards
-/// its core sits on, and the trie all of that was read against.
+/// committed: the star its shape implies under the trie the block
+/// committed under, and which of its shards deliver.
 ///
 /// Taken once, at one placement, and carried from there — every consumer
 /// reads this and none re-derives it, so a reshape landing between
@@ -67,306 +50,17 @@ impl Decomposed {
 /// with no placement to freeze against.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Classified {
-    decomposed: Decomposed,
     /// The trie the classification was read against, and the one every
     /// plan built from it resolves an owner through.
     trie: Arc<ShardTrie>,
-    /// Each node's role once placement settled it: the classifier's,
-    /// with a leg whose home is in the core set folded into the core.
-    roles: Vec<LegRole>,
-    core: BTreeSet<ShardId>,
+    /// The star: whether the shape divides, each node's settled role and
+    /// home, the core set, and every edge that crosses.
+    star: Star<ShardId>,
     delivering: BTreeSet<ShardId>,
     /// The shards that run an outbound leg beside an inbound one: a
     /// swap's caller, which withdraws before the venue and banks after
     /// it. Never a core shard, whose legs are its core member's.
     mixed: BTreeSet<ShardId>,
-}
-
-/// One transaction's frozen shape, bound to the legs and crossings it
-/// was frozen over.
-///
-/// Every question about who runs what is asked of this. The placement
-/// fold behind those questions is done once here rather than rebuilt per
-/// question, and no caller has to carry the three halves of the answer
-/// around together to ask one.
-pub struct Shape<'a> {
-    star: Star<'a>,
-    crossings: &'a [Crossing],
-    decomposed: bool,
-}
-
-impl Shape<'_> {
-    /// The value edges that cross.
-    ///
-    /// None when the shape runs whole: every participant runs every node, so
-    /// nothing is handed between them.
-    #[must_use]
-    pub fn edges(&self) -> Vec<CrossingEdge> {
-        if !self.decomposed {
-            return Vec::new();
-        }
-        let star = &self.star;
-        self.crossings
-            .iter()
-            .filter_map(|crossing| {
-                let consumer = star.consumer_of(crossing.node, crossing.output)?;
-                let producer_runs = star.running(crossing.node);
-                let to: BTreeSet<ShardId> = star
-                    .running(consumer)
-                    .difference(&producer_runs)
-                    .copied()
-                    .collect();
-                (!to.is_empty()).then(|| CrossingEdge {
-                    from: star.home(crossing.node),
-                    to,
-                    node: crossing.node,
-                    output: crossing.output,
-                    record: crossing.record,
-                    delivers: star.role(consumer) == LegRole::Outbound,
-                })
-            })
-            .collect()
-    }
-    /// The claim cells the deliveries of `local`'s issued crossings write,
-    /// each under the shard that delivers it.
-    ///
-    /// For every crossing an inbound leg here produces whose consumer is a
-    /// core node: that consumer's claim cell and the shard holding it —
-    /// the consumer's own home, since a claim sits under its target
-    /// wherever else the core runs it. What a probe asks the core about
-    /// once the transaction's deadline has passed: a claim absent there,
-    /// on a core of one shard, says the core never took the crossing.
-    /// Empty when the shape runs whole.
-    #[must_use]
-    pub fn core_claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        if !self.decomposed {
-            return Vec::new();
-        }
-        let star = &self.star;
-        self.crossings
-            .iter()
-            .filter_map(|crossing| {
-                let producer = star.leg(crossing.node).ok()?;
-                if star.role(crossing.node) == LegRole::Core || star.home(crossing.node) != local {
-                    return None;
-                }
-                let consumer = star.consumer_of(crossing.node, crossing.output)?;
-                if star.role(consumer) != LegRole::Core || star.running(consumer).contains(&local) {
-                    return None;
-                }
-                let claim = CrossingSite::claim(
-                    &ProtocolHasher,
-                    star.leg(consumer).ok()?.target,
-                    producer.intent,
-                    producer.local,
-                    crossing.output,
-                    producer.expiry_ms,
-                )
-                .key();
-                Some((star.home(consumer), claim))
-            })
-            .collect()
-    }
-    /// For every crossing a node here produces — an inbound leg's, or the
-    /// core's on a core shard — whose consumer is an outbound leg on another
-    /// shard: that consumer's claim cell and its home.
-    ///
-    /// A delivery that never claimed leaves exactly this cell absent, which
-    /// is what a lapse probe asks the delivering shard about, and the
-    /// crossing is then the producer's to take back. Empty when the shape
-    /// runs whole, since nothing is then handed between shards.
-    #[must_use]
-    pub fn delivered_claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        if !self.decomposed {
-            return Vec::new();
-        }
-        let star = &self.star;
-        self.crossings
-            .iter()
-            .filter_map(|crossing| {
-                let producer = star.leg(crossing.node).ok()?;
-                if star.role(crossing.node) == LegRole::Outbound
-                    || star.home(crossing.node) != local
-                {
-                    return None;
-                }
-                let consumer = star.consumer_of(crossing.node, crossing.output)?;
-                if star.role(consumer) != LegRole::Outbound {
-                    return None;
-                }
-                let home = star.home(consumer);
-                if home == local {
-                    return None;
-                }
-                let claim = CrossingSite::claim(
-                    &ProtocolHasher,
-                    star.leg(consumer).ok()?.target,
-                    producer.intent,
-                    producer.local,
-                    crossing.output,
-                    producer.expiry_ms,
-                )
-                .key();
-                Some((home, claim))
-            })
-            .collect()
-    }
-    /// What `local` runs of the transaction, what arrives for it, and what
-    /// departs from it.
-    ///
-    /// `arrivals` is what committed bundles attested for the edges this
-    /// shard's nodes consume; `crossings` is every value edge's record cell
-    /// as the transaction derives it. Both are read, never derived.
-    ///
-    /// # Errors
-    ///
-    /// [`PlanDefect`], on its own terms — never a smaller plan.
-    pub fn plan(
-        &self,
-        arrivals: &[EscrowedValue],
-        local: ShardId,
-        side: Side,
-    ) -> Result<ShardPlan, PlanDefect> {
-        if !self.decomposed {
-            return Ok(ShardPlan::whole());
-        }
-        let star = &self.star;
-        let legs = star.legs;
-        let crossings = self.crossings;
-        let runs_here = |node: u32| star.runs(node, local, side);
-        let mut plan = LegPlan::whole(legs.len());
-        let mut participant = false;
-        for node in 0..star.len() {
-            if runs_here(node) {
-                participant = true;
-            } else {
-                plan.skip(node)?;
-            }
-        }
-        if !participant {
-            return Err(PlanDefect::NotAParticipant);
-        }
-        for index in 0..star.len() {
-            let consumer = star.leg(index)?;
-            if !runs_here(index) {
-                continue;
-            }
-            for edge in &consumer.edges {
-                let producer = star.leg(edge.source)?;
-                if runs_here(edge.source) {
-                    continue;
-                }
-                let arrived = arrivals
-                    .iter()
-                    .find(|value| (value.node, value.output) == (edge.source, edge.output))
-                    .ok_or(PlanDefect::MissingArrival {
-                        node: edge.source,
-                        output: edge.output,
-                    })?;
-                let claim = CrossingSite::claim(
-                    &ProtocolHasher,
-                    consumer.target,
-                    producer.intent,
-                    producer.local,
-                    edge.output,
-                    producer.expiry_ms,
-                );
-                plan.arrives(
-                    edge.source,
-                    edge.output,
-                    Crossed {
-                        resource: arrived.resource,
-                        amount: arrived.amount,
-                    },
-                    claim,
-                )?;
-            }
-        }
-        for crossing in crossings {
-            let producer = star.leg(crossing.node)?;
-            if !runs_here(crossing.node) {
-                continue;
-            }
-            let Some(consumer) = star.consumer_of(crossing.node, crossing.output) else {
-                continue;
-            };
-            if runs_here(consumer) {
-                continue;
-            }
-            let record = CrossingSite::record(
-                &ProtocolHasher,
-                producer.target,
-                producer.intent,
-                producer.local,
-                crossing.output,
-                producer.expiry_ms,
-            );
-            // The consumer's claim, named here because this is the last
-            // reader of the manifest that holds both ends of the edge: the
-            // record travels with the prefix and the manifest does not, so
-            // a successor asking whether the crossing was taken has only
-            // what the leaf says.
-            let consumer_claim = CrossingSite::claim(
-                &ProtocolHasher,
-                star.leg(consumer)?.target,
-                producer.intent,
-                producer.local,
-                crossing.output,
-                producer.expiry_ms,
-            )
-            .key();
-            plan.departs(
-                crossing.node,
-                crossing.output,
-                Departure {
-                    site: record,
-                    consumer_claim,
-                },
-            )?;
-        }
-        Ok(ShardPlan {
-            legs: plan,
-            scope: star.scope_for(local),
-        })
-    }
-    /// Every record cell a producer here wrote whose consumer runs
-    /// elsewhere, in edge order.
-    ///
-    /// What a retirement of this transaction deletes and what a reclaim of
-    /// it credits back are the same cells; the two differ in what a
-    /// committed record licensed doing with them, which is the ledger's
-    /// question rather than this one's. So there is one fold, and the
-    /// caller names the disposition.
-    #[must_use]
-    pub fn records_issued(&self, local: ShardId) -> Vec<SubstateKey> {
-        let star = &self.star;
-        self.crossings
-            .iter()
-            .filter_map(|crossing| {
-                let producer = star.leg(crossing.node).ok()?;
-                if star.role(crossing.node) == LegRole::Outbound
-                    || star.home(crossing.node) != local
-                {
-                    return None;
-                }
-                let consumer = star.consumer_of(crossing.node, crossing.output)?;
-                if star.running(consumer).contains(&local) {
-                    return None;
-                }
-                Some(
-                    CrossingSite::record(
-                        &ProtocolHasher,
-                        producer.target,
-                        producer.intent,
-                        producer.local,
-                        crossing.output,
-                        producer.expiry_ms,
-                    )
-                    .key(),
-                )
-            })
-            .collect()
-    }
 }
 
 /// Which of a shard's legs a member runs.
@@ -393,12 +87,11 @@ pub enum Side {
 }
 
 impl Classified {
-    /// Freeze `legs` against `trie`: the classifier's star — whether the
-    /// shape divides, the settled roles and the core set. Nothing else
-    /// enters — the trie is the one placement fact, and it changes only
-    /// at a cut, where the shard leaving it commits nothing more — so
-    /// every shard and every replica committing the transaction under
-    /// one trie freezes one shape.
+    /// Freeze `legs` against `trie`: the classifier's star, and off it
+    /// which shards deliver. Nothing else enters — the trie is the one
+    /// placement fact, and it changes only at a cut, where the shard
+    /// leaving it commits nothing more — so every shard and every replica
+    /// committing the transaction under one trie freezes one shape.
     ///
     /// The classifier reads no window. A shard scheduled to leave the
     /// trie divides like any other, in its final window too: a record
@@ -419,10 +112,8 @@ impl Classified {
             &ProtocolHasher,
         )
         .map_shards(|shard| ShardId::from_heap_index(shard.0));
-        let decomposed = Decomposed(star.decomposes);
-        let placed = Star::view(legs, &star.roles, &star.core, &trie, consumers_of(legs));
-        let (delivering, mixed) = if decomposed.holds() {
-            let (delivers, settles) = placed.delivery_sides();
+        let (delivering, mixed) = if star.decomposes {
+            let (delivers, settles) = delivery_sides(&star);
             (
                 delivers.difference(&settles).copied().collect(),
                 delivers.intersection(&settles).copied().collect(),
@@ -431,36 +122,21 @@ impl Classified {
             (BTreeSet::new(), BTreeSet::new())
         };
         Self {
-            decomposed,
             trie,
-            roles: star.roles,
-            core: star.core,
+            star,
             delivering,
             mixed,
         }
     }
 
-    /// The whole shape on every participant, with no core set read.
+    /// The whole shape on every participant, with no placement read.
     #[must_use]
     pub fn whole() -> Self {
         Self {
-            decomposed: Decomposed::WHOLE,
             trie: Arc::new(ShardTrie::single()),
-            roles: Vec::new(),
-            core: BTreeSet::new(),
+            star: Star::whole(),
             delivering: BTreeSet::new(),
             mixed: BTreeSet::new(),
-        }
-    }
-
-    /// This classification bound to the legs and crossings it was frozen
-    /// over — the handle every question about the shape is asked of.
-    #[must_use]
-    pub fn shape<'a>(&'a self, legs: &'a [LegShape], crossings: &'a [Crossing]) -> Shape<'a> {
-        Shape {
-            star: Star::of(legs, self),
-            crossings,
-            decomposed: self.decomposed.holds(),
         }
     }
 
@@ -501,17 +177,231 @@ impl Classified {
         }
     }
 
-    /// Whether the legs run where their state lives.
+    /// Whether the legs run where their state lives. Only
+    /// [`Self::freeze`] can say yes; [`Self::whole`] never does.
     #[must_use]
-    pub const fn decomposed(&self) -> Decomposed {
-        self.decomposed
+    pub const fn decomposed(&self) -> bool {
+        self.star.decomposes
     }
 
     /// The shards the core's nodes sit on.
     #[must_use]
     pub const fn core(&self) -> &BTreeSet<ShardId> {
-        &self.core
+        &self.star.core
     }
+
+    /// The value edges that cross, in `(producer, output)` order.
+    ///
+    /// None when the shape runs whole: every participant runs every
+    /// node, so nothing is handed between them.
+    #[must_use]
+    pub fn edges(&self) -> &[CrossingEdge] {
+        if self.decomposed() {
+            &self.star.edges
+        } else {
+            &[]
+        }
+    }
+
+    /// The claim cells core consumers write for the crossings a leg on
+    /// `local` issued, each under the shard holding the consumer's
+    /// target — the consumer's own home, since a claim sits under its
+    /// target wherever else the core runs it. What a probe asks the core
+    /// about once the transaction's deadline has passed: a claim absent
+    /// there, on a core of one shard, says the core never took the
+    /// crossing.
+    #[must_use]
+    pub fn core_claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
+        self.edges()
+            .iter()
+            .filter(|edge| edge.from == local && !edge.delivers)
+            .map(|edge| (self.home(edge.consumer), edge.claim.key()))
+            .collect()
+    }
+
+    /// The claim cells deliveries elsewhere write for the crossings a
+    /// node on `local` issued — an inbound leg's, or the core's on a
+    /// core shard — each under the delivering shard.
+    ///
+    /// A delivery that never claimed leaves exactly this cell absent,
+    /// which is what a lapse probe asks the delivering shard about, and
+    /// the crossing is then the producer's to take back.
+    #[must_use]
+    pub fn delivered_claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
+        self.edges()
+            .iter()
+            .filter(|edge| edge.from == local && edge.delivers)
+            .map(|edge| (self.home(edge.consumer), edge.claim.key()))
+            .collect()
+    }
+
+    /// Every record cell a producer on `local` writes for a consumer
+    /// elsewhere, in edge order.
+    ///
+    /// What a retirement of this transaction deletes and what a reclaim
+    /// of it credits back are the same cells; the two differ in what a
+    /// committed record licensed doing with them, which is the ledger's
+    /// question rather than this one's. So there is one fold, and the
+    /// caller names the disposition.
+    #[must_use]
+    pub fn records_issued(&self, local: ShardId) -> Vec<SubstateKey> {
+        self.edges()
+            .iter()
+            .filter(|edge| edge.from == local)
+            .map(|edge| edge.record.key())
+            .collect()
+    }
+
+    /// What `local` runs of the transaction on `side`, what arrives for
+    /// it, and what departs from it.
+    ///
+    /// `arrivals` is what committed bundles attested for the edges this
+    /// member consumes — read, never derived.
+    ///
+    /// # Errors
+    ///
+    /// [`PlanDefect`], on its own terms — never a smaller plan.
+    pub fn plan(
+        &self,
+        arrivals: &[EscrowedValue],
+        local: ShardId,
+        side: Side,
+    ) -> Result<ShardPlan, PlanDefect> {
+        if !self.decomposed() {
+            return Ok(ShardPlan::whole());
+        }
+        let runs_here = |node: u32| runs(&self.star, node, local, side);
+        let mut plan = LegPlan::whole(self.star.homes.len());
+        let mut participant = false;
+        for node in 0..len(&self.star) {
+            if runs_here(node) {
+                participant = true;
+            } else {
+                plan.skip(node)?;
+            }
+        }
+        if !participant {
+            return Err(PlanDefect::NotAParticipant);
+        }
+        for edge in &self.star.edges {
+            if runs_here(edge.consumer) && !runs_here(edge.producer) {
+                let arrived = arrivals
+                    .iter()
+                    .find(|value| (value.node, value.output) == (edge.producer, edge.output))
+                    .ok_or(PlanDefect::MissingArrival {
+                        node: edge.producer,
+                        output: edge.output,
+                    })?;
+                plan.arrives(
+                    edge.producer,
+                    edge.output,
+                    Crossed {
+                        resource: arrived.resource,
+                        amount: arrived.amount,
+                    },
+                    edge.claim,
+                )?;
+            } else if runs_here(edge.producer) && !runs_here(edge.consumer) {
+                plan.departs(
+                    edge.producer,
+                    edge.output,
+                    Departure {
+                        site: edge.record,
+                        consumer_claim: edge.claim.key(),
+                    },
+                )?;
+            }
+        }
+        Ok(ShardPlan {
+            legs: plan,
+            scope: self.scope_for(local),
+        })
+    }
+
+    /// The node's home. A node past the manifest has none, and answers
+    /// the root — a shard no leaf is, so nothing matches it.
+    fn home(&self, node: u32) -> ShardId {
+        self.star
+            .homes
+            .get(node as usize)
+            .copied()
+            .unwrap_or(ShardId::ROOT)
+    }
+
+    /// What `local` judges: the core set if it is in it, itself
+    /// otherwise.
+    fn scope_for(&self, local: ShardId) -> ExecutionScope {
+        let trie = Arc::clone(&self.trie);
+        if self.star.core.contains(&local) {
+            let core = self.star.core.clone();
+            ExecutionScope::spanning(move |owner| core.contains(&trie.shard_for_prefix(owner)))
+        } else {
+            ExecutionScope::spanning(move |owner| trie.shard_for_prefix(owner) == local)
+        }
+    }
+}
+
+fn len(star: &Star<ShardId>) -> u32 {
+    u32::try_from(star.homes.len()).expect("a manifest has fewer than u32 nodes")
+}
+
+/// The node's settled role. A node past the manifest is core, the
+/// direction every unsure answer takes.
+fn role(star: &Star<ShardId>, node: u32) -> LegRole {
+    star.roles.get(node as usize).copied().unwrap_or_default()
+}
+
+/// The shards that run `node`: every core shard for a core node, its
+/// home for a leg.
+fn running(star: &Star<ShardId>, node: u32) -> BTreeSet<ShardId> {
+    match role(star, node) {
+        LegRole::Core => star.core.clone(),
+        LegRole::Inbound | LegRole::Outbound | LegRole::Attesting => {
+            star.homes.get(node as usize).copied().into_iter().collect()
+        }
+    }
+}
+
+/// The side `node` runs on at `local`: a sink whose producers run
+/// elsewhere is a delivery, waiting on their arrival; everything else —
+/// a source, the core, a sink fed beside itself — issues.
+fn side_of(star: &Star<ShardId>, node: u32, local: ShardId) -> Side {
+    let delivers = role(star, node) == LegRole::Outbound
+        && star
+            .edges
+            .iter()
+            .any(|edge| edge.consumer == node && edge.to.contains(&local));
+    if delivers {
+        Side::Delivering
+    } else {
+        Side::Issuing
+    }
+}
+
+/// Whether `node` runs in `local`'s member on `side`.
+fn runs(star: &Star<ShardId>, node: u32, local: ShardId, side: Side) -> bool {
+    running(star, node).contains(&local) && side_of(star, node, local) == side
+}
+
+/// The shards running a delivery, and the shards running anything that
+/// issues. A shard in both runs the transaction as two members.
+fn delivery_sides(star: &Star<ShardId>) -> (BTreeSet<ShardId>, BTreeSet<ShardId>) {
+    let mut delivers = BTreeSet::new();
+    let mut settles = BTreeSet::new();
+    for node in 0..len(star) {
+        for shard in running(star, node) {
+            match (role(star, node), side_of(star, node, shard)) {
+                (LegRole::Attesting, _) => {}
+                (_, Side::Delivering) => {
+                    delivers.insert(shard);
+                }
+                (_, Side::Issuing) => {
+                    settles.insert(shard);
+                }
+            }
+        }
+    }
+    (delivers, settles)
 }
 
 /// One shard's member of a frozen transaction.
@@ -618,7 +508,7 @@ impl Member {
     /// and itself otherwise.
     #[must_use]
     pub fn awaited(&self) -> BTreeSet<ShardId> {
-        if !self.classified.decomposed().holds() {
+        if !self.classified.decomposed() {
             self.participating.clone()
         } else if self.in_core() {
             self.classified.core().clone()
@@ -631,7 +521,7 @@ impl Member {
     /// unless the member is a leg, whose transaction its core decides.
     #[must_use]
     pub fn decides(&self) -> bool {
-        !self.classified.decomposed().holds() || self.in_core()
+        !self.classified.decomposed() || self.in_core()
     }
 
     /// Whether the member only delivers: a leg that failed is the
@@ -639,7 +529,7 @@ impl Member {
     /// nothing — the value it claims stays in its cell for a later claim.
     #[must_use]
     pub fn delivers(&self) -> bool {
-        self.classified.decomposed().holds() && self.side == Side::Delivering
+        self.classified.decomposed() && self.side == Side::Delivering
     }
 
     /// Whether this shard's nodes sit in the core set.
@@ -771,41 +661,6 @@ impl Runs {
     }
 }
 
-/// Every `(source, output)` edge's consumer.
-fn consumers_of(legs: &[LegShape]) -> BTreeMap<(u32, u32), u32> {
-    legs.iter()
-        .enumerate()
-        .flat_map(|(index, leg)| {
-            let index = u32::try_from(index).expect("a manifest has fewer than u32 nodes");
-            leg.edges
-                .iter()
-                .map(move |edge| ((edge.source, edge.output), index))
-        })
-        .collect()
-}
-
-/// One value edge whose producer and consumer do not run together.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CrossingEdge {
-    /// The shard whose verdict commits the record cell: the producing
-    /// node's home.
-    pub from: ShardId,
-    /// The shards that claim it — every shard running the consumer that
-    /// does not also run the producer. Several for a consumer inside a
-    /// multi-shard core.
-    pub to: BTreeSet<ShardId>,
-    /// The producing node.
-    pub node: u32,
-    /// Which of its outputs the edge carries.
-    pub output: u32,
-    /// The record cell, under the producing node's target.
-    pub record: SubstateKey,
-    /// Whether an outbound leg consumes it — a delivery's arrival, which
-    /// the delivering member of each claiming shard waits on rather than
-    /// the issuing one.
-    pub delivers: bool,
-}
-
 /// What one shard runs of a transaction, and the scope it judges under.
 #[derive(Clone, Debug)]
 pub struct ShardPlan {
@@ -838,12 +693,6 @@ impl ShardPlan {
 /// outcome priced to nobody.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PlanDefect {
-    /// An edge or a crossing names a node the legs do not have.
-    #[error("node {node} is past the manifest")]
-    NoSuchNode {
-        /// The index named.
-        node: u32,
-    },
     /// A consumer this shard runs takes an edge from a producer it does
     /// not run, and nothing attested arrived for it.
     #[error("nothing arrived for edge ({node}, {output})")]
@@ -863,141 +712,10 @@ pub enum PlanDefect {
     Fault(#[from] PlanFault),
 }
 
-/// The frozen star with the placement facts every question here reads:
-/// each node's role and home, the core set, and which shards run which
-/// node on which side — all off the classification, none re-derived.
-struct Star<'a> {
-    legs: &'a [LegShape],
-    roles: &'a [LegRole],
-    core: &'a BTreeSet<ShardId>,
-    trie: &'a Arc<ShardTrie>,
-    consumers: BTreeMap<(u32, u32), u32>,
-}
-
-impl<'a> Star<'a> {
-    fn of(legs: &'a [LegShape], classified: &'a Classified) -> Self {
-        Self::view(
-            legs,
-            &classified.roles,
-            &classified.core,
-            &classified.trie,
-            consumers_of(legs),
-        )
-    }
-
-    const fn view(
-        legs: &'a [LegShape],
-        roles: &'a [LegRole],
-        core: &'a BTreeSet<ShardId>,
-        trie: &'a Arc<ShardTrie>,
-        consumers: BTreeMap<(u32, u32), u32>,
-    ) -> Self {
-        Self {
-            legs,
-            roles,
-            core,
-            trie,
-            consumers,
-        }
-    }
-
-    /// The side `node` runs on at `local`: a sink whose producers run
-    /// elsewhere is a delivery, waiting on their arrival; everything
-    /// else — a source, the core, a sink fed beside itself — issues.
-    fn side_of(&self, node: u32, local: ShardId) -> Side {
-        let delivers = self.role(node) == LegRole::Outbound
-            && self.legs.get(node as usize).is_some_and(|leg| {
-                leg.edges
-                    .iter()
-                    .any(|edge| !self.running(edge.source).contains(&local))
-            });
-        if delivers {
-            Side::Delivering
-        } else {
-            Side::Issuing
-        }
-    }
-
-    /// Whether `node` runs in `local`'s member on `side`.
-    fn runs(&self, node: u32, local: ShardId, side: Side) -> bool {
-        self.running(node).contains(&local) && self.side_of(node, local) == side
-    }
-
-    /// The shards running a delivery, and the shards running anything
-    /// that issues. A shard in both runs the transaction as two members.
-    fn delivery_sides(&self) -> (BTreeSet<ShardId>, BTreeSet<ShardId>) {
-        let mut delivers = BTreeSet::new();
-        let mut settles = BTreeSet::new();
-        for node in 0..self.len() {
-            for shard in self.running(node) {
-                match (self.role(node), self.side_of(node, shard)) {
-                    (LegRole::Attesting, _) => {}
-                    (_, Side::Delivering) => {
-                        delivers.insert(shard);
-                    }
-                    (_, Side::Issuing) => {
-                        settles.insert(shard);
-                    }
-                }
-            }
-        }
-        (delivers, settles)
-    }
-
-    fn len(&self) -> u32 {
-        u32::try_from(self.legs.len()).expect("a manifest has fewer than u32 nodes")
-    }
-
-    fn leg(&self, node: u32) -> Result<&'a LegShape, PlanDefect> {
-        self.legs
-            .get(node as usize)
-            .ok_or(PlanDefect::NoSuchNode { node })
-    }
-
-    /// The node's settled role. A node past the manifest is core, the
-    /// direction every unsure answer takes.
-    fn role(&self, node: u32) -> LegRole {
-        self.roles.get(node as usize).copied().unwrap_or_default()
-    }
-
-    fn home(&self, node: u32) -> ShardId {
-        self.legs
-            .get(node as usize)
-            .map_or(ShardId::ROOT, |leg| self.trie.shard_for_prefix(leg.target))
-    }
-
-    /// The shards that run `node`: every core shard for a core node, its
-    /// home for a leg.
-    fn running(&self, node: u32) -> BTreeSet<ShardId> {
-        match self.role(node) {
-            LegRole::Core => self.core.clone(),
-            LegRole::Inbound | LegRole::Outbound | LegRole::Attesting => {
-                BTreeSet::from([self.home(node)])
-            }
-        }
-    }
-
-    fn consumer_of(&self, node: u32, output: u32) -> Option<u32> {
-        self.consumers.get(&(node, output)).copied()
-    }
-
-    /// What `local` judges: the core set if it is in it, itself
-    /// otherwise.
-    fn scope_for(&self, local: ShardId) -> ExecutionScope {
-        let trie = Arc::clone(self.trie);
-        if self.core.contains(&local) {
-            let core = self.core.clone();
-            ExecutionScope::spanning(move |owner| core.contains(&trie.shard_for_prefix(owner)))
-        } else {
-            ExecutionScope::spanning(move |owner| trie.shard_for_prefix(owner) == local)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{Address, AddressClass, LocalKey, SubstateKey};
-    use hyperscale_vm_effects::{Hash32, SubintentHash};
+    use hyperscale_vm_effects::{CrossingSite, Hash32, SubintentHash};
     use hyperscale_vm_types::{ResourceAddr, ValueEdge};
 
     use super::*;
@@ -1039,21 +757,9 @@ mod tests {
         }
     }
 
-    fn crossing(legs: &[LegShape], node: u32, output: u32) -> Crossing {
-        let producer = &legs[node as usize];
-        Crossing {
-            node,
-            output,
-            record: CrossingSite::record(
-                &ProtocolHasher,
-                producer.target,
-                producer.intent,
-                producer.local,
-                output,
-                producer.expiry_ms,
-            )
-            .key(),
-        }
+    /// The record cell the edge `node` leaves on `output`.
+    fn record(legs: &[LegShape], node: u32, output: u32) -> SubstateKey {
+        CrossingSite::record_of(&ProtocolHasher, &legs[node as usize], output).key()
     }
 
     fn arrival(node: u32, output: u32, amount: u128) -> EscrowedValue {
@@ -1107,10 +813,7 @@ mod tests {
 
     fn frozen(legs: &[LegShape]) -> Classified {
         let classified = Classified::freeze(legs, &[], &trie());
-        assert!(
-            classified.decomposed().holds(),
-            "the fixture has to decompose"
-        );
+        assert!(classified.decomposed(), "the fixture has to decompose");
         classified
     }
 
@@ -1121,45 +824,23 @@ mod tests {
     #[test]
     fn delivered_claims_name_the_deliveries_of_what_a_shard_issued() {
         let legs = transfer();
-        let crossings = [crossing(&legs, 1, 0)];
         let bob = owner(0x22, true);
-        let expected = CrossingSite::claim(
-            &ProtocolHasher,
-            bob,
-            legs[1].intent,
-            legs[1].local,
-            0,
-            legs[1].expiry_ms,
-        )
-        .key();
+        let expected = CrossingSite::claim_of(&ProtocolHasher, bob, &legs[1], 0).key();
         assert_eq!(
-            frozen(&legs)
-                .shape(&legs, &crossings)
-                .delivered_claims(low()),
-            vec![(high(), expected)],
+            frozen(&legs).delivered_claims(low()),
+            vec![(high(), expected)]
         );
         assert!(
-            frozen(&legs)
-                .shape(&legs, &crossings)
-                .delivered_claims(high())
-                .is_empty(),
+            frozen(&legs).delivered_claims(high()).is_empty(),
             "the delivering shard issued nothing",
         );
         assert!(
-            Classified::whole()
-                .shape(&legs, &crossings)
-                .delivered_claims(low())
-                .is_empty(),
+            Classified::whole().delivered_claims(low()).is_empty(),
             "a whole shape hands nothing between shards",
         );
 
-        let swap = swap();
-        let crossings = [crossing(&swap, 1, 0), crossing(&swap, 2, 0)];
         assert!(
-            frozen(&swap)
-                .shape(&swap, &crossings)
-                .delivered_claims(low())
-                .is_empty(),
+            frozen(&swap()).delivered_claims(low()).is_empty(),
             "a crossing the core consumes is answered by the core, not a delivery",
         );
     }
@@ -1167,19 +848,12 @@ mod tests {
     /// The whole shape on every participant, whatever the trie.
     #[test]
     fn a_whole_transaction_plans_the_whole_shape() {
-        let legs = transfer();
         let plan = Classified::whole()
-            .shape(&legs, &[])
             .plan(&[], low(), Side::Issuing)
             .expect("a whole plan needs nothing");
         assert!(plan.legs.is_whole());
         assert!(plan.scope.covers(owner(0x22, true)));
-        assert!(
-            Classified::whole()
-                .shape(&legs, &[crossing(&legs, 1, 0)])
-                .edges()
-                .is_empty()
-        );
+        assert!(Classified::whole().edges().is_empty());
     }
 
     /// A transfer plans one inbound leg on the sender's shard and one
@@ -1187,20 +861,16 @@ mod tests {
     #[test]
     fn a_transfer_divides_into_an_inbound_and_an_outbound_leg() {
         let legs = transfer();
-        let crossings = vec![crossing(&legs, 1, 0)];
         let divided = frozen(&legs);
 
-        let edges = divided.shape(&legs, &crossings).edges();
+        let edges = divided.edges();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].from, low());
         assert_eq!(edges[0].to, BTreeSet::from([high()]));
-        assert_eq!(
-            Classified::freeze(&legs, &[], &trie()).core(),
-            &BTreeSet::from([low()])
-        );
+        assert_eq!(edges[0].record.key(), record(&legs, 1, 0));
+        assert_eq!(divided.core(), &BTreeSet::from([low()]));
 
         let sender = divided
-            .shape(&legs, &crossings)
             .plan(&[], low(), Side::Issuing)
             .expect("the sender's legs need no arrival");
         assert!(sender.legs.runs(0) && sender.legs.runs(1) && !sender.legs.runs(2));
@@ -1209,7 +879,6 @@ mod tests {
         assert!(!sender.scope.covers(owner(0x22, true)));
 
         let recipient = divided
-            .shape(&legs, &crossings)
             .plan(&[arrival(1, 0, 100)], high(), Side::Delivering)
             .expect("the recipient's leg has its arrival");
         assert!(!recipient.legs.runs(0) && !recipient.legs.runs(1) && recipient.legs.runs(2));
@@ -1229,18 +898,13 @@ mod tests {
     #[test]
     fn a_swap_keeps_the_core_on_the_venue_alone() {
         let legs = swap();
-        let crossings = vec![crossing(&legs, 1, 0), crossing(&legs, 2, 0)];
         let divided = frozen(&legs);
-        assert_eq!(
-            Classified::freeze(&legs, &[], &trie()).core(),
-            &BTreeSet::from([high()])
-        );
+        assert_eq!(divided.core(), &BTreeSet::from([high()]));
 
         // The caller runs the transaction as two members: its issuing one
         // signs in and withdraws, waiting on nothing, and its delivering
         // one banks the venue's output once that has crossed back.
         let issuing = divided
-            .shape(&legs, &crossings)
             .plan(&[], low(), Side::Issuing)
             .expect("the caller's issuing legs take no arrival");
         assert!(issuing.legs.runs(0) && issuing.legs.runs(1));
@@ -1248,7 +912,6 @@ mod tests {
         assert!(issuing.legs.departure(1, 0).is_some());
         assert!(issuing.legs.arrival(2, 0).is_none());
         let delivering = divided
-            .shape(&legs, &crossings)
             .plan(&[arrival(2, 0, 90)], low(), Side::Delivering)
             .expect("the caller's delivering leg has its arrival");
         assert!(delivering.legs.runs(3));
@@ -1257,7 +920,6 @@ mod tests {
         assert!(delivering.legs.departure(1, 0).is_none());
 
         let venue = divided
-            .shape(&legs, &crossings)
             .plan(&[arrival(1, 0, 100)], high(), Side::Issuing)
             .expect("the venue has its arrival");
         assert!(venue.legs.runs(2));
@@ -1273,13 +935,8 @@ mod tests {
     #[test]
     fn a_missing_arrival_is_a_defect() {
         let legs = transfer();
-        let crossings = vec![crossing(&legs, 1, 0)];
-        let divided = frozen(&legs);
         assert_eq!(
-            divided
-                .shape(&legs, &crossings)
-                .plan(&[], high(), Side::Delivering)
-                .err(),
+            frozen(&legs).plan(&[], high(), Side::Delivering).err(),
             Some(PlanDefect::MissingArrival { node: 1, output: 0 }),
         );
     }
@@ -1291,21 +948,17 @@ mod tests {
     #[test]
     fn a_core_shard_reclaims_what_it_issued_to_a_delivery() {
         let legs = swap();
-        let crossings = vec![crossing(&legs, 1, 0), crossing(&legs, 2, 0)];
         let divided = frozen(&legs);
         let venue = divided
-            .shape(&legs, &crossings)
             .plan(&[arrival(1, 0, 100)], high(), Side::Issuing)
             .expect("a core issues what it minted");
         assert!(venue.legs.departure(2, 0).is_some());
 
-        let reclaimed = divided.shape(&legs, &crossings).records_issued(high());
-        assert_eq!(reclaimed.len(), 1);
-        assert_eq!(reclaimed[0], crossings[1].record);
+        let reclaimed = divided.records_issued(high());
+        assert_eq!(reclaimed, vec![record(&legs, 2, 0)]);
         assert_eq!(reclaimed[0].owner, owner(0x33, true));
         assert_eq!(
             divided
-                .shape(&legs, &crossings)
                 .delivered_claims(high())
                 .into_iter()
                 .map(|(shard, _)| shard)
@@ -1315,34 +968,20 @@ mod tests {
         );
     }
 
-    /// A shard that runs nothing of the transaction is not a participant,
-    /// and a crossing naming a node past the manifest is malformed.
+    /// A shard that runs nothing of the transaction is not a participant.
     #[test]
-    fn a_non_participant_and_a_malformed_crossing_are_defects() {
+    fn a_non_participant_is_a_defect() {
         let legs = swap();
-        let divided = frozen(&legs);
         let elsewhere = ShardTrie::uniform(2);
         let divided_deeper = Classified::freeze(&legs, &[], &elsewhere);
-        assert!(divided_deeper.decomposed().holds());
+        assert!(divided_deeper.decomposed());
         // Under a four-leaf trie the low owners sit at path 0 and the
         // venue at path 2, so leaf 1 runs nothing.
         assert_eq!(
             divided_deeper
-                .shape(&legs, &[])
                 .plan(&[], ShardId::leaf(2, 1), Side::Issuing)
                 .err(),
             Some(PlanDefect::NotAParticipant),
-        );
-        let past = Crossing {
-            node: 9,
-            ..crossing(&legs, 1, 0)
-        };
-        assert_eq!(
-            divided
-                .shape(&legs, &[past])
-                .plan(&[arrival(2, 0, 90)], low(), Side::Issuing)
-                .err(),
-            Some(PlanDefect::NoSuchNode { node: 9 }),
         );
     }
 
@@ -1352,23 +991,17 @@ mod tests {
     #[test]
     fn a_reclaim_takes_back_the_inbound_crossing_alone() {
         let legs = swap();
-        let crossings = vec![crossing(&legs, 1, 0), crossing(&legs, 2, 0)];
-        let reclaimed = frozen(&legs).shape(&legs, &crossings).records_issued(low());
+        let reclaimed = frozen(&legs).records_issued(low());
         assert_eq!(
-            reclaimed.len(),
-            1,
+            reclaimed,
+            vec![record(&legs, 1, 0)],
             "the venue's crossing is not the caller's"
         );
-        assert_eq!(reclaimed[0], crossings[0].record);
         assert_eq!(reclaimed[0].owner, owner(0x11, false));
 
         let legs = transfer();
-        let crossings = vec![crossing(&legs, 1, 0)];
         assert!(
-            frozen(&legs)
-                .shape(&legs, &crossings)
-                .records_issued(high())
-                .is_empty(),
+            frozen(&legs).records_issued(high()).is_empty(),
             "the recipient's shard issued nothing"
         );
     }
@@ -1388,19 +1021,17 @@ mod tests {
             leg(venue, LegRole::Core, &[(1, 0)], 2),
             leg(recipient, LegRole::Outbound, &[(2, 0)], 3),
         ];
-        let crossings = [crossing(&legs, 1, 0), crossing(&legs, 2, 0)];
         let classified = frozen(&legs);
         assert!(
             !classified.mixed_at(high()),
             "the core shard runs one member"
         );
         assert!(!classified.delivers_at(high()));
-        let edges = classified.shape(&legs, &crossings).edges();
+        let edges = classified.edges();
         assert_eq!(edges.len(), 1, "only the withdraw crosses");
-        assert_eq!((edges[0].node, edges[0].output), (1, 0));
+        assert_eq!((edges[0].producer, edges[0].output), (1, 0));
 
         let core = classified
-            .shape(&legs, &crossings)
             .plan(&[arrival(1, 0, 5)], high(), Side::Issuing)
             .expect("the core member runs the venue and the deposit");
         assert!(core.legs.runs(2) && core.legs.runs(3));
@@ -1409,18 +1040,10 @@ mod tests {
             "the venue's output stays in the execution"
         );
         assert_eq!(
-            classified
-                .shape(&legs, &crossings)
-                .plan(&[], high(), Side::Delivering)
-                .err(),
+            classified.plan(&[], high(), Side::Delivering).err(),
             Some(PlanDefect::NotAParticipant),
         );
-        assert!(
-            classified
-                .shape(&legs, &crossings)
-                .records_issued(high())
-                .is_empty()
-        );
+        assert!(classified.records_issued(high()).is_empty());
     }
 
     /// An inbound leg on one shard of a multi-shard core is replicated
@@ -1446,24 +1069,18 @@ mod tests {
             leg(owner_at(0x13, 2), LegRole::Core, &[(2, 0)], 3),
             leg(owner_at(0x14, 1), LegRole::Outbound, &[(3, 0)], 4),
         ];
-        let crossings = [
-            crossing(&legs, 1, 0),
-            crossing(&legs, 2, 0),
-            crossing(&legs, 3, 0),
-        ];
         let classified = Classified::freeze(&legs, &[], &trie);
-        assert!(classified.decomposed().holds());
+        assert!(classified.decomposed());
         assert_eq!(classified.core(), &BTreeSet::from([leaf0, leaf2]));
-        let edges = classified.shape(&legs, &crossings).edges();
+        let edges = classified.edges();
         assert_eq!(
-            edges.iter().map(|edge| edge.node).collect::<Vec<_>>(),
+            edges.iter().map(|edge| edge.producer).collect::<Vec<_>>(),
             vec![3],
             "only the second venue's output to the deposit crosses"
         );
         assert_eq!(edges[0].to, BTreeSet::from([leaf1]));
         for shard in [leaf0, leaf2] {
             let plan = classified
-                .shape(&legs, &crossings)
                 .plan(&[], shard, Side::Issuing)
                 .expect("a core shard plans the withdraw beside the venues");
             assert!(
@@ -1490,24 +1107,21 @@ mod tests {
             leg(alice, LegRole::Inbound, &[], 4),
             leg(carol, LegRole::Outbound, &[(4, 0)], 5),
         ];
-        let crossings = [
-            crossing(&legs, 1, 0),
-            crossing(&legs, 2, 0),
-            crossing(&legs, 4, 0),
-        ];
         let classified = frozen(&legs);
         assert!(
             classified.mixed_at(low()),
             "the venue's return is a delivery"
         );
-        let edges = classified.shape(&legs, &crossings).edges();
         assert_eq!(
-            edges.iter().map(|edge| edge.node).collect::<Vec<_>>(),
+            classified
+                .edges()
+                .iter()
+                .map(|edge| edge.producer)
+                .collect::<Vec<_>>(),
             vec![1, 2],
             "the local transfer's edge never crosses"
         );
         let issuing = classified
-            .shape(&legs, &crossings)
             .plan(&[], low(), Side::Issuing)
             .expect("the issuing member runs both withdraws and the local deposit");
         assert!(issuing.legs.runs(1) && issuing.legs.runs(4) && issuing.legs.runs(5));
@@ -1515,7 +1129,6 @@ mod tests {
         assert!(issuing.legs.departure(1, 0).is_some());
         assert!(issuing.legs.departure(4, 0).is_none());
         let delivering = classified
-            .shape(&legs, &crossings)
             .plan(&[arrival(2, 0, 7)], low(), Side::Delivering)
             .expect("the delivering member runs the venue's return alone");
         assert!(delivering.legs.runs(3) && !delivering.legs.runs(5));
@@ -1536,7 +1149,7 @@ mod tests {
             leg(alice, LegRole::Outbound, &[(2, 0), (3, 0)], 4),
         ];
         let whole = Classified::freeze(&legs, &[], &trie());
-        assert!(!whole.decomposed().holds());
+        assert!(!whole.decomposed());
         assert!(
             !whole.delivers_at(low()) && !whole.mixed_at(low()),
             "a whole shape gives the sink's shard no second member to wait on it"
@@ -1544,10 +1157,6 @@ mod tests {
         let mut one_sided = legs;
         one_sided[4] = leg(alice, LegRole::Outbound, &[(2, 0)], 4);
         one_sided[3] = leg(alice, LegRole::Outbound, &[], 3);
-        assert!(
-            Classified::freeze(&one_sided, &[], &trie())
-                .decomposed()
-                .holds()
-        );
+        assert!(Classified::freeze(&one_sided, &[], &trie()).decomposed());
     }
 }

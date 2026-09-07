@@ -9,6 +9,7 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
+use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::XRD;
 use hyperscale_types::{
     BlockHeight, Deadline, Ed25519PrivateKey, Epoch, PrincipalAddr, ShardId, SubstateKey,
@@ -784,13 +785,11 @@ fn submit_straddler_reserving<C: Cluster>(
     to: PrincipalAddr,
 ) -> (TxHash, u64, Vec<SubstateKey>) {
     let tx = build_transfer_tx(key, from, to, STRADDLER_PAYMENT, validity_around(c.now()));
-    let records = tx
-        .try_derived(c.derivation().as_ref())
-        .expect("a scenario transfer derives")
-        .crossings
-        .iter()
-        .map(|crossing| crossing.record)
-        .collect();
+    let records = crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario transfer derives")
+            .legs,
+    );
     let work = tx.work();
     let hash = charges.submit(c, tx);
     (hash, work, records)
