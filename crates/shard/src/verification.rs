@@ -1744,49 +1744,24 @@ impl VerificationPipeline {
         }
     }
 
-    /// Verify the block settles determined halves in order, and claims
-    /// the frontier that leaves.
-    ///
-    /// A receipt states an absolute computed from its tick's baseline and
-    /// settlement is last writer per cell, so an earlier tick's
-    /// determined half landing after a later one's reverts a write later
-    /// ticks have already read. Every replica would then agree on the
-    /// wrong state — there is no divergence to notice afterwards, which
-    /// is why the order has to be refused up front rather than detected.
-    ///
-    /// Two conditions, both read off the block: the determined halves it
-    /// carries rise strictly, starting above the parent's frontier, and
-    /// the claimed frontier is where they end. Legs halves are not
-    /// constrained — a leg's declared cells are claimed against every
-    /// later tick from the moment it executes, so it has nothing to
-    /// invert against, and it may settle arbitrarily late without
-    /// wedging the ticks above it.
+    /// Verify the block claims the settlement frontier its determined
+    /// halves leave: where the last of them settles, or the parent's
+    /// frontier where it carries none. That the halves rise strictly
+    /// above the parent's frontier is admission's rule, judged before
+    /// this.
     pub fn verify_settled_order(
         block_hash: BlockHash,
         block: &Block,
         parent_settled_frontier: BlockHeight,
     ) -> bool {
-        let mut frontier = parent_settled_frontier;
-        for fw in block.certificates().iter() {
-            let fw = fw.as_unverified();
-            if !fw.is_determined() {
-                continue;
-            }
-            let tick = fw.tick_id().block_height();
-            if tick <= frontier {
-                warn!(
-                    block_hash = ?block_hash,
-                    height = block.height().inner(),
-                    tick = tick.inner(),
-                    frontier = frontier.inner(),
-                    "Settlement order verification failed — a determined half at or below \
-                     the frontier it would settle under"
-                );
-                return false;
-            }
-            frontier = tick;
-        }
-
+        let frontier = block
+            .certificates()
+            .iter()
+            .map(|fw| fw.as_unverified())
+            .filter(|fw| fw.is_determined())
+            .map(|fw| fw.tick_id().block_height())
+            .max()
+            .unwrap_or(parent_settled_frontier);
         let proposed = block.header().settled_tick_frontier();
         if proposed == frontier {
             true
@@ -2378,41 +2353,6 @@ mod tests {
             abandonment_records: Arc::new(Vec::new()),
             state_proofs: Arc::new(Vec::new()),
         }
-    }
-
-    /// The reproduced corruption, refused. Two ticks over one cell
-    /// settled in reverse across two blocks lose the later write; the
-    /// second block is the one carrying the lower tick, and its
-    /// determined half sits at or below the frontier its parent already
-    /// reached.
-    #[test]
-    fn a_determined_half_below_the_parent_frontier_is_refused() {
-        // The parent settled tick 2. This block offers tick 1.
-        let block = block_settling(&[1], &[], 2);
-        assert!(!VerificationPipeline::verify_settled_order(
-            block.hash(),
-            &block,
-            BlockHeight::new(2)
-        ));
-    }
-
-    /// Determined halves within one block must rise, or the receipts
-    /// apply in the order the block lists them and invert inside it.
-    #[test]
-    fn determined_halves_must_rise_within_a_block() {
-        let descending = block_settling(&[6, 4], &[], 6);
-        assert!(!VerificationPipeline::verify_settled_order(
-            descending.hash(),
-            &descending,
-            BlockHeight::new(3)
-        ));
-
-        let ascending = block_settling(&[4, 6], &[], 6);
-        assert!(VerificationPipeline::verify_settled_order(
-            ascending.hash(),
-            &ascending,
-            BlockHeight::new(3)
-        ));
     }
 
     /// The claimed frontier is where the determined halves end, and a

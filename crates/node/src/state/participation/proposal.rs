@@ -37,13 +37,11 @@ impl ShardParticipation {
         // how many are actually offered is the work budget inside
         // `ready_transactions`. The overhead compensates for QC-chain
         // duplicates shard consensus filters during proposal building.
-        let parent = self.shard_coordinator.proposal_parent_block_hash();
         // The transactions the ancestor chain above the committed tip
         // already carries. Proposal building drops them as duplicates, so
         // the budget has to be raised by what will be dropped or the
         // block comes out short.
-        let (ancestor_txs, _) = self.shard_coordinator.collect_qc_chain_hashes(parent);
-        let max_txs = MAX_TXS_PER_BLOCK + ancestor_txs.len();
+        let max_txs = MAX_TXS_PER_BLOCK + self.shard_coordinator.dedup_overhead();
         // The budget reads the chain, not a local claim set: the parent
         // header carries what this shard still owes in work.
         let in_flight = self.shard_coordinator.proposal_parent_in_flight();

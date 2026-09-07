@@ -66,6 +66,7 @@
 //!   nudges its view toward a higher round observed on a header or vote.
 
 pub mod action_handlers;
+pub mod admission;
 pub mod beacon_witnesses;
 pub mod ready_signal_pool;
 

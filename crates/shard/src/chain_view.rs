@@ -10,13 +10,13 @@
 //! no mutations. It's a lens, not a sub-machine. The underlying fields live
 //! on `ShardCoordinator` / `PendingBlock` just as before.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin, CommittedTip,
-    FinalizationHash, ProvisionHash, QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot,
-    SweepFrontier, TxHash, Verified, WorkInFlight,
+    QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot, SweepFrontier, Verified,
+    WorkInFlight,
 };
 use tracing::warn;
 
@@ -63,6 +63,12 @@ impl<'a> ChainView<'a> {
     /// Borrow a pending block by hash. Used by callers that need to inspect
     /// per-block state (received transactions, finalizations) beyond what
     /// the dedicated header / state-root accessors expose.
+    /// The committed height the walks stop at.
+    #[must_use]
+    pub const fn committed_height(&self) -> BlockHeight {
+        self.committed_height
+    }
+
     pub fn get_pending(&self, block_hash: BlockHash) -> Option<&PendingBlock> {
         self.pending.get(block_hash)
     }
@@ -230,96 +236,6 @@ impl<'a> ChainView<'a> {
             |qc| (qc.block_hash(), qc.clone()),
         )
     }
-
-    /// Walk the QC chain from `parent_block_hash` back to committed height,
-    /// collecting certificate, transaction, and provision hashes from
-    /// ancestor blocks. Used by the proposer (to filter duplicates) and
-    /// validators (to reject blocks containing already-included items).
-    ///
-    /// The manifest carries the full tx / cert / provision hash lists for
-    /// every pending ancestor whether or not its body has assembled, so a
-    /// single walk reads from it uniformly. Reading the block body instead
-    /// would stop the walk at the first not-yet-assembled ancestor and drop
-    /// the dedup contributions of every assembled block below it. The
-    /// just-committed block (at or below `committed_height`) is covered
-    /// separately by
-    /// [`CommitDedupIndex`](crate::commit_dedup::CommitDedupIndex)'s
-    /// `contains_*` queries, populated synchronously inside
-    /// [`crate::coordinator::ShardCoordinator::record_block_committed`].
-    pub fn collect_ancestor_hashes(
-        &self,
-        parent_block_hash: BlockHash,
-    ) -> (HashSet<TxHash>, HashSet<ProvisionHash>) {
-        let mut tx_hashes: HashSet<TxHash> = HashSet::new();
-        let mut provision_hashes: HashSet<ProvisionHash> = HashSet::new();
-
-        let mut current_hash = parent_block_hash;
-        while let Some(pending) = self.pending.get(current_hash) {
-            if pending.header().height() <= self.committed_height {
-                break;
-            }
-            let manifest = pending.manifest();
-            for tx_hash in manifest.tx_hashes() {
-                tx_hashes.insert(*tx_hash);
-            }
-            for batch_hash in manifest.provision_hashes() {
-                provision_hashes.insert(*batch_hash);
-            }
-            current_hash = pending.header().parent_block_hash();
-        }
-
-        (tx_hashes, provision_hashes)
-    }
-
-    /// The transactions the QC chain's uncommitted ancestors have already
-    /// reached a verdict for, from `parent_block_hash` back to committed
-    /// height.
-    ///
-    /// Read from the finalizations themselves rather than the manifest,
-    /// which names ticks and not the transactions under them. An ancestor
-    /// whose finalizations this node is still fetching contributes
-    /// nothing, so the answer is what this node can see — the same
-    /// direction every content rule here takes, since a node that under-
-    /// reports can only fail to reject, and the rule needs a quorum of
-    /// enforcers rather than every node.
-    pub fn ancestor_resolved_txs(&self, parent_block_hash: BlockHash) -> HashSet<TxHash> {
-        let mut resolved: HashSet<TxHash> = HashSet::new();
-        let mut current_hash = parent_block_hash;
-        while let Some(pending) = self.pending.get(current_hash) {
-            if pending.header().height() <= self.committed_height {
-                break;
-            }
-            for fw in pending.finalizations() {
-                resolved.extend(fw.deciding_tx_hashes());
-            }
-            current_hash = pending.header().parent_block_hash();
-        }
-        resolved
-    }
-
-    /// The finalizations the QC chain's uncommitted ancestors already
-    /// carry, from `parent_block_hash` back to committed height.
-    ///
-    /// The identity half of [`Self::ancestor_resolved_txs`], and the only
-    /// one that answers for a certificate whose members reach no verdict.
-    /// Read from the manifest, which names every certificate a block
-    /// carries whether or not its body has assembled here — the same
-    /// reason [`Self::collect_ancestor_hashes`] reads it.
-    pub fn ancestor_finalization_ids(
-        &self,
-        parent_block_hash: BlockHash,
-    ) -> HashSet<FinalizationHash> {
-        let mut carried: HashSet<FinalizationHash> = HashSet::new();
-        let mut current_hash = parent_block_hash;
-        while let Some(pending) = self.pending.get(current_hash) {
-            if pending.header().height() <= self.committed_height {
-                break;
-            }
-            carried.extend(pending.manifest().cert_ids().iter().copied());
-            current_hash = pending.header().parent_block_hash();
-        }
-        carried
-    }
 }
 
 #[cfg(test)]
@@ -333,6 +249,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::admission::QcChainSets;
 
     fn make_header(height: u8, parent_block_hash: BlockHash) -> BlockHeader {
         BlockHeader::new(BlockHeaderParts {
@@ -425,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_ancestor_hashes_covers_assembled_block_below_unassembled() {
+    fn the_chain_walk_covers_an_assembled_block_below_an_unassembled_one() {
         // Chain above the committed tip: walk start `middle` (manifest-only) ->
         // `low` (assembled, height 1) -> committed. `low`'s transaction must
         // still land in the dedup set even though an unassembled ancestor sits
@@ -474,7 +391,7 @@ mod tests {
                         .is_some_and(|p| p.block().is_none())
                 );
 
-                let (tx_hashes, _provisions) = view.collect_ancestor_hashes(middle_hash);
+                let tx_hashes = QcChainSets::behind(view, middle_hash).txs;
                 assert!(
                     tx_hashes.contains(&tx_hash),
                     "assembled ancestor below an unassembled one dropped from dedup set",

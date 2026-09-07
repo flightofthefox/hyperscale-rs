@@ -84,7 +84,7 @@ impl VoteFence<'_> {
     pub fn judge(&self, schedule: &TopologySchedule, block: &Block) -> Result<(), Withheld> {
         let anchored_wt = block.header().parent_qc().weighted_timestamp();
         self.finalizations(schedule, block, anchored_wt)?;
-        self.records(schedule, block)?;
+        self.records(block)?;
         self.state_proofs(block)?;
         self.precut(block)
     }
@@ -150,29 +150,21 @@ impl VoteFence<'_> {
     ///
     /// The first record whose evidence this validator contradicts or
     /// has not mirrored.
-    pub fn records(&self, schedule: &TopologySchedule, block: &Block) -> Result<(), Withheld> {
-        let anchored_wt = block.header().parent_qc().weighted_timestamp();
+    pub fn records(&self, block: &Block) -> Result<(), Withheld> {
         block
             .abandonment_records()
             .iter()
-            .try_for_each(|verdict| self.record_stands(schedule, anchored_wt, verdict))
+            .try_for_each(|verdict| self.record_stands(verdict))
     }
 
     /// Whether one record's evidence stands for this validator, on the
-    /// arm it carries. A departure is checked against the schedule,
-    /// this validator's own ledger, and the departed shard's settled
-    /// set; what a shard was heard to say is checked against this
-    /// validator's own mirror of it, equality on the word and the moment.
-    fn record_stands(
-        &self,
-        schedule: &TopologySchedule,
-        anchored_wt: WeightedTimestamp,
-        verdict: &AbandonmentRecord,
-    ) -> Result<(), Withheld> {
+    /// arm it carries. A departure is checked against this validator's
+    /// own ledger and the departed shard's settled set; what a shard was
+    /// heard to say is checked against this validator's own mirror of
+    /// it, equality on the word and the moment.
+    fn record_stands(&self, verdict: &AbandonmentRecord) -> Result<(), Withheld> {
         match verdict.evidence() {
-            CounterpartEvidence::Departed { terminal_wt } => {
-                self.departure_stands(schedule, anchored_wt, verdict, terminal_wt)
-            }
+            CounterpartEvidence::Departed { .. } => self.departure_stands(verdict),
             CounterpartEvidence::Heard(heard) => verdict
                 .unsettled()
                 .iter()
@@ -180,10 +172,10 @@ impl VoteFence<'_> {
         }
     }
 
-    /// Whether a departure record stands: the schedule attests the cut
-    /// it names, this validator's own ledger says the departed shard was
-    /// party to every name, and the shard's settled set names none of
-    /// them.
+    /// Whether a departure record stands: this validator's own ledger
+    /// says the departed shard was party to every name, and the shard's
+    /// settled set names none of them. That the schedule attests the
+    /// cut it names, inside the evidence window, is admission's rule.
     ///
     /// The set says what the departed shard settled; the ledger says
     /// what it was party to, and a record may name only that — a
@@ -194,30 +186,8 @@ impl VoteFence<'_> {
     /// ignorance; a voter that has not acquired it defers, since the
     /// record is only proposable inside the window the set can be read
     /// in, so a voter inside it either has the set or is about to.
-    fn departure_stands(
-        &self,
-        schedule: &TopologySchedule,
-        anchored_wt: WeightedTimestamp,
-        verdict: &AbandonmentRecord,
-        terminal_wt: WeightedTimestamp,
-    ) -> Result<(), Withheld> {
+    fn departure_stands(&self, verdict: &AbandonmentRecord) -> Result<(), Withheld> {
         let shard = verdict.shard();
-        let scheduled = schedule.terminal_cut_for_shard(shard, anchored_wt);
-        if scheduled != Some(terminal_wt) {
-            return Err(Withheld::Refused(format!(
-                "abandonment record names a departure of {shard:?} at {terminal_wt:?} the \
-                 schedule does not attest ({scheduled:?})"
-            )));
-        }
-        // The evidence window, read off the judging anchor's own
-        // snapshot: a record anchored after the beacon closed and swept
-        // the departure's boundary record claims what nobody can check.
-        if !schedule.terminal_evidence_readable(shard, anchored_wt) {
-            return Err(Withheld::Refused(format!(
-                "abandonment record names a departure of {shard:?} whose evidence window has \
-                 closed"
-            )));
-        }
         let stranger = self.evidence.with_parties(shard, |parties| {
             parties.map(|parties| {
                 verdict
@@ -365,20 +335,13 @@ impl VoteFence<'_> {
         }
     }
 
-    /// What in `block` belongs to the chain that ran before this one, if
-    /// anything: a transaction whose validity window opened before the
-    /// cut, or a certificate anchored before it.
-    ///
-    /// The two classes part company here. A **certificate** anchored
-    /// before the cut is refused outright and always: it names a tick on
-    /// the predecessor, resolves transactions this chain never committed,
-    /// and carries receipts computed against a state this genesis never
-    /// held. There is no harmless subset to separate out.
-    ///
-    /// A **transaction** is different. The hazard is only what the
-    /// predecessor actually *committed*; one submitted before the cut and
-    /// never committed is harmless, and landing it here is its first
-    /// inclusion. Refusing the whole class is the safe default a
+    /// Which of `block`'s transactions belong to the chain that ran
+    /// before this one: those whose validity window opened before the
+    /// cut. A certificate anchored before the cut is admission's to
+    /// refuse; a transaction is different, since the hazard is only what
+    /// the predecessor actually *committed*. One submitted before the
+    /// cut and never committed is harmless, and landing it here is its
+    /// first inclusion. Refusing the whole class is the safe default a
     /// successor runs under until it can ask the finer question, and the
     /// predecessors' answers are what narrow it: per predecessor, each
     /// absence proven against a `committed_txs_root` this chain
@@ -400,19 +363,9 @@ impl VoteFence<'_> {
     ///
     /// # Errors
     ///
-    /// Content a predecessor committed, or a transaction no predecessor
-    /// has answered for yet.
+    /// A transaction a predecessor committed, or one no predecessor has
+    /// answered for yet.
     pub fn precut(&self, block: &Block) -> Result<(), Withheld> {
-        if let Some(fw) = block
-            .certificates()
-            .iter()
-            .find(|fw| fw.local_ec().vote_anchor_ts() < self.cut)
-        {
-            return Err(Withheld::Refused(format!(
-                "certificate for tick {:?} predates this chain's origin",
-                fw.tick_id()
-            )));
-        }
         let mut deferred = None;
         for tx in block
             .transactions()

@@ -4,28 +4,29 @@
 //! the rules every honest validator applies before voting:
 //!
 //! - Header structure: proposer selection, parent-QC quorum, timestamp bounds.
-//! - Block contents: transaction ordering, `ticks` recomputation, and
-//!   cross-ancestor transaction uniqueness.
+//! - Block contents: the section-level rules here, and each section's
+//!   items through the [`crate::admission`] predicate the proposer
+//!   selected them by.
 //!
-//! Everything here is stateless — callers supply `committed_height`,
-//! `qc_chain_tx_hashes`, etc. explicitly. The async verification pipeline
-//! lives in [`crate::verification`]; this module is just the pure rules.
+//! Everything here is stateless — callers supply the [`Admission`]
+//! context explicitly. The async verification pipeline lives in
+//! [`crate::verification`]; this module is just the pure rules.
 //!
 //! Errors are returned as human-readable strings so the caller can log a
 //! single diagnostic line at the rejection site.
-use std::collections::HashSet;
 use std::sync::Arc;
 
-use hyperscale_engine::writes_committed_cell;
 use hyperscale_types::{
-    AbandonmentRoot, Block, BlockHeader, BlockHeight, CounterpartEvidence, FinalizationHash,
-    LeafRoot, LocalTimestamp, MAX_ROUND_GAP, MAX_STATE_PROOFS_PER_BLOCK,
-    MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
-    MAX_UNSETTLED_PER_BLOCK, ProvisionHash, QuorumCertificate, ShardId, ShardLoad, StateProofsRoot,
-    TopologySnapshot, Transaction, TxHash, Verifiable, VoteCount, sweep_admits_block,
+    AbandonmentRoot, Block, BlockHeader, BlockHeight, LeafRoot, LocalTimestamp, MAX_ROUND_GAP,
+    MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId, ShardLoad,
+    StateProofsRoot, TopologySnapshot, Transaction, Verifiable, VoteCount,
 };
 
-use crate::commit_dedup::CommitDedupIndex;
+use crate::admission::{
+    Admission, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
+    RecordsFold, RecordsSection, StateProofsFold, StateProofsSection, TransactionsFold,
+    TransactionsSection, admit_all, unwrapped,
+};
 
 /// True if `qc.signers()` represents at least 2f+1 of the local committee's
 /// voting power. The synced-block apply path and consensus pre-vote path
@@ -247,330 +248,6 @@ pub fn validate_transaction_ordering(block: &Block) -> Result<(), String> {
     verify_hash_sorted(block.transactions(), "transactions")
 }
 
-/// Validate that no transaction in the block has already been committed or
-/// appears in an ancestor block above committed height (the QC chain).
-/// Intra-block duplicates are excluded by the strict hash-ordering check.
-///
-/// Caller must precompute `qc_chain_tx_hashes` via the driver's QC-chain
-/// walk; this function keeps validation pure and does not reach into pending
-/// block storage itself.
-pub fn validate_no_duplicate_transactions(
-    block: &Block,
-    qc_chain_tx_hashes: &HashSet<TxHash>,
-    dedup_index: &CommitDedupIndex,
-) -> Result<(), String> {
-    if block.transactions().is_empty() {
-        return Ok(());
-    }
-
-    for tx in block.transactions().iter() {
-        let tx_hash = tx.hash();
-        if qc_chain_tx_hashes.contains(&tx_hash) {
-            return Err(format!(
-                "transaction {tx_hash} already in QC chain ancestor"
-            ));
-        }
-        if dedup_index.contains_tx(&tx_hash) {
-            return Err(format!(
-                "transaction {tx_hash} already committed within its validity window"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Validate that no transaction the block's finalizations resolve has
-/// already been resolved — by an earlier finalization in this same block,
-/// by an ancestor above committed height, or by a committed block within
-/// the retention window.
-///
-/// **This is what makes settlement and abandonment exclusive.** A shard
-/// abandons a transaction its counterpart left in flight, and settles one
-/// whose coverage completed; both are verdicts, and a transaction that
-/// took two of them would be settled on one reading of the chain and
-/// aborted on another. One rule covers both directions because it asks
-/// about the transaction rather than about which kind of verdict each
-/// certificate carried.
-///
-/// The tick check beside it is the same rule at a coarser key, for the
-/// case the fine key cannot reach: a manifest names the ticks an ancestor
-/// carries but not the transactions under them, so an ancestor whose
-/// finalizations this node has not yet fetched contributes nothing to
-/// `qc_chain_resolved_txs` and is caught here instead.
-///
-/// An abandoning record is held to the same rule. It licenses an abort and
-/// carries the terms of one, so a record naming a transaction the chain
-/// has already resolved is a request for a second verdict on it — and one
-/// every replica would honour, since a replica reconstructs the entry from
-/// the record precisely when it cannot check the name against an account
-/// of its own. A settling record is held only to its own block: it names
-/// a transaction the chain resolved before its consumer could accept.
-///
-/// Both proposer and validator hit `record_block_committed` synchronously
-/// during their respective commit handlers, so their `dedup_index` reflects
-/// the same just-committed ticks at the same logical moment. Validation
-/// against this shared state is therefore safe under the on-qc-formed race.
-pub fn validate_no_duplicate_resolutions(
-    block: &Block,
-    qc_chain_resolved_txs: &HashSet<TxHash>,
-    qc_chain_finalizations: &HashSet<FinalizationHash>,
-    dedup_index: &CommitDedupIndex,
-) -> Result<(), String> {
-    let mut resolved_here: HashSet<TxHash> = HashSet::new();
-    let mut carried_here: HashSet<FinalizationHash> = HashSet::new();
-    for fw in block.certificates().iter() {
-        // The certificate's own identity, held to once per block and once
-        // per chain. A tick whose members reach no verdict names nothing
-        // the per-transaction rule below can hold it to, so without this
-        // the same certificate rides every block.
-        let receipt_hash = fw.receipt_hash();
-        if !carried_here.insert(receipt_hash) {
-            return Err(format!(
-                "finalization {receipt_hash:?} appears twice in the same block"
-            ));
-        }
-        if qc_chain_finalizations.contains(&receipt_hash) {
-            return Err(format!(
-                "finalization {receipt_hash:?} is already carried by a QC chain ancestor"
-            ));
-        }
-        if dedup_index.contains_finalization(&receipt_hash) {
-            return Err(format!(
-                "finalization {receipt_hash:?} was already committed within its retention window"
-            ));
-        }
-        // Every name is held to once per block; only a deciding one is
-        // held against what the chain already resolved, since a leg's
-        // finalization resolves nothing and the reclaim's may follow it.
-        for outcome in fw.local_ec().tx_outcomes() {
-            let tx_hash = outcome.tx_hash();
-            if !resolved_here.insert(tx_hash) {
-                return Err(format!(
-                    "transaction {tx_hash} resolved twice within the same block"
-                ));
-            }
-            if outcome.decides() {
-                reject_if_resolved(tx_hash, qc_chain_resolved_txs, dedup_index)?;
-            }
-        }
-    }
-    for verdict in block.abandonment_records() {
-        for tx_hash in verdict.tx_hashes() {
-            if resolved_here.contains(&tx_hash) {
-                return Err(format!(
-                    "abandonment record names {tx_hash}, which the same block resolves"
-                ));
-            }
-            // A settling record names a transaction the chain resolved
-            // by design — the issuer's own verdict committed before its
-            // consumer could accept — so only an abandoning one is a
-            // request for a second verdict.
-            if verdict.evidence().abandons() {
-                reject_if_resolved(tx_hash, qc_chain_resolved_txs, dedup_index)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Refuse `tx_hash` if the chain has already reached a verdict on it — by
-/// an ancestor above committed height, or by a committed block within the
-/// retention window.
-fn reject_if_resolved(
-    tx_hash: TxHash,
-    qc_chain_resolved_txs: &HashSet<TxHash>,
-    dedup_index: &CommitDedupIndex,
-) -> Result<(), String> {
-    if qc_chain_resolved_txs.contains(&tx_hash) {
-        return Err(format!(
-            "transaction {tx_hash} already resolved by a QC chain ancestor"
-        ));
-    }
-    if dedup_index.contains_resolved_tx(&tx_hash) {
-        return Err(format!(
-            "transaction {tx_hash} already resolved within its retention window"
-        ));
-    }
-    Ok(())
-}
-
-/// Validate that no provisions batch in the block has already been committed
-/// or appears in an ancestor block above committed height. Mirrors
-/// [`validate_no_duplicate_transactions`] but for `ProvisionHash`.
-///
-/// Without this check, the on-qc-formed race could cause a proposer to
-/// re-include a just-committed batch — the duplicate is technically
-/// idempotent (admission no-ops via `pipeline.has_verified`), but the
-/// re-inclusion wastes block bytes and re-runs verification. Validators
-/// reject it outright.
-pub fn validate_no_duplicate_provisions(
-    block: &Block,
-    qc_chain_provision_hashes: &HashSet<ProvisionHash>,
-    dedup_index: &CommitDedupIndex,
-) -> Result<(), String> {
-    if block.provisions().is_empty() {
-        return Ok(());
-    }
-
-    for batch in block.provisions() {
-        let provision_hash = batch.hash();
-        if qc_chain_provision_hashes.contains(&provision_hash) {
-            return Err(format!(
-                "provisions batch {provision_hash:?} already in QC chain ancestor"
-            ));
-        }
-        if dedup_index.contains_provision(&provision_hash) {
-            return Err(format!(
-                "provisions batch {provision_hash:?} already committed within its retention window"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Validate that no provisions batch in the block is fenced by a recovery
-/// pending in the block's governing snapshot: content from a recovering
-/// shard above its attested frontier is rejected network-wide (INV-SEC-8),
-/// and folding the check into block validity keeps every replica's verdict
-/// a pure function of the block's own anchor — a block anchored before the
-/// recovery folded resolves a snapshot without the record and stays valid.
-pub fn validate_provisions_not_fenced(
-    topology_snapshot: &TopologySnapshot,
-    block: &Block,
-) -> Result<(), String> {
-    for batch in block.provisions() {
-        let source_shard = batch.source_shard();
-        if topology_snapshot.recovery_fences(source_shard, batch.block_height()) {
-            return Err(format!(
-                "provisions batch {:?} from recovering shard {source_shard:?} above the \
-                 attested frontier",
-                batch.hash(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// A non-payer shard engages a cross-shard transaction only against
-/// its payer bundle — the transaction commit proof. The block is valid
-/// only if each such transaction's bundle rides in this same block or a
-/// committed bundle named it within the retention window. Deterministic
-/// over block content plus committed chain content; the proposer's own
-/// selection gate makes honest proposals satisfy it, so this closes the
-/// Byzantine-proposer path to engaging counterpart locks before the
-/// payer shard commits.
-pub fn validate_engagement(
-    topology_snapshot: &TopologySnapshot,
-    local_shard: ShardId,
-    block: &Block,
-    dedup_index: &CommitDedupIndex,
-) -> Result<(), String> {
-    for tx in block.transactions().iter() {
-        if topology_snapshot.is_single_shard_transaction(tx) {
-            continue;
-        }
-        let payer_shard = topology_snapshot
-            .shard_trie()
-            .shard_for_prefix(tx.body().fee_payer);
-        if payer_shard == local_shard {
-            continue;
-        }
-        let tx_hash = tx.hash();
-        let in_block = block.provisions().iter().any(|batch| {
-            batch.source_shard() == payer_shard
-                && batch
-                    .transactions()
-                    .iter()
-                    .any(|entry| entry.tx_hash == tx_hash)
-        });
-        if !in_block && !dedup_index.contains_provision_tx(payer_shard, tx_hash) {
-            return Err(format!(
-                "cross-shard VM transaction {tx_hash} lacks its payer bundle \
-                 from {payer_shard:?}"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Every package a transaction names must be one this window may run:
-/// registered, past its maturity window, or born with the chain.
-///
-/// The window is what every node fetches a newly registered artifact's
-/// bytes in, so what this establishes is that by the time a transaction
-/// can run, the code it runs is code the whole committee holds. Without
-/// it, whether a transaction executes or refuses for want of code is a
-/// question about whose fetch finished first — and replicas that answer
-/// it differently attest different ticks.
-///
-/// Stated as the permission rather than the refusal, which is what makes
-/// it checkable here. Refusing only the registered-and-immature would
-/// leave the window between a publish committing on its own shard and
-/// the beacon registering it, and closing that by argument — about which
-/// nodes hold which metadata, and so which of them could have built the
-/// transaction at all — is an invariant no reader can check locally.
-///
-/// Deterministic over block content plus the window-frozen registry
-/// every member of the committee shares; the proposer's own selection
-/// gate makes honest proposals satisfy it.
-pub fn validate_packages_usable(
-    topology_snapshot: &TopologySnapshot,
-    block: &Block,
-) -> Result<(), String> {
-    for tx in block.transactions().iter() {
-        if let Some(package) = topology_snapshot.unusable_package_of(tx) {
-            return Err(format!(
-                "transaction {} names package {package}, which this window cannot run",
-                tx.hash()
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// The cells a block's transactions create for a sweep to retire must
-/// fit the per-block creation cap.
-///
-/// The sweep's own cap bounds how fast a shard can retire these; this
-/// bounds how fast it can be made to owe them. Only the pair bounds the
-/// resident population — a creation rate above the removal cap is a
-/// backlog that grows for as long as the load lasts, and a sweep that
-/// bounds ordinary operation and not the peak is not a bound.
-///
-/// Counted off the derivations, which is where the answer is: what makes
-/// a write sweepable is the family it belongs to, and nothing about a
-/// routed key says which family it is — and counted for this shard,
-/// since a cell lands only on the shard owning its prefix and that is
-/// the shard whose sweep retires it — plus the committed-transaction
-/// cell the chain itself writes for every transaction the block
-/// carries. Deterministic over block content and the window's trie,
-/// since every replica derives the same transactions the same way.
-pub fn validate_sweepable_creation(
-    topology_snapshot: &TopologySnapshot,
-    local_shard: ShardId,
-    block: &Block,
-) -> Result<(), String> {
-    let trie = topology_snapshot.shard_trie();
-    let created = block.transactions().iter().fold(0usize, |total, tx| {
-        total.saturating_add(
-            tx.sweepable_writes_on(trie, local_shard)
-                + usize::from(writes_committed_cell(
-                    tx.legs(),
-                    tx.owners(),
-                    trie,
-                    local_shard,
-                )),
-        )
-    });
-    if !sweep_admits_block(created) {
-        return Err(format!(
-            "block creates {created} sweepable cells, past the per-block cap of \
-             {MAX_SWEEPABLE_CREATED_PER_BLOCK}"
-        ));
-    }
-    Ok(())
-}
-
 /// The header's running work total must be its parent's advanced by the
 /// work the block's own certificates report.
 ///
@@ -605,20 +282,17 @@ fn validate_block_work(block: &Block, parent_load: Option<ShardLoad>) -> Result<
     Ok(())
 }
 
-/// Run all pre-vote block-contents checks: transaction ordering, `ticks`
-/// recomputation, and cross-ancestor uniqueness for txs, certs, and
-/// provisions. Returns a single diagnostic on the first failure so the
-/// caller can log once.
-#[allow(clippy::too_many_arguments)] // single dispatch over the pre-vote content checks
+/// Run every pre-vote block-contents check: the section-level rules —
+/// a coast block empty, the work total, every transaction verified and
+/// in hash order, each committing root over its section — and then each
+/// section's items through the one [`Section`] predicate the proposer
+/// selected them by, in the order the folds depend on: provisions, the
+/// transactions they engage, finalizations, the records held to their
+/// names, state proofs. Returns a single diagnostic on the first failure
+/// so the caller can log once.
 pub fn validate_block_for_vote(
-    topology_snapshot: &TopologySnapshot,
-    local_shard: ShardId,
+    ctx: &Admission<'_>,
     block: &Block,
-    qc_chain_tx_hashes: &HashSet<TxHash>,
-    qc_chain_resolved_txs: &HashSet<TxHash>,
-    qc_chain_finalizations: &HashSet<FinalizationHash>,
-    qc_chain_provision_hashes: &HashSet<ProvisionHash>,
-    dedup_index: &CommitDedupIndex,
     coasting: bool,
     parent_load: Option<ShardLoad>,
 ) -> Result<(), String> {
@@ -628,116 +302,59 @@ pub fn validate_block_for_vote(
     validate_block_work(block, parent_load)?;
     validate_transactions_verified(block)?;
     validate_transaction_ordering(block)?;
-    validate_no_duplicate_transactions(block, qc_chain_tx_hashes, dedup_index)?;
-    validate_no_duplicate_resolutions(
-        block,
-        qc_chain_resolved_txs,
-        qc_chain_finalizations,
-        dedup_index,
+    validate_roots_commit_sections(block)?;
+    admit_sections(ctx, block)
+}
+
+/// Every section's items through its [`Section`](crate::admission::Section)
+/// predicate, in the order the folds depend on.
+pub fn admit_sections(ctx: &Admission<'_>, block: &Block) -> Result<(), String> {
+    let mut provisions = ProvisionsFold::default();
+    admit_all::<ProvisionsSection>(
+        ctx,
+        &mut provisions,
+        block.provisions().iter().map(unwrapped),
     )?;
-    validate_no_duplicate_provisions(block, qc_chain_provision_hashes, dedup_index)?;
-    validate_provisions_not_fenced(topology_snapshot, block)?;
-    validate_packages_usable(topology_snapshot, block)?;
-    validate_sweepable_creation(topology_snapshot, local_shard, block)?;
-    validate_engagement(topology_snapshot, local_shard, block, dedup_index)?;
-    validate_abandonment_records_well_formed(block)?;
-    validate_state_proofs_well_formed(block)?;
+    let mut transactions = TransactionsFold::beside(&provisions);
+    admit_all::<TransactionsSection<'_>>(
+        ctx,
+        &mut transactions,
+        block.transactions().iter().map(unwrapped),
+    )?;
+    let mut finalizations = FinalizationsFold::from(ctx);
+    admit_all::<FinalizationsSection>(
+        ctx,
+        &mut finalizations,
+        block.certificates().iter().map(unwrapped),
+    )?;
+    let mut records = RecordsFold::after(&finalizations);
+    admit_all::<RecordsSection<'_>>(ctx, &mut records, block.abandonment_records())?;
+    let mut state_proofs = StateProofsFold::default();
+    admit_all::<StateProofsSection>(ctx, &mut state_proofs, block.state_proofs())?;
     Ok(())
 }
 
-/// Validate the block's state-proof bundles against the header that
-/// commits them and against the one form a section may take.
+/// The header's abandonment root and state-proofs root commit the
+/// sections they claim.
 ///
-/// Structural only — whether each proof reconstructs its anchor's root
-/// is the delegated check, and whether the anchor is the commit-proven
-/// header's is the vote fence's. What this establishes is that every
-/// replica reads the same section: the root binds the bundles to the
-/// header, and the canonical order — within each bundle and across
-/// them — means one set of answers has one encoding.
-pub fn validate_state_proofs_well_formed(block: &Block) -> Result<(), String> {
-    let bundles = block.state_proofs();
-    let computed = StateProofsRoot::over(bundles);
-    let claimed = block.header().state_proofs_root();
-    if computed != claimed {
-        return Err(format!(
-            "state proofs root {claimed:?} does not commit the block's bundles {computed:?}"
-        ));
-    }
-    if bundles.len() > MAX_STATE_PROOFS_PER_BLOCK {
-        return Err(format!(
-            "block carries {} state proofs, over the cap of {MAX_STATE_PROOFS_PER_BLOCK}",
-            bundles.len()
-        ));
-    }
-    for (at, bundle) in bundles.iter().enumerate() {
-        if !bundle.is_well_formed() {
-            return Err(format!(
-                "state proof {at} is empty, over its cap, or out of order"
-            ));
-        }
-        if at > 0 && bundles[at - 1] >= *bundle {
-            return Err(format!(
-                "state proof {at} repeats or precedes the one before it"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Validate the block's abandonment records against the header that
-/// commits them, against the one form a record may take, and against the
-/// budget they share.
-///
-/// Structural only — whether the records tell the truth is a question for
-/// the departed shards' settled sets, which this cannot see. What it
-/// establishes is that every replica reads the same claim: the root binds
-/// the records to the header, and the canonical order — within each
-/// record and across them — means one claim has one encoding, so two
-/// proposers naming the same transactions cannot produce blocks that
-/// differ.
-///
-/// The budget checked is the sum across every record, because
-/// [`MAX_UNSETTLED_PER_BLOCK`] doubles as each record's own decode cap and
-/// that cap alone would let a block spend it once per record.
-pub fn validate_abandonment_records_well_formed(block: &Block) -> Result<(), String> {
-    let verdicts = block.abandonment_records();
-    let computed = AbandonmentRoot::over(verdicts);
+/// What this establishes is that every replica reads the same section:
+/// the root binds the items to the header, and the canonical order the
+/// section rule holds each item to means one set of answers has one
+/// encoding, so two proposers naming the same claims cannot produce
+/// blocks that differ.
+pub fn validate_roots_commit_sections(block: &Block) -> Result<(), String> {
+    let computed = AbandonmentRoot::over(block.abandonment_records());
     let claimed = block.header().abandonment_root();
     if computed != claimed {
         return Err(format!(
             "abandonment root {claimed:?} does not commit the block's records {computed:?}"
         ));
     }
-
-    let mut named = 0usize;
-    let mut previous: Option<(ShardId, CounterpartEvidence)> = None;
-    for verdict in verdicts {
-        if !verdict.is_well_formed() {
-            return Err(format!(
-                "abandonment record for {:?} is empty, over its cap, or out of order",
-                verdict.shard(),
-            ));
-        }
-        // Ascending by shard and then by arm, which gives uniqueness and
-        // one encoding per claim set together — two records for one
-        // shard under one arm would leave which answer counts to the
-        // reader, and a reordering would be a second form of the same
-        // block. One shard may carry several arms: what it claimed and
-        // what it left unclaimed are different transactions.
-        let position = (verdict.shard(), verdict.evidence());
-        if previous.is_some_and(|previous| previous >= position) {
-            return Err(format!(
-                "abandonment record for {:?} repeats or precedes the one before it",
-                verdict.shard(),
-            ));
-        }
-        previous = Some(position);
-        named = named.saturating_add(verdict.unsettled().len());
-    }
-    if named > MAX_UNSETTLED_PER_BLOCK {
+    let computed = StateProofsRoot::over(block.state_proofs());
+    let claimed = block.header().state_proofs_root();
+    if computed != claimed {
         return Err(format!(
-            "abandonment records name {named} transactions, over the drain's own bound of \
-             {MAX_UNSETTLED_PER_BLOCK}",
+            "state proofs root {claimed:?} does not commit the block's bundles {computed:?}"
         ));
     }
     Ok(())
@@ -827,15 +444,48 @@ mod tests {
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, Anchor,
         BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Deadline, Finalization, Hash, Heard,
-        LocalKey, MAX_SUBINTENTS, MerkleInclusionProof, NetworkDefinition, PrincipalAddr,
-        ProposerTimestamp, ProvisionEntry, Provisions, Question, QuorumCertificate, Round, ShardId,
-        ShardLoad, Signer, SignerBitfield, StateProofBundle, StateProofsRoot, StateRoot,
-        SubstateKey, TimestampRange, Transaction, TransactionDecision, UnsettledTx, ValidatorId,
-        ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources, Word,
-        test_utils,
+        LocalKey, MAX_SUBINTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+        MerkleInclusionProof, NetworkDefinition, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
+        Provisions, Question, QuorumCertificate, Round, ShardId, ShardLoad, Signer, SignerBitfield,
+        StateProofBundle, StateProofsRoot, StateRoot, SubstateKey, TimestampRange, Transaction,
+        TransactionDecision, TxHash, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet,
+        Verifiable, Verified, WeightedTimestamp, WitnessSources, Word, test_utils,
     };
 
     use super::*;
+    use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures};
+    use crate::commit_dedup::CommitDedupIndex;
+
+    /// Admit `block`'s sections against `against`.
+    fn admit(against: &Against, block: &Block) -> Result<(), String> {
+        admit_sections(&against.ctx(), block)
+    }
+
+    /// Admission under the test committee, with nothing behind the parent.
+    fn plain() -> Against {
+        Against::window(topology_snapshot())
+    }
+
+    /// Admission anchored after a cut at which both of `ROOT`'s children
+    /// departed with their handoffs open, so a departure record naming
+    /// either at that cut is one the schedule attests.
+    fn after_departures() -> Against {
+        let (left, right) = ShardId::ROOT.children();
+        let (survivors_left, survivors_right) = (left.children(), right.children());
+        let schedule = departures(
+            &[left, right],
+            &[
+                survivors_left.0,
+                survivors_left.1,
+                survivors_right.0,
+                survivors_right.1,
+            ],
+            None,
+        );
+        let mut against = Against::schedule(topology_snapshot(), schedule);
+        against.anchor = WeightedTimestamp::from_millis(DEPARTURE_CUT_MS + 500);
+        against
+    }
 
     fn topology_snapshot() -> TopologySnapshot {
         let committee = TestCommittee::new(4, 42);
@@ -1325,8 +975,7 @@ mod tests {
             })
             .collect();
         let at_cap = block_with_transactions(BlockHeight::new(3), txs.clone());
-        let topo = topology_snapshot();
-        assert!(validate_sweepable_creation(&topo, local_shard(), &at_cap).is_ok());
+        assert!(admit(&plain(), &at_cap).is_ok());
 
         txs.push(Arc::new(Verifiable::from(
             test_utils::stub_transaction_binding(
@@ -1336,14 +985,13 @@ mod tests {
             ),
         )));
         let over = block_with_transactions(BlockHeight::new(3), txs);
-        let err = validate_sweepable_creation(&topo, local_shard(), &over)
-            .expect_err("past the cap is refused");
+        let err = admit(&plain(), &over).expect_err("past the cap is refused");
         assert!(err.contains("sweepable cells"), "{err}");
 
         // A block that binds nothing creates nothing, whatever else it
         // carries — the common case must not pay for this rule.
-        let plain = block_with_transactions(BlockHeight::new(3), vec![tx(1)]);
-        assert!(validate_sweepable_creation(&topo, local_shard(), &plain).is_ok());
+        let binding_nothing = block_with_transactions(BlockHeight::new(3), vec![tx(1)]);
+        assert!(admit(&plain(), &binding_nothing).is_ok());
     }
 
     /// A block carrying records, rooted the way the header claims.
@@ -1417,45 +1065,34 @@ mod tests {
     /// them, is refused before any proof is walked.
     #[test]
     fn a_state_proof_section_is_held_to_its_root_and_form() {
+        let held = |bundles: Vec<StateProofBundle>, root: StateProofsRoot| {
+            let block = block_with_state_proofs(bundles, root);
+            validate_roots_commit_sections(&block).and_then(|()| admit(&plain(), &block))
+        };
         let bundles = vec![bundle_at(3, &[1]), bundle_at(4, &[2, 3])];
         let root = StateProofsRoot::over(&bundles);
-        assert!(
-            validate_state_proofs_well_formed(&block_with_state_proofs(bundles.clone(), root))
-                .is_ok()
-        );
+        assert!(held(bundles.clone(), root).is_ok());
 
-        let err = validate_state_proofs_well_formed(&block_with_state_proofs(
-            bundles.clone(),
-            StateProofsRoot::ZERO,
-        ))
-        .expect_err("a root that does not commit the bundles is refused");
+        let err = held(bundles.clone(), StateProofsRoot::ZERO)
+            .expect_err("a root that does not commit the bundles is refused");
         assert!(err.contains("does not commit"), "{err}");
 
         let reversed: Vec<StateProofBundle> = bundles.iter().rev().cloned().collect();
-        let err = validate_state_proofs_well_formed(&block_with_state_proofs(
-            reversed.clone(),
-            StateProofsRoot::over(&reversed),
-        ))
-        .expect_err("out of order is a second form of the same section");
+        let err = held(reversed.clone(), StateProofsRoot::over(&reversed))
+            .expect_err("out of order is a second form of the same section");
         assert!(err.contains("repeats or precedes"), "{err}");
 
         let repeated = vec![bundle_at(3, &[1]), bundle_at(3, &[1])];
-        let err = validate_state_proofs_well_formed(&block_with_state_proofs(
-            repeated.clone(),
-            StateProofsRoot::over(&repeated),
-        ))
-        .expect_err("a repeated bundle is refused");
+        let err = held(repeated.clone(), StateProofsRoot::over(&repeated))
+            .expect_err("a repeated bundle is refused");
         assert!(err.contains("repeats or precedes"), "{err}");
 
         let empty = vec![StateProofBundle {
             keys: Vec::new(),
             ..bundle_at(3, &[1])
         }];
-        let err = validate_state_proofs_well_formed(&block_with_state_proofs(
-            empty.clone(),
-            StateProofsRoot::over(&empty),
-        ))
-        .expect_err("a bundle naming no key is refused");
+        let err = held(empty.clone(), StateProofsRoot::over(&empty))
+            .expect_err("a bundle naming no key is refused");
         assert!(err.contains("empty"), "{err}");
     }
 
@@ -1471,11 +1108,17 @@ mod tests {
     fn verdict(shard: ShardId, seeds: &[u8]) -> AbandonmentRecord {
         AbandonmentRecord::departed(
             shard,
-            WeightedTimestamp::from_millis(1_000),
+            WeightedTimestamp::from_millis(DEPARTURE_CUT_MS),
             seeds
                 .iter()
                 .map(|&seed| named(TxHash::from(Hash::from_bytes(&[seed; 32])))),
         )
+    }
+
+    /// A block's records held to the header's root and to admission,
+    /// under a schedule attesting every departure the fixtures name.
+    fn held_records(block: &Block) -> Result<(), String> {
+        validate_roots_commit_sections(block).and_then(|()| admit(&after_departures(), block))
     }
 
     /// The header commits the records, so a block whose root does not
@@ -1483,18 +1126,11 @@ mod tests {
     /// records are true.
     #[test]
     fn a_block_whose_root_does_not_commit_its_records_is_refused() {
-        let records = vec![verdict(ShardId::ROOT, &[1, 2])];
+        let records = vec![verdict(ShardId::ROOT.children().0, &[1, 2])];
         let honest = AbandonmentRoot::over(&records);
-        assert!(
-            validate_abandonment_records_well_formed(&block_with_verdicts(records.clone(), honest))
-                .is_ok()
-        );
+        assert!(held_records(&block_with_verdicts(records.clone(), honest)).is_ok());
 
-        let err = validate_abandonment_records_well_formed(&block_with_verdicts(
-            records,
-            AbandonmentRoot::ZERO,
-        ))
-        .unwrap_err();
+        let err = held_records(&block_with_verdicts(records, AbandonmentRoot::ZERO)).unwrap_err();
         assert!(err.contains("does not commit"), "{err}");
     }
 
@@ -1506,9 +1142,7 @@ mod tests {
         let malformed =
             AbandonmentRecord::departed(ShardId::ROOT, WeightedTimestamp::from_millis(1_000), []);
         let root = AbandonmentRoot::over(std::slice::from_ref(&malformed));
-        let err =
-            validate_abandonment_records_well_formed(&block_with_verdicts(vec![malformed], root))
-                .unwrap_err();
+        let err = held_records(&block_with_verdicts(vec![malformed], root)).unwrap_err();
         assert!(
             err.contains("empty, over its cap, or out of order"),
             "{err}"
@@ -1526,17 +1160,14 @@ mod tests {
 
         let ordered = vec![verdict(left, &[1]), verdict(right, &[2])];
         let root = AbandonmentRoot::over(&ordered);
-        assert!(
-            validate_abandonment_records_well_formed(&block_with_verdicts(ordered, root)).is_ok()
-        );
+        assert!(held_records(&block_with_verdicts(ordered, root)).is_ok());
 
         for records in [
             vec![verdict(right, &[2]), verdict(left, &[1])],
             vec![verdict(left, &[1]), verdict(left, &[2])],
         ] {
             let root = AbandonmentRoot::over(&records);
-            let err = validate_abandonment_records_well_formed(&block_with_verdicts(records, root))
-                .unwrap_err();
+            let err = held_records(&block_with_verdicts(records, root)).unwrap_err();
             assert!(err.contains("repeats or precedes"), "{err}");
         }
 
@@ -1558,9 +1189,7 @@ mod tests {
             ),
         ];
         let root = AbandonmentRoot::over(&two_arms);
-        assert!(
-            validate_abandonment_records_well_formed(&block_with_verdicts(two_arms, root)).is_ok()
-        );
+        assert!(held_records(&block_with_verdicts(two_arms, root)).is_ok());
         let arms_reversed = vec![
             AbandonmentRecord::heard(
                 left,
@@ -1570,10 +1199,7 @@ mod tests {
             verdict(left, &[1]),
         ];
         let root = AbandonmentRoot::over(&arms_reversed);
-        assert!(
-            validate_abandonment_records_well_formed(&block_with_verdicts(arms_reversed, root))
-                .is_err()
-        );
+        assert!(held_records(&block_with_verdicts(arms_reversed, root)).is_err());
     }
 
     /// The drain is one budget across every departure a block answers
@@ -1589,7 +1215,7 @@ mod tests {
         let span = |shard: ShardId, from: usize| {
             AbandonmentRecord::departed(
                 shard,
-                WeightedTimestamp::from_millis(1_000),
+                WeightedTimestamp::from_millis(DEPARTURE_CUT_MS),
                 (from..from + half)
                     .map(|i| named(TxHash::from(Hash::from_bytes(&i.to_le_bytes())))),
             )
@@ -1600,8 +1226,7 @@ mod tests {
         }
 
         let root = AbandonmentRoot::over(&records);
-        let err = validate_abandonment_records_well_formed(&block_with_verdicts(records, root))
-            .unwrap_err();
+        let err = held_records(&block_with_verdicts(records, root)).unwrap_err();
         assert!(err.contains("over the drain's own bound"), "{err}");
     }
 
@@ -1675,17 +1300,13 @@ mod tests {
     #[test]
     fn validate_no_duplicate_transactions_accepts_empty_block() {
         let block = block_with_transactions(BlockHeight::new(5), vec![]);
-        let qc_chain = HashSet::new();
-        let dedup_index = CommitDedupIndex::new();
-        assert!(validate_no_duplicate_transactions(&block, &qc_chain, &dedup_index).is_ok());
+        assert!(admit(&plain(), &block).is_ok());
     }
 
     #[test]
     fn validate_no_duplicate_transactions_accepts_unique() {
         let block = block_with_transactions(BlockHeight::new(5), sorted_txs(&[10, 20]));
-        let qc_chain = HashSet::new();
-        let dedup_index = CommitDedupIndex::new();
-        assert!(validate_no_duplicate_transactions(&block, &qc_chain, &dedup_index).is_ok());
+        assert!(admit(&plain(), &block).is_ok());
     }
 
     #[test]
@@ -1693,9 +1314,9 @@ mod tests {
         let txs = sorted_txs(&[10, 20]);
         let dup_hash = txs[0].hash();
         let block = block_with_transactions(BlockHeight::new(6), txs);
-        let qc_chain: HashSet<_> = std::iter::once(dup_hash).collect();
-        let dedup_index = CommitDedupIndex::new();
-        let err = validate_no_duplicate_transactions(&block, &qc_chain, &dedup_index).unwrap_err();
+        let mut against = plain();
+        against.chain.txs.insert(dup_hash);
+        let err = admit(&against, &block).unwrap_err();
         assert!(err.contains("already in QC chain ancestor"));
     }
 
@@ -1704,10 +1325,9 @@ mod tests {
         let txs = sorted_txs(&[10, 20]);
         let dup_tx = Arc::clone(&txs[0]);
         let block = block_with_transactions(BlockHeight::new(6), txs);
-        let qc_chain = HashSet::new();
-        let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_txs(&[dup_tx]);
-        let err = validate_no_duplicate_transactions(&block, &qc_chain, &dedup_index).unwrap_err();
+        let mut against = plain();
+        against.dedup.register_committed_txs(&[dup_tx]);
+        let err = admit(&against, &block).unwrap_err();
         assert!(err.contains("already committed"));
     }
 
@@ -1751,20 +1371,22 @@ mod tests {
         ))
     }
 
-    fn no_resolutions(block: &Block, dedup_index: &CommitDedupIndex) -> Result<(), String> {
-        validate_no_duplicate_resolutions(block, &HashSet::new(), &HashSet::new(), dedup_index)
+    fn no_resolutions(block: &Block, dedup_index: CommitDedupIndex) -> Result<(), String> {
+        let mut against = after_departures();
+        against.dedup = dedup_index;
+        admit(&against, block)
     }
 
     #[test]
     fn validate_no_duplicate_resolutions_accepts_empty_block() {
         let block = block_with_certificates(BlockHeight::new(5), vec![]);
-        assert!(no_resolutions(&block, &CommitDedupIndex::new()).is_ok());
+        assert!(no_resolutions(&block, CommitDedupIndex::new()).is_ok());
     }
 
     #[test]
     fn validate_no_duplicate_resolutions_accepts_unique() {
         let block = block_with_certificates(BlockHeight::new(5), vec![finalization_at(1)]);
-        assert!(no_resolutions(&block, &CommitDedupIndex::new()).is_ok());
+        assert!(no_resolutions(&block, CommitDedupIndex::new()).is_ok());
     }
 
     /// The same certificate again is refused on its identity, which is
@@ -1777,7 +1399,7 @@ mod tests {
         let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
         let mut dedup_index = CommitDedupIndex::new();
         dedup_index.register_committed_certs(&[Arc::new((*fw).clone().into())]);
-        let err = no_resolutions(&block, &dedup_index).unwrap_err();
+        let err = no_resolutions(&block, dedup_index).unwrap_err();
         assert!(
             err.contains("was already committed within its retention window"),
             "{err}"
@@ -1798,7 +1420,7 @@ mod tests {
         let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
         let mut dedup_index = CommitDedupIndex::new();
         dedup_index.register_committed_certs(&[Arc::new((*fw).clone().into())]);
-        let err = no_resolutions(&block, &dedup_index).unwrap_err();
+        let err = no_resolutions(&block, dedup_index).unwrap_err();
         assert!(
             err.contains("was already committed within its retention window"),
             "{err}"
@@ -1823,7 +1445,7 @@ mod tests {
         assert_ne!(abandoned.tick_id(), settled.tick_id());
         let block = block_with_certificates(BlockHeight::new(6), vec![abandoned]);
 
-        let err = no_resolutions(&block, &dedup_index).unwrap_err();
+        let err = no_resolutions(&block, dedup_index).unwrap_err();
         assert!(
             err.contains("already resolved within its retention window"),
             "{err}"
@@ -1847,13 +1469,13 @@ mod tests {
 
         let block = block_with_verdicts(
             vec![AbandonmentRecord::departed(
-                ShardId::ROOT,
-                WeightedTimestamp::from_millis(1_000),
+                ShardId::ROOT.children().0,
+                WeightedTimestamp::from_millis(DEPARTURE_CUT_MS),
                 [named(tx_hash)],
             )],
             AbandonmentRoot::ZERO,
         );
-        let err = no_resolutions(&block, &dedup_index).unwrap_err();
+        let err = no_resolutions(&block, dedup_index).unwrap_err();
         assert!(
             err.contains("already resolved within its retention window"),
             "{err}"
@@ -1877,12 +1499,12 @@ mod tests {
             state_proofs: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(vec![AbandonmentRecord::departed(
-                ShardId::ROOT,
-                WeightedTimestamp::from_millis(1_000),
+                ShardId::ROOT.children().0,
+                WeightedTimestamp::from_millis(DEPARTURE_CUT_MS),
                 [named(tx_hash)],
             )]),
         };
-        let err = no_resolutions(&block, &CommitDedupIndex::new()).unwrap_err();
+        let err = no_resolutions(&block, CommitDedupIndex::new()).unwrap_err();
         assert!(err.contains("which the same block resolves"), "{err}");
     }
 
@@ -1895,17 +1517,11 @@ mod tests {
             .tx_hashes()
             .next()
             .expect("a tick names its members");
-        let ancestor_resolved: HashSet<TxHash> = std::iter::once(tx_hash).collect();
-
         let block =
             block_with_certificates(BlockHeight::new(6), vec![finalization_over(9, tx_hash)]);
-        let err = validate_no_duplicate_resolutions(
-            &block,
-            &ancestor_resolved,
-            &HashSet::new(),
-            &CommitDedupIndex::new(),
-        )
-        .unwrap_err();
+        let mut against = plain();
+        against.chain.resolved.insert(tx_hash);
+        let err = admit(&against, &block).unwrap_err();
         assert!(
             err.contains("already resolved by a QC chain ancestor"),
             "{err}"
@@ -1925,11 +1541,101 @@ mod tests {
             BlockHeight::new(6),
             vec![settled, finalization_over(9, tx_hash)],
         );
-        let err = no_resolutions(&block, &CommitDedupIndex::new()).unwrap_err();
+        let err = no_resolutions(&block, CommitDedupIndex::new()).unwrap_err();
         assert!(
             err.contains("resolved twice within the same block"),
             "{err}"
         );
+    }
+
+    /// A block settling `determined` (as determined halves) and `legs`
+    /// (as legs halves).
+    fn block_settling(determined: &[u64], legs: &[u64]) -> Block {
+        use hyperscale_types::{
+            AggregateSignature, ExecutionCertificate, GlobalReceiptRoot, SignerBitfield, TickHalf,
+            TickId,
+        };
+        let half = |height: u64, half: TickHalf| {
+            let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(height));
+            let ec = ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::from_millis(height),
+                GlobalReceiptRoot::ZERO,
+                Vec::new(),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            );
+            Arc::new(Verifiable::from(Finalization::new(
+                tick_id,
+                half,
+                vec![Arc::new(ec)],
+                Vec::new(),
+            )))
+        };
+        let certificates: Vec<_> = determined
+            .iter()
+            .map(|h| half(*h, TickHalf::Determined))
+            .chain(legs.iter().map(|h| half(*h, TickHalf::Legs)))
+            .collect();
+        Block::Live {
+            header: header_at_height(BlockHeight::new(100), 100_000),
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(certificates),
+            provisions: Arc::new(Vec::new()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
+        }
+    }
+
+    /// Admission above a parent whose settlement frontier is `frontier`.
+    fn above_frontier(frontier: u64) -> Against {
+        let mut against = plain();
+        against.parent_settled_frontier = Some(BlockHeight::new(frontier));
+        against
+    }
+
+    /// The reproduced corruption, refused. Two ticks over one cell
+    /// settled in reverse across two blocks lose the later write; the
+    /// second block is the one carrying the lower tick, and its
+    /// determined half sits at or below the frontier its parent already
+    /// reached.
+    #[test]
+    fn a_determined_half_below_the_parent_frontier_is_refused() {
+        // The parent settled tick 2. This block offers tick 1.
+        let err = admit(&above_frontier(2), &block_settling(&[1], &[])).unwrap_err();
+        assert!(err.contains("at or below the frontier"), "{err}");
+    }
+
+    /// Determined halves within one block must rise, or the receipts
+    /// apply in the order the block lists them and invert inside it.
+    #[test]
+    fn determined_halves_must_rise_within_a_block() {
+        let err = admit(&above_frontier(3), &block_settling(&[6, 4], &[])).unwrap_err();
+        assert!(err.contains("at or below the frontier"), "{err}");
+        assert!(admit(&above_frontier(3), &block_settling(&[4, 6], &[])).is_ok());
+    }
+
+    /// A legs half is unconstrained. It waits on a counterpart and may
+    /// land arbitrarily late; its declared cells are claimed against
+    /// every later tick from the moment it executes, so it has nothing
+    /// to invert against — and holding it to the frontier would wedge a
+    /// tick composed entirely of legs, which never advances one.
+    #[test]
+    fn a_legs_half_settles_whatever_the_frontier_says() {
+        assert!(admit(&above_frontier(7), &block_settling(&[], &[1])).is_ok());
+        assert!(admit(&above_frontier(7), &block_settling(&[8], &[1])).is_ok());
+    }
+
+    /// A certificate anchored before the chain's origin names a tick on
+    /// a predecessor and is refused outright.
+    #[test]
+    fn a_certificate_anchored_before_the_origin_is_refused() {
+        let mut against = above_frontier(0);
+        against.chain_origin = WeightedTimestamp::from_millis(5);
+        let err = admit(&against, &block_settling(&[4], &[])).unwrap_err();
+        assert!(err.contains("predates this chain's origin"), "{err}");
+        assert!(admit(&against, &block_settling(&[6], &[])).is_ok());
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1967,17 +1673,13 @@ mod tests {
     #[test]
     fn validate_no_duplicate_provisions_accepts_empty_block() {
         let block = block_with_provisions(BlockHeight::new(5), vec![]);
-        let qc_chain = HashSet::new();
-        let dedup_index = CommitDedupIndex::new();
-        assert!(validate_no_duplicate_provisions(&block, &qc_chain, &dedup_index).is_ok());
+        assert!(admit(&plain(), &block).is_ok());
     }
 
     #[test]
     fn validate_no_duplicate_provisions_accepts_unique() {
         let block = block_with_provisions(BlockHeight::new(5), vec![provisions_with_seed(1)]);
-        let qc_chain = HashSet::new();
-        let dedup_index = CommitDedupIndex::new();
-        assert!(validate_no_duplicate_provisions(&block, &qc_chain, &dedup_index).is_ok());
+        assert!(admit(&plain(), &block).is_ok());
     }
 
     #[test]
@@ -1985,9 +1687,9 @@ mod tests {
         let p = provisions_with_seed(1);
         let dup_hash = p.hash();
         let block = block_with_provisions(BlockHeight::new(6), vec![p]);
-        let qc_chain: HashSet<_> = std::iter::once(dup_hash).collect();
-        let dedup_index = CommitDedupIndex::new();
-        let err = validate_no_duplicate_provisions(&block, &qc_chain, &dedup_index).unwrap_err();
+        let mut against = plain();
+        against.chain.provisions.insert(dup_hash);
+        let err = admit(&against, &block).unwrap_err();
         assert!(err.contains("already in QC chain ancestor"));
     }
 
@@ -1995,11 +1697,11 @@ mod tests {
     fn validate_no_duplicate_provisions_rejects_retention_dup() {
         let p = provisions_with_seed(1);
         let block = block_with_provisions(BlockHeight::new(6), vec![Arc::clone(&p)]);
-        let qc_chain = HashSet::new();
-        let mut dedup_index = CommitDedupIndex::new();
-        dedup_index
+        let mut against = plain();
+        against
+            .dedup
             .register_committed_provisions(&[p.hash()], WeightedTimestamp::from_millis(1_000));
-        let err = validate_no_duplicate_provisions(&block, &qc_chain, &dedup_index).unwrap_err();
+        let err = admit(&against, &block).unwrap_err();
         assert!(err.contains("already committed"));
     }
 
@@ -2037,7 +1739,7 @@ mod tests {
         // height 9 — above a frontier of 5 the batch is fenced content.
         let block = block_with_provisions(BlockHeight::new(6), vec![provisions_with_seed(9)]);
         let snapshot = snapshot_recovering(ShardId::leaf(1, 0), BlockHeight::new(5));
-        let err = validate_provisions_not_fenced(&snapshot, &block).unwrap_err();
+        let err = admit(&Against::window(snapshot), &block).unwrap_err();
         assert!(err.contains("recovering shard"));
     }
 
@@ -2046,7 +1748,7 @@ mod tests {
         // At the frontier the batch is legitimate pre-failure history.
         let block = block_with_provisions(BlockHeight::new(6), vec![provisions_with_seed(5)]);
         let snapshot = snapshot_recovering(ShardId::leaf(1, 0), BlockHeight::new(5));
-        assert!(validate_provisions_not_fenced(&snapshot, &block).is_ok());
+        assert!(admit(&Against::window(snapshot), &block).is_ok());
     }
 
     #[test]
@@ -2054,13 +1756,13 @@ mod tests {
         let block = block_with_provisions(BlockHeight::new(6), vec![provisions_with_seed(9)]);
         // Recovery pending for a different shard.
         let other = snapshot_recovering(ShardId::leaf(1, 1), BlockHeight::new(5));
-        assert!(validate_provisions_not_fenced(&other, &block).is_ok());
+        assert!(admit(&Against::window(other), &block).is_ok());
         // No recovery pending at all — a pre-fold governing snapshot.
         let clean = snapshot_recovering(ShardId::leaf(1, 1), BlockHeight::new(5));
         let mut recoveries = clean.pending_recoveries().clone();
         recoveries.clear();
         let clean = clean.with_pending_recoveries(recoveries);
-        assert!(validate_provisions_not_fenced(&clean, &block).is_ok());
+        assert!(admit(&Against::window(clean), &block).is_ok());
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -2114,14 +1816,8 @@ mod tests {
         txs.push(tx(30)); // Unverified entry
         let block = block_with_transactions(BlockHeight::new(1), txs);
         let err = validate_block_for_vote(
-            &topo,
-            local_shard(),
+            &Against::window(topo).ctx(),
             &block,
-            &HashSet::new(),
-            &HashSet::new(),
-            &HashSet::new(),
-            &HashSet::new(),
-            &CommitDedupIndex::new(),
             false,
             Some(ShardLoad::ZERO),
         )
@@ -2136,14 +1832,8 @@ mod tests {
         let topo = topology_snapshot();
         let with_tx = block_with_transactions(BlockHeight::new(1), sorted_verified_txs(&[10]));
         let err = validate_block_for_vote(
-            &topo,
-            local_shard(),
+            &Against::window(topo.clone()).ctx(),
             &with_tx,
-            &HashSet::new(),
-            &HashSet::new(),
-            &HashSet::new(),
-            &HashSet::new(),
-            &CommitDedupIndex::new(),
             true,
             Some(ShardLoad::ZERO),
         )
@@ -2157,14 +1847,8 @@ mod tests {
         let records = vec![verdict(ShardId::ROOT, &[1])];
         let with_record = block_with_verdicts(records.clone(), AbandonmentRoot::over(&records));
         let err = validate_block_for_vote(
-            &topo,
-            local_shard(),
+            &Against::window(topo.clone()).ctx(),
             &with_record,
-            &HashSet::new(),
-            &HashSet::new(),
-            &HashSet::new(),
-            &HashSet::new(),
-            &CommitDedupIndex::new(),
             true,
             Some(ShardLoad::ZERO),
         )
@@ -2174,16 +1858,10 @@ mod tests {
         let empty = block_with_transactions(BlockHeight::new(1), Vec::new());
         assert!(
             validate_block_for_vote(
-                &topo,
-                local_shard(),
+                &Against::window(topo).ctx(),
                 &empty,
-                &HashSet::new(),
-                &HashSet::new(),
-                &HashSet::new(),
-                &HashSet::new(),
-                &CommitDedupIndex::new(),
                 true,
-                Some(ShardLoad::ZERO),
+                Some(ShardLoad::ZERO)
             )
             .is_ok()
         );
@@ -2204,6 +1882,19 @@ mod tests {
         Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
             test_utils::stub_transaction(payer, owners, 1_000, validity),
         )))
+    }
+
+    /// Admission at `local` under `topo`, with nothing committed.
+    fn engaged(topo: &TopologySnapshot, local: ShardId) -> Against {
+        engaged_with(topo, local, CommitDedupIndex::new())
+    }
+
+    /// Admission at `local` under `topo`, with `dedup` committed.
+    fn engaged_with(topo: &TopologySnapshot, local: ShardId, dedup: CommitDedupIndex) -> Against {
+        let mut against = Against::window(topo.clone());
+        against.local_shard = local;
+        against.dedup = dedup;
+        against
     }
 
     fn block_with_tx(
@@ -2234,7 +1925,7 @@ mod tests {
 
         // No bundle anywhere: the counterpart must not engage.
         let bare = block_with_tx(&tx, Vec::new());
-        let err = validate_engagement(&topo, local, &bare, &CommitDedupIndex::new()).unwrap_err();
+        let err = admit(&engaged(&topo, local), &bare).unwrap_err();
         assert!(err.contains("payer bundle"), "{err}");
 
         // The payer's empty-entry bundle in the same block: engaged.
@@ -2250,7 +1941,7 @@ mod tests {
             .into(),
         );
         let paired = block_with_tx(&tx, vec![Arc::clone(&bundle)]);
-        assert!(validate_engagement(&topo, local, &paired, &CommitDedupIndex::new()).is_ok());
+        assert!(admit(&engaged(&topo, local), &paired).is_ok());
 
         // A bundle committed within the retention window: engaged.
         let mut dedup = CommitDedupIndex::new();
@@ -2258,7 +1949,7 @@ mod tests {
             std::slice::from_ref(&bundle),
             WeightedTimestamp::from_millis(1_000),
         );
-        assert!(validate_engagement(&topo, local, &bare, &dedup).is_ok());
+        assert!(admit(&engaged_with(&topo, local, dedup), &bare).is_ok());
 
         // A bundle from the wrong source shard is not engagement evidence.
         let wrong_source: Arc<Verifiable<Provisions>> = Arc::new(
@@ -2273,8 +1964,7 @@ mod tests {
             .into(),
         );
         let mispaired = block_with_tx(&tx, vec![wrong_source]);
-        let err =
-            validate_engagement(&topo, local, &mispaired, &CommitDedupIndex::new()).unwrap_err();
+        let err = admit(&engaged(&topo, local), &mispaired).unwrap_err();
         assert!(err.contains("payer bundle"), "{err}");
     }
 
@@ -2288,27 +1978,11 @@ mod tests {
         // the gate — no bundle demanded.
         let cross = stub_tx(payer_owner, &[local_owner.address(), payer_owner.address()]);
         let at_payer = block_with_tx(&cross, Vec::new());
-        assert!(
-            validate_engagement(
-                &topo,
-                ShardId::leaf(1, 1),
-                &at_payer,
-                &CommitDedupIndex::new()
-            )
-            .is_ok()
-        );
+        assert!(admit(&engaged(&topo, ShardId::leaf(1, 1)), &at_payer).is_ok());
 
         // A single-shard leg engages nothing remotely.
         let single = stub_tx(local_owner, &[local_owner.address()]);
         let local_only = block_with_tx(&single, Vec::new());
-        assert!(
-            validate_engagement(
-                &topo,
-                ShardId::leaf(1, 0),
-                &local_only,
-                &CommitDedupIndex::new()
-            )
-            .is_ok()
-        );
+        assert!(admit(&engaged(&topo, ShardId::leaf(1, 0)), &local_only).is_ok());
     }
 }

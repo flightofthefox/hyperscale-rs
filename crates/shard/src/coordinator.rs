@@ -12,16 +12,16 @@
 //! This provides a strong DA guarantee: if a QC forms, at least 2f+1 validators have
 //! the complete block data, making it recoverable from any honest validator in that set.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CounterpartMirror, DeferOn, Epoch,
-    FinalizationHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
-    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr, ProposerTimestamp,
-    ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup,
-    ShardId, SplitAtBoundary, StateProofBundle, StoredReceipt, SubstateKey, VerificationKind,
-    WeightedTimestamp, WorkInFlight, derive_reshape_trigger, ready_signal_window,
+    FinalizationHash, Hash, LocalTimestamp, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK,
+    PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds,
+    ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateProofBundle, StoredReceipt,
+    SubstateKey, VerificationKind, WeightedTimestamp, WorkInFlight, derive_reshape_trigger,
+    ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -100,6 +100,10 @@ use hyperscale_types::{
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
 
+use crate::admission::{
+    Admission, FinalizationsFold, ProvisionsFold, QcChainSets, RecordsFold, StateProofsFold,
+    TransactionsFold,
+};
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::block_sync::{
     BlockSyncHealthDecision, BlockSyncManager, BlockSyncVerificationResult, IngestOutcome,
@@ -115,10 +119,9 @@ use crate::lookups::{committee_public_keys, vote_recipients};
 use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
 use crate::precut::Precut;
 use crate::proposal::{
-    AdmissionWindows, ProposalKind, ProposalPayload, ProposalTracker, TakeResult,
-    assemble_build_action, dispatch_or_defer, filter_engaged_transactions, late_deliveries,
-    select_abandonment_records, select_finalizations, select_provisions, select_state_proofs,
-    select_transactions,
+    Prefilter, ProposalKind, ProposalPayload, ProposalTracker, TakeResult, assemble_build_action,
+    dispatch_or_defer, late_deliveries, select_abandonment_records, select_finalizations,
+    select_provisions, select_state_proofs, select_transactions,
 };
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::timeout_keeper::TimeoutKeeper;
@@ -1686,74 +1689,34 @@ impl ShardCoordinator {
     // Proposer Logic
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// What the block resolves: the finalizations it can carry, and the
-    /// abandonment records beside them — held to the same set of names
-    /// the chain already resolved, and to each other, so no record asks
-    /// for a second verdict on a name a finalization in the same block
-    /// settles.
-    fn select_resolutions(
-        &self,
-        topology_schedule: &TopologySchedule,
+    /// What a block anchored at `anchor` over `parent_block_hash` is
+    /// admitted against: the chain behind the parent, walked once, and
+    /// the window the block sits in.
+    fn admission<'a>(
+        &'a self,
+        snapshot: &'a TopologySnapshot,
+        topology_schedule: &'a TopologySchedule,
+        chain: &'a QcChainSets,
         parent_block_hash: BlockHash,
-        validity_anchor: WeightedTimestamp,
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
-        abandonment_records: Vec<AbandonmentRecord>,
-    ) -> (Vec<Arc<Verifiable<Finalization>>>, Vec<AbandonmentRecord>) {
-        let qc_chain_resolved_txs = self.chain_view().ancestor_resolved_txs(parent_block_hash);
-        let qc_chain_finalizations = self
-            .chain_view()
-            .ancestor_finalization_ids(parent_block_hash);
-        let (finalizations, _finalized_tx_count) = select_finalizations(
-            finalizations,
-            &qc_chain_resolved_txs,
-            &qc_chain_finalizations,
-            &self.dedup_index,
-            self.chain_view().parent_settled_frontier(parent_block_hash),
-            MAX_FINALIZED_TX_PER_BLOCK,
-            self.chain_origin.anchor_wt,
-        );
-        let abandonment_records = select_abandonment_records(
-            abandonment_records,
-            topology_schedule,
-            validity_anchor,
-            &finalizations,
-            &qc_chain_resolved_txs,
-            &self.dedup_index,
-        );
-        (finalizations, abandonment_records)
-    }
-
-    /// The transactions a block anchored at `validity_anchor` may carry:
-    /// the ready set less what the QC chain already holds, inside its
-    /// window — or, for a transaction this shard only delivers for,
-    /// inside the delivery window — and answered where it opened before
-    /// the chain did.
-    fn select_block_transactions(
-        &self,
-        topology_schedule: &TopologySchedule,
-        ready_txs: &[Arc<Verified<Transaction>>],
-        qc_chain_tx_hashes: &HashSet<TxHash>,
-        validity_anchor: WeightedTimestamp,
-    ) -> Vec<Arc<Verified<Transaction>>> {
-        let late = late_deliveries(
-            ready_txs,
-            topology_schedule,
-            validity_anchor,
-            self.local_shard,
-        );
-        select_transactions(
-            ready_txs,
-            qc_chain_tx_hashes,
-            &self.dedup_index,
-            &AdmissionWindows {
-                validity_anchor,
-                chain_origin_wt: self.chain_origin.anchor_wt,
-                precut: &self.precut,
-                late_deliveries: &late,
-            },
-            topology_schedule.head(),
-            self.local_shard,
-        )
+        anchor: WeightedTimestamp,
+        genesis_parent: bool,
+    ) -> Admission<'a> {
+        let parent_settled_frontier = if genesis_parent {
+            Some(BlockHeight::GENESIS)
+        } else {
+            self.chain_view()
+                .parent_settled_frontier_checked(parent_block_hash)
+        };
+        Admission {
+            snapshot,
+            schedule: topology_schedule,
+            local_shard: self.local_shard,
+            anchor,
+            chain_origin: self.chain_origin.anchor_wt,
+            chain,
+            dedup: &self.dedup_index,
+            parent_settled_frontier,
+        }
     }
 
     /// Try to build and broadcast a new block proposal.
@@ -1849,49 +1812,52 @@ impl ShardCoordinator {
             );
         }
 
-        // Walk the QC chain to find certificates, transactions, and
-        // provisions already in pending/certified blocks above committed
-        // height — the two-chain commit window leaves them visible and the
-        // mempool doesn't clear its ready-set until commit, so we must dedup
-        // here to avoid repeating items across consecutive blocks.
-        let (qc_chain_tx_hashes, qc_chain_provision_hashes) =
-            self.collect_qc_chain_hashes(parent_block_hash);
-
-        // Anchor validity-window filtering on the parent QC's weighted
-        // timestamp — the deterministic clock voters will use to verify
-        // this block. The one-block lag (this block's own QC may carry a
-        // slightly later timestamp) is bounded by MAX_VALIDITY_RANGE.
+        // Walk the QC chain once for what pending and certified blocks
+        // above committed height already carry — the two-chain commit
+        // window leaves them visible and the mempool doesn't clear its
+        // ready set until commit — and admit each section against it
+        // under the parent QC's weighted timestamp, the deterministic
+        // clock voters will read this block at. The one-block lag (this
+        // block's own QC may carry a slightly later timestamp) is
+        // bounded by MAX_VALIDITY_RANGE.
+        let chain = QcChainSets::behind(&self.chain_view(), parent_block_hash);
         let validity_anchor = parent_qc.weighted_timestamp();
-        let transactions = self.select_block_transactions(
+        let ctx = self.admission(
+            topology_schedule.head(),
             topology_schedule,
-            ready_txs,
-            &qc_chain_tx_hashes,
-            validity_anchor,
-        );
-        let (finalizations, abandonment_records) = self.select_resolutions(
-            topology_schedule,
+            &chain,
             parent_block_hash,
             validity_anchor,
-            finalizations,
+            parent_qc.is_genesis(),
+        );
+        // In the order the folds depend on: provisions first, since a
+        // cross-shard transaction rides only beside (or after) its payer
+        // bundle; finalizations before the records held to their names.
+        let mut provision_fold = ProvisionsFold::default();
+        let provisions = select_provisions(&ctx, &mut provision_fold, provisions);
+        let late = late_deliveries(
+            ready_txs,
+            topology_schedule,
+            validity_anchor,
+            self.local_shard,
+        );
+        let transactions = select_transactions(
+            &ctx,
+            &Prefilter {
+                precut: &self.precut,
+                late_deliveries: &late,
+            },
+            &mut TransactionsFold::beside(&provision_fold),
+            ready_txs,
+        );
+        let mut finalization_fold = FinalizationsFold::from(&ctx);
+        let finalizations = select_finalizations(&ctx, &mut finalization_fold, finalizations);
+        let abandonment_records = select_abandonment_records(
+            &ctx,
+            &mut RecordsFold::after(&finalization_fold),
             abandonment_records,
         );
-        let state_proofs = select_state_proofs(state_proofs);
-        let provisions = select_provisions(
-            provisions,
-            &qc_chain_provision_hashes,
-            &self.dedup_index,
-            MAX_TXS_PER_BLOCK,
-        );
-        // Applied after provision selection: a cross-shard transaction
-        // rides only beside (or after) its payer bundle, the engagement
-        // evidence the voters' `validate_engagement` demands.
-        let transactions = filter_engaged_transactions(
-            topology_schedule.head(),
-            self.local_shard,
-            transactions,
-            &provisions,
-            &self.dedup_index,
-        );
+        let state_proofs = select_state_proofs(&ctx, &mut StateProofsFold::default(), state_proofs);
 
         self.build_and_dispatch_proposal(
             topology_schedule,
@@ -3232,7 +3198,13 @@ impl ShardCoordinator {
             let anchor_wt = block.header().parent_qc().weighted_timestamp();
             let coasting = self.past_terminal_window(topology_schedule, anchor_wt)
                 || self.recovery_bridging(topology_schedule, anchor_wt);
-            if self.reject_invalid_block_contents(committee, block_hash, block, coasting) {
+            if self.reject_invalid_block_contents(
+                committee,
+                topology_schedule,
+                block_hash,
+                block,
+                coasting,
+            ) {
                 return vec![];
             }
 
@@ -3503,26 +3475,26 @@ impl ShardCoordinator {
     fn reject_invalid_block_contents(
         &self,
         topology_snapshot: &TopologySnapshot,
+        topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
         block: &Block,
         coasting: bool,
     ) -> bool {
         let parent = block.header().parent_block_hash();
-        let (qc_chain_tx_hashes, qc_chain_provision_hashes) = self.collect_qc_chain_hashes(parent);
-        let qc_chain_resolved_txs = self.chain_view().ancestor_resolved_txs(parent);
-        let qc_chain_finalizations = self.chain_view().ancestor_finalization_ids(parent);
-        if let Err(e) = validate_block_for_vote(
+        let chain = QcChainSets::behind(&self.chain_view(), parent);
+        let ctx = self.admission(
             topology_snapshot,
-            self.local_shard,
+            topology_schedule,
+            &chain,
+            parent,
+            block.header().parent_qc().weighted_timestamp(),
+            block.header().parent_qc().is_genesis(),
+        );
+        if let Err(e) = validate_block_for_vote(
+            &ctx,
             block,
-            &qc_chain_tx_hashes,
-            &qc_chain_resolved_txs,
-            &qc_chain_finalizations,
-            &qc_chain_provision_hashes,
-            &self.dedup_index,
             coasting,
-            self.chain_view()
-                .parent_load_checked(block.header().parent_block_hash()),
+            self.chain_view().parent_load_checked(parent),
         ) {
             warn!(
                 validator = ?self.me,
@@ -6519,23 +6491,12 @@ impl ShardCoordinator {
     ///
     /// Callers should request this many extra transactions from the mempool to
     /// compensate for duplicates that will be filtered during proposal building.
-    /// This avoids the caller needing to call `collect_qc_chain_hashes` separately.
     #[must_use]
     pub fn dedup_overhead(&self) -> usize {
         let parent_block_hash = self.proposal_parent_block_hash();
-        let (tx_hashes, _) = self.collect_qc_chain_hashes(parent_block_hash);
-        tx_hashes.len()
-    }
-
-    /// Walk the QC chain from `parent_block_hash` back to committed
-    /// height, collecting transaction and provision hashes from ancestor
-    /// blocks. Thin wrapper over [`ChainView::collect_ancestor_hashes`].
-    #[must_use]
-    pub fn collect_qc_chain_hashes(
-        &self,
-        parent_block_hash: BlockHash,
-    ) -> (HashSet<TxHash>, HashSet<ProvisionHash>) {
-        self.chain_view().collect_ancestor_hashes(parent_block_hash)
+        QcChainSets::behind(&self.chain_view(), parent_block_hash)
+            .txs
+            .len()
     }
 
     /// Get the shard consensus configuration.
@@ -6692,7 +6653,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::validation::validate_no_duplicate_transactions;
+    use crate::admission::{RecordsSection, TransactionsSection, admit_all, unwrapped};
 
     fn install_complete_block(state: &mut ShardCoordinator, block: &Block) {
         let mut pending =
@@ -10745,7 +10706,7 @@ mod tests {
 
     #[test]
     fn test_validate_no_duplicate_transactions_rejects_cross_block_dup() {
-        let (mut state, _topology) = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.committed_height = BlockHeight::new(3);
 
         let tx1 = make_test_tx_with_seed(10);
@@ -10816,17 +10777,14 @@ mod tests {
             state_proofs: Arc::new(Vec::new()),
         };
 
-        let result = {
-            let (qc_chain, _) = state.collect_qc_chain_hashes(block.header().parent_block_hash());
-            validate_no_duplicate_transactions(&block, &qc_chain, &state.dedup_index)
-        };
+        let result = state.admit_transactions(&topology, &block);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in QC chain ancestor"));
     }
 
     #[test]
     fn test_validate_no_duplicate_transactions_ignores_committed_ancestors() {
-        let (mut state, _topology) = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.committed_height = BlockHeight::new(5);
 
         let tx1 = make_test_tx_with_seed(10);
@@ -10896,14 +10854,7 @@ mod tests {
         };
 
         // Ancestor is at committed height, so walk stops before checking it
-        assert!(
-            {
-                let (qc_chain, _) =
-                    state.collect_qc_chain_hashes(block.header().parent_block_hash());
-                validate_no_duplicate_transactions(&block, &qc_chain, &state.dedup_index)
-            }
-            .is_ok()
-        );
+        assert!(state.admit_transactions(&topology, &block).is_ok());
     }
 
     /// Schedule whose window 0 carries `ROOT` (the coordinator's shard,
@@ -11058,6 +11009,58 @@ mod tests {
 
     /// A live child coordinator (`leaf(1,0)`) of a `ROOT` that terminated
     /// at wt 1000 — so `ROOT` is past-terminal at any later anchor.
+    impl ShardCoordinator {
+        /// Admit `block`'s transactions against the chain behind its
+        /// parent, the way the vote does.
+        fn admit_transactions(
+            &self,
+            topology_schedule: &TopologySchedule,
+            block: &Block,
+        ) -> Result<(), String> {
+            let parent = block.header().parent_block_hash();
+            let chain = QcChainSets::behind(&self.chain_view(), parent);
+            let ctx = self.admission(
+                topology_schedule.head(),
+                topology_schedule,
+                &chain,
+                parent,
+                block.header().parent_qc().weighted_timestamp(),
+                block.header().parent_qc().is_genesis(),
+            );
+            let provisions = ProvisionsFold::default();
+            admit_all::<TransactionsSection<'_>>(
+                &ctx,
+                &mut TransactionsFold::beside(&provisions),
+                block.transactions().iter().map(unwrapped),
+            )
+        }
+
+        /// Admit `block`'s records against the schedule, the way the
+        /// vote does, with no finalization beside them.
+        fn admit_records(
+            &self,
+            topology_schedule: &TopologySchedule,
+            block: &Block,
+        ) -> Result<(), String> {
+            let parent = block.header().parent_block_hash();
+            let chain = QcChainSets::behind(&self.chain_view(), parent);
+            let ctx = self.admission(
+                topology_schedule.head(),
+                topology_schedule,
+                &chain,
+                parent,
+                block.header().parent_qc().weighted_timestamp(),
+                block.header().parent_qc().is_genesis(),
+            );
+            let finalizations = FinalizationsFold::from(&ctx);
+            admit_all::<RecordsSection<'_>>(
+                &ctx,
+                &mut RecordsFold::after(&finalizations),
+                block.abandonment_records(),
+            )
+        }
+    }
+
     fn fence_coordinator() -> ShardCoordinator {
         ShardCoordinator::new(
             Arc::new(BlsVerifier),
@@ -11305,7 +11308,7 @@ mod tests {
         assert!(
             coord
                 .vote_fence()
-                .records(&sched, &block_with_records(AFTER_CUT_MS, records))
+                .records(&block_with_records(AFTER_CUT_MS, records))
                 .is_err()
         );
     }
@@ -11317,12 +11320,10 @@ mod tests {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         let records = vec![record_naming(coord.local_shard, ROOT_CUT_MS, b"tx")];
-        assert!(
-            coord
-                .vote_fence()
-                .records(&sched, &block_with_records(AFTER_CUT_MS, records))
-                .is_err()
-        );
+        let err = coord
+            .admit_records(&sched, &block_with_records(AFTER_CUT_MS, records))
+            .unwrap_err();
+        assert!(err.contains("schedule does not attest"), "{err}");
     }
 
     /// The stated cut is held to the schedule's own. It dates the record
@@ -11333,11 +11334,15 @@ mod tests {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS + 1, b"tx")];
+        let err = coord
+            .admit_records(&sched, &block_with_records(AFTER_CUT_MS, records))
+            .unwrap_err();
+        assert!(err.contains("schedule does not attest"), "{err}");
+        let honest = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
         assert!(
             coord
-                .vote_fence()
-                .records(&sched, &block_with_records(AFTER_CUT_MS, records))
-                .is_err()
+                .admit_records(&sched, &block_with_records(AFTER_CUT_MS, honest))
+                .is_ok()
         );
     }
 
@@ -11347,7 +11352,6 @@ mod tests {
     #[test]
     fn a_record_the_schedule_attests_is_voted_on() {
         let coord = fence_coordinator();
-        let sched = make_terminating_schedule(4);
         coord
             .evidence()
             .record_settled(ShardId::ROOT, root_settled(b"other"), parties_of(b"tx"));
@@ -11355,7 +11359,7 @@ mod tests {
         assert!(
             coord
                 .vote_fence()
-                .records(&sched, &block_with_records(AFTER_CUT_MS, records))
+                .records(&block_with_records(AFTER_CUT_MS, records))
                 .is_ok()
         );
     }
@@ -11367,7 +11371,6 @@ mod tests {
     /// departure at all cannot say either way, and defers.
     #[test]
     fn a_record_naming_a_stranger_to_the_departed_shard_is_refused() {
-        let sched = make_terminating_schedule(4);
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
         let block = block_with_records(AFTER_CUT_MS, records);
 
@@ -11378,13 +11381,13 @@ mod tests {
             parties_of(b"other"),
         );
         assert!(
-            stranger.vote_fence().records(&sched, &block).is_err(),
+            stranger.vote_fence().records(&block).is_err(),
             "a name the departed shard was not party to is not voted"
         );
 
         let unmirrored = fence_coordinator();
         assert!(
-            unmirrored.vote_fence().records(&sched, &block).is_err(),
+            unmirrored.vote_fence().records(&block).is_err(),
             "and a voter that has mirrored no departure defers"
         );
     }
@@ -11525,7 +11528,6 @@ mod tests {
     /// and no mirror defers it.
     #[test]
     fn a_refusal_record_stands_or_falls_on_the_mirror() {
-        let sched = make_terminating_schedule(4);
         let refused_wt = WeightedTimestamp::from_millis(5_000);
         let block = record_of(verdict(refused_wt, false));
         let tx_hash = figures_of(b"tx").tx_hash;
@@ -11535,7 +11537,7 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, verdict(refused_wt, false));
         assert!(
-            matching.vote_fence().records(&sched, &block).is_ok(),
+            matching.vote_fence().records(&block).is_ok(),
             "a matching mirror passes it"
         );
 
@@ -11561,14 +11563,14 @@ mod tests {
             let mismatched = fence_coordinator();
             mismatched.evidence().record(tx_hash, ShardId::ROOT, held);
             assert!(
-                mismatched.vote_fence().records(&sched, &block).is_err(),
+                mismatched.vote_fence().records(&block).is_err(),
                 "a mirror of {why} refuses it"
             );
         }
 
         let absent = fence_coordinator();
         assert!(
-            absent.vote_fence().records(&sched, &block).is_err(),
+            absent.vote_fence().records(&block).is_err(),
             "no mirror defers it"
         );
     }
@@ -11582,7 +11584,6 @@ mod tests {
     /// probed where the cell may be swept.
     #[test]
     fn an_absence_record_stands_or_falls_on_the_mirror() {
-        let sched = make_terminating_schedule(4);
         let deadline = figures_of(b"tx").deadline.at();
         let tx_hash = figures_of(b"tx").tx_hash;
         let record = |at| record_of(absent(Probed::Core, at));
@@ -11592,41 +11593,33 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Core, deadline));
         assert!(
-            matching
-                .vote_fence()
-                .records(&sched, &record(deadline))
-                .is_ok(),
+            matching.vote_fence().records(&record(deadline)).is_ok(),
             "a proof at the deadline passes a record at the deadline"
         );
         assert!(
             matching
                 .vote_fence()
-                .records(&sched, &record(deadline.plus(Duration::from_secs(5))))
+                .records(&record(deadline.plus(Duration::from_secs(5))))
                 .is_err(),
             "a record at an anchor this validator has not folded defers"
         );
         assert!(
             matching
                 .vote_fence()
-                .records(&sched, &record(deadline.minus(Duration::from_millis(1))))
+                .records(&record(deadline.minus(Duration::from_millis(1))))
                 .is_err(),
             "a record probed before the deadline is refused whatever the mirror holds"
         );
         let sweep = deadline.plus(MAX_VALIDITY_RANGE);
         assert!(
-            matching
-                .vote_fence()
-                .records(&sched, &record(sweep))
-                .is_err(),
+            matching.vote_fence().records(&record(sweep)).is_err(),
             "a record probed where the committed cell may be swept is refused"
         );
         let late = fence_coordinator();
         late.evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Core, sweep));
         assert!(
-            late.vote_fence()
-                .records(&sched, &record(deadline))
-                .is_err(),
+            late.vote_fence().records(&record(deadline)).is_err(),
             "a mirror taken past the sweep proves nothing and defers"
         );
 
@@ -11634,7 +11627,7 @@ mod tests {
         assert!(
             absent_mirror
                 .vote_fence()
-                .records(&sched, &record(deadline))
+                .records(&record(deadline))
                 .is_err(),
             "no proof defers it"
         );
@@ -11646,7 +11639,6 @@ mod tests {
     /// does not, since the questions are different proofs.
     #[test]
     fn an_untaken_record_stands_on_the_claims_own_mirror() {
-        let sched = make_terminating_schedule(4);
         let deadline = figures_of(b"tx").deadline.at();
         let tx_hash = figures_of(b"tx").tx_hash;
         let record = record_of(absent(Probed::Claim, deadline));
@@ -11656,7 +11648,7 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Claim, deadline));
         assert!(
-            claim.vote_fence().records(&sched, &record).is_ok(),
+            claim.vote_fence().records(&record).is_ok(),
             "a folded claim absence at the anchor passes it"
         );
 
@@ -11664,7 +11656,7 @@ mod tests {
         cell.evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Core, deadline));
         assert!(
-            cell.vote_fence().records(&sched, &record).is_err(),
+            cell.vote_fence().records(&record).is_err(),
             "a committed-cell absence is another question's proof, and defers"
         );
     }
@@ -11677,7 +11669,6 @@ mod tests {
     /// delivery's.
     #[test]
     fn a_lapse_record_is_held_to_the_deadline_plus_a_validity_range() {
-        let sched = make_terminating_schedule(4);
         let deadline = figures_of(b"tx").deadline.at();
         let lapse = deadline.plus(MAX_VALIDITY_RANGE);
         let tx_hash = figures_of(b"tx").tx_hash;
@@ -11688,23 +11679,17 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Delivery, lapse));
         assert!(
-            matching
-                .vote_fence()
-                .records(&sched, &record(lapse))
-                .is_ok(),
+            matching.vote_fence().records(&record(lapse)).is_ok(),
             "a proof at the lapse passes a record at the lapse"
         );
         assert!(
-            matching
-                .vote_fence()
-                .records(&sched, &record(deadline))
-                .is_err(),
+            matching.vote_fence().records(&record(deadline)).is_err(),
             "a lapse record anchored at the deadline is refused whatever the mirror holds"
         );
         assert!(
             matching
                 .vote_fence()
-                .records(&sched, &record(lapse.plus(MAX_VALIDITY_RANGE)))
+                .records(&record(lapse.plus(MAX_VALIDITY_RANGE)))
                 .is_err(),
             "a lapse record anchored where the claim cell may be swept is refused"
         );
@@ -11714,7 +11699,7 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Delivery, deadline));
         assert!(
-            short.vote_fence().records(&sched, &record(lapse)).is_err(),
+            short.vote_fence().records(&record(lapse)).is_err(),
             "a proof short of the lapse defers it"
         );
 
@@ -11723,7 +11708,7 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Core, lapse));
         assert!(
-            cores.vote_fence().records(&sched, &record(lapse)).is_err(),
+            cores.vote_fence().records(&record(lapse)).is_err(),
             "a core's cell proved absent at the lapse is not the claim proved absent: it defers"
         );
     }
@@ -11734,7 +11719,6 @@ mod tests {
     /// defers.
     #[test]
     fn an_accepted_record_stands_or_falls_on_the_mirror() {
-        let sched = make_terminating_schedule(4);
         let figures = figures_of(b"tx");
         let accepted_wt = figures.deadline.at();
         let record = |at| record_of(verdict(at, true));
@@ -11744,26 +11728,20 @@ mod tests {
             .evidence()
             .record(figures.tx_hash, ShardId::ROOT, verdict(accepted_wt, true));
         assert!(
-            matching
-                .vote_fence()
-                .records(&sched, &record(accepted_wt))
-                .is_ok(),
+            matching.vote_fence().records(&record(accepted_wt)).is_ok(),
             "the mirrored word passes"
         );
         assert!(
             matching
                 .vote_fence()
-                .records(&sched, &record(accepted_wt.plus(Duration::from_millis(1))))
+                .records(&record(accepted_wt.plus(Duration::from_millis(1))))
                 .is_err(),
             "another anchor is refused"
         );
 
         let absent = fence_coordinator();
         assert!(
-            absent
-                .vote_fence()
-                .records(&sched, &record(accepted_wt))
-                .is_err(),
+            absent.vote_fence().records(&record(accepted_wt)).is_err(),
             "no mirror defers it"
         );
     }
@@ -11775,7 +11753,6 @@ mod tests {
     #[test]
     fn a_record_naming_what_the_departed_shard_settled_is_refused() {
         let coord = fence_coordinator();
-        let sched = make_terminating_schedule(4);
         coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
@@ -11788,7 +11765,7 @@ mod tests {
         assert!(
             coord
                 .vote_fence()
-                .records(&sched, &block_with_records(AFTER_CUT_MS, records))
+                .records(&block_with_records(AFTER_CUT_MS, records))
                 .is_err()
         );
     }
