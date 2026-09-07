@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{Address, EscrowedValue, ShardId, ShardTrie, SubstateKey};
 use hyperscale_vm_effects::{CrossingEdge as StarEdge, Star, star_at};
-use hyperscale_vm_kernel::{Crossed, Departure, ExecutionScope, LegPlan, PlanFault};
+use hyperscale_vm_kernel::{Crossed, Departure, LegPlan, OwnerSet, PlanFault};
 use hyperscale_vm_types::{LegRole, LegShape, ProtocolHasher};
 
 use crate::sharding::TrieShardResolver;
@@ -314,7 +314,7 @@ impl Classified {
         }
         Ok(ShardPlan {
             legs: plan,
-            scope: self.scope_for(local),
+            judges: self.judges_for(local),
         })
     }
 
@@ -330,13 +330,13 @@ impl Classified {
 
     /// What `local` judges: the core set if it is in it, itself
     /// otherwise.
-    fn scope_for(&self, local: ShardId) -> ExecutionScope {
+    fn judges_for(&self, local: ShardId) -> OwnerSet {
         let trie = Arc::clone(&self.trie);
         if self.star.core.contains(&local) {
             let core = self.star.core.clone();
-            ExecutionScope::spanning(move |owner| core.contains(&trie.shard_for_prefix(owner)))
+            OwnerSet::of(move |owner| core.contains(&trie.shard_for_prefix(owner)))
         } else {
-            ExecutionScope::spanning(move |owner| trie.shard_for_prefix(owner) == local)
+            OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local)
         }
     }
 }
@@ -669,7 +669,7 @@ pub struct ShardPlan {
     pub legs: LegPlan,
     /// What this shard judges before any body runs: its own shard for a
     /// leg member, the whole core set for a core member.
-    pub scope: ExecutionScope,
+    pub judges: OwnerSet,
 }
 
 impl ShardPlan {
@@ -679,7 +679,7 @@ impl ShardPlan {
     pub fn whole() -> Self {
         Self {
             legs: LegPlan::whole(0),
-            scope: ExecutionScope::whole(),
+            judges: OwnerSet::whole(),
         }
     }
 }
@@ -852,7 +852,7 @@ mod tests {
             .plan(&[], low(), Side::Issuing)
             .expect("a whole plan needs nothing");
         assert!(plan.legs.is_whole());
-        assert!(plan.scope.covers(owner(0x22, true)));
+        assert!(plan.judges.covers(owner(0x22, true)));
         assert!(Classified::whole().edges().is_empty());
     }
 
@@ -875,8 +875,8 @@ mod tests {
             .expect("the sender's legs need no arrival");
         assert!(sender.legs.runs(0) && sender.legs.runs(1) && !sender.legs.runs(2));
         assert!(sender.legs.departure(1, 0).is_some());
-        assert!(sender.scope.covers(owner(0x11, false)));
-        assert!(!sender.scope.covers(owner(0x22, true)));
+        assert!(sender.judges.covers(owner(0x11, false)));
+        assert!(!sender.judges.covers(owner(0x22, true)));
 
         let recipient = divided
             .plan(&[arrival(1, 0, 100)], high(), Side::Delivering)
@@ -889,8 +889,8 @@ mod tests {
                 amount: 100
             })
         );
-        assert!(recipient.scope.covers(owner(0x22, true)));
-        assert!(!recipient.scope.covers(owner(0x11, false)));
+        assert!(recipient.judges.covers(owner(0x22, true)));
+        assert!(!recipient.judges.covers(owner(0x11, false)));
     }
 
     /// A swap plans the sign-in, the withdraw and the deposit on the
@@ -926,8 +926,8 @@ mod tests {
         assert!(!venue.legs.runs(0) && !venue.legs.runs(1) && !venue.legs.runs(3));
         assert!(venue.legs.arrival(1, 0).is_some());
         assert!(venue.legs.departure(2, 0).is_some());
-        assert!(venue.scope.covers(owner(0x33, true)));
-        assert!(!venue.scope.covers(owner(0x11, false)));
+        assert!(venue.judges.covers(owner(0x33, true)));
+        assert!(!venue.judges.covers(owner(0x11, false)));
     }
 
     /// A consumer whose producer runs elsewhere needs its arrival, and a

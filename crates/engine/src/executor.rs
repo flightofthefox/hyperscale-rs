@@ -39,8 +39,8 @@ use hyperscale_vm_effects::{
     PrefixShardResolver, SubintentRecord, admit_tree, package_hash, route_tree,
 };
 use hyperscale_vm_kernel::{
-    Baseline, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, ExecutionScope, FeeBurn,
-    Job, LegPlan, Locality, ManifestWalk, Receipt, Substates, execute_batch,
+    Baseline, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, FeeBurn, Job, LegPlan,
+    ManifestWalk, OwnerSet, Receipt, Substates, execute_batch,
 };
 use hyperscale_vm_types::{
     Address, CallTarget, CollectionId, Effect, EffectSet, EffectTarget, EntryKey, Mode, Moves,
@@ -88,9 +88,9 @@ pub struct PreparedTx {
     /// The envelope's signed execution ceiling, in fuel — one budget for
     /// the whole transaction, however many nodes its manifest walks.
     pub gas_limit: u64,
-    /// The scope this shard judges under — with the job's plan, the one
-    /// part of an entry that differs per participant.
-    pub scope: ExecutionScope,
+    /// The owners this shard judges — with the job's plan, the one part
+    /// of an entry that differs per participant.
+    pub judges: OwnerSet,
 }
 
 /// The component address a record's own contents derive, or `None` for
@@ -208,7 +208,7 @@ impl Baseline for TickBaseline {
 pub fn materialize_declared(
     snapshot: &(dyn Substates + Sync),
     declared: &EffectSet,
-    locality: &Locality,
+    locality: &OwnerSet,
     base: &mut TickBaseline,
 ) {
     for effect in declared.iter() {
@@ -217,7 +217,7 @@ pub fn materialize_declared(
         // parallel.
         let (owner, collection, lo, hi, cap) = match effect.target {
             EffectTarget::Point(key) => {
-                if locality.is_local(key.owner)
+                if locality.covers(key.owner)
                     && let Some(value) = snapshot.cell(key)
                 {
                     base.cells.insert(key, value);
@@ -237,7 +237,7 @@ pub fn materialize_declared(
                 cap,
             } => (owner, collection, lo, hi, cap),
         };
-        if locality.is_local(owner) {
+        if locality.covers(owner) {
             for (order, value) in snapshot.entries_in_range(owner, collection, lo, hi, cap as usize)
             {
                 base.entries.insert(
@@ -502,7 +502,7 @@ impl Executor {
             calls,
             legs: plan.legs,
         };
-        entry.scope = plan.scope;
+        entry.judges = plan.judges;
         Ok(entry)
     }
 
@@ -614,7 +614,7 @@ impl Executor {
             declaration,
             nullifiers: Vec::new(),
             gas_limit: 0,
-            scope: ExecutionScope::spanning(move |owner| trie.shard_for_prefix(owner) == local),
+            judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
         })
     }
 
@@ -679,7 +679,7 @@ impl Executor {
             declaration,
             nullifiers: admitted.subintents,
             gas_limit: vm.gas_limit,
-            scope: ExecutionScope::whole(),
+            judges: OwnerSet::whole(),
         })
     }
 }
@@ -929,7 +929,7 @@ fn assemble_published_tx(
     publisher: PrincipalAddr,
     artifact: &[u8],
     fee: Option<PayerFee>,
-    locality: &Locality,
+    locality: &OwnerSet,
 ) -> ExecutedTx {
     let tx_hash = vm_tx;
     let work = publish_work(artifact);
@@ -943,7 +943,7 @@ fn assemble_published_tx(
     let cached = refusal.as_ref().map_or_else(
         || {
             let mut writes = StateWrites::default();
-            if locality.is_local(publisher) {
+            if locality.covers(publisher) {
                 let package = package_hash(&ProtocolHasher, artifact);
                 // Content-addressed, so republishing the same artifact
                 // writes the same bytes to the same cell: idempotent by
@@ -1081,7 +1081,7 @@ struct KernelOutput<'a> {
 #[derive(Clone, Copy)]
 struct BatchInputs<'a> {
     base: &'a TickBaseline,
-    locality: &'a Locality,
+    locality: &'a OwnerSet,
     pools: &'a PoolRegistry,
     instances: &'a dyn ChainRecords,
     staking_package: PackageHash,
@@ -1169,7 +1169,7 @@ fn assemble_executed_tx(
         // outcome-level in the certificates, never hash equality.
         let event_hashes: Vec<Hash> = events
             .iter()
-            .filter(|event| locality.is_local(event.emitter))
+            .filter(|event| locality.covers(event.emitter))
             .map(EventExt::hash)
             .collect();
         let receipt_hash = GlobalReceipt::new(
@@ -1307,13 +1307,11 @@ impl Executor {
         // every key it declares and total locality is the same filter
         // without the trie walk.
         let locality = if inputs.iter().all(|i| !i.runs.reaches_beyond()) {
-            Locality::All
+            OwnerSet::whole()
         } else {
             let trie = ctx.shard_trie.clone();
             let local_shard = ctx.local_shard;
-            Locality::Owned(Arc::new(move |owner: Address| {
-                trie.shard_for_prefix(owner) == local_shard
-            }))
+            OwnerSet::of(move |owner: Address| trie.shard_for_prefix(owner) == local_shard)
         };
         // Publishes carry no manifest, so they never reach the kernel;
         // they settle in their own pass below.
@@ -1409,7 +1407,7 @@ impl Executor {
         //
         // Collectible means the vault routes to the executing shard by
         // the trie, not by tick locality: a local-only tick's
-        // `Locality::All` claims every owner, and reading another
+        // `OwnerSet::whole()` claims every owner, and reading another
         // shard's cell out of this shard's store is nondeterministic —
         // members disagree on what they hold outside their own subtree,
         // and a split baseline splits the tick's receipt roots.
@@ -1426,7 +1424,7 @@ impl Executor {
         // implies do too, and a shard that reported one against a cell it
         // holds none of would judge a reservation as exceeding a balance
         // it cannot see. A tick's own locality cannot decide this — the
-        // single-shard arm's `Locality::All` claims every owner.
+        // single-shard arm's `OwnerSet::whole()` claims every owner.
         base.holds = ctx
             .holds
             .iter()
@@ -1440,7 +1438,7 @@ impl Executor {
         // payer's shard only.
         // Trie-routed, like the pre-read: a tick's own locality cannot
         // decide fee ownership, because the single-shard arm's
-        // `Locality::All` would claim payers whose vaults live on
+        // `OwnerSet::whole()` would claim payers whose vaults live on
         // shards this tick never engaged.
         let fee_by_tx: BTreeMap<TxHash, PayerFee> = members
             .iter()
@@ -1492,7 +1490,8 @@ impl Executor {
                     .with_job(entry.job.clone())
                     .with_nullifiers(entry.nullifiers.clone())
                     .with_gas_limit(entry.gas_limit)
-                    .with_scope(entry.scope.clone())
+                    .with_applies(locality.clone())
+                    .with_judges(entry.judges.clone())
                     .with_fee(fee_by_tx.get(vm_tx).map(|payer| FeeBurn {
                         vault: payer.vault,
                         resource: *XRD,
@@ -1509,7 +1508,6 @@ impl Executor {
             &walk,
             protocol_hash,
             self.mode,
-            &locality,
         )
         .unwrap_or_else(|error| panic!("BFT CRITICAL: VM batch execution failed: {error}"));
 

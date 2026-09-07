@@ -669,7 +669,7 @@ fn stub_execute(
     // The payer this shard would charge: the first owner it holds.
     let mut charged: Option<Address> = None;
     for key in tx.admission_write_keys() {
-        // Only the owning shard applies a cell, exactly as `Locality`
+        // Only the owning shard applies a cell, exactly as `OwnerSet`
         // scopes the engine's fold.
         if trie.shard_for_prefix(key.owner()) != local_shard {
             continue;

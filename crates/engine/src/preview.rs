@@ -25,7 +25,7 @@ use hyperscale_effects_bridge::admit_package;
 use hyperscale_storage::Substates;
 use hyperscale_types::{Event, Transaction, WeightedTimestamp};
 use hyperscale_vm_kernel::{
-    Baseline, BatchTx, EnvInputs, Locality, ManifestWalk, Receipt, decode_amount, execute_batch,
+    Baseline, BatchTx, EnvInputs, ManifestWalk, OwnerSet, Receipt, decode_amount, execute_batch,
 };
 use hyperscale_vm_types::{Outcome, SubstateKey, price_attos};
 
@@ -172,7 +172,7 @@ fn amount_at(base: &TickBaseline, key: SubstateKey) -> u128 {
 /// Fold a run's movements and settles into the wallet's report, landing
 /// the fee on the payer's vault unless the run was credited.
 ///
-/// The walk is `Locality::All` deliberately: the report answers what the
+/// The walk is `OwnerSet::whole()` deliberately: the report answers what the
 /// transaction does, and which shard applies which part of it is a
 /// question about commitment, not about resources.
 fn resource_changes(
@@ -184,7 +184,8 @@ fn resource_changes(
 ) -> Vec<ResourceChange> {
     let mut changes: BTreeMap<SubstateKey, ResourceChange> = BTreeMap::new();
     if let Some(receipt) = receipt {
-        let moved = receipt.delta.owned(&Locality::All);
+        let whole = OwnerSet::whole();
+        let moved = receipt.delta.owned(&whole);
         for (key, movement) in moved.movements() {
             let change = changes
                 .entry(key)
@@ -291,7 +292,7 @@ impl Executor {
         materialize_declared(
             snapshot,
             &prepared.declaration.set,
-            &Locality::All,
+            &OwnerSet::whole(),
             &mut base,
         );
         // The fee vault is not a declared effect, and the report needs
@@ -325,7 +326,6 @@ impl Executor {
             &walk,
             protocol_hash,
             self.mode,
-            &Locality::All,
         ) {
             Ok(outcome) => outcome,
             // The screen is a property of one derivation's own output, so

@@ -1256,7 +1256,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
         sender.legs.departure(edge.producer, edge.output).is_some(),
         "the withdraw departs",
     );
-    assert!(sender.scope.covers(alice()) && !sender.scope.covers(far()));
+    assert!(sender.judges.covers(alice()) && !sender.judges.covers(far()));
 
     let arrived = EscrowedValue {
         node: edge.producer,
@@ -1275,7 +1275,7 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
             .departure(edge.producer, edge.output)
             .is_none()
     );
-    assert!(recipient.scope.covers(far()) && !recipient.scope.covers(alice()));
+    assert!(recipient.judges.covers(far()) && !recipient.judges.covers(alice()));
 
     assert!(matches!(
         divided.plan(&[], far_shard, Side::Delivering),
