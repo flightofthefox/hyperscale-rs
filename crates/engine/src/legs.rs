@@ -1151,6 +1151,46 @@ mod tests {
         assert_eq!(classified.plan(&[], leaf1, Side::Issuing).err(), None);
     }
 
+    /// A core member judges its whole core; a leg judges its own shard.
+    ///
+    /// A core node's conditions are settled once for the core and on
+    /// every shard that runs it, so each has to judge what the others
+    /// hold. This is the one place the two owner sets differ, and it is
+    /// why a core node can hold a cell it does not apply — which is why
+    /// an origin has to be filtered down to what it does.
+    #[test]
+    fn a_core_member_judges_its_whole_core() {
+        let trie = ShardTrie::uniform(2);
+        let (leaf0, leaf1, leaf2) = (
+            ShardId::leaf(2, 0),
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 2),
+        );
+        let (caller, here, sibling) = (owner_at(0x11, 1), owner_at(0x12, 0), owner_at(0x13, 2));
+        let legs = vec![
+            leg(caller, LegRole::Inbound, &[], 0),
+            leg(here, LegRole::Core, &[(0, 0)], 1),
+            leg(sibling, LegRole::Core, &[(1, 0)], 2),
+        ];
+        let classified = Classified::freeze(&legs, &[], &trie);
+        assert_eq!(classified.core(), &BTreeSet::from([leaf0, leaf2]));
+
+        let core = classified.judges_for(leaf0);
+        assert!(core.covers(here), "a core member judges its own node");
+        assert!(core.covers(sibling), "and the node its sibling runs");
+        assert!(
+            !core.covers(caller),
+            "and nothing outside the core, whose members judge for themselves",
+        );
+
+        let off_the_core = classified.judges_for(leaf1);
+        assert!(off_the_core.covers(caller));
+        assert!(
+            !off_the_core.covers(here) && !off_the_core.covers(sibling),
+            "a leg judges its own shard alone",
+        );
+    }
+
     /// A sink fed beside itself issues: an outbound leg whose producer
     /// runs on its own shard's issuing member takes the value directly,
     /// while one fed by the core elsewhere is that shard's delivery.
