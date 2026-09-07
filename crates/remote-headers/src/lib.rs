@@ -34,6 +34,7 @@
 //! per-shard target on the I/O loop's sliding-window `RemoteHeaderSync`
 //! state machine.
 
+mod awaiting;
 mod coordinator;
 
 pub use coordinator::{RemoteHeaderCoordinator, RemoteHeaderMemoryStats};
