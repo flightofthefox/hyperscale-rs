@@ -41,8 +41,8 @@ use hyperscale_engine::legs::Member;
 use hyperscale_types::{
     BlockHash, BlockHeight, EscrowedValue, ExecutionCertificate, ExecutionOutcome, Finalization,
     GlobalReceiptRoot, MAX_FINALIZATION_DELAY, Role, Settles, ShardId, StoredReceipt, TickHalf,
-    TickId, TransactionDecision, TxHash, TxOutcome, Verified, WeightedTimestamp,
-    compute_global_receipt_root, refused_transactions, settles,
+    TickId, TxHash, TxOutcome, Verified, WeightedTimestamp, compute_global_receipt_root,
+    refused_transactions, settles,
 };
 
 /// A tick whose local execution disagreed with the quorum's.
@@ -253,6 +253,88 @@ impl Admission {
 /// rather than routine load noise.
 pub const TICK_OVERDUE_WARN: Duration = Duration::from_secs(MAX_FINALIZATION_DELAY.as_secs() * 2);
 
+/// One member's seat in its tick: the terms it joined on, and everything
+/// the tick has learned about it since — from the engine, from the
+/// certificates that cover it, and from the chain that settles it.
+#[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)] // independent lifecycle flags, not config knobs
+struct Seat {
+    /// Whose certificate its settlement waits on, and who its own is
+    /// owed to.
+    membership: Membership,
+    /// The reservation its committing block took against the drain.
+    /// Carried apart from the transaction because an abandoned member
+    /// has no body here and still has to release exactly what was taken.
+    reserved_work: u64,
+    /// Dispatched to the engine and still owing a result. A tick is
+    /// votable once no seat is.
+    awaiting_result: bool,
+    /// Attested `Aborted` whatever its execution said: a payer's leg
+    /// whose counterparts never engaged, or a member past its own
+    /// deadline that never ran.
+    aborted: bool,
+    /// The engine's outcome.
+    result: Option<ExecutionOutcome>,
+    /// The engine's local receipt, drained into the `Finalization` at
+    /// finalization. Scoped to the tick rather than a process-wide cache
+    /// so a receipt from a locally-executed transaction cannot leak into
+    /// a `Finalization` whose certificate attests it `Aborted`.
+    receipt: Option<StoredReceipt>,
+    /// The fee receipt the engine built alongside the execution receipt,
+    /// for a cross-shard transaction this shard pays for. An abort
+    /// settles it: the transaction's own effects are discarded, the
+    /// payer's floor is not.
+    fee_receipt: Option<StoredReceipt>,
+    /// What this shard attests it did for the member, carried from
+    /// execution onto the outcome it votes.
+    attested_work: u64,
+    /// What the member's execution escrowed out, carried from execution
+    /// onto the outcome it votes.
+    escrowed: Vec<EscrowedValue>,
+    /// The shards the member's crossings land on, read off the frozen
+    /// classification at admission. Attested on the outcome only where
+    /// the execution escrowed something.
+    crossing_targets: BTreeSet<ShardId>,
+    /// Which shards have reported on the member via a certificate.
+    covered_by: BTreeSet<ShardId>,
+    /// A certificate reported abort. Terminal — an aborted transaction
+    /// needs no further coverage.
+    aborted_anywhere: bool,
+    /// A committed finalization resolved the member. The tick's
+    /// certificate and tracking state drop once every seat is — which is
+    /// later than the halves being emitted, since a handed-off
+    /// finalization still has to reach a block.
+    settled: bool,
+}
+
+impl Seat {
+    /// A seat on the terms `admission` names.
+    const fn new(membership: Membership, reserved_work: u64, admission: Admission) -> Self {
+        Self {
+            membership,
+            reserved_work,
+            awaiting_result: admission.dispatched(),
+            aborted: admission.aborts(),
+            result: None,
+            receipt: None,
+            fee_receipt: None,
+            attested_work: 0,
+            escrowed: Vec::new(),
+            crossing_targets: BTreeSet::new(),
+            covered_by: BTreeSet::new(),
+            aborted_anywhere: false,
+            settled: false,
+        }
+    }
+
+    /// Whether the member has the verdict its settlement needs: an
+    /// abort anywhere is terminal, and anything else waits for every
+    /// awaited shard to have certified it.
+    fn is_covered(&self) -> bool {
+        self.aborted_anywhere || self.membership.awaited().is_subset(&self.covered_by)
+    }
+}
+
 /// Per-tick state from composition through finalization.
 #[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)] // independent lifecycle flags, not config knobs
@@ -264,51 +346,13 @@ pub struct TickState {
     /// vote anchor, and so the committee that attests.
     tick_ts: WeightedTimestamp,
 
-    // ── Membership (in composition order) ───────────────────────────────
-    tx_hashes: Vec<TxHash>,
-    /// O(1) membership check (mirrors `tx_hashes`).
-    tx_hash_set: HashSet<TxHash>,
-    /// Per member, whose certificate its settlement waits on and who its
-    /// own certificate is owed to.
-    membership: HashMap<TxHash, Membership>,
-    /// Per-member, the reservation its committing block took against the
-    /// drain. Carried apart from the transaction because an abandoned
-    /// member has no body here and still has to release exactly what was
-    /// taken.
-    reserved_work: HashMap<TxHash, u64>,
-    /// Members dispatched to the engine and still owing a result. Empty
-    /// is what makes the tick votable.
-    awaiting_results: HashSet<TxHash>,
-    /// Members this tick attests `Aborted` whatever their execution said:
-    /// a payer's leg whose counterparts never engaged, and the ones past
-    /// their own deadline that never ran.
-    aborted: HashSet<TxHash>,
+    // ── Members ─────────────────────────────────────────────────────────
+    /// Members, in composition order.
+    order: Vec<TxHash>,
+    /// Each member's seat.
+    seats: HashMap<TxHash, Seat>,
 
-    // ── Local execution outputs ─────────────────────────────────────────
-    /// Execution results from the engine, per member.
-    execution_results: HashMap<TxHash, ExecutionOutcome>,
-    /// Local receipts from the engine, one per executed member. Drained
-    /// into the `Finalization` at finalization via `take_receipt`. Scoping
-    /// these to the tick (rather than a process-wide cache) prevents a
-    /// receipt from a locally-executed transaction from leaking into a
-    /// `Finalization` whose certificate attests it `Aborted` — the
-    /// `ExtraReceipt` race.
-    execution_receipts: HashMap<TxHash, StoredReceipt>,
-    /// Per-member fee receipts the engine built alongside the execution
-    /// receipt, for the cross-shard transactions this shard pays for.
-    /// An abort settles one of these: the transaction's own effects are
-    /// discarded, the payer's floor is not.
-    fee_receipts: HashMap<TxHash, StoredReceipt>,
-    /// What this shard attests it did per member, carried from execution
-    /// onto the outcomes it votes.
-    attested_work: HashMap<TxHash, u64>,
-    /// What each member's execution escrowed out, carried from execution
-    /// onto the outcomes it votes.
-    escrowed: HashMap<TxHash, Vec<EscrowedValue>>,
-    /// The shards each member's crossings land on, read off the frozen
-    /// classification at admission. Attested on the outcome only where
-    /// the execution escrowed something.
-    crossing_targets: HashMap<TxHash, BTreeSet<ShardId>>,
+    // ── Local vote and certificate ──────────────────────────────────────
     /// Whether the local vote has been emitted (`build_vote_data` called once).
     voted: bool,
     /// `global_receipt_root` carried on this validator's own emitted vote.
@@ -332,11 +376,6 @@ pub struct TickState {
     determined_emitted: bool,
     /// Whether the legs half's finalization has been handed off.
     legs_emitted: bool,
-    /// Members a committed finalization has resolved. The tick's
-    /// certificate and tracking state drop once every member is here —
-    /// which is later than the halves being emitted, since a handed-off
-    /// finalization still has to reach a block.
-    settled: HashSet<TxHash>,
     /// Whether the local certificate has been added to
     /// `execution_certificates`. Gates completion. Independent of the
     /// canonical-root reconciliation — `locally_divergent` carries the
@@ -346,16 +385,6 @@ pub struct TickState {
     /// `TICK_OVERDUE_WARN` threshold. Under ts-based ages we can't rely on
     /// exact equality (commits can skip over any given ms value).
     overdue_warned: bool,
-
-    // ── Cross-shard certificate collection ──────────────────────────────
-    /// Per-member, which shards have reported via a certificate.
-    covered_shards: HashMap<TxHash, BTreeSet<ShardId>>,
-    /// Per-member, whether any shard's certificate reported abort.
-    /// Terminal — an aborted transaction needs no further coverage.
-    tracker_aborted: HashSet<TxHash>,
-    /// Per-member, whether any shard's certificate reported a non-success
-    /// outcome.
-    tx_has_failure: HashSet<TxHash>,
     /// All collected certificates (local + remote).
     execution_certificates: Vec<Arc<Verified<ExecutionCertificate>>>,
 }
@@ -370,18 +399,8 @@ impl TickState {
             tick_id,
             block_hash,
             tick_ts,
-            tx_hashes: Vec::new(),
-            tx_hash_set: HashSet::new(),
-            membership: HashMap::new(),
-            reserved_work: HashMap::new(),
-            awaiting_results: HashSet::new(),
-            aborted: HashSet::new(),
-            execution_results: HashMap::new(),
-            execution_receipts: HashMap::new(),
-            fee_receipts: HashMap::new(),
-            attested_work: HashMap::new(),
-            escrowed: HashMap::new(),
-            crossing_targets: HashMap::new(),
+            order: Vec::new(),
+            seats: HashMap::new(),
             voted: false,
             local_vote_global_receipt_root: None,
             admitted_local_ec_root: None,
@@ -389,12 +408,8 @@ impl TickState {
             divergence: None,
             determined_emitted: false,
             legs_emitted: false,
-            settled: HashSet::new(),
             local_ec_emitted: false,
             overdue_warned: false,
-            covered_shards: HashMap::new(),
-            tracker_aborted: HashSet::new(),
-            tx_has_failure: HashSet::new(),
             execution_certificates: Vec::new(),
         }
     }
@@ -406,7 +421,8 @@ impl TickState {
     /// [`Aborted`](Admission::Aborted) member joins with no body at all:
     /// the ledger names it by hash, by the shards party to it, and by the
     /// work its committing block reserved, which is everything an abort
-    /// has to state.
+    /// has to state. A member the tick already holds keeps the terms it
+    /// joined under.
     pub fn admit(
         &mut self,
         tx_hash: TxHash,
@@ -414,28 +430,12 @@ impl TickState {
         reserved_work: u64,
         admission: Admission,
     ) {
-        if !self.enrol(tx_hash, membership, reserved_work) {
+        if self.seats.contains_key(&tx_hash) {
             return;
         }
-        if admission.dispatched() {
-            self.awaiting_results.insert(tx_hash);
-        }
-        if admission.aborts() {
-            self.aborted.insert(tx_hash);
-        }
-    }
-
-    /// Shared membership bookkeeping. Returns whether the hash was new —
-    /// a member the tick already holds keeps the terms it joined under.
-    fn enrol(&mut self, tx_hash: TxHash, membership: Membership, reserved_work: u64) -> bool {
-        if !self.tx_hash_set.insert(tx_hash) {
-            return false;
-        }
-        self.tx_hashes.push(tx_hash);
-        self.membership.insert(tx_hash, membership);
-        self.reserved_work.insert(tx_hash, reserved_work);
-        self.covered_shards.insert(tx_hash, BTreeSet::new());
-        true
+        self.order.push(tx_hash);
+        self.seats
+            .insert(tx_hash, Seat::new(membership, reserved_work, admission));
     }
 
     // ── Identity getters ────────────────────────────────────────────────
@@ -461,19 +461,19 @@ impl TickState {
     /// Members, in composition order.
     #[must_use]
     pub fn tx_hashes(&self) -> &[TxHash] {
-        &self.tx_hashes
+        &self.order
     }
 
     /// Whether the tick holds no members at all.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.tx_hashes.is_empty()
+        self.order.is_empty()
     }
 
     /// The subset of [`Self::tx_hashes`] whose settlement waits on a
     /// counterpart.
     pub fn awaiting_tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
-        self.tx_hashes
+        self.order
             .iter()
             .copied()
             .filter(|&tx_hash| self.awaits_beyond(tx_hash))
@@ -490,9 +490,9 @@ impl TickState {
     /// one — what puts it in the legs half rather than the determined.
     fn awaits_beyond(&self, tx_hash: TxHash) -> bool {
         let local = self.tick_id.shard_id();
-        self.membership
+        self.seats
             .get(&tx_hash)
-            .is_some_and(|membership| membership.abortable(local))
+            .is_some_and(|seat| seat.membership.abortable(local))
     }
 
     /// Whether `outcome`, attested by `shard`, covers its member here: the
@@ -514,9 +514,9 @@ impl TickState {
 
     /// Whether `tx_hash`'s settlement waits on `shard`'s certificate.
     fn awaits(&self, tx_hash: TxHash, shard: ShardId) -> bool {
-        self.membership
+        self.seats
             .get(&tx_hash)
-            .is_some_and(|membership| membership.awaited().contains(&shard))
+            .is_some_and(|seat| seat.membership.awaited().contains(&shard))
     }
 
     /// The shards other than this one that the tick's members reach —
@@ -526,9 +526,9 @@ impl TickState {
     #[must_use]
     pub fn counterpart_shards(&self) -> Vec<ShardId> {
         let local = self.tick_id.shard_id();
-        self.membership
+        self.seats
             .values()
-            .flat_map(Membership::reach)
+            .flat_map(|seat| seat.membership.reach())
             .copied()
             .filter(|&s| s != local)
             .collect::<BTreeSet<_>>()
@@ -545,15 +545,13 @@ impl TickState {
     /// transaction that reached no outcome anywhere.
     pub fn awaited_counterparts(&self) -> impl Iterator<Item = (TxHash, ShardId)> + '_ {
         let local = self.tick_id.shard_id();
-        self.tx_hashes
+        self.seats
             .iter()
-            .copied()
-            .filter(|tx_hash| !self.aborted.contains(tx_hash))
-            .flat_map(move |tx_hash| {
-                self.membership
-                    .get(&tx_hash)
-                    .into_iter()
-                    .flat_map(Membership::awaited)
+            .filter(|(_, seat)| !seat.aborted)
+            .flat_map(move |(&tx_hash, seat)| {
+                seat.membership
+                    .awaited()
+                    .iter()
                     .filter(move |&&shard| shard != local)
                     .map(move |&shard| (tx_hash, shard))
             })
@@ -562,7 +560,7 @@ impl TickState {
     /// The tick's members whose settlement waits on `shard` — what this
     /// tick is waiting on that shard for.
     pub fn txs_awaiting(&self, shard: ShardId) -> impl Iterator<Item = TxHash> + '_ {
-        self.tx_hashes
+        self.order
             .iter()
             .copied()
             .filter(move |&tx_hash| self.awaits(tx_hash, shard))
@@ -571,10 +569,10 @@ impl TickState {
     /// The tick's members `shard` is party to — what its copy of this
     /// tick's certificate carries.
     pub fn txs_reaching(&self, shard: ShardId) -> impl Iterator<Item = TxHash> + '_ {
-        self.tx_hashes.iter().copied().filter(move |tx_hash| {
-            self.membership
+        self.order.iter().copied().filter(move |tx_hash| {
+            self.seats
                 .get(tx_hash)
-                .is_some_and(|membership| membership.reach().contains(&shard))
+                .is_some_and(|seat| seat.membership.reach().contains(&shard))
         })
     }
 
@@ -582,11 +580,10 @@ impl TickState {
 
     /// Record an execution outcome from the engine. First-write-wins.
     pub fn record_execution_result(&mut self, tx_hash: TxHash, outcome: ExecutionOutcome) {
-        if !self.tx_hash_set.contains(&tx_hash) {
-            return;
+        if let Some(seat) = self.seats.get_mut(&tx_hash) {
+            seat.result.get_or_insert(outcome);
+            seat.awaiting_result = false;
         }
-        self.execution_results.entry(tx_hash).or_insert(outcome);
-        self.awaiting_results.remove(&tx_hash);
     }
 
     /// Record a local receipt from the engine. First-write-wins.
@@ -595,58 +592,54 @@ impl TickState {
     /// `ExecutionBatchCompleted` event and are scoped to this tick.
     /// Receipts for transactions not in it are silently dropped.
     pub fn record_receipt(&mut self, receipt: StoredReceipt) {
-        if !self.tx_hash_set.contains(&receipt.tx_hash) {
-            return;
+        if let Some(seat) = self.seats.get_mut(&receipt.tx_hash) {
+            seat.receipt.get_or_insert(receipt);
         }
-        self.execution_receipts
-            .entry(receipt.tx_hash)
-            .or_insert(receipt);
     }
 
     /// Record what this shard attested it did for a member.
     pub fn record_attested_work(&mut self, tx_hash: TxHash, work: u64) {
-        if !self.tx_hash_set.contains(&tx_hash) {
-            return;
+        if let Some(seat) = self.seats.get_mut(&tx_hash) {
+            seat.attested_work = work;
         }
-        self.attested_work.insert(tx_hash, work);
     }
 
     /// Record what a member's execution escrowed out.
     pub fn record_escrowed(&mut self, tx_hash: TxHash, escrowed: Vec<EscrowedValue>) {
-        if !self.tx_hash_set.contains(&tx_hash) {
-            return;
+        if let Some(seat) = self.seats.get_mut(&tx_hash) {
+            seat.escrowed = escrowed;
         }
-        self.escrowed.insert(tx_hash, escrowed);
     }
 
     /// Record the shards a member's crossings land on.
     pub fn record_crossing_targets(&mut self, tx_hash: TxHash, targets: BTreeSet<ShardId>) {
-        if !self.tx_hash_set.contains(&tx_hash) {
-            return;
+        if let Some(seat) = self.seats.get_mut(&tx_hash) {
+            seat.crossing_targets = targets;
         }
-        self.crossing_targets.insert(tx_hash, targets);
     }
 
     /// Record the fee receipt the engine built beside a member's
     /// execution receipt: what the payer owes if the transaction aborts.
     pub fn record_fee_receipt(&mut self, receipt: StoredReceipt) {
-        if !self.tx_hash_set.contains(&receipt.tx_hash) {
-            return;
+        if let Some(seat) = self.seats.get_mut(&receipt.tx_hash) {
+            seat.fee_receipt.get_or_insert(receipt);
         }
-        self.fee_receipts.entry(receipt.tx_hash).or_insert(receipt);
     }
 
     /// Number of receipts currently held. Exposed for memory stats;
     /// receipts drain at finalization.
     #[must_use]
     pub fn receipt_count(&self) -> usize {
-        self.execution_receipts.len()
+        self.seats
+            .values()
+            .filter(|seat| seat.receipt.is_some())
+            .count()
     }
 
     /// Take the receipt for a member, removing it. Used internally by
     /// [`Self::into_finalization`] to drain receipts in canonical order.
     fn take_receipt(&mut self, tx_hash: TxHash) -> Option<StoredReceipt> {
-        self.execution_receipts.remove(&tx_hash)
+        self.seats.get_mut(&tx_hash)?.receipt.take()
     }
 
     /// Whether this validator holds a local receipt for every member of
@@ -681,7 +674,11 @@ impl TickState {
             .iter()
             .filter(|outcome| members.contains(&outcome.tx_hash()))
             .all(|outcome| {
-                outcome.is_aborted() || self.execution_receipts.contains_key(&outcome.tx_hash())
+                outcome.is_aborted()
+                    || self
+                        .seats
+                        .get(&outcome.tx_hash())
+                        .is_some_and(|seat| seat.receipt.is_some())
             })
     }
 
@@ -732,7 +729,7 @@ impl TickState {
     /// waits on anything outside it.
     #[must_use]
     pub fn can_emit_vote(&self) -> bool {
-        !self.voted && self.awaiting_results.is_empty()
+        !self.voted && self.seats.values().all(|seat| !seat.awaiting_result)
     }
 
     /// Build the vote payload, consuming the one-shot vote.
@@ -754,75 +751,60 @@ impl TickState {
 
         let local = self.tick_id.shard_id();
         let outcomes: Vec<TxOutcome> = self
-            .tx_hashes
+            .order
             .iter()
             .map(|tx_hash| {
-                let outcome = if self.aborted.contains(tx_hash) {
+                let seat = self
+                    .seats
+                    .get(tx_hash)
+                    .expect("a tick seats every member it names");
+                let outcome = if seat.aborted {
                     ExecutionOutcome::Aborted
                 } else {
-                    self.execution_results
-                        .get(tx_hash)
-                        .cloned()
+                    seat.result
+                        .clone()
                         .expect("a votable tick holds a result for every member it ran")
                 };
+                // Who the settlement waits on, stated so a peer reading
+                // the certificate can tell a complete set of them from
+                // one a proposer thinned. This shard is not among them:
+                // this certificate is its report.
+                let counterparts = seat
+                    .membership
+                    .awaited()
+                    .iter()
+                    .copied()
+                    .filter(|&shard| shard != local);
                 // The charge this shard holds against the transaction, if
                 // the engine built one. Named whatever the local outcome
                 // was, because the local outcome is not what decides
                 // whether it is owed: a leg that completed here still
                 // owes the floor if a counterpart refuses it, and a
                 // charge nobody named is a charge nothing can settle.
-                let work = self.attested_work.get(tx_hash).copied().unwrap_or(0);
-                // What the transaction reserved when its block committed
-                // it, carried so the settling block can release exactly
-                // that. A member the tick could not price would release
-                // less than its block took, and the drain keeps the
-                // difference for as long as the chain runs — so the
-                // figure is required, not defaulted.
-                let reserved = *self
-                    .reserved_work
-                    .get(tx_hash)
-                    .expect("a tick prices every member it names");
-                // Who the settlement waits on, stated so a peer reading
-                // the certificate can tell a complete set of them from
-                // one a proposer thinned. This shard is not among them:
-                // this certificate is its report.
-                let counterparts = self
-                    .membership
-                    .get(tx_hash)
-                    .expect("a tick names the membership of every member it holds")
-                    .awaited()
-                    .iter()
-                    .copied()
-                    .filter(|&shard| shard != local);
-                let charge = self
-                    .fee_receipts
-                    .get(tx_hash)
+                let charge = seat
+                    .fee_receipt
+                    .as_ref()
                     .map(|fee| fee.consensus.receipt_hash());
                 // What left, and where it lands. The targets are attested
                 // only beside something escrowed: a member that issued
                 // nothing promises no bundle to anyone.
-                let escrowed = self.escrowed.get(tx_hash).cloned().unwrap_or_default();
-                let targets = if escrowed.is_empty() {
+                let targets = if seat.escrowed.is_empty() {
                     BTreeSet::new()
                 } else {
-                    self.crossing_targets
-                        .get(tx_hash)
-                        .cloned()
-                        .unwrap_or_default()
+                    seat.crossing_targets.clone()
                 };
                 match charge {
-                    Some(fee) => TxOutcome::with_fee(*tx_hash, outcome, fee, work),
-                    None => TxOutcome::attesting(*tx_hash, outcome, work),
+                    Some(fee) => TxOutcome::with_fee(*tx_hash, outcome, fee, seat.attested_work),
+                    None => TxOutcome::attesting(*tx_hash, outcome, seat.attested_work),
                 }
-                .reserving(reserved)
+                // What the transaction reserved when its block committed
+                // it, carried so the settling block can release exactly
+                // that.
+                .reserving(seat.reserved_work)
                 .awaiting(counterparts)
-                .escrowing(escrowed)
+                .escrowing(seat.escrowed.clone())
                 .crossing_to(targets)
-                .as_role(
-                    self.membership
-                        .get(tx_hash)
-                        .map_or(Role::Whole, Membership::role),
-                )
+                .as_role(seat.membership.role())
             })
             .collect();
 
@@ -873,9 +855,9 @@ impl TickState {
         let covers_something_new = ec.tx_outcomes().iter().any(|outcome| {
             self.covers(outcome, shard, is_local)
                 && self
-                    .covered_shards
+                    .seats
                     .get(&outcome.tx_hash())
-                    .is_some_and(|covered| !covered.contains(&shard))
+                    .is_some_and(|seat| !seat.covered_by.contains(&shard))
         });
         // An empty tick's own certificate covers nothing yet still has to
         // land: both halves gate on having emitted it.
@@ -889,13 +871,10 @@ impl TickState {
             if !self.covers(outcome, shard, is_local) {
                 continue;
             }
-            if let Some(covered) = self.covered_shards.get_mut(&tx_hash) {
-                covered.insert(shard);
+            if let Some(seat) = self.seats.get_mut(&tx_hash) {
+                seat.covered_by.insert(shard);
                 if outcome.is_aborted() {
-                    self.tracker_aborted.insert(tx_hash);
-                }
-                if !matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }) {
-                    self.tx_has_failure.insert(tx_hash);
+                    seat.aborted_anywhere = true;
                 }
             }
         }
@@ -949,7 +928,7 @@ impl TickState {
     /// own certificate, so nothing a counterpart does can hold them.
     #[must_use]
     pub fn determined_members(&self) -> Vec<TxHash> {
-        self.tx_hashes
+        self.order
             .iter()
             .copied()
             .filter(|&tx_hash| !self.awaits_beyond(tx_hash))
@@ -970,20 +949,9 @@ impl TickState {
         self.local_ec_emitted && !self.locally_divergent
     }
 
-    /// Whether `tx_hash` has the verdict its settlement needs: an abort
-    /// anywhere is terminal, and anything else waits for every awaited
-    /// shard to have certified it.
+    /// Whether `tx_hash` has the verdict its settlement needs.
     fn is_covered(&self, tx_hash: TxHash) -> bool {
-        if self.tracker_aborted.contains(&tx_hash) {
-            return true;
-        }
-        match (
-            self.membership.get(&tx_hash),
-            self.covered_shards.get(&tx_hash),
-        ) {
-            (Some(membership), Some(covered)) => membership.awaited().is_subset(covered),
-            _ => false,
-        }
+        self.seats.get(&tx_hash).is_some_and(Seat::is_covered)
     }
 
     /// Whether the determined half can settle now.
@@ -1039,13 +1007,11 @@ impl TickState {
     /// when its certificate and tracking state can be dropped.
     pub fn record_settled(&mut self, tx_hashes: impl IntoIterator<Item = TxHash>) -> bool {
         for tx_hash in tx_hashes {
-            if self.tx_hash_set.contains(&tx_hash) {
-                self.settled.insert(tx_hash);
+            if let Some(seat) = self.seats.get_mut(&tx_hash) {
+                seat.settled = true;
             }
         }
-        self.tx_hashes
-            .iter()
-            .all(|tx_hash| self.settled.contains(tx_hash))
+        self.seats.values().all(|seat| seat.settled)
     }
 
     /// Emit a `warn!` log exactly once, when the tick reaches
@@ -1065,24 +1031,22 @@ impl TickState {
         }
         self.overdue_warned = true;
 
-        let total = self.tx_hashes.len();
+        let total = self.order.len();
 
         let mut missing_coverage: Vec<String> = Vec::new();
-        for tx_hash in &self.tx_hashes {
-            if self.tracker_aborted.contains(tx_hash) {
+        for tx_hash in &self.order {
+            let Some(seat) = self.seats.get(tx_hash) else {
+                continue;
+            };
+            if seat.aborted_anywhere {
                 continue;
             }
-            let expected = self
+            let missing: BTreeSet<ShardId> = seat
                 .membership
-                .get(tx_hash)
-                .map(|membership| membership.awaited().clone())
-                .unwrap_or_default();
-            let covered = self
-                .covered_shards
-                .get(tx_hash)
-                .cloned()
-                .unwrap_or_default();
-            let missing: BTreeSet<ShardId> = expected.difference(&covered).copied().collect();
+                .awaited()
+                .difference(&seat.covered_by)
+                .copied()
+                .collect();
             if !missing.is_empty() {
                 let missing_list: Vec<String> =
                     missing.iter().map(|s| s.inner().to_string()).collect();
@@ -1090,7 +1054,7 @@ impl TickState {
             }
         }
 
-        let local_receipts_ready = self.has_local_receipts_for(&self.tx_hashes);
+        let local_receipts_ready = self.has_local_receipts_for(&self.order);
 
         tracing::warn!(
             tick = %self.tick_id,
@@ -1100,13 +1064,13 @@ impl TickState {
             committed_ts = committed_ts.as_millis(),
             age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
             num_txs = total,
-            awaiting_results = self.awaiting_results.len(),
+            awaiting_results = self.seats.values().filter(|seat| seat.awaiting_result).count(),
             voted = self.voted,
             local_ec_emitted = self.local_ec_emitted,
             local_receipts_ready,
-            execution_results = self.execution_results.len(),
-            aborted = self.aborted.len(),
-            tracker_aborted = self.tracker_aborted.len(),
+            execution_results = self.seats.values().filter(|seat| seat.result.is_some()).count(),
+            aborted = self.seats.values().filter(|seat| seat.aborted).count(),
+            aborted_anywhere = self.seats.values().filter(|seat| seat.aborted_anywhere).count(),
             ecs_collected = self.execution_certificates.len(),
             determined_ready = self.determined_ready(),
             legs_ready = self.legs_ready(),
@@ -1172,7 +1136,10 @@ impl TickState {
                     }
                     // Still awaiting a verdict, or holding the only one that
                     // says abort.
-                    !self.tracker_aborted.contains(&tx_hash)
+                    !self
+                        .seats
+                        .get(&tx_hash)
+                        .is_some_and(|seat| seat.aborted_anywhere)
                         || (outcome.is_aborted() && !locally_aborted.contains(&tx_hash))
                 })
             })
@@ -1217,7 +1184,9 @@ impl TickState {
                 // the pairing stays one receipt per outcome.
                 Settles::Charge(_) => {
                     self.take_receipt(outcome.tx_hash());
-                    self.fee_receipts.remove(&outcome.tx_hash())
+                    self.seats
+                        .get_mut(&outcome.tx_hash())
+                        .and_then(|seat| seat.fee_receipt.take())
                 }
                 Settles::Effects(_) | Settles::Failure => self.take_receipt(outcome.tx_hash()),
                 Settles::Nothing => continue,
@@ -1260,25 +1229,6 @@ impl TickState {
         let attestation = self.attestation_for(TickHalf::Legs, &members)?;
         self.legs_emitted = true;
         Some(self.with_drained_receipts(attestation))
-    }
-
-    /// Per-member terminal decisions derived from collected certificates.
-    /// Priority: Aborted > Reject > Accept.
-    #[must_use]
-    pub fn tx_decisions(&self) -> Vec<(TxHash, TransactionDecision)> {
-        self.tx_hashes
-            .iter()
-            .map(|tx_hash| {
-                let decision = if self.tracker_aborted.contains(tx_hash) {
-                    TransactionDecision::Aborted
-                } else if self.tx_has_failure.contains(tx_hash) {
-                    TransactionDecision::Reject
-                } else {
-                    TransactionDecision::Accept
-                };
-                (*tx_hash, decision)
-            })
-            .collect()
     }
 }
 
@@ -1399,12 +1349,12 @@ mod tests {
 
         tick.add_execution_certificate(from_peer(Vec::new()));
         assert!(
-            !tick.covered_shards[&member].contains(&peer),
+            !tick.seats[&member].covered_by.contains(&peer),
             "a leg's certificate awaited nobody and covers nothing here"
         );
         tick.add_execution_certificate(from_peer(vec![local]));
         assert!(
-            tick.covered_shards[&member].contains(&peer),
+            tick.seats[&member].covered_by.contains(&peer),
             "a certificate whose outcome awaited this shard is the counterpart"
         );
     }
@@ -1808,9 +1758,8 @@ mod tests {
             !tick.determined_ready(),
             "nothing settles before the local certificate"
         );
-        assert_eq!(
-            tick.tx_decisions(),
-            vec![(leg, TransactionDecision::Accept)],
+        assert!(
+            !tick.seats[&leg].aborted_anywhere && tick.seats[&leg].covered_by.is_empty(),
             "a shard the leg does not await decides nothing for it"
         );
 
