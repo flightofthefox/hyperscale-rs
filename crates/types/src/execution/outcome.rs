@@ -66,11 +66,24 @@ impl Role {
     /// on the transaction for the certifying shard.
     #[must_use]
     pub const fn decides(self, outcome: &ExecutionOutcome) -> bool {
-        match self {
-            Self::Whole | Self::Core | Self::Settling => true,
-            Self::Leg => !matches!(outcome, ExecutionOutcome::Succeeded { .. }),
-            Self::Delivery | Self::Retiring => false,
+        match outcome {
+            ExecutionOutcome::Succeeded { .. } => self.success_decides(),
+            // A member that could not do its part ends the transaction
+            // on this shard whatever its role, except where the role
+            // bears no verdict at all.
+            _ => !matches!(self, Self::Delivery | Self::Retiring),
         }
+    }
+
+    /// Whether a *success* in this role bears the verdict.
+    ///
+    /// The population a deadline refuses: such a success committed past
+    /// the transaction's deadline is one a leg may already have
+    /// reclaimed against, so no block carries it and the tick holding
+    /// one has nothing left to say.
+    #[must_use]
+    pub const fn success_decides(self) -> bool {
+        matches!(self, Self::Whole | Self::Core | Self::Settling)
     }
 
     /// Whether the outcome is the transaction's own execution, rather

@@ -1022,10 +1022,8 @@ impl UnresolvedTxs {
             .collect()
     }
 
-    /// Whether a committed record has established that `tx_hash` can
-    /// never settle — the question the split-boundary fence otherwise
-    /// puts to a settled set that expires.
-    /// Whether this shard only delivers for `tx_hash`.
+    /// Whether this shard only delivers for `tx_hash`, so no outcome of
+    /// its own bears the verdict and the lapse is what bounds it.
     #[must_use]
     pub fn is_delivery(&self, tx_hash: TxHash) -> bool {
         self.owed
@@ -1033,6 +1031,9 @@ impl UnresolvedTxs {
             .is_some_and(|owed| matches!(owed.part, Part::Delivery))
     }
 
+    /// Whether a committed record has established that `tx_hash` can
+    /// never settle — the question the split-boundary fence otherwise
+    /// puts to a settled set that expires.
     #[must_use]
     pub fn is_unsettled_by_departed(&self, tx_hash: TxHash) -> bool {
         self.owed

@@ -273,6 +273,12 @@ struct Seat {
     /// whose counterparts never engaged, or a member past its own
     /// deadline that never ran.
     aborted: bool,
+    /// This tick *is* the member's abandonment — it was seated past the
+    /// window that bounds it, running nothing. Kept apart from
+    /// [`Self::aborted`], which a member that ran can also carry, because
+    /// what it answers is whether abandoning the member again would
+    /// discard the abort already waiting to be certified.
+    abandons: bool,
     /// The engine's outcome.
     result: Option<ExecutionOutcome>,
     /// The engine's local receipt, drained into the `Finalization` at
@@ -315,6 +321,7 @@ impl Seat {
             reserved_work,
             awaiting_result: admission.dispatched(),
             aborted: admission.aborts(),
+            abandons: matches!(admission, Admission::Aborted),
             result: None,
             receipt: None,
             fee_receipt: None,
@@ -555,6 +562,36 @@ impl TickState {
                     .filter(move |&&shard| shard != local)
                     .map(move |&shard| (tx_hash, shard))
             })
+    }
+
+    /// Whether this tick is `tx_hash`'s abandonment rather than a tick
+    /// that merely holds it.
+    ///
+    /// Such a tick waits on nothing and can never fail to close its
+    /// coverage, so a later commit that abandoned the member again would
+    /// discard the abort this one is carrying and compose an identical
+    /// one, every block, for as long as the entry stands.
+    #[must_use]
+    pub fn abandons(&self, tx_hash: TxHash) -> bool {
+        self.seats.get(&tx_hash).is_some_and(|seat| seat.abandons)
+    }
+
+    /// Whether a success this tick attests for `tx_hash` is one no block
+    /// will carry past the transaction's deadline.
+    ///
+    /// The three terms the deadline fence reads, off the membership the
+    /// outcome's own are derived from: the success bears the verdict, it
+    /// is this shard's execution of the transaction rather than a member
+    /// settling what one left, and it waits on nobody — so no
+    /// counterpart's certificate is coming to close its coverage either.
+    #[must_use]
+    pub fn decided_alone(&self, tx_hash: TxHash) -> bool {
+        self.seats.get(&tx_hash).is_some_and(|seat| {
+            let role = seat.membership.role();
+            role.success_decides()
+                && role.executes()
+                && !seat.membership.abortable(self.tick_id.shard_id())
+        })
     }
 
     /// The tick's members whose settlement waits on `shard` — what this

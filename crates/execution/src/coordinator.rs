@@ -2866,10 +2866,13 @@ impl ExecutionCoordinator {
     /// A tick holding the transaction is speaking for it and is left to.
     /// The one composing now is about to attest it, and its verdict can
     /// carry a charge an abandonment cannot — a payer's leg admitted at
-    /// its engagement deadline being exactly that. An earlier one can
-    /// still close its coverage, unless a record says the counterpart it
-    /// waits on left the transaction unsettled, in which case it never
-    /// will.
+    /// its engagement deadline being exactly that. An earlier one is left
+    /// to while it can still close its coverage, which takes a
+    /// counterpart it waits on: a record saying that counterpart left the
+    /// transaction unsettled ends it, and so does the member awaiting
+    /// nobody in the first place, since then no certificate but this
+    /// shard's was ever coming. A tick that is itself the abandonment is
+    /// left to unconditionally — it is the answer, not a claim on one.
     ///
     /// With no tick speaking for it, what decides is whether a certificate
     /// of ours is out where a counterpart could settle against it. The
@@ -2890,13 +2893,29 @@ impl ExecutionCoordinator {
     fn beyond_every_shard(&self, composing: TickId, tx_hash: TxHash) -> bool {
         match self.ticks.tick_assignment(tx_hash) {
             Some(tick_id) if tick_id == composing => false,
-            // A delivery's tick is not left to past the close: it awaits
-            // nobody, so nothing could still close its coverage, and the
-            // claim it would write past the close is one the crossing's
-            // issuer may already have proved absent and taken back.
-            Some(_) => {
+            Some(tick_id) => {
+                let held_by = self.ticks.get_tick(&tick_id);
+                // A tick that is itself the member's abandonment is left
+                // alone whatever the entry says. It waits on nothing, so
+                // it can never fail to close its coverage, and spending
+                // another tick on the same member would discard the abort
+                // this one carries and compose an identical one — every
+                // commit, for as long as the entry stands.
+                if held_by.is_some_and(|tick| tick.abandons(tx_hash)) {
+                    return false;
+                }
+                // Two fences refuse the finalization a tick is waiting to
+                // commit, and past either the tick has nothing left to
+                // say: a delivery's is refused at the lapse, and a
+                // success that decides alone at the deadline. Left to,
+                // such a tick holds a member nothing can resolve while
+                // every proposer offers a finalization every voter
+                // refuses. Which clock each runs on is already applied —
+                // an entry reaches here only past its own abandon
+                // window's opening.
                 self.counterparts.ledger.is_unsettled_by_departed(tx_hash)
                     || self.counterparts.ledger.is_delivery(tx_hash)
+                    || held_by.is_some_and(|tick| tick.decided_alone(tx_hash))
             }
             None => {
                 !self.counterparts.ledger.is_certified(tx_hash)
@@ -8561,6 +8580,56 @@ mod tests {
         let _ = tx_hash;
     }
 
+    /// A tick holding a member whose success decides alone is not left to
+    /// past the transaction's deadline.
+    ///
+    /// Past it no block carries such a finalization — the deadline fence
+    /// refuses it, which is what licenses a leg's reclaim — so a tick
+    /// left to would hold a member nothing can resolve while every
+    /// proposer offers a finalization every voter refuses.
+    #[test]
+    fn a_tick_holding_a_success_that_decides_alone_is_abandoned_at_the_deadline() {
+        let schedule = make_test_topology();
+        let mut state = make_test_state();
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+        let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
+
+        state.on_block_committed(
+            &schedule,
+            &test_certify(
+                make_live_block(
+                    BlockHeight::new(1),
+                    1_000,
+                    ValidatorId::new(0),
+                    vec![Arc::new(tx)],
+                ),
+                1_000,
+            ),
+        );
+        let held_by = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+        assert_eq!(state.ticks.tick_assignment(tx_hash), Some(held_by));
+
+        let outcomes = abandonment_vote(&mut state, &schedule, 2, deadline_ms - 1);
+        assert!(
+            outcomes.is_empty(),
+            "short of the deadline its own certificate is still on its way"
+        );
+        assert!(state.ticks.contains_tick(&held_by));
+
+        let outcomes = abandonment_vote(&mut state, &schedule, 3, deadline_ms);
+        assert!(
+            outcomes
+                .iter()
+                .any(|outcome| outcome.tx_hash() == tx_hash && outcome.is_aborted()),
+            "at the deadline the member is abandoned: {outcomes:?}"
+        );
+        assert!(
+            !state.ticks.contains_tick(&held_by),
+            "and the tick that could no longer speak for it is discarded"
+        );
+    }
+
     /// A snapshot over an explicit leaf set, with `cut` naming the shards
     /// scheduled to terminate at the epochs given.
     fn leaves_snap(leaves: &[ShardId], cut: &[(ShardId, u64)]) -> Arc<TopologySnapshot> {
@@ -8890,6 +8959,56 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![tx_hash],
             "and the record is what makes the abort this shard's to compose",
+        );
+    }
+
+    /// Once the abort is composed the member is that tick's, and a later
+    /// commit leaves it there.
+    ///
+    /// The record covering the entry never expires, so the entry is owed
+    /// at every commit that follows. A shard that read the record as a
+    /// licence each time would discard the tick carrying the abort and
+    /// compose an identical one, every block, and the abort would never
+    /// reach a certificate.
+    #[test]
+    fn the_tick_that_abandons_a_member_keeps_it() {
+        let sched = peer_terminating_schedule(60_000);
+        let (mut state, stranded, tx_hash) = state_stranded_on(&sched, 1);
+        record_peer_left_unsettled(&mut state, tx_hash);
+
+        let composed = TickId::new(HOME, BlockHeight::new(9));
+        let block = make_live_block_on_shard(
+            HOME,
+            BlockHeight::new(9),
+            STRANDED_DEADLINE_MS,
+            ValidatorId::new(0),
+            vec![],
+        );
+        state.on_block_committed(&sched, &test_certify(block, STRANDED_DEADLINE_MS));
+        assert_eq!(
+            state.ticks.tick_assignment(tx_hash),
+            Some(composed),
+            "the commit past the deadline composes the abort",
+        );
+        assert!(!state.ticks.contains_tick(&stranded));
+
+        let later = STRANDED_DEADLINE_MS + 1_000;
+        let block = make_live_block_on_shard(
+            HOME,
+            BlockHeight::new(10),
+            later,
+            ValidatorId::new(0),
+            vec![],
+        );
+        state.on_block_committed(&sched, &test_certify(block, later));
+        assert!(
+            state.ticks.contains_tick(&composed),
+            "the tick carrying the abort survives to be certified",
+        );
+        assert_eq!(
+            state.ticks.tick_assignment(tx_hash),
+            Some(composed),
+            "and the member stays where it was abandoned",
         );
     }
 
