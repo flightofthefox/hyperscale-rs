@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 
 use hyperscale_core::{
-    Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
+    Action, CrossShardExecutionRequest, FetchIds, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
 use hyperscale_engine::legs::{Classified, Licence, Member, Runs, Side};
 use hyperscale_engine::{TickEnvironment, build_fee_receipt};
@@ -2198,9 +2198,9 @@ impl ExecutionCoordinator {
                     error = ?err,
                     "Invalid execution certificate signature"
                 );
-                return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                    ids: fetch_keys_covered(&raw),
-                })];
+                return vec![Action::AbandonFetch(FetchIds::ExecutionCerts(
+                    fetch_keys_covered(&raw),
+                ))];
             }
         };
 
@@ -2217,9 +2217,9 @@ impl ExecutionCoordinator {
                 tick = %ec_arc.tick_id(),
                 "Discarding execution certificate — epoch evicted from schedule before verification completed"
             );
-            return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                ids: fetch_keys_covered(&ec_arc),
-            })];
+            return vec![Action::AbandonFetch(FetchIds::ExecutionCerts(
+                fetch_keys_covered(&ec_arc),
+            ))];
         };
         if !ec_has_shard_quorum_power(committee, &ec_arc) {
             tracing::warn!(
@@ -2227,9 +2227,9 @@ impl ExecutionCoordinator {
                 tick = %ec_arc.tick_id(),
                 "Discarding sub-quorum execution certificate"
             );
-            return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                ids: fetch_keys_covered(&ec_arc),
-            })];
+            return vec![Action::AbandonFetch(FetchIds::ExecutionCerts(
+                fetch_keys_covered(&ec_arc),
+            ))];
         }
         // The recovery freeze, re-checked here: an EC dispatched before the
         // beacon folded a source-shard halt recovery reaches this point with
@@ -2243,9 +2243,9 @@ impl ExecutionCoordinator {
                 height = ec_arc.block_height().inner(),
                 "Discarding verified EC from a recovering shard past the freeze frontier"
             );
-            return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                ids: fetch_keys_covered(&ec_arc),
-            })];
+            return vec![Action::AbandonFetch(FetchIds::ExecutionCerts(
+                fetch_keys_covered(&ec_arc),
+            ))];
         }
 
         let shard = ec_arc.shard_id();
@@ -3401,9 +3401,9 @@ impl ExecutionCoordinator {
                     error = ?err,
                     "Dropping fetched Finalization: contained EC signature invalid"
                 );
-                return vec![Action::AbandonFetch(FetchAbandon::Finalizations {
-                    ids: vec![raw.receipt_hash()],
-                })];
+                return vec![Action::AbandonFetch(FetchIds::Finalizations(vec![
+                    raw.receipt_hash(),
+                ]))];
             }
         };
         // Lift the verification result into the `Block::Live.certificates`
@@ -3553,9 +3553,7 @@ impl ExecutionCoordinator {
         self.tick_in_flight = false;
         let mut actions = vec![Action::ClearTickChain];
         if !expected.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                ids: expected,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::ExecutionCerts(expected)));
         }
         actions
     }
@@ -4435,7 +4433,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::ExecutionCerts { ids }) if ids == &vec![(tick_id.shard_id(), covered_tx)]
+                Action::AbandonFetch(FetchIds::ExecutionCerts(ids)) if ids == &vec![(tick_id.shard_id(), covered_tx)]
             )),
             "sub-quorum drop must emit AbandonFetch::ExecutionCerts, got: {actions:?}"
         );
@@ -4483,7 +4481,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::ExecutionCerts { ids }) if ids == &vec![(tick_id.shard_id(), covered_tx)]
+                Action::AbandonFetch(FetchIds::ExecutionCerts(ids)) if ids == &vec![(tick_id.shard_id(), covered_tx)]
             )),
             "invalid-sig drop must emit AbandonFetch::ExecutionCerts, got: {actions:?}"
         );
@@ -4702,7 +4700,7 @@ mod tests {
     /// `on_finalization_verified` with `valid = false` must drop the tick
     /// rather than emit the admission continuation — that's exactly the
     /// poisoning vector this gate exists to close. The dropped tick also
-    /// surfaces a `FetchAbandon::Finalizations` so any pinned fetch
+    /// surfaces a `FetchIds::Finalizations` so any pinned fetch
     /// FSM entry releases its slot.
     #[test]
     fn on_finalization_verified_drops_invalid() {
@@ -4733,7 +4731,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![fw_hash]
+                Action::AbandonFetch(FetchIds::Finalizations(ids)) if ids == &vec![fw_hash]
             )),
             "Signature-invalid drop must emit AbandonFetch::Finalizations, got: {actions:?}"
         );
@@ -4776,7 +4774,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![fw_hash]
+                Action::AbandonFetch(FetchIds::Finalizations(ids)) if ids == &vec![fw_hash]
             )),
             "quorum-power drop must emit AbandonFetch::Finalizations, got: {actions:?}"
         );
@@ -4788,7 +4786,7 @@ mod tests {
         assert!(
             retry_actions
                 .iter()
-                .any(|a| matches!(a, Action::AbandonFetch(FetchAbandon::Finalizations { .. }))),
+                .any(|a| matches!(a, Action::AbandonFetch(FetchIds::Finalizations(..)))),
             "retry must still reach the quorum gate, got: {retry_actions:?}"
         );
     }
@@ -4824,7 +4822,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![fw_hash]
+                Action::AbandonFetch(FetchIds::Finalizations(ids)) if ids == &vec![fw_hash]
             )),
             "unknown-committee drop must emit AbandonFetch::Finalizations, got: {actions:?}"
         );
@@ -4834,7 +4832,7 @@ mod tests {
         assert!(
             retry_actions
                 .iter()
-                .any(|a| matches!(a, Action::AbandonFetch(FetchAbandon::Finalizations { .. }))),
+                .any(|a| matches!(a, Action::AbandonFetch(FetchIds::Finalizations(..)))),
             "retry must still reach the committee-keys gate, got: {retry_actions:?}"
         );
     }
@@ -4933,7 +4931,7 @@ mod tests {
         assert!(
             matches!(
                 orphan.as_slice(),
-                [Action::AbandonFetch(FetchAbandon::ExecutionCerts { .. })]
+                [Action::AbandonFetch(FetchIds::ExecutionCerts(..))]
             ),
             "an EC past the freeze frontier is dropped, got {orphan:?}"
         );
@@ -5366,7 +5364,7 @@ mod tests {
 
         let actions = state.admit_finalization(&topo, tick);
         // No admission continuation — the poisoning vector this gate
-        // exists to close. The rejection now emits a `FetchAbandon` so
+        // exists to close. The rejection now emits an `AbandonFetch` so
         // any pinned fetch FSM entry releases its slot.
         assert!(
             !actions.iter().any(|a| matches!(
@@ -5378,7 +5376,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![fw_hash]
+                Action::AbandonFetch(FetchIds::Finalizations(ids)) if ids == &vec![fw_hash]
             )),
             "sub-quorum drop must emit AbandonFetch::Finalizations, got: {actions:?}"
         );

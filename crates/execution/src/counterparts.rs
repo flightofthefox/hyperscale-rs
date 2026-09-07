@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_reclaim_probe_answered};
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
@@ -563,7 +563,7 @@ impl Counterparts {
         if ids.is_empty() {
             Vec::new()
         } else {
-            vec![Action::AbandonFetch(FetchAbandon::StateProofs { ids })]
+            vec![Action::AbandonFetch(FetchIds::StateProofs(ids))]
         }
     }
 

@@ -33,7 +33,7 @@
 
 mod action;
 mod action_context;
-mod fetch_abandon;
+mod fetch_ids;
 mod fetch_request;
 mod protocol_event;
 mod timer;
@@ -44,7 +44,7 @@ pub use action::{
     ParticipationChange, ProvisionsRequest,
 };
 pub use action_context::{ActionContext, BeaconActionContext, PreparedBlock};
-pub use fetch_abandon::FetchAbandon;
+pub use fetch_ids::FetchIds;
 pub use fetch_request::FetchRequest;
 pub use hyperscale_dispatch::Parallelism;
 pub use protocol_event::{CommitSource, ProtocolEvent, TickBatchOutcome};

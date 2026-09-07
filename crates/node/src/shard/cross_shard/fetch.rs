@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
-use hyperscale_core::ProtocolEvent;
+use hyperscale_core::{FetchIds, ProtocolEvent};
 use hyperscale_metrics::record_fetch_response_refused;
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
@@ -57,6 +57,10 @@ impl FetchBinding for LocalProvisionBinding {
     type Id = ProvisionHash;
 
     const NAME: &'static str = "local_provision";
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::LocalProvisions(ids)
+    }
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<ProvisionHash> {
         &mut shard.cross_shard.local_provision
@@ -110,9 +114,7 @@ impl FetchBinding for LocalProvisionBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::LocalProvisionsFetchFailed {
-                                hashes: split.missing,
-                            },
+                            ShardScopedInput::FetchFailed(Self::ids(split.missing)),
                         );
                     }
                     // Reject the response if the peer shipped unsolicited
@@ -126,7 +128,7 @@ impl FetchBinding for LocalProvisionBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::LocalProvisionsFetchFailed { hashes: hs },
+                        ShardScopedInput::FetchFailed(Self::ids(hs)),
                     );
                     ResponseVerdict::Accept
                 }
@@ -142,6 +144,10 @@ impl FetchBinding for FinalizationBinding {
     type Id = FinalizationHash;
 
     const NAME: &'static str = "finalization";
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::Finalizations(ids)
+    }
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<FinalizationHash> {
         &mut shard.cross_shard.finalization
@@ -186,7 +192,7 @@ impl FetchBinding for FinalizationBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::FinalizationsFetchFailed { ids: split.missing },
+                            ShardScopedInput::FetchFailed(Self::ids(split.missing)),
                         );
                     }
                     // Reject responses with unsolicited ticks (peer scoring;
@@ -201,7 +207,7 @@ impl FetchBinding for FinalizationBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::FinalizationsFetchFailed { ids: requested_ids },
+                        ShardScopedInput::FetchFailed(Self::ids(requested_ids)),
                     );
                     ResponseVerdict::Accept
                 }
@@ -221,6 +227,10 @@ impl FetchBinding for ExecCertBinding {
     type Id = (ShardId, TxHash);
 
     const NAME: &'static str = "exec_cert";
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::ExecutionCerts(ids)
+    }
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<(ShardId, TxHash)> {
         &mut shard.cross_shard.exec_cert
@@ -274,9 +284,7 @@ impl FetchBinding for ExecCertBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::ExecCertFetchFailed {
-                                hashes: split.missing,
-                            },
+                            ShardScopedInput::FetchFailed(Self::ids(split.missing)),
                         );
                     }
                     // Reject the response if the peer shipped unsolicited
@@ -291,7 +299,7 @@ impl FetchBinding for ExecCertBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::ExecCertFetchFailed { hashes: failed_ids },
+                        ShardScopedInput::FetchFailed(Self::ids(failed_ids)),
                     );
                     ResponseVerdict::Accept
                 }
@@ -347,6 +355,10 @@ impl FetchBinding for CommittedTxBinding {
 
     const NAME: &'static str = "committed_tx";
 
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::CommittedTxs(ids)
+    }
+
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
         &mut shard.cross_shard.committed_tx
     }
@@ -389,7 +401,7 @@ impl FetchBinding for CommittedTxBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::CommittedTxsFetchFailed { ids: requested },
+                            ShardScopedInput::FetchFailed(Self::ids(requested)),
                         );
                         return ResponseVerdict::Accept;
                     };
@@ -398,7 +410,7 @@ impl FetchBinding for CommittedTxBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::CommittedTxsFetchFailed { ids: requested },
+                            ShardScopedInput::FetchFailed(Self::ids(requested)),
                         );
                         return ResponseVerdict::Reject;
                     };
@@ -412,7 +424,7 @@ impl FetchBinding for CommittedTxBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::CommittedTxsFetchFailed { ids: requested },
+                            ShardScopedInput::FetchFailed(Self::ids(requested)),
                         );
                         return ResponseVerdict::Reject;
                     };
@@ -422,7 +434,7 @@ impl FetchBinding for CommittedTxBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::CommittedTxsFetchFulfilled { ids: requested },
+                        ShardScopedInput::FetchFulfilled(Self::ids(requested)),
                     );
                     push_protocol_event(
                         &es,
@@ -451,6 +463,10 @@ impl FetchBinding for StateProofBinding {
     type Id = (Anchor, SubstateKey);
 
     const NAME: &'static str = "state_proof";
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::StateProofs(ids)
+    }
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
         &mut shard.cross_shard.state_proof
@@ -498,7 +514,7 @@ impl FetchBinding for StateProofBinding {
                             push_shard_input(
                                 &es,
                                 local_shard,
-                                ShardScopedInput::StateProofFetchFailed { ids: requested },
+                                ShardScopedInput::FetchFailed(Self::ids(requested)),
                             );
                             return ResponseVerdict::Accept;
                         }
@@ -508,7 +524,7 @@ impl FetchBinding for StateProofBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::StateProofFetchFailed { ids: requested },
+                            ShardScopedInput::FetchFailed(Self::ids(requested)),
                         );
                         return ResponseVerdict::Reject;
                     };
@@ -526,7 +542,7 @@ impl FetchBinding for StateProofBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::StateProofFetchFailed { ids: requested },
+                            ShardScopedInput::FetchFailed(Self::ids(requested)),
                         );
                         return ResponseVerdict::Reject;
                     }
@@ -536,7 +552,7 @@ impl FetchBinding for StateProofBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::StateProofFetchFulfilled { ids: requested },
+                        ShardScopedInput::FetchFulfilled(Self::ids(requested)),
                     );
                     push_protocol_event(
                         &es,
@@ -565,6 +581,10 @@ impl FetchBinding for ProvisionBinding {
     /// Cross-shard provisions are addressed by a single `(shard, height)` —
     /// each request targets exactly one scope.
     const PER_ID: bool = true;
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::RemoteProvisions(ids)
+    }
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
         &mut shard.cross_shard.provision
@@ -604,10 +624,11 @@ impl FetchBinding for ProvisionBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::ProvisionsFetchFailed {
+                        ShardScopedInput::FetchFailed(Self::ids(vec![(
                             source_shard,
+                            target_shard,
                             block_height,
-                        },
+                        )])),
                     );
                 };
                 let response = match result {

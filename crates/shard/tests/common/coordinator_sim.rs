@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, CommitSource, FetchAbandon, TimerId};
+use hyperscale_core::{Action, CommitSource, FetchIds, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};

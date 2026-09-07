@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::FetchAbandon;
+use hyperscale_core::FetchIds;
 use hyperscale_types::{
     ConsensusPublicKey, ExecutionCertificate, Finalization, Hash, ScheduleLookup, TickId,
     TopologySchedule, Verifiable,
@@ -38,7 +38,7 @@ pub trait Attested {
 
     /// What refusing the artifact releases: it answers for nothing it
     /// claimed, so each claim goes back to being fetchable.
-    fn abandon(&self) -> FetchAbandon;
+    fn abandon(&self) -> FetchIds;
 }
 
 impl Attested for Verifiable<ExecutionCertificate> {
@@ -54,10 +54,8 @@ impl Attested for Verifiable<ExecutionCertificate> {
         std::iter::once(self.as_unverified())
     }
 
-    fn abandon(&self) -> FetchAbandon {
-        FetchAbandon::ExecutionCerts {
-            ids: fetch_keys_covered(self),
-        }
+    fn abandon(&self) -> FetchIds {
+        FetchIds::ExecutionCerts(fetch_keys_covered(self))
     }
 }
 
@@ -78,10 +76,8 @@ impl Attested for Arc<Verifiable<Finalization>> {
             .map(|ec| ec.as_unverified())
     }
 
-    fn abandon(&self) -> FetchAbandon {
-        FetchAbandon::Finalizations {
-            ids: vec![self.receipt_hash()],
-        }
+    fn abandon(&self) -> FetchIds {
+        FetchIds::Finalizations(vec![self.receipt_hash()])
     }
 }
 

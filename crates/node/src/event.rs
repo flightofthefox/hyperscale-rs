@@ -18,14 +18,13 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{CommitSource, ProtocolEvent};
+use hyperscale_core::{CommitSource, FetchIds, ProtocolEvent};
 use hyperscale_network::RequestError;
 use hyperscale_types::{
-    Address, Anchor, BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock,
-    CertifiedBlock, CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature,
-    ElidedCertifiedBlock, Epoch, FinalizationHash, Hash, HeaderFetchCount, LeafIndex,
-    PredecessorTerminal, ProvisionHash, ShardForkProof, ShardId, ShardVoteEquivocation,
-    SubstateKey, Transaction, TxHash, ValidatorId, Verifiable, Verified,
+    Address, BeaconWitnessCommit, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
+    CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ElidedCertifiedBlock, Epoch,
+    Hash, HeaderFetchCount, ShardForkProof, ShardId, ShardVoteEquivocation, Transaction, TxHash,
+    ValidatorId, Verifiable, Verified,
 };
 
 use crate::shard::commit::QcOnlyDivergence;
@@ -158,13 +157,6 @@ pub enum ShardScopedInput {
         artifacts: Vec<(Hash, Vec<u8>)>,
     },
 
-    /// A package artifact request failed or returned without some ids;
-    /// releases the in-flight slots for retry.
-    PackageArtifactsFetchFailed {
-        /// The content addresses still missing.
-        ids: Vec<Hash>,
-    },
-
     /// Envelopes a derivation could not resolve, each beside the
     /// component records it wanted, so the fetch can ask the shards
     /// owning them and the envelopes can wait for the answer.
@@ -181,13 +173,6 @@ pub enum ShardScopedInput {
         /// contents derive. Derived once, where the response is
         /// verified, so the shard loop never pays for the hash.
         records: Vec<(Address, Vec<u8>)>,
-    },
-
-    /// An instance record request failed or returned without some ids;
-    /// releases the in-flight slots for retry.
-    InstanceRecordsFetchFailed {
-        /// The component addresses still missing.
-        ids: Vec<Address>,
     },
 
     /// Locally-submitted tx delivered to a passive co-host: a hosted
@@ -348,23 +333,17 @@ pub enum ShardScopedInput {
         source_shard: ShardId,
     },
 
-    /// A transaction fetch request failed (network error or peer returned None).
-    TransactionsFetchFailed {
-        /// Transaction hashes that failed to fetch.
-        hashes: Vec<TxHash>,
-    },
+    /// A fetch went unanswered for these ids — a transport failure, a
+    /// peer that did not hold them, or an answer this node could not
+    /// use. The binding's state machine releases their in-flight slots
+    /// so the next tick retries against another peer.
+    FetchFailed(FetchIds),
 
-    /// Local provision fetch failed.
-    LocalProvisionsFetchFailed {
-        /// Provision hashes that failed to fetch.
-        hashes: Vec<ProvisionHash>,
-    },
-
-    /// A finalization fetch request failed.
-    FinalizationsFetchFailed {
-        /// Finalization identities that weren't returned.
-        ids: Vec<FinalizationHash>,
-    },
+    /// A fetch was answered and verified for these ids: release their
+    /// slots. Keyed by the *request* ids, not the response's contents,
+    /// so a peer's payload cannot leave a slot pinned. The payload
+    /// itself rides the accompanying `ProtocolEvent`.
+    FetchFulfilled(FetchIds),
 
     /// Transaction validated by the validation pipeline. The `NodeHost`
     /// resolves `submitted_locally` from its `locally_submitted` set
@@ -409,96 +388,6 @@ pub enum ShardScopedInput {
     ShardVoteEquivocationGossipReceived {
         /// The self-proving pair off the wire.
         evidence: Arc<ShardVoteEquivocation>,
-    },
-
-    /// A provision fetch request failed (network error or peer returned None).
-    /// The envelope shard is the consumer (target) shard whose cross-shard
-    /// fetch owns the in-flight tracking; `source_shard` here is the
-    /// originating shard whose provisions were being fetched.
-    ProvisionsFetchFailed {
-        /// Source shard whose provisions were being fetched.
-        source_shard: ShardId,
-        /// Source-shard block height the provisions were anchored to.
-        block_height: BlockHeight,
-    },
-
-    /// An execution certificate fetch request failed.
-    ExecCertFetchFailed {
-        /// `(source_shard, tx_hash)` pairs that weren't answered.
-        hashes: Vec<(ShardId, TxHash)>,
-    },
-
-    /// A committed-transaction query went unanswered — a transport
-    /// failure, a peer that doesn't hold the named terminal, or a
-    /// response this node can't lift to the attested root. Whole-batch,
-    /// because a response is usable or it isn't.
-    CommittedTxsFetchFailed {
-        /// `(predecessor, transaction)` pairs still owed an answer.
-        ids: Vec<(PredecessorTerminal, TxHash)>,
-    },
-
-    /// A committed-transaction query was answered and verified: release
-    /// the fetch slots. Keyed by the *request* ids, so a peer's payload
-    /// can't leave a slot pinned. The answers themselves ride the
-    /// accompanying `ProtocolEvent::PrecutResolutionsReceived`.
-    CommittedTxsFetchFulfilled {
-        /// `(predecessor, transaction)` pairs the response answered.
-        ids: Vec<(PredecessorTerminal, TxHash)>,
-    },
-
-    /// A state-proof query went unanswered — a transport failure, a peer
-    /// that doesn't hold the height, or a proof this node can't lift to
-    /// the anchor's root. Whole-batch, because a proof is usable or it
-    /// isn't.
-    StateProofFetchFailed {
-        /// `(anchor, key)` pairs still owed an answer.
-        ids: Vec<(Anchor, SubstateKey)>,
-    },
-
-    /// A state-proof query was answered and verified: release the fetch
-    /// slots. Keyed by the *request* ids, so a peer's payload can't
-    /// leave a slot pinned. The answers themselves ride the
-    /// accompanying `ProtocolEvent::FetchedStateProofVerified`.
-    StateProofFetchFulfilled {
-        /// `(anchor, key)` pairs the response answered.
-        ids: Vec<(Anchor, SubstateKey)>,
-    },
-
-    /// A shard-witness chunk fetch failed (network error, empty response,
-    /// or the peer's window was pruned). Per-id so multiple in-flight
-    /// runs can fail independently.
-    ShardWitnessesFetchFailed {
-        /// Anchor + range identities that failed to fetch.
-        ids: Vec<(ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex)>,
-    },
-
-    /// A shard-witness chunk response delivered its payload: release the
-    /// fetch slot so the next queued run can dispatch. Keyed by the
-    /// *request* ids, not the response contents, so a peer's payload can't
-    /// leave the slot pinned; if the delivered chunk fails admission, the
-    /// beacon coordinator's chunk re-drive re-requests the run. The
-    /// payload itself rides the accompanying
-    /// `ProtocolEvent::ShardWitnessesReceived`.
-    ShardWitnessesFetchFulfilled {
-        /// Anchor + range identities the response fulfilled.
-        ids: Vec<(ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex)>,
-    },
-
-    /// A beacon-proposal fetch failed (network error, or the peer
-    /// didn't have the proposal pooled). Per-id so multiple parallel
-    /// missing-proposal fetches can fail independently.
-    BeaconProposalFetchFailed {
-        /// `(epoch, validator)` pairs whose fetch failed.
-        ids: Vec<(Epoch, ValidatorId)>,
-    },
-
-    /// A beacon-proposal fetch response delivered a proposal: release the
-    /// fetch slot. Keyed by the request ids — same contract as
-    /// [`Self::ShardWitnessesFetchFulfilled`]. The payload rides the
-    /// accompanying `ProtocolEvent::BeaconProposalFetched`.
-    BeaconProposalFetchFulfilled {
-        /// `(epoch, validator)` pairs the response fulfilled.
-        ids: Vec<(Epoch, ValidatorId)>,
     },
 
     /// JMT prep for a QC-only commit completed off-thread; the block's
@@ -564,9 +453,7 @@ impl ShardScopedInput {
             Self::TransactionGossipReceived { .. }
             | Self::TransactionsFetched { .. }
             | Self::PackageArtifactsFetched { .. }
-            | Self::PackageArtifactsFetchFailed { .. }
             | Self::InstanceRecordsFetched { .. }
-            | Self::InstanceRecordsFetchFailed { .. }
             | Self::InstanceRecordsWanted { .. } => EventPriority::Network,
             Self::CommittedBlockGossipReceived { .. }
             | Self::ShardForkProofGossipReceived { .. }
@@ -586,21 +473,10 @@ impl ShardScopedInput {
             | Self::CommitProofResponseReceived { .. }
             | Self::SettledTxsResponseReceived { .. }
             | Self::SettledTxsFetchFailed { .. }
-            | Self::TransactionsFetchFailed { .. }
+            | Self::FetchFailed(_)
+            | Self::FetchFulfilled(_)
             | Self::TransactionValidated { .. }
             | Self::TransactionValidationsFailed { .. }
-            | Self::ProvisionsFetchFailed { .. }
-            | Self::ExecCertFetchFailed { .. }
-            | Self::LocalProvisionsFetchFailed { .. }
-            | Self::FinalizationsFetchFailed { .. }
-            | Self::CommittedTxsFetchFailed { .. }
-            | Self::CommittedTxsFetchFulfilled { .. }
-            | Self::StateProofFetchFailed { .. }
-            | Self::StateProofFetchFulfilled { .. }
-            | Self::ShardWitnessesFetchFailed { .. }
-            | Self::ShardWitnessesFetchFulfilled { .. }
-            | Self::BeaconProposalFetchFailed { .. }
-            | Self::BeaconProposalFetchFulfilled { .. }
             | Self::QcOnlyCommitPrepared { .. }
             | Self::QcOnlyCommitDiverged { .. } => EventPriority::Internal,
         }

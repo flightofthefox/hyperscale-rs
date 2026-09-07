@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use hyperscale_beacon::action_handlers::handle_action as handle_beacon_action;
 use hyperscale_core::{
-    Action, ActionContext, ActionOwner, CommitSource, FetchAbandon, FetchRequest, ProtocolEvent,
+    Action, ActionContext, ActionOwner, CommitSource, FetchRequest, ProtocolEvent,
 };
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_execution::action_handlers::handle_action as handle_execution_action;
@@ -23,7 +23,7 @@ use tracing::{debug, error, trace, warn};
 use super::{ShardLoop, ShardScopedInput, TimerOp, push_protocol_event, push_shard_input};
 use crate::beacon;
 use crate::beacon::{BeaconProposalBinding, ShardWitnessBinding};
-use crate::fetch::{FetchBinding, FetchInput};
+use crate::fetch::{FetchBinding, FetchInput, Release};
 use crate::shard::commit::{
     AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind,
     QcOnlyPending, make_commit_prepared, run_qc_only_prep,
@@ -159,7 +159,7 @@ where
                 }
             }
             Action::Fetch(req) => self.process_fetch_request(req),
-            Action::AbandonFetch(req) => self.process_fetch_abandon(req),
+            Action::AbandonFetch(ids) => self.release_fetch(ids, Release::Abandoned),
 
             // ─── ShardLoop-internal effects ────────────────────────────────
             Action::SetTimer { id, duration } => {
@@ -727,54 +727,6 @@ where
                     preferred,
                     class,
                 });
-            }
-        }
-    }
-
-    /// Dispatch a typed fetch-abandon to the corresponding binding.
-    ///
-    /// The fetch instance in this shard's `ShardIo` is notified — keyed by
-    /// the abandoning vnode's shard, not the routing target of the original
-    /// request. Symmetric to [`Self::process_fetch_request`] — translates the
-    /// variant payload into ids and feeds them through `FetchInput::Abandoned`,
-    /// which removes them from the binding's pending set and increments
-    /// `record_fetch_abandoned` so the cancellation is observable separately
-    /// from genuine admissions.
-    #[allow(clippy::needless_pass_by_value)] // mirrors process_fetch_request; future variants carry Vec ids
-    fn process_fetch_abandon(&mut self, req: FetchAbandon) {
-        match req {
-            FetchAbandon::Transactions { ids } => {
-                self.drive_fetch::<TransactionBinding>(FetchInput::Abandoned { ids });
-            }
-            FetchAbandon::RemoteProvisions {
-                source_shard,
-                block_height,
-            } => {
-                let local_shard = self.shard;
-                self.drive_fetch::<ProvisionBinding>(FetchInput::Abandoned {
-                    ids: vec![(source_shard, local_shard, block_height)],
-                });
-            }
-            FetchAbandon::LocalProvisions { hashes } => {
-                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Abandoned { ids: hashes });
-            }
-            FetchAbandon::Finalizations { ids } => {
-                self.drive_fetch::<FinalizationBinding>(FetchInput::Abandoned { ids });
-            }
-            FetchAbandon::ExecutionCerts { ids } => {
-                self.drive_fetch::<ExecCertBinding>(FetchInput::Abandoned { ids });
-            }
-            FetchAbandon::CommittedTxs { ids } => {
-                self.drive_fetch::<CommittedTxBinding>(FetchInput::Abandoned { ids });
-            }
-            FetchAbandon::StateProofs { ids } => {
-                self.drive_fetch::<StateProofBinding>(FetchInput::Abandoned { ids });
-            }
-            FetchAbandon::BeaconProposal { ids } => {
-                self.drive_fetch::<BeaconProposalBinding>(FetchInput::Abandoned { ids });
-            }
-            FetchAbandon::ShardWitnesses { ids } => {
-                self.drive_fetch::<ShardWitnessBinding>(FetchInput::Abandoned { ids });
             }
         }
     }

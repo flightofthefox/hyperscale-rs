@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchAbandon, ProtocolEvent};
+use hyperscale_core::{Action, FetchIds, ProtocolEvent};
 use hyperscale_types::{
     BlockHeight, BlockManifest, CertifiedBlock, CertifiedBlockHeader, CompletedRecovery, ForkFence,
     LocalTimestamp, ProvisionHash, Provisions, ProvisionsVerifyError, RETENTION_HORIZON, ShardId,
@@ -277,12 +277,17 @@ impl ProvisionCoordinator {
         // are outstanding; this only catches entries that would otherwise
         // leak indefinitely. Each dropped key emits an `AbandonFetch` so
         // the io_loop's `ProvisionBinding` clears the matching in-flight.
-        for (source_shard, block_height) in self.expected.cleanup_orphans(retention_cutoff) {
-            self.headers.remove((source_shard, block_height));
-            actions.push(Action::AbandonFetch(FetchAbandon::RemoteProvisions {
-                source_shard,
-                block_height,
-            }));
+        let orphaned: Vec<_> = self
+            .expected
+            .cleanup_orphans(retention_cutoff)
+            .into_iter()
+            .map(|(source_shard, block_height)| {
+                self.headers.remove((source_shard, block_height));
+                (source_shard, self.local_shard, block_height)
+            })
+            .collect();
+        if !orphaned.is_empty() {
+            actions.push(Action::AbandonFetch(FetchIds::RemoteProvisions(orphaned)));
         }
 
         // Drop provisions whose deadline has passed but never reached
@@ -348,15 +353,16 @@ impl ProvisionCoordinator {
         self.queue.purge_fenced(shard, frontier);
         let evicted = self.pipeline.purge_fenced(shard, frontier);
         if !evicted.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::LocalProvisions {
-                hashes: evicted,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::LocalProvisions(evicted)));
         }
-        for (source_shard, block_height) in self.expected.purge_fenced(shard, frontier) {
-            actions.push(Action::AbandonFetch(FetchAbandon::RemoteProvisions {
-                source_shard,
-                block_height,
-            }));
+        let stranded: Vec<_> = self
+            .expected
+            .purge_fenced(shard, frontier)
+            .into_iter()
+            .map(|(source_shard, block_height)| (source_shard, self.local_shard, block_height))
+            .collect();
+        if !stranded.is_empty() {
+            actions.push(Action::AbandonFetch(FetchIds::RemoteProvisions(stranded)));
         }
         actions
     }
@@ -420,11 +426,8 @@ impl ProvisionCoordinator {
         for key in sweep.evicted_keys {
             self.headers.remove(key);
         }
-        (!sweep.evicted_pending.is_empty()).then(|| {
-            Action::AbandonFetch(FetchAbandon::LocalProvisions {
-                hashes: sweep.evicted_pending,
-            })
-        })
+        (!sweep.evicted_pending.is_empty())
+            .then(|| Action::AbandonFetch(FetchIds::LocalProvisions(sweep.evicted_pending)))
     }
 
     /// Immediately emit `Action::Fetch(FetchRequest::RemoteProvisions)` for all outstanding expected
@@ -532,9 +535,7 @@ impl ProvisionCoordinator {
             if hashes.is_empty() {
                 return vec![];
             }
-            return vec![Action::AbandonFetch(FetchAbandon::LocalProvisions {
-                hashes,
-            })];
+            return vec![Action::AbandonFetch(FetchIds::LocalProvisions(hashes))];
         }
 
         // Only store headers that owe us a bundle — the same
@@ -573,9 +574,9 @@ impl ProvisionCoordinator {
                         height = height.inner(),
                         "Dropping drained provisions: already committed"
                     );
-                    actions.push(Action::AbandonFetch(FetchAbandon::LocalProvisions {
-                        hashes: vec![provisions_hash],
-                    }));
+                    actions.push(Action::AbandonFetch(FetchIds::LocalProvisions(vec![
+                        provisions_hash,
+                    ])));
                     continue;
                 }
                 if provisions.deadline(source_block_ts) <= local_ts {
@@ -584,9 +585,9 @@ impl ProvisionCoordinator {
                         height = height.inner(),
                         "Dropping drained provisions past deadline"
                     );
-                    actions.push(Action::AbandonFetch(FetchAbandon::LocalProvisions {
-                        hashes: vec![provisions_hash],
-                    }));
+                    actions.push(Action::AbandonFetch(FetchIds::LocalProvisions(vec![
+                        provisions_hash,
+                    ])));
                     continue;
                 }
                 actions.extend(build_verify_action(
@@ -2487,10 +2488,8 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::RemoteProvisions {
-                    source_shard: s,
-                    block_height: h,
-                }) if *s == source_shard && *h == block_height
+                Action::AbandonFetch(FetchIds::RemoteProvisions(ids))
+                    if ids.iter().any(|(s, _, h)| *s == source_shard && *h == block_height)
             )),
             "Expected AbandonFetch from orphan cleanup, got: {actions:?}"
         );
@@ -2756,7 +2755,7 @@ mod tests {
             "pending entry past `received_at + RETENTION_HORIZON` must be evicted"
         );
         let abandon = sweep_actions.iter().find_map(|a| match a {
-            Action::AbandonFetch(FetchAbandon::LocalProvisions { hashes }) => Some(hashes),
+            Action::AbandonFetch(FetchIds::LocalProvisions(hashes)) => Some(hashes),
             _ => None,
         });
         assert_eq!(

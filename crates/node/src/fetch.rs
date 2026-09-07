@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
 use crossbeam::channel::Sender;
+use hyperscale_core::FetchIds;
 use hyperscale_metrics::{
     record_fetch_abandoned, record_fetch_completed, record_fetch_retried, record_fetch_started,
 };
@@ -373,6 +374,11 @@ pub trait FetchBinding: 'static {
     /// to `true`; bag-of-hashes fetches leave it `false`.
     const PER_ID: bool = false;
 
+    /// The [`FetchIds`] arm that carries this binding's ids — how a
+    /// response boundary names the ids it failed or fulfilled, and the
+    /// inverse of the one dispatcher that routes a batch back here.
+    fn ids(ids: Vec<Self::Id>) -> FetchIds;
+
     /// Locate the `Fetch<Id>` instance for this binding inside `ShardIo` —
     /// each impl navigates to its own subsystem's state.
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id>;
@@ -397,6 +403,30 @@ pub trait FetchBinding: 'static {
         network: &N,
         sender: &Sender<HostEvent>,
     );
+}
+
+/// Why a batch of ids leaves the in-flight set: the three id-carrying
+/// [`FetchInput`]s, so one dispatcher can route a [`FetchIds`] batch to
+/// its binding whichever way it is being released.
+#[derive(Debug, Clone, Copy)]
+pub enum Release {
+    /// The attempt failed or went unanswered; retry on the next tick.
+    Failed,
+    /// The payload landed; the ids are done.
+    Admitted,
+    /// The consumer no longer wants them.
+    Abandoned,
+}
+
+impl Release {
+    /// The [`FetchInput`] releasing `ids` this way.
+    pub const fn input<Id>(self, ids: Vec<Id>) -> FetchInput<Id> {
+        match self {
+            Self::Failed => FetchInput::Failed { ids },
+            Self::Admitted => FetchInput::Admitted { ids },
+            Self::Abandoned => FetchInput::Abandoned { ids },
+        }
+    }
 }
 
 /// Result of partitioning a fetch response against the requested set.

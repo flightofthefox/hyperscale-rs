@@ -12,7 +12,7 @@
 //! `partition_solicited` helper live in [`crate::fetch`].
 
 use crossbeam::channel::Sender;
-use hyperscale_core::ProtocolEvent;
+use hyperscale_core::{FetchIds, ProtocolEvent};
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::beacon::{
@@ -85,6 +85,10 @@ impl FetchBinding for ShardWitnessBinding {
     /// ids into one request would produce a response neither could use.
     const PER_ID: bool = true;
 
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::ShardWitnesses(ids)
+    }
+
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
         &mut shard.beacon_fetch.shard_witness
     }
@@ -117,9 +121,13 @@ impl FetchBinding for ShardWitnessBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::ShardWitnessesFetchFailed {
-                            ids: vec![(source_shard, block_height, committed_block_hash, lo, hi)],
-                        },
+                        ShardScopedInput::FetchFailed(Self::ids(vec![(
+                            source_shard,
+                            block_height,
+                            committed_block_hash,
+                            lo,
+                            hi,
+                        )])),
                     );
                 };
                 let Ok(response) = result else {
@@ -139,9 +147,13 @@ impl FetchBinding for ShardWitnessBinding {
                 push_shard_input(
                     &es,
                     local_shard,
-                    ShardScopedInput::ShardWitnessesFetchFulfilled {
-                        ids: vec![(source_shard, block_height, committed_block_hash, lo, hi)],
-                    },
+                    ShardScopedInput::FetchFulfilled(Self::ids(vec![(
+                        source_shard,
+                        block_height,
+                        committed_block_hash,
+                        lo,
+                        hi,
+                    )])),
                 );
                 push_protocol_event(
                     &es,
@@ -172,6 +184,10 @@ impl FetchBinding for BeaconProposalBinding {
     /// a single proposal.
     const PER_ID: bool = true;
 
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::BeaconProposals(ids)
+    }
+
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
         &mut shard.beacon_fetch.beacon_proposal
     }
@@ -199,9 +215,7 @@ impl FetchBinding for BeaconProposalBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::BeaconProposalFetchFailed {
-                            ids: vec![(epoch, validator)],
-                        },
+                        ShardScopedInput::FetchFailed(Self::ids(vec![(epoch, validator)])),
                     );
                 };
                 let Ok(response) = result else {
@@ -227,9 +241,7 @@ impl FetchBinding for BeaconProposalBinding {
                 push_shard_input(
                     &es,
                     local_shard,
-                    ShardScopedInput::BeaconProposalFetchFulfilled {
-                        ids: vec![(epoch, validator)],
-                    },
+                    ShardScopedInput::FetchFulfilled(Self::ids(vec![(epoch, validator)])),
                 );
                 push_protocol_event(
                     &es,

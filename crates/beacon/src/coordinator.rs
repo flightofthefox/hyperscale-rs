@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{
-    Action, FetchAbandon, FetchRequest, KeepDelta, ObserveDelta, ParticipationChange, TimerId,
+    Action, FetchIds, FetchRequest, KeepDelta, ObserveDelta, ParticipationChange, TimerId,
 };
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, BeaconProposalVerifyContext,
@@ -264,7 +264,7 @@ pub struct BeaconCoordinator {
     /// hasn't observed, tracks the fetches that resolve them, and decides
     /// when assembly is ready. `adopt_block` advancing `current_epoch`
     /// past a stash evicts it via `prune_stale`, whose returned ids the
-    /// coordinator turns into [`FetchAbandon::BeaconProposal`].
+    /// coordinator turns into [`FetchIds::BeaconProposals`].
     commit_assembly: CommitAssembler,
 
     /// Per-epoch committee schedule. Its head is the current epoch's
@@ -2133,18 +2133,18 @@ impl BeaconCoordinator {
 
         let abandoned_proposals = self.commit_assembly.prune_stale(self.state.current_epoch);
         if !abandoned_proposals.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::BeaconProposal {
-                ids: abandoned_proposals,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::BeaconProposals(
+                abandoned_proposals,
+            )));
         }
         // Release in-flight witness fetches the boundary fold just consumed
         // — their leaves are below the advanced watermark, so a future
         // contribution can't include them and the runner's slot should
         // free rather than pin on a payload the tracker would only evict.
         if !abandoned_witness_ids.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::ShardWitnesses {
-                ids: abandoned_witness_ids,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::ShardWitnesses(
+                abandoned_witness_ids,
+            )));
         }
         actions.extend(self.redrive_terminal_witness_fetches());
 
@@ -4665,7 +4665,7 @@ mod tests {
 
     /// A commit that rotates the local validator off the beacon
     /// committee drops the pooled witness chunks and releases in-flight
-    /// witness fetches as `FetchAbandon::ShardWitnesses`, so the
+    /// witness fetches as `FetchIds::ShardWitnesses`, so the
     /// runner's fetch slots don't pin on payloads an off-committee vnode
     /// no longer wants.
     #[test]
@@ -4695,13 +4695,13 @@ mod tests {
         let abandoned = actions.iter().any(|a| {
             matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::ShardWitnesses { ids })
+                Action::AbandonFetch(FetchIds::ShardWitnesses(ids))
                     if ids.contains(&(shard, height, anchor, LeafIndex::new(0), LeafIndex::new(2)))
             )
         });
         assert!(
             abandoned,
-            "expected FetchAbandon::ShardWitnesses naming the in-flight fetch, got {actions:?}",
+            "expected FetchIds::ShardWitnesses naming the in-flight fetch, got {actions:?}",
         );
     }
 

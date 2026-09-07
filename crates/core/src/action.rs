@@ -27,7 +27,7 @@ use hyperscale_types::{
     WorkInFlight,
 };
 
-use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
+use crate::{CommitSource, FetchIds, FetchRequest, ProtocolEvent, TimerId};
 
 /// A request to execute a cross-shard transaction with its provisions.
 #[derive(Debug, Clone)]
@@ -1393,14 +1393,13 @@ pub enum Action {
     /// key without it ever being admitted.
     Fetch(FetchRequest),
 
-    /// Cancel an in-flight fetch the originating coordinator no longer wants.
+    /// Cancel in-flight fetches the originating coordinator no longer wants.
     ///
-    /// Symmetric to [`Self::Fetch`] — `io_loop`'s dispatcher matches the
-    /// inner [`FetchAbandon`] and feeds the ids through
-    /// `FetchInput::Abandoned` on the corresponding binding. Emitted by
+    /// Symmetric to [`Self::Fetch`]: the node feeds the ids through
+    /// `FetchInput::Abandoned` on the binding that fetches them. Emitted by
     /// coordinators at every expected-set drop site (verification
     /// succeeded, retention-horizon orphan cleanup, deadline eviction).
-    AbandonFetch(FetchAbandon),
+    AbandonFetch(FetchIds),
 
     /// Offer transactions this chain never included to whatever holds
     /// their keys now.

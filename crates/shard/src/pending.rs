@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchAbandon, FetchRequest};
+use hyperscale_core::{Action, FetchIds, FetchRequest};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, Finalization, FinalizationHash,
     LocalTimestamp, ProvisionHash, Provisions, Round, ShardId, Transaction, TxHash, ValidatorId,
@@ -34,19 +34,17 @@ impl OrphanedFetches {
     pub fn into_abandon_actions(self) -> Vec<Action> {
         let mut actions = Vec::new();
         if !self.txs.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::Transactions {
-                ids: self.txs,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::Transactions(self.txs)));
         }
         if !self.finalizations.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::Finalizations {
-                ids: self.finalizations,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::Finalizations(
+                self.finalizations,
+            )));
         }
         if !self.provisions.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::LocalProvisions {
-                hashes: self.provisions,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::LocalProvisions(
+                self.provisions,
+            )));
         }
         actions
     }

@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_engine::legs::Classified;
 use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
 use hyperscale_types::{
@@ -473,9 +473,7 @@ impl MempoolCoordinator {
         }
         let mut actions = Vec::new();
         if !moot.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::Transactions {
-                ids: moot,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::Transactions(moot)));
         }
         if !admitted.is_empty() {
             actions.push(Action::Continuation(ProtocolEvent::TransactionsAdmitted {
@@ -687,9 +685,9 @@ impl MempoolCoordinator {
             }
         }
         if !abandoned_tx_fetches.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::Transactions {
-                ids: abandoned_tx_fetches,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::Transactions(
+                abandoned_tx_fetches,
+            )));
         }
 
         // Update transaction status to Committed and add locks.
@@ -781,9 +779,7 @@ impl MempoolCoordinator {
                 record_expected_tx_dropped();
                 abandoned.push(tx_hash);
             }
-            actions.push(Action::AbandonFetch(FetchAbandon::Transactions {
-                ids: abandoned,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::Transactions(abandoned)));
         }
 
         self.prune_engagement_state();
@@ -1664,7 +1660,7 @@ mod tests {
         let abandoned: Vec<TxHash> = actions
             .iter()
             .filter_map(|a| match a {
-                Action::AbandonFetch(FetchAbandon::Transactions { ids }) => Some(ids.clone()),
+                Action::AbandonFetch(FetchIds::Transactions(ids)) => Some(ids.clone()),
                 _ => None,
             })
             .flatten()
@@ -1706,7 +1702,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::Transactions { ids }) if ids == &[tx_hash]
+                Action::AbandonFetch(FetchIds::Transactions(ids)) if ids == &[tx_hash]
             )),
             "Expected AbandonFetch for block-included expected tx, got: {actions:?}"
         );
@@ -1760,7 +1756,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::Transactions { ids }) if ids == &[tx_hash]
+                Action::AbandonFetch(FetchIds::Transactions(ids)) if ids == &[tx_hash]
             )),
             "rejected tx must emit AbandonFetch so any in-flight retry \
              is cancelled, got: {actions:?}"
