@@ -22,12 +22,12 @@ use hyperscale_core::{Action, FeeDemand};
 use hyperscale_engine::legs::Classified;
 use hyperscale_engine::writes_committed_cell;
 use hyperscale_types::{
-    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, CounterpartClaim,
-    CounterpartEvidence, Deadline, Epoch, Finalization, FinalizationHash, Hash, LocalTimestamp,
-    MAX_PROVISIONS_PER_BLOCK, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal,
-    ReshapeTrigger, RevealChain, Round, ScheduleLookup, ShardId, TopologySchedule,
-    TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, Window, sweep_admits_block,
+    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, CounterpartEvidence,
+    Deadline, Epoch, Finalization, FinalizationHash, Hash, LocalTimestamp,
+    MAX_STATE_PROOFS_PER_BLOCK, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal,
+    ReshapeTrigger, RevealChain, Round, ScheduleLookup, ShardId, StateProofBundle,
+    TopologySchedule, TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp, Window, sweep_admits_block,
 };
 use tracing::debug;
 
@@ -62,7 +62,7 @@ pub struct ProposalPayload {
     pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
     pub provisions: Vec<Arc<Verifiable<Provisions>>>,
     pub abandonment_records: Vec<AbandonmentRecord>,
-    pub state_proofs: Vec<CounterpartClaim>,
+    pub state_proofs: Vec<StateProofBundle>,
 }
 
 #[derive(Debug, Clone)]
@@ -483,22 +483,21 @@ pub fn select_abandonment_records(
         .collect()
 }
 
-/// The claims a block may carry about counterparts' chains, in the one
-/// order it carries them: ascending, without repeats, and no more than
-/// the block's cap, with the rest waiting a block.
+/// The proofs a block may carry of counterparts' cells, in the one order
+/// it carries them: ascending, without repeats, and no more than the
+/// block's cap, with the rest waiting a block.
 ///
-/// A claim that licenses nothing never reaches a block — a bundle
-/// naming no key, or a verdict naming an acceptance — so the cap is
-/// spent on answers a record arm can be offered from.
+/// A bundle naming no key answers nothing and never reaches a block, so
+/// the cap is spent on answers a record can be offered from.
 #[must_use]
-pub fn select_state_proofs(state_proofs: Vec<CounterpartClaim>) -> Vec<CounterpartClaim> {
-    let mut selected: Vec<CounterpartClaim> = state_proofs
+pub fn select_state_proofs(state_proofs: Vec<StateProofBundle>) -> Vec<StateProofBundle> {
+    let mut selected: Vec<StateProofBundle> = state_proofs
         .into_iter()
-        .filter(CounterpartClaim::is_well_formed)
+        .filter(StateProofBundle::is_well_formed)
         .collect();
     selected.sort_unstable();
     selected.dedup();
-    selected.truncate(MAX_PROVISIONS_PER_BLOCK);
+    selected.truncate(MAX_STATE_PROOFS_PER_BLOCK);
     selected
 }
 
@@ -755,9 +754,10 @@ mod tests {
         test_transaction_running,
     };
     use hyperscale_types::{
-        CommittedTxsRoot, Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_SUBINTENTS,
+        CommittedTxsRoot, Hash, Heard, MAX_FINALIZED_TX_PER_BLOCK, MAX_SUBINTENTS,
         MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
-        PredecessorTerminal, TimestampRange, TransactionDecision, UnsettledTx, ValidatorSet,
+        PredecessorTerminal, Question, TimestampRange, TransactionDecision, UnsettledTx,
+        ValidatorSet, Word,
     };
 
     use super::*;
@@ -868,9 +868,16 @@ mod tests {
             .windows()
             .handoff_evidence_expiry(handoff)
             .plus(Duration::from_millis(1));
-        let refused = AbandonmentRecord::refused(
+        let refused = AbandonmentRecord::heard(
             DEPARTED,
-            WeightedTimestamp::from_millis(2_000),
+            Heard {
+                question: Question::Verdict,
+                word: Word::Refused {
+                    decision: TransactionDecision::Reject,
+                    digest: Hash::from_bytes(b"digest"),
+                },
+                at: WeightedTimestamp::from_millis(2_000),
+            },
             [stranded()],
         );
         assert_eq!(

@@ -25,12 +25,12 @@ use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote,
     BlockVoteMessage, CertificateRoot, CertificateRootContext, CertifiedBlockHeader,
     CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError, ConsensusPublicKey,
-    ConsensusReceipt, CounterpartClaim, Deadline, Derivation, Epoch, Finalization, Hash,
-    LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, PreparedCommit,
-    PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
-    QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, ShardId,
-    ShardLoad, SplitChildRoots, StateProofsRoot, StateRoot, StateRootContext, StateRootVerifyError,
+    ConsensusReceipt, Deadline, Derivation, Epoch, Finalization, Hash, LocalReceiptRoot,
+    LocalReceiptRootContext, NetworkDefinition, PreparedCommit, PrincipalAddr as AccountAddr,
+    ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
+    ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
+    ReshapeTrigger, Resolutions, RevealChain, Round, ShardId, ShardLoad, SplitChildRoots,
+    StateProofBundle, StateProofsRoot, StateRoot, StateRootContext, StateRootVerifyError,
     Stopwatch, StoredReceipt, SubstateKey, SweepFrontier, TerminalRoots, Timeout, TimeoutContext,
     TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, UnsettledTx,
     ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp,
@@ -217,7 +217,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     topology_snapshot: &TopologySnapshot,
     provisions: Vec<Arc<Verifiable<Provisions>>>,
     abandonment_records: Vec<AbandonmentRecord>,
-    state_proofs: Vec<CounterpartClaim>,
+    state_proofs: Vec<StateProofBundle>,
     parent_in_flight: WorkInFlight,
     parent_settled_frontier: BlockHeight,
     parent_sweep_frontier: SweepFrontier,
@@ -799,13 +799,7 @@ where
             state_proofs,
         } => {
             let start = Stopwatch::start();
-            // A verdict carries no proof to check: it is a commitment
-            // to a certificate, held to the one this validator has at
-            // the vote fence rather than to bytes in the block.
-            let result = state_proofs.iter().try_for_each(|claim| {
-                let Some(bundle) = claim.cells() else {
-                    return Ok(());
-                };
+            let result = state_proofs.iter().try_for_each(|bundle| {
                 bundle.inclusions().map(|_| ()).map_err(|error| {
                     format!(
                         "state proof against {:?} at {} does not answer for its keys: {error}",

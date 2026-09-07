@@ -145,13 +145,12 @@ pub use receipt::global::GlobalReceipt;
 pub use receipt::metadata::{ExecutionMetadata, FeeSummary, LogLevel};
 pub use receipt::stored::StoredReceipt;
 pub use shard::abandonment::{
-    AbandonmentRecord, AbortCharge, Absence, Acceptance, CounterpartEvidence, Refusal, Resolutions,
-    UnsettledTx,
+    AbandonmentRecord, AbortCharge, CounterpartEvidence, Heard, Question, Resolutions, UnsettledTx,
+    Word,
 };
 pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch, LinkageError};
 pub use shard::certified_header::{CertifiedBlockHeader, CertifiedHeaderVerifyError};
 pub use shard::chain_origin::{ChainOrigin, PredecessorTerminal};
-pub use shard::claim::{CounterpartClaim, VerdictClaim};
 pub use shard::commit_proof::{
     CommitProof, CommitProofVerifyError, MAX_COMMIT_PROOF_ANCESTRY, ResolvedCommittee,
 };
@@ -169,8 +168,9 @@ pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, Rehy
 pub use shard::limits::{
     MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_COMMITTED_TX_QUERY, MAX_DRAIN_WORK,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_GAS_LIMIT, MAX_PROVISION_TARGET_SHARDS,
-    MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_SWEEP_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, drain_admits_block, sweep_admits_block,
+    MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_STATE_PROOFS_PER_BLOCK, MAX_SWEEP_PER_BLOCK,
+    MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+    drain_admits_block, sweep_admits_block,
 };
 pub use shard::load::ShardLoad;
 pub use shard::manifest::{BlockManifest, BlockMetadata};

@@ -5,9 +5,9 @@ use hyperscale_hbor::Hbor;
 
 use crate::{
     AbandonmentRecord, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight,
-    CounterpartClaim, FinalizationHash, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    QuorumCertificate, TxHash, Verifiable, WitnessSources,
+    FinalizationHash, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    QuorumCertificate, StateProofBundle, TxHash, Verifiable, WitnessSources,
 };
 
 /// Hash-level description of a block's contents (transactions and certificates).
@@ -35,8 +35,8 @@ pub struct BlockManifest {
     /// The block's state-proof bundles, mirrored verbatim: every
     /// validator holds a proof it fetched itself or none, and what the
     /// block commits to is the proposer's bytes.
-    #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
-    state_proofs: Vec<CounterpartClaim>,
+    #[hbor(max = MAX_STATE_PROOFS_PER_BLOCK)]
+    state_proofs: Vec<StateProofBundle>,
     /// The block's beacon-witness inputs, mirrored verbatim — the
     /// sync/reload path replays leaf derivation from the manifest under
     /// QC trust. See [`WitnessSources`].
@@ -68,7 +68,7 @@ impl BlockManifest {
         cert_ids: Vec<FinalizationHash>,
         provision_hashes: Vec<ProvisionHash>,
         abandonment_records: Vec<AbandonmentRecord>,
-        state_proofs: Vec<CounterpartClaim>,
+        state_proofs: Vec<StateProofBundle>,
         witness_sources: WitnessSources,
     ) -> Self {
         Self {
@@ -112,7 +112,7 @@ impl BlockManifest {
 
     /// The block's state-proof bundles.
     #[must_use]
-    pub const fn state_proofs(&self) -> &Vec<CounterpartClaim> {
+    pub const fn state_proofs(&self) -> &Vec<StateProofBundle> {
         &self.state_proofs
     }
 

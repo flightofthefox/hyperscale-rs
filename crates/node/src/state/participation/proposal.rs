@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    AbandonmentRecord, CounterpartClaim, Finalization, MAX_TXS_PER_BLOCK, Provisions,
+    AbandonmentRecord, Finalization, MAX_TXS_PER_BLOCK, Provisions, StateProofBundle,
     TopologySchedule, TopologySnapshot, Transaction, Verifiable, Verified,
 };
 
@@ -20,7 +20,7 @@ pub(in crate::state) struct ProposalInputs {
     pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
     pub provisions: Vec<Arc<Verifiable<Provisions>>>,
     pub abandonment_records: Vec<AbandonmentRecord>,
-    pub state_proofs: Vec<CounterpartClaim>,
+    pub state_proofs: Vec<StateProofBundle>,
 }
 
 impl ShardParticipation {

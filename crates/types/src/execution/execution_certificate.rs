@@ -17,11 +17,11 @@ use hyperscale_hbor::{
 use thiserror::Error;
 
 use crate::{
-    AggregateSignature, BlockHeight, ConsensusPublicKey, ExecutionVote, ExecutionVoteMessage,
-    GlobalReceiptRoot, Hash, MAX_TXS_PER_BLOCK, NetworkDefinition, RETENTION_HORIZON, ShardId,
-    SignerBitfield, TickId, TxHash, TxOutcome, ValidatorId, Verified, Verify, WeightedTimestamp,
-    compute_global_receipt_root, compute_sparse_proof, signed_bytes, tx_outcome_leaf,
-    verify_sparse_inclusion,
+    AggregateSignature, BlockHeight, ConsensusPublicKey, ExecutionOutcome, ExecutionVote,
+    ExecutionVoteMessage, GlobalReceiptRoot, Hash, Heard, MAX_TXS_PER_BLOCK, NetworkDefinition,
+    Question, RETENTION_HORIZON, ShardId, SignerBitfield, TickId, TransactionDecision, TxHash,
+    TxOutcome, ValidatorId, Verified, Verify, WeightedTimestamp, Word, compute_global_receipt_root,
+    compute_sparse_proof, signed_bytes, tx_outcome_leaf, verify_sparse_inclusion,
 };
 
 /// Domain tag separating a certificate's attested digest from every
@@ -404,6 +404,35 @@ impl ExecutionCertificate {
     #[must_use]
     pub const fn tx_outcomes(&self) -> &Vec<TxOutcome> {
         &self.tx_outcomes
+    }
+
+    /// What this certificate says of each transaction, as a counterpart
+    /// hears it: an acceptance or a refusal, at the vote anchor, named
+    /// by the attested digest.
+    pub fn verdicts(&self) -> impl Iterator<Item = (TxHash, Heard)> + '_ {
+        let digest = self.attested_digest();
+        let at = self.vote_anchor_ts;
+        self.tx_outcomes.iter().map(move |outcome| {
+            let word = match outcome.outcome() {
+                ExecutionOutcome::Succeeded { .. } => Word::Accepted { digest },
+                ExecutionOutcome::Failed => Word::Refused {
+                    decision: TransactionDecision::Reject,
+                    digest,
+                },
+                ExecutionOutcome::Aborted => Word::Refused {
+                    decision: TransactionDecision::Aborted,
+                    digest,
+                },
+            };
+            (
+                outcome.tx_hash(),
+                Heard {
+                    question: Question::Verdict,
+                    word,
+                    at,
+                },
+            )
+        })
     }
 
     /// signature aggregated signature from 2f+1 validators.

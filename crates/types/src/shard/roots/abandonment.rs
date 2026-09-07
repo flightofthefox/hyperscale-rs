@@ -1,5 +1,6 @@
 //! [`AbandonmentRoot`] verification.
 
+use hyperscale_hbor::to_vec as hbor_to_vec;
 use thiserror::Error;
 
 use crate::{AbandonmentRecord, AbandonmentRoot, Hash, Verified, Verify, compute_merkle_root};
@@ -8,9 +9,9 @@ use crate::{AbandonmentRecord, AbandonmentRoot, Hash, Verified, Verify, compute_
 /// [`AbandonmentRoot::ZERO`]; otherwise the merkle root of each record's
 /// own hash.
 ///
-/// A record's leaf covers the shard it answers for, the kind and moment
-/// of its evidence, and every transaction it names with the figures
-/// abandoning it takes, so two blocks claiming the same root carry the
+/// A record's leaf covers its whole encoding — the shard it answers for,
+/// its evidence, and every transaction it names with the figures
+/// abandoning it takes — so two blocks claiming the same root carry the
 /// same records.
 #[must_use]
 pub fn abandonment_root_from_records(records: &[AbandonmentRecord]) -> AbandonmentRoot {
@@ -25,29 +26,18 @@ pub fn abandonment_root_from_records(records: &[AbandonmentRecord]) -> Abandonme
 /// other leaf preimage the codebase hashes.
 const ABANDONMENT_LEAF_TAG: &[u8] = b"hyperscale.abandonment_leaf.v1";
 
-/// One record's leaf: its shard, its evidence's arm and moment, and each
-/// transaction it names with its deadline, its reservation and its
-/// charge, in the canonical order the record is built in.
+/// One record's leaf: the tag and its canonical encoding, which covers
+/// the shard, the evidence whole, and every figure of every name — a
+/// figure the root does not commit to is a figure two bodies can
+/// disagree on under one certificate.
 ///
-/// The arm is a byte of its own because the arms license different
-/// aborts, and a leaf naming only the moment would let one pass as the
-/// other. The charge is under the leaf because a figure the root does
-/// not commit to is a figure two bodies can disagree on under one
-/// certificate.
+/// # Panics
+///
+/// If the record does not encode, which a value built through
+/// [`AbandonmentRecord::new`] under its caps always does.
 fn record_leaf(record: &AbandonmentRecord) -> Hash {
-    let mut bytes = ABANDONMENT_LEAF_TAG.to_vec();
-    bytes.reserve(17 + record.unsettled().len() * 112);
-    bytes.extend_from_slice(&record.shard().to_le_bytes());
-    bytes.push(record.evidence().discriminant());
-    bytes.extend_from_slice(&record.evidence().moment().as_millis().to_le_bytes());
-    for entry in record.unsettled() {
-        bytes.extend_from_slice(entry.tx_hash.as_bytes());
-        bytes.extend_from_slice(&entry.deadline.at().as_millis().to_le_bytes());
-        bytes.extend_from_slice(&entry.declared_work.to_le_bytes());
-        bytes.extend_from_slice(&entry.charge.vault.to_bytes());
-        bytes.extend_from_slice(&entry.charge.amount.to_le_bytes());
-    }
-    Hash::from_bytes(&bytes)
+    let bytes = hbor_to_vec(record).expect("an abandonment record encodes");
+    Hash::from_parts(&[ABANDONMENT_LEAF_TAG, &bytes])
 }
 
 /// Inputs the [`AbandonmentRoot`] verifier reads against.
@@ -98,8 +88,8 @@ impl Verify<&AbandonmentRootContext<'_>> for AbandonmentRoot {
 mod tests {
     use super::*;
     use crate::{
-        AbortCharge, Address, AddressClass, CounterpartEvidence, Deadline, LocalKey, ShardId,
-        SubstateKey, TxHash, UnsettledTx, WeightedTimestamp,
+        AbortCharge, Address, AddressClass, Deadline, Hash, Heard, LocalKey, Probed, Question,
+        ShardId, SubstateKey, TransactionDecision, TxHash, UnsettledTx, WeightedTimestamp, Word,
     };
 
     fn tx(seed: u8) -> UnsettledTx {
@@ -203,29 +193,47 @@ mod tests {
     }
 
     /// The arms license different aborts, so two records agreeing on
-    /// everything but the kind of evidence are different claims.
+    /// everything but the evidence are different claims.
     #[test]
-    fn departed_and_refused_at_one_moment_give_different_leaves() {
+    fn every_arm_at_one_moment_gives_its_own_leaf() {
         let moment = WeightedTimestamp::from_millis(1_000);
-        let departed = AbandonmentRecord::departed(ShardId::ROOT, moment, [tx(1)]);
-        let refused = AbandonmentRecord::new(
-            ShardId::ROOT,
-            CounterpartEvidence::Refused { refused_wt: moment },
-            [tx(1)],
-        );
-        let unclaimed = AbandonmentRecord::new(
-            ShardId::ROOT,
-            CounterpartEvidence::Unclaimed { probed_wt: moment },
-            [tx(1)],
-        );
-        let lapsed = AbandonmentRecord::lapsed(ShardId::ROOT, moment, [tx(1)]);
-        let untaken = AbandonmentRecord::untaken(ShardId::ROOT, moment, [tx(1)]);
-        assert_ne!(root_of(&departed), root_of(&refused));
-        assert_ne!(root_of(&refused), root_of(&unclaimed));
-        assert_ne!(root_of(&departed), root_of(&unclaimed));
-        assert_ne!(root_of(&unclaimed), root_of(&lapsed));
-        assert_ne!(root_of(&unclaimed), root_of(&untaken));
-        assert_ne!(root_of(&lapsed), root_of(&untaken));
+        let heard = |question, word| {
+            AbandonmentRecord::heard(
+                ShardId::ROOT,
+                Heard {
+                    question,
+                    word,
+                    at: moment,
+                },
+                [tx(1)],
+            )
+        };
+        let digest = Hash::from_bytes(b"digest");
+        let records = [
+            AbandonmentRecord::departed(ShardId::ROOT, moment, [tx(1)]),
+            heard(
+                Question::Verdict,
+                Word::Refused {
+                    decision: TransactionDecision::Reject,
+                    digest,
+                },
+            ),
+            heard(
+                Question::Verdict,
+                Word::Refused {
+                    decision: TransactionDecision::Aborted,
+                    digest,
+                },
+            ),
+            heard(Question::Verdict, Word::Accepted { digest }),
+            heard(Question::Cell(Probed::Core), Word::Absent),
+            heard(Question::Cell(Probed::Delivery), Word::Absent),
+            heard(Question::Cell(Probed::Claim), Word::Absent),
+        ];
+        let mut roots: Vec<AbandonmentRoot> = records.iter().map(root_of).collect();
+        roots.sort_unstable();
+        roots.dedup();
+        assert_eq!(roots.len(), records.len());
     }
 
     /// Verification is the recomputation, so a claimed root the records do

@@ -45,17 +45,17 @@ use hyperscale_metrics::{
 };
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
 use hyperscale_types::{
-    AbandonmentRecord, Absence, Acceptance, Attempt, AwaitingTopologyBuffer, Block, BlockHash,
-    BlockHeader, BlockHeight, BloomFilter, CertifiedBlock, CounterpartClaim, CounterpartMirror,
-    Deadline, DeclaredKey, Derivation, ExecutionCertificate, ExecutionCertificateVerifyError,
-    ExecutionOutcome, ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError,
-    GlobalReceiptRoot, Hash, Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Mode, Probed,
-    ProvenAnchors, Provisions, Refusal, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
-    ShardTrie, StateAnchor, StateProofBundle, StoredReceipt, SubstateKey, TickId, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution,
-    UnsettledTx, ValidatorId, VerdictClaim, Verifiable, Verified, WeightedTimestamp, Window,
-    derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
+    AbandonmentRecord, Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight,
+    BloomFilter, CertifiedBlock, CounterpartEvidence, CounterpartMirror, Deadline, DeclaredKey,
+    Derivation, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
+    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Heard, Inclusion,
+    MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+    MerkleInclusionProof, Mode, Probed, ProvenAnchors, Provisions, Question, ScheduleLookup,
+    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateAnchor, StateProofBundle,
+    StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot, Transaction,
+    TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
+    Verifiable, Verified, WeightedTimestamp, Window, Word, derive_block_transactions,
+    settled_set_verdict, tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::CrossingCell;
 use tracing::instrument;
@@ -75,7 +75,7 @@ use crate::provisioning::{ProvisioningTracker, Requirement, divided_requirements
 use crate::tick_state::{Admission, Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
 use crate::unresolved::{
-    Abandonable, Answer, Probe, Probeable, Reclaimable, Retirable, Unanswerable, UnresolvedTxs,
+    Abandonable, Probe, Probeable, Reclaimable, Retirable, Unanswerable, UnresolvedTxs,
 };
 use crate::vote_tracker::VoteTracker;
 
@@ -222,6 +222,12 @@ pub struct ExecutionMemoryStats {
 /// One counterpart cell a leg entry asks about: the shard holding it,
 /// the cell, the anchor an answer is held to, and which question it is.
 type CounterpartCell = (ShardId, SubstateKey, Probed);
+
+/// What counterparts were heard to say, by shard and question, then by
+/// the moment and word of each answer: the grouping a block's records
+/// are composed from.
+type HeardByQuestion =
+    BTreeMap<(ShardId, Question), BTreeMap<(WeightedTimestamp, Word), Vec<UnsettledTx>>>;
 
 /// Every cell `entry` asks a counterpart about, under `trie`: one core
 /// shard's committed cell, each delivery's claim on the shard that was
@@ -2659,14 +2665,24 @@ impl ExecutionCoordinator {
             })
             .collect();
         let mut actions = Vec::new();
-        for claim in block.state_proofs() {
-            // A verdict is the counterpart's own word, folded from the
-            // chain rather than from whatever this replica happened to
-            // hear broadcast — which is the whole point of committing it.
-            match claim {
-                CounterpartClaim::Verdict(verdict) => actions.extend(self.fold_verdict(verdict)),
-                CounterpartClaim::Cells(bundle) => {
-                    actions.extend(self.fold_cells(bundle, &cells));
+        for bundle in block.state_proofs() {
+            actions.extend(self.fold_cells(bundle, &cells));
+        }
+        actions
+    }
+
+    /// Fold the verdicts a committed block's records restate: each is
+    /// the counterpart's own word, folded from the chain, so a replica
+    /// that never heard the certificate broadcast holds it from the
+    /// block alone.
+    fn fold_verdict_records(&mut self, block: &Block) -> Vec<Action> {
+        let mut actions = Vec::new();
+        for record in block.abandonment_records() {
+            if let CounterpartEvidence::Heard(heard) = record.evidence()
+                && heard.question == Question::Verdict
+            {
+                for entry in record.unsettled() {
+                    actions.extend(self.fold_verdict(record.shard(), entry.tx_hash, heard));
                 }
             }
         }
@@ -2711,37 +2727,33 @@ impl ExecutionCoordinator {
                     let Some(inclusion) = probed.read(inclusion, entry.core.len()) else {
                         continue;
                     };
-                    let answer = match inclusion {
-                        Inclusion::Present(_) => Answer::Committed,
-                        Inclusion::Absent => Answer::Absent(Absence {
-                            probed_wt: bundle.anchor_ts,
-                        }),
-                    };
                     // The question is answered, and a fetch still out
                     // for it is released with it.
                     if !self.unresolved.close_question(entry.tx_hash, shard, probed) {
                         continue;
                     }
-                    match answer {
-                        Answer::Committed => {}
-                        Answer::Absent(absence) => {
-                            self.evidence
-                                .record_absence(entry.tx_hash, shard, probed, absence);
-                        }
-                    }
                     record_reclaim_probe_answered(inclusion.is_present());
                     let tx_hash = entry.tx_hash;
-                    actions.push(match answer {
+                    actions.push(match inclusion {
                         // The counterpart took it, and its certificate
                         // says how. Its broadcast may have missed this
                         // shard, so it is fetched rather than waited for.
-                        Answer::Committed => Action::Fetch(FetchRequest::ExecutionCerts {
+                        Inclusion::Present(_) => Action::Fetch(FetchRequest::ExecutionCerts {
                             source_shard: shard,
                             tx_hash,
                             preferred: None,
                             class: None,
                         }),
-                        Answer::Absent(_) => {
+                        Inclusion::Absent => {
+                            self.evidence.record(
+                                tx_hash,
+                                shard,
+                                Heard {
+                                    question: Question::Cell(probed),
+                                    word: Word::Absent,
+                                    at: bundle.anchor_ts,
+                                },
+                            );
                             Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
                         }
                     });
@@ -2751,84 +2763,74 @@ impl ExecutionCoordinator {
         actions
     }
 
-    /// Fold a verdict the chain committed into the refusal the record
-    /// arms are offered from.
+    /// Fold what `shard` said of `tx_hash` into the mirror the vote
+    /// fence reads, and tell the mempool.
     ///
-    /// The mirror stays, as a cache in front of the fold rather than the
-    /// source of truth it was: what a replica heard broadcast is what
-    /// lets it check a claim before the claim commits, and what the chain
-    /// committed is what every replica holds afterwards, restart or no.
-    /// First write wins, as the fold itself is — a second claim for one
-    /// `(transaction, shard)` restates a decision that is already the
-    /// chain's.
-    fn fold_verdict(&self, verdict: &VerdictClaim) -> Vec<Action> {
-        if verdict.shard == self.local_shard || !verdict.refuses() {
+    /// Fed from two directions and read the same way from both: a
+    /// certificate arriving by broadcast, and a record the chain
+    /// committed, which is the counterpart's own word folded from the
+    /// chain rather than from whatever this replica happened to hear —
+    /// so a replica that came up between a core's verdict and the
+    /// record's proposal holds the same answer its peers do. First
+    /// write wins, as the chain's answer is: a second certificate or
+    /// record restates a decision already held.
+    ///
+    /// Only a word this shard has a use for is kept. A core's refusal
+    /// is the transaction's verdict, where a leg here issued for it; a
+    /// consumer's acceptance — a core's or a delivery's — is what
+    /// settles the record held for its claim; and a core shard's
+    /// acceptance counts toward the transaction being accepted, which
+    /// is every core shard saying so.
+    fn fold_verdict(&mut self, shard: ShardId, tx_hash: TxHash, heard: Heard) -> Vec<Action> {
+        if shard == self.local_shard || heard.question != Question::Verdict {
             return Vec::new();
         }
-        if self
-            .unresolved
-            .unsettled_leg_figures(verdict.tx_hash)
-            .is_none()
-        {
-            return Vec::new();
+        let in_core = self.unresolved.core_holds(tx_hash, shard);
+        let consumes = self.unresolved.consumer_holds(tx_hash, shard);
+        let mut actions = Vec::new();
+        match heard.word {
+            Word::Accepted { .. } => {
+                if consumes && self.evidence.record(tx_hash, shard, heard) {
+                    actions.push(Action::Continuation(
+                        ProtocolEvent::CounterpartEvidenceObserved,
+                    ));
+                }
+                if in_core && self.unresolved.record_acceptance(tx_hash, shard) {
+                    actions.push(Action::Continuation(ProtocolEvent::TransactionsResolved {
+                        resolutions: vec![(
+                            tx_hash,
+                            TxResolution::CoreDecided(TransactionDecision::Accept),
+                        )],
+                    }));
+                }
+            }
+            Word::Refused { decision, .. } => {
+                if in_core
+                    && self.unresolved.unsettled_leg_figures(tx_hash).is_some()
+                    && self.evidence.record(tx_hash, shard, heard)
+                {
+                    actions.push(Action::Continuation(
+                        ProtocolEvent::CounterpartEvidenceObserved,
+                    ));
+                    actions.push(Action::Continuation(ProtocolEvent::TransactionsResolved {
+                        resolutions: vec![(tx_hash, TxResolution::CoreDecided(decision))],
+                    }));
+                }
+            }
+            Word::Absent => {}
         }
-        let refusal = Refusal {
-            refused_wt: verdict.anchor_ts,
-            decision: verdict.decision,
-            digest: verdict.digest,
-        };
-        if !self.unresolved.core_holds(verdict.tx_hash, verdict.shard)
-            || !self
-                .evidence
-                .record_refusal(verdict.tx_hash, verdict.shard, refusal)
-        {
-            return Vec::new();
-        }
-        let decision = if verdict.decision == TransactionDecision::Aborted {
-            TransactionDecision::Aborted
-        } else {
-            TransactionDecision::Reject
-        };
-        vec![
-            Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved),
-            Action::Continuation(ProtocolEvent::TransactionsResolved {
-                resolutions: vec![(verdict.tx_hash, TxResolution::CoreDecided(decision))],
-            }),
-        ]
+        actions
     }
 
-    /// What this validator can claim about counterparts' chains that no
-    /// block has carried yet, in the one order a block carries them,
-    /// under the block's cap.
-    ///
-    /// The proofs its own fetches answered, and the verdicts its own
-    /// broadcasts delivered. A verdict is offered only where a leg here
-    /// still owes an outcome and the shard that made it is one of the
-    /// transaction's core — which is where a verdict licenses a record
-    /// at all — and the ledger keeps none that does not, so nothing is
-    /// filtered here. That bound is what keeps the vote fence's deferral
-    /// rare: it withholds the vote on the whole block, so an unbounded
-    /// offer would couple every transaction in a block to the slowest
-    /// broadcast on the abort path.
+    /// The proofs this validator's own fetches answered that no block
+    /// has carried yet, in the one order a block carries them, under
+    /// the block's cap.
     #[must_use]
-    pub fn pending_state_proofs(&self) -> Vec<CounterpartClaim> {
-        let proofs = self.fetched.keys().cloned().map(CounterpartClaim::Cells);
-        let verdicts = self
-            .evidence
-            .refusals()
-            .into_iter()
-            .map(|(tx_hash, shard, refusal)| {
-                CounterpartClaim::Verdict(VerdictClaim {
-                    shard,
-                    tx_hash,
-                    anchor_ts: refusal.refused_wt,
-                    decision: refusal.decision,
-                    digest: refusal.digest,
-                })
-            });
-        proofs
-            .chain(verdicts)
-            .take(MAX_PROVISIONS_PER_BLOCK)
+    pub fn pending_state_proofs(&self) -> Vec<StateProofBundle> {
+        self.fetched
+            .keys()
+            .take(MAX_STATE_PROOFS_PER_BLOCK)
+            .cloned()
             .collect()
     }
 
@@ -3062,12 +3064,11 @@ impl ExecutionCoordinator {
         self.gc_settled_sets(topology_schedule);
         // A proof the chain now carries is everybody's: its answers are
         // folded here, and nothing offers it again.
-        for claim in block.state_proofs() {
-            if let Some(bundle) = claim.cells() {
-                self.fetched.remove(bundle);
-            }
+        for bundle in block.state_proofs() {
+            self.fetched.remove(bundle);
         }
         let mut actions = self.fold_state_proofs(topology_schedule, block);
+        actions.extend(self.fold_verdict_records(block));
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
         // could still carry one is nobody's to resolve.
@@ -3443,11 +3444,11 @@ impl ExecutionCoordinator {
     #[must_use]
     pub fn pending_abandonment_records(&self) -> Vec<AbandonmentRecord> {
         let mut budget = MAX_UNSETTLED_PER_BLOCK;
-        // One record per shard and arm, ascending: departures first,
-        // since a departure covers everything the shard was party to,
-        // refusals then for the shards still running, and the arms in
-        // the order the block carries them.
-        let mut records: BTreeMap<(ShardId, u8), AbandonmentRecord> = BTreeMap::new();
+        // One record per shard and arm, ascending: a departure first,
+        // since it covers everything the shard was party to, then one
+        // per question for the shards still running, in the order the
+        // block carries them.
+        let mut records: BTreeMap<(ShardId, Option<Question>), AbandonmentRecord> = BTreeMap::new();
         // The sets are a hash map, so the shards are walked in sorted
         // order rather than its own: which departures the budget reaches
         // must not turn on a per-process iteration order.
@@ -3467,106 +3468,56 @@ impl ExecutionCoordinator {
                 }
                 budget -= unsettled.len();
                 let record = AbandonmentRecord::departed(shard, settled.terminal_wt, unsettled);
-                records.insert((shard, record.evidence().discriminant()), record);
+                records.insert((shard, None), record);
             }
         });
-        // Mirrored refusals, grouped by shard and then by the anchor the
-        // core refused at: one anchor per shard per block, earliest
-        // first, because a record spanning two anchors satisfies the
-        // fence's equality check for neither.
-        let refused = self
-            .evidence
-            .refusals()
-            .into_iter()
-            .map(|(tx_hash, shard, refusal)| (tx_hash, shard, refusal.refused_wt));
-        self.offer_at_earliest_anchor(
-            &mut records,
-            &mut budget,
-            refused,
-            AbandonmentRecord::refused,
-        );
-        // Answers the chain committed, grouped the same way, one arm per
-        // kind of counterpart: a record states the one anchor every name
-        // in it was proved at, and a core's committed cell absent, a
-        // delivery's claim absent and a one-shard core's claim absent are
-        // different claims held to different floors.
-        for (probed, record) in [
-            (
-                Probed::Core,
-                AbandonmentRecord::unclaimed as fn(_, _, _) -> _,
-            ),
-            (Probed::Delivery, AbandonmentRecord::lapsed),
-            (Probed::Claim, AbandonmentRecord::untaken),
-        ] {
-            let absent = self
-                .evidence
-                .absences(probed)
-                .into_iter()
-                .map(|(tx_hash, shard, absence)| (tx_hash, shard, absence.probed_wt));
-            self.offer_at_earliest_anchor(&mut records, &mut budget, absent, record);
-        }
-        // Mirrored acceptances, under the one settling arm: a consumer's
-        // certificate saying it took what a leg here issued, licensing
-        // the record's retirement rather than a reclaim. Offered until
-        // the chain has it written down and no longer: the mirror lives
-        // to the entry, and the entry to the retirement, so a record
-        // offered past its own commit could reach a block after the
-        // evidence every voter checks it against has gone.
-        let accepted = self
-            .evidence
-            .acceptances()
-            .into_iter()
-            .filter(|(tx_hash, shard, _)| self.unresolved.acceptance_unrecorded(*tx_hash, *shard))
-            .map(|(tx_hash, shard, acceptance)| (tx_hash, shard, acceptance.accepted_wt));
-        self.offer_at_earliest_anchor(
-            &mut records,
-            &mut budget,
-            accepted,
-            AbandonmentRecord::accepted,
-        );
-        records.into_values().collect()
-    }
-
-    /// Offer one record per shard from `mirrored`, at the shard's
-    /// earliest anchor, for the shards `records` does not yet name and
-    /// the names no record covers yet, under the shared budget.
-    fn offer_at_earliest_anchor(
-        &self,
-        records: &mut BTreeMap<(ShardId, u8), AbandonmentRecord>,
-        budget: &mut usize,
-        mirrored: impl IntoIterator<Item = (TxHash, ShardId, WeightedTimestamp)>,
-        record: fn(ShardId, WeightedTimestamp, Vec<UnsettledTx>) -> AbandonmentRecord,
-    ) {
-        let mut anchored: BTreeMap<ShardId, BTreeMap<WeightedTimestamp, Vec<UnsettledTx>>> =
-            BTreeMap::new();
-        for (tx_hash, shard, anchor) in mirrored {
-            if let Some(figures) = self.unresolved.unsettled_leg_figures(tx_hash) {
-                anchored
-                    .entry(shard)
-                    .or_default()
-                    .entry(anchor)
-                    .or_default()
-                    .push(figures);
+        // What counterparts were heard to say, one record per shard and
+        // question, at the shard's earliest anchor: a record states the
+        // one moment every name in it was answered at, since one
+        // spanning two satisfies the fence's equality check for neither,
+        // and the rest waits a block. Nothing is offered beside a
+        // departure, which answers for everything the shard was party
+        // to. An acceptance is offered until the chain has it written
+        // down and no longer: the mirror lives to the entry, and the
+        // entry to the retirement, so a record offered past its own
+        // commit could reach a block after the evidence every voter
+        // checks it against has gone.
+        let mut heard: HeardByQuestion = BTreeMap::new();
+        for (tx_hash, shard, word) in self.evidence.all() {
+            if matches!(word.word, Word::Accepted { .. })
+                && !self.unresolved.acceptance_unrecorded(tx_hash, shard)
+            {
+                continue;
             }
-        }
-        for (shard, anchors) in anchored {
-            if *budget == 0 || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
-                break;
-            }
-            let Some((anchor, mut unsettled)) = anchors.into_iter().next() else {
+            let Some(figures) = self.unresolved.unsettled_leg_figures(tx_hash) else {
                 continue;
             };
-            // A departure answers for everything the shard was party
-            // to, so nothing else is offered beside one; the other
-            // arms are different answers about different names.
-            let arm = record(shard, anchor, Vec::new()).evidence().discriminant();
-            if records.contains_key(&(shard, 0)) || records.contains_key(&(shard, arm)) {
+            heard
+                .entry((shard, word.question))
+                .or_default()
+                .entry((word.at, word.word))
+                .or_default()
+                .push(figures);
+        }
+        for ((shard, question), anchors) in heard {
+            if budget == 0 || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
+                break;
+            }
+            if records.contains_key(&(shard, None)) {
                 continue;
             }
-            unsettled.truncate(*budget);
-            *budget -= unsettled.len();
-            records.insert((shard, arm), record(shard, anchor, unsettled));
+            let Some(((at, word), mut unsettled)) = anchors.into_iter().next() else {
+                continue;
+            };
+            unsettled.truncate(budget);
+            budget -= unsettled.len();
+            let evidence = Heard { question, word, at };
+            records.insert(
+                (shard, Some(question)),
+                AbandonmentRecord::heard(shard, evidence, unsettled),
+            );
         }
+        records.into_values().collect()
     }
 
     /// Let go of what this shard holds against transactions no shard can
@@ -3822,85 +3773,15 @@ impl ExecutionCoordinator {
     // Phase 5: Finalization
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Mirror what `ec` says a core decided of the transactions legs
-    /// here issued for: each new refusal is handed to the vote fence,
-    /// and each verdict — a refusal, or a success once every core shard
-    /// has given one — to the mempool, whose terminal for a leg is the
-    /// core's verdict.
-    ///
-    /// Only a core's word counts: a leg elsewhere failing is its own
-    /// outcome, not the transaction's verdict, and the leg entry names
-    /// whose word it takes. First write wins per shard: a certificate is
-    /// one per shard per transaction, so a second copy is a re-broadcast
-    /// of the same word.
+    /// Fold every verdict a certificate carries, before it is routed:
+    /// the leg's tick settled long ago, so the certificate routes
+    /// nowhere, and what it says is the one thing in it this shard still
+    /// has a use for.
     fn mirror_verdicts(&mut self, ec: &Arc<Verified<ExecutionCertificate>>) -> Vec<Action> {
         let shard = ec.shard_id();
-        if shard == self.local_shard {
-            return Vec::new();
-        }
         let mut actions = Vec::new();
-        let mut resolutions = Vec::new();
-        for outcome in ec.tx_outcomes() {
-            let tx_hash = outcome.tx_hash();
-            let in_core = self.unresolved.core_holds(tx_hash, shard);
-            let consumes = self.unresolved.consumer_holds(tx_hash, shard);
-            if !in_core && !consumes {
-                continue;
-            }
-            if matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }) {
-                // A consumer that succeeded took the crossing a leg here
-                // issued: its word is what settles the record held for
-                // its claim, and the fence checks an `Accepted` record
-                // against it as it checks a `Refused` one.
-                if consumes
-                    && self.evidence.record_acceptance(
-                        tx_hash,
-                        shard,
-                        Acceptance {
-                            accepted_wt: ec.vote_anchor_ts(),
-                            digest: ec.attested_digest(),
-                        },
-                    )
-                {
-                    actions.push(Action::Continuation(
-                        ProtocolEvent::CounterpartEvidenceObserved,
-                    ));
-                }
-                if in_core && self.unresolved.record_acceptance(tx_hash, shard) {
-                    resolutions.push((
-                        tx_hash,
-                        TxResolution::CoreDecided(TransactionDecision::Accept),
-                    ));
-                }
-                continue;
-            }
-            if !in_core {
-                continue;
-            }
-            if self.unresolved.unsettled_leg_figures(tx_hash).is_none() {
-                continue;
-            }
-            let decision = if outcome.is_aborted() {
-                TransactionDecision::Aborted
-            } else {
-                TransactionDecision::Reject
-            };
-            let refusal = Refusal {
-                refused_wt: ec.vote_anchor_ts(),
-                decision,
-                digest: ec.attested_digest(),
-            };
-            if self.evidence.record_refusal(tx_hash, shard, refusal) {
-                actions.push(Action::Continuation(
-                    ProtocolEvent::CounterpartEvidenceObserved,
-                ));
-                resolutions.push((tx_hash, TxResolution::CoreDecided(decision)));
-            }
-        }
-        if !resolutions.is_empty() {
-            actions.push(Action::Continuation(ProtocolEvent::TransactionsResolved {
-                resolutions,
-            }));
+        for (tx_hash, heard) in ec.verdicts() {
+            actions.extend(self.fold_verdict(shard, tx_hash, heard));
         }
         actions
     }
@@ -4711,11 +4592,11 @@ mod tests {
     use hyperscale_types::{
         AbortCharge, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
         ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed,
-        EpochWindows, ExecutionOutcome, GlobalReceiptHash, Hash, LocalKey, MAX_FINALIZATION_DELAY,
-        MAX_VALIDITY_RANGE, NetworkDefinition, QuorumCertificate, RETENTION_HORIZON, Randomness,
-        RecoveryCause, SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer, SignerBitfield,
-        StateRoot, StoredReceipt, SubstateKey, TickHalf, TransactionDecision, TxResolution,
-        UnsettledTx, ValidatorInfo, ValidatorSet, Window,
+        EpochWindows, ExecutionOutcome, GlobalReceiptHash, Hash, Heard, LocalKey,
+        MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, NetworkDefinition, Question, QuorumCertificate,
+        RETENTION_HORIZON, Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor,
+        ShardRecovery, Signer, SignerBitfield, StateRoot, StoredReceipt, SubstateKey, TickHalf,
+        TransactionDecision, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet, Window, Word,
     };
     use hyperscale_vm_types::Seeded;
 
@@ -8093,28 +7974,18 @@ mod tests {
         );
         state.unresolved.certify(tx_hash);
         assert!(
-            state.evidence.refusals().is_empty(),
+            state.evidence.all().is_empty(),
             "nothing was broadcast to this replica"
         );
 
         let anchor = WeightedTimestamp::from_millis(7_000);
         let digest = Hash::from_bytes(b"digest");
-        let verdict = VerdictClaim {
-            shard: PEER,
-            tx_hash,
-            anchor_ts: anchor,
-            decision: TransactionDecision::Reject,
-            digest,
-        };
-        let actions = state.fold_verdict(&verdict);
+        let verdict = refused(anchor, digest);
+        let actions = state.fold_verdict(PEER, tx_hash, verdict);
 
         assert_eq!(
-            state.evidence.refusal(tx_hash, PEER),
-            Some(Refusal {
-                refused_wt: anchor,
-                decision: TransactionDecision::Reject,
-                digest,
-            }),
+            state.evidence.heard(tx_hash, PEER, Question::Verdict),
+            Some(verdict),
             "the chain's own word reaches the mirror the record fence reads",
         );
         assert!(
@@ -8127,16 +7998,20 @@ mod tests {
 
         // The fold is first-write-wins, as the chain's answer is: a
         // second claim restates a decision already committed.
-        let again = state.fold_verdict(&VerdictClaim {
-            anchor_ts: WeightedTimestamp::from_millis(8_000),
-            ..verdict
-        });
+        let again = state.fold_verdict(
+            PEER,
+            tx_hash,
+            Heard {
+                at: WeightedTimestamp::from_millis(8_000),
+                ..verdict
+            },
+        );
         assert!(again.is_empty(), "{again:?}");
         assert_eq!(
             state
                 .evidence
-                .refusal(tx_hash, PEER)
-                .map(|held| held.refused_wt),
+                .heard(tx_hash, PEER, Question::Verdict)
+                .map(|held| held.at),
             Some(anchor),
         );
 
@@ -8150,13 +8025,10 @@ mod tests {
         );
         assert!(
             fresh
-                .fold_verdict(&VerdictClaim {
-                    decision: TransactionDecision::Accept,
-                    ..verdict
-                })
+                .fold_verdict(PEER, tx_hash, accepted(anchor, digest))
                 .is_empty(),
         );
-        assert!(fresh.evidence.refusals().is_empty());
+        assert!(fresh.evidence.all().is_empty());
     }
 
     /// A core's refusal of a transaction a leg here issued for is
@@ -8197,14 +8069,13 @@ mod tests {
             )))
         };
         let actions = state.handle_attestation(&schedule, &certificate(ExecutionOutcome::Failed));
-        let mirrored = state.evidence.refusal(tx_hash, PEER);
+        let word = refused(
+            WeightedTimestamp::from_millis(7_000),
+            certificate(ExecutionOutcome::Failed).attested_digest(),
+        );
         assert_eq!(
-            mirrored,
-            Some(Refusal {
-                refused_wt: WeightedTimestamp::from_millis(7_000),
-                decision: TransactionDecision::Reject,
-                digest: mirrored.expect("mirrored above").digest,
-            }),
+            state.evidence.heard(tx_hash, PEER, Question::Verdict),
+            Some(word),
             "the refusal reaches the mirror the vote fence reads"
         );
         assert!(
@@ -8216,9 +8087,9 @@ mod tests {
         );
         assert_eq!(
             state.pending_abandonment_records(),
-            vec![AbandonmentRecord::refused(
+            vec![AbandonmentRecord::heard(
                 PEER,
-                WeightedTimestamp::from_millis(7_000),
+                word,
                 [UnsettledTx::for_transaction(&transaction)],
             )],
             "and a record is offered under the certificate's anchor"
@@ -8420,7 +8291,7 @@ mod tests {
             certificates,
             provisions,
             abandonment_records,
-            state_proofs: Arc::new(bundles.into_iter().map(CounterpartClaim::Cells).collect()),
+            state_proofs: Arc::new(bundles),
             witness_sources,
         };
         state.on_block_committed(schedule, &test_certify(block, ts_ms))
@@ -8428,7 +8299,7 @@ mod tests {
 
     /// The absences of `tx_hash` at [`PEER`] handed to the fence among
     /// mirror.
-    fn absences_observed(state: &ExecutionCoordinator, tx_hash: TxHash) -> Vec<Absence> {
+    fn absences_observed(state: &ExecutionCoordinator, tx_hash: TxHash) -> Vec<Heard> {
         absences_observed_at(state, PEER, tx_hash)
     }
 
@@ -8438,11 +8309,41 @@ mod tests {
         state: &ExecutionCoordinator,
         at: ShardId,
         tx_hash: TxHash,
-    ) -> Vec<Absence> {
+    ) -> Vec<Heard> {
         [Probed::Core, Probed::Delivery, Probed::Claim]
             .into_iter()
-            .filter_map(|probed| state.evidence.absence(tx_hash, at, probed))
+            .filter_map(|probed| state.evidence.heard(tx_hash, at, Question::Cell(probed)))
             .collect()
+    }
+
+    /// `probed` proved absent at `at`.
+    fn absent(probed: Probed, at: WeightedTimestamp) -> Heard {
+        Heard {
+            question: Question::Cell(probed),
+            word: Word::Absent,
+            at,
+        }
+    }
+
+    /// A rejection at `at`, by the certificate `digest` names.
+    fn refused(at: WeightedTimestamp, digest: Hash) -> Heard {
+        Heard {
+            question: Question::Verdict,
+            word: Word::Refused {
+                decision: TransactionDecision::Reject,
+                digest,
+            },
+            at,
+        }
+    }
+
+    /// An acceptance at `at`, by the certificate `digest` names.
+    fn accepted(at: WeightedTimestamp, digest: Hash) -> Heard {
+        Heard {
+            question: Question::Verdict,
+            word: Word::Accepted { digest },
+            at,
+        }
     }
 
     /// A delivery that never claimed is probed at its lapse, the
@@ -8502,11 +8403,15 @@ mod tests {
         let _ = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert_eq!(
             absences_observed(&state, tx_hash),
-            vec![Absence { probed_wt: later }],
+            vec![absent(Probed::Delivery, later)],
         );
         assert_eq!(
             state.pending_abandonment_records(),
-            vec![AbandonmentRecord::lapsed(PEER, later, [figures])],
+            vec![AbandonmentRecord::heard(
+                PEER,
+                absent(Probed::Delivery, later),
+                [figures]
+            )],
             "offered as a lapse, under the anchor it was proved at"
         );
     }
@@ -8552,7 +8457,7 @@ mod tests {
         state.on_state_proof_verified(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
         assert_eq!(
             state.pending_state_proofs(),
-            vec![CounterpartClaim::Cells(bundle.clone())],
+            vec![bundle.clone()],
             "dated to the clock the probe read off the header"
         );
 
@@ -8560,7 +8465,7 @@ mod tests {
         commit_carrying(&mut state, &schedule, 1, deadline_ms, Vec::new());
         assert_eq!(
             state.pending_state_proofs(),
-            vec![CounterpartClaim::Cells(bundle.clone())],
+            vec![bundle.clone()],
             "a block carrying no proofs leaves the offer standing"
         );
         commit_carrying(&mut state, &schedule, 2, deadline_ms, vec![bundle]);
@@ -8648,11 +8553,15 @@ mod tests {
         let _ = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert_eq!(
             absences_observed_at(&state, successor, tx_hash),
-            vec![Absence { probed_wt: later }],
+            vec![absent(Probed::Delivery, later)],
         );
         assert_eq!(
             state.pending_abandonment_records(),
-            vec![AbandonmentRecord::lapsed(successor, later, [figures])],
+            vec![AbandonmentRecord::heard(
+                successor,
+                absent(Probed::Delivery, later),
+                [figures]
+            )],
             "offered as a lapse under the successor's name"
         );
     }
@@ -8769,12 +8678,16 @@ mod tests {
         );
         assert_eq!(
             absences_observed_at(&state, CORE, tx_hash),
-            vec![Absence { probed_wt: later }],
+            vec![absent(Probed::Core, later)],
             "the absence reaches the mirror the vote fence reads"
         );
         assert_eq!(
             state.pending_abandonment_records(),
-            vec![AbandonmentRecord::unclaimed(CORE, later, [figures])],
+            vec![AbandonmentRecord::heard(
+                CORE,
+                absent(Probed::Core, later),
+                [figures]
+            )],
             "and a record is offered under the anchor it was proved at"
         );
 
@@ -8910,7 +8823,11 @@ mod tests {
         );
         assert_eq!(
             state.pending_abandonment_records(),
-            vec![AbandonmentRecord::untaken(PEER, deadline, [figures])],
+            vec![AbandonmentRecord::heard(
+                PEER,
+                absent(Probed::Claim, deadline),
+                [figures]
+            )],
             "offered as untaken, under the anchor it was proved at"
         );
 
@@ -9062,7 +8979,10 @@ mod tests {
             "a present claim fetches the consumer's certificate"
         );
         assert!(
-            state.evidence.acceptance(tx_hash, PEER).is_none(),
+            state
+                .evidence
+                .heard(tx_hash, PEER, Question::Verdict)
+                .is_none(),
             "and is not itself evidence"
         );
         assert!(state.pending_abandonment_records().is_empty());
@@ -9100,23 +9020,21 @@ mod tests {
             )),
             "the fence is told the acceptance landed"
         );
+        let word = accepted(probed_wt, certificate.attested_digest());
         assert_eq!(
-            state
-                .evidence
-                .acceptance(tx_hash, PEER)
-                .map(|acceptance| acceptance.accepted_wt),
-            Some(probed_wt),
+            state.evidence.heard(tx_hash, PEER, Question::Verdict),
+            Some(word),
             "the acceptance reaches the mirror the vote fence reads"
         );
         assert_eq!(
             state.pending_abandonment_records(),
-            vec![AbandonmentRecord::accepted(PEER, probed_wt, [figures])],
+            vec![AbandonmentRecord::heard(PEER, word, [figures])],
             "and a record is offered under the certificate's anchor"
         );
 
         state
             .unresolved
-            .record_abandonment_records(&[AbandonmentRecord::accepted(PEER, probed_wt, [figures])]);
+            .record_abandonment_records(&[AbandonmentRecord::heard(PEER, word, [figures])]);
         let actions = commit_carrying(&mut state, &schedule, 2, probed_wt.as_millis(), Vec::new());
         let request = actions
             .iter()

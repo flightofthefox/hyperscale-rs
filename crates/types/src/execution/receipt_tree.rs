@@ -1,107 +1,35 @@
 //! Receipt tree leaves and `global_receipt_root` computation/proof helpers.
 
+use hyperscale_hbor::to_vec as hbor_to_vec;
+
 use crate::{
-    ExecutionOutcome, GlobalReceiptRoot, Hash, ShardId, TxOutcome, compute_merkle_root,
-    compute_merkle_root_with_proof,
+    GlobalReceiptRoot, Hash, TxOutcome, compute_merkle_root, compute_merkle_root_with_proof,
 };
 
-/// Compute the leaf hash for a transaction outcome in the receipt tree.
+/// Domain tag separating a transaction outcome's receipt-tree leaf from
+/// every other leaf preimage the codebase hashes.
+const TX_OUTCOME_LEAF_TAG: &[u8] = b"hyperscale.tx_outcome_leaf.v1";
+
+/// The leaf hash of a transaction outcome in the receipt tree: the tag
+/// and the outcome's canonical encoding.
 ///
-/// - `Succeeded`: `H(tx_hash || receipt_hash)`
-/// - `Failed`:    `H(tx_hash || b"FAILED:")` (domain-tagged; canonical hash is implicit)
-/// - `Aborted`:   `H(tx_hash || b"ABORTED:")`
+/// The vote signature covers only the receipt root, and decoding
+/// recomputes that root from the outcomes, so every field of the
+/// outcome has to sit under the leaf or it is an aggregator's to forge:
+/// the verdict, the attested and reserved work, any settled fee receipt,
+/// the shards the settlement waits on, what the execution escrowed and
+/// where those crossings land, and what the outcome says of its own
+/// role. The encoding admits one reading of all of them, so nothing is
+/// packed by hand.
 ///
-/// The domain tags ensure the three variants can never collide.
+/// # Panics
 ///
-/// The attested `work` scalar, any settled fee receipt, and the three
-/// lists — the shards the transaction's settlement waits on, what the
-/// execution escrowed out, and where those crossings land — extend the
-/// leaf under their own domain tags. The vote signature covers only the
-/// receipt root, and decoding recomputes that root from the outcomes —
-/// so a field outside the leaf would be an aggregator's to forge. Work
-/// in particular feeds emission weighting and the reshape load
-/// predicate, the awaited shards decide how many certificates it takes
-/// to settle the transaction at all, and an escrowed entry is what a
-/// consuming shard claims, so all of it must sit under the signed root.
-///
-/// The lists are led by their three counts. Each entry is fixed-width,
-/// which makes one list admit one reading; three lists in a row do not,
-/// because a 104-byte escrowed entry carries 32 bytes of manifest-chosen
-/// resource address and can spell whatever separates them. The counts
-/// fix the split on their own, so the reading never rests on a tag
-/// being unspellable.
+/// If the outcome does not encode, which one built under its caps
+/// always does.
 #[must_use]
 pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
-    let base = match outcome.outcome() {
-        ExecutionOutcome::Succeeded { receipt_hash } => {
-            Hash::from_parts(&[outcome.tx_hash().as_bytes(), receipt_hash.as_bytes()])
-        }
-        ExecutionOutcome::Failed => Hash::from_parts(&[outcome.tx_hash().as_bytes(), b"FAILED:"]),
-        ExecutionOutcome::Aborted => Hash::from_parts(&[outcome.tx_hash().as_bytes(), b"ABORTED:"]),
-    };
-    let with_work = Hash::from_parts(&[
-        base.as_bytes(),
-        b"WORK:",
-        &outcome.attested_work().to_le_bytes(),
-        b"RESERVED:",
-        &outcome.declared_work().to_le_bytes(),
-    ]);
-    let with_fee = outcome.fee_receipt().map_or(with_work, |fee_receipt| {
-        Hash::from_parts(&[with_work.as_bytes(), b"FEE:", fee_receipt.as_bytes()])
-    });
-    let count = |len: usize| u32::try_from(len).unwrap_or(u32::MAX).to_le_bytes();
-    let counts: Vec<u8> = [
-        count(outcome.counterparts().len()),
-        count(outcome.escrowed().len()),
-        count(outcome.crossing_targets().len()),
-    ]
-    .concat();
-    let awaited = shard_bytes(outcome.counterparts());
-    // Fixed-width per entry, like the shard lists either side of it.
-    let escrowed: Vec<u8> = outcome
-        .escrowed()
-        .iter()
-        .flat_map(|entry| {
-            let mut bytes = [0u8; 104];
-            bytes[..4].copy_from_slice(&entry.node.to_le_bytes());
-            bytes[4..8].copy_from_slice(&entry.output.to_le_bytes());
-            bytes[8..40].copy_from_slice(&entry.resource.to_bytes());
-            bytes[40..56].copy_from_slice(&entry.amount.to_le_bytes());
-            bytes[56..].copy_from_slice(&entry.record.to_bytes());
-            bytes
-        })
-        .collect();
-    let targets = shard_bytes(outcome.crossing_targets());
-    Hash::from_parts(&[
-        with_fee.as_bytes(),
-        b"LISTS:",
-        &counts,
-        b"AWAITS:",
-        &awaited,
-        b"ESCROWED:",
-        &escrowed,
-        b"CROSSING:",
-        &targets,
-        b"DECIDES:",
-        &[u8::from(outcome.decides())],
-        b"EXECUTES:",
-        &[u8::from(outcome.executes())],
-    ])
-}
-
-/// A shard list as fixed-width entries, so the concatenation admits one
-/// reading — a variable encoding would let two different sets agree on
-/// their bytes.
-fn shard_bytes(shards: &[ShardId]) -> Vec<u8> {
-    shards
-        .iter()
-        .flat_map(|shard| {
-            let mut bytes = [0u8; 12];
-            bytes[..4].copy_from_slice(&shard.depth().to_le_bytes());
-            bytes[4..].copy_from_slice(&shard.path().to_le_bytes());
-            bytes
-        })
-        .collect()
+    let bytes = hbor_to_vec(outcome).expect("a transaction outcome encodes");
+    Hash::from_parts(&[TX_OUTCOME_LEAF_TAG, &bytes])
 }
 
 /// Compute the receipt root from a list of transaction outcomes.
@@ -188,7 +116,7 @@ mod tests {
     use hyperscale_vm_types::{Address, AddressClass, LocalKey, ResourceAddr, SubstateKey};
 
     use super::*;
-    use crate::{EscrowedValue, GlobalReceiptHash, TxHash};
+    use crate::{EscrowedValue, ExecutionOutcome, GlobalReceiptHash, ShardId, TxHash};
 
     /// Whether an outcome decides its transaction is under the signed
     /// leaf: a leg's success and a core's are otherwise identical bytes.

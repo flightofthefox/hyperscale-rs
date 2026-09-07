@@ -12,15 +12,15 @@ use hyperscale_types::{
     AbandonmentRecord, BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount,
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote,
     CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
-    CertifiedBlockHeader, ConsensusPublicKey, CounterpartClaim, DeclaredRange, Epoch,
-    EscrowedValue, ExecutionCertificate, ExecutionVote, Finalization, GlobalReceiptRoot, Hash,
-    HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
-    PcVoteEquivocation, PrincipalAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap,
-    Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote,
-    ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round,
-    ShardForkProof, ShardId, ShardLoad, ShardTrie, ShardVoteEquivocation, SharedCertificates,
-    SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
-    SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry, SubstateKey,
+    CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, EscrowedValue,
+    ExecutionCertificate, ExecutionVote, Finalization, GlobalReceiptRoot, Hash, HeaderFetchCount,
+    LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
+    PrincipalAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
+    ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadySignal,
+    ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round, ShardForkProof,
+    ShardId, ShardLoad, ShardTrie, ShardVoteEquivocation, SharedCertificates, SharedTransactions,
+    SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
+    SpcView, SplitChildRoots, StateProofBundle, StateRoot, SubstateEntry, SubstateKey,
     SweepFrontier, TerminalEvidence, TerminalRoots, TickId, Timeout, TopologySchedule,
     TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
     UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
@@ -990,7 +990,7 @@ pub enum Action {
         /// Block whose state proofs are being checked.
         block_hash: BlockHash,
         /// Every bundle the block carries.
-        state_proofs: Vec<CounterpartClaim>,
+        state_proofs: Vec<StateProofBundle>,
     },
 
     /// Build a complete block proposal.
@@ -1035,7 +1035,7 @@ pub enum Action {
         abandonment_records: Vec<AbandonmentRecord>,
         /// Proofs of counterparts' cells this proposer's fetches
         /// answered, for every replica to fold at commit.
-        state_proofs: Vec<CounterpartClaim>,
+        state_proofs: Vec<StateProofBundle>,
         /// Prior fee-reservation demand per local payer among the
         /// candidate transactions — in-flight holds plus the uncommitted
         /// window, excluding the candidates themselves. The builder

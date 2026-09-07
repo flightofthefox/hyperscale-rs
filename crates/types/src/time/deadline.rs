@@ -136,7 +136,7 @@ impl Window {
 
 /// Which counterpart a probe asks, and so which record its absence is
 /// offered as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
 pub enum Probed {
     /// A core's committed cell, past the transaction's deadline.
     Core,

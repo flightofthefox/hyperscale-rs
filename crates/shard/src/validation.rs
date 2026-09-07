@@ -18,11 +18,11 @@ use std::sync::Arc;
 
 use hyperscale_engine::writes_committed_cell;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, FinalizationHash, LocalTimestamp, MAX_PROVISIONS_PER_BLOCK,
-    MAX_ROUND_GAP, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
-    MAX_UNSETTLED_PER_BLOCK, ProvisionHash, QuorumCertificate, ShardId, ShardLoad,
-    TopologySnapshot, Transaction, TxHash, Verifiable, VoteCount, abandonment_root_from_records,
-    state_proofs_root_from_bundles, sweep_admits_block,
+    Block, BlockHeader, BlockHeight, CounterpartEvidence, FinalizationHash, LocalTimestamp,
+    MAX_ROUND_GAP, MAX_STATE_PROOFS_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK,
+    MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MAX_UNSETTLED_PER_BLOCK, ProvisionHash,
+    QuorumCertificate, ShardId, ShardLoad, TopologySnapshot, Transaction, TxHash, Verifiable,
+    VoteCount, abandonment_root_from_records, state_proofs_root_from_bundles, sweep_admits_block,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -663,22 +663,21 @@ pub fn validate_state_proofs_well_formed(block: &Block) -> Result<(), String> {
             "state proofs root {claimed:?} does not commit the block's bundles {computed:?}"
         ));
     }
-    if bundles.len() > MAX_PROVISIONS_PER_BLOCK {
+    if bundles.len() > MAX_STATE_PROOFS_PER_BLOCK {
         return Err(format!(
-            "block carries {} state proofs, over the cap of {MAX_PROVISIONS_PER_BLOCK}",
+            "block carries {} state proofs, over the cap of {MAX_STATE_PROOFS_PER_BLOCK}",
             bundles.len()
         ));
     }
-    for (at, claim) in bundles.iter().enumerate() {
-        if !claim.is_well_formed() {
+    for (at, bundle) in bundles.iter().enumerate() {
+        if !bundle.is_well_formed() {
             return Err(format!(
-                "counterpart claim {at} is empty, over its cap, out of order, or names a \
-                 verdict that licenses nothing"
+                "state proof {at} is empty, over its cap, or out of order"
             ));
         }
-        if at > 0 && bundles[at - 1] >= *claim {
+        if at > 0 && bundles[at - 1] >= *bundle {
             return Err(format!(
-                "counterpart claim {at} repeats or precedes the one before it"
+                "state proof {at} repeats or precedes the one before it"
             ));
         }
     }
@@ -711,7 +710,7 @@ pub fn validate_abandonment_records_well_formed(block: &Block) -> Result<(), Str
     }
 
     let mut named = 0usize;
-    let mut previous: Option<(ShardId, u8)> = None;
+    let mut previous: Option<(ShardId, CounterpartEvidence)> = None;
     for verdict in verdicts {
         if !verdict.is_well_formed() {
             return Err(format!(
@@ -725,7 +724,7 @@ pub fn validate_abandonment_records_well_formed(block: &Block) -> Result<(), Str
         // reader, and a reordering would be a second form of the same
         // block. One shard may carry several arms: what it claimed and
         // what it left unclaimed are different transactions.
-        let position = (verdict.shard(), verdict.evidence().discriminant());
+        let position = (verdict.shard(), verdict.evidence());
         if previous.is_some_and(|previous| previous >= position) {
             return Err(format!(
                 "abandonment record for {:?} repeats or precedes the one before it",
@@ -827,13 +826,12 @@ mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
-        BlockHeader, BlockHeaderParts, ChainOrigin, CounterpartClaim, Deadline, Finalization, Hash,
-        LocalKey, MAX_SUBINTENTS, MerkleInclusionProof, NetworkDefinition, PrincipalAddr,
-        ProposerTimestamp, ProvisionEntry, Provisions, QuorumCertificate, Round, ShardId,
-        ShardLoad, Signer, SignerBitfield, StateAnchor, StateProofBundle, StateProofsRoot,
-        StateRoot, SubstateKey, TimestampRange, Transaction, TransactionDecision, UnsettledTx,
-        ValidatorId, ValidatorInfo, ValidatorSet, VerdictClaim, Verifiable, Verified,
-        WeightedTimestamp, WitnessSources, test_utils,
+        BlockHeader, BlockHeaderParts, ChainOrigin, Deadline, Finalization, Hash, Heard, LocalKey,
+        MAX_SUBINTENTS, MerkleInclusionProof, NetworkDefinition, PrincipalAddr, ProposerTimestamp,
+        ProvisionEntry, Provisions, Question, QuorumCertificate, Round, ShardId, ShardLoad, Signer,
+        SignerBitfield, StateAnchor, StateProofBundle, StateProofsRoot, StateRoot, SubstateKey,
+        TimestampRange, Transaction, TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo,
+        ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources, Word, test_utils,
     };
 
     use super::*;
@@ -1372,7 +1370,7 @@ mod tests {
     }
 
     /// A block carrying `bundles` under a header claiming `root`.
-    fn block_with_state_proofs(bundles: Vec<CounterpartClaim>, root: StateProofsRoot) -> Block {
+    fn block_with_state_proofs(bundles: Vec<StateProofBundle>, root: StateProofsRoot) -> Block {
         let base = header_at_height(BlockHeight::new(6), 100_000);
         Block::Live {
             header: BlockHeader::new(BlockHeaderParts {
@@ -1395,9 +1393,9 @@ mod tests {
         }
     }
 
-    /// A cells claim against `ROOT` at `height`, answering for `keys`.
-    fn bundle_at(height: u64, keys: &[u8]) -> CounterpartClaim {
-        CounterpartClaim::Cells(StateProofBundle::new(
+    /// A bundle against `ROOT` at `height`, answering for `keys`.
+    fn bundle_at(height: u64, keys: &[u8]) -> StateProofBundle {
+        StateProofBundle::new(
             StateAnchor {
                 shard: ShardId::ROOT,
                 height: BlockHeight::new(height),
@@ -1409,7 +1407,7 @@ mod tests {
                 local: LocalKey([*seed; 16]),
             }),
             MerkleInclusionProof::dummy(),
-        ))
+        )
     }
 
     /// The section is bound to the header's root and held to one form:
@@ -1432,7 +1430,7 @@ mod tests {
         .expect_err("a root that does not commit the bundles is refused");
         assert!(err.contains("does not commit"), "{err}");
 
-        let reversed: Vec<CounterpartClaim> = bundles.iter().rev().cloned().collect();
+        let reversed: Vec<StateProofBundle> = bundles.iter().rev().cloned().collect();
         let err = validate_state_proofs_well_formed(&block_with_state_proofs(
             reversed.clone(),
             state_proofs_root_from_bundles(&reversed),
@@ -1448,35 +1446,16 @@ mod tests {
         .expect_err("a repeated bundle is refused");
         assert!(err.contains("repeats or precedes"), "{err}");
 
-        let CounterpartClaim::Cells(cells) = bundle_at(3, &[1]) else {
-            unreachable!("a cells claim")
-        };
-        let empty = vec![CounterpartClaim::Cells(StateProofBundle {
+        let empty = vec![StateProofBundle {
             keys: Vec::new(),
-            ..cells
-        })];
+            ..bundle_at(3, &[1])
+        }];
         let err = validate_state_proofs_well_formed(&block_with_state_proofs(
             empty.clone(),
             state_proofs_root_from_bundles(&empty),
         ))
         .expect_err("a bundle naming no key is refused");
         assert!(err.contains("empty"), "{err}");
-
-        // A verdict that licenses nothing is as malformed as a bundle
-        // naming no key: both cost a leaf for an answer nothing reads.
-        let accepted = vec![CounterpartClaim::Verdict(VerdictClaim {
-            shard: ShardId::ROOT,
-            tx_hash: TxHash::from(Hash::from_bytes(b"tx")),
-            anchor_ts: WeightedTimestamp::from_millis(1),
-            decision: TransactionDecision::Accept,
-            digest: Hash::from_bytes(b"digest"),
-        })];
-        let err = validate_state_proofs_well_formed(&block_with_state_proofs(
-            accepted.clone(),
-            state_proofs_root_from_bundles(&accepted),
-        ))
-        .expect_err("an acceptance licenses no record");
-        assert!(err.contains("licenses nothing"), "{err}");
     }
 
     fn named(tx_hash: TxHash) -> UnsettledTx {
@@ -1562,11 +1541,18 @@ mod tests {
 
         // One shard under two arms is two answers about two sets of
         // transactions, in arm order.
+        let accepted = Heard {
+            question: Question::Verdict,
+            word: Word::Accepted {
+                digest: Hash::from_bytes(b"digest"),
+            },
+            at: WeightedTimestamp::from_millis(9),
+        };
         let two_arms = vec![
             verdict(left, &[1]),
-            AbandonmentRecord::accepted(
+            AbandonmentRecord::heard(
                 left,
-                WeightedTimestamp::from_millis(9),
+                accepted,
                 [named(TxHash::from(Hash::from_bytes(&[2; 32])))],
             ),
         ];
@@ -1575,9 +1561,9 @@ mod tests {
             validate_abandonment_records_well_formed(&block_with_verdicts(two_arms, root)).is_ok()
         );
         let arms_reversed = vec![
-            AbandonmentRecord::accepted(
+            AbandonmentRecord::heard(
                 left,
-                WeightedTimestamp::from_millis(9),
+                accepted,
                 [named(TxHash::from(Hash::from_bytes(&[2; 32])))],
             ),
             verdict(left, &[1]),

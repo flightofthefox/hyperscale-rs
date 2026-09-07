@@ -11,7 +11,7 @@
 
 use hyperscale_vm_types::TX_UNITS;
 
-use crate::WorkInFlight;
+use crate::{Question, WorkInFlight};
 
 /// Hard cap on the number of live transactions any single block can carry.
 ///
@@ -136,17 +136,13 @@ pub const MAX_UNSETTLED_PER_BLOCK: usize = (MAX_DRAIN_WORK / TX_UNITS) as usize;
 /// it carries at most one per counterpart shard per arm of the evidence
 /// vocabulary, and a record may name a live shard — a refusing core, a
 /// consumer that claimed — as readily as one that left. So the bound is
-/// the shard count times the arms: more records than that names a shard
-/// that does not exist or an arm twice. A shard with evidence at several
-/// anchors under one arm drains one anchor per block, which costs
-/// settlement rate rather than this bound.
+/// the shard count times the arms, a departure and one per question:
+/// more records than that names a shard that does not exist or an arm
+/// twice. A shard with evidence at several anchors under one arm drains
+/// one anchor per block, which costs settlement rate rather than this
+/// bound.
 pub const MAX_ABANDONMENT_RECORDS_PER_BLOCK: usize =
-    MAX_PROVISION_TARGET_SHARDS * UNSETTLEABLE_ARMS;
-
-/// The arms of the record vocabulary: departed, refused, unclaimed,
-/// lapsed, claimed and untaken. Stated beside the cap that multiplies
-/// by it.
-pub const UNSETTLEABLE_ARMS: usize = 6;
+    MAX_PROVISION_TARGET_SHARDS * (1 + Question::ALL.len());
 
 /// Cap on the number of shards a block can name as provision targets, at
 /// decode time.
@@ -189,6 +185,15 @@ pub const MAX_COMMITTED_TX_QUERY: usize = 256;
 /// for small-to-mid-shard topologies; widening the topology may require
 /// revisiting.
 pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
+
+/// Hard cap on the state-proof bundles a block can carry.
+///
+/// One bundle answers one fetch against one counterpart height; the
+/// proposer offers what its own fetches answered and the rest waits a
+/// block. Bounded so the vote fence's deferral — which withholds the
+/// vote on the whole block — cannot couple every transaction in a block
+/// to the slowest proof on the abort path.
+pub const MAX_STATE_PROOFS_PER_BLOCK: usize = 256;
 
 /// How far the drain's transaction *count* may run past the depth its
 /// work budget is sized for, when every transaction is as cheap as one

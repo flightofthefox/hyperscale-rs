@@ -1,10 +1,10 @@
 //! What this node has heard counterparts say about the transactions its
 //! legs issued for, as one mirror.
 //!
-//! Three facts live here, each about one `(transaction, counterpart)`
-//! pair: a core shard's refusal, read off its certificate; a
-//! counterpart's proved absence of a cell; and a consumer's acceptance,
-//! read off its certificate. Each licenses an abandonment record, and each is asked
+//! One fact lives here, about one `(transaction, counterpart, question)`
+//! triple: what the counterpart said and when — a verdict read off its
+//! certificate, or a cell's absence read off a proof the chain
+//! committed. Each licenses an abandonment record, and each is asked
 //! about twice — once by the execution coordinator, composing the record
 //! to offer, and once by the vote fence, checking a record a block
 //! carries against what this validator itself holds.
@@ -35,19 +35,18 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::RwLock;
 
-use crate::{Absence, Acceptance, Probed, Refusal, SettledTxSet, ShardId, TxHash};
+use crate::{Heard, Question, SettledTxSet, ShardId, TxHash};
 
 /// The facts, under one lock: they are written together at a commit and
 /// read together at a vote, so splitting them would buy contention
 /// nobody is waiting on.
 #[derive(Debug, Default)]
 struct Mirrored {
-    refusals: HashMap<(TxHash, ShardId), Refusal>,
-    /// Keyed by the question too: a core's committed cell proved absent
-    /// is not a delivery's claim proved absent, and they license
-    /// different records held to different floors.
-    absences: HashMap<(TxHash, ShardId, Probed), Absence>,
-    acceptances: HashMap<(TxHash, ShardId), Acceptance>,
+    /// What each counterpart said to each question about each
+    /// transaction, first word winning: a shard says one thing per
+    /// question, and the moment a record is checked against must not
+    /// move under it.
+    heard: HashMap<(TxHash, ShardId, Question), Heard>,
     /// Complete settled-transaction sets of shards that have terminated,
     /// each verified against its beacon-attested terminal root. Absence
     /// from a set is proof, not ignorance.
@@ -72,136 +71,46 @@ impl CounterpartMirror {
         Self::default()
     }
 
-    /// Record a core shard's refusal, first word winning.
+    /// Record what `shard` said about `tx_hash`, first word winning.
     ///
-    /// `true` when this is the first refusal held for the pair — a
-    /// second certificate restates a decision already mirrored, and the
-    /// anchor the record is checked against must not move under it.
+    /// `true` when this is the first word held for the question — a
+    /// second certificate or proof restates an answer already mirrored.
     ///
     /// # Panics
     ///
     /// If the lock is poisoned, which means a consumer panicked holding
     /// it — the node is already unsound at that point.
-    pub fn record_refusal(&self, tx_hash: TxHash, shard: ShardId, refusal: Refusal) -> bool {
+    pub fn record(&self, tx_hash: TxHash, shard: ShardId, heard: Heard) -> bool {
         let mut mirrored = self.write();
-        let vacant = !mirrored.refusals.contains_key(&(tx_hash, shard));
+        let key = (tx_hash, shard, heard.question);
+        let vacant = !mirrored.heard.contains_key(&key);
         if vacant {
-            mirrored.refusals.insert((tx_hash, shard), refusal);
+            mirrored.heard.insert(key, heard);
         }
         vacant
     }
 
-    /// Record a counterpart's proved absence of a cell, first proof
-    /// winning.
-    ///
-    /// # Panics
-    ///
-    /// If the lock is poisoned.
-    pub fn record_absence(
-        &self,
-        tx_hash: TxHash,
-        shard: ShardId,
-        probed: Probed,
-        absence: Absence,
-    ) {
-        self.write()
-            .absences
-            .entry((tx_hash, shard, probed))
-            .or_insert(absence);
-    }
-
-    /// Record a consumer's acceptance, first word winning.
-    ///
-    /// `true` when this is the first acceptance held for the pair.
-    ///
-    /// # Panics
-    ///
-    /// If the lock is poisoned.
-    pub fn record_acceptance(
-        &self,
-        tx_hash: TxHash,
-        shard: ShardId,
-        acceptance: Acceptance,
-    ) -> bool {
-        let mut mirrored = self.write();
-        let vacant = !mirrored.acceptances.contains_key(&(tx_hash, shard));
-        if vacant {
-            mirrored.acceptances.insert((tx_hash, shard), acceptance);
-        }
-        vacant
-    }
-
-    /// The refusal held for one pair.
+    /// What `shard` said to `question` about `tx_hash`, if anything.
     ///
     /// # Panics
     ///
     /// If the lock is poisoned.
     #[must_use]
-    pub fn refusal(&self, tx_hash: TxHash, shard: ShardId) -> Option<Refusal> {
-        self.read().refusals.get(&(tx_hash, shard)).copied()
+    pub fn heard(&self, tx_hash: TxHash, shard: ShardId, question: Question) -> Option<Heard> {
+        self.read().heard.get(&(tx_hash, shard, question)).copied()
     }
 
-    /// The absence held for one pair.
+    /// Everything held, with the pair each speaks for.
     ///
     /// # Panics
     ///
     /// If the lock is poisoned.
     #[must_use]
-    pub fn absence(&self, tx_hash: TxHash, shard: ShardId, probed: Probed) -> Option<Absence> {
-        self.read().absences.get(&(tx_hash, shard, probed)).copied()
-    }
-
-    /// The acceptance held for one pair.
-    ///
-    /// # Panics
-    ///
-    /// If the lock is poisoned.
-    #[must_use]
-    pub fn acceptance(&self, tx_hash: TxHash, shard: ShardId) -> Option<Acceptance> {
-        self.read().acceptances.get(&(tx_hash, shard)).copied()
-    }
-
-    /// Every refusal held, with the pair it speaks for.
-    ///
-    /// # Panics
-    ///
-    /// If the lock is poisoned.
-    #[must_use]
-    pub fn refusals(&self) -> Vec<(TxHash, ShardId, Refusal)> {
+    pub fn all(&self) -> Vec<(TxHash, ShardId, Heard)> {
         self.read()
-            .refusals
+            .heard
             .iter()
-            .map(|(&(tx_hash, shard), &refusal)| (tx_hash, shard, refusal))
-            .collect()
-    }
-
-    /// Every absence held of the kind `probed` asks, with the pair it
-    /// speaks for.
-    ///
-    /// # Panics
-    ///
-    /// If the lock is poisoned.
-    #[must_use]
-    pub fn absences(&self, probed: Probed) -> Vec<(TxHash, ShardId, Absence)> {
-        self.read()
-            .absences
-            .iter()
-            .filter(|((_, _, kind), _)| *kind == probed)
-            .map(|(&(tx_hash, shard, _), &absence)| (tx_hash, shard, absence))
-            .collect()
-    }
-
-    /// Every acceptance held, with the pair it speaks for.
-    ///
-    /// # Panics
-    ///
-    /// If the lock is poisoned.
-    #[must_use]
-    pub fn acceptances(&self) -> Vec<(TxHash, ShardId, Acceptance)> {
-        self.read()
-            .acceptances
-            .iter()
-            .map(|(&(tx_hash, shard), &acceptance)| (tx_hash, shard, acceptance))
+            .map(|(&(tx_hash, shard, _), &heard)| (tx_hash, shard, heard))
             .collect()
     }
 
@@ -265,12 +174,7 @@ impl CounterpartMirror {
     ///
     /// If the lock is poisoned.
     pub fn retain(&self, held: &dyn Fn(TxHash) -> bool) {
-        let mut mirrored = self.write();
-        mirrored.refusals.retain(|&(tx_hash, _), _| held(tx_hash));
-        mirrored.absences.retain(|&(tx_hash, ..), _| held(tx_hash));
-        mirrored
-            .acceptances
-            .retain(|&(tx_hash, _), _| held(tx_hash));
+        self.write().heard.retain(|&(tx_hash, ..), _| held(tx_hash));
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Mirrored> {

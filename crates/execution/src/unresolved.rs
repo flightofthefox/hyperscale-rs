@@ -24,10 +24,10 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Absence, Address, BlockHeight, CounterpartEvidence, Deadline,
-    Finalization, MAX_VALIDITY_RANGE, Probed, ShardId, ShardTrie, StateAnchor, SubstateKey,
-    Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
-    WeightedTimestamp, Window,
+    AbandonmentRecord, AbortCharge, Address, BlockHeight, CounterpartEvidence, Deadline,
+    Finalization, MAX_VALIDITY_RANGE, Probed, Question, ShardId, ShardTrie, StateAnchor,
+    SubstateKey, Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable,
+    Verified, WeightedTimestamp, Window, Word,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -61,24 +61,11 @@ pub struct Probe {
     pub answered: bool,
 }
 
-/// What a proof the chain committed said about one counterpart cell of
-/// one transaction — the fold every replica reaches at the same height,
-/// and what the record arms are offered from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Answer {
-    /// The counterpart took it: its certificate is what speaks next, and
-    /// is fetched rather than waited for.
-    Committed,
-    /// The counterpart had not taken it past the floor: what an
-    /// `Unclaimed`, `Lapsed` or `Untaken` record is offered from.
-    Absent(Absence),
-}
-
 /// Let go of every fetch `owed` still has out, so a counterpart that
 /// never serves the height does not pin the slot.
 fn release_fetches(released: &mut Vec<(StateAnchor, SubstateKey)>, owed: &Owed) {
     released.extend(
-        owed.heard
+        owed.asked
             .probes
             .values()
             .filter(|probe| !probe.answered)
@@ -171,11 +158,11 @@ struct Owed {
     /// an outcome here, and the entry going is what makes it moot. A
     /// second home would have to be reclaimed on its own rule, and two
     /// rules for one fact are two answers to when it stops being true.
-    heard: Heard,
+    asked: Asked,
 }
 
-/// What this coordinator holds of its own about one transaction's
-/// counterparts.
+/// What this coordinator holds of its own about the questions it has
+/// put to one transaction's counterparts.
 ///
 /// What a counterpart *said* is not here: a refusal, an absence and a
 /// claim are each asked about by the vote fence too, so they live in the
@@ -183,7 +170,7 @@ struct Owed {
 /// coordinator's own working state around them — who has answered, what
 /// it has asked, and which questions are closed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Heard {
+struct Asked {
     /// The core shards whose certificates accepted it. A core shard's
     /// tick closes on every other core shard's certificate, so one
     /// saying it succeeded is not the transaction accepted — that is
@@ -470,7 +457,7 @@ impl UnresolvedTxs {
                 unsettled_by: None,
                 evidence: None,
                 claimed_by: BTreeSet::new(),
-                heard: Heard::default(),
+                asked: Asked::default(),
             };
             self.owed.entry(tx.hash()).or_insert(owed);
         }
@@ -624,7 +611,7 @@ impl UnresolvedTxs {
             return false;
         };
         self.owed.get_mut(&tx_hash).is_some_and(|owed| {
-            owed.heard.accepted.insert(shard) && owed.heard.accepted.len() == core_len
+            owed.asked.accepted.insert(shard) && owed.asked.accepted.len() == core_len
         })
     }
 
@@ -635,7 +622,7 @@ impl UnresolvedTxs {
     pub fn answered(&self, tx_hash: TxHash, shard: ShardId, probed: Probed) -> bool {
         self.owed
             .get(&tx_hash)
-            .is_some_and(|owed| owed.heard.answered.contains(&(shard, probed)))
+            .is_some_and(|owed| owed.asked.answered.contains(&(shard, probed)))
     }
 
     /// Whether a probe of that cell is already out, or already answered
@@ -656,14 +643,14 @@ impl UnresolvedTxs {
     ) -> bool {
         self.owed
             .get(&tx_hash)
-            .and_then(|owed| owed.heard.probes.get(&(shard, probed)))
+            .and_then(|owed| owed.asked.probes.get(&(shard, probed)))
             .is_some_and(|probe| !probe.answered || probe.anchor.height >= height)
     }
 
     /// Put a question to a counterpart, replacing whatever stood.
     pub fn record_probe(&mut self, tx_hash: TxHash, shard: ShardId, probe: Probe) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
-            owed.heard.probes.insert((shard, probe.probed), probe);
+            owed.asked.probes.insert((shard, probe.probed), probe);
         }
     }
 
@@ -681,7 +668,7 @@ impl UnresolvedTxs {
         let mut answered = BTreeSet::new();
         let mut anchor_ts = None;
         for (&tx_hash, owed) in &mut self.owed {
-            for probe in owed.heard.probes.values_mut() {
+            for probe in owed.asked.probes.values_mut() {
                 if probe.anchor == anchor && keys.contains(&probe.key) {
                     probe.answered = true;
                     answered.insert(tx_hash);
@@ -701,7 +688,7 @@ impl UnresolvedTxs {
         let Some(owed) = self.owed.get_mut(&tx_hash) else {
             return false;
         };
-        if let Some(probe) = owed.heard.probes.remove(&(shard, probed))
+        if let Some(probe) = owed.asked.probes.remove(&(shard, probed))
             && !probe.answered
         {
             self.released_fetches.push((probe.anchor, probe.key));
@@ -709,7 +696,7 @@ impl UnresolvedTxs {
         self.owed
             .get_mut(&tx_hash)
             .expect("held above")
-            .heard
+            .asked
             .answered
             .insert((shard, probed))
     }
@@ -945,7 +932,7 @@ impl UnresolvedTxs {
                         unsettled_by: Some(verdict.shard()),
                         evidence: Some(verdict.evidence()),
                         claimed_by: BTreeSet::new(),
-                        heard: Heard::default(),
+                        asked: Asked::default(),
                     },
                 );
             }
@@ -1165,23 +1152,35 @@ impl UnresolvedTxs {
                         TxResolution::LegFinalized
                     }
                 } else if accepted && owed.is_some_and(|owed| owed.kind.is_leg()) {
-                    match owed.and_then(|owed| owed.evidence) {
-                        Some(CounterpartEvidence::Refused { .. }) => {
-                            TxResolution::Decided(TransactionDecision::Reject)
+                    // The reclaim reports what its record established
+                    // of the transaction: a core's refusal is the
+                    // transaction's verdict; a departure, or a core
+                    // that never took it, aborts it; a delivery that
+                    // lapsed says nothing of the transaction, which the
+                    // core decided.
+                    let decided = match owed.and_then(|owed| owed.evidence) {
+                        Some(CounterpartEvidence::Departed { .. }) => TransactionDecision::Aborted,
+                        Some(CounterpartEvidence::Heard(heard)) => {
+                            match (heard.question, heard.word) {
+                                (Question::Verdict, Word::Refused { .. }) => {
+                                    TransactionDecision::Reject
+                                }
+                                (Question::Cell(Probed::Core | Probed::Claim), Word::Absent) => {
+                                    TransactionDecision::Aborted
+                                }
+                                (Question::Cell(Probed::Delivery), _)
+                                | (Question::Verdict, Word::Accepted { .. } | Word::Absent)
+                                | (
+                                    Question::Cell(_),
+                                    Word::Refused { .. } | Word::Accepted { .. },
+                                ) => {
+                                    continue;
+                                }
+                            }
                         }
-                        Some(
-                            CounterpartEvidence::Departed { .. }
-                            | CounterpartEvidence::Unclaimed { .. }
-                            | CounterpartEvidence::Untaken { .. },
-                        ) => TxResolution::Decided(TransactionDecision::Aborted),
-                        Some(
-                            CounterpartEvidence::Lapsed { .. }
-                            | CounterpartEvidence::Accepted { .. },
-                        )
-                        | None => {
-                            continue;
-                        }
-                    }
+                        None => continue,
+                    };
+                    TxResolution::Decided(decided)
                 } else {
                     TxResolution::Decided(decision)
                 };
@@ -1420,11 +1419,43 @@ mod tests {
         test_prefix, test_principal,
     };
     use hyperscale_types::{
-        BlockHeight, EPOCH_DURATION, EpochWindows, LocalKey, MAX_FINALIZATION_DELAY,
+        BlockHeight, EPOCH_DURATION, EpochWindows, Hash, Heard, LocalKey, MAX_FINALIZATION_DELAY,
         MAX_VALIDITY_RANGE, TimestampRange, UnsettledTx, Verified, WeightedTimestamp,
     };
 
     use super::*;
+
+    /// `probed` proved absent at `at`.
+    fn absent(probed: Probed, at: WeightedTimestamp) -> Heard {
+        Heard {
+            question: Question::Cell(probed),
+            word: Word::Absent,
+            at,
+        }
+    }
+
+    /// A rejection at `at`.
+    fn refused(at: WeightedTimestamp) -> Heard {
+        Heard {
+            question: Question::Verdict,
+            word: Word::Refused {
+                decision: TransactionDecision::Reject,
+                digest: Hash::from_bytes(b"digest"),
+            },
+            at,
+        }
+    }
+
+    /// An acceptance at `at`.
+    fn accepted(at: WeightedTimestamp) -> Heard {
+        Heard {
+            question: Question::Verdict,
+            word: Word::Accepted {
+                digest: Hash::from_bytes(b"digest"),
+            },
+            at,
+        }
+    }
 
     /// This shard owns the prefixes whose leading bit is zero, so an
     /// address is remote or local by its top byte and nothing else.
@@ -2107,9 +2138,9 @@ mod tests {
             "at the deadline the leg is probeable and the whole entry is not"
         );
 
-        ledger.record_abandonment_records(&[AbandonmentRecord::unclaimed(
+        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
             PARTNER,
-            deadline,
+            absent(Probed::Core, deadline),
             [names(&leg)],
         )]);
         assert!(
@@ -2156,9 +2187,9 @@ mod tests {
                 claims: Vec::new(),
             }],
         );
-        ledger.record_abandonment_records(&[AbandonmentRecord::lapsed(
+        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
             PARTNER,
-            deadline.plus(MAX_VALIDITY_RANGE),
+            absent(Probed::Delivery, deadline.plus(MAX_VALIDITY_RANGE)),
             [names(&leg)],
         )]);
         assert!(ledger.probeable(deadline).is_empty(), "covered once");
@@ -2212,9 +2243,9 @@ mod tests {
                 claims: Vec::new(),
             }],
         );
-        ledger.record_abandonment_records(&[AbandonmentRecord::lapsed(
+        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
             PARTNER,
-            deadline.plus(MAX_VALIDITY_RANGE),
+            absent(Probed::Delivery, deadline.plus(MAX_VALIDITY_RANGE)),
             [names(&tx)],
         )]);
         let reclaims = ledger.reclaimable();
@@ -2346,9 +2377,9 @@ mod tests {
             fw(&ledger, reclaim.clone()).is_empty(),
             "a deciding success on a leg entry no record covers says nothing"
         );
-        ledger.record_abandonment_records(&[AbandonmentRecord::refused(
+        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
             PARTNER,
-            ms(70_000),
+            refused(ms(70_000)),
             [names(&leg)],
         )]);
         assert_eq!(
@@ -2372,9 +2403,9 @@ mod tests {
             )],
             "the reclaim of a leg its core never took reports an abort"
         );
-        ledger.record_abandonment_records(&[AbandonmentRecord::lapsed(
+        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
             PARTNER,
-            ms(200_000),
+            absent(Probed::Delivery, ms(200_000)),
             [names(&leg)],
         )]);
         assert!(
@@ -2430,9 +2461,9 @@ mod tests {
         ledger.certify(tx.hash());
         assert!(ledger.retirable().is_empty(), "nothing retires on a clock");
 
-        ledger.record_abandonment_records(&[AbandonmentRecord::accepted(
+        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
             PARTNER,
-            ms(70_000),
+            accepted(ms(70_000)),
             [names(&tx)],
         )]);
         let retirable = ledger.retirable();
@@ -2540,9 +2571,9 @@ mod tests {
     fn a_refusal_record_naming_an_unheld_transaction_rebuilds_a_leg_entry() {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(7, 60_000);
-        ledger.record_abandonment_records(&[AbandonmentRecord::refused(
+        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
             PARTNER,
-            ms(1_000),
+            refused(ms(1_000)),
             [names(&tx)],
         )]);
         assert_eq!(ledger.len(), 1);

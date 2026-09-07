@@ -17,13 +17,13 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_metrics::record_verdict_claim_deferred;
 use hyperscale_types::{
-    AbandonmentRecord, BlockHash, CounterpartClaim, CounterpartEvidence, CounterpartMirror, Epoch,
-    FinalizationHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
-    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr, Probed, ProposerTimestamp,
-    ProvenAnchor, ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger,
+    AbandonmentRecord, BlockHash, CounterpartEvidence, CounterpartMirror, Epoch, FinalizationHash,
+    Hash, Heard, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
+    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr, ProposerTimestamp, ProvenAnchor,
+    ProvenAnchors, ProvisionHash, Question, ReadySignal, ReshapeThresholds, ReshapeTrigger,
     Resolutions, ScheduleLookup, SettledSetVerdict, ShardId, SplitAtBoundary, StateProofBundle,
-    StoredReceipt, SubstateKey, TxClaim, TxOutcome, UnsettledTx, VerdictClaim, WeightedTimestamp,
-    WorkInFlight, derive_reshape_trigger, ready_signal_window, settled_set_verdict,
+    StoredReceipt, SubstateKey, TxClaim, TxOutcome, UnsettledTx, WeightedTimestamp, WorkInFlight,
+    derive_reshape_trigger, ready_signal_window, settled_set_verdict,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -97,11 +97,10 @@ use hyperscale_types::{
     LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, MAX_VALIDITY_RANGE,
     PredecessorTerminal, ProvisionRootVerifyError, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext, QcVerifyError,
-    QuorumCertificate, RecoveryCause, Refusal, Round, SafeVoteRegisters, StateRoot,
-    StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, Transaction,
-    TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier,
-    Verify, VoteCount, VotePosition, derive_leaves, missed_proposals_since_prev_commit,
-    ready_leaf_payload,
+    QuorumCertificate, RecoveryCause, Round, SafeVoteRegisters, StateRoot, StateRootVerifyError,
+    Timeout, TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TxHash,
+    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
+    VotePosition, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -472,15 +471,6 @@ pub struct ShardCoordinator {
     /// anchor. One mirror, so the fence cannot accept a bundle at an
     /// anchor the prober would not have chosen.
     proven_anchors: Arc<ProvenAnchors>,
-}
-
-/// Whether the mirror `held` is the certificate `claim` names: the same
-/// anchor, the same decision, and the same signed identity.
-fn mirrors(held: &Refusal, claim: &VerdictClaim) -> bool {
-    let same_anchor = held.refused_wt == claim.anchor_ts;
-    let same_word = held.decision == claim.decision;
-    let same_bytes = held.digest == claim.digest;
-    same_anchor && same_word && same_bytes
 }
 
 /// Whether `bundle` names `held`: the root its anchor claims and the
@@ -987,18 +977,9 @@ impl ShardCoordinator {
     /// anchor reaches every voter in the ordinary course.
     fn fence_state_proofs(&self, block: &Block, block_hash: BlockHash) -> Option<Vec<Action>> {
         let mut wanted = Vec::new();
-        for claim in block.state_proofs() {
-            match claim {
-                CounterpartClaim::Cells(bundle) => {
-                    if !self.anchor_stands(bundle, block_hash, &mut wanted) {
-                        return Some(vec![]);
-                    }
-                }
-                CounterpartClaim::Verdict(verdict) => {
-                    if !self.verdict_stands(verdict, block_hash) {
-                        return Some(vec![]);
-                    }
-                }
+        for bundle in block.state_proofs() {
+            if !self.anchor_stands(bundle, block_hash, &mut wanted) {
+                return Some(vec![]);
             }
         }
         (!wanted.is_empty()).then_some(wanted)
@@ -1044,56 +1025,6 @@ impl ShardCoordinator {
                     block_height: anchor.height,
                 }));
                 true
-            }
-        }
-    }
-
-    /// Whether a verdict claim stands on the certificate this voter
-    /// holds: the same anchor, the same decision, and the same signed
-    /// identity.
-    ///
-    /// A voter holding no certificate for the transaction defers, exactly
-    /// as it defers on an anchor it has not proven — and the deferral is
-    /// metered, since a lost broadcast is now invisible where the old
-    /// mirror at least held nothing. The certificate is re-fetchable from
-    /// anyone holding it, so the deferral resolves on the path that
-    /// already exists.
-    fn verdict_stands(&self, verdict: &VerdictClaim, block_hash: BlockHash) -> bool {
-        if !verdict.refuses() {
-            warn!(
-                validator = ?self.me,
-                block_hash = ?block_hash,
-                shard = ?verdict.shard,
-                tx_hash = ?verdict.tx_hash,
-                "Verdict claim names an acceptance, which licenses nothing — not voting"
-            );
-            return false;
-        }
-        match self.evidence.refusal(verdict.tx_hash, verdict.shard) {
-            Some(held) if mirrors(&held, verdict) => true,
-            Some(held) => {
-                warn!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    shard = ?verdict.shard,
-                    tx_hash = ?verdict.tx_hash,
-                    claimed_ts = ?verdict.anchor_ts,
-                    held_ts = ?held.refused_wt,
-                    "Verdict claim restates a certificate this validator reads differently \
-                     — not voting"
-                );
-                false
-            }
-            None => {
-                record_verdict_claim_deferred();
-                trace!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    shard = ?verdict.shard,
-                    tx_hash = ?verdict.tx_hash,
-                    "Verdict claim names a certificate this validator does not hold; deferring"
-                );
-                false
             }
         }
     }
@@ -1263,11 +1194,11 @@ impl ShardCoordinator {
     }
 
     /// Whether one record's evidence stands for this validator, on the
-    /// arm it carries. A departure is checked against the schedule; a
-    /// refusal against this validator's own mirror of the core's
-    /// certificate, equality on the anchor; an absence against this
-    /// validator's own proof, at any anchor past the name's deadline. A
-    /// voter that cannot check defers, which is the same answer as a
+    /// arm it carries. A departure is checked against the schedule,
+    /// this validator's own ledger, and the departed shard's settled
+    /// set; what a shard was heard to say is checked against this
+    /// validator's own mirror of it, equality on the word and the moment.
+    /// A voter that cannot check defers, which is the same answer as a
     /// refusal here: not this vote.
     fn record_evidence_stands(
         &self,
@@ -1277,230 +1208,180 @@ impl ShardCoordinator {
         verdict: &AbandonmentRecord,
     ) -> bool {
         match verdict.evidence() {
-            // A departure is checked against the schedule and this
-            // validator's own ledger here, and the settled set below. The
-            // set says what the departed shard settled; the ledger says
-            // what it was party to, and a record may name only that — a
-            // stranger to the departed shard is absent from its set
-            // trivially, and abandoning it would charge a payer for a
-            // transaction a live counterpart can still settle.
-            CounterpartEvidence::Departed { terminal_wt } => {
-                let scheduled =
-                    topology_schedule.terminal_cut_for_shard(verdict.shard(), anchored_wt);
-                if scheduled != Some(terminal_wt) {
-                    warn!(
-                        validator = ?self.me,
-                        block_hash = ?block_hash,
-                        shard = ?verdict.shard(),
-                        claimed = ?terminal_wt,
-                        ?scheduled,
-                        "Abandonment record names a departure the schedule does not attest — \
-                         not voting"
-                    );
-                    return false;
-                }
-                let named = self.evidence.with_parties(verdict.shard(), |parties| {
-                    parties.map(|parties| {
-                        verdict
-                            .tx_hashes()
-                            .find(|tx_hash| !parties.contains(tx_hash))
-                    })
-                });
-                let Some(stranger) = named else {
-                    trace!(
-                        validator = ?self.me,
-                        block_hash = ?block_hash,
-                        shard = ?verdict.shard(),
-                        "Departure record's parties not yet mirrored; deferring"
-                    );
-                    return false;
-                };
-                if let Some(stranger) = stranger {
-                    warn!(
-                        validator = ?self.me,
-                        block_hash = ?block_hash,
-                        shard = ?verdict.shard(),
-                        tx_hash = ?stranger,
-                        "Abandonment record names a transaction the departed shard was not \
-                         party to — not voting"
-                    );
-                    return false;
-                }
-            }
-            // A refusal is checked against this validator's own mirror
-            // of the core's certificate: equality on the anchor. A
-            // voter holding no mirror cannot say and defers; one whose
-            // mirror disagrees refuses.
-            CounterpartEvidence::Refused { refused_wt } => {
-                for entry in verdict.unsettled() {
-                    if !self.refusal_stands(verdict, entry, refused_wt, block_hash) {
-                        return false;
-                    }
-                }
-            }
-            // An absence is checked against the proof the chain
-            // committed. The record's anchor has to sit inside every
-            // name's absence window — at or past the deadline, which is
-            // the probe anchor, since before it the core may still
-            // commit; and short of the committed cell's sweep, since
-            // past it the cell is gone whatever the core did. And it has
-            // to be the anchor this validator folded: every replica
-            // folds the same committed proofs in the same order, so an
-            // honest record restates the answer they all hold. A voter
-            // that has not folded it yet defers. A lapse is the same
-            // check against the later window a delivery's claim cell
-            // has. Both windows derive from the deadline the record
-            // restates, so the voter needs no body to find them.
-            CounterpartEvidence::Unclaimed { probed_wt } => {
-                for entry in verdict.unsettled() {
-                    if !self.absence_stands(verdict, entry, probed_wt, Probed::Core, block_hash) {
-                        return false;
-                    }
-                }
-            }
-            CounterpartEvidence::Lapsed { probed_wt } => {
-                for entry in verdict.unsettled() {
-                    if !self.absence_stands(verdict, entry, probed_wt, Probed::Delivery, block_hash)
-                    {
-                        return false;
-                    }
-                }
-            }
-            CounterpartEvidence::Untaken { probed_wt } => {
-                for entry in verdict.unsettled() {
-                    if !self.absence_stands(verdict, entry, probed_wt, Probed::Claim, block_hash) {
-                        return false;
-                    }
-                }
-            }
-            // An acceptance is checked as a refusal is: against this
-            // validator's own mirror of the consumer's certificate,
-            // equality on the anchor. A voter holding no mirror defers.
-            CounterpartEvidence::Accepted { accepted_wt } => {
-                for entry in verdict.unsettled() {
-                    if !self.acceptance_stands(verdict, entry, accepted_wt, block_hash) {
-                        return false;
-                    }
-                }
-            }
+            CounterpartEvidence::Departed { terminal_wt } => self.departure_stands(
+                topology_schedule,
+                block_hash,
+                anchored_wt,
+                verdict,
+                terminal_wt,
+            ),
+            CounterpartEvidence::Heard(heard) => verdict
+                .unsettled()
+                .iter()
+                .all(|entry| self.heard_stands(verdict.shard(), entry, heard, block_hash)),
         }
-        true
     }
 
-    /// Whether one name's absence stands for this validator: the
-    /// record's anchor is one `licenses` accepts for the name's validity
-    /// end, and it is the anchor this validator folded off the chain's
-    /// own proofs. A voter that has not folded it defers.
-    fn absence_stands(
+    /// Whether a departure record stands: the schedule attests the cut
+    /// it names, this validator's own ledger says the departed shard was
+    /// party to every name, and the shard's settled set names none of
+    /// them.
+    ///
+    /// The set says what the departed shard settled; the ledger says
+    /// what it was party to, and a record may name only that — a
+    /// stranger to the departed shard is absent from its set trivially,
+    /// and abandoning it would charge a payer for a transaction a live
+    /// counterpart can still settle. The set is complete and
+    /// beacon-attested, so absence from it is proof rather than
+    /// ignorance; a voter that has not acquired it defers, since the
+    /// record is only proposable inside the window the set can be read
+    /// in, so a voter inside it either has the set or is about to.
+    fn departure_stands(
         &self,
-        verdict: &AbandonmentRecord,
-        entry: &UnsettledTx,
-        probed_wt: WeightedTimestamp,
-        probed: Probed,
+        topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
+        anchored_wt: WeightedTimestamp,
+        verdict: &AbandonmentRecord,
+        terminal_wt: WeightedTimestamp,
     ) -> bool {
-        if !probed.licenses(probed_wt, entry.deadline) {
+        let shard = verdict.shard();
+        let scheduled = topology_schedule.terminal_cut_for_shard(shard, anchored_wt);
+        if scheduled != Some(terminal_wt) {
             warn!(
                 validator = ?self.me,
                 block_hash = ?block_hash,
-                shard = ?verdict.shard(),
+                shard = ?shard,
+                claimed = ?terminal_wt,
+                ?scheduled,
+                "Abandonment record names a departure the schedule does not attest — not voting"
+            );
+            return false;
+        }
+        // The evidence window, read off the judging anchor's own
+        // snapshot: a record anchored after the beacon closed and swept
+        // the departure's boundary record claims what nobody can check.
+        if !topology_schedule.terminal_evidence_readable(shard, anchored_wt) {
+            warn!(
+                validator = ?self.me,
+                block_hash = ?block_hash,
+                shard = ?shard,
+                "Abandonment record names a departure whose evidence window has closed — not \
+                 voting"
+            );
+            return false;
+        }
+        let stranger = self.evidence.with_parties(shard, |parties| {
+            parties.map(|parties| {
+                verdict
+                    .tx_hashes()
+                    .find(|tx_hash| !parties.contains(tx_hash))
+            })
+        });
+        let Some(stranger) = stranger else {
+            trace!(
+                validator = ?self.me,
+                block_hash = ?block_hash,
+                shard = ?shard,
+                "Departure record's parties not yet mirrored; deferring"
+            );
+            return false;
+        };
+        if let Some(stranger) = stranger {
+            warn!(
+                validator = ?self.me,
+                block_hash = ?block_hash,
+                shard = ?shard,
+                tx_hash = ?stranger,
+                "Abandonment record names a transaction the departed shard was not party to — \
+                 not voting"
+            );
+            return false;
+        }
+        let settled = self.evidence.with_settled(|sets| {
+            sets.get(&shard).map(|settled| {
+                verdict
+                    .tx_hashes()
+                    .find(|tx_hash| settled.txs.contains(tx_hash))
+            })
+        });
+        match settled {
+            None => {
+                trace!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    shard = ?shard,
+                    "Settled set for an abandonment record unknown at vote; deferring"
+                );
+                false
+            }
+            Some(Some(tx_hash)) => {
+                warn!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    shard = ?shard,
+                    tx_hash = ?tx_hash,
+                    "Abandonment record names a transaction its shard settled — not voting"
+                );
+                false
+            }
+            Some(None) => true,
+        }
+    }
+
+    /// Whether one name's word stands for this validator: an answer to a
+    /// cell question sits inside the window the question is meaningful
+    /// in for the name's deadline, and the word and the moment are the
+    /// ones this validator itself mirrored — off the counterpart's
+    /// certificate, or off the proof the chain committed, which every
+    /// replica folds at the same height. A voter holding no mirror
+    /// cannot say and defers; one whose mirror disagrees refuses.
+    fn heard_stands(
+        &self,
+        shard: ShardId,
+        entry: &UnsettledTx,
+        heard: Heard,
+        block_hash: BlockHash,
+    ) -> bool {
+        if let Question::Cell(probed) = heard.question
+            && !probed.licenses(heard.at, entry.deadline)
+        {
+            warn!(
+                validator = ?self.me,
+                block_hash = ?block_hash,
+                shard = ?shard,
                 tx_hash = ?entry.tx_hash,
-                probed = ?probed_wt,
+                probed = ?heard.at,
                 deadline = ?entry.deadline,
                 "Abandonment record probes an absence outside its window — not voting"
             );
             return false;
         }
-        let folded = self
-            .evidence
-            .absence(entry.tx_hash, verdict.shard(), probed)
-            .is_some_and(|absence| absence.probed_wt == probed_wt);
-        if !folded {
-            trace!(
-                validator = ?self.me,
-                block_hash = ?block_hash,
-                shard = ?verdict.shard(),
-                tx_hash = ?entry.tx_hash,
-                "Abandonment record restates an absence this validator has not proved; \
-                 deferring"
-            );
-            return false;
-        }
-        true
-    }
-
-    /// Whether one name's refusal, as a `Refused` record restates it at
-    /// `refused_wt`, stands on this validator's own mirror of the
-    /// core's certificate: equality on the anchor.
-    fn refusal_stands(
-        &self,
-        verdict: &AbandonmentRecord,
-        entry: &UnsettledTx,
-        refused_wt: WeightedTimestamp,
-        block_hash: BlockHash,
-    ) -> bool {
-        match self.evidence.refusal(entry.tx_hash, verdict.shard()) {
-            Some(mirrored) if mirrored.refused_wt == refused_wt => true,
+        match self.evidence.heard(entry.tx_hash, shard, heard.question) {
+            Some(mirrored) if mirrored == heard => true,
             Some(mirrored) => {
                 warn!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
-                    shard = ?verdict.shard(),
+                    shard = ?shard,
                     tx_hash = ?entry.tx_hash,
-                    claimed = ?refused_wt,
-                    mirrored = ?mirrored.refused_wt,
-                    "Abandonment record restates a refusal at an anchor this validator did \
-                     not see — not voting"
+                    claimed = ?heard,
+                    ?mirrored,
+                    "Abandonment record restates an answer this validator reads differently — \
+                     not voting"
                 );
                 false
             }
             None => {
+                if heard.question == Question::Verdict {
+                    record_verdict_claim_deferred();
+                }
                 trace!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
-                    shard = ?verdict.shard(),
+                    shard = ?shard,
                     tx_hash = ?entry.tx_hash,
-                    "Abandonment record restates a refusal this validator has not mirrored; \
+                    "Abandonment record restates an answer this validator has not mirrored; \
                      deferring"
-                );
-                false
-            }
-        }
-    }
-
-    /// Whether one name's acceptance, as an `Accepted` record restates
-    /// it at `accepted_wt`, stands on this validator's own mirror of the
-    /// consumer's certificate: equality on the anchor.
-    fn acceptance_stands(
-        &self,
-        verdict: &AbandonmentRecord,
-        entry: &UnsettledTx,
-        accepted_wt: WeightedTimestamp,
-        block_hash: BlockHash,
-    ) -> bool {
-        match self.evidence.acceptance(entry.tx_hash, verdict.shard()) {
-            Some(mirrored) if mirrored.accepted_wt == accepted_wt => true,
-            Some(mirrored) => {
-                warn!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    shard = ?verdict.shard(),
-                    tx_hash = ?entry.tx_hash,
-                    claimed = ?accepted_wt,
-                    mirrored = ?mirrored.accepted_wt,
-                    "Abandonment record restates an acceptance at an anchor this validator \
-                     did not see — not voting"
-                );
-                false
-            }
-            None => {
-                trace!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    shard = ?verdict.shard(),
-                    tx_hash = ?entry.tx_hash,
-                    "Abandonment record restates an acceptance this validator has not \
-                     mirrored; deferring"
                 );
                 false
             }
@@ -1510,91 +1391,21 @@ impl ShardCoordinator {
     /// Whether the block's abandonment records are ones this voter
     /// can attest to, and so whether voting on it must be withheld.
     ///
-    /// A record makes two claims, and both have to be checked or neither
-    /// is. The first is that a shard departed, at a stated cut; the second
-    /// is that it left the named transactions unsettled when it went.
-    ///
-    /// The departure is the schedule's to answer, and it is asked first
-    /// because the second question is only meaningful once it holds. A
-    /// shard still live in the anchored window has no settled set and can
-    /// settle any of the transactions named at any time, so a record
-    /// against it is not a claim a voter could ever check — and
-    /// [`settled_set_verdict`] passes over such a shard rather than
-    /// judging it, which is right for the question it exists to ask and
-    /// would leave this one unasked. The stated cut is held to the
-    /// schedule's own for the same reason: it is what dates the record
-    /// against the transactions it speaks for, and nothing downstream
-    /// re-derives it.
-    ///
-    /// What the departed shard actually settled is then the same question
-    /// the split-boundary fence puts to its settled set, so it is asked
-    /// through the same predicate and the record's validity cannot drift
-    /// from the verdict it will later license. The set is complete and
-    /// beacon-attested, so absence from it is proof rather than ignorance.
-    ///
-    /// A voter that has not acquired the set defers rather than guessing:
-    /// the record is only proposable inside the window where the set can
-    /// be read, so a voter inside it either has the set or is about to.
-    /// After that window the record is history and nothing re-asks this.
-    ///
-    /// The figures each name restates are not this fence's to check:
-    /// they are read off the committed body, which lives in the store,
-    /// and so are checked by the delegated verification the vote also
-    /// waits on ([`Self::on_resolutions_verified`]).
+    /// Each record is held to the evidence it claims, on the arm it
+    /// carries. The figures each name restates are not this fence's to
+    /// check: they are read off the committed body, which lives in the
+    /// store, and so are checked by the delegated verification the vote
+    /// also waits on ([`Self::on_resolutions_verified`]).
     fn fence_abandonment_records(
         &self,
         topology_schedule: &TopologySchedule,
         block: &Block,
         block_hash: BlockHash,
     ) -> bool {
-        if block.abandonment_records().is_empty() {
-            return false;
-        }
         let anchored_wt = block.header().parent_qc().weighted_timestamp();
-        for verdict in block.abandonment_records() {
-            if !self.record_evidence_stands(topology_schedule, block_hash, anchored_wt, verdict) {
-                return true;
-            }
-        }
-        // Only a departure is a claim about a settled set; a refusal is a
-        // claim about a live shard, which is never inside a terminal
-        // window and has no set to check against.
-        let claims = block
-            .abandonment_records()
-            .iter()
-            .filter(|verdict| matches!(verdict.evidence(), CounterpartEvidence::Departed { .. }))
-            .flat_map(|verdict| {
-                verdict
-                    .tx_hashes()
-                    .map(move |tx_hash| (verdict.shard(), tx_hash, TxClaim::Abandoned))
-            });
-        match self.evidence.with_settled(|settled| {
-            settled_set_verdict(
-                settled,
-                topology_schedule,
-                self.local_shard,
-                anchored_wt,
-                claims,
-            )
-        }) {
-            SettledSetVerdict::Pass => false,
-            SettledSetVerdict::Reject => {
-                warn!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    "Abandonment record names a transaction its shard settled — not voting"
-                );
-                true
-            }
-            SettledSetVerdict::Defer => {
-                trace!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    "Settled set for a abandonment record unknown at vote; deferring"
-                );
-                true
-            }
-        }
+        block.abandonment_records().iter().any(|verdict| {
+            !self.record_evidence_stands(topology_schedule, block_hash, anchored_wt, verdict)
+        })
     }
 
     /// Whether `wt` lands past this shard's terminal window — the coast
@@ -2416,7 +2227,7 @@ impl ShardCoordinator {
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         abandonment_records: Vec<AbandonmentRecord>,
-        state_proofs: Vec<CounterpartClaim>,
+        state_proofs: Vec<StateProofBundle>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // not the committed block — this lets the chain grow while the
@@ -5319,7 +5130,7 @@ impl ShardCoordinator {
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         abandonment_records: Vec<AbandonmentRecord>,
-        state_proofs: Vec<CounterpartClaim>,
+        state_proofs: Vec<StateProofBundle>,
     ) -> Vec<Action> {
         let height = qc.height();
 
@@ -7575,13 +7386,13 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
     use hyperscale_types::{
-        Absence, Acceptance, AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot,
-        BlockHeaderParts, CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash,
-        MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, SettledTxSet,
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeaderParts,
+        CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash, Heard, MAX_TIMESTAMP_DELAY,
+        MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, Probed, Question, SettledTxSet,
         SettledTxsRoot, ShardAnchor, ShardId, Signer, SignerBitfield, TerminalRoots,
         TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision,
         UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
-        WitnessSources, abandonment_root_from_records, test_utils,
+        WitnessSources, Word, abandonment_root_from_records, test_utils,
     };
 
     use super::*;
@@ -12039,11 +11850,6 @@ mod tests {
 
     /// A block carrying `bundles`, committed under their root.
     fn block_with_state_proofs(bundles: Vec<StateProofBundle>) -> Block {
-        block_with_claims(bundles.into_iter().map(CounterpartClaim::Cells).collect())
-    }
-
-    /// A block carrying `claims`, committed under their root.
-    fn block_with_claims(bundles: Vec<CounterpartClaim>) -> Block {
         use hyperscale_types::state_proofs_root_from_bundles;
         Block::Live {
             header: BlockHeader::new(BlockHeaderParts {
@@ -12134,98 +11940,6 @@ mod tests {
                 .fence_state_proofs(&agreeing, BlockHash::ZERO)
                 .is_none(),
             "the anchor the chain committed passes to the proof walk"
-        );
-    }
-
-    /// A verdict claim the chain offers, against the certificate this
-    /// voter holds: matching passes, disagreeing refuses, absent defers.
-    ///
-    /// The deferral is what makes the claim safe to commit without the
-    /// bytes — a voter that never heard the broadcast withholds rather
-    /// than taking the proposer's word — and it is why the offer is
-    /// filtered to verdicts that license a record.
-    #[test]
-    fn a_verdict_claim_stands_on_the_certificate_this_voter_holds() {
-        let peer = ShardId::leaf(1, 1);
-        let tx_hash = TxHash::from(Hash::from_bytes(b"tx"));
-        let anchor = WeightedTimestamp::from_millis(7_000);
-        let digest = Hash::from_bytes(b"digest");
-        let claim = |anchor_ts, decision, digest| {
-            block_with_claims(vec![CounterpartClaim::Verdict(VerdictClaim {
-                shard: peer,
-                tx_hash,
-                anchor_ts,
-                decision,
-                digest,
-            })])
-        };
-
-        // Holding nothing: the vote is withheld, and there is no commit
-        // proof to ask for — the certificate arrives by broadcast.
-        let coord = fence_coordinator();
-        assert!(
-            coord
-                .fence_state_proofs(
-                    &claim(anchor, TransactionDecision::Reject, digest),
-                    BlockHash::ZERO
-                )
-                .is_some_and(|withheld| withheld.is_empty()),
-            "a claim naming a certificate this voter has not heard defers",
-        );
-
-        let coord = fence_coordinator();
-        coord.evidence().record_refusal(
-            tx_hash,
-            peer,
-            Refusal {
-                refused_wt: anchor,
-                decision: TransactionDecision::Reject,
-                digest,
-            },
-        );
-        assert!(
-            coord
-                .fence_state_proofs(
-                    &claim(anchor, TransactionDecision::Reject, digest),
-                    BlockHash::ZERO
-                )
-                .is_none(),
-            "the certificate this voter holds passes the claim",
-        );
-
-        // Each term is checked: a different anchor, a different word, or
-        // different bytes is a certificate this voter reads differently.
-        for (anchor_ts, decision, digest) in [
-            (
-                WeightedTimestamp::from_millis(7_001),
-                TransactionDecision::Reject,
-                digest,
-            ),
-            (anchor, TransactionDecision::Aborted, digest),
-            (
-                anchor,
-                TransactionDecision::Reject,
-                Hash::from_bytes(b"other"),
-            ),
-        ] {
-            assert!(
-                coord
-                    .fence_state_proofs(&claim(anchor_ts, decision, digest), BlockHash::ZERO)
-                    .is_some_and(|withheld| withheld.is_empty()),
-                "a claim restating the certificate differently is refused",
-            );
-        }
-
-        // An acceptance licenses no record, so it is refused rather than
-        // folded into an answer nothing reads.
-        assert!(
-            coord
-                .fence_state_proofs(
-                    &claim(anchor, TransactionDecision::Accept, digest),
-                    BlockHash::ZERO
-                )
-                .is_some_and(|withheld| withheld.is_empty()),
-            "an acceptance is not a verdict a block may claim",
         );
     }
 
@@ -12464,42 +12178,91 @@ mod tests {
         );
     }
 
+    /// `probed` proved absent at `at`.
+    fn absent(probed: Probed, at: WeightedTimestamp) -> Heard {
+        Heard {
+            question: Question::Cell(probed),
+            word: Word::Absent,
+            at,
+        }
+    }
+
+    /// A verdict at `at`: a rejection, or an acceptance.
+    fn verdict(at: WeightedTimestamp, accepted: bool) -> Heard {
+        let digest = Hash::from_bytes(b"digest");
+        Heard {
+            question: Question::Verdict,
+            word: if accepted {
+                Word::Accepted { digest }
+            } else {
+                Word::Refused {
+                    decision: TransactionDecision::Reject,
+                    digest,
+                }
+            },
+            at,
+        }
+    }
+
+    /// A block carrying one record of what `ROOT` said, naming `tx`.
+    fn record_of(heard: Heard) -> Block {
+        block_with_records(
+            AFTER_CUT_MS,
+            vec![AbandonmentRecord::heard(
+                ShardId::ROOT,
+                heard,
+                [figures_of(b"tx")],
+            )],
+        )
+    }
+
     /// A refusal record is checked against this validator's own mirror
     /// of the core's certificate, and against nothing else: a matching
-    /// mirror passes it outside any terminal window, a mirror at another
-    /// anchor refuses it, and no mirror defers it.
+    /// mirror passes it outside any terminal window; a mirror at another
+    /// anchor, of another decision or of another certificate refuses it;
+    /// and no mirror defers it.
     #[test]
     fn a_refusal_record_stands_or_falls_on_the_mirror() {
         let sched = make_terminating_schedule(4);
         let refused_wt = WeightedTimestamp::from_millis(5_000);
-        let refused = AbandonmentRecord::refused(ShardId::ROOT, refused_wt, [figures_of(b"tx")]);
-        let block = block_with_records(AFTER_CUT_MS, vec![refused]);
+        let block = record_of(verdict(refused_wt, false));
         let tx_hash = figures_of(b"tx").tx_hash;
-        let mirror = |refused_wt: WeightedTimestamp| Refusal {
-            refused_wt,
-            decision: TransactionDecision::Reject,
-            digest: Hash::from_bytes(b"digest"),
-        };
 
         let matching = fence_coordinator();
         matching
             .evidence()
-            .record_refusal(tx_hash, ShardId::ROOT, mirror(refused_wt));
+            .record(tx_hash, ShardId::ROOT, verdict(refused_wt, false));
         assert!(
             !matching.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
             "a matching mirror passes it"
         );
 
-        let mismatched = fence_coordinator();
-        mismatched.evidence().record_refusal(
-            tx_hash,
-            ShardId::ROOT,
-            mirror(WeightedTimestamp::from_millis(6_000)),
-        );
-        assert!(
-            mismatched.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
-            "a mirror at another anchor refuses it"
-        );
+        let mut aborted = verdict(refused_wt, false);
+        aborted.word = Word::Refused {
+            decision: TransactionDecision::Aborted,
+            digest: Hash::from_bytes(b"digest"),
+        };
+        let mut other_bytes = verdict(refused_wt, false);
+        other_bytes.word = Word::Refused {
+            decision: TransactionDecision::Reject,
+            digest: Hash::from_bytes(b"other"),
+        };
+        for (held, why) in [
+            (
+                verdict(WeightedTimestamp::from_millis(6_000), false),
+                "another anchor",
+            ),
+            (aborted, "another decision"),
+            (other_bytes, "another certificate"),
+            (verdict(refused_wt, true), "an acceptance"),
+        ] {
+            let mismatched = fence_coordinator();
+            mismatched.evidence().record(tx_hash, ShardId::ROOT, held);
+            assert!(
+                mismatched.fence_abandonment_records(&sched, &block, BlockHash::ZERO),
+                "a mirror of {why} refuses it"
+            );
+        }
 
         let absent = fence_coordinator();
         assert!(
@@ -12508,33 +12271,24 @@ mod tests {
         );
     }
 
-    /// An absence record is checked against the proof the chain
-    /// committed: the folded answer at the record's own anchor passes
-    /// it, an answer at another anchor defers it — every replica folds
-    /// the same proofs, so an honest record restates what they hold —
-    /// the record's own anchor short of the deadline refuses it whatever
-    /// the mirror says, and no answer defers it.
+    /// An absence record is checked against the proof this validator
+    /// folded off the chain: the record's anchor has to sit inside the
+    /// name's absence window and be the one folded. A proof at the
+    /// deadline passes a record at the deadline, a record at an anchor
+    /// this validator has not folded defers, a record probed short of
+    /// the deadline is refused whatever the mirror holds, and so is one
+    /// probed where the cell may be swept.
     #[test]
     fn an_absence_record_stands_or_falls_on_the_mirror() {
         let sched = make_terminating_schedule(4);
         let deadline = figures_of(b"tx").deadline.at();
         let tx_hash = figures_of(b"tx").tx_hash;
-        let mirror = |probed_wt: WeightedTimestamp| Absence { probed_wt };
-        let record = |probed_wt: WeightedTimestamp| {
-            block_with_records(
-                AFTER_CUT_MS,
-                vec![AbandonmentRecord::unclaimed(
-                    ShardId::ROOT,
-                    probed_wt,
-                    [figures_of(b"tx")],
-                )],
-            )
-        };
+        let record = |at| record_of(absent(Probed::Core, at));
 
         let matching = fence_coordinator();
         matching
             .evidence()
-            .record_absence(tx_hash, ShardId::ROOT, Probed::Core, mirror(deadline));
+            .record(tx_hash, ShardId::ROOT, absent(Probed::Core, deadline));
         assert!(
             !matching.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
             "a proof at the deadline passes a record at the deadline"
@@ -12562,15 +12316,15 @@ mod tests {
         );
         let late = fence_coordinator();
         late.evidence()
-            .record_absence(tx_hash, ShardId::ROOT, Probed::Core, mirror(sweep));
+            .record(tx_hash, ShardId::ROOT, absent(Probed::Core, sweep));
         assert!(
             late.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
             "a mirror taken past the sweep proves nothing and defers"
         );
 
-        let absent = fence_coordinator();
+        let absent_mirror = fence_coordinator();
         assert!(
-            absent.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
+            absent_mirror.fence_abandonment_records(&sched, &record(deadline), BlockHash::ZERO),
             "no proof defers it"
         );
     }
@@ -12578,28 +12332,18 @@ mod tests {
     /// An untaken record — a one-shard core's claim absent — stands on
     /// the claim's own mirror: a folded claim absence at the record's
     /// anchor passes it, and a committed-cell absence at the same anchor
-    /// does not, since the arms are different proofs.
+    /// does not, since the questions are different proofs.
     #[test]
     fn an_untaken_record_stands_on_the_claims_own_mirror() {
         let sched = make_terminating_schedule(4);
         let deadline = figures_of(b"tx").deadline.at();
         let tx_hash = figures_of(b"tx").tx_hash;
-        let absence = Absence {
-            probed_wt: deadline,
-        };
-        let record = block_with_records(
-            AFTER_CUT_MS,
-            vec![AbandonmentRecord::untaken(
-                ShardId::ROOT,
-                deadline,
-                [figures_of(b"tx")],
-            )],
-        );
+        let record = record_of(absent(Probed::Claim, deadline));
 
         let claim = fence_coordinator();
         claim
             .evidence()
-            .record_absence(tx_hash, ShardId::ROOT, Probed::Claim, absence);
+            .record(tx_hash, ShardId::ROOT, absent(Probed::Claim, deadline));
         assert!(
             !claim.fence_abandonment_records(&sched, &record, BlockHash::ZERO),
             "a folded claim absence at the anchor passes it"
@@ -12607,14 +12351,14 @@ mod tests {
 
         let cell = fence_coordinator();
         cell.evidence()
-            .record_absence(tx_hash, ShardId::ROOT, Probed::Core, absence);
+            .record(tx_hash, ShardId::ROOT, absent(Probed::Core, deadline));
         assert!(
             cell.fence_abandonment_records(&sched, &record, BlockHash::ZERO),
-            "a committed-cell absence is another arm's proof, and defers"
+            "a committed-cell absence is another question's proof, and defers"
         );
     }
 
-    /// A lapse record is the same check against a later floor: the
+    /// A lapse record is the same check against a later window: the
     /// name's deadline plus one validity range. A proof at the lapse
     /// passes a record at the lapse, a record anchored at the deadline
     /// is refused whatever the mirror holds, and a mirror short of the
@@ -12626,22 +12370,12 @@ mod tests {
         let deadline = figures_of(b"tx").deadline.at();
         let lapse = deadline.plus(MAX_VALIDITY_RANGE);
         let tx_hash = figures_of(b"tx").tx_hash;
-        let mirror = |probed_wt: WeightedTimestamp| Absence { probed_wt };
-        let record = |probed_wt: WeightedTimestamp| {
-            block_with_records(
-                AFTER_CUT_MS,
-                vec![AbandonmentRecord::lapsed(
-                    ShardId::ROOT,
-                    probed_wt,
-                    [figures_of(b"tx")],
-                )],
-            )
-        };
+        let record = |at| record_of(absent(Probed::Delivery, at));
 
         let matching = fence_coordinator();
         matching
             .evidence()
-            .record_absence(tx_hash, ShardId::ROOT, Probed::Delivery, mirror(lapse));
+            .record(tx_hash, ShardId::ROOT, absent(Probed::Delivery, lapse));
         assert!(
             !matching.fence_abandonment_records(&sched, &record(lapse), BlockHash::ZERO),
             "a proof at the lapse passes a record at the lapse"
@@ -12660,60 +12394,42 @@ mod tests {
         );
 
         let short = fence_coordinator();
-        short.evidence().record_absence(
-            tx_hash,
-            ShardId::ROOT,
-            Probed::Delivery,
-            Absence {
-                probed_wt: deadline,
-            },
-        );
+        short
+            .evidence()
+            .record(tx_hash, ShardId::ROOT, absent(Probed::Delivery, deadline));
         assert!(
             short.fence_abandonment_records(&sched, &record(lapse), BlockHash::ZERO),
             "a proof short of the lapse defers it"
         );
 
         let cores = fence_coordinator();
-        cores.evidence().record_absence(
-            tx_hash,
-            ShardId::ROOT,
-            Probed::Core,
-            Absence { probed_wt: lapse },
-        );
+        cores
+            .evidence()
+            .record(tx_hash, ShardId::ROOT, absent(Probed::Core, lapse));
         assert!(
             cores.fence_abandonment_records(&sched, &record(lapse), BlockHash::ZERO),
             "a core's cell proved absent at the lapse is not the claim proved absent: it defers"
         );
     }
 
-    /// An `Accepted` record is checked against this validator's own
-    /// mirror of the consumer's certificate, as a `Refused` one is: the
-    /// mirrored anchor passes it, another anchor refuses it, and no
-    /// mirror defers.
+    /// An acceptance record is checked against this validator's own
+    /// mirror of the consumer's certificate, as a refusal is: the
+    /// mirrored word passes it, another anchor refuses it, and no mirror
+    /// defers.
     #[test]
     fn an_accepted_record_stands_or_falls_on_the_mirror() {
         let sched = make_terminating_schedule(4);
         let figures = figures_of(b"tx");
         let accepted_wt = figures.deadline.at();
-        let record = |at: WeightedTimestamp| {
-            block_with_records(
-                AFTER_CUT_MS,
-                vec![AbandonmentRecord::accepted(ShardId::ROOT, at, [figures])],
-            )
-        };
+        let record = |at| record_of(verdict(at, true));
 
         let matching = fence_coordinator();
-        matching.evidence().record_acceptance(
-            figures.tx_hash,
-            ShardId::ROOT,
-            Acceptance {
-                accepted_wt,
-                digest: Hash::from_bytes(b"digest"),
-            },
-        );
+        matching
+            .evidence()
+            .record(figures.tx_hash, ShardId::ROOT, verdict(accepted_wt, true));
         assert!(
             !matching.fence_abandonment_records(&sched, &record(accepted_wt), BlockHash::ZERO),
-            "the mirrored anchor passes"
+            "the mirrored word passes"
         );
         assert!(
             matching.fence_abandonment_records(
