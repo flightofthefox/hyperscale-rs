@@ -39,28 +39,23 @@ use hyperscale_core::{
 };
 use hyperscale_engine::legs::{Classified, Licence, Member, Runs, Side};
 use hyperscale_engine::{TickEnvironment, build_fee_receipt};
-use hyperscale_metrics::{
-    record_rebuilt_verdict_entry, record_reclaim_admitted, record_reclaim_probe_answered,
-    record_unresolvable_tx,
-};
-use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
+use hyperscale_metrics::{record_reclaim_admitted, record_unresolvable_tx};
+use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
-    CertifiedBlock, ConsensusPublicKey, CounterpartEvidence, CounterpartMirror, Deadline,
-    DeclaredKey, Derivation, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
-    Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Heard,
-    Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Mode, Probed, ProvenAnchors, Provisions,
-    Question, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateProofBundle, StoredReceipt,
-    SubstateKey, TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision,
-    TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, Window, Word, derive_block_transactions, settled_set_verdict, tick_leader,
-    tick_leader_at,
+    Anchor, Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
+    ConsensusPublicKey, CounterpartMirror, Deadline, DeclaredKey, Derivation, ExecutionCertificate,
+    ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationHash,
+    FinalizationVerifyError, GlobalReceiptRoot, Hash, MerkleInclusionProof, Mode, ProvenAnchors,
+    Provisions, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StoredReceipt, SubstateKey,
+    TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
+    TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    Window, derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::CrossingCell;
 use tracing::instrument;
 
 use crate::candidates::{Admitted, TickCandidates};
+use crate::counterparts::{Counterparts, Offers};
 use crate::early_arrivals::{EARLY_VOTE_RETENTION, EarlyArrivalBuffer};
 use crate::exec_cert_store::ExecCertStore;
 use crate::expected_certs::ExpectedCertTracker;
@@ -76,7 +71,7 @@ use crate::provisional::ProvisionalCells;
 use crate::provisioning::{ProvisioningTracker, Requirement, requirements_of};
 use crate::tick_state::{Admission, Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
-use crate::unresolved::{Probeable, Reclaimable, Released, Retirable, Unanswerable, UnresolvedTxs};
+use crate::unresolved::{Reclaimable, Retirable, Unanswerable, UnresolvedTxs};
 use crate::vote_tracker::VoteTracker;
 
 /// One payer-side engagement wait: the transaction, the counterpart
@@ -228,56 +223,6 @@ enum Gate {
     Refused,
 }
 
-/// One counterpart cell a leg entry asks about: the shard holding it,
-/// the cell, the anchor an answer is held to, and which question it is.
-type CounterpartCell = (ShardId, SubstateKey, Probed);
-
-/// What counterparts were heard to say, by shard and question, then by
-/// the moment and word of each answer: the grouping a block's records
-/// are composed from.
-type HeardByQuestion =
-    BTreeMap<(ShardId, Question), BTreeMap<(WeightedTimestamp, Word), Vec<UnsettledTx>>>;
-
-/// Every cell `entry` asks a counterpart about, under `trie`: one core
-/// shard's committed cell, each delivery's claim on the shard that was
-/// to deliver it and on whatever shard holds the cell's prefix now, and
-/// each core consumer's claim. The one enumeration the prober and the
-/// commit-time fold both read, so what is asked and what is answered
-/// are the same cells.
-fn counterpart_cells(entry: &Probeable, trie: &ShardTrie) -> Vec<CounterpartCell> {
-    // The committed cell is asked about only where its absence would
-    // answer: a core of more than one shard, whose shards settle on each
-    // other's certificates with no clock. A core of one shard answers
-    // through its claim, which the deadline fences.
-    let core = entry
-        .core
-        .iter()
-        .next()
-        .filter(|_| {
-            Probed::Core
-                .read(Inclusion::Absent, entry.core.len())
-                .is_some()
-        })
-        .map(|&shard| {
-            (
-                shard,
-                committed_tx_cell_key(shard, entry.tx_hash, entry.deadline.validity_end()),
-                Probed::Core,
-            )
-        });
-    let deliveries = entry.deliveries.iter().flat_map(|&(delivered_by, claim)| {
-        BTreeSet::from([delivered_by, trie.shard_for_prefix(claim.owner)])
-            .into_iter()
-            .map(move |shard| (shard, claim, Probed::Delivery))
-    });
-    let claims = entry.claims.iter().flat_map(|&(shard, claim)| {
-        BTreeSet::from([shard, trie.shard_for_prefix(claim.owner)])
-            .into_iter()
-            .map(move |shard| (shard, claim, Probed::Claim))
-    });
-    core.into_iter().chain(deliveries).chain(claims).collect()
-}
-
 /// The name a housekeeping member over inherited records takes on the
 /// chain that inherited them.
 ///
@@ -356,12 +301,6 @@ pub struct ExecutionCoordinator {
     /// tick absent from the map — never dispatched, or committed by a
     /// shard past the execution window — resolves nothing.
     ticked: BTreeMap<TickId, TickedBatch>,
-
-    /// Committed transactions still owed an outcome, folded from the
-    /// chain rather than read off live tick state — the only account of
-    /// what this shard has in flight that can be rebuilt after losing
-    /// that state.
-    unresolved: UnresolvedTxs,
 
     /// The escrow records this shard inherited with a prefix, each still
     /// unresolved, by cell key.
@@ -454,48 +393,12 @@ pub struct ExecutionCoordinator {
     /// re-driven through the handler it arrived by ([`Self::release`]).
     parked: ParkedArtifacts,
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Commit-proof gate
-    // ═══════════════════════════════════════════════════════════════════════
-    /// What counterparts have said about the transactions legs here
-    /// issued for, shared with the shard coordinator's vote fence: a
-    /// core's refusal, a proved absence, a consumer's claim. This
-    /// coordinator is the only writer, and the only one that says what
-    /// to drop — the ledger below is what an entry there speaks for.
-    ///
-    /// One mirror, because the fence checks a record against exactly
-    /// what was offered from, and two copies could answer differently.
-    evidence: Arc<CounterpartMirror>,
-
-    /// Commit-proven remote source blocks, shared with the shard
-    /// coordinator, which owns the mirror and feeds it off
-    /// `RemoteHeaderCommitted`.
-    ///
-    /// A cross-shard EC is consumable only against a proven source block
-    /// — a bare QC certifies availability, and an f+1..2f corrupt
-    /// committee can certify a sibling that never commits and export ECs
-    /// computed from it. The same anchors are what a probe of a
-    /// counterpart's committed set is taken against, and what this
-    /// validator's vote fence holds a block's state proofs to: one
-    /// mirror, so a bundle cannot pass the fence at an anchor no prober
-    /// here would have chosen.
-    proven_anchors: Arc<ProvenAnchors>,
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Split-boundary finalize gate
-    // ═══════════════════════════════════════════════════════════════════════
-    /// The proofs this validator's own fetches answered, each with the
-    /// transactions whose probes it spoke to, held to offer in a block
-    /// this validator proposes: a proof is committed content, folded by
-    /// every replica at the same height, and the fetch is only how the
-    /// proposer comes by the bytes. A bundle leaves when a block
-    /// carries it, or when every transaction it answered for is gone.
-    fetched: BTreeMap<StateProofBundle, BTreeSet<TxHash>>,
-    /// Fetches the ledger let go of since the last commit — a question
-    /// the chain answered first, or one whose entry is gone — released
-    /// as one abandon at the commit, so a counterpart that never serves
-    /// the height does not pin the slot.
-    released_fetches: Vec<(Anchor, SubstateKey)>,
+    /// What counterparts have said about the transactions in flight
+    /// here, and what this shard still asks them: the ledger of what is
+    /// owed an outcome, the mirror the vote fence reads, the questions
+    /// out and the proofs fetched back. The tick machine reads the
+    /// ledger through it.
+    counterparts: Counterparts,
 
     /// This validator's identity.
     me: ValidatorId,
@@ -578,8 +481,7 @@ impl ExecutionCoordinator {
             None => recovered.committee_anchor_wt(),
         };
         Self {
-            proven_anchors,
-            evidence,
+            counterparts: Counterparts::new(local_shard, proven_anchors, evidence),
             finalized,
             committed_height,
             committed_ts: committed_block_anchor_wt,
@@ -589,7 +491,6 @@ impl ExecutionCoordinator {
             tick_in_flight: false,
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
-            unresolved: UnresolvedTxs::default(),
             inherited: recovered
                 .inherited_records
                 .iter()
@@ -606,8 +507,6 @@ impl ExecutionCoordinator {
             exec_certs,
             pending_verifications: HashSet::new(),
             parked: ParkedArtifacts::default(),
-            fetched: BTreeMap::new(),
-            released_fetches: Vec::new(),
             me,
             local_shard,
         }
@@ -825,7 +724,7 @@ impl ExecutionCoordinator {
         // what this shard is to them — is theirs and this shard's, so a
         // rebuild reads the same account off the same blocks however
         // long after.
-        self.unresolved.register_committed(
+        self.counterparts.ledger.register_committed(
             local_shard,
             ts,
             members
@@ -974,7 +873,7 @@ impl ExecutionCoordinator {
             if let Some(held_by) = self.ticks.tick_assignment(tx_hash) {
                 self.discard_tick(held_by);
             }
-            let mut participating = self.unresolved.counterparts(tx_hash, trie);
+            let mut participating = self.counterparts.ledger.counterparts(tx_hash, trie);
             participating.insert(local_shard);
             state.admit(
                 tx_hash,
@@ -1000,7 +899,7 @@ impl ExecutionCoordinator {
             }
             self.candidates.remove(tx_hash);
             self.ticks.assign_tx(tx_hash, tick_id);
-            self.unresolved.certify(tx_hash);
+            self.counterparts.ledger.certify(tx_hash);
         }
     }
 
@@ -1042,12 +941,12 @@ impl ExecutionCoordinator {
             body: transaction,
             classified,
             charged,
-        } in self.unresolved.reclaimable()
+        } in self.counterparts.ledger.reclaimable()
         {
             if self.ticks.tick_assignment(tx_hash).is_some() {
                 continue;
             }
-            self.unresolved.admit_reclaim(tx_hash);
+            self.counterparts.ledger.admit_reclaim(tx_hash);
             record_reclaim_admitted();
             // A mixed shard's delivering member waits on what the core
             // returns, and the evidence this reclaim is composed from is
@@ -1162,7 +1061,7 @@ impl ExecutionCoordinator {
             tx_hash,
             body: transaction,
             classified,
-        } in self.unresolved.retirable()
+        } in self.counterparts.ledger.retirable()
         {
             // Only once nothing this shard runs of the transaction is
             // left: a mixed shard's delivering member is still a
@@ -1171,7 +1070,7 @@ impl ExecutionCoordinator {
             if self.ticks.tick_assignment(tx_hash).is_some() || self.candidates.contains(tx_hash) {
                 continue;
             }
-            self.unresolved.admit_retire(tx_hash);
+            self.counterparts.ledger.admit_retire(tx_hash);
             let records = classified.records_issued(local_shard);
             self.seat_settling(
                 tick_id,
@@ -1282,7 +1181,7 @@ impl ExecutionCoordinator {
         };
         state.record_crossing_targets(member.request.tx_hash, targets);
         self.ticks.assign_tx(member.request.tx_hash, tick_id);
-        self.unresolved.certify(member.request.tx_hash);
+        self.counterparts.ledger.certify(member.request.tx_hash);
         // A shard with legs on both sides of the core runs them as two
         // members: the issuing one just admitted, and a delivering one
         // that waits on what the core returns. Registered here, at the
@@ -2216,8 +2115,12 @@ impl ExecutionCoordinator {
         // `settled_set_admits` — because a departed chain supplies no
         // further commit proofs.
         if shard != self.local_shard
-            && self.proven_anchors.at(shard, cert.block_height()).is_none()
-            && !self.settled_set_admits(shard, &cert)
+            && self
+                .counterparts
+                .proven_anchors
+                .at(shard, cert.block_height())
+                .is_none()
+            && !self.counterparts.settled_set_admits(shard, &cert)
         {
             let height = cert.block_height();
             tracing::debug!(
@@ -2393,18 +2296,34 @@ impl ExecutionCoordinator {
     // Expected Execution Certificate Tracking
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// The counterpart mirror this coordinator writes, for the vote
-    /// fence to read.
-    #[must_use]
-    pub const fn evidence(&self) -> &Arc<CounterpartMirror> {
-        &self.evidence
-    }
-
     /// The shared mirror of commit-proven remote anchors, which the shard
     /// coordinator owns and fills.
     #[must_use]
     pub const fn proven_anchors(&self) -> &Arc<ProvenAnchors> {
-        &self.proven_anchors
+        &self.counterparts.proven_anchors
+    }
+
+    /// Ask each silent counterpart what it holds, against the trie that
+    /// says who was party to each transaction.
+    fn probe_silent_counterparts(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        let trie = self.counterpart_trie(topology_schedule);
+        self.counterparts.probe(trie, self.committed_ts)
+    }
+
+    /// Keep a fetched proof for a block this validator proposes.
+    pub fn on_proof_fetched(
+        &mut self,
+        anchor: Anchor,
+        keys: Vec<SubstateKey>,
+        proof: MerkleInclusionProof,
+    ) {
+        self.counterparts.on_proof_fetched(anchor, keys, proof);
+    }
+
+    /// What this validator holds to offer in a block it proposes.
+    #[must_use]
+    pub fn offers(&self) -> Offers {
+        self.counterparts.offers()
     }
 
     /// Handle a commit-proven remote header from the `RemoteHeaderCoordinator`.
@@ -2443,355 +2362,6 @@ impl ExecutionCoordinator {
             });
         }
         actions
-    }
-
-    /// Ask each silent counterpart whether it took the transaction a
-    /// leg here issued for, once the transaction's deadline has passed.
-    ///
-    /// The deadline gates the probe and never the reclaim: absence at a
-    /// block past the floor is the evidence, and before it the
-    /// counterpart may still legitimately act. A core of more than one
-    /// shard is asked about the transaction's committed cell past the
-    /// deadline, and the probe goes to the core's lowest shard — any one
-    /// core shard's absence suffices, and the choice has to be the same
-    /// on every validator or a voter's mirror would name a shard the
-    /// record does not. A core of one shard writes no cell and is asked
-    /// about its consumer's claim instead. A
-    /// delivering shard is asked about the crossing's claim cell past
-    /// the lapse, the delivery window's close plus the finalization
-    /// delay, since a delivery admitted under the close has claimed by
-    /// then or never will. Each is asked against the newest commit-proven
-    /// header of that shard inside its window — at or past its floor and
-    /// short of the probed cell's own sweep, since a proof against a
-    /// swept cell is a true proof of nothing — which is the header the
-    /// shard is likeliest to still serve, a proof being taken from a
-    /// bounded history behind its tip. A shard whose header has not
-    /// reached here yet is asked when it does, and one whose every held
-    /// header is past the window is not asked at all: the entry then
-    /// waits out its horizon.
-    ///
-    /// A delivering shard that departs at a reshape may leave no header
-    /// past the lapse at all, so the claim cell is asked about wherever
-    /// its prefix sits: on the shard that was to deliver it and on the
-    /// shard the trie names for its owner now, which is the successor
-    /// holding the departed chain's cells. Both are asked rather than
-    /// the trie's answer alone, because the vote fence checks a record
-    /// against the voter's own proof of the shard it names, and two
-    /// validators straddling the cut would otherwise prove different
-    /// shards and never both vote one record.
-    ///
-    /// The cell is named from signed content and the counterpart shard
-    /// alone, so nothing but the header and the proof is fetched.
-    fn probe_silent_counterparts(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
-        let trie = self.counterpart_trie(topology_schedule);
-        let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
-        for entry in self.unresolved.probeable(self.committed_ts) {
-            for (shard, key, probed) in counterpart_cells(&entry, trie) {
-                // The chain has answered: nothing is asked again.
-                if self.unresolved.answered(entry.tx_hash, shard, probed) {
-                    continue;
-                }
-                // The newest licensed header held: the one the shard is
-                // likeliest to still serve, since a proof is taken from
-                // a bounded history behind its tip.
-                let Some(anchor) = self
-                    .proven_anchors
-                    .newest_licensed(shard, |ts| probed.licenses(ts, entry.deadline))
-                else {
-                    continue;
-                };
-                // A question in flight is left alone: a core's header
-                // lands every block, and moving the probe to each new
-                // one abandons the fetch before its answer returns. A
-                // probe whose fetch has answered is moved on, which is
-                // how a claim the chain read absent is asked again —
-                // at a newer header, not of the same one every block.
-                if self
-                    .unresolved
-                    .probe_stands(entry.tx_hash, shard, probed, anchor.height)
-                {
-                    continue;
-                }
-                self.unresolved
-                    .record_probe(entry.tx_hash, shard, probed, anchor, key);
-                wanted.entry(anchor).or_default().push(key);
-            }
-        }
-        wanted
-            .into_iter()
-            .map(|(anchor, keys)| {
-                Action::Fetch(FetchRequest::StateProof {
-                    anchor,
-                    keys,
-                    preferred: None,
-                    class: None,
-                })
-            })
-            .collect()
-    }
-
-    /// Keep a fetched proof for a block this validator proposes.
-    ///
-    /// The fetch is only how the proposer comes by the bytes: nothing is
-    /// read off the answer here, since the answer is the chain's once a
-    /// block carries the proof and every replica folds it there. The
-    /// probes the proof spoke to are marked answered, so the question is
-    /// not put to the same header again, and the bundle is kept beside
-    /// the transactions it answered for, dated to the clock the probe
-    /// read off the header.
-    pub fn on_state_proof_verified(
-        &mut self,
-        anchor: Anchor,
-        keys: Vec<SubstateKey>,
-        proof: MerkleInclusionProof,
-    ) {
-        let answered = self.unresolved.mark_probes_answered(anchor, &keys);
-        // An answer nothing here asked about is nobody's to commit.
-        if !answered.is_empty() {
-            self.fetched
-                .entry(StateProofBundle::new(anchor, keys, proof))
-                .or_default()
-                .extend(answered);
-        }
-    }
-
-    /// Fold the proofs a committed block carries into the answers every
-    /// replica holds, and hand each to the vote fence.
-    ///
-    /// A bundle answers every cell of the ledger's on the anchor's shard
-    /// whose window the anchor's clock sits inside — whether or not this
-    /// replica had a probe out, and wherever its own probe sat — so a
-    /// replica that never fetched reads the same answer as the one that
-    /// did. A key found present means the counterpart took the
-    /// transaction, and its own certificate speaks for it next: a
-    /// refusal there is mirrored on arrival, and an acceptance is what
-    /// settles the record held for the consumer's claim. A core
-    /// consumer's claim absent on a core of more than one shard says
-    /// only that a sibling is pending, and is asked again at the next
-    /// header.
-    /// The first proof to answer a cell is the answer; a later one adds
-    /// nothing. The hand-off is a continuation emitted here rather than
-    /// a map the fence reads later, so an answer is never collected
-    /// before it is drained.
-    fn fold_state_proofs(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block: &Block,
-    ) -> Vec<Action> {
-        if block.state_proofs().is_empty() {
-            return Vec::new();
-        }
-        let trie = self.counterpart_trie(topology_schedule);
-        let cells: Vec<(Probeable, Vec<CounterpartCell>)> = self
-            .unresolved
-            .cells()
-            .into_iter()
-            .map(|entry| {
-                let cells = counterpart_cells(&entry, trie);
-                (entry, cells)
-            })
-            .collect();
-        let mut actions = Vec::new();
-        for bundle in block.state_proofs() {
-            actions.extend(self.fold_cells(bundle, &cells));
-        }
-        actions
-    }
-
-    /// Fold the verdicts a committed block's records restate: each is
-    /// the counterpart's own word, folded from the chain, so a replica
-    /// that never heard the certificate broadcast holds it from the
-    /// block alone.
-    fn fold_verdict_records(&mut self, block: &Block) -> Vec<Action> {
-        let mut actions = Vec::new();
-        for record in block.abandonment_records() {
-            if let CounterpartEvidence::Heard(heard) = record.evidence()
-                && heard.question == Question::Verdict
-            {
-                for entry in record.unsettled() {
-                    actions.extend(self.fold_verdict(record.shard(), entry.tx_hash, heard));
-                }
-            }
-        }
-        actions
-    }
-
-    /// Fold one bundle's answers into the questions the ledger is
-    /// waiting on.
-    fn fold_cells(
-        &mut self,
-        bundle: &StateProofBundle,
-        cells: &[(Probeable, Vec<CounterpartCell>)],
-    ) -> Vec<Action> {
-        let mut actions = Vec::new();
-        let inclusions = match bundle.inclusions() {
-            Ok(inclusions) => inclusions,
-            Err(error) => {
-                tracing::error!(
-                    shard = ?bundle.anchor.shard,
-                    height = bundle.anchor.height.inner(),
-                    %error,
-                    "A committed state proof does not answer for its keys"
-                );
-                return actions;
-            }
-        };
-        {
-            for (entry, cells) in cells {
-                for &(shard, key, probed) in cells {
-                    if shard != bundle.anchor.shard
-                        || !probed.licenses(bundle.anchor.ts, entry.deadline)
-                    {
-                        continue;
-                    }
-                    let Some(&(_, inclusion)) = inclusions.iter().find(|(asked, _)| *asked == key)
-                    else {
-                        continue;
-                    };
-                    // Read by the one arity rule, whoever fetched the
-                    // proof: a probe never sent may still be answered
-                    // by a proof a block carries.
-                    let Some(inclusion) = probed.read(inclusion, entry.core.len()) else {
-                        continue;
-                    };
-                    // The question is answered, and a fetch still out
-                    // for it is released with it.
-                    let Some(Released(released)) =
-                        self.unresolved.close_question(entry.tx_hash, shard, probed)
-                    else {
-                        continue;
-                    };
-                    self.released_fetches.extend(released);
-                    record_reclaim_probe_answered(inclusion.is_present());
-                    let tx_hash = entry.tx_hash;
-                    match inclusion {
-                        // The counterpart took it, and its certificate
-                        // says how. Its broadcast may have missed this
-                        // shard, so it is fetched rather than waited for.
-                        Inclusion::Present(_) => {
-                            actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
-                                source_shard: shard,
-                                tx_hash,
-                                preferred: None,
-                                class: None,
-                            }));
-                        }
-                        Inclusion::Absent => {
-                            self.evidence.record(
-                                tx_hash,
-                                shard,
-                                Heard {
-                                    question: Question::Cell(probed),
-                                    word: Word::Absent,
-                                    at: bundle.anchor.ts,
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        actions
-    }
-
-    /// Write what the block's abandoning records cover into the mirror
-    /// the gate and the fence read: neither asks a settled set about a
-    /// transaction the chain has established no counterpart can settle.
-    fn cover_recorded(&self, block: &Block) {
-        for record in block.abandonment_records() {
-            if record.evidence().abandons() {
-                for tx_hash in record.tx_hashes() {
-                    self.evidence.cover(tx_hash);
-                }
-            }
-        }
-    }
-
-    /// Fold what `shard` said of `tx_hash` into the mirror the vote
-    /// fence reads, and tell the mempool.
-    ///
-    /// Fed from two directions and read the same way from both: a
-    /// certificate arriving by broadcast, and a record the chain
-    /// committed, which is the counterpart's own word folded from the
-    /// chain rather than from whatever this replica happened to hear —
-    /// so a replica that came up between a core's verdict and the
-    /// record's proposal holds the same answer its peers do. First
-    /// write wins, as the chain's answer is: a second certificate or
-    /// record restates a decision already held.
-    ///
-    /// Only a word this shard has a use for is kept. A core's refusal
-    /// is the transaction's verdict, where a leg here issued for it; a
-    /// consumer's acceptance — a core's or a delivery's — is what
-    /// settles the record held for its claim; and a core shard's
-    /// acceptance counts toward the transaction being accepted, which
-    /// is every core shard saying so.
-    fn fold_verdict(&mut self, shard: ShardId, tx_hash: TxHash, heard: Heard) -> Vec<Action> {
-        if shard == self.local_shard || heard.question != Question::Verdict {
-            return Vec::new();
-        }
-        let in_core = self.unresolved.core_holds(tx_hash, shard);
-        let consumes = self.unresolved.consumer_holds(tx_hash, shard);
-        let mut actions = Vec::new();
-        match heard.word {
-            Word::Accepted { .. } => {
-                if consumes {
-                    self.evidence.record(tx_hash, shard, heard);
-                }
-                if in_core && self.unresolved.record_acceptance(tx_hash, shard) {
-                    actions.push(Action::Continuation(ProtocolEvent::TransactionsResolved {
-                        resolutions: vec![(
-                            tx_hash,
-                            TxResolution::CoreDecided(TransactionDecision::Accept),
-                        )],
-                    }));
-                }
-            }
-            Word::Refused { decision, .. } => {
-                if in_core
-                    && self.unresolved.unsettled_leg_figures(tx_hash).is_some()
-                    && self.evidence.record(tx_hash, shard, heard)
-                {
-                    actions.push(Action::Continuation(ProtocolEvent::TransactionsResolved {
-                        resolutions: vec![(tx_hash, TxResolution::CoreDecided(decision))],
-                    }));
-                }
-            }
-            Word::Absent => {}
-        }
-        actions
-    }
-
-    /// The proofs this validator's own fetches answered that no block
-    /// has carried yet, in the one order a block carries them, under
-    /// the block's cap.
-    #[must_use]
-    pub fn pending_state_proofs(&self) -> Vec<StateProofBundle> {
-        self.fetched
-            .keys()
-            .take(MAX_STATE_PROOFS_PER_BLOCK)
-            .cloned()
-            .collect()
-    }
-
-    /// Drop the bundles no transaction they answered for still needs,
-    /// and release every fetch the ledger let go — a question the chain
-    /// answered first, or one whose entry is gone — so a counterpart
-    /// that never serves the height does not pin the slot.
-    fn release_answered_fetches(&mut self) -> Vec<Action> {
-        let unresolved = &self.unresolved;
-        self.fetched
-            .retain(|_, answered| answered.iter().any(|tx_hash| unresolved.contains(*tx_hash)));
-        // The one retention rule for what counterparts said: an entry
-        // there speaks for a transaction this ledger still owes an
-        // outcome for, and the ledger is here.
-        self.evidence
-            .retain(&|tx_hash| unresolved.contains(tx_hash));
-        let ids = std::mem::take(&mut self.released_fetches);
-        if ids.is_empty() {
-            Vec::new()
-        } else {
-            vec![Action::AbandonFetch(FetchAbandon::StateProofs { ids })]
-        }
     }
 
     /// Eager-fetch every expected execution cert whose fallback hasn't fired,
@@ -3000,37 +2570,16 @@ impl ExecutionCoordinator {
             self.committed_ts = own_anchor;
         }
         self.provisioning.advance_clock(self.committed_ts);
-        self.gc_settled_sets(topology_schedule);
-        // A proof the chain now carries is everybody's: its answers are
-        // folded here, and nothing offers it again.
-        for bundle in block.state_proofs() {
-            self.fetched.remove(bundle);
-        }
-        let mut actions = self.fold_state_proofs(topology_schedule, block);
-        actions.extend(self.fold_verdict_records(block));
-        // Every verdict this block carries resolves its transactions,
-        // whichever way it went; what is left past every window that
-        // could still carry one is nobody's to resolve.
-        let released = self.unresolved.release_resolved(block.certificates());
-        self.released_fetches.extend(released);
-        // What the block writes down about departed shards, before the
-        // prune below reads what is still answerable.
-        let rebuilt = self
-            .unresolved
-            .record_abandonment_records(block.abandonment_records());
-        for _ in 0..rebuilt {
-            record_rebuilt_verdict_entry();
-        }
-        self.cover_recorded(block);
-        self.stamp_departures(topology_schedule);
         self.sweep_candidates();
-        let pruned = self.unresolved.prune(self.committed_ts);
-        self.released_fetches.extend(pruned.released);
-        self.release_unanswerable(&pruned.unanswerable);
-        actions.extend(self.release_answered_fetches());
-        // The committed clock is what opens a leg's deadline, so the
-        // cores gone silent past it are asked here.
-        actions.extend(self.probe_silent_counterparts(topology_schedule));
+        // What the block says about counterparts, and what it opens to
+        // ask them; the strands no counterpart can answer for any more
+        // are let go of below.
+        let trie = self.counterpart_trie(topology_schedule);
+        let committed =
+            self.counterparts
+                .on_commit(trie, topology_schedule, block, self.committed_ts);
+        let mut actions = committed.actions;
+        self.release_unanswerable(&committed.unanswerable);
 
         // Timeout checks + pruning run every block, not just commits that
         // carry txs.
@@ -3282,7 +2831,8 @@ impl ExecutionCoordinator {
     /// fence's question, which [`Finalization::claims`] is what lets the
     /// fence ask about an abandonment at all.
     fn abandonable(&self, composing: TickId) -> Vec<UnsettledTx> {
-        self.unresolved
+        self.counterparts
+            .ledger
             .past_deadline(self.committed_ts)
             .into_iter()
             .filter(|entry| self.beyond_every_shard(composing, entry.tx_hash))
@@ -3344,11 +2894,12 @@ impl ExecutionCoordinator {
             // claim it would write past the close is one the crossing's
             // issuer may already have proved absent and taken back.
             Some(_) => {
-                self.unresolved.is_unsettled_by_departed(tx_hash)
-                    || self.unresolved.is_delivery(tx_hash)
+                self.counterparts.ledger.is_unsettled_by_departed(tx_hash)
+                    || self.counterparts.ledger.is_delivery(tx_hash)
             }
             None => {
-                !self.unresolved.is_certified(tx_hash) || self.no_counterpart_can_settle(tx_hash)
+                !self.counterparts.ledger.is_certified(tx_hash)
+                    || self.no_counterpart_can_settle(tx_hash)
             }
         }
     }
@@ -3358,104 +2909,8 @@ impl ExecutionCoordinator {
     /// certificate but ours to combine with, or a committed record says
     /// the one that was left it unsettled.
     fn no_counterpart_can_settle(&self, tx_hash: TxHash) -> bool {
-        !self.unresolved.reaches_beyond(tx_hash)
-            || self.unresolved.is_unsettled_by_departed(tx_hash)
-    }
-
-    /// The records this shard has evidence for and has not yet written
-    /// down — what each departed counterpart left of its business here.
-    ///
-    /// Composed from the settled sets, which is what bounds when this can
-    /// speak at all: a set is acquired once the departed shard's terminal
-    /// roots are attested and dropped at its evidence expiry, so a record
-    /// is only ever offered while the evidence for it is readable, which
-    /// is the same window every voter can check it in. Absence from a set
-    /// is proof rather than ignorance — the set is complete and
-    /// beacon-attested — so a transaction of ours it does not name is one
-    /// that shard never settled and now never will.
-    ///
-    /// Bounded by [`MAX_UNSETTLED_PER_BLOCK`], one budget across every
-    /// departure, with the remainder left for the next block.
-    ///
-    /// Ascending by shard, which is the one order a block may carry them
-    /// in.
-    #[must_use]
-    pub fn pending_abandonment_records(&self) -> Vec<AbandonmentRecord> {
-        let mut budget = MAX_UNSETTLED_PER_BLOCK;
-        // One record per shard and arm, ascending: a departure first,
-        // since it covers everything the shard was party to, then one
-        // per question for the shards still running, in the order the
-        // block carries them.
-        let mut records: BTreeMap<(ShardId, Option<Question>), AbandonmentRecord> = BTreeMap::new();
-        // The sets are a hash map, so the shards are walked in sorted
-        // order rather than its own: which departures the budget reaches
-        // must not turn on a per-process iteration order.
-        self.evidence.with_settled(|sets| {
-            let mut shards: Vec<ShardId> = sets.keys().copied().collect();
-            shards.sort_unstable();
-            for shard in shards {
-                if budget == 0 || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
-                    break;
-                }
-                let settled = &sets[&shard];
-                let mut unsettled = self.unresolved.outstanding_with(shard, settled.terminal_wt);
-                unsettled.retain(|entry| !settled.txs.contains(&entry.tx_hash));
-                unsettled.truncate(budget);
-                if unsettled.is_empty() {
-                    continue;
-                }
-                budget -= unsettled.len();
-                let record = AbandonmentRecord::departed(shard, settled.terminal_wt, unsettled);
-                records.insert((shard, None), record);
-            }
-        });
-        // What counterparts were heard to say, one record per shard and
-        // question, at the shard's earliest anchor: a record states the
-        // one moment every name in it was answered at, since one
-        // spanning two satisfies the fence's equality check for neither,
-        // and the rest waits a block. Nothing is offered beside a
-        // departure, which answers for everything the shard was party
-        // to. An acceptance is offered until the chain has it written
-        // down and no longer: the mirror lives to the entry, and the
-        // entry to the retirement, so a record offered past its own
-        // commit could reach a block after the evidence every voter
-        // checks it against has gone.
-        let mut heard: HeardByQuestion = BTreeMap::new();
-        for (tx_hash, shard, word) in self.evidence.all() {
-            if matches!(word.word, Word::Accepted { .. })
-                && !self.unresolved.acceptance_unrecorded(tx_hash, shard)
-            {
-                continue;
-            }
-            let Some(figures) = self.unresolved.unsettled_leg_figures(tx_hash) else {
-                continue;
-            };
-            heard
-                .entry((shard, word.question))
-                .or_default()
-                .entry((word.at, word.word))
-                .or_default()
-                .push(figures);
-        }
-        for ((shard, question), anchors) in heard {
-            if budget == 0 || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
-                break;
-            }
-            if records.contains_key(&(shard, None)) {
-                continue;
-            }
-            let Some(((at, word), mut unsettled)) = anchors.into_iter().next() else {
-                continue;
-            };
-            unsettled.truncate(budget);
-            budget -= unsettled.len();
-            let evidence = Heard { question, word, at };
-            records.insert(
-                (shard, Some(question)),
-                AbandonmentRecord::heard(shard, evidence, unsettled),
-            );
-        }
-        records.into_values().collect()
+        !self.counterparts.ledger.reaches_beyond(tx_hash)
+            || self.counterparts.ledger.is_unsettled_by_departed(tx_hash)
     }
 
     /// Let go of what this shard holds against transactions no shard can
@@ -3494,43 +2949,6 @@ impl ExecutionCoordinator {
                     "Releasing a strand whose counterparts have all fallen silent"
                 );
                 self.discard_tick(tick_id);
-            }
-        }
-    }
-
-    /// Record where each departed shard's chain ended, for the entries
-    /// whose fate only that shard's settled set can decide.
-    ///
-    /// Read on every commit, while the schedule still carries the window
-    /// that proves the terminal — the account outlives that window, and a
-    /// departure it never recorded reads afterwards as a counterpart that
-    /// never left. Re-run rather than gated on first sight, because the
-    /// expiry is not knowable at the cut: the beacon stamps the handoff
-    /// complete some epochs later, and the ledger's entry fills in on the
-    /// first commit after the stamp lands.
-    fn stamp_departures(&mut self, topology_schedule: &TopologySchedule) {
-        for (shard, cut) in topology_schedule.departures_at(self.committed_ts) {
-            if shard != self.local_shard {
-                self.unresolved.record_terminal(
-                    shard,
-                    cut,
-                    topology_schedule.handoff_evidence_expiry(shard),
-                );
-            }
-        }
-        // A departure held open is asked about by name on every commit,
-        // since the schedule lists it only while a retained window
-        // carries the shard and the stamp lands on the head's boundary
-        // record, which outlives that window. One whose evidence the
-        // schedule no longer reads at all closes now — the same reading
-        // the settled sets are dropped on — so an entry a record covers
-        // against it retires with the set that could have answered.
-        let now = self.committed_ts;
-        for shard in self.unresolved.unstamped_departures() {
-            if let Some(expiry) = topology_schedule.handoff_evidence_expiry(shard) {
-                self.unresolved.stamp_terminal(shard, expiry);
-            } else if !topology_schedule.terminal_evidence_readable(shard, now) {
-                self.unresolved.stamp_terminal(shard, now);
             }
         }
     }
@@ -3685,7 +3103,7 @@ impl ExecutionCoordinator {
         &self,
         finalizations: &[Arc<Verifiable<Finalization>>],
     ) -> Vec<(TxHash, TxResolution)> {
-        self.unresolved.resolutions_of(finalizations)
+        self.counterparts.ledger.resolutions_of(finalizations)
     }
 
     /// Register tx → tick assignments for a `Sealed` block without any of
@@ -3703,26 +3121,13 @@ impl ExecutionCoordinator {
         let tick_id = TickId::new(self.local_shard, block_height);
         for tx in transactions {
             self.ticks.assign_tx(tx.hash(), tick_id);
-            self.unresolved.certify(tx.hash());
+            self.counterparts.ledger.certify(tx.hash());
         }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Phase 5: Finalization
     // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Fold every verdict a certificate carries, before it is routed:
-    /// the leg's tick settled long ago, so the certificate routes
-    /// nowhere, and what it says is the one thing in it this shard still
-    /// has a use for.
-    fn mirror_verdicts(&mut self, ec: &Arc<Verified<ExecutionCertificate>>) -> Vec<Action> {
-        let shard = ec.shard_id();
-        let mut actions = Vec::new();
-        for (tx_hash, heard) in ec.verdicts() {
-            actions.extend(self.fold_verdict(shard, tx_hash, heard));
-        }
-        actions
-    }
 
     /// Handle a tick-level attestation (execution certificate) from any shard.
     ///
@@ -3744,7 +3149,7 @@ impl ExecutionCoordinator {
         // read before routing: the leg's tick settled long ago, so the
         // certificate routes nowhere, and the refusal is the one thing
         // in it this shard still has a use for.
-        let mut actions = self.mirror_verdicts(ec);
+        let mut actions = self.counterparts.on_certificate(ec);
 
         let routing = self.ticks.classify_attestation(ec);
 
@@ -3835,9 +3240,10 @@ impl ExecutionCoordinator {
         let verdict = {
             // Whether a shard is past-terminal is asked at the committed
             // frontier, which is what a node-local caller reads it at.
-            let claims =
-                finalized_arc.claims(self.local_shard, |tx_hash| self.evidence.covers(tx_hash));
-            self.evidence.with_settled(|settled| {
+            let claims = finalized_arc.claims(self.local_shard, |tx_hash| {
+                self.counterparts.mirror.covers(tx_hash)
+            });
+            self.counterparts.mirror.with_settled(|settled| {
                 settled_set_verdict(
                     settled,
                     topology_schedule,
@@ -3912,41 +3318,8 @@ impl ExecutionCoordinator {
         // What this shard's ledger says the departed shard was party to,
         // taken beside the set: a departure record may name only these,
         // and the fence reads it from the same mirror.
-        let parties = self.unresolved.party_to(shard, settled.terminal_wt);
-        self.evidence.record_settled(shard, settled, parties);
+        self.counterparts.on_settled(shard, settled);
         self.release(topology_schedule, Wake::SettledSet(shard))
-    }
-
-    /// Whether `shard`'s settled set stands in for a commit proof of this
-    /// certificate's source block.
-    ///
-    /// Membership means the transaction's certificate committed in the
-    /// departed chain at or before its terminal, and the set itself was
-    /// verified against the beacon-attested terminal root — a stronger
-    /// statement than a commit proof of one source block, which is
-    /// exactly what a departed chain can no longer supply. Every outcome
-    /// must be named: one outside the set is a verdict the departed
-    /// shard never settled, and a certificate naming nothing gives the
-    /// set nothing to vouch for.
-    fn settled_set_admits(&self, shard: ShardId, cert: &Verifiable<ExecutionCertificate>) -> bool {
-        self.evidence.with_settled(|sets| {
-            sets.get(&shard).is_some_and(|settled| {
-                let outcomes = cert.tx_outcomes();
-                !outcomes.is_empty()
-                    && outcomes
-                        .iter()
-                        .all(|outcome| settled.txs.contains(&outcome.tx_hash()))
-            })
-        })
-    }
-
-    /// Drop settled sets past their evidence window. Past it the gate
-    /// rejects any outcome naming the shard regardless of the set, so
-    /// retaining it only leaks memory.
-    fn gc_settled_sets(&self, topology_schedule: &TopologySchedule) {
-        let now = self.committed_ts;
-        self.evidence
-            .retain_departures(&|shard| topology_schedule.terminal_evidence_readable(shard, now));
     }
 
     /// Admission entry point for fetch-delivered (or otherwise externally
@@ -4160,7 +3533,7 @@ impl ExecutionCoordinator {
             trackers = counts.trackers,
             assignments = counts.assignments,
             expected_certs = expected.len(),
-            unresolved = self.unresolved.len(),
+            unresolved = self.counterparts.ledger.len(),
             "Chain terminated — dropped pending execution state"
         );
         // What the chain owes an outcome for goes with the rest. The
@@ -4169,7 +3542,7 @@ impl ExecutionCoordinator {
         // compose a tick to abandon them in — on a coast block, under a
         // committee it no longer has. Nothing here can reach a verdict
         // either way, which is the same reason the ticks above go.
-        self.unresolved = UnresolvedTxs::default();
+        self.counterparts.ledger = UnresolvedTxs::default();
         // The terminated chain's tick outputs die with it: successors seed
         // from settled state, and pending resolutions have nothing left to
         // resolve against. A tick still in flight lands on a cleared
@@ -4290,7 +3663,7 @@ impl ExecutionCoordinator {
                 .sum(),
             finalizations: self.finalized.len(),
             ticks: self.ticks.ticks_len(),
-            unresolved_txs: self.unresolved.len(),
+            unresolved_txs: self.counterparts.ledger.len(),
             vote_trackers: self.ticks.trackers_len(),
             early_votes: self.early.vote_len(),
             expected_exec_certs: self.expected_certs.expected_len(),
@@ -4303,7 +3676,7 @@ impl ExecutionCoordinator {
             pending_routing: self.early.pending_routing_len(),
             fulfilled_exec_certs: self.expected_certs.fulfilled_len(),
             outbound_certs: self.outbound_certs.memory_stats().tracked_certificates,
-            proven_remote_blocks: self.proven_anchors.len(),
+            proven_remote_blocks: self.counterparts.proven_anchors.len(),
             unproven_ecs: self.parked.waiting_on(|w| matches!(w, Waiting::Proof(_))),
         }
     }
@@ -4334,21 +3707,21 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_crypto_bls::BlsSigner;
-    use hyperscale_storage::ReplayWindow;
+    use hyperscale_storage::{ReplayWindow, committed_tx_cell_key};
     use hyperscale_types::test_utils::{
         StubVmStatics, certify as test_certify, make_finalization as helpers_make_finalization,
         make_leg_finalization, make_live_block as helpers_make_live_block, state_and_proof,
         test_prefix, test_transaction, test_transaction_running, test_transaction_with_prefixes,
     };
     use hyperscale_types::{
-        AbortCharge, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
-        ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, EPOCH_DURATION, Epoch, EpochSeed,
-        EpochWindows, ExecutionOutcome, GlobalReceiptHash, Hash, Heard, LocalKey,
-        MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, NetworkDefinition, Question, QuorumCertificate,
-        RETENTION_HORIZON, Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor,
-        ShardRecovery, Signer, SignerBitfield, StateRoot, StoredReceipt, SubstateKey, TickHalf,
-        TransactionDecision, TxClaim, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet,
-        Window, Word,
+        AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
+        BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
+        EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, ExecutionOutcome, GlobalReceiptHash, Hash,
+        Heard, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE,
+        NetworkDefinition, Probed, Question, QuorumCertificate, RETENTION_HORIZON, Randomness,
+        RecoveryCause, SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer, SignerBitfield,
+        StateProofBundle, StateRoot, StoredReceipt, SubstateKey, TickHalf, TransactionDecision,
+        TxClaim, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet, Window, Word,
     };
     use hyperscale_vm_types::Seeded;
 
@@ -7003,7 +6376,7 @@ mod tests {
         let tx_hash = transaction.hash();
         let tick = cross_shard_finalization(local, ShardId::ROOT, 1, tx_hash);
         let tick_id = *tick.tick_id();
-        state.unresolved.register_committed(
+        state.counterparts.ledger.register_committed(
             local,
             WeightedTimestamp::ZERO,
             [(&transaction, &Classified::whole())],
@@ -7021,7 +6394,7 @@ mod tests {
         );
         assert!(!state.finalized.contains(&tick_id));
         assert_eq!(
-            state.unresolved.len(),
+            state.counterparts.ledger.len(),
             1,
             "a gate rejection is not a verdict — the transaction stays owed",
         );
@@ -7216,7 +6589,11 @@ mod tests {
                 1_000,
             ),
         );
-        assert_eq!(state.unresolved.len(), 1, "committed and owed an outcome");
+        assert_eq!(
+            state.counterparts.ledger.len(),
+            1,
+            "committed and owed an outcome"
+        );
 
         // Its own tick never finalizes; the shard drops it so nothing can
         // attest a second verdict for it.
@@ -7490,7 +6867,7 @@ mod tests {
             "and runs it, because the tick that holds it is the tick that ran it",
         );
         assert_eq!(
-            restarted.unresolved.len(),
+            restarted.counterparts.ledger.len(),
             1,
             "still owed, as the chain says"
         );
@@ -7600,7 +6977,7 @@ mod tests {
         let tx_hash = transaction.hash();
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
-        state.unresolved.register_committed(
+        state.counterparts.ledger.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
             [(&transaction, &Classified::whole())],
@@ -7652,12 +7029,12 @@ mod tests {
         let tx_hash = transaction.hash();
         let past_deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
-        state.unresolved.register_committed(
+        state.counterparts.ledger.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
             [(&transaction, &Classified::whole())],
         );
-        state.unresolved.seed(
+        state.counterparts.ledger.seed(
             tx_hash,
             leg_part(
                 Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
@@ -7666,15 +7043,17 @@ mod tests {
                 Vec::new(),
             ),
         );
-        state.unresolved.certify(tx_hash);
+        state.counterparts.ledger.certify(tx_hash);
         state
-            .unresolved
+            .counterparts
+            .ledger
             .release_resolved(&[Arc::new(Verifiable::from(make_leg_finalization(
                 BlockHeight::new(1),
                 tx_hash,
             )))]);
         state
-            .unresolved
+            .counterparts
+            .ledger
             .record_abandonment_records(&[AbandonmentRecord::departed(
                 PEER,
                 WeightedTimestamp::from_millis(1_000),
@@ -7722,7 +7101,7 @@ mod tests {
         );
         assert!(!request.runs.abortable(), "nothing retracts a reclaim");
         assert!(
-            state.unresolved.reclaimable().is_empty(),
+            state.counterparts.ledger.reclaimable().is_empty(),
             "and the ledger has handed it to the tick"
         );
     }
@@ -7743,12 +7122,12 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        state.unresolved.register_committed(
+        state.counterparts.ledger.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
             [(&transaction, &Classified::whole())],
         );
-        state.unresolved.seed(
+        state.counterparts.ledger.seed(
             tx_hash,
             leg_part(
                 Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
@@ -7757,31 +7136,34 @@ mod tests {
                 Vec::new(),
             ),
         );
-        state.unresolved.certify(tx_hash);
+        state.counterparts.ledger.certify(tx_hash);
         assert!(
-            state.evidence.all().is_empty(),
+            state.counterparts.mirror.all().is_empty(),
             "nothing was broadcast to this replica"
         );
 
         let anchor = WeightedTimestamp::from_millis(7_000);
         let digest = Hash::from_bytes(b"digest");
         let verdict = refused(anchor, digest);
-        let before = state.evidence.generation();
-        state.fold_verdict(PEER, tx_hash, verdict);
+        let before = state.counterparts.mirror.generation();
+        state.counterparts.fold_verdict(PEER, tx_hash, verdict);
 
         assert_eq!(
-            state.evidence.heard(tx_hash, PEER, Question::Verdict),
+            state
+                .counterparts
+                .mirror
+                .heard(tx_hash, PEER, Question::Verdict),
             Some(verdict),
             "the chain's own word reaches the mirror the record fence reads",
         );
         assert!(
-            state.evidence.generation() > before,
+            state.counterparts.mirror.generation() > before,
             "and the mirror's generation moves, which is what re-drives the vote fence"
         );
 
         // The fold is first-write-wins, as the chain's answer is: a
         // second claim restates a decision already committed.
-        let again = state.fold_verdict(
+        let again = state.counterparts.fold_verdict(
             PEER,
             tx_hash,
             Heard {
@@ -7792,7 +7174,8 @@ mod tests {
         assert!(again.is_empty(), "{again:?}");
         assert_eq!(
             state
-                .evidence
+                .counterparts
+                .mirror
                 .heard(tx_hash, PEER, Question::Verdict)
                 .map(|held| held.at),
             Some(anchor),
@@ -7801,17 +7184,18 @@ mod tests {
         // An acceptance settles the transaction and licenses no record,
         // so it never reaches the mirror at all.
         let mut fresh = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        fresh.unresolved.register_committed(
+        fresh.counterparts.ledger.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
             [(&transaction, &Classified::whole())],
         );
         assert!(
             fresh
+                .counterparts
                 .fold_verdict(PEER, tx_hash, accepted(anchor, digest))
                 .is_empty(),
         );
-        assert!(fresh.evidence.all().is_empty());
+        assert!(fresh.counterparts.mirror.all().is_empty());
     }
 
     /// A core's refusal of a transaction a leg here issued for is
@@ -7827,12 +7211,12 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        state.unresolved.register_committed(
+        state.counterparts.ledger.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
             [(&transaction, &Classified::whole())],
         );
-        state.unresolved.seed(
+        state.counterparts.ledger.seed(
             tx_hash,
             leg_part(
                 Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
@@ -7841,7 +7225,7 @@ mod tests {
                 Vec::new(),
             ),
         );
-        state.unresolved.certify(tx_hash);
+        state.counterparts.ledger.certify(tx_hash);
 
         let certificate = |outcome: ExecutionOutcome| {
             Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
@@ -7853,23 +7237,26 @@ mod tests {
                 SignerBitfield::new(4),
             )))
         };
-        let before = state.evidence.generation();
+        let before = state.counterparts.mirror.generation();
         let actions = state.handle_attestation(&schedule, &certificate(ExecutionOutcome::Failed));
         let word = refused(
             WeightedTimestamp::from_millis(7_000),
             certificate(ExecutionOutcome::Failed).attested_digest(),
         );
         assert_eq!(
-            state.evidence.heard(tx_hash, PEER, Question::Verdict),
+            state
+                .counterparts
+                .mirror
+                .heard(tx_hash, PEER, Question::Verdict),
             Some(word),
             "the refusal reaches the mirror the vote fence reads"
         );
         assert!(
-            state.evidence.generation() > before,
+            state.counterparts.mirror.generation() > before,
             "and the mirror's generation moves, re-driving the votes that deferred without it"
         );
         assert_eq!(
-            state.pending_abandonment_records(),
+            state.offers().abandonment_records,
             vec![AbandonmentRecord::heard(
                 PEER,
                 word,
@@ -7916,12 +7303,12 @@ mod tests {
             )))
         };
         let mut accepting = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        accepting.unresolved.register_committed(
+        accepting.counterparts.ledger.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
             [(&transaction, &Classified::whole())],
         );
-        accepting.unresolved.seed(
+        accepting.counterparts.ledger.seed(
             tx_hash,
             leg_part(
                 Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
@@ -7930,7 +7317,7 @@ mod tests {
                 Vec::new(),
             ),
         );
-        let before = accepting.evidence.generation();
+        let before = accepting.counterparts.mirror.generation();
         let actions = accepting.handle_attestation(
             &schedule,
             &certificate(ExecutionOutcome::Succeeded {
@@ -7938,11 +7325,11 @@ mod tests {
             }),
         );
         assert_eq!(
-            accepting.evidence.generation(),
+            accepting.counterparts.mirror.generation(),
             before,
             "a success is not a refusal"
         );
-        assert!(accepting.pending_abandonment_records().is_empty());
+        assert!(accepting.offers().abandonment_records.is_empty());
         assert_eq!(
             resolved(&actions),
             vec![(
@@ -7985,12 +7372,12 @@ mod tests {
         classified: Classified,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        state.unresolved.register_committed(
+        state.counterparts.ledger.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
             [(transaction, &Classified::whole())],
         );
-        state.unresolved.seed(
+        state.counterparts.ledger.seed(
             transaction.hash(),
             leg_part(
                 Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
@@ -7999,7 +7386,7 @@ mod tests {
                 Vec::new(),
             ),
         );
-        state.unresolved.certify(transaction.hash());
+        state.counterparts.ledger.certify(transaction.hash());
         state
     }
 
@@ -8115,7 +7502,12 @@ mod tests {
     ) -> Vec<Heard> {
         [Probed::Core, Probed::Delivery, Probed::Claim]
             .into_iter()
-            .filter_map(|probed| state.evidence.heard(tx_hash, at, Question::Cell(probed)))
+            .filter_map(|probed| {
+                state
+                    .counterparts
+                    .mirror
+                    .heard(tx_hash, at, Question::Cell(probed))
+            })
             .collect()
     }
 
@@ -8169,12 +7561,12 @@ mod tests {
             local: LocalKey([0xC1; 16]),
         };
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        state.unresolved.register_committed(
+        state.counterparts.ledger.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
             [(&transaction, &Classified::whole())],
         );
-        state.unresolved.seed(
+        state.counterparts.ledger.seed(
             tx_hash,
             leg_part(
                 Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
@@ -8183,7 +7575,7 @@ mod tests {
                 Vec::new(),
             ),
         );
-        state.unresolved.certify(tx_hash);
+        state.counterparts.ledger.certify(tx_hash);
 
         let held: [(u64, WeightedTimestamp, &[u8]); 2] =
             [(3, deadline, b"deadline"), (4, lapse, b"at")];
@@ -8211,7 +7603,7 @@ mod tests {
             vec![absent(Probed::Delivery, later)],
         );
         assert_eq!(
-            state.pending_abandonment_records(),
+            state.offers().abandonment_records,
             vec![AbandonmentRecord::heard(
                 PEER,
                 absent(Probed::Delivery, later),
@@ -8240,12 +7632,12 @@ mod tests {
             local: LocalKey([0xC1; 16]),
         };
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        state.unresolved.register_committed(
+        state.counterparts.ledger.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
             [(&transaction, &Classified::whole())],
         );
-        state.unresolved.seed(
+        state.counterparts.ledger.seed(
             tx_hash,
             leg_part(
                 Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
@@ -8254,16 +7646,16 @@ mod tests {
                 Vec::new(),
             ),
         );
-        state.unresolved.certify(tx_hash);
+        state.counterparts.ledger.certify(tx_hash);
         let (bundle, _) = proven_at(&mut state, &schedule, PEER, 5, later, &[], &[claim]);
         state.committed_ts = deadline;
         assert_eq!(
             state_proof_fetches(&state.probe_silent_counterparts(&schedule)),
             vec![(bundle.anchor, vec![claim])],
         );
-        state.on_state_proof_verified(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
+        state.on_proof_fetched(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
         assert_eq!(
-            state.pending_state_proofs(),
+            state.offers().state_proofs,
             vec![bundle.clone()],
             "dated to the clock the probe read off the header"
         );
@@ -8271,13 +7663,13 @@ mod tests {
         let deadline_ms = deadline.as_millis();
         commit_carrying(&mut state, &schedule, 1, deadline_ms, Vec::new());
         assert_eq!(
-            state.pending_state_proofs(),
+            state.offers().state_proofs,
             vec![bundle.clone()],
             "a block carrying no proofs leaves the offer standing"
         );
         commit_carrying(&mut state, &schedule, 2, deadline_ms, vec![bundle]);
         assert!(
-            state.pending_state_proofs().is_empty(),
+            state.offers().state_proofs.is_empty(),
             "a proof the chain carries is everybody's"
         );
     }
@@ -8311,12 +7703,12 @@ mod tests {
             "the fixture's claim sits under the departed peer's left child"
         );
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        state.unresolved.register_committed(
+        state.counterparts.ledger.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
             [(&transaction, &Classified::whole())],
         );
-        state.unresolved.seed(
+        state.counterparts.ledger.seed(
             tx_hash,
             leg_part(
                 Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
@@ -8325,7 +7717,7 @@ mod tests {
                 Vec::new(),
             ),
         );
-        state.unresolved.certify(tx_hash);
+        state.counterparts.ledger.certify(tx_hash);
         // The local chain has crossed the peer's cut: its committee is
         // anchored in a window whose trie names the children.
         state.committed_committee_anchor_wt = lapse;
@@ -8365,7 +7757,7 @@ mod tests {
             vec![absent(Probed::Delivery, later)],
         );
         assert_eq!(
-            state.pending_abandonment_records(),
+            state.offers().abandonment_records,
             vec![AbandonmentRecord::heard(
                 successor,
                 absent(Probed::Delivery, later),
@@ -8474,7 +7866,7 @@ mod tests {
             "a proof taken before the deadline says nothing: the core may still commit"
         );
 
-        let before = state.evidence.generation();
+        let before = state.counterparts.mirror.generation();
         commit_carrying(
             &mut state,
             &schedule,
@@ -8483,7 +7875,7 @@ mod tests {
             vec![bundle.clone()],
         );
         assert!(
-            state.evidence.generation() > before,
+            state.counterparts.mirror.generation() > before,
             "the absence lands in the mirror the fence reads"
         );
         assert_eq!(
@@ -8492,7 +7884,7 @@ mod tests {
             "the absence reaches the mirror the vote fence reads"
         );
         assert_eq!(
-            state.pending_abandonment_records(),
+            state.offers().abandonment_records,
             vec![AbandonmentRecord::heard(
                 CORE,
                 absent(Probed::Core, later),
@@ -8501,10 +7893,10 @@ mod tests {
             "and a record is offered under the anchor it was proved at"
         );
 
-        let before = state.evidence.generation();
+        let before = state.counterparts.mirror.generation();
         commit_carrying(&mut state, &schedule, 3, deadline.as_millis(), vec![bundle]);
         assert_eq!(
-            state.evidence.generation(),
+            state.counterparts.mirror.generation(),
             before,
             "a second copy adds nothing"
         );
@@ -8548,7 +7940,7 @@ mod tests {
             )),
             "and its certificate is fetched, since a refusal there licenses the reclaim"
         );
-        assert!(state.pending_abandonment_records().is_empty());
+        assert!(state.offers().abandonment_records.is_empty());
         assert!(
             state_proof_fetches(&state.probe_silent_counterparts(&schedule)).is_empty(),
             "and is not asked again"
@@ -8573,12 +7965,12 @@ mod tests {
         classified: Classified,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        state.unresolved.register_committed(
+        state.counterparts.ledger.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
             [(transaction, &Classified::whole())],
         );
-        state.unresolved.seed(
+        state.counterparts.ledger.seed(
             transaction.hash(),
             leg_part(
                 Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
@@ -8587,7 +7979,7 @@ mod tests {
                 vec![(PEER, claim)],
             ),
         );
-        state.unresolved.certify(transaction.hash());
+        state.counterparts.ledger.certify(transaction.hash());
         state.committed_ts = UnsettledTx::for_transaction(transaction).deadline.at();
         state
     }
@@ -8623,15 +8015,15 @@ mod tests {
             "a core of one shard writes no committed cell, so only its consumer's claim is asked"
         );
 
-        state.on_state_proof_verified(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
-        let before = state.evidence.generation();
+        state.on_proof_fetched(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
+        let before = state.counterparts.mirror.generation();
         commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert!(
-            state.evidence.generation() > before,
+            state.counterparts.mirror.generation() > before,
             "an absent claim on a core of one shard is evidence"
         );
         assert_eq!(
-            state.pending_abandonment_records(),
+            state.offers().abandonment_records,
             vec![AbandonmentRecord::heard(
                 PEER,
                 absent(Probed::Claim, deadline),
@@ -8693,15 +8085,15 @@ mod tests {
             "the committed cell and the claim are asked together"
         );
 
-        state.on_state_proof_verified(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
-        let before = state.evidence.generation();
+        state.on_proof_fetched(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
+        let before = state.counterparts.mirror.generation();
         commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert_eq!(
-            state.evidence.generation(),
+            state.counterparts.mirror.generation(),
             before,
             "an absent claim on a core of two shards proves nothing"
         );
-        assert!(state.pending_abandonment_records().is_empty());
+        assert!(state.offers().abandonment_records.is_empty());
 
         let (later, opened) = proven_at(
             &mut state,
@@ -8788,12 +8180,13 @@ mod tests {
         );
         assert!(
             state
-                .evidence
+                .counterparts
+                .mirror
                 .heard(tx_hash, PEER, Question::Verdict)
                 .is_none(),
             "and is not itself evidence"
         );
-        assert!(state.pending_abandonment_records().is_empty());
+        assert!(state.offers().abandonment_records.is_empty());
     }
 
     /// A consumer's acceptance is mirrored off its certificate, handed to
@@ -8820,26 +8213,30 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         )));
-        let before = state.evidence.generation();
+        let before = state.counterparts.mirror.generation();
         state.handle_attestation(&schedule, &certificate);
         assert!(
-            state.evidence.generation() > before,
+            state.counterparts.mirror.generation() > before,
             "the acceptance lands in the mirror the fence reads"
         );
         let word = accepted(probed_wt, certificate.attested_digest());
         assert_eq!(
-            state.evidence.heard(tx_hash, PEER, Question::Verdict),
+            state
+                .counterparts
+                .mirror
+                .heard(tx_hash, PEER, Question::Verdict),
             Some(word),
             "the acceptance reaches the mirror the vote fence reads"
         );
         assert_eq!(
-            state.pending_abandonment_records(),
+            state.offers().abandonment_records,
             vec![AbandonmentRecord::heard(PEER, word, [figures])],
             "and a record is offered under the certificate's anchor"
         );
 
         state
-            .unresolved
+            .counterparts
+            .ledger
             .record_abandonment_records(&[AbandonmentRecord::heard(PEER, word, [figures])]);
         let actions = commit_carrying(&mut state, &schedule, 2, probed_wt.as_millis(), Vec::new());
         let request = actions
@@ -8860,7 +8257,7 @@ mod tests {
         ));
         assert!(!request.runs.abortable(), "nothing retracts a retirement");
         assert!(
-            state.unresolved.retirable().is_empty(),
+            state.counterparts.ledger.retirable().is_empty(),
             "and the ledger has handed it to the tick"
         );
     }
@@ -8893,8 +8290,8 @@ mod tests {
                 1_000,
             ),
         );
-        state.unresolved.seed(tx_hash, Part::Delivery);
-        state.unresolved.certify(tx_hash);
+        state.counterparts.ledger.seed(tx_hash, Part::Delivery);
+        state.counterparts.ledger.certify(tx_hash);
         let held_by = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         assert_eq!(state.ticks.tick_assignment(tx_hash), Some(held_by));
 
@@ -8948,7 +8345,7 @@ mod tests {
             outcomes.is_empty(),
             "a transaction short of its deadline is not abandoned"
         );
-        assert_eq!(state.unresolved.len(), 1, "and stays owed");
+        assert_eq!(state.counterparts.ledger.len(), 1, "and stays owed");
     }
 
     /// A tick that has not yet spoken withholds the abort — it is about
@@ -9183,7 +8580,8 @@ mod tests {
     /// a tick on an abort.
     fn record_peer_left_unsettled(state: &mut ExecutionCoordinator, tx_hash: TxHash) {
         state
-            .unresolved
+            .counterparts
+            .ledger
             .record_abandonment_records(&[AbandonmentRecord::departed(
                 PEER,
                 WeightedTimestamp::from_millis(60_000),
@@ -9235,14 +8633,16 @@ mod tests {
         )));
         state.ticks.insert_tick(tick_id, tick);
         state.ticks.assign_tx(tx_hash, tick_id);
-        state.unresolved.register_committed(
+        state.counterparts.ledger.register_committed(
             local,
             WeightedTimestamp::ZERO,
             [(&transaction, &Classified::whole())],
         );
-        state.unresolved.certify(tx_hash);
+        state.counterparts.ledger.certify(tx_hash);
         state.committed_ts = WeightedTimestamp::from_millis(STRANDED_DEADLINE_MS);
-        state.stamp_departures(topology_schedule);
+        state
+            .counterparts
+            .stamp_departures(topology_schedule, state.committed_ts);
         (state, tick_id, tx_hash)
     }
 
@@ -9288,7 +8688,7 @@ mod tests {
             },
         );
 
-        let records = state.pending_abandonment_records();
+        let records = state.offers().abandonment_records;
         assert_eq!(records.len(), 1, "the peer's departure is answerable");
         assert_eq!(records[0].shard(), PEER);
         assert_eq!(
@@ -9298,12 +8698,15 @@ mod tests {
         );
 
         // Committed, the record is what the account reads afterwards.
-        state.unresolved.record_abandonment_records(&records);
-        assert!(state.unresolved.is_unsettled_by_departed(tx_hash));
+        state
+            .counterparts
+            .ledger
+            .record_abandonment_records(&records);
+        assert!(state.counterparts.ledger.is_unsettled_by_departed(tx_hash));
 
         // And what it does not offer twice.
         assert!(
-            state.pending_abandonment_records().is_empty(),
+            state.offers().abandonment_records.is_empty(),
             "a departure is answered once",
         );
 
@@ -9342,7 +8745,7 @@ mod tests {
         state.record_settled_txs(&sched, peer_left, set(120_000));
         state.record_settled_txs(&sched, PEER, set(60_000));
 
-        let records = state.pending_abandonment_records();
+        let records = state.offers().abandonment_records;
         assert_eq!(
             records
                 .iter()
@@ -9441,12 +8844,12 @@ mod tests {
         ));
         let sibling_hash = sibling.hash();
         state.ticks.assign_tx(sibling_hash, tick_id);
-        state.unresolved.register_committed(
+        state.counterparts.ledger.register_committed(
             local,
             WeightedTimestamp::ZERO,
             [(&sibling, &Classified::whole())],
         );
-        state.unresolved.certify(sibling_hash);
+        state.counterparts.ledger.certify(sibling_hash);
 
         // The commit that composes the abandonment, on the shard that
         // stranded the member.
@@ -9519,12 +8922,14 @@ mod tests {
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
         state.committed_ts = WeightedTimestamp::from_millis(1500);
-        state.unresolved.register_committed(
+        state.counterparts.ledger.register_committed(
             local,
             WeightedTimestamp::ZERO,
             [(transaction, &Classified::whole())],
         );
-        state.stamp_departures(topology_schedule);
+        state
+            .counterparts
+            .stamp_departures(topology_schedule, state.committed_ts);
         state
     }
 
@@ -9560,7 +8965,7 @@ mod tests {
         let mut state = state_abandoning(&sched, local, &transaction);
         assert!(
             abort
-                .claims(local, |tx_hash| state.evidence.covers(tx_hash))
+                .claims(local, |tx_hash| state.counterparts.mirror.covers(tx_hash))
                 .iter()
                 .any(|(shard, _, claim)| *shard == partner && *claim == TxClaim::Abandoned),
             "an abandonment names the counterparts it awaited",
@@ -9686,7 +9091,7 @@ mod tests {
         let verdict = lone_verdict_of(local, tx_hash);
         assert!(
             verdict
-                .claims(local, |tx_hash| state.evidence.covers(tx_hash))
+                .claims(local, |tx_hash| state.counterparts.mirror.covers(tx_hash))
                 .is_empty(),
             "a member that awaited nobody names no counterpart",
         );
@@ -9768,14 +9173,17 @@ mod tests {
         let tx_hash = transaction.hash();
         let mut state = state_abandoning(&stamped, HOME, &transaction);
         state
-            .unresolved
+            .counterparts
+            .ledger
             .record_terminal(PEER, WeightedTimestamp::from_millis(1000), None);
         record_peer_left_unsettled(&mut state, tx_hash);
-        assert_eq!(state.unresolved.unstamped_departures(), vec![PEER]);
+        assert_eq!(state.counterparts.ledger.unstamped_departures(), vec![PEER]);
 
-        state.stamp_departures(&stamped);
+        state
+            .counterparts
+            .stamp_departures(&stamped, state.committed_ts);
         assert!(
-            state.unresolved.unstamped_departures().is_empty(),
+            state.counterparts.ledger.unstamped_departures().is_empty(),
             "the head's stamp reaches a departure no window lists"
         );
         let expiry = stamped
@@ -9783,7 +9191,8 @@ mod tests {
             .expect("the head carries the stamp");
         assert!(
             state
-                .unresolved
+                .counterparts
+                .ledger
                 .prune(expiry.plus(Duration::from_millis(1)))
                 .unanswerable
                 .iter()
@@ -9796,14 +9205,18 @@ mod tests {
         let gone = TopologySchedule::single(leaves_snap(&[HOME, left, right], &[]));
         let mut state = state_abandoning(&gone, HOME, &transaction);
         state
-            .unresolved
+            .counterparts
+            .ledger
             .record_terminal(PEER, WeightedTimestamp::from_millis(1000), None);
         record_peer_left_unsettled(&mut state, tx_hash);
-        state.stamp_departures(&gone);
-        assert!(state.unresolved.unstamped_departures().is_empty());
+        state
+            .counterparts
+            .stamp_departures(&gone, state.committed_ts);
+        assert!(state.counterparts.ledger.unstamped_departures().is_empty());
         assert!(
             state
-                .unresolved
+                .counterparts
+                .ledger
                 .prune(state.committed_ts.plus(Duration::from_millis(1)))
                 .unanswerable
                 .iter()
@@ -9828,7 +9241,7 @@ mod tests {
         ));
         let tx_hash = transaction.hash();
         let mut state = state_abandoning(&sched, HOME, &transaction);
-        state.unresolved.record_terminal(
+        state.counterparts.ledger.record_terminal(
             PEER,
             WeightedTimestamp::from_millis(1000),
             Some(WeightedTimestamp::from_millis(1000).plus(EPOCH_DURATION * 5)),
@@ -9886,7 +9299,11 @@ mod tests {
                 .contains_tick(&TickId::new(ShardId::ROOT, BlockHeight::new(2))),
             "so the tick attesting the abort survives to be certified",
         );
-        assert_eq!(state.unresolved.len(), 1, "released only when it commits");
+        assert_eq!(
+            state.counterparts.ledger.len(),
+            1,
+            "released only when it commits"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

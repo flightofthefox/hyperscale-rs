@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use hyperscale_core::Action;
+use hyperscale_execution::Offers;
 use hyperscale_types::{
     AbandonmentRecord, Finalization, MAX_TXS_PER_BLOCK, Provisions, StateProofBundle,
     TopologySchedule, TopologySnapshot, Transaction, Verifiable, Verified,
@@ -50,11 +51,13 @@ impl ShardParticipation {
                 .ready_transactions(max_txs, in_flight.inner(), self.now);
         let finalizations = self.execution_coordinator.get_finalizations();
         // What departed counterparts left of this chain's business, while
-        // the settled sets that say so can still be read.
-        let abandonment_records = self.execution_coordinator.pending_abandonment_records();
-        // Proofs of counterparts' cells this validator's fetches
-        // answered, for every replica to fold at commit.
-        let state_proofs = self.execution_coordinator.pending_state_proofs();
+        // the settled sets that say so can still be read, and the proofs
+        // of counterparts' cells this validator's fetches answered, for
+        // every replica to fold at commit.
+        let Offers {
+            state_proofs,
+            abandonment_records,
+        } = self.execution_coordinator.offers();
         let queued = self.provisions_coordinator.queued_provisions(self.now);
 
         // The engagement gate: a non-payer shard proposes a cross-shard
