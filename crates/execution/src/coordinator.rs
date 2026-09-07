@@ -2872,6 +2872,10 @@ impl ExecutionCoordinator {
             );
             self.pending_ticks.push_back(pending);
         }
+        // What composition abandoned, before the tick it composed reads
+        // the chain: a discarded tick's legs hold cells this one may
+        // need, and nothing else is coming to release them.
+        actions.extend(self.drain_ready_tick_resolutions());
         actions.extend(self.dispatch_next_tick());
 
         actions
@@ -2966,10 +2970,11 @@ impl ExecutionCoordinator {
     }
 
     /// Drop a tick that can no longer speak for a member being abandoned,
-    /// releasing the transactions it holds to their own deadlines.
+    /// releasing the transactions it holds to their own deadlines and the
+    /// cells its legs held against.
     fn discard_tick(&mut self, tick_id: TickId) {
         let counts = self.ticks.discard_tick(&tick_id);
-        self.ticked.remove(&tick_id);
+        self.release_chain_holds(tick_id);
         // Its finalization goes with it: a proposer offering one for a
         // member abandoned here would be refused by every voter, and
         // would keep offering it.
@@ -2979,6 +2984,29 @@ impl ExecutionCoordinator {
             released = counts.assignments,
             "Discarded a tick holding an abandoned member"
         );
+    }
+
+    /// Tell the chain a tick's legs reach no verdict, so what they hold
+    /// against the cells they declared is let go of.
+    ///
+    /// A leg's reservation stands on the chain until its tick's fate
+    /// resolves it, and every later tick's reader takes it as value
+    /// already spoken for. A tick that has stopped speaking for its
+    /// members reaches no fate, so nothing else would ever release it:
+    /// the payer's cells stay locked on every replica that ran the tick,
+    /// the entry never evicts, and a replica that rebuilt the chain
+    /// without the hold reads a different overlay from the same chain.
+    fn release_chain_holds(&mut self, tick_id: TickId) {
+        let Some(members) = self
+            .ticked
+            .get(&tick_id)
+            .map(|ticked| ticked.legs.clone())
+            .filter(|legs| !legs.is_empty())
+        else {
+            self.ticked.remove(&tick_id);
+            return;
+        };
+        self.record_tick_resolution(&tick_id, TickResolution::Abandoned { members });
     }
 
     /// Whether no shard can still settle `tx_hash`.
@@ -3434,10 +3462,16 @@ impl ExecutionCoordinator {
                 // a tick that has stopped speaking for them. Releasing
                 // their assignments hands them back to the deadline path,
                 // which is the only thing that can still resolve them.
+                //
+                // The chain hears it with them. Only a half naming
+                // counterparts reaches this verdict, which is the half
+                // carrying the tick's legs, and a leg that will never be
+                // produced holds nothing.
                 for tx_hash in finalized_arc.tx_hashes() {
                     self.ticks.remove_assignment(tx_hash);
                 }
-                vec![]
+                self.release_chain_holds(tick_id);
+                self.drain_ready_tick_resolutions()
             }
         }
     }
@@ -9654,6 +9688,60 @@ mod tests {
         );
     }
 
+    /// A discarded tick tells the chain its legs reach no verdict, so
+    /// what they hold against the cells they declared is let go of.
+    ///
+    /// The hold is what every later tick's reader takes as value already
+    /// spoken for, and only a fate releases it. A discarded tick reaches
+    /// none — so without this the payer's cells stay locked on every
+    /// replica that ran the tick, while one that rebuilt the chain
+    /// without the hold judges the same reservation feasible.
+    #[test]
+    fn a_discarded_ticks_legs_release_what_they_held() {
+        let local = HOME;
+        let sched = peer_terminating_schedule(60_000);
+        let (mut state, tick_id, tx_hash) = state_stranded_on(&sched, 1);
+        record_peer_left_unsettled(&mut state, tx_hash);
+        // The tick ran the member as a leg, so the chain holds its
+        // declared reservation until the tick's fate says which side of
+        // it survives.
+        state.ticked.insert(
+            tick_id,
+            TickedBatch {
+                provisional_claims: Vec::new(),
+                legs: BTreeSet::from([tx_hash]),
+            },
+        );
+        state.last_completed_tick = tick_id.block_height();
+
+        let block = make_live_block_on_shard(
+            local,
+            BlockHeight::new(9),
+            STRANDED_DEADLINE_MS,
+            ValidatorId::new(0),
+            vec![],
+        );
+        let actions = state.on_block_committed(&sched, &test_certify(block, STRANDED_DEADLINE_MS));
+
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::ResolveTicks { resolutions } if resolutions.iter().any(
+                    |(id, resolution)| *id == tick_id
+                        && matches!(
+                            resolution,
+                            TickResolution::Abandoned { members } if members.contains(&tx_hash)
+                        )
+                )
+            )),
+            "the chain is told the discarded tick's leg never settles",
+        );
+        assert!(
+            !state.ticked.contains_key(&tick_id),
+            "and the claim table lets it go with them",
+        );
+    }
+
     /// A finalization whose only certificate is this shard's, attesting
     /// `tx_hash` aborted after awaiting `partner` — the shape composition
     /// produces past a deadline.
@@ -9894,31 +9982,9 @@ mod tests {
     /// still there. Only a late one arrives here.
     #[test]
     fn a_partner_past_its_evidence_window_refuses_the_abort() {
-        let (local, partner) = (HOME, PEER);
-        let sched = peer_terminating_schedule(1_000);
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(7)),
-        ));
-        let tx_hash = transaction.hash();
-        let mut state = state_abandoning(&sched, local, &transaction);
-
-        // The handoff completed long enough ago that the set has stopped
-        // answering: expiry = the stamp's window end plus the evidence
-        // window, and the committed frontier sits past it.
-        let sched = peer_terminating_schedule_stamped(1_000, Some(Epoch::new(0)));
-        state.record_settled_txs(
-            &sched,
-            partner,
-            SettledTxSet {
-                txs: BTreeSet::new(),
-                terminal_wt: WeightedTimestamp::ZERO,
-            },
-        );
-        state.committed_ts = WeightedTimestamp::from_millis(6_001);
-
-        let abort: Arc<Verifiable<Finalization>> = Arc::new(
-            Verified::<Finalization>::seal(abandonment_of(local, partner, tx_hash)).into(),
-        );
+        let (mut state, sched, tx_hash) = state_past_its_partners_window();
+        let abort: Arc<Verifiable<Finalization>> =
+            Arc::new(Verified::<Finalization>::seal(abandonment_of(HOME, PEER, tx_hash)).into());
         assert!(
             state.emit_or_gate_finalized(&sched, abort).is_empty(),
             "past the window the set cannot establish that the partner did not settle",
@@ -9927,6 +9993,71 @@ mod tests {
             state.parked.waiting_on(|w| w == Waiting::Settlement) == 0,
             "and it is refused rather than held: no later set will answer",
         );
+    }
+
+    /// A half the gate refuses releases what its legs held as well as the
+    /// assignments it named.
+    ///
+    /// The half will never be produced, so its legs reach no verdict and
+    /// the reservations standing for them on the chain are held against
+    /// every later tick for nothing.
+    #[test]
+    fn a_refused_half_releases_what_its_legs_held() {
+        let (mut state, sched, tx_hash) = state_past_its_partners_window();
+        let abort: Arc<Verifiable<Finalization>> =
+            Arc::new(Verified::<Finalization>::seal(abandonment_of(HOME, PEER, tx_hash)).into());
+        let tick_id = *abort.tick_id();
+        state.ticked.insert(
+            tick_id,
+            TickedBatch {
+                provisional_claims: Vec::new(),
+                legs: BTreeSet::from([tx_hash]),
+            },
+        );
+        state.last_completed_tick = tick_id.block_height();
+
+        let actions = state.emit_or_gate_finalized(&sched, abort);
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::ResolveTicks { resolutions } if resolutions.iter().any(
+                    |(id, resolution)| *id == tick_id
+                        && matches!(
+                            resolution,
+                            TickResolution::Abandoned { members } if members.contains(&tx_hash)
+                        )
+                )
+            )),
+            "the chain is told the refused half's leg never settles",
+        );
+        assert!(
+            !state.ticked.contains_key(&tick_id),
+            "and the claim table lets it go with them",
+        );
+    }
+
+    /// A shard abandoning a straddler whose partner's settled set has
+    /// stopped answering: the handoff completed long enough ago that the
+    /// expiry — the stamp's window end plus the evidence window — sits
+    /// below the committed frontier.
+    fn state_past_its_partners_window() -> (ExecutionCoordinator, TopologySchedule, TxHash) {
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(7)),
+        ));
+        let tx_hash = transaction.hash();
+        let mut state = state_abandoning(&peer_terminating_schedule(1_000), HOME, &transaction);
+
+        let sched = peer_terminating_schedule_stamped(1_000, Some(Epoch::new(0)));
+        state.record_settled_txs(
+            &sched,
+            PEER,
+            SettledTxSet {
+                txs: BTreeSet::new(),
+                terminal_wt: WeightedTimestamp::ZERO,
+            },
+        );
+        state.committed_ts = WeightedTimestamp::from_millis(6_001);
+        (state, sched, tx_hash)
     }
 
     /// A departure the ledger recorded before its window went is
