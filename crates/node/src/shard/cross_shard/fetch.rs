@@ -7,7 +7,6 @@
 //! `FetchBinding` trait, and the shared `partition_solicited` helper live in
 //! [`crate::fetch`].
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
@@ -19,13 +18,17 @@ use hyperscale_types::network::request::{
     GetCommittedTxsRequest, GetExecutionCertsRequest, GetFinalizationsRequest,
     GetLocalProvisionsRequest, GetProvisionsRequest, GetStateProofRequest,
 };
-use hyperscale_types::network::response::CommittedTxVerdict;
+use hyperscale_types::network::response::{
+    CommittedTxVerdict, GetCommittedTxsResponse, GetStateProofResponse,
+};
 use hyperscale_types::{
     Anchor, BlockHeight, ExecutionCertificate, Finalization, FinalizationHash, MessageClass,
     PredecessorTerminal, ProvisionHash, ShardId, SubstateKey, TxHash, ValidatorId, Verifiable,
 };
 
-use crate::fetch::{Fetch, FetchBinding, partition_solicited};
+use crate::fetch::{
+    Fetch, FetchBinding, Refusal, ScopedAnswer, dispatch_scoped, partition_solicited,
+};
 use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, push_shard_input};
 
 // ─── Type aliases ──────────────────────────────────────────────────────
@@ -372,82 +375,43 @@ impl FetchBinding for CommittedTxBinding {
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
-        // A chunk is grouped by `(shard, preferred, class)`, which does
-        // not separate two terminals of the same shard, and one request
-        // resolves against exactly one terminal. Split by terminal here
-        // rather than assume the chunk is uniform.
-        let mut by_terminal: BTreeMap<PredecessorTerminal, Vec<TxHash>> = BTreeMap::new();
-        for (predecessor, tx_hash) in ids {
-            by_terminal.entry(predecessor).or_default().push(tx_hash);
-        }
-        for (predecessor, tx_hashes) in by_terminal {
-            debug_assert_eq!(
-                shard, predecessor.shard,
-                "CommittedTxBinding routes to the predecessor; the scan sets it from the id",
-            );
-            let requested: Vec<Self::Id> =
-                tx_hashes.iter().map(|hash| (predecessor, *hash)).collect();
-            let request =
-                GetCommittedTxsRequest::new(predecessor.height, predecessor.block_hash, tx_hashes);
-            let es = sender.clone();
-            network.request(
-                shard,
-                preferred,
-                request,
-                class,
-                Box::new(move |result| {
-                    let asked: Vec<TxHash> = requested.iter().map(|(_, hash)| *hash).collect();
-                    let Ok(response) = result else {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::FetchFailed(Self::ids(requested)),
-                        );
-                        return ResponseVerdict::Accept;
-                    };
-                    // This peer doesn't hold the named terminal — rotate.
-                    let Some(verdicts) = response.verdicts else {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::FetchFailed(Self::ids(requested)),
-                        );
-                        return ResponseVerdict::Reject;
-                    };
-                    let Some(answers) = verified_answers(&verdicts, predecessor, &asked) else {
-                        tracing::warn!(
-                            predecessor = ?predecessor.shard,
-                            asked = asked.len(),
-                            answered = verdicts.len(),
-                            "Dropping committed-transaction response: unusable verdicts"
-                        );
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::FetchFailed(Self::ids(requested)),
-                        );
-                        return ResponseVerdict::Reject;
-                    };
-                    // Release the slots before delivering the answers, so
-                    // the freed capacity is available if handling the
-                    // delivery re-drives this fetch.
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::FetchFulfilled(Self::ids(requested)),
-                    );
-                    push_protocol_event(
-                        &es,
-                        local_shard,
-                        ProtocolEvent::PrecutResolutionsReceived {
-                            predecessor: predecessor.shard,
-                            answers,
-                        },
-                    );
-                    ResponseVerdict::Accept
-                }),
-            );
-        }
+        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
+    }
+}
+
+impl ScopedAnswer for CommittedTxBinding {
+    type Scope = PredecessorTerminal;
+    type Key = TxHash;
+    type Request = GetCommittedTxsRequest;
+
+    fn split(id: Self::Id) -> (Self::Scope, Self::Key) {
+        id
+    }
+
+    fn join(scope: Self::Scope, key: Self::Key) -> Self::Id {
+        (scope, key)
+    }
+
+    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
+        GetCommittedTxsRequest::new(scope.height, scope.block_hash, keys.to_vec())
+    }
+
+    /// Absence is the answer that relaxes the successor's standing
+    /// refusal, so it is the one that has to lift to the terminal's
+    /// `committed_txs_root`; `Committed` is what the successor already
+    /// assumes and carries no proof.
+    fn answer(
+        scope: Self::Scope,
+        keys: Vec<Self::Key>,
+        response: GetCommittedTxsResponse,
+    ) -> Result<ProtocolEvent, Refusal> {
+        let verdicts = response.verdicts.ok_or(Refusal::NotHeld)?;
+        let answers = verified_answers(&verdicts, scope, &keys)
+            .ok_or(Refusal::Unusable("unusable_verdicts"))?;
+        Ok(ProtocolEvent::PrecutResolutionsReceived {
+            predecessor: scope.shard,
+            answers,
+        })
     }
 }
 
@@ -481,92 +445,44 @@ impl FetchBinding for StateProofBinding {
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
-        // A chunk is grouped by `(shard, preferred, class)`, which does
-        // not separate two anchors of the same shard, and one proof
-        // reconstructs exactly one root. Split by anchor here.
-        let mut by_anchor: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
-        for (anchor, key) in ids {
-            by_anchor.entry(anchor).or_default().push(key);
-        }
-        for (anchor, keys) in by_anchor {
-            debug_assert_eq!(
-                shard, anchor.shard,
-                "StateProofBinding routes to the anchor's shard; the runner sets it from the id",
-            );
-            let requested: Vec<Self::Id> = keys.iter().map(|key| (anchor, *key)).collect();
-            let request = GetStateProofRequest::new(anchor.height, keys.clone());
-            let es = sender.clone();
-            network.request(
-                shard,
-                preferred,
-                request,
-                class,
-                Box::new(move |result| {
-                    let response = match result {
-                        Ok(response) => response,
-                        Err(error) => {
-                            // A peer that answered with something that is
-                            // not an answer is a refusal; a timeout or an
-                            // exhausted rotation is not.
-                            if matches!(error, RequestError::PeerError(_)) {
-                                record_fetch_response_refused("state_proof", "unusable_answer");
-                            }
-                            push_shard_input(
-                                &es,
-                                local_shard,
-                                ShardScopedInput::FetchFailed(Self::ids(requested)),
-                            );
-                            return ResponseVerdict::Accept;
-                        }
-                    };
-                    // This peer doesn't hold the height — rotate.
-                    let Some(proof) = response.proof else {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::FetchFailed(Self::ids(requested)),
-                        );
-                        return ResponseVerdict::Reject;
-                    };
-                    // Checked here so an unusable proof rotates the peer
-                    // rather than reaching a block. What it says is read
-                    // off the block that carries it, by every replica.
-                    if let Err(error) = proof.inclusions(anchor.state_root, anchor.shard, &keys) {
-                        tracing::warn!(
-                            shard = ?anchor.shard,
-                            height = anchor.height.inner(),
-                            %error,
-                            "Dropping state-proof response: unusable proof"
-                        );
-                        record_fetch_response_refused("state_proof", "unusable_proof");
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::FetchFailed(Self::ids(requested)),
-                        );
-                        return ResponseVerdict::Reject;
-                    }
-                    // Release the slots before delivering the proof, so
-                    // the freed capacity is available if handling the
-                    // delivery re-drives this fetch.
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::FetchFulfilled(Self::ids(requested)),
-                    );
-                    push_protocol_event(
-                        &es,
-                        local_shard,
-                        ProtocolEvent::FetchedStateProofVerified {
-                            anchor,
-                            keys,
-                            proof,
-                        },
-                    );
-                    ResponseVerdict::Accept
-                }),
-            );
-        }
+        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
+    }
+}
+
+impl ScopedAnswer for StateProofBinding {
+    type Scope = Anchor;
+    type Key = SubstateKey;
+    type Request = GetStateProofRequest;
+
+    fn split(id: Self::Id) -> (Self::Scope, Self::Key) {
+        id
+    }
+
+    fn join(scope: Self::Scope, key: Self::Key) -> Self::Id {
+        (scope, key)
+    }
+
+    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
+        GetStateProofRequest::new(scope.height, keys.to_vec())
+    }
+
+    /// Checked here so an unusable proof rotates the peer rather than
+    /// reaching a block. What it says is read off the block that carries
+    /// it, by every replica.
+    fn answer(
+        scope: Self::Scope,
+        keys: Vec<Self::Key>,
+        response: GetStateProofResponse,
+    ) -> Result<ProtocolEvent, Refusal> {
+        let proof = response.proof.ok_or(Refusal::NotHeld)?;
+        proof
+            .inclusions(scope.state_root, scope.shard, &keys)
+            .map_err(|_| Refusal::Unusable("unusable_proof"))?;
+        Ok(ProtocolEvent::FetchedStateProofVerified {
+            anchor: scope,
+            keys,
+            proof,
+        })
     }
 }
 

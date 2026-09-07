@@ -9,23 +9,28 @@
 //!   (`shard/{consensus,cross_shard,mempool}`, `beacon`); the `ProtocolEvent`
 //!   → in-flight-drain mapping lives outside the binding, in
 //!   `io_loop::drive_fetch_admission`.
+//! - [`ScopedAnswer`] is the contract for a binding whose request names one
+//!   scope and whose answer is checked against it; [`dispatch_scoped`] is
+//!   the one response boundary those bindings share.
 //! - [`partition_solicited`] is the shared response-boundary filter every
-//!   binding's admit handler runs.
+//!   bag-of-ids binding's admit handler runs.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
 use crossbeam::channel::Sender;
-use hyperscale_core::FetchIds;
+use hyperscale_core::{FetchIds, ProtocolEvent};
 use hyperscale_metrics::{
-    record_fetch_abandoned, record_fetch_completed, record_fetch_retried, record_fetch_started,
+    record_fetch_abandoned, record_fetch_completed, record_fetch_response_refused,
+    record_fetch_retried, record_fetch_started,
 };
-use hyperscale_network::Network;
+use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
+use hyperscale_types::network::Request;
 use hyperscale_types::{MessageClass, ShardId, Stopwatch, ValidatorId};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
-use crate::shard::{HostEvent, ShardIo};
+use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, push_shard_input};
 
 /// Tunables for a [`Fetch`] instance.
 #[derive(Debug, Clone)]
@@ -403,6 +408,137 @@ pub trait FetchBinding: 'static {
         network: &N,
         sender: &Sender<HostEvent>,
     );
+}
+
+// ─── Scoped answers ────────────────────────────────────────────────────
+
+/// A binding whose request names one scope and asks about keys under it,
+/// and whose answer is checked against that scope before anything
+/// downstream sees it: a committed-transaction query against a
+/// predecessor's terminal, a state proof against an anchor's root, a
+/// witness run against a committed block. [`dispatch_scoped`] is the one
+/// response boundary these share; the impl is the pure part — how an id
+/// splits, what the request looks like, and what the answer has to lift
+/// to.
+pub trait ScopedAnswer: FetchBinding {
+    /// What one request is checked against. A chunk is grouped by
+    /// `(shard, preferred, class)`, which does not separate two scopes of
+    /// one shard, so the dispatcher splits a chunk by this before it
+    /// issues anything.
+    type Scope: Copy + Ord + std::fmt::Debug + Send + Sync + 'static;
+    /// What is asked under a scope — `()` when the scope is the whole
+    /// question.
+    type Key: Copy + std::fmt::Debug + Send + Sync + 'static;
+    /// The wire request one scope's keys ride in.
+    type Request: Request + Clone + 'static;
+
+    /// The id as its scope and key.
+    fn split(id: Self::Id) -> (Self::Scope, Self::Key);
+
+    /// The id a scope and key name.
+    fn join(scope: Self::Scope, key: Self::Key) -> Self::Id;
+
+    /// One request for `keys` under `scope`.
+    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request;
+
+    /// Check a peer's answer against the scope and turn it into the
+    /// event that carries it, or say why it is refused. The event is
+    /// what every replica reads; nothing unverified reaches it.
+    fn answer(
+        scope: Self::Scope,
+        keys: Vec<Self::Key>,
+        response: <Self::Request as Request>::Response,
+    ) -> Result<ProtocolEvent, Refusal>;
+}
+
+/// Why a scoped answer is refused at the response boundary. Either way
+/// the ids are released for retry against another peer and the response
+/// is rejected for peer scoring; an unusable one is also counted under
+/// its reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The peer does not hold the scope — a pruned height, a terminal it
+    /// never served.
+    NotHeld,
+    /// The peer answered, but with something that does not lift to the
+    /// scope. The label is the metric reason.
+    Unusable(&'static str),
+}
+
+/// Issue one request per scope in `ids` and route each answer through
+/// [`ScopedAnswer::answer`]. The ids are released before the event goes
+/// out, so the freed capacity is available if handling the delivery
+/// re-drives the fetch. A transport error releases the ids without
+/// rejecting the response — the network already recorded it — while an
+/// answer that is not an answer counts as a refusal.
+pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
+    ids: Vec<B::Id>,
+    local_shard: ShardId,
+    shard: ShardId,
+    preferred: Option<ValidatorId>,
+    class: Option<MessageClass>,
+    network: &N,
+    sender: &Sender<HostEvent>,
+) {
+    let mut by_scope: BTreeMap<B::Scope, Vec<B::Key>> = BTreeMap::new();
+    for id in ids {
+        let (scope, key) = B::split(id);
+        by_scope.entry(scope).or_default().push(key);
+    }
+    for (scope, keys) in by_scope {
+        let requested: Vec<B::Id> = keys.iter().map(|key| B::join(scope, *key)).collect();
+        let es = sender.clone();
+        network.request(
+            shard,
+            preferred,
+            B::request(scope, &keys),
+            class,
+            Box::new(move |result| {
+                let response = match result {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if matches!(error, RequestError::PeerError(_)) {
+                            record_fetch_response_refused(B::NAME, "unusable_answer");
+                        }
+                        push_shard_input(
+                            &es,
+                            local_shard,
+                            ShardScopedInput::FetchFailed(B::ids(requested)),
+                        );
+                        return ResponseVerdict::Accept;
+                    }
+                };
+                match B::answer(scope, keys, response) {
+                    Ok(event) => {
+                        push_shard_input(
+                            &es,
+                            local_shard,
+                            ShardScopedInput::FetchFulfilled(B::ids(requested)),
+                        );
+                        push_protocol_event(&es, local_shard, event);
+                        ResponseVerdict::Accept
+                    }
+                    Err(refusal) => {
+                        if let Refusal::Unusable(reason) = refusal {
+                            warn!(
+                                binding = B::NAME,
+                                scope = ?scope,
+                                reason,
+                                "Dropping fetch response: unusable answer"
+                            );
+                            record_fetch_response_refused(B::NAME, reason);
+                        }
+                        push_shard_input(
+                            &es,
+                            local_shard,
+                            ShardScopedInput::FetchFailed(B::ids(requested)),
+                        );
+                        ResponseVerdict::Reject
+                    }
+                }
+            }),
+        );
+    }
 }
 
 /// Why a batch of ids leaves the in-flight set: the three id-carrying
