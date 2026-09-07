@@ -16,7 +16,7 @@ use hyperscale_types::{
     SweepBucket, SweepFrontier, Transaction, TxHash, WeightedTimestamp, protocol_statics,
     protocol_statics_installed,
 };
-use hyperscale_vm_effects::{CommittedTxCell, ProtocolHasher, committed_tx_key};
+use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
 use hyperscale_vm_types::ARTIFACT_GRACE_MS;
 
 use crate::tree::JmtSnapshot;
@@ -351,9 +351,10 @@ pub fn committed_tx_cells<'a>(
         .into_iter()
         .map(|tx| {
             let validity_end = tx.validity_range().end_timestamp_exclusive;
-            let cell = CommittedTxCell {
+            let cell = Marker {
                 tx: tx.hash(),
                 expiry_ms: committed_tx_expiry_ms(validity_end),
+                marks: Marked::Committed,
             };
             (
                 committed_tx_cell_key(local_shard, cell.tx, validity_end),
@@ -531,7 +532,7 @@ mod tests {
     fn a_block_creates_one_committed_cell_per_transaction() {
         use hyperscale_hbor::from_slice;
         use hyperscale_types::test_utils::{install_stub_protocol_statics, test_transaction};
-        use hyperscale_vm_effects::CommittedTxCell;
+        use hyperscale_vm_effects::Marker;
         use hyperscale_vm_types::ARTIFACT_GRACE_MS;
 
         install_stub_protocol_statics();
@@ -541,7 +542,7 @@ mod tests {
         assert_eq!(cells.len(), 2);
         for ((key, value), tx) in cells.iter().zip(&txs) {
             assert!(ShardTrie::shard_owns_prefix(shard, key.owner));
-            let decoded: CommittedTxCell = from_slice(value).expect("decodes");
+            let decoded: Marker = from_slice(value).expect("decodes");
             assert_eq!(decoded.tx, tx.hash());
             assert_eq!(
                 decoded.expiry_ms,

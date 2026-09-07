@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arc_swap::ArcSwap;
 use hyperscale_hbor::from_slice as hbor_from_slice;
 use hyperscale_vm_effects::{
-    ChainRecords, ClaimCell, CommittedTxCell, CrossingCell, Hasher, InstanceMeta, InstanceRegistry,
-    Issuance, MetadataCache, NullifierCell, PackageHash, PackageMetadata, ResourceMeta, Value,
-    committed_tx_key, escrow_claim_key, escrow_record_key, nullifier_key, package_hash,
+    ChainRecords, CrossingCell, Hasher, InstanceMeta, InstanceRegistry, Issuance, Marker,
+    MetadataCache, PackageHash, PackageMetadata, ResourceMeta, Value, escrow_record_key,
+    package_hash,
 };
 use hyperscale_vm_types::{
     Address, CallTarget, ComponentAddr, LocalKey, ResourceAddr, SubstateKey, SweepBucket,
@@ -79,57 +79,17 @@ const WASM_PREAMBLE: &[u8] = b"\0asm";
 /// walk. The claim beside it is a witness of a delivery admitted inside
 /// a window on its own chain's clock, and keeps its bucket.
 ///
-/// Three tests per arm, cheapest first, because this runs over every
-/// cell of every commit. The decode rejects on width alone; the bucket
-/// check costs nothing and is the statement that the two halves of the
-/// key agree; only then is a hash worth taking.
+/// Three tests, cheapest first, because this runs over every cell of
+/// every commit. The decode rejects on shape alone; the bucket check
+/// costs nothing and is the statement that the two halves of the key
+/// agree; only then is a hash worth taking.
 #[must_use]
 pub fn sweepable_cell(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u64> {
-    nullifier_expiry(owner, local, value)
-        .or_else(|| committed_tx_expiry(owner, local, value))
-        .or_else(|| escrow_claim_expiry(owner, local, value))
-}
-
-/// The expiry a nullifier cell carries, or `None` for every other cell.
-fn nullifier_expiry(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u64> {
-    let cell: NullifierCell = hbor_from_slice(value).ok()?;
-    if SweepBucket::claimed_by(LocalKey(local)) != SweepBucket::of(cell.expiry_ms) {
+    let marker = Marker::from_bytes(value)?;
+    if SweepBucket::claimed_by(LocalKey(local)) != SweepBucket::of(marker.expiry_ms) {
         return None;
     }
-    let key = nullifier_key(&ProtocolHasher, owner, cell.subintent, cell.expiry_ms);
-    (key.local.0 == local).then_some(cell.expiry_ms)
-}
-
-/// The expiry a committed-transaction cell carries, or `None` for every
-/// other cell. Judged the way a nullifier is: the value re-derives the
-/// key under the family's own role, so nothing about the writer enters
-/// into it.
-fn committed_tx_expiry(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u64> {
-    let cell: CommittedTxCell = hbor_from_slice(value).ok()?;
-    if SweepBucket::claimed_by(LocalKey(local)) != SweepBucket::of(cell.expiry_ms) {
-        return None;
-    }
-    let key = committed_tx_key(&ProtocolHasher, owner, cell.tx, cell.expiry_ms);
-    (key.local.0 == local).then_some(cell.expiry_ms)
-}
-
-/// The expiry an escrow claim cell carries, or `None` for every other
-/// cell. The same edge under the claim's slot, and the claim a reclaim
-/// writes under the producer's own target is judged the same way.
-fn escrow_claim_expiry(owner: Address, local: [u8; 16], value: &[u8]) -> Option<u64> {
-    let cell: ClaimCell = hbor_from_slice(value).ok()?;
-    if SweepBucket::claimed_by(LocalKey(local)) != SweepBucket::of(cell.expiry_ms) {
-        return None;
-    }
-    let key = escrow_claim_key(
-        &ProtocolHasher,
-        owner,
-        cell.intent,
-        cell.local,
-        cell.output,
-        cell.expiry_ms,
-    );
-    (key.local.0 == local).then_some(cell.expiry_ms)
+    (marker.key(&ProtocolHasher, owner).local.0 == local).then_some(marker.expiry_ms)
 }
 
 /// Whether a committed cell is an escrow record.
@@ -915,13 +875,14 @@ mod tests {
     /// is the expiry's, and a leaf at any other local is nothing.
     #[test]
     fn a_committed_transaction_cell_is_judged_off_its_leaf() {
-        use hyperscale_vm_effects::{CommittedTxCell, committed_tx_key};
+        use hyperscale_vm_effects::{Marked, committed_tx_key};
         use hyperscale_vm_types::{AddressClass, TxHash};
 
         let owner = Address::new([0x5A; 31], AddressClass::Native);
-        let cell = CommittedTxCell {
+        let cell = Marker {
             tx: TxHash(Hash32([0xC0; 32])),
             expiry_ms: 200_000,
+            marks: Marked::Committed,
         };
         let key = committed_tx_key(&ProtocolHasher, owner, cell.tx, cell.expiry_ms);
         assert_eq!(
