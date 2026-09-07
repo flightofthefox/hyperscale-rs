@@ -53,8 +53,8 @@ use hyperscale_types::{
     MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Mode, Probed, ProvenAnchors, Provisions,
     Question, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie,
     StateProofBundle, StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution, UnsettledTx,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp, Window, Word, derive_block_transactions,
+    Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
+    Verifiable, Verified, WeightedTimestamp, Window, Word, derive_block_transactions,
     settled_set_verdict, tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::CrossingCell;
@@ -2734,6 +2734,19 @@ impl ExecutionCoordinator {
         actions
     }
 
+    /// Write what the block's abandoning records cover into the mirror
+    /// the gate and the fence read: neither asks a settled set about a
+    /// transaction the chain has established no counterpart can settle.
+    fn cover_recorded(&self, block: &Block) {
+        for record in block.abandonment_records() {
+            if record.evidence().abandons() {
+                for tx_hash in record.tx_hashes() {
+                    self.evidence.cover(tx_hash);
+                }
+            }
+        }
+    }
+
     /// Fold what `shard` said of `tx_hash` into the mirror the vote
     /// fence reads, and tell the mempool.
     ///
@@ -3053,6 +3066,7 @@ impl ExecutionCoordinator {
         for _ in 0..rebuilt {
             record_rebuilt_verdict_entry();
         }
+        self.cover_recorded(block);
         self.stamp_departures(topology_schedule);
         self.retire_closed_deliveries();
         let pruned = self.unresolved.prune(self.committed_ts);
@@ -3314,7 +3328,7 @@ impl ExecutionCoordinator {
     /// offers it first and the duplicate-resolution rule refuses the
     /// abort, after which the ledger releases the transaction. And a
     /// transaction a terminating counterpart may have settled is the
-    /// fence's question, which [`Self::fence_pairs`] is what lets the
+    /// fence's question, which [`Finalization::claims`] is what lets the
     /// fence ask about an abandonment at all.
     fn abandonable(&self, composing: TickId) -> Vec<UnsettledTx> {
         self.unresolved
@@ -3849,58 +3863,6 @@ impl ExecutionCoordinator {
         actions
     }
 
-    /// The `(shard, tx_hash, claim)` triples the split-boundary fence asks
-    /// about.
-    ///
-    /// A settlement carries its participants in the certificates it
-    /// collected, so reading them off is enough. An abandonment carries
-    /// only this shard's certificate, because an abort is dominant and
-    /// needs no counterpart's verdict — and that certificate's outcome
-    /// names the counterparts the member awaited and never heard from,
-    /// which is what the fence asks their settled sets about. A member
-    /// that awaited nobody — a leg, a core answering alone, a reclaim —
-    /// makes no claim at all: its verdict is its own, settled on this
-    /// certificate, and no counterpart's set can contradict it.
-    ///
-    /// The two ask opposite questions of the same set, which is what
-    /// [`TxClaim`] carries: a settlement needs the terminating partner to
-    /// have settled its own half, an abandonment needs it not to have.
-    /// One tick can hold both, so the claim is per transaction rather
-    /// than per finalization.
-    fn fence_pairs(&self, fw: &Finalization) -> Vec<(ShardId, TxHash, TxClaim)> {
-        let mut pairs: Vec<(ShardId, TxHash, TxClaim)> = Vec::new();
-        let mut attested_remotely: HashSet<TxHash> = HashSet::new();
-        for ec in fw.execution_certificates() {
-            let shard = ec.shard_id();
-            for outcome in ec.tx_outcomes() {
-                if shard != self.local_shard {
-                    attested_remotely.insert(outcome.tx_hash());
-                }
-                pairs.push((shard, outcome.tx_hash(), TxClaim::Settled));
-            }
-        }
-        for outcome in fw.local_ec().tx_outcomes() {
-            let tx_hash = outcome.tx_hash();
-            if attested_remotely.contains(&tx_hash) {
-                continue;
-            }
-            // A committed record already answered for this one, in a form
-            // that does not expire with the set it was read from. Putting
-            // the question again would let the set's own horizon refuse a
-            // verdict the chain has already established is safe.
-            if self.unresolved.is_unsettled_by_departed(tx_hash) {
-                continue;
-            }
-            pairs.extend(
-                outcome
-                    .counterparts()
-                    .iter()
-                    .map(|&s| (s, tx_hash, TxClaim::Abandoned)),
-            );
-        }
-        pairs
-    }
-
     /// Admit a freshly built finalization downstream, or withhold it at
     /// the split-boundary gate so we never produce a tick the vote fence
     /// would reject.
@@ -3923,14 +3885,15 @@ impl ExecutionCoordinator {
         let verdict = {
             // Whether a shard is past-terminal is asked at the committed
             // frontier, which is what a node-local caller reads it at.
-            let outcomes = self.fence_pairs(finalized_arc.as_unverified());
+            let claims =
+                finalized_arc.claims(self.local_shard, |tx_hash| self.evidence.covers(tx_hash));
             self.evidence.with_settled(|settled| {
                 settled_set_verdict(
                     settled,
                     topology_schedule,
                     self.local_shard,
                     self.committed_ts,
-                    outcomes,
+                    claims,
                 )
             })
         };
@@ -4569,7 +4532,8 @@ mod tests {
         MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, NetworkDefinition, Question, QuorumCertificate,
         RETENTION_HORIZON, Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor,
         ShardRecovery, Signer, SignerBitfield, StateRoot, StoredReceipt, SubstateKey, TickHalf,
-        TransactionDecision, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet, Window, Word,
+        TransactionDecision, TxClaim, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet,
+        Window, Word,
     };
     use hyperscale_vm_types::Seeded;
 
@@ -9772,8 +9736,8 @@ mod tests {
         // from: the terminating partner is named, and the gate holds.
         let mut state = state_abandoning(&sched, local, &transaction);
         assert!(
-            state
-                .fence_pairs(&abort)
+            abort
+                .claims(local, |tx_hash| state.evidence.covers(tx_hash))
                 .iter()
                 .any(|(shard, _, claim)| *shard == partner && *claim == TxClaim::Abandoned),
             "an abandonment names the counterparts it awaited",
@@ -9891,10 +9855,9 @@ mod tests {
 
         let verdict = lone_verdict_of(local, tx_hash);
         assert!(
-            state
-                .fence_pairs(&verdict)
-                .iter()
-                .all(|(shard, _, _)| *shard == local),
+            verdict
+                .claims(local, |tx_hash| state.evidence.covers(tx_hash))
+                .is_empty(),
             "a member that awaited nobody names no counterpart",
         );
         let verdict: Arc<Verifiable<Finalization>> =

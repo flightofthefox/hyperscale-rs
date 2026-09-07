@@ -22,7 +22,7 @@ use hyperscale_types::{
     MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr, ProposerTimestamp,
     ProvenAnchors, ProvisionHash, Question, ReadySignal, ReshapeThresholds, ReshapeTrigger,
     Resolutions, ScheduleLookup, SettledSetVerdict, ShardId, SplitAtBoundary, StateProofBundle,
-    StoredReceipt, SubstateKey, TxClaim, TxOutcome, UnsettledTx, WeightedTimestamp, WorkInFlight,
+    StoredReceipt, SubstateKey, UnsettledTx, WeightedTimestamp, WorkInFlight,
     derive_reshape_trigger, ready_signal_window, settled_set_verdict,
 };
 
@@ -1047,101 +1047,42 @@ impl ShardCoordinator {
 
     /// The split-boundary fence over a block's committed finalizations.
     ///
-    /// A finalization's certificate carries one execution certificate
-    /// per participating shard. When a constituent certificate names a
-    /// shard that is **past-terminal** at the block's anchored window,
-    /// the cross-shard tick straddled that shard's split: committing this
-    /// block applies the tick's local half, so it may only commit if the
-    /// terminated shard actually settled the tick in its own chain by its
-    /// terminal block — otherwise one side of a cross-shard transaction
-    /// applies without the other.
+    /// Each finalization's claims on its counterparts' settled sets —
+    /// a settlement on every shard whose certificate it carries, an
+    /// abandonment on every shard a local outcome awaited and never
+    /// heard from — are the ones [`Finalization::claims`] derives, so a
+    /// voter judges a tick by the rule its proposer's gate composed it
+    /// under. Record coverage is read off the mirror the execution
+    /// coordinator writes at the record's commit, so a replica that came
+    /// up between the record and the abandonment holds the same answer
+    /// its peers do.
     ///
     /// Past-terminal-ness is read off the **anchored** snapshot at
     /// `anchored_wt` (the block's `parent_qc` weighted timestamp), never
     /// the head, so every replica voting this block reaches the same
     /// verdict. A shard evicted from every retained window is so far past
-    /// its terminal that any tick naming it is unreachable everywhere —
+    /// its terminal that any claim naming it is unreachable everywhere —
     /// reject. A past-terminal shard whose settled set isn't known yet
-    /// defers the vote; past the set's evidence window the tick is
-    /// categorically unreachable and rejects.
-    ///
-    /// An abandonment carries no counterpart certificate, so it yields no
-    /// settlement claim and [`Self::abandons_a_settled_tx`] is what judges
-    /// it instead.
+    /// defers the vote; past the set's evidence window the claim is
+    /// categorically unprovable and rejects.
     fn fence_finalizations(
         &self,
         topology_schedule: &TopologySchedule,
         block: &Block,
         anchored_wt: WeightedTimestamp,
     ) -> SettledSetVerdict {
-        if self.abandons_a_settled_tx(block) {
-            return SettledSetVerdict::Reject;
-        }
-        let outcomes = block.certificates().iter().flat_map(|fw| {
-            fw.execution_certificates().iter().flat_map(|ec| {
-                let shard = ec.shard_id();
-                ec.tx_outcomes()
-                    .iter()
-                    .map(move |outcome| (shard, outcome.tx_hash(), TxClaim::Settled))
-            })
-        });
+        let claims = block
+            .certificates()
+            .iter()
+            .flat_map(|fw| fw.claims(self.local_shard, |tx_hash| self.evidence.covers(tx_hash)));
         self.evidence.with_settled(|settled| {
             settled_set_verdict(
                 settled,
                 topology_schedule,
                 self.local_shard,
                 anchored_wt,
-                outcomes,
+                claims,
             )
-        })
-    }
-
-    /// Whether the block abandons a transaction some terminated shard
-    /// settled — a verdict that would tear a cross-shard transaction in
-    /// half, and the one thing about an abandonment a voter can check.
-    ///
-    /// An abandonment is a local-only outcome that awaited a counterpart
-    /// and never heard from it; its certificate names them. A local-only
-    /// outcome that awaited nobody — a leg, a core answering alone, a
-    /// reclaim — is this shard's own verdict, which no counterpart's set
-    /// can contradict, so it is left alone whatever a set says.
-    ///
-    /// The question is put to the sets rather than to the transaction. A
-    /// settled set names only what its shard settled, so a hit is proof
-    /// the transaction reached an outcome there and this shard may not
-    /// abort it, while a shard that was never party to it cannot produce
-    /// one. That is what makes the participants unnecessary here: they are
-    /// derived at commit from the transaction body, which the block
-    /// carrying the abandonment does not hold.
-    ///
-    /// A miss is not proof of the opposite — a set this node has not
-    /// acquired could still name the transaction. So enforcement is by the
-    /// replicas holding the terminated shard's set, and a block reaches no
-    /// quorum once f+1 of them do. The composing side is stricter: its
-    /// gate defers until the set answers, so an honest proposer offers no
-    /// abandonment this scan has yet to see the evidence for.
-    fn abandons_a_settled_tx(&self, block: &Block) -> bool {
-        if self.evidence.with_settled(HashMap::is_empty) {
-            return false;
-        }
-        block.certificates().iter().any(|fw| {
-            let attested_remotely: HashSet<TxHash> = fw
-                .execution_certificates()
-                .iter()
-                .filter(|ec| ec.shard_id() != self.local_shard)
-                .flat_map(|ec| ec.tx_outcomes().iter().map(TxOutcome::tx_hash))
-                .collect();
-            fw.local_ec()
-                .tx_outcomes()
-                .iter()
-                .filter(|outcome| !outcome.counterparts().is_empty())
-                .map(TxOutcome::tx_hash)
-                .filter(|tx_hash| !attested_remotely.contains(tx_hash))
-                .any(|tx_hash| {
-                    self.evidence.with_settled(|sets| {
-                        sets.values().any(|settled| settled.txs.contains(&tx_hash))
-                    })
-                })
         })
     }
 
@@ -7379,9 +7320,9 @@ mod tests {
         LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams,
         Probed, Question, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId, Signer,
         SignerBitfield, StateProofsRoot, TerminalRoots, TimestampRange, TopologySchedule,
-        TopologySnapshot, Transaction, TransactionDecision, UnsettledTx, ValidatorId,
-        ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources, Word,
-        test_utils,
+        TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxOutcome, UnsettledTx,
+        ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources,
+        Word, test_utils,
     };
 
     use super::*;
@@ -12545,12 +12486,11 @@ mod tests {
         );
     }
 
-    /// The same abandonment passes when no set names the transaction. A
-    /// miss is not proof — an unacquired set could still name it — so this
-    /// is the vote landing on the evidence the node has, which is why the
-    /// composing side defers rather than relying on this scan.
+    /// The same abandonment passes when the awaited shard's set is held
+    /// and does not name the transaction: absence from a set is proof,
+    /// so the partner never settled its half and the abort tears nothing.
     #[test]
-    fn fence_admits_an_abandonment_no_settled_set_names() {
+    fn fence_admits_an_abandonment_the_settled_set_does_not_name() {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         coord.evidence().record_settled(
@@ -12562,6 +12502,52 @@ mod tests {
             parties_of(b"tx"),
         );
         let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
+        assert_eq!(
+            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            SettledSetVerdict::Pass,
+        );
+    }
+
+    /// An abandonment whose awaited shard's set is not yet held defers,
+    /// as the proposer's gate held it: a set nobody has read could still
+    /// name the transaction, and the voter asks the same question the
+    /// gate did rather than landing on what it happens to hold.
+    #[test]
+    fn fence_defers_an_abandonment_until_the_awaited_set_is_held() {
+        let coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
+        assert_eq!(
+            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            SettledSetVerdict::Defer,
+        );
+    }
+
+    /// An abandonment a committed record covers claims nothing of any
+    /// set: the record established that no counterpart can settle the
+    /// transaction, in a form that outlives the set, so the vote passes
+    /// with the set unknown — and would pass with the set naming it,
+    /// since the record is the chain's own answer.
+    #[test]
+    fn fence_admits_an_abandonment_a_committed_record_covers() {
+        let coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        coord
+            .evidence()
+            .cover(TxHash::from(Hash::from_bytes(b"tx")));
+        let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
+        assert_eq!(
+            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            SettledSetVerdict::Pass,
+        );
+        coord.evidence().record_settled(
+            ShardId::ROOT,
+            SettledTxSet {
+                txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
+                terminal_wt: WeightedTimestamp::from_millis(1000),
+            },
+            parties_of(b"tx"),
+        );
         assert_eq!(
             coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
             SettledSetVerdict::Pass,

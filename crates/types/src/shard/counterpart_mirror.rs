@@ -32,7 +32,7 @@
 //! clock in this file: a second retention rule stated against one would
 //! be a second answer to when a fact stops being true.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::RwLock;
 
 use crate::{Heard, Question, SettledTxSet, ShardId, TxHash};
@@ -56,6 +56,10 @@ struct Mirrored {
     /// these, since one naming a stranger would abandon business the
     /// departed shard never had here.
     parties: HashMap<ShardId, BTreeSet<TxHash>>,
+    /// Transactions a committed record has established no counterpart
+    /// can settle. An abandonment of one makes no claim on any settled
+    /// set: the record answered in a form that outlives the set.
+    covered: HashSet<TxHash>,
 }
 
 /// Every counterpart's word this node holds, by transaction and shard.
@@ -126,6 +130,26 @@ impl CounterpartMirror {
         mirrored.parties.insert(shard, parties);
     }
 
+    /// Record that a committed record covers `tx_hash`: no counterpart
+    /// can settle it, whatever its set says.
+    ///
+    /// # Panics
+    ///
+    /// If the lock is poisoned.
+    pub fn cover(&self, tx_hash: TxHash) {
+        self.write().covered.insert(tx_hash);
+    }
+
+    /// Whether a committed record covers `tx_hash`.
+    ///
+    /// # Panics
+    ///
+    /// If the lock is poisoned.
+    #[must_use]
+    pub fn covers(&self, tx_hash: TxHash) -> bool {
+        self.read().covered.contains(&tx_hash)
+    }
+
     /// Read the settled sets in place, without copying them.
     ///
     /// The sets are whole transaction sets of a departed chain, so every
@@ -174,7 +198,9 @@ impl CounterpartMirror {
     ///
     /// If the lock is poisoned.
     pub fn retain(&self, held: &dyn Fn(TxHash) -> bool) {
-        self.write().heard.retain(|&(tx_hash, ..), _| held(tx_hash));
+        let mut mirrored = self.write();
+        mirrored.heard.retain(|&(tx_hash, ..), _| held(tx_hash));
+        mirrored.covered.retain(|&tx_hash| held(tx_hash));
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Mirrored> {
