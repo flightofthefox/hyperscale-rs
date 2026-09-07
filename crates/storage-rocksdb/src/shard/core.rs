@@ -478,9 +478,7 @@ impl RocksDbShardStorage {
     }
 
     /// Same as `build_substate_write_batch` but appends to an existing
-    /// `WriteBatch`. Used by callers that want to fold substate writes
-    /// into a larger atomic batch (e.g. the test-only
-    /// `commit_certificate_with_writes`).
+    /// `WriteBatch`.
     ///
     /// `base_reads`, when provided, is the read cache accumulated by the
     /// originating `SubstateView` during execution. Priors for keys
@@ -870,103 +868,5 @@ impl TreeReader for RocksDbShardStorage {
 
     fn root_path(&self) -> NibblePath {
         self.root_path.clone()
-    }
-}
-
-#[cfg(test)]
-mod test_helpers {
-    use hyperscale_metrics::record_storage_write;
-    use hyperscale_types::WeightedTimestamp;
-
-    use super::*;
-
-    impl RocksDbShardStorage {
-        /// Test helper: commits database updates with auto-incrementing JMT version.
-        /// Production goes through the prepared commit.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`StorageError`] if the underlying `RocksDB` write fails.
-        ///
-        /// # Panics
-        ///
-        /// Panics if the commit lock is poisoned.
-        #[instrument(level = Level::DEBUG, skip_all, fields(
-            cell_count = writes.cells().len(),
-            latency_us = Empty,
-        ))]
-        pub fn commit(&self, writes: &SettledWrites) -> Result<(), StorageError> {
-            self.commit_at(writes, WeightedTimestamp::from_millis(0))
-        }
-
-        /// [`Self::commit`] with the version dated, for a test that wants
-        /// the retention floor to move: a commit a horizon's worth of
-        /// weighted time after an earlier one retires it.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`StorageError`] if the underlying `RocksDB` write fails.
-        ///
-        /// # Panics
-        ///
-        /// Panics if the commit lock is poisoned.
-        pub fn commit_at(
-            &self,
-            writes: &SettledWrites,
-            at: WeightedTimestamp,
-        ) -> Result<(), StorageError> {
-            let _commit_guard = self.commit_lock.lock().unwrap();
-
-            let start = Instant::now();
-
-            // Compute JMT updates using a snapshot-based store for isolation
-            let snapshot_store = SnapshotTreeStore::new(&self.db, self.root_path.clone());
-            let (base_version, base_root) = snapshot_store.read_jmt_metadata();
-
-            // Version 0 with a non-zero root means genesis has been computed at version 0.
-            // Only treat as "no parent" when the JMT is truly empty.
-            let parent_version = tree::jmt_parent_height(BlockHeight::new(base_version), base_root)
-                .map(BlockHeight::inner);
-            let new_version = base_version + 1;
-
-            let mut batch = self.build_substate_write_batch(
-                writes,
-                new_version,
-                /* write_history */ true,
-                /* base_reads */ None,
-                /* pending */ &[],
-            );
-
-            let (new_root, collected) =
-                tree::put_at_version(&snapshot_store, parent_version, new_version, writes);
-            let jmt_snapshot = JmtSnapshot::from_collected_writes(
-                collected,
-                writes.clone(),
-                base_root,
-                BlockHeight::new(base_version),
-                new_root,
-                BlockHeight::new(new_version),
-            );
-
-            self.append_jmt_to_batch(&mut batch, &jmt_snapshot, new_version);
-            self.advance_retention_floor(&mut batch, new_version, at);
-
-            self.db
-                .write(batch)
-                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-
-            let elapsed = start.elapsed();
-            record_storage_write(elapsed.as_secs_f64());
-
-            // Record span fields
-            let span = Span::current();
-            span.record(
-                "latency_us",
-                u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
-            );
-            tracing::debug!(new_version, "commit complete");
-
-            Ok(())
-        }
     }
 }

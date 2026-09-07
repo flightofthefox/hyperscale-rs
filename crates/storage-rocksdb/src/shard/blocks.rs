@@ -656,21 +656,13 @@ impl RocksDbShardStorage {
 // code can't accidentally call them.
 #[cfg(test)]
 mod test_helpers {
-    use hyperscale_metrics::{
-        record_certificate_persisted, record_storage_batch_size, record_storage_operation,
-        record_storage_write,
-    };
-    use hyperscale_types::{BlockHeight, Finalization, Hash, QuorumCertificate, SettledWrites};
+    use hyperscale_types::{BlockHeight, Hash, QuorumCertificate};
     use rocksdb::{WriteBatch, WriteOptions};
-    use tracing::field::Empty;
-    use tracing::{Level, Span, instrument};
 
-    use super::super::column_families::CertificatesCf;
     use super::super::core::RocksDbShardStorage;
     use super::super::metadata::{
         write_committed_hash, write_committed_height, write_committed_qc,
     };
-    use super::Instant;
 
     impl RocksDbShardStorage {
         /// Test-only seed for `committed_height` / `committed_hash` /
@@ -699,69 +691,6 @@ mod test_helpers {
             self.db
                 .write_opt(batch, &opts)
                 .expect("set_chain_metadata: synced write failed");
-        }
-
-        /// Test-only deferred-commit shim for a single finalization
-        /// plus its state writes. Production goes through the prepared
-        /// commit, which folds the cert and state writes into the atomic
-        /// JMT-update batch under `commit_lock`.
-        ///
-        /// # Panics
-        /// Panics if the synced commit fails.
-        #[instrument(level = Level::DEBUG, skip_all, fields(
-            tick_id = ?certificate.tick_id(),
-            latency_us = Empty,
-            otel.kind = "INTERNAL",
-        ))]
-        pub fn commit_certificate_with_writes(
-            &self,
-            certificate: &Finalization,
-            writes: &SettledWrites,
-        ) {
-            let start = Instant::now();
-            let mut batch = WriteBatch::default();
-            let mut write_count = 0usize;
-
-            self.cf_put::<CertificatesCf>(&mut batch, &certificate.receipt_hash(), certificate);
-            write_count += 1;
-
-            // Append substate writes to the cert batch at the current JMT
-            // version. Delegates to `append_substate_writes_to_batch` so
-            // the state-history capture stays single-sourced with the
-            // production commit path.
-            let version = self.read_jmt_metadata().0;
-            self.append_substate_writes_to_batch(
-                &mut batch,
-                writes,
-                version,
-                /* write_history */ true,
-                /* base_reads */ None,
-                /* pending */ &[],
-            );
-            write_count += writes.cells().len();
-
-            let mut write_opts = WriteOptions::default();
-            write_opts.set_sync(true);
-            self.db
-                .write_opt(batch, &write_opts)
-                .expect("commit_certificate_with_writes: synced commit failed");
-
-            tracing::debug!(
-                tick_id = ?certificate.tick_id(),
-                write_count,
-                "Certificate state writes committed (JMT deferred to block commit)"
-            );
-
-            let elapsed = start.elapsed();
-            record_storage_write(elapsed.as_secs_f64());
-            record_storage_operation("commit_cert_writes", elapsed.as_secs_f64());
-            record_storage_batch_size(write_count);
-            record_certificate_persisted();
-
-            Span::current().record(
-                "latency_us",
-                u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
-            );
         }
     }
 }

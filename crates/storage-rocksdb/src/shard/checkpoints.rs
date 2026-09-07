@@ -686,7 +686,7 @@ mod tests {
     use blake3::hash as blake3_hash;
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{
-        completed_import_progress, import_boundary_state, make_settled_writes,
+        commit_one, completed_import_progress, import_boundary_state,
         test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
         test_boundary_unpinned_height_not_served, test_escrow_records_are_read_off_the_state,
         test_import_gate_reads_the_trie,
@@ -703,11 +703,6 @@ mod tests {
 
     fn open_storage(dir: &Path) -> RocksDbShardStorage {
         RocksDbShardStorage::open(dir, NibblePath::empty()).unwrap()
-    }
-
-    fn commit_one(storage: &RocksDbShardStorage, seed: u8) {
-        let writes = make_settled_writes(seed, seed, vec![seed, seed, seed]);
-        storage.commit(&writes).unwrap();
     }
 
     #[test]
@@ -767,7 +762,7 @@ mod tests {
     fn retention_evicts_oldest() {
         let temp = TempDir::new().unwrap();
         let storage = open_storage(temp.path());
-        test_boundary_retention_evicts_oldest(&storage, |seed| commit_one(&storage, seed));
+        test_boundary_retention_evicts_oldest(&storage);
     }
 
     /// A configured `boundary_retain` widens the ring beyond the
@@ -851,7 +846,7 @@ mod tests {
     fn unpinned_height_is_not_served() {
         let temp = TempDir::new().unwrap();
         let storage = open_storage(temp.path());
-        test_boundary_unpinned_height_not_served(&storage, |seed| commit_one(&storage, seed));
+        test_boundary_unpinned_height_not_served(&storage);
     }
 
     /// Full serve → import round trip: leaves enumerated and resolved
@@ -862,7 +857,7 @@ mod tests {
         let storage = open_storage(temp.path());
         let fresh_dir = TempDir::new().unwrap();
         let fresh = open_storage(fresh_dir.path());
-        test_boundary_import_roundtrip(&storage, &fresh, |writes| storage.commit(writes).unwrap());
+        test_boundary_import_roundtrip(&storage, &fresh);
     }
 
     /// A store answers for the escrow records its state holds, which is
@@ -871,9 +866,7 @@ mod tests {
     fn escrow_records_are_read_off_the_state() {
         let temp = TempDir::new().unwrap();
         let storage = open_storage(temp.path());
-        test_escrow_records_are_read_off_the_state(&storage, |writes| {
-            storage.commit(writes).unwrap();
-        });
+        test_escrow_records_are_read_off_the_state(&storage);
     }
 
     #[test]

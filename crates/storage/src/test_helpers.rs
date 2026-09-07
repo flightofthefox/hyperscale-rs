@@ -12,8 +12,8 @@ use std::time::Duration;
 use hyperscale_hbor::from_slice;
 use hyperscale_jmt::{KEY_BYTES, TreeReader};
 use hyperscale_types::test_utils::{
-    install_stub_protocol_statics, make_finalization, make_leg_finalization, stub_record_cell,
-    stub_sweepable_cell, test_transaction,
+    STUB_PACKAGE_MARKER, install_stub_protocol_statics, make_finalization, make_leg_finalization,
+    stub_record_cell, stub_sweepable_cell, test_transaction,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock,
@@ -37,9 +37,9 @@ use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
     Anchored, BOUNDARY_RETAIN, BoundaryStore, GenesisCommit, ImportCursor, ImportProgress,
-    JmtSnapshot, ParentAnchor, RecoveredState, SafeVoteRegisterStore, ShardChainReader,
-    ShardChainWriter, SubstateStore, Substates, SweepIndex, VersionedStore, WitnessSeed,
-    committed_tx_cell_key, committed_tx_cells, holds_state, sweep_for_block,
+    JmtSnapshot, PackageArtifactStore, ParentAnchor, RecoveredState, SafeVoteRegisterStore,
+    ShardChainReader, ShardChainWriter, SubstateStore, Substates, SweepIndex, VersionedStore,
+    WitnessSeed, committed_tx_cell_key, committed_tx_cells, holds_state, sweep_for_block,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -195,22 +195,33 @@ pub const fn state_key(owner_seed: u8, local_seed: u8) -> SubstateKey {
     }
 }
 
-/// Build a test attestation at the given height.
+/// A placeholder local execution certificate for the tick at `height`.
 ///
-/// Includes a single placeholder local EC so it satisfies the invariant
-/// enforced at decode time (one EC whose `tick_id` matches the tick's own).
+/// No signers, no outcomes, so it refuses and charges nothing. It is
+/// what a stored finalization needs to decode again: one certificate
+/// whose `tick_id` is the tick's own.
 #[must_use]
-pub fn make_test_finalization(height: BlockHeight, shard: ShardId) -> Finalization {
-    let tick_id = TickId::new(shard, height);
-    let local_ec = Arc::new(ExecutionCertificate::new(
-        tick_id,
+pub fn placeholder_local_ec(shard: ShardId, height: BlockHeight) -> Arc<ExecutionCertificate> {
+    Arc::new(ExecutionCertificate::new(
+        TickId::new(shard, height),
         WeightedTimestamp::from_millis(0),
         GlobalReceiptRoot::ZERO,
         Vec::new(),
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::empty(),
-    ));
-    Finalization::new(tick_id, TickHalf::Determined, vec![local_ec], vec![])
+    ))
+}
+
+/// Build a test attestation at the given height, carrying a placeholder
+/// local certificate so it decodes.
+#[must_use]
+pub fn make_test_finalization(height: BlockHeight, shard: ShardId) -> Finalization {
+    Finalization::new(
+        TickId::new(shard, height),
+        TickHalf::Determined,
+        vec![placeholder_local_ec(shard, height)],
+        vec![],
+    )
 }
 
 /// Build a minimal `Block` at the given height.
@@ -623,7 +634,31 @@ fn commit_empty_blocks_below(storage: &impl TestStore, target: BlockHeight) {
     }
 }
 
-/// Commit `writes` at `height` through the production block-commit path.
+/// A finalization at `height` whose one receipt carries `writes`, with
+/// the placeholder certificate a stored finalization needs to decode.
+fn settling(height: BlockHeight, writes: StateWrites) -> Arc<Verifiable<Finalization>> {
+    let receipt = StoredReceipt {
+        tx_hash: TxHash::ZERO,
+        consensus: Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes,
+            beacon_witness_events: Vec::new(),
+            events: Vec::new(),
+        }),
+        metadata: None,
+    };
+    Arc::new(
+        Finalization::new(
+            TickId::new(ShardId::ROOT, height),
+            TickHalf::Determined,
+            vec![placeholder_local_ec(ShardId::ROOT, height)],
+            vec![receipt],
+        )
+        .into(),
+    )
+}
+
+/// Commit `writes` at `height` through the one commit path.
 ///
 /// The writes ride a single-receipt finalization inside a test block,
 /// so substates, state history, and the JMT all land exactly as a live
@@ -633,26 +668,7 @@ pub fn commit_block_with_updates(
     height: BlockHeight,
     writes: &StateWrites,
 ) -> StateRoot {
-    let receipt = StoredReceipt {
-        tx_hash: TxHash::ZERO,
-        consensus: Arc::new(ConsensusReceipt::Succeeded {
-            receipt_hash: GlobalReceiptHash::ZERO,
-            writes: writes.clone(),
-            beacon_witness_events: Vec::new(),
-            events: Vec::new(),
-        }),
-        metadata: None,
-    };
-    let finalized = Arc::new(
-        Finalization::new(
-            TickId::new(ShardId::ROOT, height),
-            TickHalf::Determined,
-            vec![],
-            vec![receipt],
-        )
-        .into(),
-    );
-    let block = push_certificate(make_test_block(height), finalized);
+    let block = push_certificate(make_test_block(height), settling(height, writes.clone()));
     commit_settled_at(
         storage,
         &make_test_certified(block),
@@ -660,6 +676,66 @@ pub fn commit_block_with_updates(
         &[],
         &empty_witness(),
     )
+}
+
+/// Commit `writes` as the one receipt of a block at the store's next
+/// height, stamped `at`.
+///
+/// The stamp is the clock the retention floor moves on, so a chain a
+/// horizon apart per commit retires every version behind it and one a
+/// fraction apart keeps a known number. Empty writes commit an empty
+/// block, which still advances the version. Returns the committed state
+/// root.
+pub fn commit_writes_at(
+    storage: &impl TestStore,
+    writes: &SettledWrites,
+    at: WeightedTimestamp,
+) -> StateRoot {
+    let height = storage.jmt_height().next();
+    let mut block = make_test_block_at(height, at.as_millis());
+    if !writes.is_empty() {
+        block = push_certificate(block, settling(height, writes.clone().into()));
+    }
+    commit_settled_at(
+        storage,
+        &make_test_certified(block),
+        &[],
+        &[],
+        &empty_witness(),
+    )
+}
+
+/// [`commit_writes_at`] on the zero clock, for a test that does not care
+/// where the floor stands.
+pub fn commit_writes(storage: &impl TestStore, writes: &SettledWrites) -> StateRoot {
+    commit_writes_at(storage, writes, WeightedTimestamp::ZERO)
+}
+
+/// The union of already-settled fixtures — values, so nothing to fold.
+#[must_use]
+pub fn union_of(parts: &[SettledWrites]) -> SettledWrites {
+    SettledWrites::from_absolutes(
+        parts
+            .iter()
+            .flat_map(SettledWrites::cells)
+            .map(|(key, change)| (*key, change.clone()))
+            .collect(),
+    )
+}
+
+/// Writes holding a single removal of the cell [`make_state_writes`]
+/// writes.
+#[must_use]
+pub fn make_state_delete(owner_seed: u8, local_seed: u8) -> SettledWrites {
+    SettledWrites::from_absolutes(BTreeMap::from([(state_key(owner_seed, local_seed), None)]))
+}
+
+/// The clock at height `h` of a chain pacing `blocks` of itself into one
+/// retention horizon, so a tip at `h` leaves the floor at `h - blocks`.
+#[must_use]
+pub fn paced(height: u64, blocks: u64) -> WeightedTimestamp {
+    let step = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX) / blocks;
+    WeightedTimestamp::from_millis(height * step)
 }
 
 /// A block at `height` whose one tick settles `receipts` and which
@@ -941,23 +1017,26 @@ pub fn test_ec_storage_batch(storage: &(impl ShardChainReader + TestStore)) {
     assert_eq!(partial[0].tick_id(), ec3.tick_id());
 }
 
+/// One substate commit for `seed`: the cell [`make_settled_writes`]
+/// seeds, at the store's next height.
+pub fn commit_one(storage: &impl TestStore, seed: u8) {
+    commit_writes(
+        storage,
+        &make_settled_writes(seed, seed, vec![seed, seed, seed]),
+    );
+}
+
 /// Shared boundary retention test: pin one height past
 /// [`BOUNDARY_RETAIN`] and check eviction stops serving only the
 /// oldest pin.
 ///
-/// `commit_one` performs one backend-native substate commit for the
-/// given seed — backends differ in their raw commit entry points.
-///
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-pub fn test_boundary_retention_evicts_oldest<S: BoundaryStore>(
-    storage: &S,
-    commit_one: impl Fn(u8),
-) {
+pub fn test_boundary_retention_evicts_oldest<S: BoundaryStore + TestStore>(storage: &S) {
     let last = u64::try_from(BOUNDARY_RETAIN).expect("small const") + 1;
     for height in 1..=last {
-        commit_one(u8::try_from(height).expect("small loop bound"));
+        commit_one(storage, u8::try_from(height).expect("small loop bound"));
         storage.pin_boundary(BlockHeight::new(height)).unwrap();
     }
     assert!(storage.open_boundary(BlockHeight::new(1)).is_none());
@@ -971,11 +1050,8 @@ pub fn test_boundary_retention_evicts_oldest<S: BoundaryStore>(
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-pub fn test_boundary_unpinned_height_not_served<S: BoundaryStore>(
-    storage: &S,
-    commit_one: impl Fn(u8),
-) {
-    commit_one(1);
+pub fn test_boundary_unpinned_height_not_served<S: BoundaryStore + TestStore>(storage: &S) {
+    commit_one(storage, 1);
     assert!(storage.open_boundary(BlockHeight::new(1)).is_none());
 }
 
@@ -989,10 +1065,10 @@ pub fn test_boundary_unpinned_height_not_served<S: BoundaryStore>(
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-pub fn test_entries_commit_serve_and_history<S: VersionedStore>(
-    storage: &S,
-    commit: impl Fn(&SettledWrites),
-) {
+pub fn test_entries_commit_serve_and_history<S: VersionedStore + TestStore>(storage: &S) {
+    let commit = |writes: &SettledWrites| {
+        commit_writes(storage, writes);
+    };
     commit(&make_settled_entries(
         7,
         &[
@@ -1062,11 +1138,14 @@ pub fn test_entries_commit_serve_and_history<S: VersionedStore>(
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-pub fn test_sweep_index_tracks_the_leaves<S>(storage: &S, commit: impl Fn(&SettledWrites))
+pub fn test_sweep_index_tracks_the_leaves<S>(storage: &S)
 where
-    S: SubstateStore + SweepIndex,
+    S: TestStore + SweepIndex,
 {
     install_stub_protocol_statics();
+    let commit = |writes: &SettledWrites| {
+        commit_writes(storage, writes);
+    };
     let bucket_ms = SWEEP_BUCKET_MS;
     // Three cells across two buckets under two owners, so the walk has
     // to order by bucket before owner — the property a leaf-key walk
@@ -1141,11 +1220,14 @@ where
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-pub fn test_sweep_stops_at_the_ceiling_or_the_cap<S>(storage: &S, commit: impl Fn(&SettledWrites))
+pub fn test_sweep_stops_at_the_ceiling_or_the_cap<S>(storage: &S)
 where
-    S: SubstateStore + SweepIndex,
+    S: TestStore + SweepIndex,
 {
     install_stub_protocol_statics();
+    let commit = |writes: &SettledWrites| {
+        commit_writes(storage, writes);
+    };
     // Two cells a bucket apart, both long past a clock well above them.
     let cells: Vec<(SubstateKey, u64)> = [(3u64, 0x11u8), (5, 0x22)]
         .into_iter()
@@ -1264,11 +1346,14 @@ where
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-pub fn test_escrow_records_are_read_off_the_state<S>(storage: &S, commit: impl Fn(&SettledWrites))
+pub fn test_escrow_records_are_read_off_the_state<S>(storage: &S)
 where
-    S: BoundaryStore,
+    S: BoundaryStore + TestStore,
 {
     install_stub_protocol_statics();
+    let commit = |writes: &SettledWrites| {
+        commit_writes(storage, writes);
+    };
     assert!(
         storage.escrow_records().is_empty(),
         "a store holding nothing owes nothing",
@@ -1308,19 +1393,19 @@ where
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-pub fn test_boundary_import_roundtrip<S>(serving: &S, fresh: &S, commit: impl Fn(&SettledWrites))
+pub fn test_boundary_import_roundtrip<S>(serving: &S, fresh: &S)
 where
-    S: BoundaryStore + SubstateStore,
+    S: BoundaryStore + TestStore,
 {
     for seed in 1..=5u8 {
-        commit(&make_settled_writes(seed, seed, vec![seed, seed, seed]));
+        commit_one(serving, seed);
     }
     // The sixth commit is two ordered-collection entries, so the round
     // trip covers entry leaves and the index rebuild beside the cells.
-    commit(&make_settled_entries(
-        7,
-        &[(5, Some(vec![5])), (10, Some(vec![10]))],
-    ));
+    commit_writes(
+        serving,
+        &make_settled_entries(7, &[(5, Some(vec![5])), (10, Some(vec![10]))]),
+    );
     let source_root = serving.state_root();
     serving.pin_boundary(BlockHeight::new(6)).unwrap();
 
@@ -2243,4 +2328,471 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
         None,
         "the reclaim's finalization decides it and releases the floor",
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Backend conformance: what both stores answer identically
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A fresh store holds nothing: no tree, no chain, no block.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_fresh_store_holds_nothing<S: TestStore + ShardChainReader>(storage: &S) {
+    assert_eq!(storage.jmt_height(), BlockHeight::GENESIS);
+    assert_eq!(storage.state_root(), StateRoot::ZERO);
+    assert_eq!(storage.committed_height(), BlockHeight::GENESIS);
+    assert!(storage.committed_hash().is_none());
+    assert!(storage.latest_qc().is_none());
+    assert!(storage.get_block(BlockHeight::new(999)).is_none());
+    assert!(
+        storage
+            .get_transactions_batch(&[TxHash::from(Hash::from_bytes(&[1; 32]))])
+            .is_empty()
+    );
+}
+
+/// A committed cell reads back, and a snapshot keeps reading the version
+/// it was taken at while the store moves on.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version(storage: &impl TestStore) {
+    let key = state_key(3, 10);
+    assert!(storage.cell(key).is_none());
+    commit_writes(storage, &make_settled_writes(3, 10, vec![1]));
+    assert_eq!(storage.cell(key), Some(vec![1]));
+
+    let snapshot = storage.snapshot();
+    commit_writes(storage, &make_settled_writes(3, 10, vec![2]));
+    assert_eq!(
+        snapshot.cell(key),
+        Some(vec![1]),
+        "the snapshot is its version"
+    );
+    assert_eq!(storage.cell(key), Some(vec![2]));
+}
+
+/// Every commit advances the version — an empty one too — and one that
+/// writes something moves the root.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_commits_advance_the_version_and_writes_move_the_root(storage: &impl TestStore) {
+    let root0 = storage.state_root();
+    commit_writes(storage, &make_settled_writes(1, 10, vec![1]));
+    let root1 = storage.state_root();
+    assert_eq!(storage.jmt_height(), BlockHeight::new(1));
+    assert_ne!(root0, root1, "the first write moves the root");
+
+    commit_writes(storage, &make_settled_writes(4, 20, vec![2]));
+    let root2 = storage.state_root();
+    assert_eq!(storage.jmt_height(), BlockHeight::new(2));
+    assert_ne!(root1, root2, "the second write moves it again");
+
+    commit_writes(storage, &SettledWrites::default());
+    assert_eq!(
+        storage.jmt_height(),
+        BlockHeight::new(3),
+        "an empty commit still advances the version"
+    );
+    assert_eq!(
+        storage.state_root(),
+        root2,
+        "and leaves the root where it was"
+    );
+}
+
+/// The root is a function of the writes: two stores committing the same
+/// writes agree, and different writes disagree.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_the_root_is_a_function_of_the_writes<S: TestStore>(fresh: impl Fn() -> S) {
+    let (same_a, same_b, other) = (fresh(), fresh(), fresh());
+    let writes = make_settled_writes(1, 10, vec![42]);
+    commit_writes(&same_a, &writes);
+    commit_writes(&same_b, &writes);
+    assert_eq!(same_a.state_root(), same_b.state_root());
+    assert_eq!(same_a.jmt_height(), same_b.jmt_height());
+
+    commit_writes(&other, &make_settled_writes(1, 10, vec![43]));
+    assert_ne!(same_a.state_root(), other.state_root());
+}
+
+/// A committed block reads back by height and for sync, with the header
+/// and certificate it carried.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_committed_block_reads_back<S: TestStore + ShardChainReader>(storage: &S) {
+    let block = make_test_block(BlockHeight::new(1));
+    assert!(storage.get_block(BlockHeight::new(1)).is_none());
+    commit_settled_at(
+        storage,
+        &make_test_certified(block.clone()),
+        &[],
+        &[],
+        &empty_witness(),
+    );
+
+    let stored = storage.get_block(BlockHeight::new(1)).expect("committed");
+    assert_eq!(stored.block().height(), BlockHeight::new(1));
+    assert_eq!(
+        stored.block().header().timestamp(),
+        ProposerTimestamp::from_millis(1_000)
+    );
+    assert_eq!(stored.qc().block_hash(), block.hash());
+
+    let for_sync = storage
+        .get_block_for_sync(BlockHeight::new(1))
+        .expect("served");
+    assert_eq!(for_sync.block.height(), BlockHeight::new(1));
+    assert!(storage.get_block_for_sync(BlockHeight::new(999)).is_none());
+}
+
+/// The receipts a block's ticks settled reach state — one receipt, two,
+/// or none.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_committed_receipts_reach_state(storage: &impl TestStore) {
+    let root = commit_writes(storage, &make_settled_writes(1, 10, vec![42]));
+    assert_ne!(root, StateRoot::ZERO);
+    assert_eq!(storage.cell(state_key(1, 10)), Some(vec![42]));
+
+    let merged = union_of(&[
+        make_settled_writes(2, 20, vec![1]),
+        make_settled_writes(3, 30, vec![2]),
+    ]);
+    commit_writes(storage, &merged);
+    assert_eq!(storage.cell(state_key(2, 20)), Some(vec![1]));
+    assert_eq!(storage.cell(state_key(3, 30)), Some(vec![2]));
+
+    commit_writes(storage, &SettledWrites::default());
+    assert_eq!(storage.jmt_height(), BlockHeight::new(3));
+}
+
+/// The per-version substate byte total: inserts raise it, value updates
+/// leave it, deletes lower it, and every version's total stays
+/// readable.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_substate_bytes_track_commits<S: TestStore + VersionedStore>(storage: &S) {
+    commit_writes(
+        storage,
+        &union_of(&[
+            make_settled_writes(3, 7, vec![1]),
+            make_settled_writes(4, 8, vec![2]),
+        ]),
+    );
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(1)), Some(2));
+
+    commit_writes(storage, &make_settled_writes(3, 7, vec![9]));
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(2)), Some(2));
+
+    commit_writes(storage, &make_state_delete(3, 7));
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(3)), Some(1));
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(1)), Some(2));
+    assert_eq!(storage.substate_bytes_at(BlockHeight::new(4)), None);
+}
+
+/// History walk-through: a key created at V1, deleted at V2, recreated
+/// at V3 reads back correctly at every version — the "smallest history
+/// entry after V" rule end to end.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_history_reads_through_create_delete_create<S: TestStore + VersionedStore>(storage: &S) {
+    let key = state_key(7, 42);
+    // A second key stays alive throughout so the tree never empties out;
+    // the history behaviour under test is independent of it.
+    let anchor = make_settled_writes(99, 0xFF, vec![0xFF]);
+    commit_writes(
+        storage,
+        &union_of(&[make_settled_writes(7, 42, vec![0xAA]), anchor]),
+    );
+    commit_writes(storage, &make_state_delete(7, 42));
+    commit_writes(storage, &make_settled_writes(7, 42, vec![0xBB]));
+
+    let expected: &[(u64, Option<Vec<u8>>)] = &[
+        (0, None),
+        (1, Some(vec![0xAA])),
+        (2, None),
+        (3, Some(vec![0xBB])),
+    ];
+    for (version, want) in expected {
+        let got = storage.snapshot_at(BlockHeight::new(*version)).cell(key);
+        assert_eq!(&got, want, "history read at V={version}");
+    }
+}
+
+/// A historical read answers the value at that version, `Some(None)`
+/// for a cell absent there, and `None` for a height the store does not
+/// hold.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_historical_reads_resolve_per_version(storage: &impl TestStore) {
+    let key = state_key(1, 10);
+    let root_v1 = commit_writes(storage, &make_settled_writes(1, 10, vec![100]));
+    let root_v2 = commit_writes(storage, &make_settled_writes(1, 10, vec![200]));
+    assert_ne!(root_v1, root_v2);
+
+    assert_eq!(
+        storage.get_substate_at_height(key, BlockHeight::new(1)),
+        Some(Some(vec![100]))
+    );
+    assert_eq!(
+        storage.get_substate_at_height(key, BlockHeight::new(2)),
+        Some(Some(vec![200]))
+    );
+    assert_eq!(
+        storage.get_substate_at_height(state_key(99, 10), BlockHeight::new(1)),
+        Some(None),
+        "an unwritten cell reads as absent, not as an unavailable height",
+    );
+    assert!(
+        storage
+            .get_substate_at_height(key, BlockHeight::new(99))
+            .is_none(),
+        "a future height is unavailable",
+    );
+}
+
+/// Ten empty commits paced two to the horizon, so the tip at 10 floors
+/// at 8; then `snapshot_at(1)`, which the backend's test expects to
+/// panic — the DA-assumption guard for internal callers.
+///
+/// # Panics
+///
+/// Always: that is what the caller asserts.
+pub fn test_snapshot_at_below_the_floor_panics<S: TestStore + VersionedStore>(storage: &S) {
+    for height in 1..=10u64 {
+        commit_writes_at(storage, &SettledWrites::default(), paced(height, 2));
+    }
+    let _snapshot = storage.snapshot_at(BlockHeight::new(1));
+}
+
+/// A historical read of a height outside retention answers `None`
+/// rather than panicking: the external-facing spelling.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_historical_reads_respect_retention(storage: &impl TestStore) {
+    let key = SubstateKey {
+        owner: Address::new([9u8; 31], AddressClass::Component),
+        local: LocalKey([1u8; 16]),
+    };
+    for height in 1..=10u64 {
+        let value = vec![u8::try_from(height).expect("small fixture")];
+        commit_writes_at(
+            storage,
+            &SettledWrites::from_absolutes(BTreeMap::from([(key, Some(value))])),
+            paced(height, 2),
+        );
+    }
+    // Two blocks fit the horizon, so a tip at 10 floors at 8.
+    assert_eq!(
+        storage.get_substate_at_height(key, BlockHeight::new(9)),
+        Some(Some(vec![9])),
+        "a height within retention is served",
+    );
+    assert!(
+        storage
+            .get_substate_at_height(key, BlockHeight::new(1))
+            .is_none(),
+        "a height below the floor is not",
+    );
+    assert!(
+        storage
+            .get_substate_at_height(key, BlockHeight::new(99))
+            .is_none(),
+        "nor is one above the tip",
+    );
+}
+
+/// Witness retention follows the commit-carried floor with one window
+/// of hysteresis, and recovery rebuilds the accumulator window from the
+/// tip header's base — entries below it are serving stock only.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_witness_window_retention_and_recovery<S: TestStore + ShardChainReader>(
+    storage: &S,
+    recovered: impl Fn() -> RecoveredState,
+) {
+    let deposits: Vec<_> = (0u64..6).map(stake_deposit).collect();
+
+    // Window [0, 4): all four leaves appended, nothing pruned.
+    commit_block_with_witness_window(
+        storage,
+        BlockHeight::new(1),
+        0,
+        &deposits[0..4],
+        &deposits[0..4],
+        None,
+    );
+    // Window [2, 6): the tail appends, persisted floor untouched.
+    commit_block_with_witness_window(
+        storage,
+        BlockHeight::new(2),
+        2,
+        &deposits[2..6],
+        &deposits[4..6],
+        None,
+    );
+    // Window [4, 6): the base advance carries the previous window's
+    // base as the persisted floor — leaves below 2 drop, [2, 4) stays
+    // as hysteresis stock.
+    commit_block_with_witness_window(
+        storage,
+        BlockHeight::new(3),
+        4,
+        &deposits[4..6],
+        &[],
+        Some(BeaconWitnessLeafCount::new(2)),
+    );
+
+    // A read spanning the dropped range comes back short; the retained
+    // hysteresis range answers in full.
+    assert_eq!(storage.get_beacon_witness_payload_range(0, 6).len(), 4);
+    assert_eq!(
+        storage.get_beacon_witness_payload_range(2, 6),
+        deposits[2..6].to_vec(),
+    );
+
+    // Recovery starts the accumulator window at the tip's base.
+    let recovered = recovered();
+    assert_eq!(
+        recovered.beacon_witness_start,
+        BeaconWitnessLeafCount::new(4)
+    );
+    let expected: Vec<_> = deposits[4..6]
+        .iter()
+        .map(ShardWitnessPayload::leaf_hash)
+        .collect();
+    assert_eq!(recovered.beacon_witness_leaf_hashes, expected);
+}
+
+/// Safe-vote registers locked at `locked`, last voted at `last_voted`,
+/// with no justification.
+#[must_use]
+pub const fn registers(locked: u64, last_voted: u64) -> SafeVoteRegisters {
+    SafeVoteRegisters {
+        locked_round: Round::new(locked),
+        last_voted_round: Round::new(last_voted),
+        high_qc: None,
+    }
+}
+
+/// A signing position carrying `r` and one justification block — a
+/// vote's shape, so a test over the record covers the blocks written
+/// beside it too.
+#[must_use]
+pub fn position(r: SafeVoteRegisters) -> VotePosition {
+    VotePosition {
+        registers: r,
+        justification: vec![Arc::new(make_test_block(BlockHeight::new(4)))],
+    }
+}
+
+/// Register writes merge field-wise max, so a lower or mixed write can
+/// never regress either register, and recovery hands the merge back.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_registers_are_monotone_and_recoverable(
+    storage: &impl SafeVoteRegisterStore,
+    recovered: impl Fn() -> RecoveredState,
+) {
+    let validator = ValidatorId::new(1);
+    storage.persist_vote_position(validator, &position(registers(4, 6)));
+    storage.persist_vote_position(validator, &position(registers(2, 9)));
+    assert_eq!(
+        storage.safe_vote_registers(validator),
+        Some(registers(4, 9))
+    );
+    assert_eq!(
+        recovered().safe_vote_registers.get(&validator),
+        Some(&registers(4, 9))
+    );
+}
+
+/// A record written under a different chain origin is invisible to
+/// reads and recovery.
+///
+/// A checkpoint-seeded child store inherits the parent's records but
+/// must not apply them to the child chain's unrelated round numbering.
+/// The next write starts a fresh record under the new origin.
+/// `set_origin` moves the store's recorded origin the way the backend
+/// records one.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_registers_ignore_a_stale_chain_incarnation(
+    storage: &impl SafeVoteRegisterStore,
+    set_origin: impl Fn(ChainOrigin),
+    recovered: impl Fn() -> RecoveredState,
+) {
+    let validator = ValidatorId::new(1);
+    storage.persist_vote_position(validator, &position(registers(8, 8)));
+    set_origin(ChainOrigin {
+        genesis_height: BlockHeight::new(11),
+        anchor_wt: WeightedTimestamp::from_millis(999),
+    });
+
+    assert_eq!(storage.safe_vote_registers(validator), None);
+    let recovered = recovered();
+    assert!(recovered.safe_vote_registers.is_empty());
+    assert!(
+        recovered.voted_blocks.is_empty(),
+        "a block justifying a lock on another chain justifies nothing here",
+    );
+
+    storage.persist_vote_position(validator, &position(registers(1, 2)));
+    assert_eq!(
+        storage.safe_vote_registers(validator),
+        Some(registers(1, 2))
+    );
+    assert_eq!(storage.voted_blocks_above(BlockHeight::new(3)).len(), 1);
+}
+
+/// A committed cell that self-identifies as a package lands in the
+/// artifact index; an ordinary cell beside it does not.
+///
+/// The judgement is the installed statics', so the stub's marker stands
+/// in for a package. Returns the artifact, for a backend's own tail.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_package_cell_lands_in_the_artifact_index<S: TestStore + PackageArtifactStore>(
+    storage: &S,
+) -> Vec<u8> {
+    install_stub_protocol_statics();
+    let artifact = vec![7u8; 64];
+    let mut cells = BTreeMap::from([(state_key(1, STUB_PACKAGE_MARKER), Some(artifact.clone()))]);
+    cells.insert(state_key(1, 10), Some(vec![9, 9, 9]));
+    commit_writes(storage, &SettledWrites::from_absolutes(cells));
+    assert_eq!(
+        storage.package_artifacts(),
+        vec![artifact.clone()],
+        "the package-marked cell is indexed; the ordinary cell is not"
+    );
+    artifact
 }

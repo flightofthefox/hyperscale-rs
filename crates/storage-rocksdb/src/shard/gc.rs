@@ -261,7 +261,7 @@ mod tests {
 
     use hyperscale_jmt::NibblePath;
     use hyperscale_storage::Substates;
-    use hyperscale_storage::test_helpers::state_key;
+    use hyperscale_storage::test_helpers::{commit_writes_at, state_key};
     use hyperscale_types::{RETENTION_HORIZON, SettledWrites, WeightedTimestamp};
     use tempfile::TempDir;
 
@@ -290,14 +290,12 @@ mod tests {
             (key_a, Some(vec![0xAA])),
             (key_b, Some(vec![0xBB])),
         ]));
-        storage.commit_at(&writes, past(0)).unwrap();
+        commit_writes_at(&storage, &writes, past(0));
 
         // Carry the tip a horizon past the first commit with empty ones,
         // so the floor leaves version 1 behind.
         for step in 1..=4 {
-            storage
-                .commit_at(&SettledWrites::default(), past(step))
-                .unwrap();
+            commit_writes_at(&storage, &SettledWrites::default(), past(step));
         }
 
         storage.run_state_history_gc();

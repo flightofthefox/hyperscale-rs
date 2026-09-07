@@ -286,9 +286,10 @@ impl BoundaryStore for SimShardStorage {
 mod tests {
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{
-        block_settling, make_settled_writes, make_state_writes, test_boundary_import_roundtrip,
-        test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
-        test_escrow_records_are_read_off_the_state, test_import_gate_reads_the_trie,
+        block_settling, commit_one, commit_writes, make_settled_writes, make_state_writes,
+        test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
+        test_boundary_unpinned_height_not_served, test_escrow_records_are_read_off_the_state,
+        test_import_gate_reads_the_trie,
     };
     use hyperscale_storage::{SubstateStore, Substates, committed_tx_cell_key, committed_tx_cells};
     use hyperscale_types::test_utils::{
@@ -304,10 +305,6 @@ mod tests {
     use super::*;
 
     type Jmt = Tree<Blake3Hasher, 1>;
-
-    fn commit_one(storage: &SimShardStorage, seed: u8) {
-        storage.commit_shared(&make_settled_writes(seed, seed, vec![seed, seed, seed]));
-    }
 
     #[test]
     fn finalize_refuses_an_incomplete_assembly_bound_to_the_height() {
@@ -365,12 +362,12 @@ mod tests {
     fn boundary_leaf_reads_resolve_at_pinned_version() {
         let storage = SimShardStorage::default();
         let old = make_settled_writes(7, 7, vec![1]);
-        storage.commit_shared(&old);
+        commit_writes(&storage, &old);
         storage.pin_boundary(BlockHeight::new(1)).unwrap();
 
         // Overwrite the same substate at height 2.
         let new = make_settled_writes(7, 7, vec![2]);
-        storage.commit_shared(&new);
+        commit_writes(&storage, &new);
 
         let boundary = storage.open_boundary(BlockHeight::new(1)).expect("pinned");
         let root_key = boundary.get_root_key(1).expect("pinned root resolves");
@@ -392,13 +389,13 @@ mod tests {
     #[test]
     fn retention_evicts_oldest_pin() {
         let storage = SimShardStorage::default();
-        test_boundary_retention_evicts_oldest(&storage, |seed| commit_one(&storage, seed));
+        test_boundary_retention_evicts_oldest(&storage);
     }
 
     #[test]
     fn unpinned_height_is_not_served() {
         let storage = SimShardStorage::default();
-        test_boundary_unpinned_height_not_served(&storage, |seed| commit_one(&storage, seed));
+        test_boundary_unpinned_height_not_served(&storage);
     }
 
     /// Full serve → import round trip: leaves enumerated and resolved
@@ -408,7 +405,7 @@ mod tests {
     fn imported_boundary_state_reproduces_the_root() {
         let storage = SimShardStorage::default();
         let fresh = SimShardStorage::default();
-        test_boundary_import_roundtrip(&storage, &fresh, |writes| storage.commit_shared(writes));
+        test_boundary_import_roundtrip(&storage, &fresh);
     }
 
     /// A store answers for the escrow records its state holds, which is
@@ -416,9 +413,7 @@ mod tests {
     #[test]
     fn escrow_records_are_read_off_the_state() {
         let storage = SimShardStorage::default();
-        test_escrow_records_are_read_off_the_state(&storage, |writes| {
-            storage.commit_shared(writes);
-        });
+        test_escrow_records_are_read_off_the_state(&storage);
     }
 
     #[test]
@@ -474,7 +469,7 @@ mod tests {
         let mut counts = [0u64, 0];
         for (height, seed) in straddling_seeds() {
             let (writes, receipt) = follow_receipt(seed);
-            parent.commit_shared(&writes);
+            commit_writes(&parent, &writes);
             let height = BlockHeight::new(height);
             let receipts = [receipt];
 
