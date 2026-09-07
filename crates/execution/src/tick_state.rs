@@ -990,6 +990,18 @@ impl TickState {
             && legs.iter().all(|&tx_hash| self.is_covered(tx_hash))
     }
 
+    /// Whether the determined half is still owed here: the tick holds
+    /// members that await nobody but this shard, none of them settled by
+    /// a committed block, and their finalization has not been taken.
+    #[must_use]
+    pub fn determined_pending(&self) -> bool {
+        !self.determined_emitted
+            && self
+                .determined_members()
+                .iter()
+                .any(|tx_hash| self.seats.get(tx_hash).is_some_and(|seat| !seat.settled))
+    }
+
     /// Whether the determined half is out of the way — emitted, or never
     /// existed because the tick ran nothing but legs.
     fn determined_emitted_or_absent(&self) -> bool {

@@ -3440,11 +3440,34 @@ impl ExecutionCoordinator {
     /// certificate settles the writes that tick produced, and a later
     /// tick executed against the earlier one's output. `TickId` sorts by
     /// `(shard, height)`, so iterating the store is already the order
-    /// receipts have to be applied in — there is nothing to sort and
-    /// nothing to hold back.
+    /// receipts have to be applied in.
+    ///
+    /// A determined half above a tick whose own determined half is still
+    /// owed is held back. Admission refuses a determined half at or below
+    /// the frontier the chain has reached, and a certificate can lag its
+    /// tick — the tick leader's aggregation fails and the vote rotates —
+    /// so offering the later half first would carry the frontier past
+    /// the earlier tick and refuse its half for good. A half the store
+    /// already holds, built here or fetched, is not owed; legs halves
+    /// are not held at all, since admission does not judge their order.
     #[must_use]
     pub fn get_finalizations(&self) -> Vec<Arc<Verifiable<Finalization>>> {
-        self.finalized.all()
+        let floor = self
+            .ticks
+            .ticks_iter()
+            .filter(|(tick_id, tick)| {
+                tick.determined_pending() && !self.finalized.holds_determined(tick_id)
+            })
+            .map(|(tick_id, _)| tick_id.block_height())
+            .min();
+        self.finalized
+            .all()
+            .into_iter()
+            .filter(|fw| {
+                let fw = fw.as_unverified();
+                !fw.is_determined() || floor.is_none_or(|floor| fw.tick_id().block_height() < floor)
+            })
+            .collect()
     }
 
     /// Whether provisions from `shard` have been absorbed for `tx_hash` —
@@ -5872,7 +5895,12 @@ mod tests {
     /// has an execution result and a local receipt, and the local EC has
     /// been added. `TickState::is_complete` returns true.
     fn make_ready_local_tick(tx_seeds: &[u8]) -> (TickId, TickState) {
-        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+        make_ready_local_tick_at(BlockHeight::new(1), tx_seeds)
+    }
+
+    /// [`make_ready_local_tick`] at a chosen tick height.
+    fn make_ready_local_tick_at(height: BlockHeight, tx_seeds: &[u8]) -> (TickId, TickState) {
+        let tick_id = TickId::new(ShardId::ROOT, height);
         let txs: Vec<(Arc<Verified<Transaction>>, BTreeSet<ShardId>)> = tx_seeds
             .iter()
             .map(|s| {
@@ -5960,6 +5988,49 @@ mod tests {
                 .is_some_and(TickState::has_spoken),
             "a purely local tick has nothing left to say",
         );
+    }
+
+    /// A determined half is offered only once every earlier tick's
+    /// determined half has been taken: offered first, it would carry the
+    /// settlement frontier past the earlier tick, and admission would
+    /// refuse that tick's half for good once its late certificate lands.
+    #[test]
+    fn get_finalizations_holds_a_determined_half_behind_an_owed_one() {
+        let mut state = make_test_state();
+        let topo = make_test_topology();
+        let owed_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+        let owed_tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(7)));
+        // Executed, its certificate still owed.
+        state.ticks.insert_tick(
+            owed_id,
+            tick_holding(
+                owed_id,
+                WeightedTimestamp::from_millis(1_000),
+                vec![(owed_tx, BTreeSet::from([ShardId::ROOT]))],
+            ),
+        );
+        let (later_id, later) = make_ready_local_tick_at(BlockHeight::new(2), &[1, 2]);
+        state.ticks.insert_tick(later_id, later);
+        let _actions = state.finalize(&topo, &later_id);
+        assert!(state.finalized.contains(&later_id));
+
+        assert!(
+            state.get_finalizations().is_empty(),
+            "the later tick's determined half waits behind the owed one",
+        );
+
+        // The late certificate arrives and the owed half is taken.
+        state.ticks.remove_tick(&owed_id);
+        let (owed_id, owed) = make_ready_local_tick_at(BlockHeight::new(1), &[7]);
+        state.ticks.insert_tick(owed_id, owed);
+        let _actions = state.finalize(&topo, &owed_id);
+
+        let offered: Vec<BlockHeight> = state
+            .get_finalizations()
+            .iter()
+            .map(|fw| fw.as_unverified().tick_id().block_height())
+            .collect();
+        assert_eq!(offered, vec![BlockHeight::new(1), BlockHeight::new(2)]);
     }
 
     #[test]
