@@ -127,16 +127,26 @@ pub trait SubstateStore: Substates + Send + Sync + 'static {
 /// value directly — callers that need overlay coverage above the
 /// persisted tip must go through a [`crate::pending_chain::SubstateView`].
 ///
-/// # Panics
-///
-/// `snapshot_at(V)` panics if `V` is below the retention floor
-/// (saturating). This is an internal DA-assumption check — below the
-/// retention floor, the history log has been GC'd and historical reads
-/// can't be served correctly. External-facing APIs that accept
-/// network-supplied versions must check retention themselves and
-/// return `None` for out-of-range heights rather than calling through.
+/// Two spellings of one read. [`Self::snapshot_held_at`] answers `None`
+/// for a height the store does not hold, and is what every reader of a
+/// network-supplied height goes through; [`Self::snapshot_at`] panics
+/// below the floor, for internal callers whose anchor is licensed by
+/// construction — below the retention floor the history log has been
+/// collected, and an internal caller asking there is a DA-assumption
+/// bug, not a case to degrade through.
 pub trait VersionedStore: SubstateStore {
-    /// Create a snapshot anchored at the given historical block height.
+    /// The snapshot at `height`, or `None` when this store does not hold
+    /// that height: above its tip, or below its retention floor. Tip and
+    /// floor are read together, so the answer is one store's at one
+    /// instant.
+    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>>;
+
+    /// Create a snapshot anchored at `height`, which must be at or above
+    /// the retention floor; above the tip the snapshot reads the tip.
+    ///
+    /// # Panics
+    ///
+    /// If `height` is below the retention floor.
     fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_>;
 
     /// Committed substate byte total after the commit at `height`,

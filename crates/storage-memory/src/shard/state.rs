@@ -6,13 +6,15 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
-use hyperscale_storage::{JmtSnapshot, LeafRows, SweepRows, entry_leaf_rows, sweepable_expiry};
+use hyperscale_storage::{
+    JmtSnapshot, LeafRows, SweepRows, entry_leaf_rows, retire_dated, sweepable_expiry,
+};
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, EntryKey,
     ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash,
-    Provisions, QuorumCertificate, RETENTION_HORIZON, SafeVoteRegisters, SettledWrites,
-    ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, TickId, Transaction, TxHash,
-    ValidatorId, WeightedTimestamp,
+    Provisions, QuorumCertificate, SafeVoteRegisters, SettledWrites, ShardWitnessPayload,
+    StateRoot, StoredReceipt, SubstateKey, TickId, Transaction, TxHash, ValidatorId,
+    WeightedTimestamp,
 };
 
 use super::tree_store::SimTreeStore;
@@ -45,13 +47,8 @@ pub struct SharedState {
     /// Per-write prior-value entries for the entry index, mirroring
     /// `state_history` row for row.
     pub entries_history: BTreeMap<(EntryKey, u64), Option<Vec<u8>>>,
-    /// Each version's weighted timestamp, and the oldest version still
-    /// inside [`RETENTION_HORIZON`] of the tip. The floor moves only past
-    /// what it retires, which is what the `RocksDB` backend's collectors
-    /// do — the two stores answer one contract, so they derive the edge
-    /// one way.
-    ///
-    /// [`RETENTION_HORIZON`]: hyperscale_types::RETENTION_HORIZON
+    /// Each version's weighted timestamp, from the floor on; what
+    /// [`retire_dated`] reads.
     pub version_time: BTreeMap<u64, u64>,
     /// The oldest version historical reads are answered at.
     pub retention_floor: u64,
@@ -72,32 +69,27 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    /// Date `version` and move the floor past what falls outside
-    /// [`RETENTION_HORIZON`] of `tip_ts`.
-    ///
-    /// Returns the floor this commit establishes. The floor moves only
-    /// past what it retires, so a version with no date of its own — the
-    /// empty tree at zero — stays readable.
-    ///
-    /// [`RETENTION_HORIZON`]: hyperscale_types::RETENTION_HORIZON
+    /// Date `version` and move the floor past what that retires
+    /// ([`retire_dated`]). Returns the floor this commit establishes.
     pub(crate) fn advance_retention_floor(
         &mut self,
         version: u64,
         tip_ts: WeightedTimestamp,
     ) -> u64 {
         self.version_time.insert(version, tip_ts.as_millis());
-        let cutoff = tip_ts.minus(RETENTION_HORIZON).as_millis();
-        let retire: Vec<u64> = self
-            .version_time
-            .range(self.retention_floor..version)
-            .take_while(|(_, ts)| **ts < cutoff)
-            .map(|(dated, _)| *dated)
-            .collect();
-        for dated in retire {
-            self.version_time.remove(&dated);
-            self.retention_floor = dated + 1;
+        let retired = retire_dated(
+            self.retention_floor,
+            version,
+            tip_ts,
+            self.version_time
+                .range(self.retention_floor..)
+                .map(|(dated, ts)| (*dated, *ts)),
+        );
+        for dated in &retired.versions {
+            self.version_time.remove(dated);
         }
-        self.retention_floor
+        self.retention_floor = retired.floor;
+        retired.floor
     }
 
     pub(crate) fn new() -> Self {

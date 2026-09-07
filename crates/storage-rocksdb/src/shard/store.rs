@@ -5,7 +5,8 @@ use std::time::Instant;
 use hex::encode as hex_encode;
 use hyperscale_metrics::{record_storage_operation, record_storage_write};
 use hyperscale_storage::{
-    JmtSnapshot, PackageArtifactStore, SubstateStore, SweepIndex, SweepRows, VersionedStore,
+    JmtSnapshot, PackageArtifactStore, SubstateStore, Substates, SweepIndex, SweepRows,
+    VersionedStore,
 };
 use hyperscale_types::{
     Block, BlockHeight, DeclaredRange, Hash, QuorumCertificate, StateRoot, SubstateKey,
@@ -54,22 +55,7 @@ impl SubstateStore for RocksDbShardStorage {
         key: SubstateKey,
         block_height: BlockHeight,
     ) -> Option<Option<Vec<u8>>> {
-        use hyperscale_storage::Substates;
-        let snapshot = self.db.snapshot();
-        let (current_version, _) = read_jmt_metadata(&snapshot);
-        if block_height.inner() > current_version {
-            return None;
-        }
-        if block_height.inner() < retention_floor(&snapshot) {
-            return None;
-        }
-        let snap = RocksDbSnapshot {
-            snapshot,
-            db: &self.db,
-            version: block_height.inner(),
-            current_version,
-        };
-        Some(snap.cell(key))
+        Some(self.snapshot_held_at(block_height)?.cell(key))
     }
 
     fn get_entries_at_height(
@@ -77,22 +63,7 @@ impl SubstateStore for RocksDbShardStorage {
         range: DeclaredRange,
         block_height: BlockHeight,
     ) -> Option<Vec<(u128, Vec<u8>)>> {
-        use hyperscale_storage::Substates;
-        let snapshot = self.db.snapshot();
-        let (current_version, _) = read_jmt_metadata(&snapshot);
-        if block_height.inner() > current_version {
-            return None;
-        }
-        if block_height.inner() < retention_floor(&snapshot) {
-            return None;
-        }
-        let snap = RocksDbSnapshot {
-            snapshot,
-            db: &self.db,
-            version: block_height.inner(),
-            current_version,
-        };
-        Some(snap.entries_in_range(
+        Some(self.snapshot_held_at(block_height)?.entries_in_range(
             range.owner,
             range.collection,
             range.lo,
@@ -103,22 +74,29 @@ impl SubstateStore for RocksDbShardStorage {
 }
 
 impl VersionedStore for RocksDbShardStorage {
-    fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
-        // Take the DB snapshot FIRST, then read metadata THROUGH it.
-        // Reading metadata from the live DB and then taking the snapshot
-        // races with concurrent commits: a commit between the two reads
-        // leaves `current_version` stale relative to the snapshot's LSN.
-        // If `version == stale_current_version`, the trivial branch fires
-        // and returns post-commit StateCf values — a torn read.
-        // Capturing both from the same snapshot gives one consistent view.
+    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+        // Take the DB snapshot FIRST, then read the tip and the floor
+        // THROUGH it. Reading either from the live DB and then taking the
+        // snapshot races with concurrent commits: a commit between the
+        // two reads leaves `current_version` stale relative to the
+        // snapshot's LSN, and a reader told a version is retained by one
+        // and gone by the other. Capturing everything from the one
+        // snapshot gives one consistent view.
         let snapshot = self.db.snapshot();
         let (current_version, _) = read_jmt_metadata(&snapshot);
+        let held =
+            height.inner() <= current_version && height.inner() >= retention_floor(&snapshot);
+        held.then(|| RocksDbSnapshot {
+            snapshot,
+            db: &self.db,
+            version: height.inner(),
+            current_version,
+        })
+    }
 
-        // Below the floor there is no history left to reconstruct from.
-        // An internal DA-assumption check — external APIs taking a
-        // network-supplied version (`list_substates_for_node_at_height`,
-        // say) check retention themselves and answer `None` rather than
-        // calling through here.
+    fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
+        let snapshot = self.db.snapshot();
+        let (current_version, _) = read_jmt_metadata(&snapshot);
         let floor = retention_floor(&snapshot);
         assert!(
             height.inner() >= floor,

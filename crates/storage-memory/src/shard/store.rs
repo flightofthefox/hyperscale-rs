@@ -13,6 +13,7 @@ use hyperscale_types::{
 
 use super::core::SimShardStorage;
 use super::snapshot::SimSnapshot;
+use super::state::SharedState;
 
 impl SubstateStore for SimShardStorage {
     type Snapshot<'a> = SimSnapshot;
@@ -36,15 +37,7 @@ impl SubstateStore for SimShardStorage {
         key: SubstateKey,
         block_height: BlockHeight,
     ) -> Option<Option<Vec<u8>>> {
-        use hyperscale_storage::Substates;
-        let guard = read_or_recover(&self.state);
-        let current_version = guard.current_block_height.inner();
-        let floor = guard.retention_floor;
-        drop(guard);
-        if block_height.inner() > current_version || block_height.inner() < floor {
-            return None;
-        }
-        Some(self.snapshot_at(block_height).cell(key))
+        Some(self.snapshot_held_at(block_height)?.cell(key))
     }
 
     fn get_entries_at_height(
@@ -52,14 +45,7 @@ impl SubstateStore for SimShardStorage {
         range: DeclaredRange,
         block_height: BlockHeight,
     ) -> Option<Vec<(u128, Vec<u8>)>> {
-        let guard = read_or_recover(&self.state);
-        let current_version = guard.current_block_height.inner();
-        let floor = guard.retention_floor;
-        drop(guard);
-        if block_height.inner() > current_version || block_height.inner() < floor {
-            return None;
-        }
-        Some(self.snapshot_at(block_height).entries_in_range(
+        Some(self.snapshot_held_at(block_height)?.entries_in_range(
             range.owner,
             range.collection,
             range.lo,
@@ -69,35 +55,45 @@ impl SubstateStore for SimShardStorage {
     }
 }
 
+/// A point-in-time copy of `state` reading at `version`. Memory
+/// snapshots are copies — they do not observe later mutations of the
+/// backing store.
+fn snapshot_of(state: &SharedState, version: u64) -> SimSnapshot {
+    SimSnapshot {
+        current_state: state.current_state.clone(),
+        state_history: state.state_history.clone(),
+        current_entries: state.current_entries.clone(),
+        entries_history: state.entries_history.clone(),
+        version,
+        current_version: state.current_block_height.inner(),
+    }
+}
+
 impl VersionedStore for SimShardStorage {
     fn retention_floor(&self) -> u64 {
         Self::retention_floor(self)
     }
 
+    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+        let state = read_or_recover(&self.state);
+        let held = height <= state.current_block_height && height.inner() >= state.retention_floor;
+        let snapshot = held.then(|| snapshot_of(&state, height.inner()));
+        drop(state);
+        snapshot
+    }
+
     fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
-        // Retention invariant: see `RocksDbShardStorage::snapshot_at` for the
-        // full reasoning. Below the floor we can't serve historical
-        // reads; hitting this is a DA-assumption bug in the caller.
-        let guard = read_or_recover(&self.state);
-        let current_version = guard.current_block_height.inner();
-        let floor = guard.retention_floor;
+        let state = read_or_recover(&self.state);
+        let (floor, tip) = (state.retention_floor, state.current_block_height);
+        let snapshot = snapshot_of(&state, height.inner());
+        drop(state);
         assert!(
             height.inner() >= floor,
             "snapshot_at({height}) below retention floor {floor} \
-             (current_version={current_version}) — \
+             (current_version={tip}) — \
              Shard consensus + DA invariant broken; caller must anchor within retention",
         );
-        // Clone state + state-history for snapshot isolation. Memory
-        // snapshots are point-in-time copies — they don't observe later
-        // mutations of the backing store.
-        SimSnapshot {
-            current_state: guard.current_state.clone(),
-            state_history: guard.state_history.clone(),
-            current_entries: guard.current_entries.clone(),
-            entries_history: guard.entries_history.clone(),
-            version: height.inner(),
-            current_version,
-        }
+        snapshot
     }
 
     fn substate_bytes_at(&self, height: BlockHeight) -> Option<u64> {

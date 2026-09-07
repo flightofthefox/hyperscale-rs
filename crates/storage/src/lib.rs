@@ -53,6 +53,7 @@ pub use shard::pending_chain::{
     BaseReadCache, ChainEntry, PendingChain, SubstateView, TerminalWindow,
 };
 pub use shard::recovered_state::RecoveredState;
+pub use shard::retention::{Retired, retire_dated};
 pub use shard::store::{Anchored, SubstateStore, VersionedStore};
 pub use shard::sweep::{
     SweepIndex, SweepRow, SweepRows, block_settled_writes, committed_tx_cell_key,

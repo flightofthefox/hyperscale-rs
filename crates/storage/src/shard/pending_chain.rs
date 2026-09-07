@@ -1288,6 +1288,10 @@ mod tests {
             0
         }
 
+        fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+            (height <= self.persisted).then(|| self.snapshot_at(height))
+        }
+
         fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
             self.recorded_snapshot_at
                 .lock()

@@ -149,6 +149,10 @@ impl SubstateStore for SharedStorage {
 }
 
 impl VersionedStore for SharedStorage {
+    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+        self.0.snapshot_held_at(height)
+    }
+
     fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
         self.0.snapshot_at(height)
     }

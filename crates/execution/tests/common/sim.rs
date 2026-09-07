@@ -201,6 +201,10 @@ impl VersionedStore for StubBase {
         0
     }
 
+    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+        (height <= self.jmt_height()).then(|| self.snapshot_at(height))
+    }
+
     fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
         StubSnapshot(self.cells_at(height))
     }

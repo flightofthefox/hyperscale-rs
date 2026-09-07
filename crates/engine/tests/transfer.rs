@@ -175,6 +175,10 @@ impl VersionedStore for MapDb {
         0
     }
 
+    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+        (height <= self.jmt_height()).then(|| self.snapshot_at(height))
+    }
+
     fn snapshot_at(&self, _height: BlockHeight) -> Self::Snapshot<'_> {
         Self(self.0.clone())
     }
