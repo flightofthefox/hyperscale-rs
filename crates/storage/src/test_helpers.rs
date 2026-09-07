@@ -499,7 +499,8 @@ fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertifica
 
 /// Append a finalization to `block`'s certificate list, preserving
 /// the block variant.
-fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
+#[must_use]
+pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
     match block {
         Block::Live {
             header,

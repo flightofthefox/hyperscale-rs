@@ -158,7 +158,11 @@ impl DedupWindow {
             let deadline = finalization.local_ec().deadline();
             self.finalizations
                 .push((finalization.receipt_hash(), deadline));
-            for tx_hash in finalization.tx_hashes() {
+            // The names it *decided*, which is what the live index
+            // records. A leg's finalization names its transaction
+            // without resolving it, and the reclaim's finalization
+            // naming the hash later is the one neither may refuse.
+            for tx_hash in finalization.deciding_tx_hashes() {
                 self.resolved.push((tx_hash, deadline));
             }
         }

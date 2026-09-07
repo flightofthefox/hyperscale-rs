@@ -4,7 +4,7 @@ use std::sync::Arc;
 use hyperscale_storage::lock_recover::read_or_recover;
 use hyperscale_storage::test_helpers::{
     commit_settled_at, commit_writes, make_settled_writes, make_test_block,
-    make_test_block_with_anchor_wt, make_test_certified, make_test_qc, state_key,
+    make_test_block_with_anchor_wt, make_test_certified, make_test_qc, push_certificate, state_key,
     test_a_committed_block_reads_back,
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
     test_a_fresh_store_holds_nothing, test_a_package_cell_lands_in_the_artifact_index,
@@ -22,7 +22,8 @@ use hyperscale_storage::{
     VersionedStore, test_helpers,
 };
 use hyperscale_types::test_utils::{
-    install_stub_protocol_statics, stub_transaction, test_prefix, test_principal, test_transaction,
+    install_stub_protocol_statics, make_leg_finalization, stub_transaction, test_prefix,
+    test_principal, test_transaction,
 };
 use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
@@ -640,6 +641,50 @@ fn dedup_window_recovers_committed_txs_with_their_own_deadlines() {
                 .of(Deadline::of(WeightedTimestamp::from_millis(90_000)))
                 .end
         )],
+    );
+}
+
+/// The fold records the names a finalization *decided*, as the live
+/// index does.
+///
+/// A leg's finalization names its transaction without resolving it, and
+/// the reclaim's finalization naming it later is the one neither may
+/// refuse. A window that took the bare name would hold it for the
+/// retention span, so a restarted replica would refuse the reclaim — and
+/// every abandoning record naming it — while its peers admitted both.
+///
+/// The rebuild twin of `a_leg_finalization_does_not_resolve_its_transaction`.
+#[test]
+fn dedup_window_records_only_what_a_finalization_decided() {
+    let storage = SimShardStorage::default();
+    let tx = dedup_tx(1, 60_000);
+    let tx_hash = tx.hash();
+    let leg = Arc::new(Verifiable::from(make_leg_finalization(
+        BlockHeight::new(1),
+        tx_hash,
+    )));
+    let block = push_certificate(block_with_txs(BlockHeight::new(1), 1_000, vec![tx]), leg);
+    commit_empty(&storage, &block);
+
+    let window = DedupWindow::from_reader(
+        &storage,
+        BlockHeight::new(1),
+        WeightedTimestamp::from_millis(1_000),
+        ChainOrigin {
+            genesis_height: BlockHeight::new(1),
+            anchor_wt: WeightedTimestamp::ZERO,
+        },
+    );
+
+    assert!(
+        window.resolved.is_empty(),
+        "the leg's finalization decided nothing: {:?}",
+        window.resolved,
+    );
+    assert_eq!(
+        window.finalizations.len(),
+        1,
+        "while the certificate's own identity is recorded whatever it decided",
     );
 }
 
