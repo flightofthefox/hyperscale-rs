@@ -38,13 +38,18 @@ type CounterpartCell = (ShardId, SubstateKey, Probed);
 type HeardByQuestion =
     BTreeMap<(ShardId, Question), BTreeMap<(WeightedTimestamp, Word), Vec<UnsettledTx>>>;
 
-/// Every cell `entry` asks a counterpart about, under `trie`: one core
-/// shard's committed cell, each delivery's claim on the shard that was
-/// to deliver it and on whatever shard holds the cell's prefix now, and
-/// each core consumer's claim. The one enumeration the prober and the
-/// commit-time fold both read, so what is asked and what is answered
+/// Every cell `entry` asks a counterpart about, under `trie`: each other
+/// core shard's committed cell, each delivery's claim on the shard that
+/// was to deliver it and on whatever shard holds the cell's prefix now,
+/// and each core consumer's claim. The one enumeration the prober and
+/// the commit-time fold both read, so what is asked and what is answered
 /// are the same cells.
-fn counterpart_cells(entry: &Probeable, trie: &ShardTrie) -> Vec<CounterpartCell> {
+///
+/// `local` is never asked about: a core member holds the core it is part
+/// of, itself included, because the arity an absent committed cell is
+/// read against is the core's own — but what it has committed is not
+/// something it fetches a proof of.
+fn counterpart_cells(entry: &Probeable, local: ShardId, trie: &ShardTrie) -> Vec<CounterpartCell> {
     // The committed cell is asked about only where its absence would
     // answer: a core of more than one shard, whose shards settle on each
     // other's certificates with no clock. A core of one shard answers
@@ -63,7 +68,7 @@ fn counterpart_cells(entry: &Probeable, trie: &ShardTrie) -> Vec<CounterpartCell
     let core = entry
         .core
         .iter()
-        .filter(move |_| core_answers)
+        .filter(move |&&shard| core_answers && shard != local)
         .map(|&shard| {
             (
                 shard,
@@ -313,7 +318,7 @@ impl Counterparts {
     pub fn probe(&mut self, trie: &ShardTrie, now: WeightedTimestamp) -> Vec<Action> {
         let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
         for entry in self.ledger.probeable(now) {
-            for (shard, key, probed) in counterpart_cells(&entry, trie) {
+            for (shard, key, probed) in counterpart_cells(&entry, self.local_shard, trie) {
                 // The chain has answered: nothing is asked again.
                 if self.ledger.answered(entry.tx_hash, shard, probed) {
                     continue;
@@ -409,7 +414,7 @@ impl Counterparts {
             .cells()
             .into_iter()
             .map(|entry| {
-                let cells = counterpart_cells(&entry, trie);
+                let cells = counterpart_cells(&entry, self.local_shard, trie);
                 (entry, cells)
             })
             .collect();
@@ -570,7 +575,7 @@ impl Counterparts {
             }
             Word::Refused { decision, .. } => {
                 if in_core
-                    && self.ledger.unsettled_leg_figures(tx_hash).is_some()
+                    && self.ledger.unsettled_figures(tx_hash).is_some()
                     && self.mirror.record(tx_hash, shard, heard)
                 {
                     actions.push(Action::Continuation(ProtocolEvent::TransactionsResolved {
@@ -705,7 +710,7 @@ impl Counterparts {
             {
                 continue;
             }
-            let Some(figures) = self.ledger.unsettled_leg_figures(tx_hash) else {
+            let Some(figures) = self.ledger.unsettled_figures(tx_hash) else {
                 continue;
             };
             heard

@@ -8045,6 +8045,89 @@ mod tests {
         );
     }
 
+    /// A core member asks its siblings, and never itself.
+    ///
+    /// A core spanning shards settles only when every one of them
+    /// certifies, and a sibling that never included the transaction
+    /// never will. Without the question the member waits on a
+    /// certificate nobody owes it: it is not decided alone, so the
+    /// deadline does not reach it, and no counterpart has departed, so
+    /// nothing else does either.
+    #[test]
+    fn a_core_member_asks_the_siblings_it_waits_on() {
+        let schedule = two_shard_core_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let figures = UnsettledTx::for_transaction(&transaction);
+        let deadline = figures.deadline.at();
+        let cell = |shard| {
+            committed_tx_cell_key(
+                shard,
+                tx_hash,
+                transaction.validity_range().end_timestamp_exclusive,
+            )
+        };
+        // A member of the core, on CORE, whose sibling is CORE_SIBLING.
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), CORE);
+        state.counterparts.ledger.register_committed(
+            CORE,
+            WeightedTimestamp::ZERO,
+            [(&transaction, &two_shard_core_classified())],
+        );
+        state.counterparts.ledger.certify(tx_hash);
+        state.committed_ts = deadline;
+
+        let (never, opened) = proven_at(
+            &mut state,
+            &schedule,
+            CORE_SIBLING,
+            4,
+            deadline,
+            &[],
+            &[cell(CORE_SIBLING)],
+        );
+        assert_eq!(
+            state_proof_fetches(&opened),
+            vec![(never.anchor, vec![cell(CORE_SIBLING)])],
+            "the sibling whose certificate the settlement waits on is asked",
+        );
+
+        commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![never]);
+        assert_eq!(
+            absences_observed_at(&state, CORE_SIBLING, tx_hash),
+            vec![absent(Probed::Core, deadline)],
+            "and its silence is written down",
+        );
+        let records = state.offers(&schedule).abandonment_records;
+        assert_eq!(
+            records,
+            vec![AbandonmentRecord::heard(
+                CORE_SIBLING,
+                absent(Probed::Core, deadline),
+                [figures]
+            )],
+            "so the member can say why its core can never settle",
+        );
+
+        // Committed, the record is what releases the member: the entry
+        // is covered, and a covered entry is the shard's to abandon.
+        state
+            .counterparts
+            .ledger
+            .record_abandonment_records(&records);
+        assert!(state.counterparts.ledger.is_unsettled_by_departed(tx_hash));
+        assert_eq!(
+            state
+                .abandonable(TickId::new(CORE, BlockHeight::new(9)))
+                .iter()
+                .map(|entry| entry.tx_hash)
+                .collect::<Vec<_>>(),
+            vec![tx_hash],
+        );
+    }
+
     /// Every core shard is asked, so the one that never included the
     /// transaction answers even where its sibling did.
     ///

@@ -352,7 +352,10 @@ impl Part {
             Self::Issuer(Kept {
                 body,
                 classified: classified.clone(),
-                core: BTreeSet::new(),
+                // The core it is part of, itself included: what its own
+                // settlement waits on, and the arity an absent committed
+                // cell is read against. The prober skips this shard.
+                core: classified.core().clone(),
                 deliveries,
                 claims: Vec::new(),
             })
@@ -588,10 +591,10 @@ impl UnresolvedTxs {
     /// record covers yet. `None` for anything else: a record is composed
     /// once per entry.
     #[must_use]
-    pub fn unsettled_leg_figures(&self, tx_hash: TxHash) -> Option<UnsettledTx> {
+    pub fn unsettled_figures(&self, tx_hash: TxHash) -> Option<UnsettledTx> {
         self.owed
             .get(&tx_hash)
-            .filter(|owed| owed.part.is_leg() && owed.covered.is_none())
+            .filter(|owed| owed.part.kept().is_some() && owed.covered.is_none())
             .map(|owed| owed.figures)
     }
 
@@ -781,15 +784,26 @@ impl UnresolvedTxs {
     pub fn cells(&self) -> Vec<Probeable> {
         self.owed
             .iter()
-            .filter(|(_, owed)| owed.part.is_leg() && owed.covered.is_none())
+            .filter(|(_, owed)| owed.covered.is_none())
             .filter_map(|(tx_hash, owed)| {
-                let leg = owed.part.kept()?;
+                let kept = owed.part.kept()?;
+                // What an entry asks about is what it waits on. A leg
+                // waits for the core's verdict and for the crossings it
+                // issued to be claimed; a core member waits only for its
+                // siblings, whose certificates its own settlement needs.
+                // Its deliveries are what it waits on once it has a
+                // verdict, as the `Remainder` its acceptance leaves.
+                let (deliveries, claims) = if owed.part.is_leg() {
+                    (kept.deliveries.clone(), kept.claims.clone())
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 Some(Probeable {
                     tx_hash: *tx_hash,
                     deadline: owed.figures.deadline,
-                    core: leg.core.clone(),
-                    deliveries: leg.deliveries.clone(),
-                    claims: leg.claims.clone(),
+                    core: kept.core.clone(),
+                    deliveries,
+                    claims,
                 })
             })
             .collect()
