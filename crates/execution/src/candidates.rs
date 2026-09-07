@@ -250,19 +250,6 @@ impl TickCandidates {
             if !candidate.engagement_settled(now) {
                 continue;
             }
-            // A delivery is admissible to the window's close and no
-            // later: past it the crossing lapses and its issuer may
-            // reclaim on a proof the claim is absent, so a delivery
-            // composed past the close would claim what a reclaim may
-            // already have taken back. It is abandoned at the close.
-            if candidate.member.side() == Side::Delivering
-                && now
-                    >= Window::Delivery
-                        .of(Deadline::of_transaction(&candidate.tx))
-                        .end
-            {
-                continue;
-            }
             let membership = Membership::of(&candidate.member);
             // A member whose effects a counterpart's verdict can still
             // discard: its writes stay provisional, and its declaration
@@ -335,10 +322,12 @@ impl TickCandidates {
 
     /// Drop every delivering candidate the delivery window has closed on.
     ///
-    /// [`Self::compose`] already refuses one past the close, so it is a
-    /// candidate no tick can ever take again — and the shard that holds
-    /// it holds the transaction's body and walks it once per block for
-    /// as long as it does. Returns the hashes dropped.
+    /// A delivery is admissible to the window's close and no later: past
+    /// it the crossing lapses and its issuer may reclaim on a proof the
+    /// claim is absent, so a delivery composed past the close would
+    /// claim what a reclaim may already have taken back. Run before
+    /// every composition under the same clock, so [`Self::compose`]
+    /// never sees one. Returns the hashes dropped.
     ///
     /// A mixed shard's delivering member is the one that reaches this:
     /// registered beside its issuing member, and removed by nothing else,

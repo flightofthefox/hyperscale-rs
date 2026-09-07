@@ -152,7 +152,7 @@ impl Classified {
     /// admissible past the transaction's validity end, since the record
     /// cell it claims is bounded by its own sweep and not by the window.
     #[must_use]
-    pub fn delivers_at(&self, shard: ShardId) -> bool {
+    pub fn only_delivers_at(&self, shard: ShardId) -> bool {
         self.delivering.contains(&shard)
     }
 
@@ -170,7 +170,7 @@ impl Classified {
     /// delivering member is registered by the issuing one's admission.
     #[must_use]
     pub fn first_side_at(&self, shard: ShardId) -> Side {
-        if self.delivers_at(shard) {
+        if self.only_delivers_at(shard) {
             Side::Delivering
         } else {
             Side::Issuing
@@ -1026,7 +1026,7 @@ mod tests {
             !classified.mixed_at(high()),
             "the core shard runs one member"
         );
-        assert!(!classified.delivers_at(high()));
+        assert!(!classified.only_delivers_at(high()));
         let edges = classified.edges();
         assert_eq!(edges.len(), 1, "only the withdraw crosses");
         assert_eq!((edges[0].producer, edges[0].output), (1, 0));
@@ -1151,7 +1151,7 @@ mod tests {
         let whole = Classified::freeze(&legs, &[], &trie());
         assert!(!whole.decomposed());
         assert!(
-            !whole.delivers_at(low()) && !whole.mixed_at(low()),
+            !whole.only_delivers_at(low()) && !whole.mixed_at(low()),
             "a whole shape gives the sink's shard no second member to wait on it"
         );
         let mut one_sided = legs;

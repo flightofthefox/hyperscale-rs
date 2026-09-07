@@ -1630,11 +1630,14 @@ mod tests {
             placement,
         );
         assert!(transfer.decomposed());
-        assert!(transfer.delivers_at(recipient));
-        assert!(!transfer.delivers_at(sender), "the core bears the verdict");
+        assert!(transfer.only_delivers_at(recipient));
+        assert!(
+            !transfer.only_delivers_at(sender),
+            "the core bears the verdict"
+        );
         let swap = Classified::freeze(&swap(), &[], placement);
         assert!(
-            !swap.delivers_at(leaf(0)),
+            !swap.only_delivers_at(leaf(0)),
             "a shard that also issues runs on the transaction's window"
         );
 

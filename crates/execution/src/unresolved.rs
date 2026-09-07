@@ -336,7 +336,7 @@ impl Part {
             return Self::Whole;
         }
         let in_core = classified.core().contains(&local);
-        if !in_core && classified.delivers_at(local) {
+        if !in_core && classified.only_delivers_at(local) {
             return Self::Delivery;
         }
         // Block-container entries decoded from the wire land as

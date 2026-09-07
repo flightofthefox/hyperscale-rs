@@ -904,7 +904,7 @@ impl MempoolCoordinator {
         let validity_end = tx.validity_range().end_timestamp_exclusive;
         let delivers = cross_shard
             && Classified::freeze(tx.legs(), tx.owners(), topology_snapshot.shard_trie())
-                .delivers_at(self.local_shard);
+                .only_delivers_at(self.local_shard);
         if delivers {
             Window::Delivery.of(Deadline::of(validity_end)).end
         } else {

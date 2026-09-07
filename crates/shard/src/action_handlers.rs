@@ -784,7 +784,7 @@ where
                 // the lapse, and a body this shard delivers for is one
                 // frozen divided with this shard delivering.
                 held.get(&tx_hash).map(|tx| {
-                    Classified::freeze(tx.legs(), tx.owners(), &trie).delivers_at(ctx.shard)
+                    Classified::freeze(tx.legs(), tx.owners(), &trie).only_delivers_at(ctx.shard)
                         && anchor >= Window::Lapse.of(Deadline::of_transaction(tx)).start
                 })
             })
