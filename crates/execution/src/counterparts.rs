@@ -21,8 +21,9 @@ use hyperscale_types::{
     AbandonmentRecord, Anchor, Block, CounterpartEvidence, CounterpartMirror, ExecutionCertificate,
     Heard, Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK,
     MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed, ProvenAnchors, Question, SettledTxSet,
-    ShardId, ShardTrie, StateProofBundle, SubstateKey, TopologySchedule, TransactionDecision,
-    TxHash, TxResolution, UnsettledTx, Verifiable, Verified, WeightedTimestamp, Word,
+    ShardId, ShardTrie, StateProofBundle, SubstateKey, TerminalEvidence, TopologySchedule,
+    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
+    WeightedTimestamp, Word,
 };
 
 use crate::unresolved::{Probeable, Released, Unanswerable, UnresolvedTxs};
@@ -215,6 +216,45 @@ impl Counterparts {
     pub fn on_settled(&self, shard: ShardId, settled: SettledTxSet) {
         let parties = self.ledger.party_to(shard, settled.terminal_wt);
         self.mirror.record_settled(shard, settled, parties);
+    }
+
+    /// The departed shards whose settled sets the fence will need and
+    /// this validator does not hold: every shard the schedule still
+    /// routes to whose boundary record attests a settled root, until the
+    /// handoff-anchored evidence window has closed at `now` (an
+    /// unstamped window is open). Re-derived whole on every beacon fold,
+    /// so a set acquired, a window closed or a shard evicted simply
+    /// drops out.
+    #[must_use]
+    pub fn wanted_settled_sets(
+        &self,
+        topology_schedule: &TopologySchedule,
+        now: WeightedTimestamp,
+    ) -> Vec<TerminalEvidence> {
+        let head = topology_schedule.head();
+        topology_schedule
+            .routable_shards()
+            .into_iter()
+            .filter(|&shard| shard != self.local_shard)
+            .filter(|&shard| !self.mirror.with_settled(|sets| sets.contains_key(&shard)))
+            .filter(|&shard| {
+                topology_schedule
+                    .handoff_evidence_expiry(shard)
+                    .is_none_or(|expiry| now <= expiry)
+            })
+            .filter_map(|shard| {
+                let anchor = head.boundary(shard)?;
+                let attested_root = anchor.terminal_roots?.settled_txs;
+                let terminal_wt = topology_schedule.terminal_cut_wt(shard)?;
+                Some(TerminalEvidence {
+                    shard,
+                    height: anchor.height,
+                    block_hash: anchor.block_hash,
+                    terminal_wt,
+                    attested_root,
+                })
+            })
+            .collect()
     }
 
     /// What this validator holds to offer in a block it proposes.

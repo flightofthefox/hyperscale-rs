@@ -492,12 +492,6 @@ where
                     headers,
                 );
             }
-            ShardScopedInput::SettledTxsResponseReceived { source_shard, txs } => {
-                self.handle_settled_txs_response_received(source_shard, txs);
-            }
-            ShardScopedInput::SettledTxsFetchFailed { source_shard } => {
-                self.handle_settled_txs_fetch_failed(source_shard);
-            }
 
             // ── Fetch protocol ─────────────────────────────────────────
             ShardScopedInput::FetchFailed(ids) => self.release_fetch(ids, Release::Failed),

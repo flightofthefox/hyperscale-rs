@@ -1,5 +1,6 @@
 //! Generic fetch dispatch + tick-timer plumbing.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use hyperscale_core::{FetchIds, ProtocolEvent, TimerId};
@@ -12,7 +13,7 @@ use crate::beacon::{self, BeaconProposalBinding, ShardWitnessBinding};
 use crate::fetch::{FetchBinding, FetchInput, FetchOutput, Release};
 use crate::shard::cross_shard::{
     CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
-    ProvisionBinding, StateProofBinding,
+    ProvisionBinding, SettledTxsBinding, StateProofBinding,
 };
 use crate::shard::instances::InstanceRecordBinding;
 use crate::shard::mempool::TransactionBinding;
@@ -112,6 +113,7 @@ where
             FetchIds::ExecutionCerts(ids) => self.drive_fetch::<ExecCertBinding>(how.input(ids)),
             FetchIds::CommittedTxs(ids) => self.drive_fetch::<CommittedTxBinding>(how.input(ids)),
             FetchIds::StateProofs(ids) => self.drive_fetch::<StateProofBinding>(how.input(ids)),
+            FetchIds::SettledTxs(ids) => self.drive_fetch::<SettledTxsBinding>(how.input(ids)),
             FetchIds::BeaconProposals(ids) => {
                 self.drive_fetch::<BeaconProposalBinding>(how.input(ids));
             }
@@ -124,6 +126,25 @@ where
             FetchIds::InstanceRecords(ids) => {
                 self.drive_fetch::<InstanceRecordBinding>(how.input(ids));
             }
+        }
+    }
+
+    /// Release what `B`'s fetch still holds `within` a scope that
+    /// `wanted` no longer names. For a fetch whose consumer re-derives
+    /// its whole wanted set each pass, this is the only retirement:
+    /// nothing answers for an id the consumer stopped asking about.
+    pub(in crate::shard) fn abandon_unwanted<B: FetchBinding>(
+        &mut self,
+        wanted: &BTreeSet<B::Id>,
+        within: impl Fn(&B::Id) -> bool,
+    ) {
+        let stale: Vec<B::Id> = B::fetch_mut(&mut self.io)
+            .pending_ids()
+            .filter(|id| within(id) && !wanted.contains(id))
+            .cloned()
+            .collect();
+        if !stale.is_empty() {
+            self.drive_fetch::<B>(FetchInput::Abandoned { ids: stale });
         }
     }
 

@@ -3375,7 +3375,15 @@ impl ExecutionCoordinator {
         &mut self,
         topology_schedule: &TopologySchedule,
     ) -> Vec<Action> {
-        self.release(topology_schedule, Wake::Beacon)
+        let mut actions = self.release(topology_schedule, Wake::Beacon);
+        actions.push(Action::Fetch(FetchRequest::SettledTxs {
+            wanted: self
+                .counterparts
+                .wanted_settled_sets(topology_schedule, self.committed_ts),
+            preferred: None,
+            class: None,
+        }));
+        actions
     }
 
     /// Handle the result of [`Action::VerifyFinalization`]. Emits the

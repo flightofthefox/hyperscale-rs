@@ -23,15 +23,20 @@ use crate::{
     WeightedTimestamp,
 };
 
-/// What a survivor needs to acquire a departed shard's settled set and to
-/// know how long the answer is good for.
+/// What a survivor needs to acquire a departed shard's settled set: the
+/// terminal to ask for and the root the answer must recompute to.
 ///
 /// Every field is read off the node's own beacon fold — the terminal
 /// anchor's height, hash and attested root from the boundary record, the
-/// cut and its expiry from the schedule's window grid — so nothing here is
-/// fetched and nothing here is trusted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// cut from the schedule's window grid — so nothing here is fetched and
+/// nothing here is trusted. It is the key the acquisition is tracked
+/// under: a revised terminal is a different key, and how long the answer
+/// stays wanted is decided by whoever derives the wanted set, not
+/// stamped here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TerminalEvidence {
+    /// The departed shard.
+    pub shard: ShardId,
     /// Height of the departed shard's terminal block, naming the window
     /// end the serve reconstructs from.
     pub height: BlockHeight,
@@ -43,11 +48,6 @@ pub struct TerminalEvidence {
     /// The beacon-attested `settled_txs_root` a fetched list must
     /// recompute to.
     pub attested_root: SettledTxsRoot,
-    /// When this acquisition stops being worth driving: the shard's
-    /// handoff-anchored evidence expiry, or `None` while the beacon has
-    /// not stamped the handoff complete (an open window). Refreshed on
-    /// every scan, so a driver armed before the stamp picks it up.
-    pub expires: Option<WeightedTimestamp>,
 }
 
 /// A terminated shard's settled-transaction set.

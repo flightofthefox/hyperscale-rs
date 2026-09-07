@@ -21,10 +21,9 @@ use hyperscale_types::{
     ShardId, ShardLoad, ShardTrie, ShardVoteEquivocation, SharedCertificates, SharedTransactions,
     SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
     SpcView, SplitChildRoots, StateProofBundle, StateRoot, SubstateEntry, SubstateKey,
-    SweepFrontier, TerminalEvidence, TerminalRoots, TickId, Timeout, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
-    UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
-    WorkInFlight,
+    SweepFrontier, TerminalRoots, TickId, Timeout, TopologySchedule, TopologySnapshot, Transaction,
+    TransactionRoot, TransactionStatus, TxHash, TxOutcome, UnsettledTx, ValidatorId, Verifiable,
+    Verified, VoteCount, VotePosition, WeightedTimestamp, WorkInFlight,
 };
 
 use crate::{CommitSource, FetchIds, FetchRequest, ProtocolEvent, TimerId};
@@ -1363,26 +1362,6 @@ pub enum Action {
         count: HeaderFetchCount,
     },
 
-    /// Acquire a terminated shard's settled-transaction set `S_P` for the
-    /// split-boundary fence in one beacon-attested shot.
-    ///
-    /// Emitted when the node's own beacon fold attests a terminated
-    /// shard's `settled_txs_root` it doesn't yet hold `S_P` for. The
-    /// I/O loop fetches the shard's complete settled-transaction window list
-    /// from its terminal committee (`peers`), accepts it only when the
-    /// recomputed root equals `attested_root`, and feeds the verified
-    /// set back as [`crate::ProtocolEvent::SettledTxsReconstructed`].
-    StartSettledTxsAcquisition {
-        /// The terminated shard whose settled set to acquire.
-        shard: ShardId,
-        /// The terminal to fetch against, the root to check the list
-        /// against, and how long the answer stays good — all read off the
-        /// emitting node's own beacon fold.
-        evidence: TerminalEvidence,
-        /// The terminated shard's terminal committee, asked in rotation.
-        peers: Vec<ValidatorId>,
-    },
-
     /// Issue a network fetch via one of the unified fetch protocols.
     ///
     /// Replaces the family of flat `Fetch*` / `RequestMissing*` variants —
@@ -1895,7 +1874,6 @@ impl Action {
             | Self::StartBeaconBlockSync { .. }
             | Self::StartRemoteHeaderSync { .. }
             | Self::FetchCommitProof { .. }
-            | Self::StartSettledTxsAcquisition { .. }
             | Self::RestoreCommittedState { .. }
             | Self::Fetch(_)
             | Self::AbandonFetch(_)

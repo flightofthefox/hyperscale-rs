@@ -10,7 +10,8 @@
 
 use hyperscale_types::{
     Address, Anchor, BlockHash, BlockHeight, Epoch, FinalizationHash, Hash, LeafIndex,
-    PredecessorTerminal, ProvisionHash, ShardId, SubstateKey, TxHash, ValidatorId,
+    PredecessorTerminal, ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash,
+    ValidatorId,
 };
 
 /// A batch of ids under the binding that fetches them — one variant per
@@ -37,6 +38,9 @@ pub enum FetchIds {
     CommittedTxs(Vec<(PredecessorTerminal, TxHash)>),
     /// State-proof probes as `(anchor, key)`.
     StateProofs(Vec<(Anchor, SubstateKey)>),
+    /// Departed shards' settled sets, by the terminal each is checked
+    /// against.
+    SettledTxs(Vec<TerminalEvidence>),
     /// Missing beacon proposals as `(epoch, validator)`.
     BeaconProposals(Vec<(Epoch, ValidatorId)>),
     /// Beacon-witness leaf runs as `(source_shard, block_height,

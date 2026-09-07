@@ -744,10 +744,10 @@ pub enum ProtocolEvent {
         proof: MerkleInclusionProof,
     },
 
-    /// The `io_loop`'s settled-set acquisition verified a past-terminal
-    /// shard's complete settled-transaction set against its beacon-attested root.
-    /// `ShardCoordinator` records it for the split-boundary fence and
-    /// re-drives any votes that deferred for want of it.
+    /// A settled-set fetch verified a past-terminal shard's complete
+    /// settled-transaction set against its beacon-attested root. The
+    /// execution coordinator records it for the split-boundary fence and
+    /// releases what waited on it.
     SettledTxsReconstructed {
         /// The terminated shard whose settled set this is.
         shard: ShardId,

@@ -19,7 +19,8 @@
 
 use hyperscale_types::{
     Anchor, BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, MessageClass,
-    PredecessorTerminal, ProvisionHash, ShardId, SubstateKey, TxHash, ValidatorId,
+    PredecessorTerminal, ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash,
+    ValidatorId,
 };
 
 /// Fetch family — one variant per payload type.
@@ -159,6 +160,26 @@ pub enum FetchRequest {
         anchor: Anchor,
         /// The keys whose presence or absence under it is wanted.
         keys: Vec<SubstateKey>,
+        /// Always `None` for this variant; see variant-level doc.
+        preferred: Option<ValidatorId>,
+        /// Optional class override; see enum-level doc.
+        class: Option<MessageClass>,
+    },
+    /// A departed shard's settled-transaction set, checked against the
+    /// root this node's own beacon fold attests. Routing shard is
+    /// `evidence.shard`, whose terminal committee keeps serving while
+    /// any retained window carries it. `preferred` is `None`: every
+    /// member holds the same window.
+    ///
+    /// Carries the whole wanted set, re-derived on every beacon fold.
+    /// The node diffs it against what the fetch already holds, so a
+    /// terminal that drops out of the set here — the set acquired, the
+    /// evidence window closed, the shard evicted from every retained
+    /// window — is what releases its slot. An empty set is how the last
+    /// one retires.
+    SettledTxs {
+        /// Every terminal whose settled set is still wanted.
+        wanted: Vec<TerminalEvidence>,
         /// Always `None` for this variant; see variant-level doc.
         preferred: Option<ValidatorId>,
         /// Optional class override; see enum-level doc.

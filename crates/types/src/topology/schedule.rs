@@ -412,8 +412,8 @@ impl TopologySchedule {
     ///
     /// The local-bookkeeping companion of the fence's own inline
     /// derivation in [`settled_set_verdict`](crate::settled_set_verdict):
-    /// caches, prunes, and acquisition drivers retain on this, so none of
-    /// them stops reading while the fence still expects an answer.
+    /// caches, prunes, and the settled sets still wanted all read this, so
+    /// none of them stops asking while the fence still expects an answer.
     #[must_use]
     pub fn terminal_evidence_readable(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
         match self.lookup(wt) {

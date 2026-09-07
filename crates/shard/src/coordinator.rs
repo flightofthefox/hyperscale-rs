@@ -974,14 +974,6 @@ impl ShardCoordinator {
         }
     }
 
-    /// Whether this validator has acquired the settled-transaction set
-    /// for a terminated shard. The acquisition host fills the mirror; a
-    /// test or RPC reads this to observe that it ran.
-    #[must_use]
-    pub fn holds_settled_set(&self, shard: ShardId) -> bool {
-        self.evidence.with_settled(|sets| sets.contains_key(&shard))
-    }
-
     /// Whether anything the vote fence reads has been written since the
     /// last time this answered `true`: a counterpart's word, a settled
     /// set, a record's cover, a proven anchor, a predecessor's answer.

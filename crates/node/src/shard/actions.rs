@@ -1,6 +1,6 @@
 //! Action processing and dispatch.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_beacon::action_handlers::handle_action as handle_beacon_action;
@@ -15,15 +15,15 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    BeaconProposal, BeaconWitnessCommit, CertifiedBlock, Epoch, PredecessorTerminal,
-    TopologySchedule, TransactionStatus, TxHash, ValidatorId, Verified,
+    BeaconProposal, BeaconWitnessCommit, CertifiedBlock, Epoch, PredecessorTerminal, ShardId,
+    TerminalEvidence, TopologySchedule, TransactionStatus, TxHash, ValidatorId, Verified,
 };
 use tracing::{debug, error, trace, warn};
 
 use super::{ShardLoop, ShardScopedInput, TimerOp, push_protocol_event, push_shard_input};
 use crate::beacon;
 use crate::beacon::{BeaconProposalBinding, ShardWitnessBinding};
-use crate::fetch::{FetchBinding, FetchInput, Release};
+use crate::fetch::{FetchInput, Release};
 use crate::shard::commit::{
     AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind,
     QcOnlyPending, make_commit_prepared, run_qc_only_prep,
@@ -31,7 +31,7 @@ use crate::shard::commit::{
 use crate::shard::consensus::BlockSyncInput;
 use crate::shard::cross_shard::{
     CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
-    ProvisionBinding, StateProofBinding,
+    ProvisionBinding, SettledTxsBinding, StateProofBinding,
 };
 use crate::shard::mempool::TransactionBinding;
 
@@ -143,11 +143,6 @@ where
                 from_height,
                 count,
             } => self.process_fetch_commit_proof(source_shard, from_height, count),
-            Action::StartSettledTxsAcquisition {
-                shard,
-                evidence,
-                peers,
-            } => self.process_start_settled_txs_acquisition(shard, evidence, peers),
             Action::ReofferTransactions { txs } => {
                 // Through the client submit rail, not this shard's gossip
                 // topic: the fan-out resolves each transaction against
@@ -664,26 +659,47 @@ where
                     .map(|tx_hash| (predecessor, tx_hash))
                     .collect();
                 // The scan re-derives the whole wanted set for this
-                // predecessor each pass, so anything the FSM still holds
-                // and the scan no longer names is an answer nobody is
-                // waiting for — a transaction that expired out of the
-                // pool, or the rule retiring as the chain outlives its
-                // origin. Nothing else retires these ids: a terminated
-                // committee that never answers would pin them for good.
-                let stale: Vec<_> = CommittedTxBinding::fetch_mut(&mut self.io)
-                    .pending_ids()
-                    .filter(|id| id.0.shard == predecessor.shard && !wanted.contains(id))
-                    .copied()
-                    .collect();
-                if !stale.is_empty() {
-                    self.drive_fetch::<CommittedTxBinding>(FetchInput::Abandoned { ids: stale });
-                }
+                // predecessor each pass, so anything the fetch still
+                // holds under it and the scan no longer names is an
+                // answer nobody is waiting for — a transaction that
+                // expired out of the pool, or the rule retiring as the
+                // chain outlives its origin. Nothing else retires these
+                // ids: a terminated committee that never answers would
+                // pin them for good.
+                self.abandon_unwanted::<CommittedTxBinding>(&wanted, |id| {
+                    id.0.shard == predecessor.shard
+                });
                 self.drive_fetch::<CommittedTxBinding>(FetchInput::Request {
                     ids: wanted.into_iter().collect(),
                     shard: predecessor.shard,
                     preferred,
                     class,
                 });
+            }
+            FetchRequest::SettledTxs {
+                wanted,
+                preferred,
+                class,
+            } => {
+                // The whole wanted set arrives on every beacon fold, so
+                // a terminal the fetch still holds and the set no longer
+                // names — acquired, its window closed, its shard evicted
+                // — is released here; nothing else retires it, and a
+                // committee that never answers would pin it for good.
+                let wanted: BTreeSet<TerminalEvidence> = wanted.into_iter().collect();
+                self.abandon_unwanted::<SettledTxsBinding>(&wanted, |_| true);
+                let mut by_shard: BTreeMap<ShardId, Vec<TerminalEvidence>> = BTreeMap::new();
+                for evidence in wanted {
+                    by_shard.entry(evidence.shard).or_default().push(evidence);
+                }
+                for (shard, ids) in by_shard {
+                    self.drive_fetch::<SettledTxsBinding>(FetchInput::Request {
+                        ids,
+                        shard,
+                        preferred,
+                        class,
+                    });
+                }
             }
             FetchRequest::StateProof {
                 anchor,
