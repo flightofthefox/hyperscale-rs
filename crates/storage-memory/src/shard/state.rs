@@ -2,7 +2,7 @@
 //!
 //! Contains the internal state structures protected by `RwLocks` in `SimShardStorage`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
@@ -216,11 +216,17 @@ pub struct ConsensusState {
     pub receipt_heights: HashMap<TxHash, BlockHeight>,
     /// Execution certificates keyed by [`TickId`].
     pub execution_certs: HashMap<TickId, ExecutionCertificate>,
-    /// Index: attested transaction → the certificate carrying its
-    /// outcome. Mirrors the production `tx_cert_index` CF so simulation
-    /// integration tests serve the by-transaction certificate fetch the
-    /// same way a real node does.
-    pub tx_cert_index: HashMap<TxHash, TickId>,
+    /// Index: attested transaction → every certificate of this shard's
+    /// carrying an outcome for it. Mirrors the production
+    /// `tx_cert_index` CF so simulation integration tests serve the
+    /// by-transaction certificate fetch the same way a real node does.
+    ///
+    /// A set rather than a slot: a shard certifies one transaction its
+    /// verdict and then again whatever settles what the verdict left —
+    /// a retirement, a reclaim, an abandonment — and a counterpart that
+    /// asks by naming the transaction cannot say which of them it
+    /// wants.
+    pub tx_cert_index: HashMap<TxHash, BTreeSet<TickId>>,
     /// Index: `block_height` → `TickId`s at that height.
     pub finalizations_by_height: HashMap<BlockHeight, Vec<TickId>>,
     /// Beacon-witness leaves keyed by leaf index. Mirrors the production

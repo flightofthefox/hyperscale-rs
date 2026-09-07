@@ -17,6 +17,16 @@ use hyperscale_types::{ExecutionCertificate, TickId, TxHash};
 /// storage via [`PendingChain`]. Cache eviction happens at finalization
 /// commit, at which point storage is the authoritative source.
 ///
+/// Both tiers are read for every transaction asked about, not the chain
+/// only on a cache miss. A shard certifies one transaction more than
+/// once — its verdict, and then the retirement, reclaim or abandonment
+/// that settles what the verdict left — so the two tiers can hold
+/// different certificates for it, and which one answers the asker's
+/// question is not something either tier knows. Answering with the one
+/// that happened to be found leaves a counterpart waiting on a verdict
+/// holding a retirement that covers nothing its tick awaits, and asking
+/// again gets the same answer for as long as it asks.
+///
 /// The request names transactions, and one certificate covers a whole
 /// batch of them, so several requested transactions commonly resolve to
 /// the same certificate — it is answered once, projected to the
@@ -37,22 +47,18 @@ pub fn serve_execution_certs_request<S: ShardStorage>(
     // request named it for.
     let mut asked: HashMap<TickId, (Arc<ExecutionCertificate>, HashSet<TxHash>)> = HashMap::new();
     let mut order: Vec<TickId> = Vec::new();
-    let mut missing: Vec<TxHash> = Vec::new();
 
     for &tx_hash in &req.tx_hashes {
-        match exec_cert_store.get_for_tx(tx_hash) {
-            Some(cert) => record(&mut asked, &mut order, Arc::new((**cert).clone()), tx_hash),
-            None => missing.push(tx_hash),
+        for cert in exec_cert_store.certificates_for_tx(tx_hash) {
+            record(&mut asked, &mut order, Arc::new((**cert).clone()), tx_hash);
         }
     }
 
-    if !missing.is_empty() {
-        for cert in pending_chain.execution_certificates_for_txs(&missing) {
-            let cert = Arc::new(cert.into_inner());
-            for tx_hash in &missing {
-                if cert.covers(tx_hash) {
-                    record(&mut asked, &mut order, Arc::clone(&cert), *tx_hash);
-                }
+    for cert in pending_chain.execution_certificates_for_txs(&req.tx_hashes) {
+        let cert = Arc::new(cert.into_inner());
+        for &tx_hash in &req.tx_hashes {
+            if cert.covers(&tx_hash) {
+                record(&mut asked, &mut order, Arc::clone(&cert), tx_hash);
             }
         }
     }
@@ -96,4 +102,99 @@ fn record(
         })
         .1
         .insert(tx_hash);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use hyperscale_storage::test_helpers::{
+        commit_settled_at, make_test_block, make_test_certified, push_certificate,
+    };
+    use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_types::{
+        AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHeight,
+        ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, Role, ShardId,
+        SignerBitfield, TickHalf, TxOutcome, Verified, WeightedTimestamp,
+    };
+
+    use super::*;
+
+    fn cert(height: u64, tx_hash: TxHash, role: Role) -> ExecutionCertificate {
+        ExecutionCertificate::new(
+            TickId::new(ShardId::ROOT, BlockHeight::new(height)),
+            WeightedTimestamp::from_millis(height + 1),
+            GlobalReceiptRoot::ZERO,
+            vec![
+                TxOutcome::new(
+                    tx_hash,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+                .as_role(role),
+            ],
+            AggregateSignature::new([0u8; 96]),
+            SignerBitfield::new(4),
+        )
+    }
+
+    /// A transaction this shard certified twice is answered with both,
+    /// whichever tier each is in.
+    ///
+    /// The verdict's certificate leaves the cache when its finalization
+    /// commits and stays on the chain; whatever settles what the verdict
+    /// left is certified later and is in the cache. Reading the chain
+    /// only on a cache miss answers a counterpart waiting on the verdict
+    /// with the settling certificate alone, which covers nothing its tick
+    /// awaits — and asking again gets the same answer for as long as it
+    /// asks.
+    #[test]
+    fn both_tiers_answer_for_a_transaction_certified_twice() {
+        let tx_hash = TxHash::from(Hash::from_bytes(&[3u8; 32]));
+        let verdict = cert(1, tx_hash, Role::Core);
+        let settling = cert(2, tx_hash, Role::Retiring);
+
+        // The verdict is on the chain, where its committed finalization
+        // put it; the settling certificate is still in the cache.
+        let storage = Arc::new(SimShardStorage::default());
+        let block = push_certificate(
+            make_test_block(BlockHeight::new(1)),
+            Arc::new(
+                Finalization::new(
+                    *verdict.tick_id(),
+                    TickHalf::Legs,
+                    vec![Arc::new(verdict.clone())],
+                    vec![],
+                )
+                .into(),
+            ),
+        );
+        commit_settled_at(
+            &*storage,
+            &make_test_certified(block),
+            &[],
+            &[],
+            &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+        );
+        let pending_chain = PendingChain::new(storage);
+        let store = ExecCertStore::new();
+        store.insert(Arc::new(Verified::new_unchecked_for_test(settling.clone())));
+
+        let answered = serve_execution_certs_request(
+            &pending_chain,
+            &store,
+            &GetExecutionCertsRequest {
+                tx_hashes: vec![tx_hash],
+            },
+        );
+        let mut ticks: Vec<TickId> = answered
+            .certificates
+            .expect("both answer")
+            .iter()
+            .map(|cert| *cert.tick_id())
+            .collect();
+        ticks.sort_unstable();
+        assert_eq!(ticks, vec![*verdict.tick_id(), *settling.tick_id()]);
+    }
 }

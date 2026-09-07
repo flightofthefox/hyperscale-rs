@@ -227,9 +227,13 @@ impl SimShardStorage {
 /// settled cross-shard transaction lands here under both sides'
 /// certificates, and the index answers "what did THIS shard attest for
 /// the transaction" — the question a counterpart's fallback fetch asks
-/// this shard. Letting a remote copy win the single slot serves the
-/// requester its own certificate back, which it rightly refuses as
-/// unsolicited, and the fetch loops forever.
+/// this shard. A remote copy in there serves the requester its own
+/// certificate back, which it rightly refuses as unsolicited, and the
+/// fetch loops forever.
+///
+/// Every one of this shard's is indexed, not the newest: the verdict and
+/// whatever settles what it left both name the transaction, and only the
+/// asker can tell which answers the question its tick waits on.
 fn record_execution_certs(consensus: &mut ConsensusState, block: &Block) {
     let local_shard = block
         .certificates()
@@ -253,7 +257,9 @@ fn record_execution_certs(consensus: &mut ConsensusState, block: &Block) {
         for outcome in cert.tx_outcomes() {
             consensus
                 .tx_cert_index
-                .insert(outcome.tx_hash(), *cert.tick_id());
+                .entry(outcome.tx_hash())
+                .or_default()
+                .insert(*cert.tick_id());
         }
     }
 }

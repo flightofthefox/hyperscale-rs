@@ -4,7 +4,7 @@
 //! `Finalization`, `Block`, and `QuorumCertificate` so that
 //! storage-memory and storage-rocksdb tests can share a single source of truth.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1734,6 +1734,75 @@ pub fn test_tx_index_answers_with_the_local_shards_certificate(
         served[0].tick_id(),
         local.tick_id(),
         "and it is this shard's own, not the counterpart copy riding beside it",
+    );
+}
+
+/// Shared test: the transaction index answers with every certificate of
+/// this shard's naming the transaction, not the newest.
+///
+/// A shard certifies one transaction its verdict and then again whatever
+/// settles what the verdict left — a retirement, a reclaim, an
+/// abandonment. A counterpart asks by naming the transaction and cannot
+/// say which it wants, so a single slot hands it whichever committed
+/// last: a counterpart waiting on the verdict then holds a certificate
+/// covering nothing its tick awaits, and asking again gets the same
+/// answer for as long as it asks.
+///
+/// Both certificates land in one block here, which is the case a
+/// per-certificate write would also lose: it would read the stored set
+/// before either landed and drop the first.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_the_tx_index_answers_with_every_certificate_of_this_shards(
+    storage: &(impl ShardChainReader + TestStore),
+) {
+    let tx = TxHash::from(Hash::from_bytes(&[8u8; 32]));
+    let verdict = execution_certificate_over(BlockHeight::new(1), from_ref(&tx));
+    let settling = execution_certificate_over(BlockHeight::new(2), from_ref(&tx));
+
+    commit_empty_blocks_below(storage, BlockHeight::new(1));
+    let block = push_certificate(
+        push_certificate(
+            make_test_block(BlockHeight::new(1)),
+            Arc::new(
+                Finalization::new(
+                    *verdict.tick_id(),
+                    TickHalf::Legs,
+                    vec![Arc::new(verdict.clone())],
+                    vec![],
+                )
+                .into(),
+            ),
+        ),
+        Arc::new(
+            Finalization::new(
+                *settling.tick_id(),
+                TickHalf::Determined,
+                vec![Arc::new(settling.clone())],
+                vec![],
+            )
+            .into(),
+        ),
+    );
+    commit_settled_at(
+        storage,
+        &make_test_certified(block),
+        &[],
+        &[],
+        &empty_witness(),
+    );
+
+    let served: BTreeSet<TickId> = storage
+        .get_execution_certificates_for_txs(from_ref(&tx))
+        .iter()
+        .map(|cert| *cert.tick_id())
+        .collect();
+    assert_eq!(
+        served,
+        BTreeSet::from([*verdict.tick_id(), *settling.tick_id()]),
+        "both of this shard's certificates for the transaction answer for it",
     );
 }
 

@@ -111,6 +111,7 @@ impl ShardChainReader for RocksDbShardStorage {
         tx_hashes
             .iter()
             .filter_map(|tx| get::<TxCertIndexCf>(&*self.db, index_cf, &Hash::from(*tx)))
+            .flatten()
             .filter(|tick_id| seen.insert(*tick_id))
             .filter_map(|tick_id| get::<ExecutionCertsCf>(&*self.db, certs_cf, &tick_id))
             .map(Verified::<ExecutionCertificate>::from_persisted)

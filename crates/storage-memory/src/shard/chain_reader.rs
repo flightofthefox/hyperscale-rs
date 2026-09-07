@@ -130,6 +130,7 @@ impl ShardChainReader for SimShardStorage {
         tx_hashes
             .iter()
             .filter_map(|tx| c.tx_cert_index.get(tx))
+            .flatten()
             .filter(|tick_id| seen.insert(tick_id))
             .filter_map(|tick_id| c.execution_certs.get(tick_id).cloned())
             .map(Verified::<ExecutionCertificate>::from_persisted)

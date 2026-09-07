@@ -424,6 +424,12 @@ fn the_tx_index_answers_with_the_local_shards_certificate() {
 }
 
 #[test]
+fn the_tx_index_answers_with_every_certificate_of_this_shards() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_the_tx_index_answers_with_every_certificate_of_this_shards(&storage);
+}
+
+#[test]
 fn test_ec_storage_roundtrip() {
     let storage = SimShardStorage::default();
     test_helpers::test_ec_storage_roundtrip(&storage);

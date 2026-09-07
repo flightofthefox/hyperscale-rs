@@ -22,6 +22,7 @@ use hyperscale_storage::test_helpers::{
     test_snapshot_at_below_the_floor_panics, test_substate_bytes_track_commits,
     test_sweep_index_counts_a_pending_ancestors_move, test_sweep_index_tracks_the_leaves,
     test_sweep_stops_at_the_ceiling_or_the_cap, test_the_root_is_a_function_of_the_writes,
+    test_the_tx_index_answers_with_every_certificate_of_this_shards,
     test_tx_index_answers_with_the_local_shards_certificate,
     test_undischarged_record_holds_the_floor, test_unresolved_fold,
     test_widest_tick_copy_holds_the_slot,
@@ -1102,6 +1103,13 @@ fn the_tx_index_answers_with_the_local_shards_certificate() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     test_tx_index_answers_with_the_local_shards_certificate(&storage);
+}
+
+#[test]
+fn the_tx_index_answers_with_every_certificate_of_this_shards() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_the_tx_index_answers_with_every_certificate_of_this_shards(&storage);
 }
 
 /// The shared package-index test, then a reopen: the index is what a

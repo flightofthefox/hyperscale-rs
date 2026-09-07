@@ -3,6 +3,7 @@
 //! This is the single source of truth for what column families exist,
 //! what they store, and how their keys/values are encoded.
 
+use std::collections::BTreeSet;
 use std::marker::PhantomData;
 
 use hyperscale_hbor::{HborDecode, HborEncode};
@@ -693,9 +694,14 @@ pub struct TxCertIndexCf;
 impl TypedCf for TxCertIndexCf {
     const NAME: &'static str = TX_CERT_INDEX_CF;
     type Key = Hash;
-    type Value = TickId;
+    /// Every tick of this shard's that carried an outcome for the
+    /// transaction, not the newest: a shard certifies one transaction
+    /// its verdict and then again whatever settles what the verdict left
+    /// — a retirement, a reclaim, an abandonment — and a counterpart
+    /// fetching by transaction cannot name which of them it wants.
+    type Value = BTreeSet<TickId>;
     type KeyCodec = HashCodec;
-    type ValueCodec = HborCodec<TickId>;
+    type ValueCodec = HborCodec<BTreeSet<TickId>>;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.tx_cert_index
