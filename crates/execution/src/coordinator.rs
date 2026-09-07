@@ -852,12 +852,6 @@ impl ExecutionCoordinator {
         // One placement at one anchor: the trie this block committed
         // under, and the answer frozen onto each transaction from here.
         let trie = classification.shard_trie();
-        // The ledger takes the transactions themselves. What it needs of
-        // them — when they expire, what they reserved, what they reach
-        // outside this shard — is theirs and this shard's, so a rebuild
-        // reads the same account off the same blocks however long after.
-        self.unresolved
-            .register_committed(local_shard, ts, transactions.iter());
         let members: Vec<CommittedMember> = members
             .into_iter()
             .map(|(tx, participating)| CommittedMember {
@@ -866,6 +860,19 @@ impl ExecutionCoordinator {
                 participating,
             })
             .collect();
+        // The ledger takes the transactions themselves, each with the
+        // classification frozen here. What it needs of them — when they
+        // expire, what they reserved, what they reach outside this shard,
+        // what this shard is to them — is theirs and this shard's, so a
+        // rebuild reads the same account off the same blocks however
+        // long after.
+        self.unresolved.register_committed(
+            local_shard,
+            ts,
+            members
+                .iter()
+                .map(|member| (&member.tx, &member.classified)),
+        );
         let reaches_beyond: Vec<CommittedMember> = members
             .iter()
             .filter(|member| member.reaches_beyond(local_shard))
@@ -892,38 +899,6 @@ impl ExecutionCoordinator {
                 Ok(v) => Arc::new(v),
                 Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
             };
-            // A leg is what this shard runs of a member frozen divided
-            // with it outside the core set. Marked here, beside the
-            // freeze, so a replay marks the same entries. A shard that
-            // only delivers holds no leg entry — nothing to reclaim, no
-            // core whose refusal is its own — and runs on the delivery
-            // window's clock instead.
-            if classified.decomposed().holds() && !classified.core().contains(&local_shard) {
-                if classified.delivers_at(local_shard) {
-                    self.unresolved.mark_delivery(tx.hash());
-                } else {
-                    let shape = classified.shape(tx.legs(), tx.crossings());
-                    self.unresolved.mark_leg(
-                        tx.hash(),
-                        Arc::clone(&verified),
-                        classified.clone(),
-                        shape.delivered_claims(local_shard),
-                        shape.core_claims(local_shard),
-                    );
-                }
-            } else if classified.decomposed().holds() {
-                // A core member's verdict is its own, but what it issues
-                // to deliveries elsewhere outlives it: kept for the
-                // reclaim of whatever those deliveries never claim.
-                self.unresolved.mark_issuer(
-                    tx.hash(),
-                    Arc::clone(&verified),
-                    classified.clone(),
-                    classified
-                        .shape(tx.legs(), tx.crossings())
-                        .delivered_claims(local_shard),
-                );
-            }
             self.candidates
                 .register(verified, participating, ts, classified);
         }
@@ -4601,6 +4576,7 @@ mod tests {
     use hyperscale_vm_types::Seeded;
 
     use super::*;
+    use crate::unresolved::{Kept, Part};
 
     fn make_test_topology() -> TopologySchedule {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
@@ -7240,7 +7216,7 @@ mod tests {
         state.unresolved.register_committed(
             local,
             WeightedTimestamp::ZERO,
-            std::iter::once(&transaction),
+            [(&transaction, &Classified::whole())],
         );
         state.ticks.assign_tx(tx_hash, tick_id);
 
@@ -7829,7 +7805,7 @@ mod tests {
         state.unresolved.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
-            std::iter::once(&transaction),
+            [(&transaction, &Classified::whole())],
         );
 
         let block = make_live_block_on_shard(
@@ -7881,14 +7857,16 @@ mod tests {
         state.unresolved.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
-            std::iter::once(&transaction),
+            [(&transaction, &Classified::whole())],
         );
-        state.unresolved.mark_leg(
+        state.unresolved.seed(
             tx_hash,
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            leg_classified(),
-            Vec::new(),
-            Vec::new(),
+            leg_part(
+                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                leg_classified(),
+                Vec::new(),
+                Vec::new(),
+            ),
         );
         state.unresolved.certify(tx_hash);
         state
@@ -7970,14 +7948,16 @@ mod tests {
         state.unresolved.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
-            std::iter::once(&transaction),
+            [(&transaction, &Classified::whole())],
         );
-        state.unresolved.mark_leg(
+        state.unresolved.seed(
             tx_hash,
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            leg_classified(),
-            Vec::new(),
-            Vec::new(),
+            leg_part(
+                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                leg_classified(),
+                Vec::new(),
+                Vec::new(),
+            ),
         );
         state.unresolved.certify(tx_hash);
         assert!(
@@ -8028,7 +8008,7 @@ mod tests {
         fresh.unresolved.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
-            std::iter::once(&transaction),
+            [(&transaction, &Classified::whole())],
         );
         assert!(
             fresh
@@ -8054,14 +8034,16 @@ mod tests {
         state.unresolved.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
-            std::iter::once(&transaction),
+            [(&transaction, &Classified::whole())],
         );
-        state.unresolved.mark_leg(
+        state.unresolved.seed(
             tx_hash,
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            leg_classified(),
-            Vec::new(),
-            Vec::new(),
+            leg_part(
+                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                leg_classified(),
+                Vec::new(),
+                Vec::new(),
+            ),
         );
         state.unresolved.certify(tx_hash);
 
@@ -8143,14 +8125,16 @@ mod tests {
         accepting.unresolved.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
-            std::iter::once(&transaction),
+            [(&transaction, &Classified::whole())],
         );
-        accepting.unresolved.mark_leg(
+        accepting.unresolved.seed(
             tx_hash,
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            leg_classified(),
-            Vec::new(),
-            Vec::new(),
+            leg_part(
+                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                leg_classified(),
+                Vec::new(),
+                Vec::new(),
+            ),
         );
         let actions = accepting.handle_attestation(
             &schedule,
@@ -8211,14 +8195,16 @@ mod tests {
         state.unresolved.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
-            std::iter::once(transaction),
+            [(transaction, &Classified::whole())],
         );
-        state.unresolved.mark_leg(
+        state.unresolved.seed(
             transaction.hash(),
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            classified,
-            Vec::new(),
-            Vec::new(),
+            leg_part(
+                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                classified,
+                Vec::new(),
+                Vec::new(),
+            ),
         );
         state.unresolved.certify(transaction.hash());
         state
@@ -8304,6 +8290,23 @@ mod tests {
         state.on_block_committed(schedule, &test_certify(block, ts_ms))
     }
 
+    /// The part a leg plays, with the cells a fixture names for it.
+    fn leg_part(
+        body: Arc<Verified<Transaction>>,
+        classified: Classified,
+        deliveries: Vec<(ShardId, SubstateKey)>,
+        claims: Vec<(ShardId, SubstateKey)>,
+    ) -> Part {
+        let core = classified.core().clone();
+        Part::Leg(Kept {
+            body,
+            classified,
+            core,
+            deliveries,
+            claims,
+        })
+    }
+
     /// The absences of `tx_hash` at [`PEER`] handed to the fence among
     /// mirror.
     fn absences_observed(state: &ExecutionCoordinator, tx_hash: TxHash) -> Vec<Heard> {
@@ -8376,14 +8379,16 @@ mod tests {
         state.unresolved.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
-            std::iter::once(&transaction),
+            [(&transaction, &Classified::whole())],
         );
-        state.unresolved.mark_leg(
+        state.unresolved.seed(
             tx_hash,
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            delivery_classified(),
-            vec![(PEER, claim)],
-            Vec::new(),
+            leg_part(
+                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                delivery_classified(),
+                vec![(PEER, claim)],
+                Vec::new(),
+            ),
         );
         state.unresolved.certify(tx_hash);
 
@@ -8445,14 +8450,16 @@ mod tests {
         state.unresolved.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
-            std::iter::once(&transaction),
+            [(&transaction, &Classified::whole())],
         );
-        state.unresolved.mark_leg(
+        state.unresolved.seed(
             tx_hash,
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            delivery_classified(),
-            vec![(PEER, claim)],
-            Vec::new(),
+            leg_part(
+                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                delivery_classified(),
+                vec![(PEER, claim)],
+                Vec::new(),
+            ),
         );
         state.unresolved.certify(tx_hash);
         let (bundle, _) = proven_at(&mut state, &schedule, PEER, 5, later, &[], &[claim]);
@@ -8514,14 +8521,16 @@ mod tests {
         state.unresolved.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
-            std::iter::once(&transaction),
+            [(&transaction, &Classified::whole())],
         );
-        state.unresolved.mark_leg(
+        state.unresolved.seed(
             tx_hash,
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            delivery_classified(),
-            vec![(PEER, claim)],
-            Vec::new(),
+            leg_part(
+                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                delivery_classified(),
+                vec![(PEER, claim)],
+                Vec::new(),
+            ),
         );
         state.unresolved.certify(tx_hash);
         // The local chain has crossed the peer's cut: its committee is
@@ -8777,14 +8786,16 @@ mod tests {
         state.unresolved.register_committed(
             HOME,
             WeightedTimestamp::ZERO,
-            std::iter::once(transaction),
+            [(transaction, &Classified::whole())],
         );
-        state.unresolved.mark_leg(
+        state.unresolved.seed(
             transaction.hash(),
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            classified,
-            Vec::new(),
-            vec![(PEER, claim)],
+            leg_part(
+                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                classified,
+                Vec::new(),
+                vec![(PEER, claim)],
+            ),
         );
         state.unresolved.certify(transaction.hash());
         state.committed_ts = UnsettledTx::for_transaction(transaction).deadline.at();
@@ -9097,7 +9108,7 @@ mod tests {
                 1_000,
             ),
         );
-        state.unresolved.mark_delivery(tx_hash);
+        state.unresolved.seed(tx_hash, Part::Delivery);
         state.unresolved.certify(tx_hash);
         let held_by = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         assert_eq!(state.ticks.tick_assignment(tx_hash), Some(held_by));
@@ -9442,7 +9453,7 @@ mod tests {
         state.unresolved.register_committed(
             local,
             WeightedTimestamp::ZERO,
-            std::iter::once(&transaction),
+            [(&transaction, &Classified::whole())],
         );
         state.unresolved.certify(tx_hash);
         state.committed_ts = WeightedTimestamp::from_millis(STRANDED_DEADLINE_MS);
@@ -9648,7 +9659,7 @@ mod tests {
         state.unresolved.register_committed(
             local,
             WeightedTimestamp::ZERO,
-            std::iter::once(&sibling),
+            [(&sibling, &Classified::whole())],
         );
         state.unresolved.certify(sibling_hash);
 
@@ -9726,7 +9737,7 @@ mod tests {
         state.unresolved.register_committed(
             local,
             WeightedTimestamp::ZERO,
-            std::iter::once(transaction),
+            [(transaction, &Classified::whole())],
         );
         state.stamp_departures(topology_schedule);
         state
