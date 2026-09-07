@@ -156,6 +156,13 @@ impl SimulationRunner {
             .iter()
             .map(|&validator| self.runtime_vnode_init(host, validator, shard, &recovered))
             .collect();
+        // A co-hosted pool extra has no host in the transport's layout until
+        // it is seated: bind it here, as the reshape seat does, or every
+        // notification addressed to it — headers, votes, ready-signal
+        // traffic — is dropped as unreachable and the seat never syncs.
+        for &validator in validators {
+            self.network.bind_validator(validator, host);
+        }
         self.hosts[host as usize].add_shard(inits, storage, self.event_txs[host as usize].clone());
         // Parity with the production supervisor's `unfollow_in_pool`: each
         // seated validator now drives its beacon from this shard, so retire any
