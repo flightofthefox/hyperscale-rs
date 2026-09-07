@@ -17,7 +17,7 @@ use hyperscale_types::{
     protocol_statics_installed,
 };
 use hyperscale_vm_effects::{CommittedTxCell, ProtocolHasher, committed_tx_key};
-use hyperscale_vm_types::NULLIFIER_GRACE_MS;
+use hyperscale_vm_types::ARTIFACT_GRACE_MS;
 
 use crate::tree::JmtSnapshot;
 use crate::{
@@ -386,7 +386,7 @@ pub fn committed_tx_cell_key(
 /// When a committed cell stops being needed: the transaction's validity
 /// end plus the grace, on the nullifier's clock.
 const fn committed_tx_expiry_ms(validity_end: WeightedTimestamp) -> u64 {
-    validity_end.as_millis().saturating_add(NULLIFIER_GRACE_MS)
+    validity_end.as_millis().saturating_add(ARTIFACT_GRACE_MS)
 }
 
 #[cfg(test)]
@@ -532,7 +532,7 @@ mod tests {
         use hyperscale_hbor::from_slice;
         use hyperscale_types::test_utils::{install_stub_protocol_statics, test_transaction};
         use hyperscale_vm_effects::CommittedTxCell;
-        use hyperscale_vm_types::NULLIFIER_GRACE_MS;
+        use hyperscale_vm_types::ARTIFACT_GRACE_MS;
 
         install_stub_protocol_statics();
         let shard = ShardId::leaf(1, 1);
@@ -545,7 +545,7 @@ mod tests {
             assert_eq!(decoded.tx, tx.hash());
             assert_eq!(
                 decoded.expiry_ms,
-                tx.validity_range().end_timestamp_exclusive.as_millis() + NULLIFIER_GRACE_MS
+                tx.validity_range().end_timestamp_exclusive.as_millis() + ARTIFACT_GRACE_MS
             );
         }
         assert_eq!(

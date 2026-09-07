@@ -1650,7 +1650,7 @@ fn an_inherited_record_decides_itself_against_its_claim() {
     let inside = record.expiry_ms - 1;
     assert!(
         Window::Claim
-            .of(Deadline::from_escrow_expiry(record.expiry_ms))
+            .of(Deadline::from_expiry(record.expiry_ms))
             .contains(&WeightedTimestamp::from_millis(inside))
     );
 

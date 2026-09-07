@@ -1247,7 +1247,7 @@ fn takes_back(
             if snapshot.cell(record.consumer_claim).is_some() {
                 Ok(false)
             } else if Window::Claim
-                .of(Deadline::from_escrow_expiry(record.expiry_ms))
+                .of(Deadline::from_expiry(record.expiry_ms))
                 .contains(&ctx.tick_ts)
             {
                 Ok(true)

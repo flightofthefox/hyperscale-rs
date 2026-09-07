@@ -27,7 +27,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{InstanceMeta, nullifier_key, package_hash};
 use hyperscale_vm_fixtures::lottery;
-use hyperscale_vm_types::{NULLIFIER_GRACE_MS, SEAL_MATURITY_EPOCHS};
+use hyperscale_vm_types::{ARTIFACT_GRACE_MS, SEAL_MATURITY_EPOCHS};
 
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::conservation::{Charges, World};
@@ -1936,7 +1936,7 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
     let expiry_ms = window
         .end_timestamp_exclusive
         .as_millis()
-        .saturating_add(NULLIFIER_GRACE_MS);
+        .saturating_add(ARTIFACT_GRACE_MS);
     let nullifier = nullifier_key(
         &ProtocolHasher,
         requester,

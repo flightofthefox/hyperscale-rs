@@ -59,7 +59,7 @@ impl Deadline {
     /// intent's deadline sits one [`CLAIM_WINDOW`] before it. For a
     /// reader holding the record and no body.
     #[must_use]
-    pub const fn from_escrow_expiry(expiry_ms: u64) -> Self {
+    pub const fn from_expiry(expiry_ms: u64) -> Self {
         Self(WeightedTimestamp::from_millis(
             expiry_ms.saturating_sub(CLAIM_WINDOW.as_secs() * 1_000),
         ))
@@ -197,7 +197,7 @@ impl Probed {
 mod tests {
     use std::time::Duration;
 
-    use hyperscale_vm_types::ESCROW_GRACE_MS;
+    use hyperscale_vm_types::ARTIFACT_GRACE_MS;
 
     use super::{CLAIM_WINDOW, Deadline, Probed, Window};
     use crate::{
@@ -267,7 +267,7 @@ mod tests {
         let lapse = Window::Lapse.of(deadline);
         assert_eq!(
             lapse.end,
-            validity_end.plus(Duration::from_millis(ESCROW_GRACE_MS)),
+            validity_end.plus(Duration::from_millis(ARTIFACT_GRACE_MS)),
             "the claim cell's grace, keyed to a window never earlier than this one",
         );
         assert_eq!(lapse.end.elapsed_since(lapse.start), MAX_VALIDITY_RANGE);
@@ -320,8 +320,8 @@ mod tests {
     #[test]
     fn an_escrow_expiry_reads_back_to_its_deadline() {
         let validity_end = ms(60_000);
-        let expiry_ms = validity_end.as_millis() + ESCROW_GRACE_MS;
-        let deadline = Deadline::from_escrow_expiry(expiry_ms);
+        let expiry_ms = validity_end.as_millis() + ARTIFACT_GRACE_MS;
+        let deadline = Deadline::from_expiry(expiry_ms);
         assert_eq!(deadline, Deadline::of(validity_end));
         let claim = Window::Claim.of(deadline);
         assert_eq!(claim.end, ms(expiry_ms));

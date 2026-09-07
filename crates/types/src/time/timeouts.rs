@@ -18,7 +18,7 @@
 
 use std::time::Duration;
 
-use hyperscale_vm_types::{ESCROW_GRACE_MS, NULLIFIER_GRACE_MS};
+use hyperscale_vm_types::ARTIFACT_GRACE_MS;
 
 use crate::{CLAIM_WINDOW, MAX_VALIDITY_RANGE};
 
@@ -82,25 +82,19 @@ const _: () = assert!(
     "the dedup walk covers every tier of the index it rebuilds",
 );
 
-/// A nullifier's life and every other tx-derived artifact's are the same
-/// bound, asserted rather than assumed: the VM keys and values a
-/// nullifier by an expiry it computes from its own constant, and this is
-/// where the two spellings are held together. If the horizon moves, that
-/// constant moves with it — a nullifier swept while some chain can still
-/// be deciding a spend of it is a replay, and one retained past it is
-/// state nobody can retire.
-const _: () = assert!(
-    RETENTION_HORIZON.as_secs() * 1_000 == NULLIFIER_GRACE_MS,
-    "a nullifier's grace is the protocol's retention horizon",
-);
-
-/// An escrow record outlives the nullifier by the claim window: the
-/// lapse is proved no earlier than one validity range past the
+/// Every tx-derived artifact's life is one bound, asserted rather than
+/// assumed: the VM keys and values a nullifier, a committed cell and an
+/// escrow cell by an expiry it computes from its own constant, and this
+/// is where the two spellings are held together. The lapse of a
+/// crossing is proved no earlier than one validity range past the
 /// deadline, and the reclaim then has one more to commit before the
-/// record it takes back is swept.
+/// record it takes back is swept — so the grace is the deadline plus the
+/// claim window, and a cell swept earlier would license a reclaim of
+/// state already gone, while one retained past it is state nobody can
+/// retire.
 const _: () = assert!(
-    (MAX_FINALIZATION_DELAY.as_secs() + CLAIM_WINDOW.as_secs()) * 1_000 == ESCROW_GRACE_MS,
-    "an escrow cell's grace is the deadline plus the claim window",
+    (MAX_FINALIZATION_DELAY.as_secs() + CLAIM_WINDOW.as_secs()) * 1_000 == ARTIFACT_GRACE_MS,
+    "an artifact's grace is the deadline plus the claim window",
 );
 
 /// The horizon must not outlive the epoch that produced what it retains.

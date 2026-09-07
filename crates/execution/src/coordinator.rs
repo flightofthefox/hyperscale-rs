@@ -1143,7 +1143,7 @@ impl ExecutionCoordinator {
         for (key, record) in &self.inherited {
             if trie.shard_for_prefix(record.consumer_claim.owner) != local_shard
                 || !Window::Claim
-                    .of(Deadline::from_escrow_expiry(record.expiry_ms))
+                    .of(Deadline::from_expiry(record.expiry_ms))
                     .contains(&tick_ts)
             {
                 continue;

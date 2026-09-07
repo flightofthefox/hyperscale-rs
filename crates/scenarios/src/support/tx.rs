@@ -2221,7 +2221,7 @@ pub fn payment_request(signer: PrincipalAddr, amount: u128) -> IntentDecl {
 /// [`payment_request`] standing only for `window`.
 ///
 /// The nullifier a spend of it takes lives for that window plus
-/// [`NULLIFIER_GRACE_MS`](hyperscale_vm_types::NULLIFIER_GRACE_MS), so a
+/// [`ARTIFACT_GRACE_MS`](hyperscale_vm_types::ARTIFACT_GRACE_MS), so a
 /// request signed for a transaction-shaped window yields a nullifier a
 /// scenario's clock can outrun and watch the sweep retire.
 #[must_use]
