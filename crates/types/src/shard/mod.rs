@@ -4,6 +4,8 @@
 //! - [`certified`]: [`CertifiedBlock`] pairing of a block with its certifying QC.
 //! - [`certified_header`]: [`CertifiedBlockHeader`] cross-shard trust attestation.
 //! - [`evidence`]: [`ShardVoteEquivocation`] self-proving double-vote evidence.
+//! - [`demands`]: what a block [`Demands`](demands::Demands) be checked
+//!   before a vote, and how one [`CheckOutcome`](demands::CheckOutcome) ends.
 //! - [`fork_fence`]: [`ForkFence`](fork_fence::ForkFence) — the gossip-timed
 //!   quiesce every cross-shard consumer engages against a proven fork.
 //! - [`header`]: [`BlockHeader`] (shard-voted metadata).
@@ -34,6 +36,7 @@ pub mod certified_header;
 pub mod chain_origin;
 pub mod commit_proof;
 pub mod counterpart_mirror;
+pub mod demands;
 pub mod evidence;
 pub mod fork_fence;
 pub mod header;

@@ -677,10 +677,10 @@ pub enum Action {
     /// shard-local state changes to the JMT and compares the resulting
     /// root against the header's `state_root`.
     ///
-    /// Always emits `ProtocolEvent::LocalReceiptRootVerified`. Emits
-    /// `ProtocolEvent::StateRootVerified` only on receipt-root pass; on
-    /// receipt-root failure the handler short-circuits and the pipeline
-    /// rejects the block from the receipt-root event alone.
+    /// Always completes the local-receipt-root check. Completes the
+    /// state-root check only on receipt-root pass; on receipt-root
+    /// failure the handler short-circuits and the pipeline rejects the
+    /// block from the receipt-root refusal alone.
     ///
     /// The action handler walks the snapshot chain from `parent_block_hash`
     /// to build an overlay of uncommitted tree nodes, then calls
@@ -831,9 +831,8 @@ pub enum Action {
     /// against the header's `transaction_root`. Also checks that every tx's
     /// `validity_range` is well-formed and contains `validity_anchor` — the
     /// parent QC's `weighted_timestamp` carried on the block. Returns
-    /// `ProtocolEvent::TransactionRootVerified` carrying
-    /// `Result<Verified<TransactionRoot>, TxRootVerifyError>`; the `Err`
-    /// variant distinguishes a merkle-root mismatch from an out-of-window
+    /// `ProtocolEvent::BlockCheckCompleted` for the transaction root; the
+    /// verifier's error distinguishes a merkle-root mismatch from an out-of-window
     /// transaction.
     ///
     /// Pure CPU; no JMT dependency.
@@ -872,7 +871,7 @@ pub enum Action {
     ///
     /// Computes the merkle root from the certificates' `receipt_hash` values
     /// and compares against the block header's claimed `certificate_root`.
-    /// Returns `ProtocolEvent::CertificateRootVerified`.
+    /// Returns `ProtocolEvent::BlockCheckCompleted`.
     ///
     /// Pure CPU operation — verified in parallel with state root and transaction root.
     VerifyCertificateRoot {
@@ -915,7 +914,7 @@ pub enum Action {
     /// reads the same vault version regardless of local commit progress;
     /// the coordinator holds the dispatch until its own commit pipeline
     /// has materialized that height.
-    /// Returns `ProtocolEvent::ReservationsVerified`.
+    /// Returns `ProtocolEvent::BlockCheckCompleted`.
     VerifyReservations {
         /// Block whose reservations are being verified.
         block_hash: BlockHash,
@@ -941,7 +940,7 @@ pub enum Action {
     /// at any distance — so the check needs no window of its own. A body
     /// the store never held answers `Unknown`, and the vote defers on it
     /// rather than accepting.
-    /// Returns `ProtocolEvent::ResolutionsVerified`.
+    /// Returns `ProtocolEvent::BlockCheckCompleted`.
     VerifyResolutions {
         /// Block whose resolutions are being checked.
         block_hash: BlockHash,
@@ -971,7 +970,7 @@ pub enum Action {
     /// header's — is the shard coordinator's to check synchronously
     /// against the anchors it holds, before this is dispatched; what is
     /// delegated is the proof walk. Returns
-    /// `ProtocolEvent::StateProofsVerified`.
+    /// `ProtocolEvent::BlockCheckCompleted`.
     VerifyStateProofs {
         /// Block whose state proofs are being checked.
         block_hash: BlockHash,

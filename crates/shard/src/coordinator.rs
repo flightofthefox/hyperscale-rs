@@ -16,12 +16,12 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, BlockHash, CounterpartMirror, Epoch, FinalizationHash, Hash,
-    LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal,
-    ReshapeThresholds, ReshapeTrigger, Resolutions, ScheduleLookup, ShardId, SplitAtBoundary,
-    StateProofBundle, StoredReceipt, SubstateKey, WeightedTimestamp, WorkInFlight,
-    derive_reshape_trigger, ready_signal_window,
+    AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CounterpartMirror, DeferOn, Epoch,
+    FinalizationHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
+    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr, ProposerTimestamp,
+    ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup,
+    ShardId, SplitAtBoundary, StateProofBundle, StoredReceipt, SubstateKey, VerificationKind,
+    WeightedTimestamp, WorkInFlight, derive_reshape_trigger, ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -89,15 +89,13 @@ use std::time::Duration;
 
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
-    BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootVerifyError,
-    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertificateRoot, CertifiedBlock,
-    CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization, LocalReceiptRoot, MAX_ROUND_GAP,
-    MAX_VALIDITY_RANGE, PredecessorTerminal, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
-    Provisions, ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, RecoveryCause,
-    RootMismatch, Round, SafeVoteRegisters, StateRoot, StateRootVerifyError, Timeout,
-    TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TxHash, TxRootVerifyError,
-    ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount, VotePosition, derive_leaves,
-    missed_proposals_since_prev_commit, ready_leaf_payload,
+    BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
+    BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
+    MAX_ROUND_GAP, MAX_VALIDITY_RANGE, PredecessorTerminal, Provisions, QcContext, QcVerifyError,
+    QuorumCertificate, RecoveryCause, Round, SafeVoteRegisters, StateRoot, Timeout,
+    TopologySchedule, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, Verified,
+    Verifier, Verify, VoteCount, VotePosition, derive_leaves, missed_proposals_since_prev_commit,
+    ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -130,7 +128,7 @@ use crate::validation::{
 };
 use crate::verification::{
     InFlightCheck, ReadyStateRootVerification, SubstateCountBlocked, SubstateCountSource,
-    VerificationKind, VerificationPipeline, committed_cells_for,
+    VerificationPipeline, committed_cells_for,
 };
 use crate::view_change::ViewChangeController;
 use crate::vote_keeper::VoteKeeper;
@@ -3956,287 +3954,52 @@ impl ShardCoordinator {
         actions
     }
 
-    /// Handle state root verification result.
+    /// One check on a pending block completed.
     ///
-    /// Called when the runner completes `Action::VerifyStateRoot`. If the state root
-    /// Handle a block root verification result (unified handler).
-    ///
-    /// Handle a completed transaction-root verification.
-    pub fn on_transaction_root_verified(
+    /// A pass records the stage and, once every check the block demands
+    /// has passed, votes — re-checking the safe-vote rule at emission,
+    /// since the round or the lock may have moved while the checks ran —
+    /// and re-drives the two-chain commit an assembled handle may have
+    /// been waiting on. A refusal drops the block. A deferral clears the
+    /// stage so the next re-drive of the vote dispatches the check again
+    /// and leaves the block pending: this validator cannot say yet, and
+    /// the block commits on a quorum's certificate like any block it did
+    /// not vote for.
+    #[instrument(skip(self, topology_schedule, outcome), fields(block_hash = ?block_hash, ?kind))]
+    pub fn on_block_check_completed(
         &mut self,
         topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
-        result: Result<Verified<TransactionRoot>, TxRootVerifyError>,
+        kind: VerificationKind,
+        outcome: CheckOutcome,
     ) -> Vec<Action> {
-        let valid = result.is_ok();
-        if let Ok(verified) = result {
-            self.verification
-                .record_transaction_root_result(block_hash, verified);
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::TransactionRoot,
-            block_hash,
-            valid,
-        )
-    }
-
-    /// Handle a completed certificate-root verification.
-    pub fn on_certificate_root_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        result: Result<Verified<CertificateRoot>, RootMismatch<CertificateRoot>>,
-    ) -> Vec<Action> {
-        let valid = result.is_ok();
-        if let Ok(verified) = result {
-            self.verification
-                .record_certificate_root_result(block_hash, verified);
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::CertificateRoot,
-            block_hash,
-            valid,
-        )
-    }
-
-    /// Handle a completed local-receipt-root verification.
-    pub fn on_local_receipt_root_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        result: Result<Verified<LocalReceiptRoot>, RootMismatch<LocalReceiptRoot>>,
-    ) -> Vec<Action> {
-        let valid = result.is_ok();
-        if let Ok(verified) = result {
-            self.verification
-                .record_local_receipt_root_result(block_hash, verified);
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::LocalReceiptRoot,
-            block_hash,
-            valid,
-        )
-    }
-
-    /// Handle a completed provisions-root verification.
-    pub fn on_provisions_root_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        result: Result<Verified<ProvisionsRoot>, RootMismatch<ProvisionsRoot>>,
-    ) -> Vec<Action> {
-        let valid = result.is_ok();
-        if let Ok(verified) = result {
-            self.verification
-                .record_provisions_root_result(block_hash, verified);
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::ProvisionRoot,
-            block_hash,
-            valid,
-        )
-    }
-
-    /// Handle a completed provision-tx-roots verification.
-    pub fn on_provision_tx_roots_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        result: Result<Verified<ProvisionTxRootsMap>, ProvisionTxRootsVerifyError>,
-    ) -> Vec<Action> {
-        let valid = result.is_ok();
-        if let Ok(verified) = result {
-            self.verification
-                .record_provision_tx_roots_result(block_hash, verified);
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::ProvisionTxRoots,
-            block_hash,
-            valid,
-        )
-    }
-
-    /// Handle a completed payer-shard fee-reservation verification.
-    pub fn on_reservations_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        result: &Result<(), String>,
-    ) -> Vec<Action> {
-        if let Err(reason) = result {
-            warn!(
-                block_hash = ?block_hash,
-                reason = %reason,
-                "VM fee-reservation verification FAILED"
-            );
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::Reservations,
-            block_hash,
-            result.is_ok(),
-        )
-    }
-
-    /// Handle a completed resolutions check.
-    ///
-    /// An exact answer verifies the root; a wrong figure or a lapsed
-    /// delivery refuses the block, as any root does. An unknown name is
-    /// neither: this validator's store never held the transaction, so it
-    /// cannot say, and the root is left in flight — the block stays
-    /// pending and unvoted here, and commits on a quorum's certificate
-    /// like any block this validator did not vote for.
-    pub fn on_resolutions_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        verdict: Resolutions,
-    ) -> Vec<Action> {
-        match verdict {
-            Resolutions::Exact => {}
-            Resolutions::Wrong(tx_hash) => {
+        match outcome {
+            CheckOutcome::Refused => {
                 warn!(
-                    validator = ?self.me,
                     block_hash = ?block_hash,
-                    ?tx_hash,
-                    "Abandonment record restates figures its transaction does not fix — \
-                     not voting"
+                    ?kind,
+                    "Block check FAILED — rejecting block"
                 );
+                self.verification.refused(block_hash, kind);
+                return self.remove_pending_block(block_hash);
             }
-            Resolutions::Lapsed(tx_hash) => {
-                warn!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    ?tx_hash,
-                    "Finalization delivers a crossing at or past its lapse — not voting"
-                );
-            }
-            Resolutions::Overdue(tx_hash) => {
-                warn!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    ?tx_hash,
-                    "Finalization succeeds at or past its deadline — not voting"
-                );
-            }
-            Resolutions::Unknown(tx_hash) => {
+            CheckOutcome::Deferred(DeferOn::Bodies(names)) => {
                 trace!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
-                    ?tx_hash,
-                    "Abandonment record names a transaction this validator does not hold; \
-                     deferring"
+                    ?kind,
+                    ?names,
+                    "Block check names transactions this validator does not hold; deferring"
                 );
+                self.verification.deferred(block_hash, kind);
                 return vec![];
             }
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::Resolutions,
-            block_hash,
-            matches!(verdict, Resolutions::Exact),
-        )
-    }
-
-    /// Handle a completed state-proof check: every bundle reconstructed
-    /// its anchor's root, or the block is refused as any root failure
-    /// is.
-    pub fn on_state_proofs_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        result: &Result<(), String>,
-    ) -> Vec<Action> {
-        if let Err(reason) = result {
-            warn!(
-                validator = ?self.me,
-                block_hash = ?block_hash,
-                %reason,
-                "A state proof does not reconstruct its anchor's root — not voting"
-            );
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::StateProofs,
-            block_hash,
-            result.is_ok(),
-        )
-    }
-
-    /// Handle a completed beacon-witness-root verification.
-    pub fn on_beacon_witness_root_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        result: Result<Verified<BeaconWitnessRoot>, BeaconWitnessRootVerifyError>,
-    ) -> Vec<Action> {
-        let valid = result.is_ok();
-        if let Ok(verified) = result {
-            self.verification
-                .record_beacon_witness_root_result(block_hash, verified);
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::BeaconWitnessRoot,
-            block_hash,
-            valid,
-        )
-    }
-
-    /// Handle a completed state-root verification. The `PreparedCommit`
-    /// byproduct was already side-channelled inside the action handler;
-    /// the verified handle here signals success or failure of the JMT replay.
-    pub fn on_state_root_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        result: Result<Verified<StateRoot>, StateRootVerifyError>,
-        bytes_delta: i64,
-    ) -> Vec<Action> {
-        let valid = result.is_ok();
-        if let Ok(verified) = result {
-            self.verification
-                .record_state_root_result(block_hash, verified);
-            self.pending_bytes_deltas.insert(block_hash, bytes_delta);
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::StateRoot,
-            block_hash,
-            valid,
-        )
-    }
-
-    /// Shared completion logic for the per-kind root-verified handlers above.
-    /// If invalid, the block is rejected. If valid and every other root for
-    /// the block has been verified, proceeds to vote.
-    #[instrument(skip(self, topology_schedule), fields(block_hash = ?block_hash, ?kind, valid = valid))]
-    fn on_root_verified_impl(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        kind: VerificationKind,
-        block_hash: BlockHash,
-        valid: bool,
-    ) -> Vec<Action> {
-        let pipeline_ok = match kind {
-            VerificationKind::StateRoot => {
-                self.verification.on_state_root_verified(block_hash, valid)
+            CheckOutcome::Checked { bytes_delta } => {
+                if kind == VerificationKind::StateRoot {
+                    self.pending_bytes_deltas.insert(block_hash, bytes_delta);
+                }
+                self.verification.checked(block_hash, kind);
             }
-            other => self.verification.on_root_verified(block_hash, other, valid),
-        };
-
-        if !pipeline_ok {
-            warn!(
-                block_hash = ?block_hash,
-                ?kind,
-                "Block root verification FAILED"
-            );
-            return self.remove_pending_block(block_hash);
         }
 
         let mut actions = Vec::new();
@@ -4254,7 +4017,7 @@ impl ShardCoordinator {
             debug!(
                 block_hash = ?block_hash,
                 ?kind,
-                "Verification complete but block not found in pending or synced"
+                "Check complete but block not found in pending or synced"
             );
             return actions;
         };
@@ -4267,7 +4030,7 @@ impl ShardCoordinator {
             debug!(
                 block_hash = ?block_hash,
                 ?kind,
-                "Verification done, waiting for other verifications"
+                "Check complete, waiting for the others"
             );
             return actions;
         }
@@ -4507,7 +4270,7 @@ impl ShardCoordinator {
         // Mark everything verified so the pipeline is complete. This also
         // unblocks child block verifications that need the overlay from this
         // block's PreparedCommit.
-        self.verification.mark_proposal_fully_verified(block_hash);
+        self.verification.mark_proposal_fully_verified(block);
 
         let mut actions = vec![Action::BroadcastBlockHeader {
             header: Box::new(block.header().clone()),
@@ -6918,11 +6681,11 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
     use hyperscale_types::{
-        AbandonmentRoot, AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot,
-        BlockHeaderParts, CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash, Heard,
-        LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams,
-        Probed, Question, SettledSetVerdict, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId,
-        Signer, SignerBitfield, StateProofsRoot, TerminalRoots, TimestampRange, TopologySchedule,
+        AbandonmentRoot, AggregateSignature, BeaconWitnessLeafCount, BlockHeaderParts,
+        CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash, Heard, LeafRoot,
+        MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, Probed,
+        Question, SettledSetVerdict, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId, Signer,
+        SignerBitfield, StateProofsRoot, TerminalRoots, TimestampRange, TopologySchedule,
         TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxOutcome, UnsettledTx,
         ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources,
         Word, settled_set_verdict, test_utils,
@@ -8639,11 +8402,12 @@ mod tests {
         );
 
         // State root completes — beacon witness root still pending.
-        let state_root_ok = Ok(Verified::<StateRoot>::new_unchecked_for_test(
-            StateRoot::ZERO,
-        ));
-        let after_state =
-            state.on_state_root_verified(&topology_schedule, block_hash, state_root_ok, 0);
+        let after_state = state.on_block_check_completed(
+            &topology_schedule,
+            block_hash,
+            VerificationKind::StateRoot,
+            CheckOutcome::Checked { bytes_delta: 0 },
+        );
         assert!(
             !after_state
                 .iter()
@@ -8651,18 +8415,11 @@ mod tests {
         );
 
         // Beacon witness root completes — now we vote.
-        let beacon_root = state
-            .pending_blocks
-            .get_block(block_hash)
-            .expect("pending block")
-            .header()
-            .beacon_witness_root();
-        let after_roots = state.on_beacon_witness_root_verified(
+        let after_roots = state.on_block_check_completed(
             &topology_schedule,
             block_hash,
-            Ok(Verified::<BeaconWitnessRoot>::new_unchecked_for_test(
-                beacon_root,
-            )),
+            VerificationKind::BeaconWitnessRoot,
+            CheckOutcome::Checked { bytes_delta: 0 },
         );
         assert!(
             after_roots
@@ -11634,9 +11391,9 @@ mod tests {
 
     /// The figures each name restates are checked off the committed body
     /// by a delegated verification, whose three answers fold in
-    /// differently: exact verifies the root, wrong refuses the block, and
-    /// unknown leaves the root in flight — the block pending, the vote
-    /// deferred.
+    /// differently: exact verifies the check, wrong refuses the block, and
+    /// unknown clears the check's in-flight mark — the block pending, the
+    /// vote deferred, and the check dispatched again on the next re-drive.
     #[test]
     fn a_records_figures_are_checked_off_the_body_and_folded_three_ways() {
         let sched = make_terminating_schedule(4);
@@ -11662,17 +11419,23 @@ mod tests {
         );
         assert!(coord.verification.is_root_in_flight(block_hash, kind));
 
-        coord.on_resolutions_verified(&sched, block_hash, Resolutions::Unknown(tx_hash));
+        coord.on_block_check_completed(
+            &sched,
+            block_hash,
+            kind,
+            CheckOutcome::Deferred(DeferOn::Bodies(vec![tx_hash])),
+        );
         assert!(
-            coord.verification.is_root_in_flight(block_hash, kind),
-            "an unknown name leaves the root in flight"
+            !coord.verification.is_root_in_flight(block_hash, kind)
+                && !coord.verification.is_root_verified(block_hash, kind),
+            "an unknown name clears the in-flight mark, so a re-drive asks again"
         );
         assert!(
             coord.pending_blocks.get(block_hash).is_some(),
             "and the block pending"
         );
 
-        coord.on_resolutions_verified(&sched, block_hash, Resolutions::Wrong(tx_hash));
+        coord.on_block_check_completed(&sched, block_hash, kind, CheckOutcome::Refused);
         assert!(
             coord.pending_blocks.get(block_hash).is_none(),
             "a wrong figure refuses the block"
@@ -11683,7 +11446,7 @@ mod tests {
         coord
             .verification
             .initiate_resolutions_verification(block_hash, &block, &sched);
-        coord.on_resolutions_verified(&sched, block_hash, Resolutions::Lapsed(tx_hash));
+        coord.on_block_check_completed(&sched, block_hash, kind, CheckOutcome::Refused);
         assert!(
             coord.pending_blocks.get(block_hash).is_none(),
             "a delivery past its lapse refuses the block"
@@ -11694,7 +11457,7 @@ mod tests {
         coord
             .verification
             .initiate_resolutions_verification(block_hash, &block, &sched);
-        coord.on_resolutions_verified(&sched, block_hash, Resolutions::Overdue(tx_hash));
+        coord.on_block_check_completed(&sched, block_hash, kind, CheckOutcome::Refused);
         assert!(
             coord.pending_blocks.get(block_hash).is_none(),
             "a success past its deadline refuses the block"
@@ -11705,7 +11468,12 @@ mod tests {
         coord
             .verification
             .initiate_resolutions_verification(block_hash, &block, &sched);
-        coord.on_resolutions_verified(&sched, block_hash, Resolutions::Exact);
+        coord.on_block_check_completed(
+            &sched,
+            block_hash,
+            kind,
+            CheckOutcome::Checked { bytes_delta: 0 },
+        );
         assert!(
             coord.verification.is_root_verified(block_hash, kind),
             "an exact restatement verifies the root"

@@ -12,13 +12,12 @@ use hyperscale_hbor::Hbor;
 use thiserror::Error;
 
 use crate::{
-    AbandonmentRecord, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, CertificateRoot,
-    ChainOrigin, Derivation, Finalization, LocalReceiptRoot, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
-    QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots, StateProofBundle, StateRoot,
-    Transaction, TransactionRoot, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    WitnessSources,
+    AbandonmentRecord, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Demands, Derivation,
+    ExecutionOutcome, Finalization, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    Provisions, QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots,
+    StateProofBundle, StateRoot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, WitnessSources,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -441,6 +440,56 @@ impl Block {
         }
     }
 
+    /// Every transaction the block's finalizations resolve without
+    /// deciding: a delivery's or a leg's, checked against the lapse
+    /// where the body says this shard delivers for it.
+    #[must_use]
+    pub fn undecided_names(&self) -> Vec<TxHash> {
+        self.certificates()
+            .iter()
+            .flat_map(|fw| fw.local_ec().tx_outcomes().iter())
+            .filter(|outcome| !outcome.decides())
+            .map(TxOutcome::tx_hash)
+            .collect()
+    }
+
+    /// Every transaction the block's finalizations decide with success
+    /// by its own execution, for a member that awaits nobody — the only
+    /// successes the deadline bounds. One with a sibling to stay atomic
+    /// with settles on the sibling's clock, however late; a member
+    /// settling what an execution left is past the deadline by
+    /// construction.
+    #[must_use]
+    pub fn successes_decided_alone(&self) -> Vec<TxHash> {
+        self.certificates()
+            .iter()
+            .flat_map(|fw| fw.local_ec().tx_outcomes().iter())
+            .filter(|outcome| {
+                outcome.decides()
+                    && outcome.executes()
+                    && outcome.counterparts().is_empty()
+                    && matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. })
+            })
+            .map(TxOutcome::tx_hash)
+            .collect()
+    }
+
+    /// Whether the block carries anything the resolutions check reads:
+    /// a record's figures, or a finalization resolving a name it does
+    /// not decide, or one it decides with success alone.
+    #[must_use]
+    pub fn resolves_anything(&self) -> bool {
+        !self.abandonment_records().is_empty()
+            || !self.undecided_names().is_empty()
+            || !self.successes_decided_alone().is_empty()
+    }
+
+    /// The checks this block demands before a vote.
+    #[must_use]
+    pub fn demands(&self) -> Demands {
+        Demands::of(self)
+    }
+
     /// Gas this shard consumed across the ticks the block settles.
     ///
     /// The increment behind the header's running gas total, and the reason
@@ -639,60 +688,35 @@ pub enum VerifiedBlockAssembleError {
 impl Verified<Block> {
     /// Composite assembly. Pairs `block` with a `Verified<BlockHeader>`
     /// after confirming the header's content matches the block, and
-    /// consumes a typed witness for each per-root verification.
+    /// consumes the witness that every check the block demanded passed.
     ///
     /// Construction asserts:
     /// 1. The header passes [`<BlockHeader as crate::Verify>`](crate::Verify)
     ///    (which transitively asserts `parent_qc` is verified).
-    /// 2. The block's contents match its declared commitment roots
-    ///    (`transaction_root`, `certificate_root`, `local_receipt_root`,
-    ///    `provision_root`, `provision_tx_roots`, `beacon_witness_root`).
-    ///    Each per-root check is witnessed by a typed `Verified<XRoot>`
-    ///    value the constructor consumes.
+    /// 2. Every check in [`Block::demands`] — the roots over its
+    ///    sections, its state root, its resolutions and state proofs,
+    ///    and the reservations its voters derived — was answered in
+    ///    the block's favour, witnessed by the `Verified<Demands>` the
+    ///    constructor consumes.
     ///
-    /// The witnesses are taken by value: each `Verified<XRoot>` can only
-    /// have been produced by its `Verify` impl (the only constructor
-    /// outside `new_unchecked`), so consuming them at assemble time
-    /// makes the predicate structurally unforgeable — no caller can
-    /// fabricate a "verified" marker without having run the check.
-    ///
-    /// The witnesses are **not** rebound to the block at this layer: a
-    /// `Verified<TransactionRoot>` carries a typed claim that some root
-    /// equals the merkle commitment over some content, but the verifier
-    /// doesn't record which block the content came from. Pairing each
-    /// witness with this block's content is the caller's responsibility
-    /// — in practice the verification pipeline keys per-root slots by
-    /// `block_hash` so the witness fed into `assemble` is always the one
-    /// produced from this block's own dispatch. Direct callers outside
-    /// that pipeline (tests, future helpers) must uphold the same
-    /// pairing or the resulting `Verified<Block>`'s internal-commitment
-    /// claim becomes unsound.
-    ///
-    /// State-root verification is intentionally not a witness here. Its
-    /// verified value (`Verified<StateRoot, PreparedCommit>`) carries a
-    /// byproduct that the action handler side-channels via
-    /// `ActionContext::commit_prepared`, so the verified value can't
-    /// ride in cleanly; the JMT-replay check still gates voting and
-    /// commit via the parallel pipeline path.
+    /// The witness is taken by value: a `Verified<Demands>` is produced
+    /// only by the verification pipeline once its per-check stages for
+    /// the block are all `Verified`, so consuming it here makes the
+    /// predicate structurally unforgeable — no caller can fabricate a
+    /// "verified" marker without the pipeline having seen the checks.
+    /// The witness is not rebound to the block at this layer: the
+    /// pipeline keys its stages by `block_hash`, so the demands fed in
+    /// are always the ones derived from this block's own dispatch.
     ///
     /// # Errors
     ///
     /// Returns [`VerifiedBlockAssembleError::HeaderMismatch`] when the
     /// verified header does not match the supplied block.
-    #[allow(
-        clippy::needless_pass_by_value,
-        clippy::too_many_arguments,
-        clippy::missing_const_for_fn
-    )] // typed witnesses are consumed; the moves make the assembly contract explicit
+    #[allow(clippy::needless_pass_by_value)] // the witness is consumed; the move is the contract
     pub fn assemble(
         block: Block,
         header: Verified<BlockHeader>,
-        _tx_root: Verified<TransactionRoot>,
-        _certificate_root: Verified<CertificateRoot>,
-        _local_receipt_root: Verified<LocalReceiptRoot>,
-        _provision_root: Verified<ProvisionsRoot>,
-        _provision_tx_roots: Verified<ProvisionTxRootsMap>,
-        _beacon_witness_root: Verified<BeaconWitnessRoot>,
+        _demands: Verified<Demands>,
     ) -> Result<Self, VerifiedBlockAssembleError> {
         let header_hash = header.as_ref().hash();
         let block_hash = block.hash();

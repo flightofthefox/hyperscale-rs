@@ -156,6 +156,7 @@ pub use shard::commit_proof::{
     CommitProof, CommitProofVerifyError, MAX_COMMIT_PROOF_ANCESTRY, ResolvedCommittee,
 };
 pub use shard::counterpart_mirror::CounterpartMirror;
+pub use shard::demands::{CheckOutcome, DeferOn, Demands, VerificationKind};
 pub use shard::evidence::{
     ShardForkProof, ShardForkProofVerifyError, ShardVoteEquivocation, ShardVoteEquivocationContext,
     ShardVoteEquivocationVerifyError, verify_shard_vote_equivocation,

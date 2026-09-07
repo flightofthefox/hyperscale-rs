@@ -343,16 +343,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::QuorumCertificateResult { .. }
             | ProtocolEvent::QcSignatureVerified { .. }
             | ProtocolEvent::RemoteHeaderQcVerified { .. }
-            | ProtocolEvent::TransactionRootVerified { .. }
-            | ProtocolEvent::CertificateRootVerified { .. }
-            | ProtocolEvent::LocalReceiptRootVerified { .. }
-            | ProtocolEvent::ProvisionsRootVerified { .. }
-            | ProtocolEvent::ProvisionTxRootsVerified { .. }
-            | ProtocolEvent::ReservationsVerified { .. }
-            | ProtocolEvent::ResolutionsVerified { .. }
-            | ProtocolEvent::StateProofsVerified { .. }
-            | ProtocolEvent::BeaconWitnessRootVerified { .. }
-            | ProtocolEvent::StateRootVerified { .. }
+            | ProtocolEvent::BlockCheckCompleted { .. }
             | ProtocolEvent::ProposalBuilt { .. }
             | ProtocolEvent::BlockPersisted { .. }
             | ProtocolEvent::FinalizationsAdmitted { .. }

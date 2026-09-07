@@ -39,15 +39,16 @@ use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
     BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError, Block, BlockHash,
     BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockVote, CertificateRoot,
-    CertifiedBlock, ConsensusPublicKey, ConsensusReceipt, Epoch, Finalization, Hash, HborSigned,
-    LocalReceiptRoot, LocalTimestamp, NetworkDefinition, ProposerTimestamp,
+    CertifiedBlock, CheckOutcome, ConsensusPublicKey, ConsensusReceipt, Epoch, Finalization, Hash,
+    HborSigned, LocalReceiptRoot, LocalTimestamp, NetworkDefinition, ProposerTimestamp,
     ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
     ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, ReadySignal, RootMismatch, Round,
     ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload, Signer, StateRoot,
     StateRootContext, StateRootVerifyError, StoredReceipt, SweepFrontier, Timeout, TimeoutContext,
     TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext,
-    TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, WorkInFlight, local_settled_tx_hashes, shard_reveal_sign, signed_bytes,
+    TxHash, TxRootVerifyError, ValidatorId, Verifiable, VerificationKind, Verified, Verify,
+    VoteCount, VrfProof, WeightedTimestamp, WorkInFlight, local_settled_tx_hashes,
+    shard_reveal_sign, signed_bytes,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -229,37 +230,10 @@ enum SimEvent {
         block_hash: BlockHash,
         result: Result<Verified<QuorumCertificate>, QcVerifyError>,
     },
-    TransactionRootVerified {
+    BlockCheckCompleted {
         block_hash: BlockHash,
-        result: Result<Verified<TransactionRoot>, TxRootVerifyError>,
-    },
-    CertificateRootVerified {
-        block_hash: BlockHash,
-        result: Result<Verified<CertificateRoot>, RootMismatch<CertificateRoot>>,
-    },
-    LocalReceiptRootVerified {
-        block_hash: BlockHash,
-        result: Result<Verified<LocalReceiptRoot>, RootMismatch<LocalReceiptRoot>>,
-    },
-    ProvisionsRootVerified {
-        block_hash: BlockHash,
-        result: Result<Verified<ProvisionsRoot>, RootMismatch<ProvisionsRoot>>,
-    },
-    ProvisionTxRootsVerified {
-        block_hash: BlockHash,
-        result: Result<Verified<ProvisionTxRootsMap>, ProvisionTxRootsVerifyError>,
-    },
-    ReservationsVerified {
-        block_hash: BlockHash,
-    },
-    BeaconWitnessRootVerified {
-        block_hash: BlockHash,
-        result: Result<Verified<BeaconWitnessRoot>, BeaconWitnessRootVerifyError>,
-    },
-    StateRootVerified {
-        block_hash: BlockHash,
-        result: Result<Verified<StateRoot>, StateRootVerifyError>,
-        bytes_delta: i64,
+        kind: VerificationKind,
+        outcome: CheckOutcome,
     },
     BlockReadyToCommit {
         certified: Arc<Verified<CertifiedBlock>>,
@@ -269,6 +243,19 @@ enum SimEvent {
         block_hash: BlockHash,
         qc: Verified<QuorumCertificate>,
     },
+}
+
+/// The completion event the sim loops back for one check.
+const fn check_completed(block_hash: BlockHash, kind: VerificationKind, passed: bool) -> SimEvent {
+    SimEvent::BlockCheckCompleted {
+        block_hash,
+        kind,
+        outcome: if passed {
+            CheckOutcome::Checked { bytes_delta: 0 }
+        } else {
+            CheckOutcome::Refused
+        },
+    }
 }
 
 impl SimEvent {
@@ -282,14 +269,7 @@ impl SimEvent {
             Self::ProposalBuilt { .. } => "ProposalBuilt",
             Self::QcResult { .. } => "QcResult",
             Self::QcSignatureVerified { .. } => "QcSignatureVerified",
-            Self::TransactionRootVerified { .. } => "TransactionRootVerified",
-            Self::CertificateRootVerified { .. } => "CertificateRootVerified",
-            Self::LocalReceiptRootVerified { .. } => "LocalReceiptRootVerified",
-            Self::ProvisionsRootVerified { .. } => "ProvisionsRootVerified",
-            Self::ProvisionTxRootsVerified { .. } => "ProvisionTxRootsVerified",
-            Self::ReservationsVerified { .. } => "ReservationsVerified",
-            Self::BeaconWitnessRootVerified { .. } => "BeaconWitnessRootVerified",
-            Self::StateRootVerified { .. } => "StateRootVerified",
+            Self::BlockCheckCompleted { .. } => "BlockCheckCompleted",
             Self::BlockReadyToCommit { .. } => "BlockReadyToCommit",
             Self::QuorumCertificateFormed { .. } => "QuorumCertificateFormed",
         }
@@ -1184,32 +1164,11 @@ impl ShardCoordinatorSim {
             SimEvent::QcSignatureVerified { block_hash, result } => {
                 coord.on_qc_signature_verified(topology_schedule, block_hash, result)
             }
-            SimEvent::TransactionRootVerified { block_hash, result } => {
-                coord.on_transaction_root_verified(topology_schedule, block_hash, result)
-            }
-            SimEvent::CertificateRootVerified { block_hash, result } => {
-                coord.on_certificate_root_verified(topology_schedule, block_hash, result)
-            }
-            SimEvent::LocalReceiptRootVerified { block_hash, result } => {
-                coord.on_local_receipt_root_verified(topology_schedule, block_hash, result)
-            }
-            SimEvent::ProvisionsRootVerified { block_hash, result } => {
-                coord.on_provisions_root_verified(topology_schedule, block_hash, result)
-            }
-            SimEvent::ProvisionTxRootsVerified { block_hash, result } => {
-                coord.on_provision_tx_roots_verified(topology_schedule, block_hash, result)
-            }
-            SimEvent::ReservationsVerified { block_hash } => {
-                coord.on_reservations_verified(topology_schedule, block_hash, &Ok(()))
-            }
-            SimEvent::BeaconWitnessRootVerified { block_hash, result } => {
-                coord.on_beacon_witness_root_verified(topology_schedule, block_hash, result)
-            }
-            SimEvent::StateRootVerified {
+            SimEvent::BlockCheckCompleted {
                 block_hash,
-                result,
-                bytes_delta,
-            } => coord.on_state_root_verified(topology_schedule, block_hash, result, bytes_delta),
+                kind,
+                outcome,
+            } => coord.on_block_check_completed(topology_schedule, block_hash, kind, outcome),
             SimEvent::BlockReadyToCommit { certified, source } => {
                 coord.on_block_ready_to_commit(topology_schedule, certified, source)
             }
@@ -1666,7 +1625,11 @@ impl ShardCoordinatorSim {
                 let result = expected_root.verify(&tx_ctx);
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
-                    event: SimEvent::TransactionRootVerified { block_hash, result },
+                    event: check_completed(
+                        block_hash,
+                        VerificationKind::TransactionRoot,
+                        result.is_ok(),
+                    ),
                 });
             }
             Action::VerifyCertificateRoot {
@@ -1677,7 +1640,11 @@ impl ShardCoordinatorSim {
                 let result = expected_root.verify(certificates.as_slice());
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
-                    event: SimEvent::CertificateRootVerified { block_hash, result },
+                    event: check_completed(
+                        block_hash,
+                        VerificationKind::CertificateRoot,
+                        result.is_ok(),
+                    ),
                 });
             }
             Action::VerifyProvisionRoot {
@@ -1690,7 +1657,11 @@ impl ShardCoordinatorSim {
                 let result = expected_root.verify(raw_batch_hashes.as_slice());
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
-                    event: SimEvent::ProvisionsRootVerified { block_hash, result },
+                    event: check_completed(
+                        block_hash,
+                        VerificationKind::ProvisionRoot,
+                        result.is_ok(),
+                    ),
                 });
             }
             Action::VerifyProvisionTxRoots {
@@ -1709,7 +1680,11 @@ impl ShardCoordinatorSim {
                 let result = expected.verify(&ptx_ctx);
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
-                    event: SimEvent::ProvisionTxRootsVerified { block_hash, result },
+                    event: check_completed(
+                        block_hash,
+                        VerificationKind::ProvisionTxRoots,
+                        result.is_ok(),
+                    ),
                 });
             }
             // The mini-sim holds no substate store, so a payer's balance is
@@ -1719,7 +1694,11 @@ impl ShardCoordinatorSim {
             Action::VerifyReservations { block_hash, .. } => {
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
-                    event: SimEvent::ReservationsVerified { block_hash },
+                    event: SimEvent::BlockCheckCompleted {
+                        block_hash,
+                        kind: VerificationKind::Reservations,
+                        outcome: CheckOutcome::Checked { bytes_delta: 0 },
+                    },
                 });
             }
             Action::VerifyBeaconWitnessRoot {
@@ -1771,7 +1750,11 @@ impl ShardCoordinatorSim {
                 let result = expected_root.verify(&bw_ctx);
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
-                    event: SimEvent::BeaconWitnessRootVerified { block_hash, result },
+                    event: check_completed(
+                        block_hash,
+                        VerificationKind::BeaconWitnessRoot,
+                        result.is_ok(),
+                    ),
                 });
             }
             Action::VerifyStateRoot {
@@ -1804,10 +1787,11 @@ impl ShardCoordinatorSim {
                 let receipt_ok = receipt_result.is_ok();
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
-                    event: SimEvent::LocalReceiptRootVerified {
+                    event: check_completed(
                         block_hash,
-                        result: receipt_result,
-                    },
+                        VerificationKind::LocalReceiptRoot,
+                        receipt_result.is_ok(),
+                    ),
                 });
                 if !receipt_ok {
                     return;
@@ -1880,10 +1864,13 @@ impl ShardCoordinatorSim {
                 }
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
-                    event: SimEvent::StateRootVerified {
+                    event: SimEvent::BlockCheckCompleted {
                         block_hash,
-                        result: verify_result,
-                        bytes_delta,
+                        kind: VerificationKind::StateRoot,
+                        outcome: match verify_result {
+                            Ok(_) => CheckOutcome::Checked { bytes_delta },
+                            Err(_) => CheckOutcome::Refused,
+                        },
                     },
                 });
             }

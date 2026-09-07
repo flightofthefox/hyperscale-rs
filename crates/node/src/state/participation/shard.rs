@@ -147,47 +147,15 @@ impl ShardParticipation {
             } => self
                 .remote_headers_coordinator
                 .on_remote_header_qc_verified(topology_schedule, shard, height, sender, *result),
-            ProtocolEvent::TransactionRootVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_transaction_root_verified(topology_schedule, block_hash, result),
-            ProtocolEvent::CertificateRootVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_certificate_root_verified(topology_schedule, block_hash, result),
-            ProtocolEvent::LocalReceiptRootVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_local_receipt_root_verified(topology_schedule, block_hash, result),
-            ProtocolEvent::ProvisionsRootVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_provisions_root_verified(topology_schedule, block_hash, result),
-            ProtocolEvent::ProvisionTxRootsVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_provision_tx_roots_verified(topology_schedule, block_hash, result),
-            ProtocolEvent::ReservationsVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_reservations_verified(topology_schedule, block_hash, &result),
-            ProtocolEvent::StateProofsVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_state_proofs_verified(topology_schedule, block_hash, &result),
-            ProtocolEvent::ResolutionsVerified {
+            ProtocolEvent::BlockCheckCompleted {
                 block_hash,
-                verdict,
-            } => self.shard_coordinator.on_resolutions_verified(
+                kind,
+                outcome,
+            } => self.shard_coordinator.on_block_check_completed(
                 topology_schedule,
                 block_hash,
-                verdict,
-            ),
-            ProtocolEvent::BeaconWitnessRootVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_beacon_witness_root_verified(topology_schedule, block_hash, result),
-            ProtocolEvent::StateRootVerified {
-                block_hash,
-                result,
-                bytes_delta,
-            } => self.shard_coordinator.on_state_root_verified(
-                topology_schedule,
-                block_hash,
-                result,
-                bytes_delta,
+                kind,
+                outcome,
             ),
             ProtocolEvent::ProposalBuilt {
                 height,

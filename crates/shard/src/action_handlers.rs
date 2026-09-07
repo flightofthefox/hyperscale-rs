@@ -24,19 +24,19 @@ use hyperscale_types::{
     AbandonmentRecord, AbandonmentRoot, BeaconWitnessLeafCount, BeaconWitnessRootContext, Block,
     BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote,
     BlockVoteMessage, CertificateRoot, CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage,
-    CertifiedHeaderVerifyError, ConsensusPublicKey, ConsensusReceipt, Deadline, Derivation, Epoch,
-    Finalization, Hash, LocalReceiptRoot, NetworkDefinition, PreparedCommit,
-    PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal,
-    ReshapeTrigger, Resolutions, RevealChain, Round, ShardId, ShardLoad, SplitChildRoots,
-    StateProofBundle, StateProofsRoot, StateRoot, StateRootContext, StateRootVerifyError,
+    CertifiedHeaderVerifyError, CheckOutcome, ConsensusPublicKey, ConsensusReceipt, Deadline,
+    DeferOn, Derivation, Epoch, Finalization, Hash, LocalReceiptRoot, NetworkDefinition,
+    PreparedCommit, PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash,
+    ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext,
+    QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, ShardId,
+    ShardLoad, SplitChildRoots, StateProofBundle, StateProofsRoot, StateRoot, StateRootContext,
     Stopwatch, StoredReceipt, SubstateKey, SweepFrontier, TerminalRoots, Timeout, TimeoutContext,
     TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, UnsettledTx,
-    ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp,
-    Window, WitnessSources, WorkInFlight, absorb_committed_cells, commit_witness_window,
-    derive_leaves, local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
-    protocol_statics, shard_reveal_sign, signed_bytes, vrf_output_from_proof,
-    work_over_certificates,
+    ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof,
+    WeightedTimestamp, Window, WitnessSources, WorkInFlight, absorb_committed_cells,
+    commit_witness_window, derive_leaves, local_settled_tx_hashes,
+    missed_proposals_since_prev_commit, next_reveal_chain, protocol_statics, shard_reveal_sign,
+    signed_bytes, vrf_output_from_proof, work_over_certificates,
 };
 
 /// Result of QC verification and assembly.
@@ -466,6 +466,27 @@ fn split_child_roots_for_header(
 
 /// A package published in this block is usable by transactions admitted
 /// after it commits, and this is where that becomes true.
+/// The completion event for one check on `block_hash`: a pass, or a
+/// refusal logged with the verifier's reason.
+fn check_completed<T, E: std::fmt::Display>(
+    block_hash: BlockHash,
+    kind: VerificationKind,
+    result: Result<T, E>,
+) -> ProtocolEvent {
+    let outcome = match result {
+        Ok(_) => CheckOutcome::Checked { bytes_delta: 0 },
+        Err(reason) => {
+            tracing::warn!(?block_hash, ?kind, %reason, "Block check FAILED");
+            CheckOutcome::Refused
+        }
+    };
+    ProtocolEvent::BlockCheckCompleted {
+        block_hash,
+        kind,
+        outcome,
+    }
+}
+
 fn absorb_finalized_cells(ticks: &[Arc<Verifiable<Finalization>>], derivation: &dyn Derivation) {
     let receipts: Vec<Arc<ConsensusReceipt>> = ticks
         .iter()
@@ -618,10 +639,11 @@ where
                 "transaction_root",
                 start.elapsed().as_secs_f64(),
             );
-            if let Err(e) = &result {
-                tracing::warn!(?block_hash, reason = %e, "Transaction root verification FAILED");
-            }
-            ctx.notify_protocol(ProtocolEvent::TransactionRootVerified { block_hash, result });
+            ctx.notify_protocol(check_completed(
+                block_hash,
+                VerificationKind::TransactionRoot,
+                result,
+            ));
         }
 
         Action::VerifyProvisionTxRoots {
@@ -643,10 +665,11 @@ where
                 "provision_tx_roots",
                 start.elapsed().as_secs_f64(),
             );
-            if let Err(e) = &result {
-                tracing::warn!(?block_hash, reason = %e, "Provision tx-roots verification FAILED");
-            }
-            ctx.notify_protocol(ProtocolEvent::ProvisionTxRootsVerified { block_hash, result });
+            ctx.notify_protocol(check_completed(
+                block_hash,
+                VerificationKind::ProvisionTxRoots,
+                result,
+            ));
         }
 
         Action::VerifyReservations {
@@ -716,7 +739,11 @@ where
                     break;
                 }
             }
-            ctx.notify_protocol(ProtocolEvent::ReservationsVerified { block_hash, result });
+            ctx.notify_protocol(check_completed(
+                block_hash,
+                VerificationKind::Reservations,
+                result,
+            ));
         }
 
         Action::VerifyResolutions {
@@ -769,27 +796,44 @@ where
                 held.get(&tx_hash)
                     .map(|tx| Deadline::of_transaction(tx).passed(anchor))
             });
-            match verdict {
-                Resolutions::Wrong(tx_hash) => tracing::warn!(
-                    ?block_hash,
-                    ?tx_hash,
-                    "Resolutions verification FAILED: a record misstates a figure"
-                ),
-                Resolutions::Lapsed(tx_hash) => tracing::warn!(
-                    ?block_hash,
-                    ?tx_hash,
-                    "Resolutions verification FAILED: a finalization delivers past the lapse"
-                ),
-                Resolutions::Overdue(tx_hash) => tracing::warn!(
-                    ?block_hash,
-                    ?tx_hash,
-                    "Resolutions verification FAILED: a finalization succeeds past the deadline"
-                ),
-                Resolutions::Exact | Resolutions::Unknown(_) => {}
-            }
-            ctx.notify_protocol(ProtocolEvent::ResolutionsVerified {
+            // An exact answer passes; a wrong figure, a lapsed delivery
+            // or an overdue success refuses the block; a name this
+            // validator's store never held is neither — the check waits
+            // for the body.
+            let outcome = match verdict {
+                Resolutions::Exact => CheckOutcome::Checked { bytes_delta: 0 },
+                Resolutions::Wrong(tx_hash) => {
+                    tracing::warn!(
+                        ?block_hash,
+                        ?tx_hash,
+                        "Resolutions verification FAILED: a record misstates a figure"
+                    );
+                    CheckOutcome::Refused
+                }
+                Resolutions::Lapsed(tx_hash) => {
+                    tracing::warn!(
+                        ?block_hash,
+                        ?tx_hash,
+                        "Resolutions verification FAILED: a finalization delivers past the lapse"
+                    );
+                    CheckOutcome::Refused
+                }
+                Resolutions::Overdue(tx_hash) => {
+                    tracing::warn!(
+                        ?block_hash,
+                        ?tx_hash,
+                        "Resolutions verification FAILED: a finalization succeeds past the deadline"
+                    );
+                    CheckOutcome::Refused
+                }
+                Resolutions::Unknown(tx_hash) => {
+                    CheckOutcome::Deferred(DeferOn::Bodies(vec![tx_hash]))
+                }
+            };
+            ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
                 block_hash,
-                verdict,
+                kind: VerificationKind::Resolutions,
+                outcome,
             });
         }
 
@@ -808,10 +852,11 @@ where
                 })
             });
             record_signature_verification_latency("state_proofs", start.elapsed().as_secs_f64());
-            if let Err(reason) = &result {
-                tracing::warn!(?block_hash, %reason, "State proofs verification FAILED");
-            }
-            ctx.notify_protocol(ProtocolEvent::StateProofsVerified { block_hash, result });
+            ctx.notify_protocol(check_completed(
+                block_hash,
+                VerificationKind::StateProofs,
+                result,
+            ));
         }
 
         Action::VerifyProvisionRoot {
@@ -823,10 +868,11 @@ where
             let raw_batch_hashes: Vec<Hash> = batch_hashes.iter().map(|h| h.into_raw()).collect();
             let result = expected_root.verify(raw_batch_hashes.as_slice());
             record_signature_verification_latency("provision_root", start.elapsed().as_secs_f64());
-            if let Err(e) = &result {
-                tracing::warn!(?block_hash, reason = %e, "Provision root verification FAILED");
-            }
-            ctx.notify_protocol(ProtocolEvent::ProvisionsRootVerified { block_hash, result });
+            ctx.notify_protocol(check_completed(
+                block_hash,
+                VerificationKind::ProvisionRoot,
+                result,
+            ));
         }
 
         Action::VerifyCertificateRoot {
@@ -840,10 +886,11 @@ where
                 "certificate_root",
                 start.elapsed().as_secs_f64(),
             );
-            if let Err(e) = &result {
-                tracing::warn!(?block_hash, reason = %e, "Certificate root verification FAILED");
-            }
-            ctx.notify_protocol(ProtocolEvent::CertificateRootVerified { block_hash, result });
+            ctx.notify_protocol(check_completed(
+                block_hash,
+                VerificationKind::CertificateRoot,
+                result,
+            ));
         }
 
         Action::VerifyBeaconWitnessRoot {
@@ -903,7 +950,11 @@ where
                 "beacon_witness_root",
                 start.elapsed().as_secs_f64(),
             );
-            ctx.notify_protocol(ProtocolEvent::BeaconWitnessRootVerified { block_hash, result });
+            ctx.notify_protocol(check_completed(
+                block_hash,
+                VerificationKind::BeaconWitnessRoot,
+                result,
+            ));
         }
 
         Action::VerifyStateRoot {
@@ -930,7 +981,7 @@ where
             // `local_receipt_root`. If they diverge, JMT recomputation
             // can't match `state_root` either (receipts ARE the JMT input),
             // so short-circuit on the receipt-root failure alone — the
-            // pipeline rejects the block on the `LocalReceiptRootVerified`
+            // pipeline rejects the block on the receipt-root refusal
             // error without needing a synthetic state-root failure event.
             let stored_receipts: Vec<StoredReceipt> = finalizations
                 .iter()
@@ -944,13 +995,11 @@ where
                 receipt_start.elapsed().as_secs_f64(),
             );
             let receipt_root_valid = receipt_result.is_ok();
-            if let Err(e) = &receipt_result {
-                tracing::warn!(?block_hash, reason = %e, "Local receipt root verification FAILED");
-            }
-            ctx.notify_protocol(ProtocolEvent::LocalReceiptRootVerified {
+            ctx.notify_protocol(check_completed(
                 block_hash,
-                result: receipt_result,
-            });
+                VerificationKind::LocalReceiptRoot,
+                receipt_result,
+            ));
 
             if !receipt_root_valid {
                 return;
@@ -984,13 +1033,10 @@ where
                     ?computed_sweep_frontier,
                     "Rejecting block whose sweep frontier is not the one its interval produces"
                 );
-                ctx.notify_protocol(ProtocolEvent::StateRootVerified {
+                ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
                     block_hash,
-                    result: Err(StateRootVerifyError::SweepFrontierMismatch {
-                        expected: claimed_sweep_frontier,
-                        computed: computed_sweep_frontier,
-                    }),
-                    bytes_delta: 0,
+                    kind: VerificationKind::StateRoot,
+                    outcome: CheckOutcome::Refused,
                 });
                 return;
             }
@@ -1048,19 +1094,24 @@ where
                     settled_txs: local_settled_tx_hashes(&finalizations, ctx.shard),
                     committed_txs: block_tx_hashes,
                 });
-            } else if let Err(e) = &verify_result {
-                tracing::warn!(
-                    block_hash = ?block_hash,
-                    block_height = block_height.inner(),
-                    parent_block_height = parent_block_height.inner(),
-                    reason = %e,
-                    "State root verification FAILED"
-                );
             }
-            ctx.notify_protocol(ProtocolEvent::StateRootVerified {
+            let outcome = match verify_result {
+                Ok(_) => CheckOutcome::Checked { bytes_delta },
+                Err(e) => {
+                    tracing::warn!(
+                        block_hash = ?block_hash,
+                        block_height = block_height.inner(),
+                        parent_block_height = parent_block_height.inner(),
+                        reason = %e,
+                        "State root verification FAILED"
+                    );
+                    CheckOutcome::Refused
+                }
+            };
+            ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
                 block_hash,
-                result: verify_result,
-                bytes_delta,
+                kind: VerificationKind::StateRoot,
+                outcome,
             });
         }
 
