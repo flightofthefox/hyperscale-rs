@@ -21,9 +21,8 @@ use hyperscale_types::network::request::{
 };
 use hyperscale_types::network::response::CommittedTxVerdict;
 use hyperscale_types::{
-    BlockHeight, ExecutionCertificate, Finalization, FinalizationHash, MessageClass,
-    PredecessorTerminal, ProvisionHash, ShardId, StateAnchor, SubstateKey, TxHash, ValidatorId,
-    Verifiable,
+    Anchor, BlockHeight, ExecutionCertificate, Finalization, FinalizationHash, MessageClass,
+    PredecessorTerminal, ProvisionHash, ShardId, SubstateKey, TxHash, ValidatorId, Verifiable,
 };
 
 use crate::fetch::{Fetch, FetchBinding, partition_solicited};
@@ -47,7 +46,7 @@ pub type ProvisionFetch = Fetch<(ShardId, ShardId, BlockHeight)>;
 /// reconstruct, and its `committed_txs_root` is the key each absence
 /// proof is checked against.
 pub type CommittedTxFetch = Fetch<(PredecessorTerminal, TxHash)>;
-pub type StateProofFetch = Fetch<(StateAnchor, SubstateKey)>;
+pub type StateProofFetch = Fetch<(Anchor, SubstateKey)>;
 
 // ─── Bindings ──────────────────────────────────────────────────────────
 
@@ -449,7 +448,7 @@ impl FetchBinding for StateProofBinding {
     /// and one key whose presence under it is asked. The anchor rides
     /// whole because its root is what the answer is checked against
     /// before it reaches the coordinator.
-    type Id = (StateAnchor, SubstateKey);
+    type Id = (Anchor, SubstateKey);
 
     const NAME: &'static str = "state_proof";
 
@@ -469,7 +468,7 @@ impl FetchBinding for StateProofBinding {
         // A chunk is grouped by `(shard, preferred, class)`, which does
         // not separate two anchors of the same shard, and one proof
         // reconstructs exactly one root. Split by anchor here.
-        let mut by_anchor: BTreeMap<StateAnchor, Vec<SubstateKey>> = BTreeMap::new();
+        let mut by_anchor: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
         for (anchor, key) in ids {
             by_anchor.entry(anchor).or_default().push(key);
         }

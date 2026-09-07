@@ -84,7 +84,7 @@ impl Verify<&StateProofsRootContext<'_>> for StateProofsRoot {
 mod tests {
     use super::*;
     use crate::{
-        Address, AddressClass, BlockHeight, LocalKey, MerkleInclusionProof, ShardId, StateAnchor,
+        Address, AddressClass, Anchor, BlockHeight, LocalKey, MerkleInclusionProof, ShardId,
         StateRoot, SubstateKey, WeightedTimestamp,
     };
 
@@ -97,12 +97,12 @@ mod tests {
 
     fn bundle(height: u64, keys: &[u8], proof: &[u8]) -> StateProofBundle {
         StateProofBundle::new(
-            StateAnchor {
+            Anchor {
                 shard: ShardId::ROOT,
                 height: BlockHeight::new(height),
                 state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
+                ts: WeightedTimestamp::from_millis(height * 1_000),
             },
-            WeightedTimestamp::from_millis(height * 1_000),
             keys.iter().map(|seed| key(*seed)),
             MerkleInclusionProof::new(proof.to_vec()),
         )
@@ -131,7 +131,7 @@ mod tests {
             state_proofs_root_from_bundles(&[bundle(3, &[1, 2], b"q")])
         );
         let mut other_clock = bundle(3, &[1, 2], b"p");
-        other_clock.anchor_ts = WeightedTimestamp::from_millis(1);
+        other_clock.anchor.ts = WeightedTimestamp::from_millis(1);
         assert_ne!(base, state_proofs_root_from_bundles(&[other_clock]));
     }
 

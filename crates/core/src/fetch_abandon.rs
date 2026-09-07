@@ -11,8 +11,8 @@
 //! `FetchInput::Abandoned` on the corresponding binding.
 
 use hyperscale_types::{
-    BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, PredecessorTerminal, ProvisionHash,
-    ShardId, StateAnchor, SubstateKey, TxHash, ValidatorId,
+    Anchor, BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, PredecessorTerminal,
+    ProvisionHash, ShardId, SubstateKey, TxHash, ValidatorId,
 };
 
 /// Fetch-cancel family — one variant per payload type. Variants are added
@@ -88,7 +88,7 @@ pub enum FetchAbandon {
     /// serves the height does not pin the slot for the process's life.
     StateProofs {
         /// `(anchor, key)` pairs whose probe should stop.
-        ids: Vec<(StateAnchor, SubstateKey)>,
+        ids: Vec<(Anchor, SubstateKey)>,
     },
     /// Missing-proposal fetch keyed by `(epoch, validator)`. Emitted by
     /// the beacon coordinator when a pending commit-assembly stash is

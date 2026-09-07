@@ -17,9 +17,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_metrics::record_verdict_claim_deferred;
 use hyperscale_types::{
-    AbandonmentRecord, BlockHash, CounterpartEvidence, CounterpartMirror, Epoch, FinalizationHash,
-    Hash, Heard, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
-    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr, ProposerTimestamp, ProvenAnchor,
+    AbandonmentRecord, Anchor, BlockHash, CounterpartEvidence, CounterpartMirror, Epoch,
+    FinalizationHash, Hash, Heard, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
+    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr, ProposerTimestamp,
     ProvenAnchors, ProvisionHash, Question, ReadySignal, ReshapeThresholds, ReshapeTrigger,
     Resolutions, ScheduleLookup, SettledSetVerdict, ShardId, SplitAtBoundary, StateProofBundle,
     StoredReceipt, SubstateKey, TxClaim, TxOutcome, UnsettledTx, WeightedTimestamp, WorkInFlight,
@@ -473,12 +473,6 @@ pub struct ShardCoordinator {
     proven_anchors: Arc<ProvenAnchors>,
 }
 
-/// Whether `bundle` names `held`: the root its anchor claims and the
-/// clock it dates the answer to are both the header's.
-fn names(held: ProvenAnchor, bundle: &StateProofBundle) -> bool {
-    held.state_root == bundle.anchor.state_root && held.ts == bundle.anchor_ts
-}
-
 impl std::fmt::Debug for ShardCoordinator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShardCoordinator")
@@ -929,14 +923,8 @@ impl ShardCoordinator {
 
     /// Mirror a commit-proven remote header for everything that asks
     /// whether this node has proven a counterpart's height.
-    pub fn record_proven_anchor(
-        &mut self,
-        shard: ShardId,
-        height: BlockHeight,
-        state_root: StateRoot,
-        ts: WeightedTimestamp,
-    ) {
-        self.proven_anchors.record(shard, height, state_root, ts);
+    pub fn record_proven_anchor(&mut self, anchor: Anchor) {
+        self.proven_anchors.record(anchor);
     }
 
     /// The counterpart mirror the vote fence reads, for the execution
@@ -986,7 +974,8 @@ impl ShardCoordinator {
     }
 
     /// Whether a bundle's anchor is one this voter has commit-proven, and
-    /// whether it agrees with the header held for it.
+    /// whether every term of it — the root and the clock — agrees with
+    /// the header held for it.
     fn anchor_stands(
         &self,
         bundle: &StateProofBundle,
@@ -995,7 +984,7 @@ impl ShardCoordinator {
     ) -> bool {
         let anchor = bundle.anchor;
         match self.proven_anchors.at(anchor.shard, anchor.height) {
-            Some(held) if names(held, bundle) => true,
+            Some(held) if held == anchor => true,
             Some(held) => {
                 warn!(
                     validator = ?self.me,
@@ -1004,7 +993,7 @@ impl ShardCoordinator {
                     height = anchor.height.inner(),
                     claimed_root = ?anchor.state_root,
                     held_root = ?held.state_root,
-                    claimed_ts = ?bundle.anchor_ts,
+                    claimed_ts = ?anchor.ts,
                     held_ts = ?held.ts,
                     "State proof names an anchor this validator's commit-proven header \
                      disagrees with — not voting"
@@ -11869,14 +11858,14 @@ mod tests {
     /// A bundle against `shard` at height 5 under the root `root` names,
     /// claiming the anchor's clock is `ts_ms`.
     fn bundle_against(shard: ShardId, root: &[u8], ts_ms: u64) -> StateProofBundle {
-        use hyperscale_types::{MerkleInclusionProof, StateAnchor};
+        use hyperscale_types::MerkleInclusionProof;
         StateProofBundle::new(
-            StateAnchor {
+            Anchor {
                 shard,
                 height: BlockHeight::new(5),
                 state_root: StateRoot::from_raw(Hash::from_bytes(root)),
+                ts: WeightedTimestamp::from_millis(ts_ms),
             },
-            WeightedTimestamp::from_millis(ts_ms),
             [stub_abort_charge(1).vault],
             MerkleInclusionProof::dummy(),
         )
@@ -11913,12 +11902,12 @@ mod tests {
     fn a_state_proof_disagreeing_with_the_held_header_is_refused() {
         let mut coord = fence_coordinator();
         let peer = ShardId::leaf(1, 1);
-        coord.record_proven_anchor(
-            peer,
-            BlockHeight::new(5),
-            StateRoot::from_raw(Hash::from_bytes(b"root")),
-            WeightedTimestamp::from_millis(5_000),
-        );
+        coord.record_proven_anchor(Anchor {
+            shard: peer,
+            height: BlockHeight::new(5),
+            state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
+            ts: WeightedTimestamp::from_millis(5_000),
+        });
 
         let other_root = block_with_state_proofs(vec![bundle_against(peer, b"other", 5_000)]);
         assert!(

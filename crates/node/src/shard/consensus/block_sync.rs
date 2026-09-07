@@ -681,14 +681,14 @@ mod tests {
     /// block whose answers are not the chain's.
     #[test]
     fn validate_binds_state_proofs_in_both_directions() {
-        use hyperscale_types::{MerkleInclusionProof, StateAnchor, StateProofBundle, StateRoot};
+        use hyperscale_types::{Anchor, MerkleInclusionProof, StateProofBundle, StateRoot};
         let bundles = vec![StateProofBundle::new(
-            StateAnchor {
+            Anchor {
                 shard: ShardId::leaf(1, 0),
                 height: BlockHeight::new(3),
                 state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
+                ts: WeightedTimestamp::from_millis(3_000),
             },
-            WeightedTimestamp::from_millis(3_000),
             [stub_abort_charge(1).vault],
             MerkleInclusionProof::dummy(),
         )];

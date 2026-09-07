@@ -24,10 +24,10 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Address, BlockHeight, CounterpartEvidence, Deadline,
-    Finalization, MAX_VALIDITY_RANGE, Probed, Question, ShardId, ShardTrie, StateAnchor,
-    SubstateKey, Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable,
-    Verified, WeightedTimestamp, Window, Word,
+    AbandonmentRecord, AbortCharge, Address, Anchor, BlockHeight, CounterpartEvidence, Deadline,
+    Finalization, MAX_VALIDITY_RANGE, Probed, Question, ShardId, ShardTrie, SubstateKey,
+    Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
+    WeightedTimestamp, Window, Word,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -44,33 +44,45 @@ pub struct Abandonable {
     pub charge: AbortCharge,
 }
 
-/// What this shard has asked a silent counterpart about one transaction:
-/// a proof of `key` against `anchor`, whose block sits at `probed_wt`.
+/// Where a question this shard put to a counterpart about one cell
+/// stands.
 ///
 /// A probe is the fetch and nothing more. Its answer is read off the
-/// block that carries the proof, by every replica alike, so the probe
-/// stays only to keep the question from being asked twice of one
-/// header: `answered` once the fetch returned and its bytes are waiting
-/// to be offered in a block.
+/// block that carries the proof, by every replica alike, so the
+/// standing is kept only so one header is asked once: a question in
+/// flight is left alone, one whose fetch has answered is moved on to a
+/// newer header, and one the chain has answered is never asked again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Probe {
-    pub anchor: StateAnchor,
-    pub key: SubstateKey,
-    pub probed_wt: WeightedTimestamp,
-    pub probed: Probed,
-    pub answered: bool,
+pub enum Standing {
+    /// A fetch of `key` against `anchor` is out.
+    Asked {
+        /// The commit-proven state the proof is asked against.
+        anchor: Anchor,
+        /// The cell asked about.
+        key: SubstateKey,
+    },
+    /// The fetch against `anchor` returned, and its bytes are waiting to
+    /// be offered in a block.
+    Answered(Anchor),
+    /// The chain answered.
+    Closed,
 }
 
-/// Let go of every fetch `owed` still has out, so a counterpart that
-/// never serves the height does not pin the slot.
-fn release_fetches(released: &mut Vec<(StateAnchor, SubstateKey)>, owed: &Owed) {
-    released.extend(
-        owed.asked
-            .probes
-            .values()
-            .filter(|probe| !probe.answered)
-            .map(|probe| (probe.anchor, probe.key)),
-    );
+/// What closing a question released: the fetch still out for it, if
+/// any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Released(pub Option<(Anchor, SubstateKey)>);
+
+/// The fetches `owed` still has out, for the caller to let go of so a
+/// counterpart that never serves the height does not pin the slot.
+fn outstanding_fetches(owed: &Owed) -> impl Iterator<Item = (Anchor, SubstateKey)> + '_ {
+    owed.asked
+        .cells
+        .values()
+        .filter_map(|standing| match standing {
+            Standing::Asked { anchor, key } => Some((*anchor, *key)),
+            Standing::Answered(_) | Standing::Closed => None,
+        })
 }
 
 /// One committed transaction's outstanding account.
@@ -176,13 +188,10 @@ struct Asked {
     /// saying it succeeded is not the transaction accepted — that is
     /// every core shard saying so, and this is the count.
     accepted: BTreeSet<ShardId>,
-    /// What this validator has asked a silent counterpart, by cell: its
-    /// own fetch and nothing more, so one header is asked once.
-    probes: BTreeMap<(ShardId, Probed), Probe>,
-    /// The cells the chain has answered, whichever way. A closed
-    /// question is never asked again, and what the answer *was* is the
-    /// mirror's to say.
-    answered: BTreeSet<(ShardId, Probed)>,
+    /// Where each question this validator has put to a counterpart
+    /// about a cell stands. What the answer *was* is the mirror's to
+    /// say.
+    cells: BTreeMap<(ShardId, Probed), Standing>,
 }
 
 /// What a tick of this shard's composed over a leg entry's records.
@@ -261,6 +270,17 @@ pub struct Unanswerable {
     /// Whether a committed record had named it unsettled by a departed
     /// counterpart.
     pub covered_by_record: bool,
+}
+
+/// What a prune let go of: the transactions dropped without an outcome,
+/// and the fetches still out for entries that went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pruned {
+    /// The transactions dropped because every counterpart fell silent.
+    pub unanswerable: Vec<Unanswerable>,
+    /// The fetches this validator had out for entries that went, for
+    /// the caller to let go of.
+    pub released: Vec<(Anchor, SubstateKey)>,
 }
 
 /// What this shard's part in a transaction is.
@@ -404,14 +424,6 @@ pub struct UnresolvedTxs {
     /// the schedule window that proves the terminal, which is retained on
     /// a frontier of its own.
     departed: BTreeMap<ShardId, Departure>,
-    /// Fetches that were still out when the question they asked stopped
-    /// mattering — the entry released, or the chain answering first.
-    ///
-    /// A probe is this validator's own fetch, so releasing it is an
-    /// action rather than a fact, and the ledger states which ones it
-    /// let go rather than leaving the caller to diff for them. Drained
-    /// each commit; nothing reads it twice.
-    released_fetches: Vec<(StateAnchor, SubstateKey)>,
 }
 
 impl UnresolvedTxs {
@@ -620,9 +632,12 @@ impl UnresolvedTxs {
     /// again.
     #[must_use]
     pub fn answered(&self, tx_hash: TxHash, shard: ShardId, probed: Probed) -> bool {
-        self.owed
-            .get(&tx_hash)
-            .is_some_and(|owed| owed.asked.answered.contains(&(shard, probed)))
+        self.owed.get(&tx_hash).is_some_and(|owed| {
+            matches!(
+                owed.asked.cells.get(&(shard, probed)),
+                Some(Standing::Closed)
+            )
+        })
     }
 
     /// Whether a probe of that cell is already out, or already answered
@@ -643,67 +658,75 @@ impl UnresolvedTxs {
     ) -> bool {
         self.owed
             .get(&tx_hash)
-            .and_then(|owed| owed.asked.probes.get(&(shard, probed)))
-            .is_some_and(|probe| !probe.answered || probe.anchor.height >= height)
+            .and_then(|owed| owed.asked.cells.get(&(shard, probed)))
+            .is_some_and(|standing| match standing {
+                Standing::Asked { .. } | Standing::Closed => true,
+                Standing::Answered(anchor) => anchor.height >= height,
+            })
     }
 
-    /// Put a question to a counterpart, replacing whatever stood.
-    pub fn record_probe(&mut self, tx_hash: TxHash, shard: ShardId, probe: Probe) {
+    /// Put a question to a counterpart, replacing whatever stood: a
+    /// fetch of `key` against `anchor`.
+    pub fn record_probe(
+        &mut self,
+        tx_hash: TxHash,
+        shard: ShardId,
+        probed: Probed,
+        anchor: Anchor,
+        key: SubstateKey,
+    ) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
-            owed.asked.probes.insert((shard, probe.probed), probe);
+            owed.asked
+                .cells
+                .insert((shard, probed), Standing::Asked { anchor, key });
         }
     }
 
-    /// Mark every probe this proof spoke to as answered, and name the
-    /// transactions it answered for with the clock its header sat at.
+    /// Mark every question this proof spoke to as answered, and name
+    /// the transactions it answered for.
     ///
     /// The fetch is only how the proposer comes by the bytes: nothing is
     /// decided here, since the answer is the chain's once a block carries
     /// the proof.
     pub fn mark_probes_answered(
         &mut self,
-        anchor: StateAnchor,
+        anchor: Anchor,
         keys: &[SubstateKey],
-    ) -> (BTreeSet<TxHash>, Option<WeightedTimestamp>) {
+    ) -> BTreeSet<TxHash> {
         let mut answered = BTreeSet::new();
-        let mut anchor_ts = None;
         for (&tx_hash, owed) in &mut self.owed {
-            for probe in owed.asked.probes.values_mut() {
-                if probe.anchor == anchor && keys.contains(&probe.key) {
-                    probe.answered = true;
+            for standing in owed.asked.cells.values_mut() {
+                if let Standing::Asked { anchor: asked, key } = standing
+                    && *asked == anchor
+                    && keys.contains(key)
+                {
+                    *standing = Standing::Answered(anchor);
                     answered.insert(tx_hash);
-                    anchor_ts = Some(probe.probed_wt);
                 }
             }
         }
-        (answered, anchor_ts)
+        answered
     }
 
     /// Close the question `probed` asks of `shard` about `tx_hash`,
-    /// releasing any fetch of this validator's still out for it.
+    /// naming any fetch of this validator's still out for it so the
+    /// caller can let it go.
     ///
-    /// First proof wins: `false` says the cell was already answered, and
+    /// First proof wins: `None` says the cell was already answered, and
     /// a later proof adds nothing.
-    pub fn close_question(&mut self, tx_hash: TxHash, shard: ShardId, probed: Probed) -> bool {
-        let Some(owed) = self.owed.get_mut(&tx_hash) else {
-            return false;
+    pub fn close_question(
+        &mut self,
+        tx_hash: TxHash,
+        shard: ShardId,
+        probed: Probed,
+    ) -> Option<Released> {
+        let owed = self.owed.get_mut(&tx_hash)?;
+        let released = match owed.asked.cells.insert((shard, probed), Standing::Closed) {
+            Some(Standing::Closed) => return None,
+            Some(Standing::Asked { anchor, key }) => Some((anchor, key)),
+            Some(Standing::Answered(_)) | None => None,
         };
-        if let Some(probe) = owed.asked.probes.remove(&(shard, probed))
-            && !probe.answered
-        {
-            self.released_fetches.push((probe.anchor, probe.key));
-        }
-        self.owed
-            .get_mut(&tx_hash)
-            .expect("held above")
-            .asked
-            .answered
-            .insert((shard, probed))
-    }
-
-    /// The fetches the ledger has let go since this was last asked.
-    pub fn take_released_fetches(&mut self) -> Vec<(StateAnchor, SubstateKey)> {
-        std::mem::take(&mut self.released_fetches)
+        Some(Released(released))
     }
 
     /// The leg entries whose counterparts may now be asked whether they
@@ -1202,7 +1225,11 @@ impl UnresolvedTxs {
     /// the retirement. A leg that failed is the transaction's end on
     /// this shard — it issued nothing, so there is nothing to reclaim —
     /// and its own finalization releases it.
-    pub fn release_resolved(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
+    pub fn release_resolved(
+        &mut self,
+        finalizations: &[Arc<Verifiable<Finalization>>],
+    ) -> Vec<(Anchor, SubstateKey)> {
+        let mut released = Vec::new();
         for finalization in finalizations {
             let deciding: BTreeSet<TxHash> = finalization.deciding_tx_hashes().collect();
             for (tx_hash, decision) in finalization.tx_decisions() {
@@ -1232,12 +1259,13 @@ impl UnresolvedTxs {
                     owed.charged = true;
                 } else {
                     if let Some(gone) = self.owed.remove(&tx_hash) {
-                        release_fetches(&mut self.released_fetches, &gone);
+                        released.extend(outstanding_fetches(&gone));
                     }
                     self.kept.remove(&tx_hash);
                 }
             }
         }
+        released
     }
 
     /// The transactions a verdict of this shard's can still speak for,
@@ -1326,8 +1354,9 @@ impl UnresolvedTxs {
     /// from one that never had the evidence to compose it. A leg entry
     /// dropped at its horizon is not among them: its reservation came
     /// back with its own finalization, so nothing leaks with it.
-    pub fn prune(&mut self, now: WeightedTimestamp) -> Vec<Unanswerable> {
+    pub fn prune(&mut self, now: WeightedTimestamp) -> Pruned {
         let mut unanswerable = Vec::new();
+        let mut released = Vec::new();
         let (kept, dropped): (BTreeMap<TxHash, Owed>, BTreeMap<TxHash, Owed>) =
             std::mem::take(&mut self.owed)
                 .into_iter()
@@ -1377,7 +1406,7 @@ impl UnresolvedTxs {
                 });
         self.owed = kept;
         for owed in dropped.values() {
-            release_fetches(&mut self.released_fetches, owed);
+            released.extend(outstanding_fetches(owed));
         }
         let owed = &self.owed;
         self.kept.retain(|tx_hash, _| owed.contains_key(tx_hash));
@@ -1401,7 +1430,10 @@ impl UnresolvedTxs {
             })
         });
 
-        unanswerable
+        Pruned {
+            unanswerable,
+            released,
+        }
     }
 
     #[must_use]
@@ -1727,11 +1759,13 @@ mod tests {
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
         assert!(
-            ledger.prune(expiry(cut)).is_empty(),
+            ledger.prune(expiry(cut)).unanswerable.is_empty(),
             "while the set still reads, the strand is nobody's to release",
         );
         assert_eq!(
-            ledger.prune(expiry(cut).plus(Duration::from_millis(1))),
+            ledger
+                .prune(expiry(cut).plus(Duration::from_millis(1)))
+                .unanswerable,
             vec![Unanswerable {
                 tx_hash: tx.hash(),
                 covered_by_record: false,
@@ -1764,7 +1798,9 @@ mod tests {
         );
 
         assert_eq!(
-            ledger.prune(expiry(cut).plus(Duration::from_millis(1))),
+            ledger
+                .prune(expiry(cut).plus(Duration::from_millis(1)))
+                .unanswerable,
             vec![Unanswerable {
                 tx_hash: tx.hash(),
                 covered_by_record: true,
@@ -1825,13 +1861,15 @@ mod tests {
         )]);
 
         assert!(
-            ledger.prune(cut).is_empty(),
+            ledger.prune(cut).unanswerable.is_empty(),
             "the transaction's own deadline is long past, and decides nothing here",
         );
         assert_eq!(ledger.len(), 1);
 
         assert_eq!(
-            ledger.prune(expiry(cut).plus(Duration::from_millis(1))),
+            ledger
+                .prune(expiry(cut).plus(Duration::from_millis(1)))
+                .unanswerable,
             vec![Unanswerable {
                 tx_hash: tx.hash(),
                 covered_by_record: true,
@@ -1906,11 +1944,14 @@ mod tests {
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         assert!(
-            ledger.prune(deadline).is_empty(),
+            ledger.prune(deadline).unanswerable.is_empty(),
             "not yet past its own window",
         );
         assert!(
-            ledger.prune(deadline.plus(MAX_VALIDITY_RANGE)).is_empty(),
+            ledger
+                .prune(deadline.plus(MAX_VALIDITY_RANGE))
+                .unanswerable
+                .is_empty(),
             "and gone at that window's end without ever being a strand",
         );
         assert_eq!(ledger.len(), 0);
@@ -2006,6 +2047,7 @@ mod tests {
         assert!(
             ledger
                 .prune(expiry(stale).plus(MAX_VALIDITY_RANGE))
+                .unanswerable
                 .is_empty(),
             "the shard owning the prefix at commit is the successor, still running",
         );
@@ -2033,14 +2075,14 @@ mod tests {
 
         let far = expiry(cut).plus(EPOCH_DURATION * 100);
         assert!(
-            ledger.prune(far).is_empty(),
+            ledger.prune(far).unanswerable.is_empty(),
             "an open window holds the covered entry"
         );
         assert_eq!(ledger.len(), 1);
 
         ledger.stamp_terminal(PARTNER, expiry(cut));
         assert!(ledger.unstamped_departures().is_empty());
-        let dropped = ledger.prune(far);
+        let dropped = ledger.prune(far).unanswerable;
         assert_eq!(
             dropped,
             vec![Unanswerable {
@@ -2588,7 +2630,7 @@ mod tests {
         let horizon = ms(60_000)
             .plus(MAX_FINALIZATION_DELAY)
             .plus(MAX_VALIDITY_RANGE * 2);
-        assert!(ledger.prune(horizon).is_empty());
+        assert!(ledger.prune(horizon).unanswerable.is_empty());
         assert_eq!(ledger.len(), 0, "gone at its horizon");
     }
 
@@ -2616,6 +2658,7 @@ mod tests {
             assert!(
                 ledger
                     .prune(horizon.minus(Duration::from_millis(1)))
+                    .unanswerable
                     .is_empty()
             );
             assert_eq!(
@@ -2624,7 +2667,7 @@ mod tests {
                 "covered={covered}: it stands short of its horizon"
             );
             assert!(
-                ledger.prune(horizon).is_empty(),
+                ledger.prune(horizon).unanswerable.is_empty(),
                 "covered={covered}: and leaks no reservation going"
             );
             assert_eq!(ledger.len(), 0, "covered={covered}: gone at its horizon");

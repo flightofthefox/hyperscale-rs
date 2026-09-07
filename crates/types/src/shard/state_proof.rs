@@ -14,24 +14,18 @@
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    Inclusion, MAX_COMMITTED_TX_QUERY, MerkleInclusionProof, StateAnchor, StateProofError,
-    SubstateKey, WeightedTimestamp,
+    Anchor, Inclusion, MAX_COMMITTED_TX_QUERY, MerkleInclusionProof, StateProofError, SubstateKey,
 };
 
 /// One fetch's answer: a multiproof over `keys` against `anchor`.
 ///
-/// The anchor names the shard, the height and the root the proof
-/// reconstructs; `anchor_ts` is the anchor's block clock, which a voter
-/// holds to the commit-proven header it has for the anchor, so a window
-/// read off it at commit is read off chain content and never the
-/// proposer's word.
+/// The anchor names the shard, the height, the root the proof
+/// reconstructs and the block's clock, every term of which a voter
+/// holds to the commit-proven header it has for the height.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hbor)]
 pub struct StateProofBundle {
     /// The commit-proven state the proof reconstructs.
-    pub anchor: StateAnchor,
-    /// The anchor's parent-QC weighted timestamp: the clock every
-    /// window the answer is held to is read against.
-    pub anchor_ts: WeightedTimestamp,
+    pub anchor: Anchor,
     /// The keys the proof answers for, sorted and without repeats.
     #[hbor(max = MAX_COMMITTED_TX_QUERY)]
     pub keys: Vec<SubstateKey>,
@@ -43,8 +37,7 @@ impl StateProofBundle {
     /// A bundle over `keys`, in the one order it may carry them.
     #[must_use]
     pub fn new(
-        anchor: StateAnchor,
-        anchor_ts: WeightedTimestamp,
+        anchor: Anchor,
         keys: impl IntoIterator<Item = SubstateKey>,
         proof: MerkleInclusionProof,
     ) -> Self {
@@ -53,7 +46,6 @@ impl StateProofBundle {
         keys.dedup();
         Self {
             anchor,
-            anchor_ts,
             keys,
             proof,
         }
@@ -87,7 +79,9 @@ impl StateProofBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Address, AddressClass, BlockHeight, Hash, LocalKey, ShardId, StateRoot};
+    use crate::{
+        Address, AddressClass, BlockHeight, Hash, LocalKey, ShardId, StateRoot, WeightedTimestamp,
+    };
 
     fn key(seed: u8) -> SubstateKey {
         SubstateKey {
@@ -96,11 +90,12 @@ mod tests {
         }
     }
 
-    fn anchor() -> StateAnchor {
-        StateAnchor {
+    fn anchor() -> Anchor {
+        Anchor {
             shard: ShardId::ROOT,
             height: BlockHeight::new(3),
             state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
+            ts: WeightedTimestamp::ZERO,
         }
     }
 
@@ -110,13 +105,11 @@ mod tests {
     fn a_bundle_is_built_in_its_canonical_order() {
         let jumbled = StateProofBundle::new(
             anchor(),
-            WeightedTimestamp::ZERO,
             [key(3), key(1), key(3), key(2)],
             MerkleInclusionProof::dummy(),
         );
         let ordered = StateProofBundle::new(
             anchor(),
-            WeightedTimestamp::ZERO,
             [key(1), key(2), key(3)],
             MerkleInclusionProof::dummy(),
         );
@@ -130,7 +123,6 @@ mod tests {
     fn a_bundle_out_of_its_form_is_refused() {
         let over = |keys: Vec<SubstateKey>| StateProofBundle {
             anchor: anchor(),
-            anchor_ts: WeightedTimestamp::ZERO,
             keys,
             proof: MerkleInclusionProof::dummy(),
         };

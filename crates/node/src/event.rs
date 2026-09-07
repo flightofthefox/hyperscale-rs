@@ -21,11 +21,11 @@ use std::sync::Arc;
 use hyperscale_core::{CommitSource, ProtocolEvent};
 use hyperscale_network::RequestError;
 use hyperscale_types::{
-    Address, BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
-    CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ElidedCertifiedBlock, Epoch,
-    FinalizationHash, Hash, HeaderFetchCount, LeafIndex, PredecessorTerminal, ProvisionHash,
-    ShardForkProof, ShardId, ShardVoteEquivocation, StateAnchor, SubstateKey, Transaction, TxHash,
-    ValidatorId, Verifiable, Verified,
+    Address, Anchor, BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock,
+    CertifiedBlock, CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature,
+    ElidedCertifiedBlock, Epoch, FinalizationHash, Hash, HeaderFetchCount, LeafIndex,
+    PredecessorTerminal, ProvisionHash, ShardForkProof, ShardId, ShardVoteEquivocation,
+    SubstateKey, Transaction, TxHash, ValidatorId, Verifiable, Verified,
 };
 
 use crate::shard::commit::QcOnlyDivergence;
@@ -452,7 +452,7 @@ pub enum ShardScopedInput {
     /// isn't.
     StateProofFetchFailed {
         /// `(anchor, key)` pairs still owed an answer.
-        ids: Vec<(StateAnchor, SubstateKey)>,
+        ids: Vec<(Anchor, SubstateKey)>,
     },
 
     /// A state-proof query was answered and verified: release the fetch
@@ -461,7 +461,7 @@ pub enum ShardScopedInput {
     /// accompanying `ProtocolEvent::FetchedStateProofVerified`.
     StateProofFetchFulfilled {
         /// `(anchor, key)` pairs the response answered.
-        ids: Vec<(StateAnchor, SubstateKey)>,
+        ids: Vec<(Anchor, SubstateKey)>,
     },
 
     /// A shard-witness chunk fetch failed (network error, empty response,

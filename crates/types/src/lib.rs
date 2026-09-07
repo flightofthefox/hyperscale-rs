@@ -148,6 +148,7 @@ pub use shard::abandonment::{
     AbandonmentRecord, AbortCharge, CounterpartEvidence, Heard, Question, Resolutions, UnsettledTx,
     Word,
 };
+pub use shard::anchor::Anchor;
 pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch, LinkageError};
 pub use shard::certified_header::{CertifiedBlockHeader, CertifiedHeaderVerifyError};
 pub use shard::chain_origin::{ChainOrigin, PredecessorTerminal};
@@ -174,7 +175,7 @@ pub use shard::limits::{
 };
 pub use shard::load::ShardLoad;
 pub use shard::manifest::{BlockManifest, BlockMetadata};
-pub use shard::proven_anchors::{ProvenAnchor, ProvenAnchors};
+pub use shard::proven_anchors::ProvenAnchors;
 pub use shard::quorum_certificate::{QcContext, QcVerifyError, QuorumCertificate};
 pub use shard::reshape::{ReshapeThresholds, ReshapeTrigger};
 pub use shard::roots::{
@@ -191,7 +192,6 @@ pub use shard::roots::{
     next_reveal_chain, prove_committed_tx_absent, ready_leaf_payload, settled_txs_root_from_hashes,
     state_proofs_root_from_bundles,
 };
-pub use shard::state_anchor::StateAnchor;
 pub use shard::state_proof::StateProofBundle;
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};

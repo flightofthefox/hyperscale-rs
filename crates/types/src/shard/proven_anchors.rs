@@ -33,25 +33,13 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
-use crate::{BlockHeight, RETENTION_HORIZON, ShardId, StateRoot, WeightedTimestamp};
-
-/// One commit-proven remote header, projected to what its consumers ask.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProvenAnchor {
-    /// The state root the header commits to — what a proof taken against
-    /// this height must reconstruct.
-    pub state_root: StateRoot,
-    /// The header's parent-QC weighted timestamp: the clock every window
-    /// an answer at this anchor is held to is read against, and the one
-    /// this anchor is retired on.
-    pub ts: WeightedTimestamp,
-}
+use crate::{Anchor, BlockHeight, RETENTION_HORIZON, ShardId, WeightedTimestamp};
 
 /// Every commit-proven remote header this node holds, by shard and
 /// height.
 #[derive(Debug, Default)]
 pub struct ProvenAnchors {
-    by_height: RwLock<BTreeMap<(ShardId, BlockHeight), ProvenAnchor>>,
+    by_height: RwLock<BTreeMap<(ShardId, BlockHeight), Anchor>>,
 }
 
 impl ProvenAnchors {
@@ -67,17 +55,11 @@ impl ProvenAnchors {
     ///
     /// If the lock is poisoned, which means a consumer panicked holding
     /// it — the node is already unsound at that point.
-    pub fn record(
-        &self,
-        shard: ShardId,
-        height: BlockHeight,
-        state_root: StateRoot,
-        ts: WeightedTimestamp,
-    ) {
+    pub fn record(&self, anchor: Anchor) {
         self.by_height
             .write()
             .expect("proven anchors lock poisoned")
-            .insert((shard, height), ProvenAnchor { state_root, ts });
+            .insert((anchor.shard, anchor.height), anchor);
     }
 
     /// The anchor at `(shard, height)`, if this node has proven it.
@@ -86,7 +68,7 @@ impl ProvenAnchors {
     ///
     /// As [`Self::record`].
     #[must_use]
-    pub fn at(&self, shard: ShardId, height: BlockHeight) -> Option<ProvenAnchor> {
+    pub fn at(&self, shard: ShardId, height: BlockHeight) -> Option<Anchor> {
         self.by_height
             .read()
             .expect("proven anchors lock poisoned")
@@ -106,14 +88,14 @@ impl ProvenAnchors {
         &self,
         shard: ShardId,
         licensed: impl Fn(WeightedTimestamp) -> bool,
-    ) -> Option<(BlockHeight, ProvenAnchor)> {
+    ) -> Option<Anchor> {
         self.by_height
             .read()
             .expect("proven anchors lock poisoned")
-            .iter()
-            .filter(|((at, _), anchor)| *at == shard && licensed(anchor.ts))
-            .map(|((_, height), anchor)| (*height, *anchor))
-            .max_by_key(|(height, _)| *height)
+            .values()
+            .filter(|anchor| anchor.shard == shard && licensed(anchor.ts))
+            .max_by_key(|anchor| anchor.height)
+            .copied()
     }
 
     /// How many anchors are held, for the metric that reports it.
@@ -161,7 +143,7 @@ impl ProvenAnchors {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Hash;
+    use crate::{Hash, StateRoot};
 
     fn root(seed: u8) -> StateRoot {
         StateRoot::from_raw(Hash::from_bytes(&[seed; 32]))
@@ -171,15 +153,24 @@ mod tests {
         WeightedTimestamp::from_millis(at)
     }
 
+    fn anchor(shard: ShardId, height: u64, seed: u8, ts: WeightedTimestamp) -> Anchor {
+        Anchor {
+            shard,
+            height: BlockHeight::new(height),
+            state_root: root(seed),
+            ts,
+        }
+    }
+
     /// One mirror answers both questions of it: whether a height is
     /// proven, and which of a shard's proven heights a window reaches.
     #[test]
     fn one_mirror_answers_the_fence_and_the_prober() {
         let anchors = ProvenAnchors::new();
         let shard = ShardId::leaf(1, 1);
-        anchors.record(shard, BlockHeight::new(4), root(4), ms(4_000));
-        anchors.record(shard, BlockHeight::new(9), root(9), ms(9_000));
-        anchors.record(ShardId::leaf(1, 0), BlockHeight::new(9), root(1), ms(9_000));
+        anchors.record(anchor(shard, 4, 4, ms(4_000)));
+        anchors.record(anchor(shard, 9, 9, ms(9_000)));
+        anchors.record(anchor(ShardId::leaf(1, 0), 9, 1, ms(9_000)));
 
         assert_eq!(
             anchors.at(shard, BlockHeight::new(4)).unwrap().state_root,
@@ -187,7 +178,7 @@ mod tests {
         );
         assert_eq!(anchors.at(shard, BlockHeight::new(5)), None);
         assert_eq!(
-            anchors.newest_licensed(shard, |_| true).unwrap().0,
+            anchors.newest_licensed(shard, |_| true).unwrap().height,
             BlockHeight::new(9),
             "the highest of that shard's, and never another shard's",
         );
@@ -195,7 +186,7 @@ mod tests {
             anchors
                 .newest_licensed(shard, |ts| ts <= ms(5_000))
                 .unwrap()
-                .0,
+                .height,
             BlockHeight::new(4),
             "and the highest the window reaches, not the highest held",
         );
@@ -211,8 +202,8 @@ mod tests {
         let horizon = u64::try_from(RETENTION_HORIZON.as_millis()).expect("fits");
         // Exactly a horizon back is still reachable; a millisecond past
         // it is not, which is the edge the retirement is stated at.
-        anchors.record(shard, BlockHeight::new(1), root(1), old);
-        anchors.record(shard, BlockHeight::new(2), root(2), ms(1_001));
+        anchors.record(anchor(shard, 1, 1, old));
+        anchors.record(anchor(shard, 2, 2, ms(1_001)));
 
         anchors.retire_below(ms(1_000 + horizon));
         assert!(anchors.at(shard, BlockHeight::new(1)).is_some());

@@ -825,13 +825,14 @@ mod tests {
         test_principal,
     };
     use hyperscale_types::{
-        AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
-        BlockHeader, BlockHeaderParts, ChainOrigin, Deadline, Finalization, Hash, Heard, LocalKey,
-        MAX_SUBINTENTS, MerkleInclusionProof, NetworkDefinition, PrincipalAddr, ProposerTimestamp,
-        ProvisionEntry, Provisions, Question, QuorumCertificate, Round, ShardId, ShardLoad, Signer,
-        SignerBitfield, StateAnchor, StateProofBundle, StateProofsRoot, StateRoot, SubstateKey,
-        TimestampRange, Transaction, TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo,
-        ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources, Word, test_utils,
+        AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, Anchor,
+        BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Deadline, Finalization, Hash, Heard,
+        LocalKey, MAX_SUBINTENTS, MerkleInclusionProof, NetworkDefinition, PrincipalAddr,
+        ProposerTimestamp, ProvisionEntry, Provisions, Question, QuorumCertificate, Round, ShardId,
+        ShardLoad, Signer, SignerBitfield, StateProofBundle, StateProofsRoot, StateRoot,
+        SubstateKey, TimestampRange, Transaction, TransactionDecision, UnsettledTx, ValidatorId,
+        ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources, Word,
+        test_utils,
     };
 
     use super::*;
@@ -1396,12 +1397,12 @@ mod tests {
     /// A bundle against `ROOT` at `height`, answering for `keys`.
     fn bundle_at(height: u64, keys: &[u8]) -> StateProofBundle {
         StateProofBundle::new(
-            StateAnchor {
+            Anchor {
                 shard: ShardId::ROOT,
                 height: BlockHeight::new(height),
                 state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
+                ts: WeightedTimestamp::from_millis(height * 1_000),
             },
-            WeightedTimestamp::from_millis(height * 1_000),
             keys.iter().map(|seed| SubstateKey {
                 owner: Address::new([*seed; 31], AddressClass::Component),
                 local: LocalKey([*seed; 16]),

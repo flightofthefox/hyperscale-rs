@@ -13,7 +13,9 @@
 use std::sync::Arc;
 
 use hyperscale_core::Action;
-use hyperscale_types::{CertifiedBlock, CertifiedBlockHeader, Verified, derive_block_transactions};
+use hyperscale_types::{
+    Anchor, CertifiedBlock, CertifiedBlockHeader, Verified, derive_block_transactions,
+};
 
 use super::NodeStateMachine;
 
@@ -182,12 +184,8 @@ impl NodeStateMachine {
         // block's state proofs to what this validator has commit-proven,
         // and the certificate gate and the probe anchor read the same
         // mirror, so nothing downstream may run before it is in.
-        s.shard_coordinator.record_proven_anchor(
-            certified_header.shard_id(),
-            certified_header.header().height(),
-            certified_header.state_root(),
-            certified_header.header().parent_qc().weighted_timestamp(),
-        );
+        s.shard_coordinator
+            .record_proven_anchor(Anchor::of(certified_header));
         let mut actions = s
             .provisions_coordinator
             .on_committed_remote_header(topology_schedule, certified_header);

@@ -18,8 +18,8 @@
 //! the fetch key (no id-set to enumerate).
 
 use hyperscale_types::{
-    BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, MessageClass, PredecessorTerminal,
-    ProvisionHash, ShardId, StateAnchor, SubstateKey, TxHash, ValidatorId,
+    Anchor, BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, MessageClass,
+    PredecessorTerminal, ProvisionHash, ShardId, SubstateKey, TxHash, ValidatorId,
 };
 
 /// Fetch family — one variant per payload type.
@@ -156,7 +156,7 @@ pub enum FetchRequest {
     /// proof taken at one height never answers a probe at another.
     StateProof {
         /// The commit-proven state the proof reconstructs.
-        anchor: StateAnchor,
+        anchor: Anchor,
         /// The keys whose presence or absence under it is wanted.
         keys: Vec<SubstateKey>,
         /// Always `None` for this variant; see variant-level doc.

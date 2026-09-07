@@ -26,6 +26,7 @@
 //!   beacon-witness inputs a block carries.
 
 pub mod abandonment;
+pub mod anchor;
 #[allow(clippy::module_inception)]
 mod block;
 pub mod certified;
@@ -44,7 +45,6 @@ pub mod proven_anchors;
 pub mod quorum_certificate;
 pub mod reshape;
 pub mod roots;
-pub mod state_anchor;
 pub mod state_proof;
 pub mod storage_commit;
 pub mod sweep;

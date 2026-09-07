@@ -45,16 +45,16 @@ use hyperscale_metrics::{
 };
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
 use hyperscale_types::{
-    AbandonmentRecord, Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight,
-    BloomFilter, CertifiedBlock, CounterpartEvidence, CounterpartMirror, Deadline, DeclaredKey,
-    Derivation, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
-    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Heard, Inclusion,
-    MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    MerkleInclusionProof, Mode, Probed, ProvenAnchors, Provisions, Question, ScheduleLookup,
-    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateAnchor, StateProofBundle,
-    StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot, Transaction,
-    TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp, Window, Word, derive_block_transactions,
+    AbandonmentRecord, Anchor, Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader,
+    BlockHeight, BloomFilter, CertifiedBlock, CounterpartEvidence, CounterpartMirror, Deadline,
+    DeclaredKey, Derivation, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
+    Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Heard,
+    Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Mode, Probed, ProvenAnchors, Provisions,
+    Question, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie,
+    StateProofBundle, StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution, UnsettledTx,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, Window, Word, derive_block_transactions,
     settled_set_verdict, tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::CrossingCell;
@@ -75,7 +75,7 @@ use crate::provisioning::{ProvisioningTracker, Requirement, divided_requirements
 use crate::tick_state::{Admission, Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
 use crate::unresolved::{
-    Abandonable, Probe, Probeable, Reclaimable, Retirable, Unanswerable, UnresolvedTxs,
+    Abandonable, Probeable, Reclaimable, Released, Retirable, Unanswerable, UnresolvedTxs,
 };
 use crate::vote_tracker::VoteTracker;
 
@@ -521,6 +521,11 @@ pub struct ExecutionCoordinator {
     /// proposer comes by the bytes. A bundle leaves when a block
     /// carries it, or when every transaction it answered for is gone.
     fetched: BTreeMap<StateProofBundle, BTreeSet<TxHash>>,
+    /// Fetches the ledger let go of since the last commit — a question
+    /// the chain answered first, or one whose entry is gone — released
+    /// as one abandon at the commit, so a counterpart that never serves
+    /// the height does not pin the slot.
+    released_fetches: Vec<(Anchor, SubstateKey)>,
 
     /// Finalizations built but withheld because a contained EC names a
     /// shard that is scheduled to terminate, or past-terminal with its
@@ -644,6 +649,7 @@ impl ExecutionCoordinator {
 
             unproven_ecs: AwaitingTopologyBuffer::new(),
             fetched: BTreeMap::new(),
+            released_fetches: Vec::new(),
             gated_finalized: BTreeMap::new(),
             me,
             local_shard,
@@ -2543,7 +2549,7 @@ impl ExecutionCoordinator {
     /// alone, so nothing but the header and the proof is fetched.
     fn probe_silent_counterparts(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let trie = self.counterpart_trie(topology_schedule);
-        let mut wanted: BTreeMap<StateAnchor, Vec<SubstateKey>> = BTreeMap::new();
+        let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
         for entry in self.unresolved.probeable(self.committed_ts) {
             for (shard, key, probed) in counterpart_cells(&entry, trie) {
                 // The chain has answered: nothing is asked again.
@@ -2553,7 +2559,7 @@ impl ExecutionCoordinator {
                 // The newest licensed header held: the one the shard is
                 // likeliest to still serve, since a proof is taken from
                 // a bounded history behind its tip.
-                let Some((height, source)) = self
+                let Some(anchor) = self
                     .proven_anchors
                     .newest_licensed(shard, |ts| probed.licenses(ts, entry.deadline))
                 else {
@@ -2567,26 +2573,12 @@ impl ExecutionCoordinator {
                 // at a newer header, not of the same one every block.
                 if self
                     .unresolved
-                    .probe_stands(entry.tx_hash, shard, probed, height)
+                    .probe_stands(entry.tx_hash, shard, probed, anchor.height)
                 {
                     continue;
                 }
-                let anchor = StateAnchor {
-                    shard,
-                    height,
-                    state_root: source.state_root,
-                };
-                self.unresolved.record_probe(
-                    entry.tx_hash,
-                    shard,
-                    Probe {
-                        anchor,
-                        key,
-                        probed_wt: source.ts,
-                        probed,
-                        answered: false,
-                    },
-                );
+                self.unresolved
+                    .record_probe(entry.tx_hash, shard, probed, anchor, key);
                 wanted.entry(anchor).or_default().push(key);
             }
         }
@@ -2614,15 +2606,15 @@ impl ExecutionCoordinator {
     /// read off the header.
     pub fn on_state_proof_verified(
         &mut self,
-        anchor: StateAnchor,
+        anchor: Anchor,
         keys: Vec<SubstateKey>,
         proof: MerkleInclusionProof,
     ) {
-        let (answered, anchor_ts) = self.unresolved.mark_probes_answered(anchor, &keys);
+        let answered = self.unresolved.mark_probes_answered(anchor, &keys);
         // An answer nothing here asked about is nobody's to commit.
-        if let Some(anchor_ts) = anchor_ts {
+        if !answered.is_empty() {
             self.fetched
-                .entry(StateProofBundle::new(anchor, anchor_ts, keys, proof))
+                .entry(StateProofBundle::new(anchor, keys, proof))
                 .or_default()
                 .extend(answered);
         }
@@ -2713,7 +2705,7 @@ impl ExecutionCoordinator {
             for (entry, cells) in cells {
                 for &(shard, key, probed) in cells {
                     if shard != bundle.anchor.shard
-                        || !probed.licenses(bundle.anchor_ts, entry.deadline)
+                        || !probed.licenses(bundle.anchor.ts, entry.deadline)
                     {
                         continue;
                     }
@@ -2729,9 +2721,12 @@ impl ExecutionCoordinator {
                     };
                     // The question is answered, and a fetch still out
                     // for it is released with it.
-                    if !self.unresolved.close_question(entry.tx_hash, shard, probed) {
+                    let Some(Released(released)) =
+                        self.unresolved.close_question(entry.tx_hash, shard, probed)
+                    else {
                         continue;
-                    }
+                    };
+                    self.released_fetches.extend(released);
                     record_reclaim_probe_answered(inclusion.is_present());
                     let tx_hash = entry.tx_hash;
                     actions.push(match inclusion {
@@ -2751,7 +2746,7 @@ impl ExecutionCoordinator {
                                 Heard {
                                     question: Question::Cell(probed),
                                     word: Word::Absent,
-                                    at: bundle.anchor_ts,
+                                    at: bundle.anchor.ts,
                                 },
                             );
                             Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
@@ -2847,7 +2842,7 @@ impl ExecutionCoordinator {
         // outcome for, and the ledger is here.
         self.evidence
             .retain(&|tx_hash| unresolved.contains(tx_hash));
-        let ids = self.unresolved.take_released_fetches();
+        let ids = std::mem::take(&mut self.released_fetches);
         if ids.is_empty() {
             Vec::new()
         } else {
@@ -3072,7 +3067,8 @@ impl ExecutionCoordinator {
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
         // could still carry one is nobody's to resolve.
-        self.unresolved.release_resolved(block.certificates());
+        let released = self.unresolved.release_resolved(block.certificates());
+        self.released_fetches.extend(released);
         // What the block writes down about departed shards, before the
         // prune below reads what is still answerable.
         let rebuilt = self
@@ -3083,8 +3079,9 @@ impl ExecutionCoordinator {
         }
         self.stamp_departures(topology_schedule);
         self.retire_closed_deliveries();
-        let unanswerable = self.unresolved.prune(self.committed_ts);
-        self.release_unanswerable(&unanswerable);
+        let pruned = self.unresolved.prune(self.committed_ts);
+        self.released_fetches.extend(pruned.released);
+        self.release_unanswerable(&pruned.unanswerable);
         actions.extend(self.release_answered_fetches());
         // The committed clock is what opens a leg's deadline, so the
         // cores gone silent past it are asked here.
@@ -5843,12 +5840,12 @@ mod tests {
         );
 
         // The commit proof lands: the deferred EC replays into dispatch.
-        state.proven_anchors().record(
-            remote_shard,
-            BlockHeight::new(5),
-            StateRoot::ZERO,
-            WeightedTimestamp::ZERO,
-        );
+        state.proven_anchors().record(Anchor {
+            shard: remote_shard,
+            height: BlockHeight::new(5),
+            state_root: StateRoot::ZERO,
+            ts: WeightedTimestamp::ZERO,
+        });
         let actions = state.on_committed_remote_header(&topo, remote_shard);
         assert!(
             actions
@@ -6333,12 +6330,12 @@ mod tests {
 
         // The source block is commit-proven; the gate under test is verify
         // dispatch without a local tracker, not the commit-proof gate.
-        state.proven_anchors().record(
-            remote_shard,
-            BlockHeight::new(5),
-            StateRoot::ZERO,
-            WeightedTimestamp::ZERO,
-        );
+        state.proven_anchors().record(Anchor {
+            shard: remote_shard,
+            height: BlockHeight::new(5),
+            state_root: StateRoot::ZERO,
+            ts: WeightedTimestamp::ZERO,
+        });
         state.on_committed_remote_header(&topo, remote_shard);
         let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(
@@ -8218,7 +8215,7 @@ mod tests {
     }
 
     /// The state-proof fetches among `actions`, by anchor.
-    fn state_proof_fetches(actions: &[Action]) -> Vec<(StateAnchor, Vec<SubstateKey>)> {
+    fn state_proof_fetches(actions: &[Action]) -> Vec<(Anchor, Vec<SubstateKey>)> {
         actions
             .iter()
             .filter_map(|action| match action {
@@ -8244,16 +8241,16 @@ mod tests {
         asked: &[SubstateKey],
     ) -> (StateProofBundle, Vec<Action>) {
         let (state_root, proof) = state_and_proof(shard, present, asked);
-        let height = BlockHeight::new(height);
-        state.proven_anchors().record(shard, height, state_root, ts);
-        let opened = state.on_committed_remote_header(schedule, shard);
-        let anchor = StateAnchor {
+        let anchor = Anchor {
             shard,
-            height,
+            height: BlockHeight::new(height),
             state_root,
+            ts,
         };
+        state.proven_anchors().record(anchor);
+        let opened = state.on_committed_remote_header(schedule, shard);
         (
-            StateProofBundle::new(anchor, ts, asked.iter().copied(), proof),
+            StateProofBundle::new(anchor, asked.iter().copied(), proof),
             opened,
         )
     }
@@ -8383,12 +8380,12 @@ mod tests {
         let held: [(u64, WeightedTimestamp, &[u8]); 2] =
             [(3, deadline, b"deadline"), (4, lapse, b"at")];
         for (height, ts, tag) in held {
-            state.proven_anchors().record(
-                PEER,
-                BlockHeight::new(height),
-                StateRoot::from_raw(Hash::from_bytes(tag)),
+            state.proven_anchors().record(Anchor {
+                shard: PEER,
+                height: BlockHeight::new(height),
+                state_root: StateRoot::from_raw(Hash::from_bytes(tag)),
                 ts,
-            );
+            });
             state.on_committed_remote_header(&schedule, PEER);
         }
         let later = lapse.plus(Duration::from_secs(1));
@@ -8524,12 +8521,12 @@ mod tests {
         let held: [(u64, WeightedTimestamp, &[u8]); 2] =
             [(3, deadline, b"short"), (4, lapse, b"at")];
         for (height, ts, tag) in held {
-            state.proven_anchors().record(
-                successor,
-                BlockHeight::new(height),
-                StateRoot::from_raw(Hash::from_bytes(tag)),
+            state.proven_anchors().record(Anchor {
+                shard: successor,
+                height: BlockHeight::new(height),
+                state_root: StateRoot::from_raw(Hash::from_bytes(tag)),
                 ts,
-            );
+            });
             state.on_committed_remote_header(&schedule, successor);
         }
         let later = lapse.plus(Duration::from_secs(1));
@@ -8600,9 +8597,12 @@ mod tests {
             (4, deadline, b"at"),
         ];
         for (height, ts, tag) in held {
-            state
-                .proven_anchors()
-                .record(CORE, BlockHeight::new(height), root(tag), ts);
+            state.proven_anchors().record(Anchor {
+                shard: CORE,
+                height: BlockHeight::new(height),
+                state_root: root(tag),
+                ts,
+            });
             let actions = state.on_committed_remote_header(&schedule, CORE);
             assert!(
                 state_proof_fetches(&actions).is_empty(),
@@ -9964,6 +9964,7 @@ mod tests {
             state
                 .unresolved
                 .prune(expiry.plus(Duration::from_millis(1)))
+                .unanswerable
                 .iter()
                 .any(|entry| entry.tx_hash == tx_hash && entry.covered_by_record),
             "and the covered entry retires past it"
@@ -9983,6 +9984,7 @@ mod tests {
             state
                 .unresolved
                 .prune(state.committed_ts.plus(Duration::from_millis(1)))
+                .unanswerable
                 .iter()
                 .any(|entry| entry.tx_hash == tx_hash && entry.covered_by_record),
             "an unreadable departure closes at once"

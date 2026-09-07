@@ -9,8 +9,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconBlockHash, BeaconProposal, BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block,
-    BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
+    Anchor, BeaconBlockHash, BeaconProposal, BeaconWitnessRoot, BeaconWitnessRootVerifyError,
+    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
     CandidateBeaconBlockVerifyError, CertRootVerifyError, CertificateRoot, CertifiedBeaconBlock,
     CertifiedBeaconBlockVerifyError, CertifiedBlock, CertifiedBlockHeader,
     CertifiedHeaderVerifyError, Epoch, ExecutionCertificate, ExecutionCertificateVerifyError,
@@ -21,10 +21,9 @@ use hyperscale_types::{
     QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal,
     Resolutions, Round, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
     SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
-    SpcProposalObject, SpcProposalObjectVerifyError, SpcView, StateAnchor, StateRoot,
-    StateRootVerifyError, StoredReceipt, SubstateKey, TickId, Timeout, Transaction,
-    TransactionRoot, TxHash, TxOutcome, TxResolution, TxRootVerifyError, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp,
+    SpcProposalObject, SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError,
+    StoredReceipt, SubstateKey, TickId, Timeout, Transaction, TransactionRoot, TxHash, TxOutcome,
+    TxResolution, TxRootVerifyError, ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 
 /// What one tick's batch produced.
@@ -835,7 +834,7 @@ pub enum ProtocolEvent {
     /// the answer is the chain's once a block carries the proof.
     FetchedStateProofVerified {
         /// The state the proof was checked against.
-        anchor: StateAnchor,
+        anchor: Anchor,
         /// The keys the proof was asked about.
         keys: Vec<SubstateKey>,
         /// The proof as fetched.
