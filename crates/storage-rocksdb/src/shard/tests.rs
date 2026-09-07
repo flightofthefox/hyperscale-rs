@@ -20,8 +20,8 @@ use hyperscale_storage::test_helpers::{
     test_registers_are_monotone_and_recoverable, test_registers_ignore_a_stale_chain_incarnation,
     test_registers_recover_their_justification, test_retained_bundle_drops_below_the_history_floor,
     test_snapshot_at_below_the_floor_panics, test_substate_bytes_track_commits,
-    test_sweep_index_tracks_the_leaves, test_sweep_stops_at_the_ceiling_or_the_cap,
-    test_the_root_is_a_function_of_the_writes,
+    test_sweep_index_counts_a_pending_ancestors_move, test_sweep_index_tracks_the_leaves,
+    test_sweep_stops_at_the_ceiling_or_the_cap, test_the_root_is_a_function_of_the_writes,
     test_tx_index_answers_with_the_local_shards_certificate,
     test_undischarged_record_holds_the_floor, test_unresolved_fold,
     test_widest_tick_copy_holds_the_slot,
@@ -150,6 +150,12 @@ fn a_blocks_sweep_stops_at_the_ceiling_or_the_cap() {
 fn the_sweep_index_tracks_the_leaves() {
     let (_dir, storage) = open_fresh();
     test_sweep_index_tracks_the_leaves(&storage);
+}
+
+#[test]
+fn the_sweep_index_counts_a_pending_ancestors_move() {
+    let (_dir, storage) = open_fresh();
+    test_sweep_index_counts_a_pending_ancestors_move(&storage);
 }
 
 /// The shared entry pipeline, then the `RocksDB` tail: carry the tip

@@ -6,7 +6,7 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    JmtSnapshot, ParentAnchor, ShardChainWriter, merge_writes_from_receipts, with_sweep,
+    JmtSnapshot, ParentAnchor, ShardChainWriter, SweepRows, merge_writes_from_receipts, with_sweep,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, StateRoot,
@@ -58,6 +58,7 @@ impl ShardChainWriter for RocksDbShardStorage {
             let prepared = build_prepared_commit(
                 Arc::clone(self),
                 WriteBatch::default(),
+                SweepRows::default(),
                 Arc::clone(&jmt_snapshot),
             );
             return (parent.state_root, jmt_snapshot, prepared);
@@ -111,7 +112,7 @@ impl ShardChainWriter for RocksDbShardStorage {
 
         // Merge writes for the substate WriteBatch (off the state_root critical path).
         // Pre-build substate + receipt writes into a WriteBatch for efficient commit.
-        let mut write_batch = self.build_substate_write_batch(
+        let (mut write_batch, sweep_rows) = self.build_substate_write_batch(
             &settled,
             block_height.inner(),
             /* write_history */ true,
@@ -126,8 +127,12 @@ impl ShardChainWriter for RocksDbShardStorage {
             add_receipt_to_batch(&mut write_batch, consensus_cf, metadata_cf, receipt);
         }
 
-        let prepared =
-            build_prepared_commit(Arc::clone(self), write_batch, Arc::clone(&jmt_snapshot));
+        let prepared = build_prepared_commit(
+            Arc::clone(self),
+            write_batch,
+            sweep_rows,
+            Arc::clone(&jmt_snapshot),
+        );
 
         (computed_root, jmt_snapshot, prepared)
     }
@@ -144,6 +149,7 @@ impl ShardChainWriter for RocksDbShardStorage {
 fn build_prepared_commit(
     storage: Arc<RocksDbShardStorage>,
     write_batch: WriteBatch,
+    sweep_rows: SweepRows,
     jmt_snapshot: Arc<JmtSnapshot>,
 ) -> PreparedCommit {
     Box::new(
@@ -171,11 +177,13 @@ fn build_prepared_commit(
             );
             storage.append_beacon_witnesses_to_batch(&mut write_batch, witness);
 
-            // The block's execution certificates append inside
-            // `try_apply_prepared_commit`, which holds `commit_lock`
-            // across the read their write depends on.
+            // The block's execution certificates and its sweep-index
+            // delta append inside `try_apply_prepared_commit`, which
+            // holds `commit_lock` across the reads their writes depend
+            // on.
             let applied = storage.try_apply_prepared_commit(
                 write_batch,
+                &sweep_rows,
                 &jmt_snapshot,
                 block,
                 qc,

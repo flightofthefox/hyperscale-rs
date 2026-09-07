@@ -109,10 +109,12 @@ pub struct RocksDbShardStorage {
 /// the pairs that have something in them and a sweep's walk skips
 /// nothing and visits nothing empty.
 ///
-/// The read is against the persisted store rather than any pending
-/// overlay because the rows are a total over what has *committed*, and
-/// every batch that moved one has already been applied by the time this
-/// one is built.
+/// A row is a total over what has *committed*, and the read that carries
+/// it forward is against the persisted store. So this belongs where
+/// commits serialize — under `commit_lock`, with `batch` the next thing
+/// written. Folded while an ancestor is still unpersisted it would
+/// overwrite that ancestor's move to the same row with a count taken
+/// before it.
 pub fn fold_sweep_rows(db: &DB, batch: &mut WriteBatch, cf: &CfHandles<'_>, moved: &SweepRows) {
     if moved.is_empty() {
         return;
@@ -457,6 +459,10 @@ impl RocksDbShardStorage {
     /// a prior read past them would judge the no-op skip — and record
     /// history — against state older than the parent's. A caller building
     /// at the committed tip passes `&[]`.
+    ///
+    /// Returns the sweep-index delta beside the batch rather than folding
+    /// it, for the reason [`fold_sweep_rows`] gives: the fold reads the
+    /// persisted index, so it belongs where the batch is written.
     pub(crate) fn build_substate_write_batch(
         &self,
         writes: &SettledWrites,
@@ -464,9 +470,9 @@ impl RocksDbShardStorage {
         write_history: bool,
         base_reads: Option<&BaseReadCache>,
         pending: &[Arc<JmtSnapshot>],
-    ) -> WriteBatch {
+    ) -> (WriteBatch, SweepRows) {
         let mut batch = WriteBatch::default();
-        self.append_substate_writes_to_batch(
+        let sweep_rows = self.append_substate_writes_to_batch(
             &mut batch,
             writes,
             version,
@@ -474,7 +480,7 @@ impl RocksDbShardStorage {
             base_reads,
             pending,
         );
-        batch
+        (batch, sweep_rows)
     }
 
     /// Same as `build_substate_write_batch` but appends to an existing
@@ -493,7 +499,7 @@ impl RocksDbShardStorage {
         write_history: bool,
         base_reads: Option<&BaseReadCache>,
         pending: &[Arc<JmtSnapshot>],
-    ) {
+    ) -> SweepRows {
         let cf = self.cf();
         let state_cf = StateCf::handle(&cf);
         let history_cf = StateHistoryCf::handle(&cf);
@@ -607,8 +613,6 @@ impl RocksDbShardStorage {
             pending,
         );
 
-        fold_sweep_rows(&self.db, batch, &cf, &sweep_rows);
-
         // Index the history keys by version so GC can delete them without
         // scanning StateHistoryCf. Skipped when write_history is false
         // (genesis) — nothing was written.
@@ -620,6 +624,8 @@ impl RocksDbShardStorage {
                 &stale_history_keys,
             );
         }
+
+        sweep_rows
     }
 
     /// The entries half of a substate write batch: each entry's leaf row
@@ -740,13 +746,16 @@ impl RocksDbShardStorage {
         // Genesis writes at version 0. Repeat Sets to the same key
         // overwrite — idempotent by RocksDB write semantics. No history
         // entries: genesis has no pre-state to preserve.
-        let batch = self.build_substate_write_batch(
+        let (mut batch, sweep_rows) = self.build_substate_write_batch(
             writes,
             0,
             /* write_history */ false,
             /* base_reads */ None,
             /* pending */ &[],
         );
+        // Genesis builds and writes in one step over an empty store, so
+        // the fold's read is of what this batch is about to extend.
+        fold_sweep_rows(&self.db, &mut batch, &self.cf(), &sweep_rows);
 
         // Substates only — no JMT, no sync (genesis isn't durability-critical).
         self.db

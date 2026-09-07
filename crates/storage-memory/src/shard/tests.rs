@@ -13,8 +13,9 @@ use hyperscale_storage::test_helpers::{
     test_historical_reads_respect_retention, test_history_reads_through_create_delete_create,
     test_registers_are_monotone_and_recoverable, test_registers_ignore_a_stale_chain_incarnation,
     test_snapshot_at_below_the_floor_panics, test_substate_bytes_track_commits,
-    test_sweep_index_tracks_the_leaves, test_sweep_stops_at_the_ceiling_or_the_cap,
-    test_the_root_is_a_function_of_the_writes, test_witness_window_retention_and_recovery,
+    test_sweep_index_counts_a_pending_ancestors_move, test_sweep_index_tracks_the_leaves,
+    test_sweep_stops_at_the_ceiling_or_the_cap, test_the_root_is_a_function_of_the_writes,
+    test_witness_window_retention_and_recovery,
 };
 use hyperscale_storage::{
     DedupWindow, ParentAnchor, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
@@ -55,6 +56,11 @@ fn a_blocks_sweep_stops_at_the_ceiling_or_the_cap() {
 #[test]
 fn the_sweep_index_tracks_the_leaves() {
     test_sweep_index_tracks_the_leaves(&SimShardStorage::default());
+}
+
+#[test]
+fn the_sweep_index_counts_a_pending_ancestors_move() {
+    test_sweep_index_counts_a_pending_ancestors_move(&SimShardStorage::default());
 }
 
 #[test]

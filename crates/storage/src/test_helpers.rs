@@ -1214,6 +1214,106 @@ where
     );
 }
 
+/// Shared sweep conformance: a block prepared while its parent is still
+/// unpersisted counts into the same row as its parent.
+///
+/// Two blocks moving one `(bucket, owner)` row is the ordinary case —
+/// one signer's nullifiers, one venue's claims, the committed cells of
+/// one window — and the parent of a block being prepared holds no commit
+/// QC yet, so it is unpersisted exactly when this happens. A backend
+/// folding the row from what it has persisted counts the second move
+/// alone; the row then drains while its leaves remain, and the walk
+/// stops finding them.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_sweep_index_counts_a_pending_ancestors_move<S>(storage: &S)
+where
+    S: TestStore + SweepIndex,
+{
+    install_stub_protocol_statics();
+    let handle = Arc::new(storage.clone());
+    let owner = Address::new([0x40; 31], AddressClass::Component);
+    let expiry = 3 * SWEEP_BUCKET_MS;
+    let cell = |body: u8| {
+        let (local, value) = stub_sweepable_cell(expiry, body);
+        (SubstateKey { owner, local }, value)
+    };
+    let (first, first_value) = cell(0x11);
+    let (second, second_value) = cell(0x22);
+
+    let one = BlockHeight::new(1);
+    let writes = SettledWrites::from_absolutes(BTreeMap::from([(first, Some(first_value))]));
+    let block_one = push_certificate(make_test_block(one), settling(one, writes.into()));
+    let (root_one, snapshot_one, commit_one) = handle.prepare_block_commit(
+        ParentAnchor {
+            state_root: handle.state_root(),
+            height: handle.jmt_height(),
+            state: &handle.snapshot(),
+            pending: &[],
+            base_reads: None,
+        },
+        &block_one.certificates()[..],
+        &[],
+        &[],
+        one,
+    );
+
+    // Prepared over height 1 before height 1 has been applied, which is
+    // what makes the row's prior unreadable from the store.
+    let two = BlockHeight::new(2);
+    let writes = SettledWrites::from_absolutes(BTreeMap::from([(second, Some(second_value))]));
+    let block_two = push_certificate(make_test_block(two), settling(two, writes.into()));
+    let pending = from_ref(&snapshot_one);
+    let (_, _, commit_two) = handle.prepare_block_commit(
+        ParentAnchor {
+            state_root: root_one,
+            height: one,
+            state: &PendingBaseline::new(handle.snapshot(), pending, one),
+            pending,
+            base_reads: None,
+        },
+        &block_two.certificates()[..],
+        &[],
+        &[],
+        two,
+    );
+
+    let witness = empty_witness();
+    commit_one(
+        SyncHint::FlushNow,
+        &make_test_certified(block_one),
+        &witness,
+    );
+    commit_two(
+        SyncHint::FlushNow,
+        &make_test_certified(block_two),
+        &witness,
+    );
+
+    let all = SweepBucket(u32::MAX);
+    let mut both = vec![(first, expiry), (second, expiry)];
+    both.sort_by_key(|(key, _)| *key);
+    assert_eq!(
+        storage.sweep_candidates(SweepFrontier::ZERO, all, 10),
+        both,
+        "both cells sit in the row the two blocks moved"
+    );
+
+    // Removing one leaves the other reachable. A row that counted one
+    // move would be emptied here and take the survivor's leaf with it.
+    commit_writes(
+        storage,
+        &SettledWrites::from_absolutes(BTreeMap::from([(first, None)])),
+    );
+    assert_eq!(
+        storage.sweep_candidates(SweepFrontier::ZERO, all, 10),
+        vec![(second, expiry)],
+        "the row outlived the removal, so its surviving leaf is still swept"
+    );
+}
+
 /// Shared block-sweep conformance: where a block's frontier lands, and
 /// that resuming from it loses nothing.
 ///

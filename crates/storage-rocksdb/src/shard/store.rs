@@ -15,7 +15,7 @@ use hyperscale_types::{
 use rocksdb::{WriteBatch, WriteOptions};
 
 use super::column_families::{PackageArtifactsCf, StateCf, SweepIndexCf};
-use super::core::RocksDbShardStorage;
+use super::core::{RocksDbShardStorage, fold_sweep_rows};
 use super::execution_certs::append_block_certs_to_batch;
 use super::metadata::read_jmt_metadata;
 use super::retention::retention_floor;
@@ -136,6 +136,7 @@ impl RocksDbShardStorage {
     pub(crate) fn try_apply_prepared_commit(
         &self,
         mut write_batch: WriteBatch,
+        sweep_rows: &SweepRows,
         jmt_snapshot: &JmtSnapshot,
         block: &Block,
         qc: &Verified<QuorumCertificate>,
@@ -176,6 +177,12 @@ impl RocksDbShardStorage {
         // which copy of a tick to keep reads the stored copy, and that
         // read has to sit under `commit_lock` with the write it decides.
         append_block_certs_to_batch(self, &mut write_batch, block);
+
+        // The sweep index is a total over what has committed, so its
+        // fold reads the persisted rows and belongs here for the same
+        // reason: a batch prepared over unpersisted ancestors has not
+        // seen what they moved.
+        fold_sweep_rows(&self.db, &mut write_batch, &self.cf(), sweep_rows);
 
         // Fold consensus metadata into the same batch for crash-safe atomicity.
         Self::append_consensus_to_batch(&mut write_batch, block, qc);

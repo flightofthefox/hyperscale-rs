@@ -628,13 +628,16 @@ impl BoundaryStore for RocksDbShardStorage {
             return Ok(base_root);
         }
 
-        let mut batch = self.build_substate_write_batch(
+        let (mut batch, sweep_rows) = self.build_substate_write_batch(
             &filtered,
             height.inner(),
             /* write_history */ true,
             /* base_reads */ None,
             /* pending */ &[],
         );
+        // `commit_lock` is held across this whole follow and the batch is
+        // written below, so the fold's read is of the state it extends.
+        fold_sweep_rows(&self.db, &mut batch, &self.cf(), &sweep_rows);
         let parent_version =
             jmt_parent_height(BlockHeight::new(base_version), base_root).map(BlockHeight::inner);
         let (new_root, collected) =
