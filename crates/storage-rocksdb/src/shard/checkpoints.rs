@@ -19,9 +19,8 @@ use std::sync::Arc;
 use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, SubstateStore, Substates, WitnessSeed,
-    entry_from_leaf, followed_block_writes, holds_state, is_record_cell, package_of_cell,
-    sweepable_expiry,
+    AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, LeafRows, SubstateStore, Substates,
+    WitnessSeed, followed_block_writes, holds_state, is_record_cell,
 };
 use hyperscale_types::{Block, BlockHeight, ChainOrigin, StateRoot, SubstateKey, SubstateLeaf};
 use hyperscale_vm_types::{Address, CollectionId, SweepBucket};
@@ -63,16 +62,21 @@ fn index_imported_leaves(
     let mut sweep_rows: BTreeMap<(SweepBucket, Address), u32> = BTreeMap::new();
     for leaf in leaves {
         batch_put::<StateCf>(batch, state_cf, &leaf.key, &leaf.value);
-        if let Some((entry_key, value)) = entry_from_leaf(leaf.key, &leaf.value) {
+        let LeafRows {
+            entry,
+            package,
+            sweep,
+        } = LeafRows::of(leaf.key, &leaf.value);
+        if let Some((entry_key, value)) = entry {
             batch_put::<EntriesCf>(batch, entries_cf, &entry_key, &value);
         }
         // The package index earns its rebuild for a sharper reason: an
         // imported store whose committee turns over is the only place a
         // foreign shard can still fetch this artifact from.
-        if let Some(package) = package_of_cell(leaf.key, &leaf.value) {
+        if let Some(package) = package {
             batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, &leaf.value);
         }
-        if let Some(expiry) = sweepable_expiry(leaf.key, &leaf.value) {
+        if let Some(expiry) = sweep {
             *sweep_rows
                 .entry((SweepBucket::of(expiry), leaf.key.owner))
                 .or_default() += 1;

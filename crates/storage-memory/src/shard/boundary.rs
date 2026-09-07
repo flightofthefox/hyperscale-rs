@@ -12,9 +12,8 @@ use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
-    AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, SubstateStore, Substates,
-    WitnessSeed, entry_from_leaf, followed_block_writes, holds_state, is_record_cell,
-    package_of_cell, sweepable_expiry,
+    AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, LeafRows, SubstateStore,
+    Substates, WitnessSeed, followed_block_writes, holds_state, is_record_cell,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryKey, StateRoot, SubstateKey, SubstateLeaf,
@@ -194,22 +193,25 @@ impl BoundaryStore for SimShardStorage {
             state.tree_store.insert(key, Arc::new(node));
         }
         for leaf in leaves {
-            // The ordered entry index is derived state: rebuild it from
-            // the leaves themselves — the row exists exactly where the
-            // leaf re-derives.
-            if let Some((entry_key, value)) = entry_from_leaf(leaf.key, &leaf.value) {
+            // Every index is derived state, rebuilt from the leaves
+            // themselves: a row exists exactly where a leaf re-derives
+            // it. A successor holds the prefix and no history, so the
+            // leaves it just imported are the only honest source for
+            // what it owes a sweep, and for the artifacts a foreign
+            // shard can still fetch from it once its committee turns
+            // over.
+            let LeafRows {
+                entry,
+                package,
+                sweep,
+            } = LeafRows::of(leaf.key, &leaf.value);
+            if let Some((entry_key, value)) = entry {
                 state.current_entries.insert(entry_key, value);
             }
-            // So is the package index, and for a sharper reason: an
-            // imported store whose committee turns over is the only place
-            // a foreign shard can still fetch this artifact from.
-            if let Some(package) = package_of_cell(leaf.key, &leaf.value) {
+            if let Some(package) = package {
                 state.package_artifacts.insert(package, leaf.value.clone());
             }
-            // And so is the sweep index. A successor holds the prefix
-            // and no history, so the leaves it just imported are the
-            // only honest source for what it owes a sweep.
-            if let Some(expiry) = sweepable_expiry(leaf.key, &leaf.value) {
+            if let Some(expiry) = sweep {
                 *state
                     .sweep_index
                     .entry((SweepBucket::of(expiry), leaf.key.owner))

@@ -22,8 +22,8 @@ use hyperscale_hbor::from_slice;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_metrics::record_storage_read;
 use hyperscale_storage::{
-    BaseReadCache, GenesisCommit, JmtSnapshot, SubstateStore, Substates, entry_leaf_value,
-    package_of_cell, pending_write, sweepable_expiry, tree,
+    BaseReadCache, GenesisCommit, JmtSnapshot, LeafRows, SubstateStore, Substates,
+    entry_leaf_value, pending_write, sweepable_expiry, tree,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryLeaf, ProtocolHasher, QuorumCertificate,
@@ -100,18 +100,16 @@ pub struct RocksDbShardStorage {
 /// Move one cell's write across the sweep index's rows.
 ///
 /// The index counts live sweepable cells per owner and bucket, so what
-/// matters is whether the cell was sweepable before and whether it is
-/// after — both judged from bytes alone. A value equal to its prior is
-/// sweepable in exactly the same row, which is why the no-op writes the
-/// caller skips need no entry here either.
+/// matters is the expiry the cell carried before, `was`, and the one it
+/// carries after, `now`. A value equal to its prior is sweepable in
+/// exactly the same row, which is why the no-op writes the caller skips
+/// need no entry here either.
 fn record_sweep_delta(
     deltas: &mut BTreeMap<(SweepBucket, Address), i64>,
     key: SubstateKey,
-    prior: Option<&[u8]>,
-    change: Option<&[u8]>,
+    was: Option<u64>,
+    now: Option<u64>,
 ) {
-    let was = prior.and_then(|bytes| sweepable_expiry(key, bytes));
-    let now = change.and_then(|bytes| sweepable_expiry(key, bytes));
     if was == now {
         return;
     }
@@ -540,10 +538,30 @@ impl RocksDbShardStorage {
         let history_key_codec = VersionedSubstateKeyCodec;
         let mut stale_history_keys: Vec<Vec<u8>> = Vec::new();
         let mut sweep_deltas: BTreeMap<(SweepBucket, Address), i64> = BTreeMap::new();
+        let artifacts_cf = PackageArtifactsCf::handle(&cf);
         for ((key, change), prior_slot) in writes.cells().iter().zip(priors) {
             let prior =
                 prior_slot.expect("every write must have a resolved prior (cache hit or fetched)");
-            record_sweep_delta(&mut sweep_deltas, *key, prior.as_deref(), change.as_deref());
+            // Of the prior's rows only the sweep row moves: the package
+            // index is content-addressed and never retracts, and an
+            // entry's index row is written from the settled entries.
+            let was = prior
+                .as_deref()
+                .and_then(|bytes| sweepable_expiry(*key, bytes));
+            let LeafRows {
+                entry: _,
+                package,
+                sweep: now,
+            } = change
+                .as_deref()
+                .map_or_else(LeafRows::default, |bytes| LeafRows::of(*key, bytes));
+            record_sweep_delta(&mut sweep_deltas, *key, was, now);
+            // A cell that self-identifies as a package lands its artifact
+            // in the content-addressed index, in the same atomic batch as
+            // the state that carries it.
+            if let (Some(package), Some(value)) = (package, change) {
+                batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, value);
+            }
             if let Some(new_value) = change {
                 // No-op short-circuit: setting a key to the value it
                 // already holds changes nothing. Skip both the history
@@ -583,18 +601,6 @@ impl RocksDbShardStorage {
             &mut stale_history_keys,
             pending,
         );
-
-        // A committed cell that self-identifies as a package lands its
-        // artifact in the content-addressed index, in the same atomic
-        // batch as the state that carries it.
-        let artifacts_cf = PackageArtifactsCf::handle(&cf);
-        for (key, change) in writes.cells() {
-            if let Some(value) = change
-                && let Some(package) = package_of_cell(*key, value)
-            {
-                batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, value);
-            }
-        }
 
         self.append_sweep_rows_to_batch(batch, &cf, &sweep_deltas);
 

@@ -11,6 +11,7 @@ pub mod boundary;
 pub mod chain_reader;
 pub mod chain_writer;
 pub mod dedup_window;
+pub mod derived;
 pub mod genesis;
 pub mod packages;
 pub mod pending_chain;

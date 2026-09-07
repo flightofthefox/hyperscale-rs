@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
-use hyperscale_storage::{JmtSnapshot, entry_leaf_rows, package_of_cell, sweepable_expiry};
+use hyperscale_storage::{JmtSnapshot, LeafRows, entry_leaf_rows, sweepable_expiry};
 use hyperscale_types::{
     Address, Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt,
     EntryKey, ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash,
@@ -363,14 +363,24 @@ pub fn apply_writes(
     let leaf_rows = entry_leaf_rows(writes.entries());
     for (key, change) in writes.cells().iter().chain(&leaf_rows) {
         let prior = state.current_state.get(key).cloned();
-        // The sweep index counts live sweepable cells per owner and
-        // bucket, moved by whatever the write changes the cell into.
+        // Of the prior's rows only the sweep row moves: the package
+        // index is content-addressed and never retracts, and an entry's
+        // index row is written from the settled entries below.
         let was = prior
             .as_deref()
             .and_then(|bytes| sweepable_expiry(*key, bytes));
-        let now = change
+        let LeafRows {
+            entry: _,
+            package,
+            sweep: now,
+        } = change
             .as_deref()
-            .and_then(|bytes| sweepable_expiry(*key, bytes));
+            .map_or_else(LeafRows::default, |bytes| LeafRows::of(*key, bytes));
+        if let (Some(package), Some(value)) = (package, change) {
+            state.package_artifacts.insert(package, value.clone());
+        }
+        // The sweep index counts live sweepable cells per owner and
+        // bucket, moved by whatever the write changes the cell into.
         if was != now {
             if let Some(expiry) = was {
                 let row = (SweepBucket::of(expiry), key.owner);
@@ -403,14 +413,6 @@ pub fn apply_writes(
             None => {
                 state.current_state.remove(key);
             }
-        }
-    }
-    // The package index, fed exactly as the RocksDB backend feeds its CF.
-    for (key, change) in writes.cells() {
-        if let Some(value) = change
-            && let Some(package) = package_of_cell(*key, value)
-        {
-            state.package_artifacts.insert(package, value.clone());
         }
     }
     for (key, change) in writes.entries() {
