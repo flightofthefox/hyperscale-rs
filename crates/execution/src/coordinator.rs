@@ -231,16 +231,19 @@ type CounterpartCell = (ShardId, SubstateKey, WeightedTimestamp, Probed);
 /// commit-time fold both read, so what is asked and what is answered
 /// are the same cells.
 fn counterpart_cells(entry: &Probeable, trie: &ShardTrie) -> Vec<CounterpartCell> {
-    // Only a core of more than one shard writes the committed cell, and
-    // only it is asked for one: its shards settle on each other's
-    // certificates with no clock, so its claim absent past the deadline
-    // may be pending. A core of one shard answers through its claim,
-    // which the deadline fences.
+    // The committed cell is asked about only where its absence would
+    // answer: a core of more than one shard, whose shards settle on each
+    // other's certificates with no clock. A core of one shard answers
+    // through its claim, which the deadline fences.
     let core = entry
         .core
         .iter()
         .next()
-        .filter(|_| entry.core.len() > 1)
+        .filter(|_| {
+            Probed::Core
+                .read(Inclusion::Absent, entry.core.len())
+                .is_some()
+        })
         .map(|&shard| {
             (
                 shard,
@@ -2711,26 +2714,18 @@ impl ExecutionCoordinator {
                     else {
                         continue;
                     };
-                    let answer = match (inclusion, probed) {
-                        (Inclusion::Present(_), _) => Answer::Committed,
-                        // A claim absent on a core of one shard is the
-                        // core never taking the crossing: its one
-                        // execution wrote the claim by the deadline or
-                        // never will, and the window opens there. On a
-                        // core of more it says only that a sibling is
-                        // pending, and the committed cell answers.
-                        (Inclusion::Absent, Probed::Claim) if entry.core.len() != 1 => continue,
-                        // And a committed cell absent on a core of one
-                        // shard proves nothing: such a core writes none.
-                        // The probe is never sent, but a proof carried
-                        // in a block is read here whoever fetched it.
-                        (Inclusion::Absent, Probed::Core) if entry.core.len() == 1 => continue,
-                        (Inclusion::Absent, Probed::Core | Probed::Delivery | Probed::Claim) => {
-                            Answer::Absent(Absence {
-                                probed_wt: bundle.anchor_ts,
-                                floor,
-                            })
-                        }
+                    // Read by the one arity rule, whoever fetched the
+                    // proof: a probe never sent may still be answered
+                    // by a proof a block carries.
+                    let Some(inclusion) = probed.read(inclusion, entry.core.len()) else {
+                        continue;
+                    };
+                    let answer = match inclusion {
+                        Inclusion::Present(_) => Answer::Committed,
+                        Inclusion::Absent => Answer::Absent(Absence {
+                            probed_wt: bundle.anchor_ts,
+                            floor,
+                        }),
                     };
                     // The question is answered, and a fetch still out
                     // for it is released with it.

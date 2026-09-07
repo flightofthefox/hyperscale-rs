@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use hyperscale_vm_types::{ESCROW_GRACE_MS, NULLIFIER_GRACE_MS};
 
-use crate::{MAX_VALIDITY_RANGE, WeightedTimestamp};
+use crate::{Inclusion, MAX_VALIDITY_RANGE, WeightedTimestamp};
 
 /// The longest a cross-shard transaction may take to finalize, past the
 /// last block that could have included it.
@@ -215,6 +215,29 @@ impl Probed {
     pub fn licenses(self, probed_wt: WeightedTimestamp, validity_end: WeightedTimestamp) -> bool {
         self.window(validity_end).contains(&probed_wt)
     }
+
+    /// What `inclusion` of the probed cell says, for a core of `core_len`
+    /// shards: the inclusion itself, or `None` where it says nothing.
+    ///
+    /// A cell present says the counterpart took the transaction whatever
+    /// the core's arity. A claim absent says the core never took it only
+    /// where the core is one shard, whose one execution wrote the claim
+    /// by the deadline or never will; on a core of more it says only
+    /// that a sibling is pending. A committed cell absent says the core
+    /// never committed it only where the core is more than one shard,
+    /// since a core of one writes none. The one rule for both, stated
+    /// once, so the prober asks only what an absence would answer and
+    /// the fold reads a carried proof by the same rule whoever fetched
+    /// it.
+    #[must_use]
+    pub const fn read(self, inclusion: Inclusion, core_len: usize) -> Option<Inclusion> {
+        match (inclusion, self) {
+            (Inclusion::Present(_), _) | (Inclusion::Absent, Self::Delivery) => Some(inclusion),
+            (Inclusion::Absent, Self::Claim) if core_len == 1 => Some(inclusion),
+            (Inclusion::Absent, Self::Core) if core_len > 1 => Some(inclusion),
+            (Inclusion::Absent, Self::Claim | Self::Core) => None,
+        }
+    }
 }
 
 /// The moment past which a delivery of a transaction's outbound value
@@ -396,7 +419,7 @@ mod tests {
     use hyperscale_vm_types::ESCROW_GRACE_MS;
 
     use super::{
-        MAX_FINALIZATION_DELAY, Probed, RETENTION_HORIZON, delivery_admissible,
+        Inclusion, MAX_FINALIZATION_DELAY, Probed, RETENTION_HORIZON, delivery_admissible,
         delivery_window_close, lapse_probe_anchor, lapse_probe_ceiling, reclaim_probe_anchor,
         validity_end_of, verdict_window_close,
     };
@@ -490,6 +513,32 @@ mod tests {
             lapse_probe_ceiling(validity_end),
             verdict_window_close(lapse_probe_anchor(validity_end))
         );
+    }
+
+    /// A claim absent answers for a core of one shard and a committed
+    /// cell absent for a core of more; each says nothing about the other
+    /// arity, a delivery's claim absent answers whatever the core, and a
+    /// cell present answers everywhere.
+    #[test]
+    fn an_absence_answers_only_for_the_arity_that_writes_the_cell() {
+        let present = Inclusion::Present([7; 32]);
+        for core_len in [0, 1, 2, 3] {
+            for probed in [Probed::Core, Probed::Claim, Probed::Delivery] {
+                assert_eq!(probed.read(present, core_len), Some(present));
+            }
+            assert_eq!(
+                Probed::Delivery.read(Inclusion::Absent, core_len),
+                Some(Inclusion::Absent)
+            );
+            assert_eq!(
+                Probed::Claim.read(Inclusion::Absent, core_len).is_some(),
+                core_len == 1
+            );
+            assert_eq!(
+                Probed::Core.read(Inclusion::Absent, core_len).is_some(),
+                core_len > 1
+            );
+        }
     }
 
     /// A probe at the validity end itself licenses nothing: a core block
