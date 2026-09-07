@@ -1,28 +1,25 @@
 //! Provision absorption and readiness tracking for cross-shard
 //! transactions.
 //!
-//! Three correlated maps:
-//!
-//! - [`verified`](ProvisioningTracker::verified) — committed entry lists
-//!   keyed by `tx_hash`, one `Arc<Vec<SubstateEntry>>` per source shard
-//!   contribution. Feeds the cross-shard dispatch action for each tx.
-//! - `required` — what each cross-shard tx waits for, as one set of
-//!   [`Requirement`]s. Populated when the tx's tick is created.
-//! - `received` — the remote shards whose provisions have actually
-//!   landed, and the cells those bundles carried present. Populated by
-//!   [`absorb_provisions`](ProvisioningTracker::absorb_provisions).
+//! One absorption per source shard and transaction —
+//! [`absorbed`](ProvisioningTracker::absorbed) — holds what that shard's
+//! committed bundles carried: the environment its latest bundle stated
+//! and every leaf, by key. It is what a cross-shard dispatch carries,
+//! where a crossing's record cell is read from, and the evidence that
+//! the shard committed the transaction. Beside it, `required` is what
+//! each candidate waits for, as one set of [`Requirement`]s.
 //!
 //! A tx is fully provisioned when every requirement is met; that predicate
 //! is surfaced as [`is_fully_provisioned`](ProvisioningTracker::is_fully_provisioned)
-//! so callers never inspect the underlying sets.
+//! so callers never inspect the underlying maps.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_engine::legs::{Classified, Member, Side};
 use hyperscale_types::{
-    Deadline, Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, SubstateKey, TxHash, Verified,
-    WeightedTimestamp, Window,
+    Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, SubstateKey, TxHash, Verified,
+    WeightedTimestamp,
 };
 use hyperscale_vm_types::{AddressClass, LegShape};
 
@@ -63,22 +60,6 @@ pub enum Requirement {
 #[must_use]
 pub fn requirements_of(member: &Member, legs: &[LegShape]) -> BTreeSet<Requirement> {
     divided_requirements(legs, member.classified(), member.local(), member.side())
-}
-
-/// The earliest `member`'s provisioning entry may be swept, where the
-/// member is a delivery of a transaction whose validity ends at
-/// `validity_end`.
-///
-/// A delivery is admissible to the delivery window's close and probed a
-/// finalization delay past it, which outlives the retention horizon the
-/// entry would otherwise take: a bundle landing after the sweep would
-/// populate `present` against a requirement nobody records, and the
-/// delivery would be abandoned at the close while the issuer reclaims a
-/// crossing its deliverer could have taken. Every other member waits
-/// inside the horizon and takes no floor.
-#[must_use]
-pub fn floor_of(member: &Member, validity_end: WeightedTimestamp) -> Option<WeightedTimestamp> {
-    (member.side() == Side::Delivering).then(|| Window::Lapse.of(Deadline::of(validity_end)).start)
 }
 
 /// What a divided member of a transaction files: its execution scope
@@ -155,115 +136,116 @@ pub struct SourceAnchor {
     pub clock: WeightedTimestamp,
 }
 
-pub struct ProvisioningTracker {
-    /// Verified provisions keyed by `tx_hash`. Written when provisions are
-    /// absorbed; read when a cross-shard tick dispatches. Cleared on the
-    /// terminal-state path ([`remove_tx`]) when a finalization
-    /// commits, and swept by [`gc_stale_provisions`] for txs whose
-    /// retention horizon elapsed without ever finalizing.
-    verified: HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
+/// What one source shard's committed bundles carried for a transaction.
+#[derive(Debug, Clone)]
+pub struct Absorbed {
+    /// The environment the shard's latest bundle carried.
+    anchor: SourceAnchor,
+    /// Every leaf the shard's bundles carried, sorted by key. A shard
+    /// sends a transaction two bundles at most — its committed state
+    /// when the transaction commits there, and the record cells its
+    /// certificate wrote when that commits — and a re-broadcast restates
+    /// one of them, so a later bundle restates or adds keys and never
+    /// takes one away.
+    entries: Arc<Vec<SubstateEntry>>,
+    /// The commit clock at the latest absorption, which bounds an
+    /// absorption no candidate here has filed for.
+    at: WeightedTimestamp,
+}
 
-    /// What each cross-shard tx waits for. One set per transaction,
-    /// indexed by nothing else. Populated at tick creation.
+impl Absorbed {
+    fn new(at: WeightedTimestamp, anchor: SourceAnchor, entries: &[SubstateEntry]) -> Self {
+        let mut entries = entries.to_vec();
+        entries.sort_by_key(|entry| entry.key);
+        entries.dedup_by_key(|entry| entry.key);
+        Self {
+            anchor,
+            entries: Arc::new(entries),
+            at,
+        }
+    }
+
+    /// Fold a later bundle from the same shard in. A bundle restating
+    /// what is held changes nothing but the clock.
+    fn absorb(&mut self, at: WeightedTimestamp, anchor: SourceAnchor, entries: &[SubstateEntry]) {
+        self.at = at;
+        self.anchor = anchor;
+        let restated = entries.iter().all(|entry| {
+            self.entries
+                .binary_search_by_key(&entry.key, |held| held.key)
+                .is_ok_and(|index| self.entries[index].value == entry.value)
+        });
+        if restated {
+            return;
+        }
+        let mut merged: BTreeMap<SubstateKey, SubstateEntry> = self
+            .entries
+            .iter()
+            .map(|entry| (entry.key, entry.clone()))
+            .collect();
+        merged.extend(entries.iter().map(|entry| (entry.key, entry.clone())));
+        self.entries = Arc::new(merged.into_values().collect());
+    }
+
+    fn present(&self, key: SubstateKey) -> Option<&[u8]> {
+        let index = self
+            .entries
+            .binary_search_by_key(&key, |held| held.key)
+            .ok()?;
+        self.entries[index].value.as_deref()
+    }
+}
+
+pub struct ProvisioningTracker {
+    /// What each source shard's committed bundles carried for each
+    /// transaction. Written when a bundle is absorbed; read when a
+    /// candidate is composed, for its dispatch and for the arrivals its
+    /// legs consume.
+    absorbed: HashMap<TxHash, BTreeMap<ShardId, Absorbed>>,
+
+    /// What each candidate waits for. One set per transaction, indexed
+    /// by nothing else, filed when the candidate is registered.
     required: HashMap<TxHash, BTreeSet<Requirement>>,
 
-    /// The cells committed bundles carried present for each tx, each
-    /// under the shard whose bundle carried it, with its bytes — what a
-    /// [`Requirement::Crossing`] is satisfied by and what the arrival it
-    /// names is read from.
-    present: HashMap<TxHash, BTreeMap<(ShardId, SubstateKey), Vec<u8>>>,
-
-    /// Remote shards whose provisions have been received, each with the
-    /// environment anchor its bundle carried. Populated by
-    /// [`absorb_provisions`]. The payer shard's entry is the clock and
-    /// draw a non-payer participant executes under.
-    received: HashMap<TxHash, BTreeMap<ShardId, SourceAnchor>>,
-
     /// The payer shard of each cross-shard transaction whose payer is
-    /// remote, recorded at tick creation beside `required`. Resolves
-    /// which `received` entry carries the transaction's environment
-    /// without re-deriving topology at dispatch.
+    /// remote, recorded beside `required`. Resolves which absorption
+    /// carries the transaction's environment without re-deriving
+    /// topology at dispatch.
     payer_shards: HashMap<TxHash, ShardId>,
 
-    /// Per-tx retention deadline = the latest `now + RETENTION_HORIZON`
-    /// observed at any insert point that touches the tx. Past the
-    /// deadline the tx is provably terminal everywhere — every shard
-    /// has either committed an EC for it or its `validity_range` has
-    /// expired and any tick that admitted it has timed out. Anchored
-    /// on BFT-attested `committed_ts`, matching the sender-side
-    /// deadline used by [`OutboundProvisionTracker`](hyperscale_provisions::OutboundProvisionTracker).
-    deadlines: HashMap<TxHash, WeightedTimestamp>,
-
     /// Latest BFT-attested local-commit weighted timestamp seen via
-    /// [`advance_clock`]. Drives deadline stamping deterministically
-    /// across validators.
+    /// [`advance_clock`](Self::advance_clock). What an absorption is
+    /// stamped with, deterministically across validators.
     now: WeightedTimestamp,
 }
 
 impl ProvisioningTracker {
     pub fn new() -> Self {
         Self {
-            verified: HashMap::new(),
+            absorbed: HashMap::new(),
             required: HashMap::new(),
-            present: HashMap::new(),
-            received: HashMap::new(),
             payer_shards: HashMap::new(),
-            deadlines: HashMap::new(),
             now: WeightedTimestamp::ZERO,
         }
     }
 
-    /// Update the shard consensus-attested local-commit clock used for deadline
-    /// stamping. Called once per `on_block_committed`. Monotone — out-of-order
-    /// or stale calls are ignored.
+    /// Update the shard consensus-attested local-commit clock absorptions
+    /// are stamped with. Called once per `on_block_committed`. Monotone —
+    /// out-of-order or stale calls are ignored.
     pub fn advance_clock(&mut self, now: WeightedTimestamp) {
         if now > self.now {
             self.now = now;
         }
     }
 
-    /// Stamp `tx_hash` with a deadline of `self.now + RETENTION_HORIZON`,
-    /// or `floor` where that is later. Idempotent re-stamping only ever
-    /// extends the deadline forward, so a late-arriving provision never
-    /// causes earlier eviction than its predecessor.
-    fn stamp_deadline(&mut self, tx_hash: TxHash, floor: Option<WeightedTimestamp>) {
-        let deadline = self
-            .now
-            .plus(RETENTION_HORIZON)
-            .max(floor.unwrap_or(WeightedTimestamp::ZERO));
-        self.deadlines
-            .entry(tx_hash)
-            .and_modify(|d| {
-                if deadline > *d {
-                    *d = deadline;
-                }
-            })
-            .or_insert(deadline);
-    }
-
-    // ─── Required / received ────────────────────────────────────────────
+    // ─── Required / absorbed ────────────────────────────────────────────
 
     /// Record what `tx_hash` waits for. Overwrites any previous entry —
-    /// callers set this once per tick creation. Arrival order does not
+    /// callers set this once per candidate. Arrival order does not
     /// matter: a bundle absorbed before its requirement is filed still
     /// answers it.
-    ///
-    /// `floor` is the earliest the entry may be swept, for a member whose
-    /// wait outlives the retention horizon: a delivery is admissible to
-    /// the delivery window's close, which can sit a whole validity range
-    /// past the block that committed it, and a requirement swept before
-    /// then leaves a later bundle populating `present` against a
-    /// requirement nobody records — the delivery is abandoned at the
-    /// close and the issuer reclaims a crossing the deliverer could have
-    /// taken.
-    pub fn record_required(
-        &mut self,
-        tx_hash: TxHash,
-        requirements: BTreeSet<Requirement>,
-        floor: Option<WeightedTimestamp>,
-    ) {
+    pub fn record_required(&mut self, tx_hash: TxHash, requirements: BTreeSet<Requirement>) {
         self.required.insert(tx_hash, requirements);
-        self.stamp_deadline(tx_hash, floor);
     }
 
     /// Record the remote payer shard of a cross-shard transaction, so
@@ -273,25 +255,25 @@ impl ProvisioningTracker {
         self.payer_shards.insert(tx_hash, payer_shard);
     }
 
-    /// Whether provisions from `shard` have been absorbed for `tx_hash`.
+    /// Whether a bundle from `shard` has been absorbed for `tx_hash`.
     /// For a transaction's payer shard this is the transaction commit
     /// proof held: absorption admits a bundle only against a
     /// commit-proven source header, committed into the local chain.
     #[must_use]
     pub fn has_received_from(&self, tx_hash: TxHash, shard: ShardId) -> bool {
-        self.received
+        self.absorbed
             .get(&tx_hash)
-            .is_some_and(|received| received.contains_key(&shard))
+            .is_some_and(|by_shard| by_shard.contains_key(&shard))
     }
 
     /// The environment carried by the remote payer's bundle: the
-    /// payer-shard committing block's parent-QC weighted timestamp and
-    /// reveal chain. `None` when the payer is local (the tick
-    /// block is the anchor) or the bundle has not been absorbed.
+    /// payer-shard committing block's parent-QC weighted timestamp.
+    /// `None` when the payer is local (the tick block is the anchor) or
+    /// the bundle has not been absorbed.
     #[must_use]
     pub fn payer_anchor(&self, tx_hash: TxHash) -> Option<SourceAnchor> {
         let payer = self.payer_shards.get(&tx_hash)?;
-        self.received.get(&tx_hash)?.get(payer).copied()
+        Some(self.absorbed.get(&tx_hash)?.get(payer)?.anchor)
     }
 
     /// Whether every requirement for `tx_hash` is met. Returns `false`
@@ -301,23 +283,19 @@ impl ProvisioningTracker {
     pub fn is_fully_provisioned(&self, tx_hash: TxHash) -> bool {
         self.required.get(&tx_hash).is_some_and(|required| {
             required.iter().all(|requirement| match requirement {
-                Requirement::CommittedState(shard) => self
-                    .received
-                    .get(&tx_hash)
-                    .is_some_and(|received| received.contains_key(shard)),
-                Requirement::Crossing { source, key } => self
-                    .present
-                    .get(&tx_hash)
-                    .is_some_and(|present| present.contains_key(&(*source, *key))),
+                Requirement::CommittedState(shard) => self.has_received_from(tx_hash, *shard),
+                Requirement::Crossing { source, key } => {
+                    self.present_cell(tx_hash, *source, *key).is_some()
+                }
             })
         })
     }
 
     // ─── Batch absorption ───────────────────────────────────────────────
 
-    /// Absorb a committed provisions. Appends each tx's entry list to the
-    /// verified map (one entry list per source-shard contribution) and
-    /// records `provisions.source_shard` under `received[tx_hash]`.
+    /// Absorb a committed bundle: what it carries for each transaction
+    /// is folded into the source shard's absorption for it, so a
+    /// re-broadcast restates what is held rather than doubling it.
     ///
     /// Returns the `tx_hash`es touched — the caller uses these to compute
     /// which local ticks are affected and to drive the dispatch check.
@@ -331,66 +309,55 @@ impl ProvisioningTracker {
         };
         for tx_entry in provisions.transactions() {
             let tx_hash = tx_entry.tx_hash;
-            let entries = Arc::new(tx_entry.entries.clone());
-            self.present.entry(tx_hash).or_default().extend(
-                entries
-                    .iter()
-                    .filter_map(|entry| Some(((source_shard, entry.key), entry.value.clone()?))),
-            );
-            self.verified.entry(tx_hash).or_default().push(entries);
-            self.received
+            self.absorbed
                 .entry(tx_hash)
                 .or_default()
-                .insert(source_shard, anchor);
-            self.stamp_deadline(tx_hash, None);
+                .entry(source_shard)
+                .and_modify(|absorbed| absorbed.absorb(self.now, anchor, &tx_entry.entries))
+                .or_insert_with(|| Absorbed::new(self.now, anchor, &tx_entry.entries));
             touched.push(tx_hash);
         }
         touched
     }
 
-    // ─── Terminal cleanup ───────────────────────────────────────────────
+    // ─── Retention ──────────────────────────────────────────────────────
 
-    /// Drop all state for `tx_hash` across every owned map. Called when a
-    /// finalization commits and the transaction reaches terminal state.
-    pub fn remove_tx(&mut self, tx_hash: TxHash) {
-        self.verified.remove(&tx_hash);
-        self.required.remove(&tx_hash);
-        self.present.remove(&tx_hash);
-        self.received.remove(&tx_hash);
-        self.payer_shards.remove(&tx_hash);
-        self.deadlines.remove(&tx_hash);
-    }
-
-    /// Drop tracker state for txs whose retention horizon elapsed without
-    /// reaching finalization. Past `now + RETENTION_HORIZON` from the
-    /// latest insert touching the tx, the tx is provably terminal everywhere
-    /// — every shard has either committed an EC for it or its
-    /// `validity_range` has expired and any tick that admitted it has timed
-    /// out — so no future local tick can still consume the verified
-    /// provisions. Returns the number of txs swept.
-    pub fn gc_stale_provisions(&mut self, now_ts: WeightedTimestamp) -> usize {
-        let stale: Vec<TxHash> = self
-            .deadlines
-            .iter()
-            .filter(|(_, deadline)| **deadline <= now_ts)
-            .map(|(tx, _)| *tx)
-            .collect();
-        let count = stale.len();
-        for tx in stale {
-            self.remove_tx(tx);
-        }
-        count
+    /// Drop what no candidate waits for.
+    ///
+    /// A requirement is a candidate's and goes with it: once a tick has
+    /// taken the member, or nothing will, the entry answers nobody. An
+    /// absorption no candidate has filed for lives one horizon past its
+    /// last bundle — a bundle can land before its transaction commits
+    /// here, and past `RETENTION_HORIZON` the transaction is provably
+    /// terminal everywhere, so no candidate can still consume it.
+    /// Returns the number of transactions whose absorptions were swept.
+    pub fn sweep(&mut self, now: WeightedTimestamp, waiting: impl Fn(TxHash) -> bool) -> usize {
+        self.required.retain(|tx_hash, _| waiting(*tx_hash));
+        self.payer_shards.retain(|tx_hash, _| waiting(*tx_hash));
+        let before = self.absorbed.len();
+        self.absorbed.retain(|tx_hash, by_shard| {
+            waiting(*tx_hash)
+                || by_shard
+                    .values()
+                    .any(|absorbed| absorbed.at.plus(RETENTION_HORIZON) > now)
+        });
+        before - self.absorbed.len()
     }
 
     // ─── Accessors ──────────────────────────────────────────────────────
 
-    /// Verified provision entries for `tx_hash`, one slice element per
-    /// source-shard contribution. Threaded into
-    /// [`TickState::dispatch_if_ready`](crate::tick_state::TickState::dispatch_if_ready)
-    /// so the tick can assemble cross-shard execution requests with a
-    /// per-tx lookup against committed provisions.
-    pub fn provisions_for(&self, tx_hash: TxHash) -> Option<&[Arc<Vec<SubstateEntry>>]> {
-        self.verified.get(&tx_hash).map(Vec::as_slice)
+    /// What was absorbed for `tx_hash`, one entry list per source shard
+    /// in shard order — what a cross-shard execution request carries.
+    #[must_use]
+    pub fn provisions_for(&self, tx_hash: TxHash) -> Vec<Arc<Vec<SubstateEntry>>> {
+        self.absorbed
+            .get(&tx_hash)
+            .map_or_else(Vec::new, |by_shard| {
+                by_shard
+                    .values()
+                    .map(|absorbed| Arc::clone(&absorbed.entries))
+                    .collect()
+            })
     }
 
     /// The bytes of `key` as a committed bundle from `source` carried
@@ -403,41 +370,24 @@ impl ProvisioningTracker {
         source: ShardId,
         key: SubstateKey,
     ) -> Option<&[u8]> {
-        self.present
-            .get(&tx_hash)?
-            .get(&(source, key))
-            .map(Vec::as_slice)
+        self.absorbed.get(&tx_hash)?.get(&source)?.present(key)
     }
 
-    pub fn verified_len(&self) -> usize {
-        self.verified.len()
+    /// Transactions with at least one bundle absorbed.
+    pub fn absorbed_len(&self) -> usize {
+        self.absorbed.len()
     }
 
+    /// Transactions with a requirement filed.
     pub fn required_len(&self) -> usize {
         self.required.len()
-    }
-
-    pub fn received_len(&self) -> usize {
-        self.received.len()
-    }
-}
-
-#[cfg(test)]
-impl ProvisioningTracker {
-    /// Test-only door for seeding `verified` directly. Production code
-    /// populates this map via [`Self::absorb_provisions`]; tests that only
-    /// exercise the dispatch lookup don't need to construct full
-    /// [`Provisions`](hyperscale_types::Provisions) batches.
-    pub fn seed_provisions(&mut self, tx_hash: TxHash, entries: Vec<Arc<Vec<SubstateEntry>>>) {
-        self.verified.insert(tx_hash, entries);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{
-        BlockHeight, Deadline, Hash, MerkleInclusionProof, ProvisionEntry, ShardTrie, Window,
-    };
+    use hyperscale_types::test_utils::test_key;
+    use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, ShardTrie};
 
     use super::*;
     use crate::fixtures;
@@ -474,6 +424,21 @@ mod tests {
         make_provisions_at(source, block_height, anchor(0), tx_hashes)
     }
 
+    fn bundle_for(
+        source: ShardId,
+        tx_hash: TxHash,
+        entries: Vec<SubstateEntry>,
+    ) -> Verified<Provisions> {
+        Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
+            source,
+            ShardId::leaf(2, 0),
+            BlockHeight::new(5),
+            anchor(0).clock,
+            MerkleInclusionProof::dummy(),
+            vec![ProvisionEntry::new(tx_hash, entries)],
+        ))
+    }
+
     fn anchor(clock_ms: u64) -> SourceAnchor {
         SourceAnchor {
             clock: WeightedTimestamp::from_millis(clock_ms),
@@ -483,9 +448,8 @@ mod tests {
     #[test]
     fn fresh_tracker_reports_no_state() {
         let t = ProvisioningTracker::new();
-        assert_eq!(t.verified_len(), 0);
+        assert_eq!(t.absorbed_len(), 0);
         assert_eq!(t.required_len(), 0);
-        assert_eq!(t.received_len(), 0);
         assert!(!t.is_fully_provisioned(TxHash::from(Hash::from_bytes(b"missing"))));
     }
 
@@ -514,7 +478,6 @@ mod tests {
                 .into_iter()
                 .map(Requirement::CommittedState)
                 .collect(),
-            None,
         );
 
         assert!(!t.is_fully_provisioned(tx));
@@ -566,7 +529,7 @@ mod tests {
         // A stranger carrying the key answers nothing, and its bytes are
         // never the arrival.
         let mut planted = ProvisioningTracker::new();
-        planted.record_required(tx, BTreeSet::from([requirement]), None);
+        planted.record_required(tx, BTreeSet::from([requirement]));
         planted.absorb_provisions(&bundle(
             shard(3),
             vec![SubstateEntry::new(record, Some(vec![9]))],
@@ -583,7 +546,7 @@ mod tests {
             shard(1),
             vec![SubstateEntry::new(record, Some(vec![7]))],
         ));
-        early.record_required(tx, BTreeSet::from([requirement]), None);
+        early.record_required(tx, BTreeSet::from([requirement]));
         assert!(early.is_fully_provisioned(tx));
         assert_eq!(
             early.present_cell(tx, shard(1), record),
@@ -593,7 +556,7 @@ mod tests {
 
         // The named source, carrying the wrong cell or an absent value.
         let mut wrong = ProvisioningTracker::new();
-        wrong.record_required(tx, BTreeSet::from([requirement]), None);
+        wrong.record_required(tx, BTreeSet::from([requirement]));
         wrong.absorb_provisions(&bundle(
             shard(1),
             vec![SubstateEntry::new(other, Some(vec![7]))],
@@ -613,7 +576,6 @@ mod tests {
         both.record_required(
             tx,
             BTreeSet::from([requirement, Requirement::CommittedState(shard(2))]),
-            None,
         );
         both.absorb_provisions(&bundle(
             shard(1),
@@ -737,7 +699,7 @@ mod tests {
         // the empty set dispatch without any provision landing.
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"delta-only"));
-        t.record_required(tx, BTreeSet::new(), None);
+        t.record_required(tx, BTreeSet::new());
         assert!(t.is_fully_provisioned(tx));
     }
 
@@ -764,18 +726,17 @@ mod tests {
     }
 
     #[test]
-    fn absorb_provisions_populates_verified_and_received_maps() {
+    fn absorb_provisions_records_the_source_once() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
         let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
         t.absorb_provisions(&provisions);
 
-        assert_eq!(t.verified_len(), 1);
-        assert_eq!(t.received_len(), 1);
+        assert_eq!(t.absorbed_len(), 1);
         assert_eq!(
-            t.verified.get(&tx).map_or(0, Vec::len),
+            t.provisions_for(tx).len(),
             1,
-            "one provision recorded per provisions entry"
+            "one absorption per source shard"
         );
     }
 
@@ -786,14 +747,44 @@ mod tests {
         t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), vec![tx]));
         t.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(5), vec![tx]));
 
-        // Two distinct source shards → two verified entry lists and two
-        // received entries.
-        assert_eq!(t.verified.get(&tx).map_or(0, Vec::len), 2);
         assert_eq!(
-            t.received.get(&tx).map_or(0, BTreeMap::len),
+            t.provisions_for(tx).len(),
             2,
-            "received set contains both source shards"
+            "one absorption per source shard"
         );
+        assert!(t.has_received_from(tx, shard(1)));
+        assert!(t.has_received_from(tx, shard(2)));
+    }
+
+    /// A re-broadcast restates what is held: the dispatch carries the
+    /// bundle once, and a second bundle from the same shard adds its
+    /// cells beside the first's rather than beneath a second copy.
+    #[test]
+    fn a_shards_later_bundle_restates_or_adds_and_never_doubles() {
+        let mut t = ProvisioningTracker::new();
+        let tx = TxHash::from(Hash::from_bytes(b"tx"));
+        let a = test_key(1);
+        let b = test_key(2);
+        let first = || bundle_for(shard(1), tx, vec![SubstateEntry::new(a, Some(vec![1]))]);
+        t.absorb_provisions(&first());
+        t.absorb_provisions(&first());
+        assert_eq!(
+            t.provisions_for(tx).len(),
+            1,
+            "a re-broadcast is absorbed once"
+        );
+        assert_eq!(t.present_cell(tx, shard(1), a), Some(&[1][..]));
+
+        t.absorb_provisions(&bundle_for(
+            shard(1),
+            tx,
+            vec![SubstateEntry::new(b, Some(vec![2]))],
+        ));
+        let carried = t.provisions_for(tx);
+        assert_eq!(carried.len(), 1, "still one absorption for the shard");
+        assert_eq!(carried[0].len(), 2, "holding both bundles' cells");
+        assert_eq!(t.present_cell(tx, shard(1), a), Some(&[1][..]));
+        assert_eq!(t.present_cell(tx, shard(1), b), Some(&[2][..]));
     }
 
     #[test]
@@ -806,7 +797,6 @@ mod tests {
                 .into_iter()
                 .map(Requirement::CommittedState)
                 .collect(),
-            None,
         );
         t.record_payer_shard(tx, shard(2));
 
@@ -829,60 +819,39 @@ mod tests {
             vec![tx],
         ));
         assert_eq!(t.payer_anchor(tx), Some(anchor(9_500)));
-
-        t.remove_tx(tx);
-        assert_eq!(t.payer_anchor(tx), None);
     }
 
+    /// A requirement is its candidate's: the sweep drops it the moment
+    /// no candidate waits, and keeps it however long one does — a
+    /// delivery is admissible to the delivery window's close, a whole
+    /// validity range past the horizon a stray absorption gets.
     #[test]
-    fn remove_tx_drops_state_from_every_owned_map() {
+    fn a_requirement_lives_with_its_candidate_and_no_longer() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
-        t.record_required(
-            tx,
-            std::iter::once(Requirement::CommittedState(shard(1))).collect(),
-            None,
-        );
-        let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
-        t.absorb_provisions(&provisions);
-        assert!(t.is_fully_provisioned(tx));
-
-        t.remove_tx(tx);
-
-        assert!(!t.is_fully_provisioned(tx));
-        assert_eq!(t.verified_len(), 0);
-        assert_eq!(t.required_len(), 0);
-        assert_eq!(t.received_len(), 0);
-    }
-
-    /// A delivery's requirement outlives the retention horizon: it is
-    /// admissible to the delivery window's close, which can sit a whole
-    /// validity range past the block that committed it, and a bundle
-    /// landing after a sweep would answer a requirement nobody records.
-    #[test]
-    fn a_delivery_requirement_stands_past_the_retention_horizon() {
-        let mut t = ProvisioningTracker::new();
-        let tx = TxHash::from(Hash::from_bytes(b"delivery"));
-        let validity_end = WeightedTimestamp::from_millis(100_000);
-        let floor = Window::Lapse.of(Deadline::of(validity_end)).start;
         t.advance_clock(WeightedTimestamp::from_millis(1_000));
         t.record_required(
             tx,
-            BTreeSet::from([Requirement::CommittedState(shard(1))]),
-            Some(floor),
+            std::iter::once(Requirement::CommittedState(shard(1))).collect(),
         );
+        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), vec![tx]));
+        assert!(t.is_fully_provisioned(tx));
 
+        let long_after = WeightedTimestamp::from_millis(1_000)
+            .plus(RETENTION_HORIZON)
+            .plus(RETENTION_HORIZON);
         assert_eq!(
-            t.gc_stale_provisions(WeightedTimestamp::from_millis(1_000).plus(RETENTION_HORIZON)),
+            t.sweep(long_after, |_| true),
             0,
-            "the horizon is not what bounds a delivery",
+            "the horizon is not what bounds it"
         );
-        assert_eq!(
-            t.gc_stale_provisions(floor.minus(std::time::Duration::from_millis(1))),
-            0,
-            "short of the anchor the issuer's lapse proof is taken at",
-        );
-        assert_eq!(t.gc_stale_provisions(floor), 1, "and gone at it");
+        assert!(t.is_fully_provisioned(tx));
+
+        assert_eq!(t.sweep(long_after, |_| false), 1);
+        assert!(!t.is_fully_provisioned(tx));
+        assert_eq!(t.absorbed_len(), 0);
+        assert_eq!(t.required_len(), 0);
+        assert_eq!(t.payer_anchor(tx), None);
     }
 
     #[test]
@@ -892,7 +861,6 @@ mod tests {
         t.record_required(
             tx,
             std::iter::once(Requirement::CommittedState(shard(1))).collect(),
-            None,
         );
         // Re-record with a different requirement set.
         t.record_required(
@@ -901,82 +869,39 @@ mod tests {
                 .into_iter()
                 .map(Requirement::CommittedState)
                 .collect(),
-            None,
         );
         assert_eq!(t.required.get(&tx).map_or(0, BTreeSet::len), 2);
     }
 
+    /// An absorption no candidate has filed for lives one horizon past
+    /// its last bundle, whichever shard's it was.
     #[test]
-    fn gc_stale_provisions_evicts_past_horizon_and_keeps_fresh() {
-        use hyperscale_types::RETENTION_HORIZON;
-
+    fn a_stray_absorption_is_swept_one_horizon_past_its_last_bundle() {
         let mut t = ProvisioningTracker::new();
         let tx_old = TxHash::from(Hash::from_bytes(b"old"));
         let tx_fresh = TxHash::from(Hash::from_bytes(b"fresh"));
 
-        // Old tx absorbed at clock = ms(1_000).
         t.advance_clock(WeightedTimestamp::from_millis(1_000));
-        t.record_required(
-            tx_old,
-            std::iter::once(Requirement::CommittedState(shard(1))).collect(),
-            None,
-        );
         t.absorb_provisions(&make_provisions(
             shard(1),
             BlockHeight::new(5),
-            vec![tx_old],
+            vec![tx_old, tx_fresh],
         ));
-
-        // Fresh tx absorbed at clock = ms(60_000).
         t.advance_clock(WeightedTimestamp::from_millis(60_000));
-        t.record_required(
-            tx_fresh,
-            std::iter::once(Requirement::CommittedState(shard(1))).collect(),
-            None,
-        );
         t.absorb_provisions(&make_provisions(
-            shard(1),
+            shard(2),
             BlockHeight::new(6),
             vec![tx_fresh],
         ));
 
-        let horizon_ms = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX);
-        // Past tx_old's deadline (1_000 + horizon) but not tx_fresh's
-        // (60_000 + horizon).
-        let now = WeightedTimestamp::from_millis(1_000 + horizon_ms + 1);
-        assert!(now.as_millis() < 60_000 + horizon_ms);
-
-        let evicted = t.gc_stale_provisions(now);
-        assert_eq!(evicted, 1);
-
-        assert!(!t.verified.contains_key(&tx_old));
-        assert!(!t.received.contains_key(&tx_old));
-        assert!(!t.required.contains_key(&tx_old));
-        assert!(t.verified.contains_key(&tx_fresh));
-        assert!(t.received.contains_key(&tx_fresh));
-        assert!(t.required.contains_key(&tx_fresh));
-    }
-
-    #[test]
-    fn gc_stale_provisions_late_insert_extends_deadline() {
-        use hyperscale_types::RETENTION_HORIZON;
-
-        let mut t = ProvisioningTracker::new();
-        let tx = TxHash::from(Hash::from_bytes(b"tx"));
-
-        // First insert at clock = ms(1_000) → deadline = 1_000 + horizon.
-        t.advance_clock(WeightedTimestamp::from_millis(1_000));
-        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), vec![tx]));
-
-        // Second insert at clock = ms(60_000) → deadline extended to
-        // 60_000 + horizon.
-        t.advance_clock(WeightedTimestamp::from_millis(60_000));
-        t.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(5), vec![tx]));
-
-        let horizon_ms = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX);
-        // Past the FIRST deadline but not the SECOND. Entry must survive.
-        let now = WeightedTimestamp::from_millis(1_000 + horizon_ms + 1);
-        assert_eq!(t.gc_stale_provisions(now), 0);
-        assert!(t.verified.contains_key(&tx));
+        // Past the first bundle's horizon but not the second's.
+        let now = WeightedTimestamp::from_millis(1_001).plus(RETENTION_HORIZON);
+        assert_eq!(t.sweep(now, |_| false), 1);
+        assert!(!t.has_received_from(tx_old, shard(1)));
+        assert!(
+            t.has_received_from(tx_fresh, shard(1)),
+            "the later bundle holds the whole absorption"
+        );
+        assert!(t.has_received_from(tx_fresh, shard(2)));
     }
 }

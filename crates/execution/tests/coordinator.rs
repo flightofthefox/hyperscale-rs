@@ -44,9 +44,8 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
         vote_trackers,
         early_votes,
         expected_exec_certs,
-        verified_provisions,
+        absorbed_provisions,
         required_provision_shards,
-        received_provision_shards,
         ticks_with_ec,
         pending_vote_retries,
         tick_assignments,
@@ -65,9 +64,8 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
     assert_eq!(vote_trackers, 0);
     assert_eq!(early_votes, 0);
     assert_eq!(expected_exec_certs, 0);
-    assert_eq!(verified_provisions, 0);
+    assert_eq!(absorbed_provisions, 0);
     assert_eq!(required_provision_shards, 0);
-    assert_eq!(received_provision_shards, 0);
     assert_eq!(ticks_with_ec, 0);
     assert_eq!(pending_vote_retries, 0);
     assert_eq!(tick_assignments, 0);

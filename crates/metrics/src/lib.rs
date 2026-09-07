@@ -96,12 +96,10 @@ pub struct MemoryMetrics {
     pub exec_early_votes: usize,
     /// Expected execution certificates from remote shards.
     pub exec_expected_exec_certs: usize,
-    /// Verified state provisions per transaction.
-    pub exec_verified_provisions: usize,
-    /// Required provision shards per transaction.
+    /// Transactions with a provision bundle absorbed.
+    pub exec_absorbed_provisions: usize,
+    /// Candidates with a requirement set filed.
     pub exec_required_provision_shards: usize,
-    /// Received provision shards per transaction.
-    pub exec_received_provision_shards: usize,
     /// Ticks that have produced an execution certificate.
     pub exec_ticks_with_ec: usize,
     /// Ticks with pending vote retries.

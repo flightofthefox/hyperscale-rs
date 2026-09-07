@@ -71,7 +71,7 @@ use crate::lookups::{
 };
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::provisional::ProvisionalCells;
-use crate::provisioning::{ProvisioningTracker, Requirement, floor_of, requirements_of};
+use crate::provisioning::{ProvisioningTracker, Requirement, requirements_of};
 use crate::tick_state::{Admission, Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
 use crate::unresolved::{Probeable, Reclaimable, Released, Retirable, Unanswerable, UnresolvedTxs};
@@ -189,12 +189,10 @@ pub struct ExecutionMemoryStats {
     pub early_votes: usize,
     /// Expected EC arrivals from remote shards we're awaiting.
     pub expected_exec_certs: usize,
-    /// Verified provisions held per cross-shard tx.
-    pub verified_provisions: usize,
-    /// Distinct (tx, source-shard) requirements awaiting provisioning.
+    /// Transactions with a provision bundle absorbed.
+    pub absorbed_provisions: usize,
+    /// Candidates with a requirement set filed.
     pub required_provision_shards: usize,
-    /// Distinct (tx, source-shard) provisions received so far.
-    pub received_provision_shards: usize,
     /// Ticks whose local EC has been emitted.
     pub ticks_with_ec: usize,
     /// Vote retries scheduled for resend after rotation timeout.
@@ -754,11 +752,8 @@ impl ExecutionCoordinator {
                     classified.first_side_at(local_shard),
                     participating.clone(),
                 );
-                self.provisioning.record_required(
-                    tx_hash,
-                    requirements_of(&member, tx.legs()),
-                    floor_of(&member, tx.validity_range().end_timestamp_exclusive),
-                );
+                self.provisioning
+                    .record_required(tx_hash, requirements_of(&member, tx.legs()));
                 continue;
             }
             let remote_participants = || -> BTreeSet<ShardId> {
@@ -813,7 +808,6 @@ impl ExecutionCoordinator {
                     .into_iter()
                     .map(Requirement::CommittedState)
                     .collect(),
-                None,
             );
         }
 
@@ -1030,22 +1024,24 @@ impl ExecutionCoordinator {
                 state.record_fee_receipt(StoredReceipt::synced(tx_hash, Arc::new(fee)));
             }
             self.candidates.remove(tx_hash);
-            self.provisioning.remove_tx(tx_hash);
             self.ticks.assign_tx(tx_hash, tick_id);
             self.unresolved.certify(tx_hash);
         }
     }
 
-    /// Drop every delivering candidate the delivery window has closed on,
-    /// and the provisioning entry that was held for it.
+    /// Drop every delivering candidate the delivery window has closed
+    /// on, and what no candidate waits for any more.
     ///
     /// Past the close no tick can take the member, and a mixed shard's
     /// delivering candidate is removed by nothing else — its ledger entry
-    /// is the leg's, and a leg is never abandoned.
-    fn retire_closed_deliveries(&mut self) {
-        for tx_hash in self.candidates.drop_closed_deliveries(self.committed_ts) {
-            self.provisioning.remove_tx(tx_hash);
-        }
+    /// is the leg's, and a leg is never abandoned. What was provisioned
+    /// belongs to the candidates waiting on it, and a mixed shard's
+    /// delivering member is one until its own tick takes it.
+    fn sweep_candidates(&mut self) {
+        self.candidates.drop_closed_deliveries(self.committed_ts);
+        let candidates = &self.candidates;
+        self.provisioning
+            .sweep(self.committed_ts, |tx_hash| candidates.contains(tx_hash));
     }
 
     /// Admit into the tick being composed every reclaim a committed
@@ -1083,7 +1079,6 @@ impl ExecutionCoordinator {
             // that the core never claimed. Nothing is coming, so the
             // candidate goes with the leg it was registered beside.
             self.candidates.remove(tx_hash);
-            self.provisioning.remove_tx(tx_hash);
             let records = classified.records_issued(local_shard);
             // The plan reads no body — every cell is the record's — but
             // the price still follows the vault, and this is the shard
@@ -1331,7 +1326,6 @@ impl ExecutionCoordinator {
             self.provisioning.record_required(
                 member.request.tx_hash,
                 requirements_of(&delivering, body.legs()),
-                floor_of(&delivering, body.validity_range().end_timestamp_exclusive),
             );
             self.candidates
                 .register_member(Arc::clone(body), delivering, member.request.clock);
@@ -3064,7 +3058,7 @@ impl ExecutionCoordinator {
         }
         self.cover_recorded(block);
         self.stamp_departures(topology_schedule);
-        self.retire_closed_deliveries();
+        self.sweep_candidates();
         let pruned = self.unresolved.prune(self.committed_ts);
         self.released_fetches.extend(pruned.released);
         self.release_unanswerable(&pruned.unanswerable);
@@ -3079,7 +3073,6 @@ impl ExecutionCoordinator {
         actions.extend(self.check_vote_retry_timeouts(topology_schedule));
         self.prune_execution_state();
         self.early.gc_stale_ecs(self.committed_ts);
-        self.provisioning.gc_stale_provisions(self.committed_ts);
         // Commit-proof marks age out with the ECs they gate, and the
         // shard coordinator retires them: one mirror, one retirement.
         // Deferred ECs drop at their own deadline.
@@ -4310,13 +4303,6 @@ impl ExecutionCoordinator {
         }
         for &tx_hash in &tx_hashes {
             self.ticks.remove_assignment(tx_hash);
-            // What the transaction was provisioned with belongs to every
-            // member this shard runs of it: a mixed shard's delivering
-            // member is still waiting on its arrival when the issuing
-            // one's finalization commits, and drops it with its own.
-            if !self.candidates.contains(tx_hash) {
-                self.provisioning.remove_tx(tx_hash);
-            }
         }
         // Drain pending-tx sets on fulfilled-cert tombstones referencing
         // any of these txs. When the EC's last referenced tx terminates,
@@ -4474,9 +4460,8 @@ impl ExecutionCoordinator {
             vote_trackers: self.ticks.trackers_len(),
             early_votes: self.early.vote_len(),
             expected_exec_certs: self.expected_certs.expected_len(),
-            verified_provisions: self.provisioning.verified_len(),
+            absorbed_provisions: self.provisioning.absorbed_len(),
             required_provision_shards: self.provisioning.required_len(),
-            received_provision_shards: self.provisioning.received_len(),
             ticks_with_ec: self.ticks.ec_dispatched_len(),
             pending_vote_retries: self.ticks.retries_len(),
             tick_assignments: self.ticks.assignments_len(),
@@ -10054,7 +10039,6 @@ mod tests {
         state.provisioning.record_required(
             tx_hash,
             std::iter::once(Requirement::CommittedState(ShardId::leaf(1, 1))).collect(),
-            None,
         );
         // Drive finalize to populate the FinalizationStore naturally.
         let _ = state.finalize(&make_test_topology(), &tick_id);
@@ -10070,14 +10054,15 @@ mod tests {
         assert_eq!(before.required_provision_shards, 1);
 
         state.remove_finalization(&finalized);
+        // Provisioning is a candidate's, swept at the next commit.
+        state.provisioning.sweep(state.committed_ts, |_| false);
 
         let after = state.memory_stats();
         assert_eq!(after.finalizations, 0);
         assert_eq!(after.ticks, 0);
         assert_eq!(after.tick_assignments, 0);
-        assert_eq!(after.verified_provisions, 0);
+        assert_eq!(after.absorbed_provisions, 0);
         assert_eq!(after.required_provision_shards, 0);
-        assert_eq!(after.received_provision_shards, 0);
     }
 
     /// An expectation is stamped with the weighted timestamp of the

@@ -287,10 +287,7 @@ impl TickCandidates {
                     tx_hash,
                     transaction: Some(Arc::clone(&candidate.tx)),
                     provisions: if reaches_beyond {
-                        provisioning
-                            .provisions_for(tx_hash)
-                            .map(<[_]>::to_vec)
-                            .unwrap_or_default()
+                        provisioning.provisions_for(tx_hash)
                     } else {
                         Vec::new()
                     },
@@ -447,7 +444,7 @@ mod tests {
         );
         assert!(candidates.contains(hash), "so it is still waiting");
 
-        provisioning.record_required(hash, BTreeSet::new(), None);
+        provisioning.record_required(hash, BTreeSet::new());
         let admitted =
             candidates.compose(&provisioning, &mut ProvisionalCells::default(), ms(1_000));
         assert_eq!(admitted.len(), 1);
@@ -517,7 +514,7 @@ mod tests {
         candidates.record_engagement_wait(hash, BTreeSet::from([remote]), ms(60_000));
 
         let mut provisioning = ProvisioningTracker::new();
-        provisioning.record_required(hash, BTreeSet::new(), None);
+        provisioning.record_required(hash, BTreeSet::new());
 
         assert!(
             candidates
@@ -545,7 +542,7 @@ mod tests {
         candidates.record_engagement_wait(hash, BTreeSet::from([remote]), ms(60_000));
 
         let mut provisioning = ProvisioningTracker::new();
-        provisioning.record_required(hash, BTreeSet::new(), None);
+        provisioning.record_required(hash, BTreeSet::new());
 
         let admitted =
             candidates.compose(&provisioning, &mut ProvisionalCells::default(), ms(60_000));
@@ -595,7 +592,7 @@ mod tests {
         let hash = tx.hash();
         candidates.register(tx, BTreeSet::from([local, venue]), ms(1_000), classified);
         let mut provisioning = ProvisioningTracker::new();
-        provisioning.record_required(hash, BTreeSet::new(), None);
+        provisioning.record_required(hash, BTreeSet::new());
 
         let admitted =
             candidates.compose(&provisioning, &mut ProvisionalCells::default(), ms(1_000));
@@ -640,7 +637,7 @@ mod tests {
         let mut provisioning = ProvisioningTracker::new();
         for seed in [1, 2] {
             let tx = contending(seed);
-            provisioning.record_required(tx.hash(), BTreeSet::new(), None);
+            provisioning.record_required(tx.hash(), BTreeSet::new());
             whole.register(tx, participating.clone(), ms(1_000), Classified::whole());
         }
         let mut held = ProvisionalCells::default();

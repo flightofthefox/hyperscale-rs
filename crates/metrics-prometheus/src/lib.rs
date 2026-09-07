@@ -1384,16 +1384,12 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.exec_expected_exec_certs as f64);
         self.metrics
             .memory_exec
-            .with_label_values(&["verified_provisions"])
-            .set(m.exec_verified_provisions as f64);
+            .with_label_values(&["absorbed_provisions"])
+            .set(m.exec_absorbed_provisions as f64);
         self.metrics
             .memory_exec
             .with_label_values(&["required_provision_shards"])
             .set(m.exec_required_provision_shards as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["received_provision_shards"])
-            .set(m.exec_received_provision_shards as f64);
         self.metrics
             .memory_exec
             .with_label_values(&["ticks_with_ec"])
