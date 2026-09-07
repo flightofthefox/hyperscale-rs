@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_types::{Address, EscrowedValue, ShardId, ShardTrie};
-use hyperscale_vm_effects::{CrossingSite, StarShape, star_at};
+use hyperscale_vm_effects::{CrossingSite, star_at};
 use hyperscale_vm_kernel::{Crossed, Departure, ExecutionScope, LegPlan, PlanFault};
 use hyperscale_vm_types::{Crossing, LegRole, LegShape, ProtocolHasher, SubstateKey};
 
@@ -393,23 +393,14 @@ pub enum Side {
 }
 
 impl Classified {
-    /// Freeze `legs` against `trie`: the classifier's own answer, the
-    /// settled roles and the core set beside it. Nothing else enters —
-    /// the trie is the one placement fact, and it changes only at a cut,
-    /// where the shard leaving it commits nothing more — so every shard
-    /// and every replica committing the transaction under one trie
-    /// freezes one shape.
+    /// Freeze `legs` against `trie`: the classifier's star — whether the
+    /// shape divides, the settled roles and the core set. Nothing else
+    /// enters — the trie is the one placement fact, and it changes only
+    /// at a cut, where the shard leaving it commits nothing more — so
+    /// every shard and every replica committing the transaction under
+    /// one trie freezes one shape.
     ///
-    /// Dividing takes two conjuncts. The classifier's own asks whether
-    /// the shape's value edges can be cut at all. The planner's asks
-    /// whether the cut leaves every sink a member that can run it: a
-    /// sink fed from both sides of its own shard has none, since the
-    /// issuing member could only hand it the local edge through a bundle
-    /// to itself, and the delivering member waits on an arrival that
-    /// edge never produces. Running whole is always correct, so such a
-    /// shape takes that.
-    ///
-    /// Neither conjunct reads a window. A shard scheduled to leave the
+    /// The classifier reads no window. A shard scheduled to leave the
     /// trie divides like any other, in its final window too: a record
     /// cell follows its prefix to the successor, a claim or a delivery
     /// is a pull on whoever holds the prefix when it is made, and a
@@ -421,19 +412,15 @@ impl Classified {
     #[must_use]
     pub fn freeze(legs: &[LegShape], owners: &[Address], trie: &ShardTrie) -> Self {
         let trie = Arc::new(trie.clone());
-        let star = star_of(legs, &trie);
-        let core: BTreeSet<ShardId> = star
-            .core
-            .iter()
-            .map(|shard| ShardId::from_heap_index(shard.0))
-            .collect();
-        let consumers = consumers_of(legs);
-        let roles = fold_beside_the_core(legs, &star.roles, &core, &trie, &consumers);
-        let placed = Star::view(legs, &roles, &core, &trie, consumers);
-        let decomposed = Decomposed(
-            star.decomposes(legs, owners, &TrieShardResolver { trie: &trie })
-                && placed.no_sink_is_fed_from_both_sides(),
-        );
+        let star = star_at(
+            legs,
+            owners,
+            &TrieShardResolver { trie: &trie },
+            &ProtocolHasher,
+        )
+        .map_shards(|shard| ShardId::from_heap_index(shard.0));
+        let decomposed = Decomposed(star.decomposes);
+        let placed = Star::view(legs, &star.roles, &star.core, &trie, consumers_of(legs));
         let (delivering, mixed) = if decomposed.holds() {
             let (delivers, settles) = placed.delivery_sides();
             (
@@ -446,8 +433,8 @@ impl Classified {
         Self {
             decomposed,
             trie,
-            roles,
-            core,
+            roles: star.roles,
+            core: star.core,
             delivering,
             mixed,
         }
@@ -784,51 +771,6 @@ impl Runs {
     }
 }
 
-/// The star `legs` implies under `trie` — the anchored half of the
-/// classification.
-///
-/// It reaches `star_at`, so the write-free demotion is decided once, in
-/// the classifier, rather than a second time here.
-#[must_use]
-fn star_of(legs: &[LegShape], trie: &ShardTrie) -> StarShape {
-    star_at(legs, &TrieShardResolver { trie })
-}
-
-/// The settled roles with every leg beside the core folded into it: an
-/// attesting node on a core shard, an inbound leg on a core shard feeding
-/// a core node, an outbound leg on a core shard fed by one. Each then
-/// runs in the core member and is replicated where the core is, so
-/// nothing is departed between a producer and a consumer that run
-/// together.
-fn fold_beside_the_core(
-    legs: &[LegShape],
-    settled: &[LegRole],
-    core: &BTreeSet<ShardId>,
-    trie: &ShardTrie,
-    consumers: &BTreeMap<(u32, u32), u32>,
-) -> Vec<LegRole> {
-    let role_of = |node: u32| settled.get(node as usize).copied().unwrap_or_default();
-    (0u32..)
-        .zip(settled.iter().zip(legs))
-        .map(|(index, (&role, leg))| {
-            if !core.contains(&trie.shard_for_prefix(leg.target)) {
-                return role;
-            }
-            let beside_the_core = match role {
-                LegRole::Attesting | LegRole::Core => true,
-                LegRole::Inbound => leg_outputs(legs, index)
-                    .filter_map(|output| consumers.get(&(index, output)))
-                    .any(|&consumer| role_of(consumer) == LegRole::Core),
-                LegRole::Outbound => leg
-                    .edges
-                    .iter()
-                    .any(|edge| role_of(edge.source) == LegRole::Core),
-            };
-            if beside_the_core { LegRole::Core } else { role }
-        })
-        .collect()
-}
-
 /// Every `(source, output)` edge's consumer.
 fn consumers_of(legs: &[LegShape]) -> BTreeMap<(u32, u32), u32> {
     legs.iter()
@@ -840,14 +782,6 @@ fn consumers_of(legs: &[LegShape]) -> BTreeMap<(u32, u32), u32> {
                 .map(move |edge| ((edge.source, edge.output), index))
         })
         .collect()
-}
-
-/// The outputs of `node` some edge consumes.
-fn leg_outputs(legs: &[LegShape], node: u32) -> impl Iterator<Item = u32> + '_ {
-    legs.iter()
-        .flat_map(|leg| leg.edges.iter())
-        .filter(move |edge| edge.source == node)
-        .map(|edge| edge.output)
 }
 
 /// One value edge whose producer and consumer do not run together.
@@ -1045,29 +979,6 @@ impl<'a> Star<'a> {
 
     fn consumer_of(&self, node: u32, output: u32) -> Option<u32> {
         self.consumers.get(&(node, output)).copied()
-    }
-
-    /// Whether every sink's producers all run where it does, or none do.
-    ///
-    /// A sink fed from both sides has no member that can run it: its
-    /// shard's issuing member would have to hand it the local edge
-    /// through a bundle to itself, and its delivering member waits on an
-    /// arrival that edge never produces. Read off the settled roles, so
-    /// a leg folded into the core is asked about where the core runs
-    /// rather than where its own prefix sits.
-    fn no_sink_is_fed_from_both_sides(&self) -> bool {
-        (0u32..).zip(self.legs).all(|(node, leg)| {
-            if self.role(node) != LegRole::Outbound {
-                return true;
-            }
-            let home = self.home(node);
-            let beside: BTreeSet<bool> = leg
-                .edges
-                .iter()
-                .map(|edge| self.running(edge.source).contains(&home))
-                .collect();
-            beside.len() <= 1
-        })
     }
 
     /// What `local` judges: the core set if it is in it, itself
