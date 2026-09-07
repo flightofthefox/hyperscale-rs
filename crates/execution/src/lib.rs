@@ -30,6 +30,7 @@ mod fixtures;
 mod gate;
 mod lookups;
 mod outbound_certs;
+mod parked;
 mod provisional;
 mod provisioning;
 mod ticks;

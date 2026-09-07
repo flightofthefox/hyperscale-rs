@@ -45,17 +45,17 @@ use hyperscale_metrics::{
 };
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader,
-    BlockHeight, BloomFilter, CertifiedBlock, ConsensusPublicKey, CounterpartEvidence,
-    CounterpartMirror, Deadline, DeclaredKey, Derivation, ExecutionCertificate,
-    ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationHash,
-    FinalizationVerifyError, GlobalReceiptRoot, Hash, Heard, Inclusion,
-    MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    MerkleInclusionProof, Mode, Probed, ProvenAnchors, Provisions, Question, SettledSetVerdict,
-    SettledTxSet, ShardId, ShardTrie, StateProofBundle, StoredReceipt, SubstateKey, TickId,
-    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
-    TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, Window, Word,
-    derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
+    AbandonmentRecord, Anchor, Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
+    CertifiedBlock, ConsensusPublicKey, CounterpartEvidence, CounterpartMirror, Deadline,
+    DeclaredKey, Derivation, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
+    Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Heard,
+    Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Mode, Probed, ProvenAnchors, Provisions,
+    Question, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateProofBundle, StoredReceipt,
+    SubstateKey, TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision,
+    TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, Window, Word, derive_block_transactions, settled_set_verdict, tick_leader,
+    tick_leader_at,
 };
 use hyperscale_vm_effects::CrossingCell;
 use tracing::instrument;
@@ -71,6 +71,7 @@ use crate::lookups::{
     peers_excluding_self,
 };
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
+use crate::parked::{Parked, ParkedArtifacts, Waiting, Wake};
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::{ProvisioningTracker, Requirement, requirements_of};
 use crate::tick_state::{Admission, Divergence, Membership, TickState};
@@ -448,20 +449,10 @@ pub struct ExecutionCoordinator {
     /// dispatch on every byte-identical retransmit.
     pending_verifications: HashSet<Hash>,
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Beacon-sync-lag buffers
-    // ═══════════════════════════════════════════════════════════════════════
-    /// Cross-shard ECs whose committee epoch this node's beacon hasn't reached,
-    /// so `at(vote_anchor_ts)` can't resolve the signing committee. Keyed by the
-    /// EC's own shard, bounded per shard (drop-oldest). Re-attempted on
-    /// `BeaconBlockPersisted`. Pure catch-up: a buffered EC means *we* are
-    /// behind, since under lookahead its committee is already globally fixed.
-    awaiting_certs: AwaitingTopologyBuffer<Verifiable<ExecutionCertificate>>,
-
-    /// Fetched `Finalization`s deferred for the same reason — a contained EC's
-    /// committee epoch isn't in our schedule yet. Keyed by the tick's own shard;
-    /// re-attempted on `BeaconBlockPersisted`.
-    awaiting_finalizations: AwaitingTopologyBuffer<Arc<Verifiable<Finalization>>>,
+    /// Everything held until evidence lets it through — a beacon epoch,
+    /// a source block's commit proof, a departed partner's settled set —
+    /// re-driven through the handler it arrived by ([`Self::release`]).
+    parked: ParkedArtifacts,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Commit-proof gate
@@ -490,13 +481,6 @@ pub struct ExecutionCoordinator {
     /// here would have chosen.
     proven_anchors: Arc<ProvenAnchors>,
 
-    /// Cross-shard ECs racing ahead of their source block's commit proof,
-    /// keyed by the EC's shard, bounded per shard (drop-oldest). Replayed
-    /// when `RemoteHeaderCommitted` proves a block for the shard; entries
-    /// still unproven re-buffer. Dropping an entry is safe — the expected
-    /// tracker re-fetches on timeout.
-    unproven_ecs: AwaitingTopologyBuffer<Verifiable<ExecutionCertificate>>,
-
     // ═══════════════════════════════════════════════════════════════════════
     // Split-boundary finalize gate
     // ═══════════════════════════════════════════════════════════════════════
@@ -512,14 +496,6 @@ pub struct ExecutionCoordinator {
     /// as one abandon at the commit, so a counterpart that never serves
     /// the height does not pin the slot.
     released_fetches: Vec<(Anchor, SubstateKey)>,
-
-    /// Finalizations built but withheld because a contained EC names a
-    /// shard that is scheduled to terminate, or past-terminal with its
-    /// settled set not yet known (the gate's `Defer`). Re-checked on every
-    /// commit and when a set is recorded; a tick leaves only on evidence —
-    /// settled-set membership, the scheduled termination clearing, or the
-    /// schedule evicting the shard — never on a clock. Keyed by `TickId`.
-    gated_finalized: BTreeMap<FinalizationHash, Arc<Verifiable<Finalization>>>,
 
     /// This validator's identity.
     me: ValidatorId,
@@ -629,13 +605,9 @@ impl ExecutionCoordinator {
             outbound_certs: OutboundExecutionCertificateTracker::new(),
             exec_certs,
             pending_verifications: HashSet::new(),
-            awaiting_certs: AwaitingTopologyBuffer::new(),
-            awaiting_finalizations: AwaitingTopologyBuffer::new(),
-
-            unproven_ecs: AwaitingTopologyBuffer::new(),
+            parked: ParkedArtifacts::default(),
             fetched: BTreeMap::new(),
             released_fetches: Vec::new(),
-            gated_finalized: BTreeMap::new(),
             me,
             local_shard,
         }
@@ -2254,7 +2226,8 @@ impl ExecutionCoordinator {
                 height = height.inner(),
                 "Deferring EC until its source block is commit-proven"
             );
-            self.unproven_ecs.push(shard, cert);
+            self.parked
+                .park(Waiting::Proof(shard), Parked::Certificate(Box::new(cert)));
             // At or below the shard's attested boundary the height sits
             // under the remote-header sync anchor — a joiner or a fresh
             // recovery committee anchors there and syncs only forward, so
@@ -2282,7 +2255,8 @@ impl ExecutionCoordinator {
             }],
             Err(Gate::InFlight) => vec![],
             Err(Gate::BeaconBehind) => {
-                self.awaiting_certs.push(shard, cert);
+                self.parked
+                    .park(Waiting::Beacon, Parked::Certificate(Box::new(cert)));
                 vec![]
             }
             Err(Gate::Refused) => vec![Action::AbandonFetch(cert.abandon())],
@@ -2437,10 +2411,9 @@ impl ExecutionCoordinator {
     ///
     /// The anchor is already in the shared mirror — the shard coordinator
     /// records it before this runs, which is what opens the commit-proof
-    /// gate. What is left here is replaying the shard's deferred ECs
-    /// through [`Self::on_execution_certificate`], with entries whose
-    /// source block is still unproven re-buffering, and taking the probes
-    /// the new header now anchors.
+    /// gate. What is left here is releasing the shard's certificates held
+    /// on the proof, with any whose source block is still unproven
+    /// re-parking, and taking the probes the new header now anchors.
     pub fn on_committed_remote_header(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -2449,14 +2422,26 @@ impl ExecutionCoordinator {
         if source_shard == self.local_shard {
             return vec![];
         }
-        let deferred = self.unproven_ecs.drain_shard(source_shard);
-        let mut actions = Vec::new();
-        for cert in deferred {
-            actions.extend(self.on_execution_certificate(topology_schedule, cert));
-        }
+        let mut actions = self.release(topology_schedule, Wake::Proof(source_shard));
         // A counterpart's header past a leg's deadline is what a probe
         // of its committed set, or of its claim cell, waits on.
         actions.extend(self.probe_silent_counterparts(topology_schedule));
+        actions
+    }
+
+    /// Re-drive everything `wake` lets through, each by the handler it
+    /// arrived by, which parks again whatever still waits.
+    fn release(&mut self, topology_schedule: &TopologySchedule, wake: Wake) -> Vec<Action> {
+        let mut actions = Vec::new();
+        for item in self.parked.release(wake) {
+            actions.extend(match item {
+                Parked::Certificate(cert) => {
+                    self.on_execution_certificate(topology_schedule, *cert)
+                }
+                Parked::Fetched(tick) => self.admit_finalization(topology_schedule, tick),
+                Parked::Built(tick) => self.emit_or_gate_finalized(topology_schedule, tick),
+            });
+        }
         actions
     }
 
@@ -3053,15 +3038,12 @@ impl ExecutionCoordinator {
         actions.extend(self.check_vote_retry_timeouts(topology_schedule));
         self.prune_execution_state();
         self.early.gc_stale_ecs(self.committed_ts);
-        // Commit-proof marks age out with the ECs they gate, and the
-        // shard coordinator retires them: one mirror, one retirement.
-        // Deferred ECs drop at their own deadline.
         // Re-check gate-held finalizations against the advanced schedule:
         // emit any it now resolves, and drop any whose partner it has
         // evicted from every retained window. Runs every block so a settled
         // set that never reconstructs can't pin the buffer; a rejected
         // straddler's transactions stay owed until their deadline.
-        actions.extend(self.redrive_gated_finalizations(topology_schedule));
+        actions.extend(self.release(topology_schedule, Wake::Commit));
 
         // Re-broadcast outbound ECs that haven't been ACKed via tick
         // finalization. Driven from the commit cadence so the schedule is
@@ -3838,9 +3820,8 @@ impl ExecutionCoordinator {
     ///
     /// `Pass` records the tick and emits the admission event (one event
     /// covers both the shard consensus subscriber and the `io_loop`
-    /// serving cache). `Defer` buffers it until the terminating shard's
-    /// settled set resolves it or its scheduled termination clears
-    /// ([`Self::redrive_gated_finalizations`]).
+    /// serving cache). `Defer` parks it until the terminating shard's
+    /// settled set resolves it or its scheduled termination clears.
     /// `Reject` drops it — the tick names a past-terminal shard that
     /// didn't settle it, so it must never be produced. Nothing here
     /// resolves its transactions; they stay owed, and the tick at their
@@ -3880,8 +3861,8 @@ impl ExecutionCoordinator {
                 // evicts it from every retained window (reject). Never
                 // dropped on a clock — a deadline verdict here can
                 // contradict a settlement the partner already committed.
-                self.gated_finalized
-                    .insert(finalized_arc.receipt_hash(), finalized_arc);
+                self.parked
+                    .park(Waiting::Settlement, Parked::Built(finalized_arc));
                 vec![]
             }
             SettledSetVerdict::Reject => {
@@ -3900,19 +3881,16 @@ impl ExecutionCoordinator {
     }
 
     /// Record a past-terminal shard's settled-transaction set for the finalize
-    /// gate (mirrors the shard coordinator's fence feed). Pair with
-    /// [`Self::redrive_gated_finalizations`] to release ticks that the
-    /// gate held while the set was unknown.
+    /// gate (mirrors the shard coordinator's fence feed), and release
+    /// what waited on it: the finalizations the gate held while the set
+    /// was unknown, and the shard's certificates parked on a commit
+    /// proof the departed chain can no longer supply — the set stands in
+    /// for the proof of everything it names
+    /// ([`Self::settled_set_admits`]).
     ///
     /// Also arms the fallback fetch: what the partner says it settled and
     /// we are still waiting on is exactly the certificates it owes us, and
     /// the header that first named them may never have reached us.
-    ///
-    /// Returns the actions of replaying the shard's commit-proof-deferred
-    /// certificates: the set stands in for the proof of everything it
-    /// names ([`Self::settled_set_admits`]), so a certificate parked on a
-    /// proof the departed chain can no longer supply goes back through
-    /// the gate now.
     pub fn record_settled_txs(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -3936,13 +3914,7 @@ impl ExecutionCoordinator {
         // and the fence reads it from the same mirror.
         let parties = self.unresolved.party_to(shard, settled.terminal_wt);
         self.evidence.record_settled(shard, settled, parties);
-
-        let deferred = self.unproven_ecs.drain_shard(shard);
-        let mut actions = Vec::new();
-        for cert in deferred {
-            actions.extend(self.on_execution_certificate(topology_schedule, cert));
-        }
-        actions
+        self.release(topology_schedule, Wake::SettledSet(shard))
     }
 
     /// Whether `shard`'s settled set stands in for a commit proof of this
@@ -3975,26 +3947,6 @@ impl ExecutionCoordinator {
         let now = self.committed_ts;
         self.evidence
             .retain_departures(&|shard| topology_schedule.terminal_evidence_readable(shard, now));
-    }
-
-    /// Re-check every gate-held finalization against the current settled
-    /// sets and schedule: emit the ones now resolvable, drop the ones now
-    /// known unsettled or schedule-evicted, and re-hold the rest.
-    pub fn redrive_gated_finalizations(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-    ) -> Vec<Action> {
-        if self.gated_finalized.is_empty() {
-            return Vec::new();
-        }
-        let gated: Vec<Arc<Verifiable<Finalization>>> = std::mem::take(&mut self.gated_finalized)
-            .into_values()
-            .collect();
-        let mut actions = Vec::new();
-        for finalized_arc in gated {
-            actions.extend(self.emit_or_gate_finalized(topology_schedule, finalized_arc));
-        }
-        actions
     }
 
     /// Admission entry point for fetch-delivered (or otherwise externally
@@ -4037,32 +3989,20 @@ impl ExecutionCoordinator {
             }],
             Err(Gate::InFlight) => Vec::new(),
             Err(Gate::BeaconBehind) => {
-                // Buffer the whole tick; replayed on `BeaconBlockPersisted`
-                // once the beacon reaches the deferred EC's epoch.
-                self.awaiting_finalizations
-                    .push(tick.tick_id().shard_id(), tick);
+                self.parked.park(Waiting::Beacon, Parked::Fetched(tick));
                 Vec::new()
             }
             Err(Gate::Refused) => vec![Action::AbandonFetch(tick.abandon())],
         }
     }
 
-    /// Re-attempt every buffered cross-shard EC and finalization now that the
-    /// beacon has advanced. Drains both buffers and replays each through its
-    /// normal admission path, which re-resolves the committee and re-buffers
-    /// any still beyond the schedule. Called on `BeaconBlockPersisted`.
+    /// Re-drive every certificate and finalization held on a committee
+    /// epoch the beacon has now reached. Called on `BeaconBlockPersisted`.
     pub fn on_beacon_block_persisted(
         &mut self,
         topology_schedule: &TopologySchedule,
     ) -> Vec<Action> {
-        let mut actions = Vec::new();
-        for cert in self.awaiting_certs.drain() {
-            actions.extend(self.on_execution_certificate(topology_schedule, cert));
-        }
-        for tick in self.awaiting_finalizations.drain() {
-            actions.extend(self.admit_finalization(topology_schedule, tick));
-        }
-        actions
+        self.release(topology_schedule, Wake::Beacon)
     }
 
     /// Handle the result of [`Action::VerifyFinalization`]. Emits the
@@ -4364,7 +4304,7 @@ impl ExecutionCoordinator {
             fulfilled_exec_certs: self.expected_certs.fulfilled_len(),
             outbound_certs: self.outbound_certs.memory_stats().tracked_certificates,
             proven_remote_blocks: self.proven_anchors.len(),
-            unproven_ecs: self.unproven_ecs.len(),
+            unproven_ecs: self.parked.waiting_on(|w| matches!(w, Waiting::Proof(_))),
         }
     }
 
@@ -7012,10 +6952,14 @@ mod tests {
             deferred.is_empty(),
             "the gate withholds the tick while the settled set is unknown",
         );
-        assert_eq!(state.gated_finalized.len(), 1, "held at the gate");
+        assert_eq!(
+            state.parked.waiting_on(|w| w == Waiting::Settlement),
+            1,
+            "held at the gate"
+        );
         assert!(!state.finalized.contains(&tick_id));
 
-        state.record_settled_txs(
+        let released = state.record_settled_txs(
             &sched,
             ShardId::ROOT,
             SettledTxSet {
@@ -7023,7 +6967,6 @@ mod tests {
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
         );
-        let released = state.redrive_gated_finalizations(&sched);
         assert!(
             matches!(
                 released.as_slice(),
@@ -7033,7 +6976,7 @@ mod tests {
             ),
             "recording the settled set releases the held tick for admission",
         );
-        assert!(state.gated_finalized.is_empty());
+        assert_eq!(state.parked.waiting_on(|w| w == Waiting::Settlement), 0);
         assert!(state.finalized.contains(&tick_id));
     }
 
@@ -7073,7 +7016,7 @@ mod tests {
             "the gate drops a tick the terminated shard never settled",
         );
         assert!(
-            state.gated_finalized.is_empty(),
+            state.parked.waiting_on(|w| w == Waiting::Settlement) == 0,
             "a rejected tick is not buffered for retry",
         );
         assert!(!state.finalized.contains(&tick_id));
@@ -7117,7 +7060,11 @@ mod tests {
             deferred.is_empty(),
             "no one-sided finalize while the partner's settled set is unknown",
         );
-        assert_eq!(state.gated_finalized.len(), 1, "held at the gate");
+        assert_eq!(
+            state.parked.waiting_on(|w| w == Waiting::Settlement),
+            1,
+            "held at the gate"
+        );
 
         // ROOT terminated having settled nothing → the held tick rejects on
         // redrive, is never finalized, and its tx aborts (not wedged).
@@ -7129,12 +7076,12 @@ mod tests {
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
         );
-        let released = state.redrive_gated_finalizations(&sched);
+        let released = state.release(&sched, Wake::Commit);
         assert!(
             released.is_empty(),
             "an unsettled transaction is never finalized — no one-sided application",
         );
-        assert!(state.gated_finalized.is_empty());
+        assert_eq!(state.parked.waiting_on(|w| w == Waiting::Settlement), 0);
         assert!(!state.finalized.contains(&tick_id));
     }
 
@@ -7196,25 +7143,29 @@ mod tests {
             deferred.is_empty(),
             "held while the partner is scheduled to terminate",
         );
-        assert_eq!(state.gated_finalized.len(), 1, "held at the gate");
+        assert_eq!(
+            state.parked.waiting_on(|w| w == Waiting::Settlement),
+            1,
+            "held at the gate"
+        );
 
         // The settled set doesn't exist yet; the commit clock sails past
         // the tick's anchor (1ms) plus the horizon with epoch 0 still
         // governing. The hold must survive the clock.
         state.committed_ts = WeightedTimestamp::from_millis(2).plus(RETENTION_HORIZON);
-        let released = state.redrive_gated_finalizations(&sched);
+        let released = state.release(&sched, Wake::Commit);
         assert!(released.is_empty(), "an unresolved tick is never finalized");
         assert!(
-            !state.gated_finalized.is_empty(),
+            state.parked.waiting_on(|w| w == Waiting::Settlement) > 0,
             "a gate-held tick is never dropped on a clock",
         );
 
         // ROOT falls out of every retained window: no honest artifact can
         // resolve the tick anymore, so the redrive rejects it.
         let evicted = TopologySchedule::new(epoch_ms, Epoch::new(0), post_split);
-        let released = state.redrive_gated_finalizations(&evicted);
+        let released = state.release(&evicted, Wake::Commit);
         assert!(released.is_empty(), "an unresolved tick is never finalized");
-        assert!(state.gated_finalized.is_empty());
+        assert_eq!(state.parked.waiting_on(|w| w == Waiting::Settlement), 0);
         assert!(!state.finalized.contains(&tick_id));
     }
 
@@ -9621,7 +9572,11 @@ mod tests {
             state.emit_or_gate_finalized(&sched, held).is_empty(),
             "held while the partner's settled set is unknown",
         );
-        assert_eq!(state.gated_finalized.len(), 1, "held at the gate");
+        assert_eq!(
+            state.parked.waiting_on(|w| w == Waiting::Settlement),
+            1,
+            "held at the gate"
+        );
     }
 
     /// The abort of a transaction the terminated partner never settled is
@@ -9659,7 +9614,10 @@ mod tests {
             !state.emit_or_gate_finalized(&sched, abort).is_empty(),
             "the partner terminated without settling it, so the abort is the outcome",
         );
-        assert!(state.gated_finalized.is_empty(), "and nothing is held back");
+        assert!(
+            state.parked.waiting_on(|w| w == Waiting::Settlement) == 0,
+            "and nothing is held back"
+        );
     }
 
     /// The abort of a transaction the terminated partner *did* settle is
@@ -9693,7 +9651,7 @@ mod tests {
             "the partner settled its half, so this shard may not abort",
         );
         assert!(
-            state.gated_finalized.is_empty(),
+            state.parked.waiting_on(|w| w == Waiting::Settlement) == 0,
             "and it is refused rather than held: the set already answered",
         );
     }
@@ -9738,7 +9696,10 @@ mod tests {
             !state.emit_or_gate_finalized(&sched, verdict).is_empty(),
             "the partner settled its half on the record; this shard's verdict is its own",
         );
-        assert!(state.gated_finalized.is_empty(), "and nothing is held back");
+        assert!(
+            state.parked.waiting_on(|w| w == Waiting::Settlement) == 0,
+            "and nothing is held back"
+        );
     }
 
     /// An abort naming a partner whose settled set can never be read is
@@ -9783,7 +9744,7 @@ mod tests {
             "past the window the set cannot establish that the partner did not settle",
         );
         assert!(
-            state.gated_finalized.is_empty(),
+            state.parked.waiting_on(|w| w == Waiting::Settlement) == 0,
             "and it is refused rather than held: no later set will answer",
         );
     }
@@ -9879,7 +9840,10 @@ mod tests {
             state.emit_or_gate_finalized(&sched, abort).is_empty(),
             "a shard no retained window carries answers neither question",
         );
-        assert!(state.gated_finalized.is_empty(), "and is refused, not held");
+        assert!(
+            state.parked.waiting_on(|w| w == Waiting::Settlement) == 0,
+            "and is refused, not held"
+        );
     }
 
     /// A tick already attesting the abandonment withholds the next one:

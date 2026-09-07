@@ -228,23 +228,17 @@ impl ShardParticipation {
         actions
     }
 
-    /// Record a past-terminal shard's settled set on both coordinators,
-    /// then re-drive the gate-held finalizations that deferred for want
-    /// of it; the votes that deferred re-drive off the fence's evidence.
+    /// Record a past-terminal shard's settled set, which releases what
+    /// the execution coordinator held for want of it; the votes that
+    /// deferred re-drive off the fence's evidence.
     fn on_settled_txs_reconstructed(
         &mut self,
         topology_schedule: &TopologySchedule,
         shard: ShardId,
         set: SettledTxSet,
     ) -> Vec<Action> {
-        let mut actions =
-            self.execution_coordinator
-                .record_settled_txs(topology_schedule, shard, set);
-        actions.extend(
-            self.execution_coordinator
-                .redrive_gated_finalizations(topology_schedule),
-        );
-        actions
+        self.execution_coordinator
+            .record_settled_txs(topology_schedule, shard, set)
     }
 }
 
