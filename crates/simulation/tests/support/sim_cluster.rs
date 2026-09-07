@@ -624,9 +624,14 @@ impl Cluster for SimCluster {
     }
 
     fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs> {
+        // Across every store of the shard, not the first: a member seated at
+        // runtime snap-synced to an anchor and holds no block below it, so
+        // its chain alone says nothing about what committed before it.
         (0..self.runner.num_hosts())
-            .find_map(|host| self.runner.hosts_shard(host, shard))
-            .map_or_else(Vec::new, |store| chain_membership(store, tx))
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .map(|store| chain_membership(store, tx))
+            .find(|ran| !ran.is_empty())
+            .unwrap_or_default()
     }
 
     fn chain_fate(
@@ -637,12 +642,15 @@ impl Cluster for SimCluster {
         Option<BlockHeight>,
         Option<(BlockHeight, TransactionDecision)>,
     ) {
-        let Some(store) =
-            (0..self.runner.num_hosts()).find_map(|host| self.runner.hosts_shard(host, shard))
-        else {
-            return (None, None);
-        };
-        chain_fate(store, tx)
+        // Merged across every store of the shard, since a runtime seat's
+        // chain starts at its snap-sync anchor; the chains agree wherever
+        // they overlap.
+        (0..self.runner.num_hosts())
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .map(|store| chain_fate(store, tx))
+            .fold((None, None), |(committed, finalized), (c, f)| {
+                (committed.or(c), finalized.or(f))
+            })
     }
 }
 
