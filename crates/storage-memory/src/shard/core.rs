@@ -192,6 +192,7 @@ impl SimShardStorage {
                 self,
                 committed_height,
                 committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),
+                BlockHeight::new(self.retention_floor()),
             ),
             dedup: DedupWindow::from_reader(
                 self,

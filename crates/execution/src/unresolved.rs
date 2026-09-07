@@ -103,6 +103,16 @@ struct Owed {
     /// certificate outlives the tick, and a shard that could not say
     /// whether it had issued one would have to assume it had.
     certified: bool,
+    /// Whether the tick that took it is one this replica cannot rebuild —
+    /// composed below the height its store can still anchor a baseline
+    /// at, so a replay folds the block and composes nothing from it.
+    ///
+    /// The entry is the shard's account either way. What this withholds
+    /// is the one thing that needs the tick: a verdict of this replica's
+    /// own, which would discard a tick it never held and abandon a member
+    /// its peers are still settling. The fate arrives as committed
+    /// content instead.
+    spoken_for: bool,
     /// Whether a committed finalization of this shard's settled the
     /// transaction's price: a leg's own, which burned it inside its
     /// writes, or the verdict that made an issuer a remainder.
@@ -557,6 +567,7 @@ impl UnresolvedTxs {
                     .filter(|prefix| !ShardTrie::shard_owns_prefix(local_shard, *prefix))
                     .collect(),
                 certified: false,
+                spoken_for: false,
                 charged: false,
                 part: Part::of(local_shard, tx, classified),
                 taken: None,
@@ -918,6 +929,22 @@ impl UnresolvedTxs {
         self.owed.get(&tx_hash).is_some_and(|owed| owed.certified)
     }
 
+    /// Record that the tick holding `tx_hash` is one this replica did not
+    /// rebuild: a certificate of this shard's covers it, and no verdict of
+    /// this replica's may speak for it.
+    pub fn speak_for(&mut self, tx_hash: TxHash) {
+        if let Some(owed) = self.owed.get_mut(&tx_hash) {
+            owed.certified = true;
+            owed.spoken_for = true;
+        }
+    }
+
+    /// Whether a tick this replica cannot rebuild holds `tx_hash`.
+    #[must_use]
+    pub fn is_spoken_for(&self, tx_hash: TxHash) -> bool {
+        self.owed.get(&tx_hash).is_some_and(|owed| owed.spoken_for)
+    }
+
     /// Take what a committed block says departed shards left unsettled.
     ///
     /// A record names transactions its shard did not settle before it
@@ -971,6 +998,7 @@ impl UnresolvedTxs {
                         committed_ts: verdict.evidence().moment(),
                         remote_prefixes: BTreeSet::new(),
                         certified: true,
+                        spoken_for: false,
                         charged: false,
                         // A leg entry lives inside the replay window —
                         // its horizon is the transaction's own — so a

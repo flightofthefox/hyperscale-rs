@@ -14,15 +14,15 @@ use crate::crypto::Ed25519PrivateKey;
 use crate::{
     AbortCharge, AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
     BlockVoteMessage, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommitProof,
-    ConsensusPublicKey, ConsensusSignature, DeclaredKey, Derivation, DerivationError, Derived,
-    EnvelopeExt, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
-    MerkleInclusionProof, NetworkDefinition, NetworkId, ProposerTimestamp, ProtocolStatics,
-    QuorumCertificate, Role, Round, Routing, ShardForkProof, ShardId, SignerBitfield, StateRoot,
-    SubintentSig, TickHalf, TickId, TimestampRange, TopologySnapshot, Transaction, TransactionBody,
-    TransactionDecision, TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo,
-    ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources,
-    compute_global_receipt_root, declared_work, install_protocol_statics,
-    protocol_statics_installed, signed_bytes,
+    ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, DeclaredKey, Derivation,
+    DerivationError, Derived, EnvelopeExt, ExecutionCertificate, ExecutionOutcome, Finalization,
+    GlobalReceiptHash, Hash, MerkleInclusionProof, NetworkDefinition, NetworkId, ProposerTimestamp,
+    ProtocolStatics, QuorumCertificate, Role, Round, Routing, ShardForkProof, ShardId,
+    SignerBitfield, StateRoot, StateWrites, StoredReceipt, SubintentSig, TickHalf, TickId,
+    TimestampRange, TopologySnapshot, Transaction, TransactionBody, TransactionDecision,
+    TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
+    Verified, WeightedTimestamp, WitnessSources, compute_global_receipt_root, declared_work,
+    install_protocol_statics, protocol_statics_installed, signed_bytes,
 };
 
 /// Create a test transaction the [`StubVmStatics`] derivation routes to
@@ -850,6 +850,48 @@ const fn outcome_of(decision: TransactionDecision) -> ExecutionOutcome {
         TransactionDecision::Reject => ExecutionOutcome::Failed,
         TransactionDecision::Aborted => ExecutionOutcome::Aborted,
     }
+}
+
+/// A finalization at `block_height` deciding `tx_hash` a success, with
+/// the receipt stating what it left.
+///
+/// What the commit path applies to the base, and what a replay reads a
+/// settled tick's contribution off where it re-ran no tick to produce
+/// one.
+#[must_use]
+pub fn make_finalization_leaving(
+    block_height: BlockHeight,
+    tx_hash: TxHash,
+    writes: StateWrites,
+) -> Finalization {
+    let receipt = StoredReceipt::synced(
+        tx_hash,
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes,
+            beacon_witness_events: Vec::new(),
+            events: Vec::new(),
+        }),
+    );
+    let outcomes = vec![TxOutcome::new(
+        tx_hash,
+        outcome_of(TransactionDecision::Accept),
+    )];
+    let tick_id = TickId::new(ShardId::ROOT, block_height);
+    let ec = ExecutionCertificate::new(
+        tick_id,
+        WeightedTimestamp::from_millis(block_height.inner() + 1),
+        compute_global_receipt_root(&outcomes),
+        outcomes,
+        AggregateSignature::new([0u8; 96]),
+        SignerBitfield::new(4),
+    );
+    Finalization::new(
+        tick_id,
+        TickHalf::Determined,
+        vec![Arc::new(ec)],
+        vec![receipt],
+    )
 }
 
 /// A single-certificate finalization at `block_height` over `outcomes`.

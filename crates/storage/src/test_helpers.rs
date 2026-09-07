@@ -2177,7 +2177,19 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + TestStore)) {
 
     // And the window puts them back, so replaying it composes the leg
     // rather than waiting on evidence nothing will send again.
-    let window = replay_window(storage, BlockHeight::new(4), WeightedTimestamp::ZERO);
+    assert_replayed_window(storage);
+}
+
+/// What the window hands back: every block from the floor to the tip, in
+/// the shape a commit runs on, with the clock below it and the bundles
+/// sealing dropped reattached.
+fn assert_replayed_window(storage: &(impl ShardChainReader + TestStore)) {
+    let window = replay_window(
+        storage,
+        BlockHeight::new(4),
+        WeightedTimestamp::ZERO,
+        BlockHeight::GENESIS,
+    );
     let heights: Vec<BlockHeight> = window
         .blocks
         .iter()
@@ -2197,6 +2209,12 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + TestStore)) {
         Some(WeightedTimestamp::ZERO),
         "carrying the clock of the block below it, so the first block replayed keeps the carry",
     );
+    assert_eq!(
+        window.compose_from,
+        BlockHeight::new(2),
+        "with nothing retired, composition starts where the fold does",
+    );
+    assert_compose_floor_follows_retention(storage);
     assert_eq!(
         window.blocks[1]
             .block()
@@ -2222,6 +2240,29 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + TestStore)) {
             .iter()
             .all(|certified| certified.block().is_live()),
         "a replayed block arrives in the shape a commit runs on, bundles or not",
+    );
+}
+
+/// A store that has retired history below the replay floor still folds
+/// the whole window and composes only above what it can anchor: a tick
+/// at height `H` reads its baseline at `H - 1`, so a floor at 2 puts the
+/// first composable tick at 3.
+fn assert_compose_floor_follows_retention(storage: &impl ShardChainReader) {
+    let retired = replay_window(
+        storage,
+        BlockHeight::new(4),
+        WeightedTimestamp::ZERO,
+        BlockHeight::new(2),
+    );
+    assert_eq!(
+        retired.blocks.len(),
+        3,
+        "the fold's reach is what is owed an outcome, whatever the store retired",
+    );
+    assert_eq!(
+        retired.compose_from,
+        BlockHeight::new(3),
+        "and composition starts at the first height whose baseline is readable",
     );
 }
 

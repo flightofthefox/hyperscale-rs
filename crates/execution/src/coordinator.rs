@@ -46,10 +46,11 @@ use hyperscale_types::{
     ConsensusPublicKey, CounterpartMirror, Deadline, DeclaredKey, Derivation, ExecutionCertificate,
     ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationHash,
     FinalizationVerifyError, GlobalReceiptRoot, Hash, MerkleInclusionProof, Mode, ProvenAnchors,
-    Provisions, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StoredReceipt, SubstateKey,
-    TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
-    TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    Window, derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
+    Provisions, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateWrites, StoredReceipt,
+    SubstateKey, TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision,
+    TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, Window, derive_block_transactions, settled_set_verdict, tick_leader,
+    tick_leader_at,
 };
 use hyperscale_vm_effects::CrossingCell;
 use tracing::instrument;
@@ -96,6 +97,24 @@ impl CommittedMember {
     fn reaches_beyond(&self, local: ShardId) -> bool {
         self.participating.iter().any(|&shard| shard != local)
     }
+}
+
+/// This shard's members of a committed block's transactions, each under
+/// one placement at one anchor: the trie the block committed under, and
+/// the answer frozen onto each transaction from here.
+fn committed_members(
+    classification: &TopologySnapshot,
+    transactions: &[Arc<Verifiable<Transaction>>],
+) -> Vec<CommittedMember> {
+    let trie = classification.shard_trie();
+    assign_participants(classification, transactions)
+        .into_iter()
+        .map(|(tx, participating)| CommittedMember {
+            classified: Classified::freeze(tx.legs(), tx.owners(), trie),
+            tx,
+            participating,
+        })
+        .collect()
 }
 
 /// The committed block a tick is created against: its identity, and the
@@ -321,6 +340,15 @@ pub struct ExecutionCoordinator {
     /// and are empty from then on.
     replay_blocks: Vec<Verified<CertifiedBlock>>,
 
+    /// The lowest height a tick may be composed at.
+    ///
+    /// A tick reads its baseline as of the height below it, and a store
+    /// answers a historical read only inside its retention horizon — so a
+    /// replay reaching further back than that folds those blocks and
+    /// composes nothing from them. `GENESIS` on every path but a replay,
+    /// where every height qualifies.
+    compose_from: BlockHeight,
+
     /// Tick fates known but not yet emittable, each with the tick that
     /// carries its entries. Drained whenever a tick completes or a block
     /// commits.
@@ -497,6 +525,7 @@ impl ExecutionCoordinator {
                 .filter_map(|(key, value)| Some((*key, CrossingCell::from_bytes(value)?)))
                 .collect(),
             replay_blocks: recovered.replay.blocks.clone(),
+            compose_from: recovered.replay.compose_from,
             pending_tick_resolutions: Vec::new(),
             candidates: TickCandidates::new(local_shard),
             ticks: TickRegistry::new(),
@@ -688,6 +717,37 @@ impl ExecutionCoordinator {
         engagement_waits
     }
 
+    /// Fold what a committed block put in flight, for a block below the
+    /// height the replay may compose at.
+    ///
+    /// The ledger entry and nothing else. A tick composed here would read
+    /// its baseline at a height the store has retired, and there is
+    /// nothing for it to run: whatever this block committed was taken by
+    /// a tick of this shard's whose fate the replay reads off a later
+    /// block, or off the peers once it is live. So each member is
+    /// registered and then spoken for — the entry stands and its
+    /// counterparts are tracked, while this replica never offers a
+    /// verdict on a member it cannot re-run.
+    fn fold_committed_txs(
+        &mut self,
+        classification: &TopologySnapshot,
+        ts: WeightedTimestamp,
+        transactions: &[Arc<Verifiable<Transaction>>],
+    ) {
+        let local_shard = self.local_shard;
+        let members = committed_members(classification, transactions);
+        self.counterparts.ledger.register_committed(
+            local_shard,
+            ts,
+            members
+                .iter()
+                .map(|member| (&member.tx, &member.classified)),
+        );
+        for member in &members {
+            self.counterparts.ledger.speak_for(member.tx.hash());
+        }
+    }
+
     /// Record what a committed block puts in flight: the ledger entry it
     /// owes an outcome for, the provisions and engagement echoes its
     /// cross-shard members wait on, and the candidate itself.
@@ -706,18 +766,7 @@ impl ExecutionCoordinator {
         transactions: &[Arc<Verifiable<Transaction>>],
     ) {
         let local_shard = self.local_shard;
-        let members = assign_participants(classification, transactions);
-        // One placement at one anchor: the trie this block committed
-        // under, and the answer frozen onto each transaction from here.
-        let trie = classification.shard_trie();
-        let members: Vec<CommittedMember> = members
-            .into_iter()
-            .map(|(tx, participating)| CommittedMember {
-                classified: Classified::freeze(tx.legs(), tx.owners(), trie),
-                tx,
-                participating,
-            })
-            .collect();
+        let members = committed_members(classification, transactions);
         // The ledger takes the transactions themselves, each with the
         // classification frozen here. What it needs of them — when they
         // expire, what they reserved, what they reach outside this shard,
@@ -782,6 +831,15 @@ impl ExecutionCoordinator {
     /// certificate for that height would come back under a root it never
     /// computed.
     ///
+    /// Two reaches, because a replay has two jobs. The ledger is folded
+    /// from every block the window holds, which runs back as far as an
+    /// undischarged record. A tick is composed over a baseline, and a
+    /// baseline is a historical read the store retires — so below
+    /// [`compose_from`](Self::compose_from) the blocks are folded and
+    /// nothing is composed. Nothing is lost there: a tick composed below
+    /// that height was settled by a fate this fold reads off the chain,
+    /// and what it left is seated from the receipts that committed it.
+    ///
     /// The blocks arrive with the provision bundles they carried already
     /// reattached, so a leg composes here on the evidence it composed on
     /// the first time rather than waiting for a fetch nobody will answer.
@@ -810,7 +868,10 @@ impl ExecutionCoordinator {
             "Replaying the chain the restart lost execution state for"
         );
 
-        let mut actions = Vec::new();
+        // Every settled tick the replay is below the store's reach to
+        // re-run, seated on the chain before the first one it does run
+        // reads a baseline that has to carry it.
+        let mut actions = self.restored_ticks(&blocks);
         for certified in &blocks {
             // The replay window came off the store, so nothing derived
             // these on the way in.
@@ -825,6 +886,61 @@ impl ExecutionCoordinator {
             actions.extend(self.on_block_committed(topology_schedule, certified));
         }
         actions
+    }
+
+    /// Seat the ticks the replay folds past on the chain, from what the
+    /// receipts that settled them say they left.
+    ///
+    /// A tick composed below [`compose_from`](Self::compose_from) is one
+    /// no replay of this replica's re-runs, and its writes reach the base
+    /// only at the block that committed its finalization. Every tick the
+    /// replay *does* compose below that block reads a baseline the base
+    /// has not caught up to and the chain no longer holds — a baseline
+    /// nobody else computed. The receipts state exactly what the base
+    /// gains and where, which is all such a baseline is missing.
+    ///
+    /// Ahead of the replay rather than inside it, because the block that
+    /// settles a tick can sit above the block the settlement is owed to.
+    ///
+    /// Only the settlements that committed at or above that height, since
+    /// the lowest baseline the replay reads is the one below it and the
+    /// base already carries everything settled there.
+    fn restored_ticks(&self, blocks: &[Verified<CertifiedBlock>]) -> Vec<Action> {
+        let mut resolutions: Vec<(TickId, TickResolution)> = Vec::new();
+        for certified in blocks {
+            let block = certified.block();
+            if block.height() < self.compose_from {
+                continue;
+            }
+            for fw in block.certificates().iter() {
+                let fw = fw.as_unverified();
+                let tick_id = *fw.tick_id();
+                if tick_id.block_height() >= self.compose_from {
+                    continue;
+                }
+                let writes: Vec<(TxHash, StateWrites)> = fw
+                    .receipts()
+                    .iter()
+                    .filter_map(|receipt| {
+                        Some((receipt.tx_hash, receipt.consensus.writes()?.clone()))
+                    })
+                    .collect();
+                if writes.is_empty() {
+                    continue;
+                }
+                resolutions.push((
+                    tick_id,
+                    TickResolution::Restored {
+                        height: block.height(),
+                        writes,
+                    },
+                ));
+            }
+        }
+        if resolutions.is_empty() {
+            return Vec::new();
+        }
+        vec![Action::ResolveTicks { resolutions }]
     }
 
     /// Compose this commit's tick and set it up to be attested.
@@ -2686,6 +2802,15 @@ impl ExecutionCoordinator {
         let anchored =
             self.classification_committee(topology_schedule, self.committed_committee_anchor_wt);
 
+        // Below where a baseline is readable there is a fold and no
+        // composition. The provisions this block carried go with it: they
+        // are the evidence its own members ran on, and no member left to
+        // compose waits for them.
+        if height < self.compose_from {
+            self.fold_committed_txs(anchored, self.committed_ts, transactions);
+            return actions;
+        }
+
         // ── Provision broadcasting (proposer only) ─────────────────────
         if self.me == header.proposer() {
             let local_shard = self.local_shard;
@@ -2891,6 +3016,13 @@ impl ExecutionCoordinator {
     /// the fence would then refuse the abort that replaced it, tearing the
     /// transaction across the two shards.
     fn beyond_every_shard(&self, composing: TickId, tx_hash: TxHash) -> bool {
+        // A tick this replica never rebuilt holds it, and abandoning
+        // would spend a verdict against a settlement its peers are still
+        // reaching. Whatever that tick's fate is arrives as committed
+        // content, which is what folded the entry in the first place.
+        if self.counterparts.ledger.is_spoken_for(tx_hash) {
+            return false;
+        }
         match self.ticks.tick_assignment(tx_hash) {
             Some(tick_id) if tick_id == composing => false,
             Some(tick_id) => {
@@ -2998,6 +3130,10 @@ impl ExecutionCoordinator {
                 ticked.legs.iter().all(|leg| members.contains(leg))
             }
             TickResolution::Abandoned { .. } => true,
+            // Never reaches here: a restore is emitted for a tick this
+            // coordinator holds no claims for, and only the replay emits
+            // one at all.
+            TickResolution::Restored { .. } => false,
         };
         if releases_claims {
             self.ticked.remove(tick_id);
@@ -3759,8 +3895,9 @@ mod tests {
     use hyperscale_storage::{ReplayWindow, committed_tx_cell_key};
     use hyperscale_types::test_utils::{
         StubVmStatics, certify as test_certify, make_finalization as helpers_make_finalization,
-        make_leg_finalization, make_live_block as helpers_make_live_block, state_and_proof,
-        test_prefix, test_transaction, test_transaction_running, test_transaction_with_prefixes,
+        make_finalization_leaving, make_leg_finalization,
+        make_live_block as helpers_make_live_block, state_and_proof, test_prefix, test_transaction,
+        test_transaction_running, test_transaction_with_prefixes,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
@@ -6872,6 +7009,7 @@ mod tests {
             committed_height: BlockHeight::new(3),
             replay: ReplayWindow {
                 blocks: vec![replayable(committing, 2_000), replayable(settling, 3_000)],
+                compose_from: BlockHeight::GENESIS,
                 anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
             },
             ..RecoveredState::default()
@@ -6892,6 +7030,189 @@ mod tests {
             None,
             "the replayed finalization hands the transaction back, so nothing \
              speaks for it",
+        );
+    }
+
+    /// A replay reaching below what the store can anchor folds those
+    /// blocks and composes nothing from them.
+    ///
+    /// The fold's reach is what the chain is still owed an outcome for,
+    /// which runs back as far as an undischarged record; a tick's is a
+    /// baseline, and a baseline is a historical read the store retires at
+    /// `RETENTION_HORIZON`. Composing there dispatches an execution
+    /// anchored at a height the store answers with a panic.
+    #[test]
+    fn a_replay_below_the_stores_reach_folds_without_composing() {
+        let schedule = make_test_topology();
+        let held = test_transaction(1);
+        let held_hash = held.hash();
+        let committing = make_live_block(
+            BlockHeight::new(2),
+            2_000,
+            ValidatorId::new(0),
+            vec![Arc::new(held)],
+        );
+        let above = make_live_block(BlockHeight::new(3), 3_000, ValidatorId::new(0), vec![]);
+
+        let recovered = RecoveredState {
+            committed_height: BlockHeight::new(3),
+            replay: ReplayWindow {
+                blocks: vec![replayable(committing, 2_000), replayable(above, 3_000)],
+                // The store has retired everything below height 2, so a
+                // tick at 2 would read a baseline at 1 that is gone.
+                compose_from: BlockHeight::new(3),
+                anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
+            },
+            ..RecoveredState::default()
+        };
+        let mut restarted = ExecutionCoordinator::with_shared_stores(
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            &recovered,
+            Arc::new(ExecCertStore::new()),
+            Arc::new(FinalizationStore::new()),
+            Arc::new(ProvenAnchors::new()),
+            Arc::new(CounterpartMirror::new()),
+        );
+
+        let actions = restarted.on_committed_state_restored(&schedule, &StubVmStatics);
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            "nothing is dispatched at a height whose baseline the store has retired",
+        );
+        assert!(
+            restarted.candidates.is_empty(),
+            "and nothing waits to be composed there either",
+        );
+        assert_eq!(
+            restarted.counterparts.ledger.len(),
+            1,
+            "the fold still owes the outcome the chain says it owes",
+        );
+        assert!(
+            restarted.counterparts.ledger.is_spoken_for(held_hash),
+            "held by a tick this replica cannot rebuild",
+        );
+    }
+
+    /// A settled tick the replay folds past is seated on the chain from
+    /// the receipts that committed it, ahead of the first tick the replay
+    /// composes.
+    ///
+    /// The writes reach the base at the block that committed the
+    /// finalization, which can sit above the block the replay starts
+    /// composing at — so a tick composed in between reads a baseline the
+    /// base has not caught up to and the chain, having run no tick there,
+    /// no longer holds.
+    #[test]
+    fn a_replay_seats_the_settled_ticks_it_folds_past() {
+        let schedule = make_test_topology();
+        let settled = test_transaction(1);
+        let settled_hash = settled.hash();
+        let committing = make_live_block(
+            BlockHeight::new(2),
+            2_000,
+            ValidatorId::new(0),
+            vec![Arc::new(settled)],
+        );
+        // The tick at height 2 settles at height 4, one block above where
+        // composition resumes.
+        let finalization: Arc<Verifiable<Finalization>> = Arc::new(
+            make_finalization_leaving(BlockHeight::new(2), settled_hash, StateWrites::default())
+                .into(),
+        );
+        let settling = helpers_make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(4),
+            4_000,
+            ValidatorId::new(0),
+            vec![],
+            vec![finalization],
+        );
+
+        let recovered = RecoveredState {
+            committed_height: BlockHeight::new(4),
+            replay: ReplayWindow {
+                blocks: vec![replayable(committing, 2_000), replayable(settling, 4_000)],
+                compose_from: BlockHeight::new(3),
+                anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
+            },
+            ..RecoveredState::default()
+        };
+        let mut restarted = ExecutionCoordinator::with_shared_stores(
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            &recovered,
+            Arc::new(ExecCertStore::new()),
+            Arc::new(FinalizationStore::new()),
+            Arc::new(ProvenAnchors::new()),
+            Arc::new(CounterpartMirror::new()),
+        );
+
+        let actions = restarted.on_committed_state_restored(&schedule, &StubVmStatics);
+        let restored = actions.iter().position(|action| {
+            matches!(action, Action::ResolveTicks { resolutions }
+            if resolutions.iter().any(|(tick_id, resolution)| {
+                *tick_id == TickId::new(ShardId::ROOT, BlockHeight::new(2))
+                    && matches!(
+                        resolution,
+                        TickResolution::Restored { height, .. }
+                            if *height == BlockHeight::new(4)
+                    )
+            }))
+        });
+        assert!(
+            restored.is_some(),
+            "the tick the replay folded past is seated from what settled it",
+        );
+        assert!(
+            actions[..restored.expect("seated")]
+                .iter()
+                .all(|action| !matches!(action, Action::ExecuteTransactions { .. })),
+            "and seated before anything the replay composes reads a baseline",
+        );
+    }
+
+    /// And a member of such a tick is never abandoned by this replica: a
+    /// verdict of its own would discard a tick it never held while its
+    /// peers are still settling one.
+    #[test]
+    fn a_member_a_replay_could_not_recompose_is_never_abandoned() {
+        let schedule = make_test_topology();
+        let held = test_transaction(1);
+        let committing = make_live_block(
+            BlockHeight::new(2),
+            2_000,
+            ValidatorId::new(0),
+            vec![Arc::new(held)],
+        );
+        let recovered = RecoveredState {
+            committed_height: BlockHeight::new(2),
+            replay: ReplayWindow {
+                blocks: vec![replayable(committing, 2_000)],
+                compose_from: BlockHeight::new(3),
+                anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
+            },
+            ..RecoveredState::default()
+        };
+        let mut restarted = ExecutionCoordinator::with_shared_stores(
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            &recovered,
+            Arc::new(ExecCertStore::new()),
+            Arc::new(FinalizationStore::new()),
+            Arc::new(ProvenAnchors::new()),
+            Arc::new(CounterpartMirror::new()),
+        );
+        restarted.on_committed_state_restored(&schedule, &StubVmStatics);
+
+        let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
+        let outcomes = abandonment_vote(&mut restarted, &schedule, 3, deadline_ms);
+        assert!(
+            outcomes.is_empty(),
+            "the fate arrives as committed content, not as a verdict of ours",
         );
     }
 
@@ -6933,6 +7254,7 @@ mod tests {
             committed_height: BlockHeight::new(2),
             replay: ReplayWindow {
                 blocks: vec![replayable(committing, 2_000)],
+                compose_from: BlockHeight::GENESIS,
                 anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
             },
             ..RecoveredState::default()
