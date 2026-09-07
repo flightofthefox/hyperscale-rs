@@ -311,7 +311,7 @@ impl Executor {
                 seeds: inputs.env.seeds.clone(),
             },
         )
-        .with_calls(prepared.calls)
+        .with_job(prepared.job)
         .with_nullifiers(prepared.nullifiers)];
         let walk = ManifestWalk {
             backend: &self.backend,

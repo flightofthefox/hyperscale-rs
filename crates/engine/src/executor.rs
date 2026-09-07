@@ -39,8 +39,8 @@ use hyperscale_vm_effects::{
     PrefixShardResolver, SubintentRecord, admit_tree, package_hash, route_tree,
 };
 use hyperscale_vm_kernel::{
-    Baseline, BatchTx, EnvInputs, ExecutionMode, ExecutionScope, FeeBurn, LegPlan, Locality,
-    ManifestWalk, Receipt, Reclaim, Retire, Substates, execute_batch,
+    Baseline, BatchTx, Disposal, Disposition, EnvInputs, ExecutionMode, ExecutionScope, FeeBurn,
+    Job, LegPlan, Locality, ManifestWalk, Receipt, Substates, execute_batch,
 };
 use hyperscale_vm_types::{
     Address, CallTarget, CollectionId, Effect, EffectSet, EffectTarget, EntryKey, Mode, Moves,
@@ -49,7 +49,7 @@ use hyperscale_vm_types::{
 
 use crate::backend::EngineBackend;
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
-use crate::legs::{Licence, Member, Runs, ShardPlan};
+use crate::legs::{Licence, Member, Runs};
 use crate::records::BatchRecords;
 use crate::sharding::writes_root;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
@@ -72,10 +72,12 @@ pub enum TargetAuthority {
 /// [`ManifestWalk`] performs them over the engine backend. Nothing on
 /// this side names a method.
 pub struct PreparedTx {
-    /// The lowered invocations the kernel walks, in manifest node order.
-    /// Envelope trees lower into one flat list, so nothing downstream
-    /// sees intent structure.
-    pub calls: Vec<NodeCall>,
+    /// What the kernel does for this member: walk the lowered
+    /// invocations, in manifest node order, under the plan saying which
+    /// of them this shard runs — envelope trees lower into one flat
+    /// list, so nothing downstream sees intent structure — or settle
+    /// the records a settlement names.
+    pub job: Job,
     /// The routed declaration, both views: the folded set scheduling
     /// reads, and the clause order the capability table is built in —
     /// which is what a lowered call's handle positions index.
@@ -86,9 +88,9 @@ pub struct PreparedTx {
     /// The envelope's signed execution ceiling, in fuel — one budget for
     /// the whole transaction, however many nodes its manifest walks.
     pub gas_limit: u64,
-    /// What this shard runs of the transaction and the scope it judges
-    /// under — the one part of an entry that differs per participant.
-    pub plan: ShardPlan,
+    /// The scope this shard judges under — with the job's plan, the one
+    /// part of an entry that differs per participant.
+    pub scope: ExecutionScope,
 }
 
 /// The component address a record's own contents derive, or `None` for
@@ -482,7 +484,7 @@ impl Executor {
         arrivals: &[EscrowedValue],
     ) -> Result<PreparedTx, String> {
         let mut entry = Self::prepare(tx, records)?;
-        entry.plan = member
+        let plan = member
             .classified()
             .plan(arrivals, member.local(), member.side())
             .map_err(|defect| format!("no plan for this shard: {defect}"))?;
@@ -492,7 +494,15 @@ impl Executor {
         if member.is_second() {
             entry.nullifiers.clear();
         }
-        declare_crossing_cells(&mut entry.declaration, &entry.plan.legs)?;
+        declare_crossing_cells(&mut entry.declaration, &plan.legs)?;
+        let Job::Manifest { calls, .. } = entry.job else {
+            return Err("a prepared transaction walks its manifest".to_string());
+        };
+        entry.job = Job::Manifest {
+            calls,
+            legs: plan.legs,
+        };
+        entry.scope = plan.scope;
         Ok(entry)
     }
 
@@ -540,10 +550,9 @@ impl Executor {
         if records.is_empty() {
             return Err("this shard has no record to settle".to_string());
         }
-        let mut plan = housekeeping_plan(ctx, records.len());
+        let mut disposals = Vec::with_capacity(records.len());
         let mut declaration = Declaration::default();
-        let mut decided = 0usize;
-        for (at, key) in records.iter().enumerate() {
+        for key in records {
             let record = match (read_record(snapshot, *key), on) {
                 (Some(record), _) => record,
                 (None, Licence::OwnLeaf) => continue,
@@ -551,7 +560,6 @@ impl Executor {
                     return Err(format!("settlement of record {key:?} reads no record"));
                 }
             };
-            let slot = u32::try_from(at).map_err(|_| "a plan past its own width".to_string())?;
             let mut declare_here = |effect, holds| {
                 declare(&mut declaration, effect, holds).map_err(|conflict| {
                     format!("settled cell contradicts the declaration: {conflict}")
@@ -564,18 +572,14 @@ impl Executor {
                 },
                 None,
             )?;
-            if takes_back(on, *key, &record, ctx, snapshot)? {
+            // The claim site under the producer's own target: what a
+            // reclaim writes, and what holds either settlement to the
+            // record's edge.
+            let claim = CrossingSite::claim_on(&ProtocolHasher, key.owner, &record);
+            let disposition = if takes_back(on, *key, &record, ctx, snapshot)? {
                 let origin = record
                     .origin
                     .ok_or_else(|| format!("reclaim of record {key:?} names no origin"))?;
-                let claim = CrossingSite::claim(
-                    &ProtocolHasher,
-                    key.owner,
-                    record.intent,
-                    record.local,
-                    record.output,
-                    record.expiry_ms,
-                );
                 declare_here(
                     Effect {
                         target: EffectTarget::Point(claim.key()),
@@ -590,40 +594,27 @@ impl Executor {
                     },
                     Some(record.resource),
                 )?;
-                plan.legs
-                    .reclaims(
-                        slot,
-                        0,
-                        Reclaim {
-                            record: *key,
-                            claim,
-                        },
-                    )
-                    .map_err(|fault| format!("reclaim plan refuses record {key:?}: {fault}"))?;
+                Disposition::Reclaim
             } else {
-                let site = CrossingSite::record(
-                    &ProtocolHasher,
-                    key.owner,
-                    record.intent,
-                    record.local,
-                    record.output,
-                    record.expiry_ms,
-                );
-                plan.legs
-                    .retires(slot, 0, Retire { record: site })
-                    .map_err(|fault| format!("retirement plan refuses record {key:?}: {fault}"))?;
-            }
-            decided = decided.saturating_add(1);
+                Disposition::Retire
+            };
+            disposals.push(Disposal {
+                record: *key,
+                claim,
+                disposition,
+            });
         }
-        if decided == 0 {
+        if disposals.is_empty() {
             return Err("every inherited record was settled already".to_string());
         }
+        let trie = ctx.shard_trie.clone();
+        let local = ctx.local_shard;
         Ok(PreparedTx {
-            calls: Vec::new(),
+            job: Job::Records(disposals),
             declaration,
             nullifiers: Vec::new(),
             gas_limit: 0,
-            plan,
+            scope: ExecutionScope::spanning(move |owner| trie.shard_for_prefix(owner) == local),
         })
     }
 
@@ -662,29 +653,33 @@ impl Executor {
         // here would reach the same set but discard the order, which is
         // what a guest's positional handle parameters are indexed by.
         let declaration = routing.declaration().clone();
+        let calls = match authority {
+            TargetAuthority::Required => routing.calls,
+            // A preview shown before its counterparties have signed:
+            // every guarded call is answered as if whoever it names
+            // had presented themselves. The lie is told here and
+            // nowhere else, so nothing on the commit path can reach
+            // it.
+            TargetAuthority::Assumed => routing
+                .calls
+                .into_iter()
+                .map(|call| NodeCall {
+                    requires: Vec::new(),
+                    ..call
+                })
+                .collect(),
+        };
         Ok(PreparedTx {
-            calls: match authority {
-                TargetAuthority::Required => routing.calls,
-                // A preview shown before its counterparties have signed:
-                // every guarded call is answered as if whoever it names
-                // had presented themselves. The lie is told here and
-                // nowhere else, so nothing on the commit path can reach
-                // it.
-                TargetAuthority::Assumed => routing
-                    .calls
-                    .into_iter()
-                    .map(|call| NodeCall {
-                        requires: Vec::new(),
-                        ..call
-                    })
-                    .collect(),
+            // Whole until the batch pipeline plans the member for its
+            // shard; a preview never divides.
+            job: Job::Manifest {
+                calls,
+                legs: LegPlan::whole(0),
             },
             declaration,
             nullifiers: admitted.subintents,
             gas_limit: vm.gas_limit,
-            // Whole until the batch pipeline plans the member for its
-            // shard; a preview never divides.
-            plan: ShardPlan::whole(),
+            scope: ExecutionScope::whole(),
         })
     }
 }
@@ -1012,7 +1007,10 @@ fn assemble_published_tx(
 
 /// The plan a member that ran the whole shape ran under, for a receipt
 /// with no prepared entry to read one off.
-static WHOLE_LEGS: LazyLock<LegPlan> = LazyLock::new(|| LegPlan::whole(0));
+static WHOLE_JOB: LazyLock<Job> = LazyLock::new(|| Job::Manifest {
+    calls: Vec::new(),
+    legs: LegPlan::whole(0),
+});
 
 /// Declare the record and claim cells a divided member's plan writes,
 /// as exclusive writes appended to its declaration.
@@ -1070,9 +1068,9 @@ fn declare(
 struct KernelOutput<'a> {
     receipt: &'a Receipt,
     work: u64,
-    /// The legs the member ran: what names the record cell of each
+    /// What the member did: whose plan names the record cell of each
     /// edge the receipt says it issued.
-    legs: &'a LegPlan,
+    job: &'a Job,
 }
 
 /// What every transaction in a batch assembles against: the pre-read
@@ -1101,7 +1099,7 @@ fn assemble_executed_tx(
     let KernelOutput {
         receipt,
         work: attested_work,
-        legs,
+        job,
     } = kernel;
     let tx_hash = vm_tx;
     let charged = fee.map_or(0, |payer| payer.price.min(payer.max_fee));
@@ -1193,7 +1191,7 @@ fn assemble_executed_tx(
                 output,
                 resource: crossed.resource,
                 amount: crossed.amount,
-                record: legs
+                record: job
                     .departure(node, output)
                     .expect("the kernel issues only what the plan departs")
                     .site
@@ -1227,29 +1225,6 @@ fn assemble_executed_tx(
 struct BatchMember {
     tx_hash: TxHash,
     body: Option<Arc<Verified<Transaction>>>,
-}
-
-/// The plan a housekeeping member runs: `records` slots, none of them a
-/// node, and this shard's own subtree as the scope.
-///
-/// The slot is a position in the record list and not a manifest edge —
-/// there is no manifest here, and the plan's edge map wants a key that
-/// cannot collide. Two records at one position is what an index rules
-/// out and what a `(node, output)` read off two intents' leaves would
-/// not.
-fn housekeeping_plan(ctx: &TickBatchContext<'_>, records: usize) -> ShardPlan {
-    let mut legs = LegPlan::whole(records);
-    for slot in 0..records {
-        if let Ok(slot) = u32::try_from(slot) {
-            let _ = legs.skip(slot);
-        }
-    }
-    let trie = ctx.shard_trie.clone();
-    let local = ctx.local_shard;
-    ShardPlan {
-        legs,
-        scope: ExecutionScope::spanning(move |owner| trie.shard_for_prefix(owner) == local),
-    }
 }
 
 /// Whether the settlement of `record` under `on` takes the crossing
@@ -1514,11 +1489,10 @@ impl Executor {
                     .cloned()
                     .expect("every prepared transaction has an environment");
                 BatchTx::new(*vm_tx, entry.declaration.clone(), env)
-                    .with_calls(entry.calls.clone())
+                    .with_job(entry.job.clone())
                     .with_nullifiers(entry.nullifiers.clone())
                     .with_gas_limit(entry.gas_limit)
-                    .with_legs(entry.plan.legs.clone())
-                    .with_scope(entry.plan.scope.clone())
+                    .with_scope(entry.scope.clone())
                     .with_fee(fee_by_tx.get(vm_tx).map(|payer| FeeBurn {
                         vault: payer.vault,
                         resource: *XRD,
@@ -1555,9 +1529,7 @@ impl Executor {
             let kernel = KernelOutput {
                 receipt,
                 work: outcome.work.get(vm_tx).map_or(0, |w| w.units),
-                legs: prepared
-                    .get(vm_tx)
-                    .map_or(&WHOLE_LEGS, |entry| &entry.plan.legs),
+                job: prepared.get(vm_tx).map_or(&WHOLE_JOB, |entry| &entry.job),
             };
             let executed = assemble_executed_tx(
                 ctx,
