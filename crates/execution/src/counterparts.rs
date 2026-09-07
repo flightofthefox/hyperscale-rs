@@ -49,15 +49,21 @@ fn counterpart_cells(entry: &Probeable, trie: &ShardTrie) -> Vec<CounterpartCell
     // answer: a core of more than one shard, whose shards settle on each
     // other's certificates with no clock. A core of one shard answers
     // through its claim, which the deadline fences.
+    //
+    // Every core shard is asked, because any one of them absent is the
+    // whole answer — a core that one of its shards never included can
+    // never settle — while the shards that did include say only that a
+    // sibling is still pending. Asking the lowest alone leaves the
+    // crossing stranded whenever that shard is the one that included.
+    // Nothing is asked before the deadline, so a core that settles pays
+    // for none of this.
+    let core_answers = Probed::Core
+        .read(Inclusion::Absent, entry.core.len())
+        .is_some();
     let core = entry
         .core
         .iter()
-        .next()
-        .filter(|_| {
-            Probed::Core
-                .read(Inclusion::Absent, entry.core.len())
-                .is_some()
-        })
+        .filter(move |_| core_answers)
         .map(|&shard| {
             (
                 shard,
@@ -75,7 +81,7 @@ fn counterpart_cells(entry: &Probeable, trie: &ShardTrie) -> Vec<CounterpartCell
             .into_iter()
             .map(move |shard| (shard, claim, Probed::Claim))
     });
-    core.into_iter().chain(deliveries).chain(claims).collect()
+    core.chain(deliveries).chain(claims).collect()
 }
 
 /// What a commit folded, and what it could not answer for.

@@ -8045,6 +8045,85 @@ mod tests {
         );
     }
 
+    /// Every core shard is asked, so the one that never included the
+    /// transaction answers even where its sibling did.
+    ///
+    /// A core settles only if all of its shards do, so one shard absent
+    /// past the deadline is the whole answer, while a shard that did
+    /// include says only that a sibling is still pending. Asking the
+    /// lowest alone strands the crossing exactly when that shard is the
+    /// one that included it.
+    #[test]
+    fn a_core_shard_that_never_included_it_answers_beside_a_sibling_that_did() {
+        let schedule = two_shard_core_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let figures = UnsettledTx::for_transaction(&transaction);
+        let deadline = figures.deadline.at();
+        let validity_end = transaction.validity_range().end_timestamp_exclusive;
+        let cell = |shard| committed_tx_cell_key(shard, tx_hash, validity_end);
+        let mut state = leg_state(&transaction, two_shard_core_classified());
+        state.committed_ts = deadline;
+
+        // The lowest core shard committed the transaction; its sibling
+        // never did.
+        let (included, opened) = proven_at(
+            &mut state,
+            &schedule,
+            CORE,
+            4,
+            deadline,
+            &[cell(CORE)],
+            &[cell(CORE)],
+        );
+        assert_eq!(
+            state_proof_fetches(&opened),
+            vec![(included.anchor, vec![cell(CORE)])],
+        );
+        let (never, opened) = proven_at(
+            &mut state,
+            &schedule,
+            CORE_SIBLING,
+            4,
+            deadline,
+            &[],
+            &[cell(CORE_SIBLING)],
+        );
+        assert_eq!(
+            state_proof_fetches(&opened),
+            vec![(never.anchor, vec![cell(CORE_SIBLING)])],
+            "the sibling is asked too, and about its own cell",
+        );
+
+        commit_carrying(
+            &mut state,
+            &schedule,
+            1,
+            deadline.as_millis(),
+            vec![included, never],
+        );
+        assert!(
+            absences_observed_at(&state, CORE, tx_hash).is_empty(),
+            "the shard that included it is not absent",
+        );
+        assert_eq!(
+            absences_observed_at(&state, CORE_SIBLING, tx_hash),
+            vec![absent(Probed::Core, deadline)],
+            "and the sibling that never did answers",
+        );
+        assert_eq!(
+            state.offers(&schedule).abandonment_records,
+            vec![AbandonmentRecord::heard(
+                CORE_SIBLING,
+                absent(Probed::Core, deadline),
+                [figures]
+            )],
+            "which is what licenses taking the crossing back",
+        );
+    }
+
     /// A leg entry on `HOME` whose core consumer's claim sits at `claim`
     /// on `PEER`, with the committed clock at the deadline: what a claim
     /// probe is issued for.
