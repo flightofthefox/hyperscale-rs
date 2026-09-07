@@ -24,9 +24,9 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
-    AdmittedTree, ChainRecords, Claim, Composed, CrossingSite, EnvelopeTree, IntentHeader,
-    ManifestHash, PackageHash, PrefixShardResolver, Routing as RoutedTransaction, RuleBytes, Value,
-    admit_tree, child_key, effect_units, footprint, legs_of, package_hash,
+    AdmittedTree, ChainRecords, Claim, CrossingSite, EnvelopeTree, IntentHeader, ManifestHash,
+    PackageHash, PrefixShardResolver, Routing as RoutedTransaction, RuleBytes, Value, admit_tree,
+    child_key, effect_units, footprint, legs_of, package_hash,
     package_key as canonical_package_key, principal_address, route_tree, xrd,
 };
 use hyperscale_vm_fixtures::lottery;
@@ -568,11 +568,6 @@ struct Division {
 
 /// Divide an admitted tree.
 ///
-/// Classified against the view admission lowered it under — the chain's
-/// records with the tree's own layered behind them — since a node
-/// targeting a component the envelope itself carries resolves there and
-/// nowhere else.
-///
 /// Keys are made of what each node's own signer signed — the intent, the
 /// node's index within it, and that intent's expiry — so two compositions
 /// of one subintent derive the same record for its nodes, and nothing
@@ -583,20 +578,8 @@ struct Division {
 /// edge turns out to cross. Walked from the consumer side because that
 /// is where an edge is named, and admission has already refused an edge
 /// with two consumers.
-fn divide(
-    tree: &EnvelopeTree,
-    admitted: &AdmittedTree,
-    chain: &dyn ChainRecords,
-) -> Result<Division, DerivationError> {
-    let manifest = admitted.admitted.manifest();
-    let resolvable = Composed::new(chain, &tree.instances, &ProtocolHasher);
-    let legs = legs_of(&admitted.admitted, &resolvable).map_err(|unresolved| {
-        // Admission resolved every target it lowered, so this is a
-        // package the chain has since stopped answering for — a gap this
-        // node's, which closes when the record lands, not a verdict.
-        let target = manifest.nodes.get(unresolved.node).map(|node| node.target);
-        DerivationError::Unresolved(target.into_iter().collect())
-    })?;
+fn divide(admitted: &AdmittedTree) -> Result<Division, DerivationError> {
+    let legs = legs_of(&admitted.admitted);
     let mut crossings = Vec::new();
     for consumer in &legs {
         for edge in &consumer.edges {
@@ -724,7 +707,7 @@ impl Derivation for BridgeStatics {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let Division { legs, crossings } = divide(&tree, &admitted, &chain)?;
+        let Division { legs, crossings } = divide(&admitted)?;
         // What this transaction costs a block, on the engine's own
         // schedule: the fixed charge for carrying it, what it declared it
         // would touch, and the ceiling it signed for its own execution.
