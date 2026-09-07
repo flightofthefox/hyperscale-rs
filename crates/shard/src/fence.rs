@@ -23,8 +23,8 @@ use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_metrics::record_verdict_claim_deferred;
 use hyperscale_types::{
     AbandonmentRecord, Block, CounterpartEvidence, CounterpartMirror, Heard, ProvenAnchors,
-    Question, SettledSetVerdict, ShardId, StateProofBundle, TopologySchedule, UnsettledTx,
-    WeightedTimestamp, settled_set_verdict,
+    Question, SettledSetVerdict, ShardId, StateProofBundle, TopologySchedule, TxClaim, UnsettledTx,
+    WeightedTimestamp, Word, settled_set_verdict,
 };
 
 use crate::precut::{Precut, PrecutStatus};
@@ -84,7 +84,7 @@ impl VoteFence<'_> {
     pub fn judge(&self, schedule: &TopologySchedule, block: &Block) -> Result<(), Withheld> {
         let anchored_wt = block.header().parent_qc().weighted_timestamp();
         self.finalizations(schedule, block, anchored_wt)?;
-        self.records(block)?;
+        self.records(schedule, block, anchored_wt)?;
         self.state_proofs(block)?;
         self.precut(block)
     }
@@ -150,11 +150,16 @@ impl VoteFence<'_> {
     ///
     /// The first record whose evidence this validator contradicts or
     /// has not mirrored.
-    pub fn records(&self, block: &Block) -> Result<(), Withheld> {
+    pub fn records(
+        &self,
+        schedule: &TopologySchedule,
+        block: &Block,
+        anchored_wt: WeightedTimestamp,
+    ) -> Result<(), Withheld> {
         block
             .abandonment_records()
             .iter()
-            .try_for_each(|verdict| self.record_stands(verdict))
+            .try_for_each(|verdict| self.record_stands(schedule, anchored_wt, verdict))
     }
 
     /// Whether one record's evidence stands for this validator, on the
@@ -162,13 +167,17 @@ impl VoteFence<'_> {
     /// own ledger and the departed shard's settled set; what a shard was
     /// heard to say is checked against this validator's own mirror of
     /// it, equality on the word and the moment.
-    fn record_stands(&self, verdict: &AbandonmentRecord) -> Result<(), Withheld> {
+    fn record_stands(
+        &self,
+        schedule: &TopologySchedule,
+        anchored_wt: WeightedTimestamp,
+        verdict: &AbandonmentRecord,
+    ) -> Result<(), Withheld> {
         match verdict.evidence() {
             CounterpartEvidence::Departed { .. } => self.departure_stands(verdict),
-            CounterpartEvidence::Heard(heard) => verdict
-                .unsettled()
-                .iter()
-                .try_for_each(|entry| self.heard_stands(verdict.shard(), entry, heard)),
+            CounterpartEvidence::Heard(heard) => verdict.unsettled().iter().try_for_each(|entry| {
+                self.heard_stands(schedule, anchored_wt, verdict.shard(), entry, heard)
+            }),
         }
     }
 
@@ -234,8 +243,15 @@ impl VoteFence<'_> {
     /// certificate, or off the proof the chain committed, which every
     /// replica folds at the same height. A voter holding no mirror
     /// cannot say and defers; one whose mirror disagrees refuses.
+    /// Whether a heard answer stands. An acceptance is also a settlement
+    /// claim on the shard that spoke it — a chain whose termination is
+    /// scheduled can be cut before the finalization its certificate
+    /// promises lands — so it is held to the verdict a finalization's
+    /// claim would be, at the block's anchor.
     fn heard_stands(
         &self,
+        schedule: &TopologySchedule,
+        anchored_wt: WeightedTimestamp,
         shard: ShardId,
         entry: &UnsettledTx,
         heard: Heard,
@@ -250,23 +266,54 @@ impl VoteFence<'_> {
             )));
         }
         match self.evidence.heard(entry.tx_hash, shard, heard.question) {
-            Some(mirrored) if mirrored == heard => Ok(()),
-            Some(mirrored) => Err(Withheld::Refused(format!(
-                "abandonment record restates {heard:?} of {shard:?} for {}, which this \
-                 validator reads as {mirrored:?}",
-                entry.tx_hash
-            ))),
+            Some(mirrored) if mirrored == heard => {}
+            Some(mirrored) => {
+                return Err(Withheld::Refused(format!(
+                    "abandonment record restates {heard:?} of {shard:?} for {}, which this \
+                     validator reads as {mirrored:?}",
+                    entry.tx_hash
+                )));
+            }
             None => {
                 if heard.question == Question::Verdict {
                     record_verdict_claim_deferred();
                 }
-                Err(Withheld::deferred(format!(
+                return Err(Withheld::deferred(format!(
                     "abandonment record restates an answer of {shard:?} for {} this validator \
                      has not mirrored",
                     entry.tx_hash
-                )))
+                )));
             }
         }
+        if heard.question == Question::Verdict && matches!(heard.word, Word::Accepted { .. }) {
+            let verdict = self.evidence.with_settled(|settled| {
+                settled_set_verdict(
+                    settled,
+                    schedule,
+                    self.local_shard,
+                    anchored_wt,
+                    [(shard, entry.tx_hash, TxClaim::Settled)],
+                )
+            });
+            match verdict {
+                SettledSetVerdict::Pass => {}
+                SettledSetVerdict::Defer => {
+                    return Err(Withheld::deferred(format!(
+                        "abandonment record takes an acceptance of {shard:?} for {} as settled \
+                         while its termination is scheduled and its settled set unknown",
+                        entry.tx_hash
+                    )));
+                }
+                SettledSetVerdict::Reject => {
+                    return Err(Withheld::Refused(format!(
+                        "abandonment record takes an acceptance of {shard:?} for {} as settled, \
+                         which its settled set contradicts",
+                        entry.tx_hash
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Whether the block's state proofs name anchors this voter can

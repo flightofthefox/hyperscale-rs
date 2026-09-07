@@ -2322,8 +2322,9 @@ impl ExecutionCoordinator {
 
     /// What this validator holds to offer in a block it proposes.
     #[must_use]
-    pub fn offers(&self) -> Offers {
-        self.counterparts.offers()
+    pub fn offers(&self, topology_schedule: &TopologySchedule) -> Offers {
+        self.counterparts
+            .offers(topology_schedule, self.committed_ts)
     }
 
     /// Handle a commit-proven remote header from the `RemoteHeaderCoordinator`.
@@ -3745,12 +3746,13 @@ mod tests {
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
         BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
-        EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, ExecutionOutcome, GlobalReceiptHash, Hash,
-        Heard, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE,
-        NetworkDefinition, Probed, Question, QuorumCertificate, RETENTION_HORIZON, Randomness,
-        RecoveryCause, SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer, SignerBitfield,
-        StateProofBundle, StateRoot, StoredReceipt, SubstateKey, TickHalf, TransactionDecision,
-        TxClaim, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet, Window, Word,
+        CounterpartEvidence, EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, ExecutionOutcome,
+        GlobalReceiptHash, Hash, Heard, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK,
+        MAX_VALIDITY_RANGE, NetworkDefinition, Probed, Question, QuorumCertificate,
+        RETENTION_HORIZON, Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor,
+        ShardRecovery, Signer, SignerBitfield, StateProofBundle, StateRoot, StoredReceipt,
+        SubstateKey, TickHalf, TransactionDecision, TxClaim, TxResolution, UnsettledTx,
+        ValidatorInfo, ValidatorSet, Window, Word,
     };
     use hyperscale_vm_types::Seeded;
 
@@ -7333,7 +7335,7 @@ mod tests {
             "and the mirror's generation moves, re-driving the votes that deferred without it"
         );
         assert_eq!(
-            state.offers().abandonment_records,
+            state.offers(&schedule).abandonment_records,
             vec![AbandonmentRecord::heard(
                 PEER,
                 word,
@@ -7406,7 +7408,7 @@ mod tests {
             before,
             "a success is not a refusal"
         );
-        assert!(accepting.offers().abandonment_records.is_empty());
+        assert!(accepting.offers(&schedule).abandonment_records.is_empty());
         assert_eq!(
             resolved(&actions),
             vec![(
@@ -7680,7 +7682,7 @@ mod tests {
             vec![absent(Probed::Delivery, later)],
         );
         assert_eq!(
-            state.offers().abandonment_records,
+            state.offers(&schedule).abandonment_records,
             vec![AbandonmentRecord::heard(
                 PEER,
                 absent(Probed::Delivery, later),
@@ -7732,7 +7734,7 @@ mod tests {
         );
         state.on_proof_fetched(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
         assert_eq!(
-            state.offers().state_proofs,
+            state.offers(&schedule).state_proofs,
             vec![bundle.clone()],
             "dated to the clock the probe read off the header"
         );
@@ -7740,13 +7742,13 @@ mod tests {
         let deadline_ms = deadline.as_millis();
         commit_carrying(&mut state, &schedule, 1, deadline_ms, Vec::new());
         assert_eq!(
-            state.offers().state_proofs,
+            state.offers(&schedule).state_proofs,
             vec![bundle.clone()],
             "a block carrying no proofs leaves the offer standing"
         );
         commit_carrying(&mut state, &schedule, 2, deadline_ms, vec![bundle]);
         assert!(
-            state.offers().state_proofs.is_empty(),
+            state.offers(&schedule).state_proofs.is_empty(),
             "a proof the chain carries is everybody's"
         );
     }
@@ -7834,7 +7836,7 @@ mod tests {
             vec![absent(Probed::Delivery, later)],
         );
         assert_eq!(
-            state.offers().abandonment_records,
+            state.offers(&schedule).abandonment_records,
             vec![AbandonmentRecord::heard(
                 successor,
                 absent(Probed::Delivery, later),
@@ -7961,7 +7963,7 @@ mod tests {
             "the absence reaches the mirror the vote fence reads"
         );
         assert_eq!(
-            state.offers().abandonment_records,
+            state.offers(&schedule).abandonment_records,
             vec![AbandonmentRecord::heard(
                 CORE,
                 absent(Probed::Core, later),
@@ -8017,7 +8019,7 @@ mod tests {
             )),
             "and its certificate is fetched, since a refusal there licenses the reclaim"
         );
-        assert!(state.offers().abandonment_records.is_empty());
+        assert!(state.offers(&schedule).abandonment_records.is_empty());
         assert!(
             state_proof_fetches(&state.probe_silent_counterparts(&schedule)).is_empty(),
             "and is not asked again"
@@ -8100,7 +8102,7 @@ mod tests {
             "an absent claim on a core of one shard is evidence"
         );
         assert_eq!(
-            state.offers().abandonment_records,
+            state.offers(&schedule).abandonment_records,
             vec![AbandonmentRecord::heard(
                 PEER,
                 absent(Probed::Claim, deadline),
@@ -8170,7 +8172,7 @@ mod tests {
             before,
             "an absent claim on a core of two shards proves nothing"
         );
-        assert!(state.offers().abandonment_records.is_empty());
+        assert!(state.offers(&schedule).abandonment_records.is_empty());
 
         let (later, opened) = proven_at(
             &mut state,
@@ -8263,7 +8265,7 @@ mod tests {
                 .is_none(),
             "and is not itself evidence"
         );
-        assert!(state.offers().abandonment_records.is_empty());
+        assert!(state.offers(&schedule).abandonment_records.is_empty());
     }
 
     /// A consumer's acceptance is mirrored off its certificate, handed to
@@ -8306,7 +8308,7 @@ mod tests {
             "the acceptance reaches the mirror the vote fence reads"
         );
         assert_eq!(
-            state.offers().abandonment_records,
+            state.offers(&schedule).abandonment_records,
             vec![AbandonmentRecord::heard(PEER, word, [figures])],
             "and a record is offered under the certificate's anchor"
         );
@@ -8336,6 +8338,99 @@ mod tests {
         assert!(
             state.counterparts.ledger.retirable().is_empty(),
             "and the ledger has handed it to the tick"
+        );
+    }
+
+    /// A consumer's acceptance is a settlement claim on it, and while the
+    /// consumer's termination is scheduled its certificate alone does
+    /// not license the retirement: the cut can land before the
+    /// finalization the certificate promises, and the terminal sweep
+    /// abandons the tick. The record is offered once the consumer's
+    /// settled set names the transaction, and never where it does not —
+    /// the escrow then stays for the reclaim.
+    #[test]
+    fn a_terminating_consumers_acceptance_is_offered_on_its_settled_set_alone() {
+        let schedule = peer_terminating_schedule(60_000);
+        let anchor = WeightedTimestamp::from_millis(30_000);
+        let cut = WeightedTimestamp::from_millis(60_000);
+        let after = WeightedTimestamp::from_millis(61_000);
+        let heard_records = |state: &ExecutionCoordinator| {
+            state
+                .offers(&schedule)
+                .abandonment_records
+                .into_iter()
+                .filter(|record| matches!(record.evidence(), CounterpartEvidence::Heard(_)))
+                .collect::<Vec<_>>()
+        };
+        let accepting = |state: &mut ExecutionCoordinator, tx_hash: TxHash| {
+            let certificate =
+                Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+                    TickId::new(PEER, BlockHeight::new(5)),
+                    anchor,
+                    GlobalReceiptRoot::ZERO,
+                    vec![TxOutcome::new(
+                        tx_hash,
+                        ExecutionOutcome::Succeeded {
+                            receipt_hash: GlobalReceiptHash::ZERO,
+                        },
+                    )],
+                    AggregateSignature::ZERO,
+                    SignerBitfield::new(4),
+                )));
+            state.handle_attestation(&schedule, &certificate);
+            accepted(anchor, certificate.attested_digest())
+        };
+
+        let (transaction, figures, _, mut state) = consumer_claim_fixture(0x7E);
+        let tx_hash = transaction.hash();
+        let word = accepting(&mut state, tx_hash);
+        assert_eq!(
+            state
+                .counterparts
+                .mirror
+                .heard(tx_hash, PEER, Question::Verdict),
+            Some(word),
+            "the acceptance is mirrored"
+        );
+        state.committed_ts = anchor;
+        assert!(
+            heard_records(&state).is_empty(),
+            "while the consumer's termination is scheduled the acceptance is not offered"
+        );
+        state.committed_ts = after;
+        assert!(
+            heard_records(&state).is_empty(),
+            "past the cut it waits for the settled set"
+        );
+        state.record_settled_txs(
+            &schedule,
+            PEER,
+            SettledTxSet {
+                txs: std::iter::once(tx_hash).collect(),
+                terminal_wt: cut,
+            },
+        );
+        assert_eq!(
+            heard_records(&state),
+            vec![AbandonmentRecord::heard(PEER, word, [figures])],
+            "a settled set naming the transaction offers the record"
+        );
+
+        let (transaction, _, _, mut unsettled) = consumer_claim_fixture(0x7F);
+        let tx_hash = transaction.hash();
+        accepting(&mut unsettled, tx_hash);
+        unsettled.committed_ts = after;
+        unsettled.record_settled_txs(
+            &schedule,
+            PEER,
+            SettledTxSet {
+                txs: BTreeSet::new(),
+                terminal_wt: cut,
+            },
+        );
+        assert!(
+            heard_records(&unsettled).is_empty(),
+            "a settled set without it never does: the certified tick never settled"
         );
     }
 
@@ -8765,7 +8860,7 @@ mod tests {
             },
         );
 
-        let records = state.offers().abandonment_records;
+        let records = state.offers(&sched).abandonment_records;
         assert_eq!(records.len(), 1, "the peer's departure is answerable");
         assert_eq!(records[0].shard(), PEER);
         assert_eq!(
@@ -8783,7 +8878,7 @@ mod tests {
 
         // And what it does not offer twice.
         assert!(
-            state.offers().abandonment_records.is_empty(),
+            state.offers(&sched).abandonment_records.is_empty(),
             "a departure is answered once",
         );
 
@@ -8822,7 +8917,7 @@ mod tests {
         state.record_settled_txs(&sched, peer_left, set(120_000));
         state.record_settled_txs(&sched, PEER, set(60_000));
 
-        let records = state.offers().abandonment_records;
+        let records = state.offers(&sched).abandonment_records;
         assert_eq!(
             records
                 .iter()

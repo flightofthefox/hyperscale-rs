@@ -11063,6 +11063,18 @@ mod tests {
         )
     }
 
+    impl VoteFence<'_> {
+        /// The fence's verdict on `block`'s records under `sched`, at the
+        /// block's own anchor, as `judge` reads them.
+        fn records_at(&self, sched: &TopologySchedule, block: &Block) -> Result<(), Withheld> {
+            self.records(
+                sched,
+                block,
+                block.header().parent_qc().weighted_timestamp(),
+            )
+        }
+    }
+
     /// A finalization whose certificate carries this validator's local
     /// EC plus a remote EC on `remote` — the cross-shard shape the fence
     /// inspects.
@@ -11300,7 +11312,11 @@ mod tests {
         assert!(
             coord
                 .vote_fence()
-                .records(&block_with_records(AFTER_CUT_MS, records))
+                .records(
+                    &sched,
+                    &block_with_records(AFTER_CUT_MS, records),
+                    WeightedTimestamp::from_millis(AFTER_CUT_MS),
+                )
                 .is_err()
         );
     }
@@ -11344,6 +11360,7 @@ mod tests {
     #[test]
     fn a_record_the_schedule_attests_is_voted_on() {
         let coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
         coord
             .evidence()
             .record_settled(ShardId::ROOT, root_settled(b"other"), parties_of(b"tx"));
@@ -11351,7 +11368,11 @@ mod tests {
         assert!(
             coord
                 .vote_fence()
-                .records(&block_with_records(AFTER_CUT_MS, records))
+                .records(
+                    &sched,
+                    &block_with_records(AFTER_CUT_MS, records),
+                    WeightedTimestamp::from_millis(AFTER_CUT_MS),
+                )
                 .is_ok()
         );
     }
@@ -11365,6 +11386,8 @@ mod tests {
     fn a_record_naming_a_stranger_to_the_departed_shard_is_refused() {
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
         let block = block_with_records(AFTER_CUT_MS, records);
+        let sched = make_terminating_schedule(4);
+        let anchor = WeightedTimestamp::from_millis(AFTER_CUT_MS);
 
         let stranger = fence_coordinator();
         stranger.evidence().record_settled(
@@ -11373,13 +11396,19 @@ mod tests {
             parties_of(b"other"),
         );
         assert!(
-            stranger.vote_fence().records(&block).is_err(),
+            stranger
+                .vote_fence()
+                .records(&sched, &block, anchor)
+                .is_err(),
             "a name the departed shard was not party to is not voted"
         );
 
         let unmirrored = fence_coordinator();
         assert!(
-            unmirrored.vote_fence().records(&block).is_err(),
+            unmirrored
+                .vote_fence()
+                .records(&sched, &block, anchor)
+                .is_err(),
             "and a voter that has mirrored no departure defers"
         );
     }
@@ -11520,6 +11549,8 @@ mod tests {
     /// and no mirror defers it.
     #[test]
     fn a_refusal_record_stands_or_falls_on_the_mirror() {
+        let sched = make_terminating_schedule(4);
+        let anchor = WeightedTimestamp::from_millis(AFTER_CUT_MS);
         let refused_wt = WeightedTimestamp::from_millis(5_000);
         let block = record_of(verdict(refused_wt, false));
         let tx_hash = figures_of(b"tx").tx_hash;
@@ -11529,7 +11560,10 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, verdict(refused_wt, false));
         assert!(
-            matching.vote_fence().records(&block).is_ok(),
+            matching
+                .vote_fence()
+                .records(&sched, &block, anchor)
+                .is_ok(),
             "a matching mirror passes it"
         );
 
@@ -11555,14 +11589,17 @@ mod tests {
             let mismatched = fence_coordinator();
             mismatched.evidence().record(tx_hash, ShardId::ROOT, held);
             assert!(
-                mismatched.vote_fence().records(&block).is_err(),
+                mismatched
+                    .vote_fence()
+                    .records(&sched, &block, anchor)
+                    .is_err(),
                 "a mirror of {why} refuses it"
             );
         }
 
         let absent = fence_coordinator();
         assert!(
-            absent.vote_fence().records(&block).is_err(),
+            absent.vote_fence().records(&sched, &block, anchor).is_err(),
             "no mirror defers it"
         );
     }
@@ -11585,33 +11622,47 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Core, deadline));
         assert!(
-            matching.vote_fence().records(&record(deadline)).is_ok(),
+            matching
+                .vote_fence()
+                .records_at(&make_terminating_schedule(4), &record(deadline))
+                .is_ok(),
             "a proof at the deadline passes a record at the deadline"
         );
         assert!(
             matching
                 .vote_fence()
-                .records(&record(deadline.plus(Duration::from_secs(5))))
+                .records_at(
+                    &make_terminating_schedule(4),
+                    &record(deadline.plus(Duration::from_secs(5)))
+                )
                 .is_err(),
             "a record at an anchor this validator has not folded defers"
         );
         assert!(
             matching
                 .vote_fence()
-                .records(&record(deadline.minus(Duration::from_millis(1))))
+                .records_at(
+                    &make_terminating_schedule(4),
+                    &record(deadline.minus(Duration::from_millis(1)))
+                )
                 .is_err(),
             "a record probed before the deadline is refused whatever the mirror holds"
         );
         let sweep = deadline.plus(MAX_VALIDITY_RANGE);
         assert!(
-            matching.vote_fence().records(&record(sweep)).is_err(),
+            matching
+                .vote_fence()
+                .records_at(&make_terminating_schedule(4), &record(sweep))
+                .is_err(),
             "a record probed where the committed cell may be swept is refused"
         );
         let late = fence_coordinator();
         late.evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Core, sweep));
         assert!(
-            late.vote_fence().records(&record(deadline)).is_err(),
+            late.vote_fence()
+                .records_at(&make_terminating_schedule(4), &record(deadline))
+                .is_err(),
             "a mirror taken past the sweep proves nothing and defers"
         );
 
@@ -11619,7 +11670,7 @@ mod tests {
         assert!(
             absent_mirror
                 .vote_fence()
-                .records(&record(deadline))
+                .records_at(&make_terminating_schedule(4), &record(deadline))
                 .is_err(),
             "no proof defers it"
         );
@@ -11640,7 +11691,10 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Claim, deadline));
         assert!(
-            claim.vote_fence().records(&record).is_ok(),
+            claim
+                .vote_fence()
+                .records_at(&make_terminating_schedule(4), &record)
+                .is_ok(),
             "a folded claim absence at the anchor passes it"
         );
 
@@ -11648,7 +11702,9 @@ mod tests {
         cell.evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Core, deadline));
         assert!(
-            cell.vote_fence().records(&record).is_err(),
+            cell.vote_fence()
+                .records_at(&make_terminating_schedule(4), &record)
+                .is_err(),
             "a committed-cell absence is another question's proof, and defers"
         );
     }
@@ -11671,17 +11727,26 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Delivery, lapse));
         assert!(
-            matching.vote_fence().records(&record(lapse)).is_ok(),
+            matching
+                .vote_fence()
+                .records_at(&make_terminating_schedule(4), &record(lapse))
+                .is_ok(),
             "a proof at the lapse passes a record at the lapse"
         );
         assert!(
-            matching.vote_fence().records(&record(deadline)).is_err(),
+            matching
+                .vote_fence()
+                .records_at(&make_terminating_schedule(4), &record(deadline))
+                .is_err(),
             "a lapse record anchored at the deadline is refused whatever the mirror holds"
         );
         assert!(
             matching
                 .vote_fence()
-                .records(&record(lapse.plus(MAX_VALIDITY_RANGE)))
+                .records_at(
+                    &make_terminating_schedule(4),
+                    &record(lapse.plus(MAX_VALIDITY_RANGE))
+                )
                 .is_err(),
             "a lapse record anchored where the claim cell may be swept is refused"
         );
@@ -11691,7 +11756,10 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Delivery, deadline));
         assert!(
-            short.vote_fence().records(&record(lapse)).is_err(),
+            short
+                .vote_fence()
+                .records_at(&make_terminating_schedule(4), &record(lapse))
+                .is_err(),
             "a proof short of the lapse defers it"
         );
 
@@ -11700,40 +11768,94 @@ mod tests {
             .evidence()
             .record(tx_hash, ShardId::ROOT, absent(Probed::Core, lapse));
         assert!(
-            cores.vote_fence().records(&record(lapse)).is_err(),
+            cores
+                .vote_fence()
+                .records_at(&make_terminating_schedule(4), &record(lapse))
+                .is_err(),
             "a core's cell proved absent at the lapse is not the claim proved absent: it defers"
         );
     }
 
     /// An acceptance record is checked against this validator's own
-    /// mirror of the consumer's certificate, as a refusal is: the
-    /// mirrored word passes it, another anchor refuses it, and no mirror
-    /// defers.
+    /// mirror of the consumer's certificate, as a refusal is, and then
+    /// against the consumer's settlement: an acceptance is a claim that
+    /// the consumer settled the transaction, and a consumer whose
+    /// termination is scheduled can be cut before the finalization its
+    /// certificate promises lands. Past the cut the settled set decides —
+    /// unknown defers, a set naming the transaction passes, a set without
+    /// it refuses — while another anchor refuses on the mirror alone and
+    /// no mirror defers.
     #[test]
-    fn an_accepted_record_stands_or_falls_on_the_mirror() {
+    fn an_accepted_record_stands_or_falls_on_the_mirror_and_the_settled_set() {
         let figures = figures_of(b"tx");
         let accepted_wt = figures.deadline.at();
         let record = |at| record_of(verdict(at, true));
+        let sched = make_terminating_schedule(4);
 
         let matching = fence_coordinator();
         matching
             .evidence()
             .record(figures.tx_hash, ShardId::ROOT, verdict(accepted_wt, true));
         assert!(
-            matching.vote_fence().records(&record(accepted_wt)).is_ok(),
-            "the mirrored word passes"
+            matches!(
+                matching
+                    .vote_fence()
+                    .records_at(&sched, &record(accepted_wt)),
+                Err(Withheld::Deferred { .. })
+            ),
+            "the mirrored word waits for the departed consumer's settled set"
+        );
+        assert!(
+            matches!(
+                matching
+                    .vote_fence()
+                    .records_at(&sched, &record(accepted_wt.plus(Duration::from_millis(1)))),
+                Err(Withheld::Refused(_))
+            ),
+            "another anchor is refused"
+        );
+
+        matching.evidence().record_settled(
+            ShardId::ROOT,
+            SettledTxSet {
+                txs: std::iter::once(figures.tx_hash).collect(),
+                terminal_wt: WeightedTimestamp::from_millis(ROOT_CUT_MS),
+            },
+            parties_of(b"tx"),
         );
         assert!(
             matching
                 .vote_fence()
-                .records(&record(accepted_wt.plus(Duration::from_millis(1))))
-                .is_err(),
-            "another anchor is refused"
+                .records_at(&sched, &record(accepted_wt))
+                .is_ok(),
+            "a settled set naming the transaction passes it"
+        );
+
+        let unsettled = fence_coordinator();
+        unsettled
+            .evidence()
+            .record(figures.tx_hash, ShardId::ROOT, verdict(accepted_wt, true));
+        unsettled.evidence().record_settled(
+            ShardId::ROOT,
+            root_settled(b"other"),
+            parties_of(b"tx"),
+        );
+        assert!(
+            matches!(
+                unsettled
+                    .vote_fence()
+                    .records_at(&sched, &record(accepted_wt)),
+                Err(Withheld::Refused(_))
+            ),
+            "a settled set without it refuses: the certified tick never settled"
         );
 
         let absent = fence_coordinator();
         assert!(
-            absent.vote_fence().records(&record(accepted_wt)).is_err(),
+            matches!(
+                absent.vote_fence().records_at(&sched, &record(accepted_wt)),
+                Err(Withheld::Deferred { .. })
+            ),
             "no mirror defers it"
         );
     }
@@ -11745,6 +11867,7 @@ mod tests {
     #[test]
     fn a_record_naming_what_the_departed_shard_settled_is_refused() {
         let coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
         coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
@@ -11757,7 +11880,11 @@ mod tests {
         assert!(
             coord
                 .vote_fence()
-                .records(&block_with_records(AFTER_CUT_MS, records))
+                .records(
+                    &sched,
+                    &block_with_records(AFTER_CUT_MS, records),
+                    WeightedTimestamp::from_millis(AFTER_CUT_MS),
+                )
                 .is_err()
         );
     }

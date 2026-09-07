@@ -20,10 +20,10 @@ use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, Block, CounterpartEvidence, CounterpartMirror, ExecutionCertificate,
     Heard, Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed, ProvenAnchors, Question, SettledTxSet,
-    ShardId, ShardTrie, StateProofBundle, SubstateKey, TerminalEvidence, TopologySchedule,
-    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
-    WeightedTimestamp, Word,
+    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed, ProvenAnchors, Question,
+    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateProofBundle, SubstateKey,
+    TerminalEvidence, TopologySchedule, TransactionDecision, TxClaim, TxHash, TxResolution,
+    UnsettledTx, Verifiable, Verified, WeightedTimestamp, Word, settled_set_verdict,
 };
 
 use crate::unresolved::{Probeable, Released, Unanswerable, UnresolvedTxs};
@@ -257,12 +257,13 @@ impl Counterparts {
             .collect()
     }
 
-    /// What this validator holds to offer in a block it proposes.
+    /// What this validator holds to offer in a block it proposes, judged
+    /// at `now`, the committed frontier.
     #[must_use]
-    pub fn offers(&self) -> Offers {
+    pub fn offers(&self, schedule: &TopologySchedule, now: WeightedTimestamp) -> Offers {
         Offers {
             state_proofs: self.state_proofs(),
-            abandonment_records: self.abandonment_records(),
+            abandonment_records: self.abandonment_records(schedule, now),
         }
     }
 
@@ -624,7 +625,11 @@ impl Counterparts {
     ///
     /// Ascending by shard, which is the one order a block may carry them
     /// in.
-    fn abandonment_records(&self) -> Vec<AbandonmentRecord> {
+    fn abandonment_records(
+        &self,
+        schedule: &TopologySchedule,
+        now: WeightedTimestamp,
+    ) -> Vec<AbandonmentRecord> {
         let mut budget = MAX_UNSETTLED_PER_BLOCK;
         // One record per shard and arm, ascending: a departure first,
         // since it covers everything the shard was party to, then one
@@ -668,6 +673,29 @@ impl Counterparts {
         for (tx_hash, shard, word) in self.mirror.all() {
             if matches!(word.word, Word::Accepted { .. })
                 && !self.ledger.acceptance_unrecorded(tx_hash, shard)
+            {
+                continue;
+            }
+            // An acceptance is a settlement claim on the shard that spoke
+            // it, and its certificate alone is not one: a live chain
+            // settles what it certifies, but a chain whose termination is
+            // scheduled can be cut before the finalization lands, and its
+            // terminal sweep abandons the tick. The claim is held to the
+            // verdict a finalization's would be — deferred while the
+            // termination is scheduled, decided by the settled set once
+            // the shard has left — and the retirement it licenses waits
+            // with it.
+            if word.question == Question::Verdict
+                && matches!(word.word, Word::Accepted { .. })
+                && self.mirror.with_settled(|sets| {
+                    settled_set_verdict(
+                        sets,
+                        schedule,
+                        self.local_shard,
+                        now,
+                        [(shard, tx_hash, TxClaim::Settled)],
+                    )
+                }) != SettledSetVerdict::Pass
             {
                 continue;
             }
