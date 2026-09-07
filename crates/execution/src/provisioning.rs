@@ -19,10 +19,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use hyperscale_engine::legs::{Classified, Side};
+use hyperscale_engine::legs::{Classified, Member, Side};
 use hyperscale_types::{
-    Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, SubstateKey, TxHash, Verified,
-    WeightedTimestamp,
+    Deadline, Provisions, RETENTION_HORIZON, ShardId, SubstateEntry, SubstateKey, TxHash, Verified,
+    WeightedTimestamp, Window,
 };
 use hyperscale_vm_types::{AddressClass, Crossing, LegShape};
 
@@ -55,6 +55,40 @@ pub enum Requirement {
         /// The record cell.
         key: SubstateKey,
     },
+}
+
+/// What `member`, a divided member of a transaction with these `legs`
+/// and `crossings`, files before it can run: its execution scope minus
+/// itself, and the crossings the legs it runs consume.
+#[must_use]
+pub fn requirements_of(
+    member: &Member,
+    legs: &[LegShape],
+    crossings: &[Crossing],
+) -> BTreeSet<Requirement> {
+    divided_requirements(
+        legs,
+        crossings,
+        member.classified(),
+        member.local(),
+        member.side(),
+    )
+}
+
+/// The earliest `member`'s provisioning entry may be swept, where the
+/// member is a delivery of a transaction whose validity ends at
+/// `validity_end`.
+///
+/// A delivery is admissible to the delivery window's close and probed a
+/// finalization delay past it, which outlives the retention horizon the
+/// entry would otherwise take: a bundle landing after the sweep would
+/// populate `present` against a requirement nobody records, and the
+/// delivery would be abandoned at the close while the issuer reclaims a
+/// crossing its deliverer could have taken. Every other member waits
+/// inside the horizon and takes no floor.
+#[must_use]
+pub fn floor_of(member: &Member, validity_end: WeightedTimestamp) -> Option<WeightedTimestamp> {
+    (member.side() == Side::Delivering).then(|| Window::Lapse.of(Deadline::of(validity_end)).start)
 }
 
 /// What a divided member of a transaction files: its execution scope

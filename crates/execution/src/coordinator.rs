@@ -71,7 +71,7 @@ use crate::lookups::{
 };
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::provisional::ProvisionalCells;
-use crate::provisioning::{ProvisioningTracker, Requirement, divided_requirements};
+use crate::provisioning::{ProvisioningTracker, Requirement, floor_of, requirements_of};
 use crate::tick_state::{Admission, Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
 use crate::unresolved::{Probeable, Reclaimable, Released, Retirable, Unanswerable, UnresolvedTxs};
@@ -281,20 +281,6 @@ fn inherited_member_name(issued_by: TxHash, records: &[SubstateKey]) -> TxHash {
     let mut parts: Vec<&[u8]> = vec![b"hyperscale.inherited.records", &issued_by.0.0];
     parts.extend(keys.iter().map(Vec::as_slice));
     TxHash::from(Hash::from_parts(&parts))
-}
-
-/// The earliest a member's provisioning entry may be swept, where the
-/// member is a delivery.
-///
-/// A delivery is admissible to the delivery window's close and probed a
-/// finalization delay past it, which outlives the retention horizon the
-/// entry would otherwise take: a bundle landing after the sweep would
-/// populate `present` against a requirement nobody records, and the
-/// delivery would be abandoned at the close while the issuer reclaims a
-/// crossing its deliverer could have taken. Every other member waits
-/// inside the horizon and takes no floor.
-fn delivery_floor(side: Side, validity_end: WeightedTimestamp) -> Option<WeightedTimestamp> {
-    (side == Side::Delivering).then(|| Window::Lapse.of(Deadline::of(validity_end)).start)
 }
 
 /// Execution state machine.
@@ -762,12 +748,16 @@ impl ExecutionCoordinator {
             // engagement exchange is filed, and it runs under its own
             // committing block's clock.
             if classified.decomposed().holds() {
-                let side = classified.first_side_at(local_shard);
-                let validity_end = tx.validity_range().end_timestamp_exclusive;
+                let member = Member::of(
+                    classified.clone(),
+                    local_shard,
+                    classified.first_side_at(local_shard),
+                    participating.clone(),
+                );
                 self.provisioning.record_required(
                     tx_hash,
-                    divided_requirements(tx.legs(), tx.crossings(), classified, local_shard, side),
-                    delivery_floor(side, validity_end),
+                    requirements_of(&member, tx.legs(), tx.crossings()),
+                    floor_of(&member, tx.validity_range().end_timestamp_exclusive),
                 );
                 continue;
             }
@@ -1086,13 +1076,6 @@ impl ExecutionCoordinator {
             if self.ticks.tick_assignment(tx_hash).is_some() {
                 continue;
             }
-            state.admit(
-                tx_hash,
-                Membership::whole(BTreeSet::from([local_shard])).settling(),
-                0,
-                Admission::Executes,
-            );
-            self.ticks.assign_tx(tx_hash, tick_id);
             self.unresolved.admit_reclaim(tx_hash);
             record_reclaim_admitted();
             // A mixed shard's delivering member waits on what the core
@@ -1101,24 +1084,23 @@ impl ExecutionCoordinator {
             // candidate goes with the leg it was registered beside.
             self.candidates.remove(tx_hash);
             self.provisioning.remove_tx(tx_hash);
-            requests.push(CrossShardExecutionRequest {
-                // The plan reads no body — every cell is the record's —
-                // but the price still follows the vault, and this is the
-                // shard that holds it.
-                transaction: Some(Arc::clone(&transaction)),
+            let records = classified
+                .shape(transaction.legs(), transaction.crossings())
+                .records_issued(local_shard);
+            // The plan reads no body — every cell is the record's — but
+            // the price still follows the vault, and this is the shard
+            // that holds it.
+            self.seat_settling(
+                tick_id,
+                tick_ts,
+                state,
+                requests,
                 tx_hash,
-                provisions: Vec::new(),
-                clock: tick_ts,
-                runs: Runs::Settle {
-                    member: Member::whole(local_shard),
-                    records: classified
-                        .shape(transaction.legs(), transaction.crossings())
-                        .records_issued(local_shard),
-                    on: Licence::Unclaimed,
-                    charged,
-                },
-                arrivals: Vec::new(),
-            });
+                Some(transaction),
+                records,
+                Licence::Unclaimed,
+                charged,
+            );
         }
     }
 
@@ -1172,13 +1154,6 @@ impl ExecutionCoordinator {
         }
         for (issued_by, records) in due {
             let tx_hash = inherited_member_name(issued_by, &records);
-            state.admit(
-                tx_hash,
-                Membership::whole(BTreeSet::from([local_shard])).settling(),
-                0,
-                Admission::Executes,
-            );
-            self.ticks.assign_tx(tx_hash, tick_id);
             // Taken once: the credit deletes the cell, so a second
             // member over the same record would read nothing and the
             // records would be stranded behind a refusal.
@@ -1186,22 +1161,20 @@ impl ExecutionCoordinator {
                 self.inherited.remove(key);
             }
             record_reclaim_admitted();
-            requests.push(CrossShardExecutionRequest {
+            // No body reached this shard: the chain that issued the
+            // crossing ended at the cut, and the price it owed was
+            // settled there.
+            self.seat_settling(
+                tick_id,
+                tick_ts,
+                state,
+                requests,
                 tx_hash,
-                // No body reached this shard: the chain that issued the
-                // crossing ended at the cut, and the price it owed was
-                // settled there.
-                transaction: None,
-                provisions: Vec::new(),
-                clock: tick_ts,
-                runs: Runs::Settle {
-                    member: Member::whole(local_shard),
-                    records,
-                    on: Licence::OwnLeaf,
-                    charged: true,
-                },
-                arrivals: Vec::new(),
-            });
+                None,
+                records,
+                Licence::OwnLeaf,
+                true,
+            );
         }
     }
 
@@ -1230,30 +1203,67 @@ impl ExecutionCoordinator {
             if self.ticks.tick_assignment(tx_hash).is_some() || self.candidates.contains(tx_hash) {
                 continue;
             }
-            state.admit(
-                tx_hash,
-                Membership::housekeeping(local_shard),
-                0,
-                Admission::Executes,
-            );
-            self.ticks.assign_tx(tx_hash, tick_id);
             self.unresolved.admit_retire(tx_hash);
-            requests.push(CrossShardExecutionRequest {
-                transaction: Some(Arc::clone(&transaction)),
+            let records = classified
+                .shape(transaction.legs(), transaction.crossings())
+                .records_issued(local_shard);
+            self.seat_settling(
+                tick_id,
+                tick_ts,
+                state,
+                requests,
                 tx_hash,
-                provisions: Vec::new(),
-                clock: tick_ts,
-                runs: Runs::Settle {
-                    member: Member::whole(local_shard),
-                    records: classified
-                        .shape(transaction.legs(), transaction.crossings())
-                        .records_issued(local_shard),
-                    on: Licence::Accepted,
-                    charged: true,
-                },
-                arrivals: Vec::new(),
-            });
+                Some(transaction),
+                records,
+                Licence::Accepted,
+                true,
+            );
         }
+    }
+
+    /// Seat a settling member in the tick: dispatched, awaiting nobody
+    /// but this shard since its own certificate is the whole of its
+    /// settlement, reserving nothing since no block took a reservation
+    /// for it, and running no node since the engine settles the records
+    /// on the licence alone.
+    #[allow(clippy::too_many_arguments)] // one seat, every term of it
+    fn seat_settling(
+        &mut self,
+        tick_id: TickId,
+        tick_ts: WeightedTimestamp,
+        state: &mut TickState,
+        requests: &mut Vec<CrossShardExecutionRequest>,
+        tx_hash: TxHash,
+        transaction: Option<Arc<Verified<Transaction>>>,
+        records: Vec<SubstateKey>,
+        on: Licence,
+        charged: bool,
+    ) {
+        let local_shard = self.local_shard;
+        // A retirement decides nothing: the verdict was reached where
+        // the claims were. Every other settlement is this shard's verdict
+        // on the transaction.
+        let membership = match on {
+            Licence::Accepted => Membership::housekeeping(local_shard),
+            Licence::Unclaimed | Licence::OwnLeaf => {
+                Membership::whole(BTreeSet::from([local_shard])).settling()
+            }
+        };
+        state.admit(tx_hash, membership, 0, Admission::Executes);
+        self.ticks.assign_tx(tx_hash, tick_id);
+        requests.push(CrossShardExecutionRequest {
+            tx_hash,
+            transaction,
+            provisions: Vec::new(),
+            clock: tick_ts,
+            runs: Runs::Settle {
+                member: Member::whole(local_shard),
+                records,
+                on,
+                charged,
+            },
+            arrivals: Vec::new(),
+        });
     }
 
     /// Seat one composed member in the tick: its reservation, its
@@ -1317,26 +1327,19 @@ impl ExecutionCoordinator {
             && shape.side() == Side::Issuing
             && shape.runs_both_sides()
         {
+            let delivering = Member::of(
+                shape.classified().clone(),
+                local_shard,
+                Side::Delivering,
+                reach,
+            );
             self.provisioning.record_required(
                 member.request.tx_hash,
-                divided_requirements(
-                    body.legs(),
-                    body.crossings(),
-                    shape.classified(),
-                    local_shard,
-                    Side::Delivering,
-                ),
-                delivery_floor(
-                    Side::Delivering,
-                    body.validity_range().end_timestamp_exclusive,
-                ),
+                requirements_of(&delivering, body.legs(), body.crossings()),
+                floor_of(&delivering, body.validity_range().end_timestamp_exclusive),
             );
-            self.candidates.register_delivery(
-                Arc::clone(body),
-                reach,
-                member.request.clock,
-                shape.classified().clone(),
-            );
+            self.candidates
+                .register_member(Arc::clone(body), delivering, member.request.clock);
         }
         if let Some((_, body)) = &shape
             && member.request.runs.abortable()

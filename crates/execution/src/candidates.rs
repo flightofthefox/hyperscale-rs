@@ -155,34 +155,23 @@ impl TickCandidates {
     ) {
         let side = classified.first_side_at(self.local_shard);
         let member = Member::of(classified, self.local_shard, side, participating);
-        self.candidates.entry(tx.hash()).or_insert(Candidate {
-            tx,
-            member,
-            committed_ts,
-            engagement_pending: BTreeSet::new(),
-            engagement_deadline: None,
-        });
+        self.register_member(tx, member, committed_ts);
     }
 
-    /// Record the delivering member of a transaction whose issuing member
-    /// a tick has just taken: this shard runs outbound legs beside the
-    /// inbound ones, and they wait on what the core returns.
+    /// Record `member` of `tx` as a candidate, under the clock of the
+    /// block that committed it.
     ///
-    /// Waits on no engagement — the issuing member settled that — and
-    /// runs under the same committing block's clock.
-    pub fn register_delivery(
+    /// A mixed shard's delivering member arrives here once a tick has
+    /// taken its issuing one: this shard runs outbound legs beside the
+    /// inbound ones, and they wait on what the core returns. It waits on
+    /// no engagement — the issuing member settled that — and runs under
+    /// the same committing block's clock.
+    pub fn register_member(
         &mut self,
         tx: Arc<Verified<Transaction>>,
-        participating: BTreeSet<ShardId>,
+        member: Member,
         committed_ts: WeightedTimestamp,
-        classified: Classified,
     ) {
-        let member = Member::of(
-            classified,
-            self.local_shard,
-            Side::Delivering,
-            participating,
-        );
         self.candidates.entry(tx.hash()).or_insert(Candidate {
             tx,
             member,
@@ -486,11 +475,15 @@ mod tests {
         let delivery = tx(6);
         let delivered = delivery.hash();
         let end = delivery.validity_range().end_timestamp_exclusive;
-        candidates.register_delivery(
+        candidates.register_member(
             delivery,
-            BTreeSet::from([LOCAL, remote]),
+            Member::of(
+                Classified::whole(),
+                LOCAL,
+                Side::Delivering,
+                BTreeSet::from([LOCAL, remote]),
+            ),
             ms(1_000),
-            Classified::whole(),
         );
         let issuing = local_only(&mut candidates, tx(7));
 
