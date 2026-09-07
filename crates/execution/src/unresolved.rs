@@ -24,25 +24,11 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Address, Anchor, BlockHeight, CounterpartEvidence, Deadline,
-    Finalization, MAX_VALIDITY_RANGE, Probed, Question, ShardId, ShardTrie, SubstateKey,
-    Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
+    AbandonmentRecord, Address, Anchor, BlockHeight, CounterpartEvidence, Deadline, Finalization,
+    MAX_VALIDITY_RANGE, Probed, Question, ShardId, ShardTrie, SubstateKey, Transaction,
+    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
     WeightedTimestamp, Window, Word,
 };
-
-/// One transaction the ledger will let a tick abandon, with everything
-/// that abandonment states: it releases the reservation its committing
-/// block took and settles the charge its class fixes, and neither is
-/// readable from an execution it never had.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Abandonable {
-    /// The transaction.
-    pub tx_hash: TxHash,
-    /// The reservation to return.
-    pub declared_work: u64,
-    /// The burn to settle, on the shard holding the vault it names.
-    pub charge: AbortCharge,
-}
 
 /// Where a question this shard put to a counterpart about one cell
 /// stands.
@@ -88,19 +74,13 @@ fn outstanding_fetches(owed: &Owed) -> impl Iterator<Item = (Anchor, SubstateKey
 /// One committed transaction's outstanding account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Owed {
-    /// The moment past which the transaction can no longer finalize
-    /// anywhere: the last block that could have included it, plus the
-    /// longest a cross-shard transaction can take to finalize. Every
-    /// window the entry is held to is read off it.
-    deadline: Deadline,
-    /// The reservation its committing block took against the drain, held
-    /// here because an abandonment has no execution to read it from and
-    /// must release exactly what was taken.
-    declared_work: u64,
-    /// What an abort of it burns, held here for the same reason: an
-    /// abandonment never reaches an engine, so the charge its verdict
-    /// settles has to be readable without one.
-    charge: AbortCharge,
+    /// What abandoning the transaction states: its deadline, which every
+    /// window the entry is held to is read off; the reservation its
+    /// committing block took against the drain; and the charge an abort
+    /// burns. Held here because an abandonment has no execution to read
+    /// them from and must release exactly what was taken, and because a
+    /// record naming the transaction restates exactly these.
+    figures: UnsettledTx,
     /// The frontier its committing block anchored at, which dates the
     /// question below: a shard that left before this never held the
     /// transaction, whatever its keyspace covers now.
@@ -210,8 +190,8 @@ impl Owed {
     /// lapses and its issuer may reclaim it.
     fn opens(&self) -> WeightedTimestamp {
         match self.kind {
-            Kind::Delivery => Window::Delivery.of(self.deadline).end,
-            Kind::Whole | Kind::Leg | Kind::Remainder => self.deadline.at(),
+            Kind::Delivery => Window::Delivery.of(self.figures.deadline).end,
+            Kind::Whole | Kind::Leg | Kind::Remainder => self.figures.deadline.at(),
         }
     }
 
@@ -445,17 +425,9 @@ impl UnresolvedTxs {
         txs: impl IntoIterator<Item = &'a Arc<Verifiable<Transaction>>>,
     ) {
         for tx in txs {
-            let UnsettledTx {
-                deadline,
-                declared_work,
-                charge,
-                ..
-            } = UnsettledTx::for_transaction(tx);
             let owed = Owed {
                 committed_ts,
-                deadline,
-                declared_work,
-                charge,
+                figures: UnsettledTx::for_transaction(tx),
                 remote_prefixes: tx
                     .routing()
                     .all_prefixes()
@@ -563,12 +535,7 @@ impl UnresolvedTxs {
         self.owed
             .get(&tx_hash)
             .filter(|owed| owed.kind.is_leg() && owed.unsettled_by.is_none())
-            .map(|owed| UnsettledTx {
-                tx_hash,
-                deadline: owed.deadline,
-                declared_work: owed.declared_work,
-                charge: owed.charge,
-            })
+            .map(|owed| owed.figures)
     }
 
     /// Whether `shard` is one of the transaction's core — whose refusal
@@ -761,7 +728,7 @@ impl UnresolvedTxs {
                 let leg = self.kept.get(tx_hash)?;
                 Some(Probeable {
                     tx_hash: *tx_hash,
-                    deadline: owed.deadline,
+                    deadline: owed.figures.deadline,
                     core: leg.core.clone(),
                     deliveries: leg.deliveries.clone(),
                     claims: leg.claims.clone(),
@@ -926,9 +893,7 @@ impl UnresolvedTxs {
                 self.owed.insert(
                     entry.tx_hash,
                     Owed {
-                        deadline: entry.deadline,
-                        declared_work: entry.declared_work,
-                        charge: entry.charge,
+                        figures: *entry,
                         // The record dates it no later than the moment its
                         // evidence was taken at, which is the one bound on
                         // its commit the record itself establishes.
@@ -985,12 +950,7 @@ impl UnresolvedTxs {
                     && owed.unsettled_by.is_none()
                     && owed.party_to(shard, cut)
             })
-            .map(|(tx_hash, owed)| UnsettledTx {
-                tx_hash: *tx_hash,
-                deadline: owed.deadline,
-                declared_work: owed.declared_work,
-                charge: owed.charge,
-            })
+            .map(|(_, owed)| owed.figures)
             .collect()
     }
 
@@ -1294,7 +1254,7 @@ impl UnresolvedTxs {
     /// certificate settled alone, so there is nothing to abandon. What a
     /// record licenses on one is a reclaim.
     #[must_use]
-    pub fn past_deadline(&self, now: WeightedTimestamp) -> Vec<Abandonable> {
+    pub fn past_deadline(&self, now: WeightedTimestamp) -> Vec<UnsettledTx> {
         self.owed
             .iter()
             .filter(|(_, owed)| !owed.kind.is_leg())
@@ -1302,11 +1262,7 @@ impl UnresolvedTxs {
                 let window = owed.abandon_window();
                 now >= window.start && (owed.unsettled_by.is_some() || now < window.end)
             })
-            .map(|(tx_hash, owed)| Abandonable {
-                tx_hash: *tx_hash,
-                declared_work: owed.declared_work,
-                charge: owed.charge,
-            })
+            .map(|(_, owed)| owed.figures)
             .collect()
     }
 
@@ -1367,7 +1323,7 @@ impl UnresolvedTxs {
                     // be composed, whatever evidence lands. Short of it
                     // only the finalization that decides it ends it.
                     if owed.kind.is_leg() {
-                        return Window::LegEntry.of(owed.deadline).end > now;
+                        return Window::LegEntry.of(owed.figures.deadline).end > now;
                     }
                     if let Some(shard) = owed.unsettled_by {
                         if self.departed.get(&shard).is_some_and(|departure| {
@@ -1451,8 +1407,9 @@ mod tests {
         test_prefix, test_principal,
     };
     use hyperscale_types::{
-        BlockHeight, EPOCH_DURATION, EpochWindows, Hash, Heard, LocalKey, MAX_FINALIZATION_DELAY,
-        MAX_VALIDITY_RANGE, TimestampRange, UnsettledTx, Verified, WeightedTimestamp,
+        AbortCharge, BlockHeight, EPOCH_DURATION, EpochWindows, Hash, Heard, LocalKey,
+        MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, TimestampRange, UnsettledTx, Verified,
+        WeightedTimestamp,
     };
 
     use super::*;
@@ -1561,13 +1518,9 @@ mod tests {
         }
     }
 
-    /// What abandoning `tx` states: its reservation and its price.
-    fn abandons(tx: &Arc<Verifiable<Transaction>>) -> Abandonable {
-        Abandonable {
-            tx_hash: tx.hash(),
-            declared_work: tx.work(),
-            charge: charge(tx),
-        }
+    /// What abandoning `tx` states, as the ledger hands it to a tick.
+    fn abandons(tx: &Arc<Verifiable<Transaction>>) -> UnsettledTx {
+        names(tx)
     }
 
     /// The burn an abort of `tx` settles.

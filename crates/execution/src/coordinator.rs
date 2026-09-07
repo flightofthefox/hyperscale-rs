@@ -74,9 +74,7 @@ use crate::provisional::ProvisionalCells;
 use crate::provisioning::{ProvisioningTracker, Requirement, divided_requirements};
 use crate::tick_state::{Admission, Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
-use crate::unresolved::{
-    Abandonable, Probeable, Reclaimable, Released, Retirable, Unanswerable, UnresolvedTxs,
-};
+use crate::unresolved::{Probeable, Reclaimable, Released, Retirable, Unanswerable, UnresolvedTxs};
 use crate::vote_tracker::VoteTracker;
 
 /// One payer-side engagement wait: the transaction, the counterpart
@@ -1029,10 +1027,11 @@ impl ExecutionCoordinator {
         let local_shard = self.local_shard;
         let trie = self.counterpart_trie(topology_schedule);
         for entry in self.abandonable(tick_id) {
-            let Abandonable {
+            let UnsettledTx {
                 tx_hash,
                 declared_work,
                 charge,
+                ..
             } = entry;
             // A tick that held the member can never speak for it — its
             // coverage will not close — and its other legs would wait on
@@ -3340,7 +3339,7 @@ impl ExecutionCoordinator {
     /// transaction a terminating counterpart may have settled is the
     /// fence's question, which [`Self::fence_pairs`] is what lets the
     /// fence ask about an abandonment at all.
-    fn abandonable(&self, composing: TickId) -> Vec<Abandonable> {
+    fn abandonable(&self, composing: TickId) -> Vec<UnsettledTx> {
         self.unresolved
             .past_deadline(self.committed_ts)
             .into_iter()

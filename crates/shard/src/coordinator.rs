@@ -92,15 +92,14 @@ use std::time::Duration;
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootVerifyError,
-    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError,
-    CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
-    LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, MAX_VALIDITY_RANGE,
-    PredecessorTerminal, ProvisionRootVerifyError, ProvisionTxRootsMap,
-    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext, QcVerifyError,
-    QuorumCertificate, RecoveryCause, Round, SafeVoteRegisters, StateRoot, StateRootVerifyError,
-    Timeout, TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TxHash,
-    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
-    VotePosition, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
+    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertificateRoot, CertifiedBlock,
+    CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization, LocalReceiptRoot, MAX_ROUND_GAP,
+    MAX_VALIDITY_RANGE, PredecessorTerminal, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
+    Provisions, ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, RecoveryCause,
+    RootMismatch, Round, SafeVoteRegisters, StateRoot, StateRootVerifyError, Timeout,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TxHash, TxRootVerifyError,
+    ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount, VotePosition, derive_leaves,
+    missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -4441,7 +4440,7 @@ impl ShardCoordinator {
         &mut self,
         topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
-        result: Result<Verified<CertificateRoot>, CertRootVerifyError>,
+        result: Result<Verified<CertificateRoot>, RootMismatch<CertificateRoot>>,
     ) -> Vec<Action> {
         let valid = result.is_ok();
         if let Ok(verified) = result {
@@ -4461,7 +4460,7 @@ impl ShardCoordinator {
         &mut self,
         topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
-        result: Result<Verified<LocalReceiptRoot>, LocalReceiptRootVerifyError>,
+        result: Result<Verified<LocalReceiptRoot>, RootMismatch<LocalReceiptRoot>>,
     ) -> Vec<Action> {
         let valid = result.is_ok();
         if let Ok(verified) = result {
@@ -4481,7 +4480,7 @@ impl ShardCoordinator {
         &mut self,
         topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
-        result: Result<Verified<ProvisionsRoot>, ProvisionRootVerifyError>,
+        result: Result<Verified<ProvisionsRoot>, RootMismatch<ProvisionsRoot>>,
     ) -> Vec<Action> {
         let valid = result.is_ok();
         if let Ok(verified) = result {
@@ -7375,13 +7374,14 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeaderParts,
-        CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash, Heard, MAX_TIMESTAMP_DELAY,
-        MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, Probed, Question, SettledTxSet,
-        SettledTxsRoot, ShardAnchor, ShardId, Signer, SignerBitfield, TerminalRoots,
-        TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision,
-        UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
-        WitnessSources, Word, abandonment_root_from_records, test_utils,
+        AbandonmentRoot, AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot,
+        BlockHeaderParts, CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash, Heard,
+        LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams,
+        Probed, Question, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId, Signer,
+        SignerBitfield, StateProofsRoot, TerminalRoots, TimestampRange, TopologySchedule,
+        TopologySnapshot, Transaction, TransactionDecision, UnsettledTx, ValidatorId,
+        ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources, Word,
+        test_utils,
     };
 
     use super::*;
@@ -11825,7 +11825,7 @@ mod tests {
                     WeightedTimestamp::from_millis(anchor_ms),
                 )
                 .into(),
-                abandonment_root: abandonment_root_from_records(&records),
+                abandonment_root: AbandonmentRoot::over(&records),
                 ..Default::default()
             }),
             transactions: Arc::new(Vec::new()),
@@ -11839,11 +11839,10 @@ mod tests {
 
     /// A block carrying `bundles`, committed under their root.
     fn block_with_state_proofs(bundles: Vec<StateProofBundle>) -> Block {
-        use hyperscale_types::state_proofs_root_from_bundles;
         Block::Live {
             header: BlockHeader::new(BlockHeaderParts {
                 height: BlockHeight::new(1),
-                state_proofs_root: state_proofs_root_from_bundles(&bundles),
+                state_proofs_root: StateProofsRoot::over(&bundles),
                 ..Default::default()
             }),
             transactions: Arc::new(Vec::new()),

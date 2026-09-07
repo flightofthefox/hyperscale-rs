@@ -23,12 +23,11 @@ use hyperscale_types::network::notification::{
 use hyperscale_types::{
     AbandonmentRecord, AbandonmentRoot, BeaconWitnessLeafCount, BeaconWitnessRootContext, Block,
     BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote,
-    BlockVoteMessage, CertificateRoot, CertificateRootContext, CertifiedBlockHeader,
-    CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError, ConsensusPublicKey,
-    ConsensusReceipt, Deadline, Derivation, Epoch, Finalization, Hash, LocalReceiptRoot,
-    LocalReceiptRootContext, NetworkDefinition, PreparedCommit, PrincipalAddr as AccountAddr,
-    ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
-    ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
+    BlockVoteMessage, CertificateRoot, CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage,
+    CertifiedHeaderVerifyError, ConsensusPublicKey, ConsensusReceipt, Deadline, Derivation, Epoch,
+    Finalization, Hash, LocalReceiptRoot, NetworkDefinition, PreparedCommit,
+    PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
+    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal,
     ReshapeTrigger, Resolutions, RevealChain, Round, ShardId, ShardLoad, SplitChildRoots,
     StateProofBundle, StateProofsRoot, StateRoot, StateRootContext, StateRootVerifyError,
     Stopwatch, StoredReceipt, SubstateKey, SweepFrontier, TerminalRoots, Timeout, TimeoutContext,
@@ -822,10 +821,7 @@ where
         } => {
             let start = Stopwatch::start();
             let raw_batch_hashes: Vec<Hash> = batch_hashes.iter().map(|h| h.into_raw()).collect();
-            let pr_ctx = ProvisionsRootContext {
-                batch_hashes: &raw_batch_hashes,
-            };
-            let result = expected_root.verify(&pr_ctx);
+            let result = expected_root.verify(raw_batch_hashes.as_slice());
             record_signature_verification_latency("provision_root", start.elapsed().as_secs_f64());
             if let Err(e) = &result {
                 tracing::warn!(?block_hash, reason = %e, "Provision root verification FAILED");
@@ -839,10 +835,7 @@ where
             certificates,
         } => {
             let start = Stopwatch::start();
-            let cert_ctx = CertificateRootContext {
-                certificates: &certificates,
-            };
-            let result = expected_root.verify(&cert_ctx);
+            let result = expected_root.verify(certificates.as_slice());
             record_signature_verification_latency(
                 "certificate_root",
                 start.elapsed().as_secs_f64(),
@@ -945,10 +938,7 @@ where
                 .collect();
 
             let receipt_start = Stopwatch::start();
-            let receipt_ctx = LocalReceiptRootContext {
-                receipts: &stored_receipts,
-            };
-            let receipt_result = expected_local_receipt_root.verify(&receipt_ctx);
+            let receipt_result = expected_local_receipt_root.verify(stored_receipts.as_slice());
             record_signature_verification_latency(
                 "local_receipt_root",
                 receipt_start.elapsed().as_secs_f64(),
@@ -2053,13 +2043,10 @@ mod tests {
     fn verify_provision_root_matches_compute_provision_root() {
         let hashes = vec![Hash::from_bytes(b"a"), Hash::from_bytes(b"b")];
         let root = Verified::<ProvisionsRoot>::compute(&hashes).into_inner();
-        let ctx = ProvisionsRootContext {
-            batch_hashes: &hashes,
-        };
-        assert!(root.verify(&ctx).is_ok());
+        assert!(root.verify(hashes.as_slice()).is_ok());
         assert!(
             ProvisionsRoot::from_raw(Hash::from_bytes(b"nope"))
-                .verify(&ctx)
+                .verify(hashes.as_slice())
                 .is_err()
         );
     }
@@ -2068,13 +2055,10 @@ mod tests {
     fn verify_certificate_root_matches_compute_certificate_root() {
         let certs: Vec<Arc<Verifiable<Finalization>>> = Vec::new();
         let root = Verified::<CertificateRoot>::compute(&certs).into_inner();
-        let ctx = CertificateRootContext {
-            certificates: &certs,
-        };
-        assert!(root.verify(&ctx).is_ok());
+        assert!(root.verify(certs.as_slice()).is_ok());
         assert!(
             CertificateRoot::from_raw(Hash::from_bytes(b"wrong"))
-                .verify(&ctx)
+                .verify(certs.as_slice())
                 .is_err()
         );
     }
@@ -2083,13 +2067,10 @@ mod tests {
     fn verify_local_receipt_root_matches_compute_local_receipt_root() {
         let receipts: Vec<StoredReceipt> = Vec::new();
         let root = Verified::<LocalReceiptRoot>::compute(&receipts).into_inner();
-        let ctx = LocalReceiptRootContext {
-            receipts: &receipts,
-        };
-        assert!(root.verify(&ctx).is_ok());
+        assert!(root.verify(receipts.as_slice()).is_ok());
         assert!(
             LocalReceiptRoot::from_raw(Hash::from_bytes(b"wrong"))
-                .verify(&ctx)
+                .verify(receipts.as_slice())
                 .is_err()
         );
     }

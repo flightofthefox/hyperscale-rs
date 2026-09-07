@@ -18,11 +18,11 @@ use std::sync::Arc;
 
 use hyperscale_engine::writes_committed_cell;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, CounterpartEvidence, FinalizationHash, LocalTimestamp,
-    MAX_ROUND_GAP, MAX_STATE_PROOFS_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-    MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MAX_UNSETTLED_PER_BLOCK, ProvisionHash,
-    QuorumCertificate, ShardId, ShardLoad, TopologySnapshot, Transaction, TxHash, Verifiable,
-    VoteCount, abandonment_root_from_records, state_proofs_root_from_bundles, sweep_admits_block,
+    AbandonmentRoot, Block, BlockHeader, BlockHeight, CounterpartEvidence, FinalizationHash,
+    LeafRoot, LocalTimestamp, MAX_ROUND_GAP, MAX_STATE_PROOFS_PER_BLOCK,
+    MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
+    MAX_UNSETTLED_PER_BLOCK, ProvisionHash, QuorumCertificate, ShardId, ShardLoad, StateProofsRoot,
+    TopologySnapshot, Transaction, TxHash, Verifiable, VoteCount, sweep_admits_block,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -656,7 +656,7 @@ pub fn validate_block_for_vote(
 /// them — means one set of answers has one encoding.
 pub fn validate_state_proofs_well_formed(block: &Block) -> Result<(), String> {
     let bundles = block.state_proofs();
-    let computed = state_proofs_root_from_bundles(bundles);
+    let computed = StateProofsRoot::over(bundles);
     let claimed = block.header().state_proofs_root();
     if computed != claimed {
         return Err(format!(
@@ -701,7 +701,7 @@ pub fn validate_state_proofs_well_formed(block: &Block) -> Result<(), String> {
 /// that cap alone would let a block spend it once per record.
 pub fn validate_abandonment_records_well_formed(block: &Block) -> Result<(), String> {
     let verdicts = block.abandonment_records();
-    let computed = abandonment_root_from_records(verdicts);
+    let computed = AbandonmentRoot::over(verdicts);
     let claimed = block.header().abandonment_root();
     if computed != claimed {
         return Err(format!(
@@ -1418,7 +1418,7 @@ mod tests {
     #[test]
     fn a_state_proof_section_is_held_to_its_root_and_form() {
         let bundles = vec![bundle_at(3, &[1]), bundle_at(4, &[2, 3])];
-        let root = state_proofs_root_from_bundles(&bundles);
+        let root = StateProofsRoot::over(&bundles);
         assert!(
             validate_state_proofs_well_formed(&block_with_state_proofs(bundles.clone(), root))
                 .is_ok()
@@ -1434,7 +1434,7 @@ mod tests {
         let reversed: Vec<StateProofBundle> = bundles.iter().rev().cloned().collect();
         let err = validate_state_proofs_well_formed(&block_with_state_proofs(
             reversed.clone(),
-            state_proofs_root_from_bundles(&reversed),
+            StateProofsRoot::over(&reversed),
         ))
         .expect_err("out of order is a second form of the same section");
         assert!(err.contains("repeats or precedes"), "{err}");
@@ -1442,7 +1442,7 @@ mod tests {
         let repeated = vec![bundle_at(3, &[1]), bundle_at(3, &[1])];
         let err = validate_state_proofs_well_formed(&block_with_state_proofs(
             repeated.clone(),
-            state_proofs_root_from_bundles(&repeated),
+            StateProofsRoot::over(&repeated),
         ))
         .expect_err("a repeated bundle is refused");
         assert!(err.contains("repeats or precedes"), "{err}");
@@ -1453,7 +1453,7 @@ mod tests {
         }];
         let err = validate_state_proofs_well_formed(&block_with_state_proofs(
             empty.clone(),
-            state_proofs_root_from_bundles(&empty),
+            StateProofsRoot::over(&empty),
         ))
         .expect_err("a bundle naming no key is refused");
         assert!(err.contains("empty"), "{err}");
@@ -1484,7 +1484,7 @@ mod tests {
     #[test]
     fn a_block_whose_root_does_not_commit_its_records_is_refused() {
         let records = vec![verdict(ShardId::ROOT, &[1, 2])];
-        let honest = abandonment_root_from_records(&records);
+        let honest = AbandonmentRoot::over(&records);
         assert!(
             validate_abandonment_records_well_formed(&block_with_verdicts(records.clone(), honest))
                 .is_ok()
@@ -1505,7 +1505,7 @@ mod tests {
     fn a_record_out_of_its_canonical_form_is_refused() {
         let malformed =
             AbandonmentRecord::departed(ShardId::ROOT, WeightedTimestamp::from_millis(1_000), []);
-        let root = abandonment_root_from_records(std::slice::from_ref(&malformed));
+        let root = AbandonmentRoot::over(std::slice::from_ref(&malformed));
         let err =
             validate_abandonment_records_well_formed(&block_with_verdicts(vec![malformed], root))
                 .unwrap_err();
@@ -1525,7 +1525,7 @@ mod tests {
         assert!(left < right, "the fixture relies on the child ordering");
 
         let ordered = vec![verdict(left, &[1]), verdict(right, &[2])];
-        let root = abandonment_root_from_records(&ordered);
+        let root = AbandonmentRoot::over(&ordered);
         assert!(
             validate_abandonment_records_well_formed(&block_with_verdicts(ordered, root)).is_ok()
         );
@@ -1534,7 +1534,7 @@ mod tests {
             vec![verdict(right, &[2]), verdict(left, &[1])],
             vec![verdict(left, &[1]), verdict(left, &[2])],
         ] {
-            let root = abandonment_root_from_records(&records);
+            let root = AbandonmentRoot::over(&records);
             let err = validate_abandonment_records_well_formed(&block_with_verdicts(records, root))
                 .unwrap_err();
             assert!(err.contains("repeats or precedes"), "{err}");
@@ -1557,7 +1557,7 @@ mod tests {
                 [named(TxHash::from(Hash::from_bytes(&[2; 32])))],
             ),
         ];
-        let root = abandonment_root_from_records(&two_arms);
+        let root = AbandonmentRoot::over(&two_arms);
         assert!(
             validate_abandonment_records_well_formed(&block_with_verdicts(two_arms, root)).is_ok()
         );
@@ -1569,7 +1569,7 @@ mod tests {
             ),
             verdict(left, &[1]),
         ];
-        let root = abandonment_root_from_records(&arms_reversed);
+        let root = AbandonmentRoot::over(&arms_reversed);
         assert!(
             validate_abandonment_records_well_formed(&block_with_verdicts(arms_reversed, root))
                 .is_err()
@@ -1599,7 +1599,7 @@ mod tests {
             assert!(record.is_well_formed(), "each record is within its own cap");
         }
 
-        let root = abandonment_root_from_records(&records);
+        let root = AbandonmentRoot::over(&records);
         let err = validate_abandonment_records_well_formed(&block_with_verdicts(records, root))
             .unwrap_err();
         assert!(err.contains("over the drain's own bound"), "{err}");
@@ -2155,8 +2155,7 @@ mod tests {
         // down, so the rule covers every body list rather than three of
         // four.
         let records = vec![verdict(ShardId::ROOT, &[1])];
-        let with_record =
-            block_with_verdicts(records.clone(), abandonment_root_from_records(&records));
+        let with_record = block_with_verdicts(records.clone(), AbandonmentRoot::over(&records));
         let err = validate_block_for_vote(
             &topo,
             local_shard(),

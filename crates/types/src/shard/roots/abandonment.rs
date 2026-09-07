@@ -1,86 +1,35 @@
-//! [`AbandonmentRoot`] verification.
+//! [`AbandonmentRoot`]: the root over a block's abandonment records,
+//! one leaf per record.
 
 use hyperscale_hbor::to_vec as hbor_to_vec;
-use thiserror::Error;
 
-use crate::{AbandonmentRecord, AbandonmentRoot, Hash, Verified, Verify, compute_merkle_root};
-
-/// The root over `records`, in block order. Empty →
-/// [`AbandonmentRoot::ZERO`]; otherwise the merkle root of each record's
-/// own hash.
-///
-/// A record's leaf covers its whole encoding — the shard it answers for,
-/// its evidence, and every transaction it names with the figures
-/// abandoning it takes — so two blocks claiming the same root carry the
-/// same records.
-#[must_use]
-pub fn abandonment_root_from_records(records: &[AbandonmentRecord]) -> AbandonmentRoot {
-    if records.is_empty() {
-        return AbandonmentRoot::ZERO;
-    }
-    let leaves: Vec<Hash> = records.iter().map(record_leaf).collect();
-    AbandonmentRoot::from_raw(compute_merkle_root(&leaves))
-}
+use crate::{AbandonmentRecord, AbandonmentRoot, Hash, LeafRoot};
 
 /// Domain tag separating an abandonment record's merkle leaf from every
 /// other leaf preimage the codebase hashes.
 const ABANDONMENT_LEAF_TAG: &[u8] = b"hyperscale.abandonment_leaf.v1";
 
-/// One record's leaf: the tag and its canonical encoding, which covers
-/// the shard, the evidence whole, and every figure of every name — a
-/// figure the root does not commit to is a figure two bodies can
-/// disagree on under one certificate.
-///
-/// # Panics
-///
-/// If the record does not encode, which a value built through
-/// [`AbandonmentRecord::new`] under its caps always does.
-fn record_leaf(record: &AbandonmentRecord) -> Hash {
-    let bytes = hbor_to_vec(record).expect("an abandonment record encodes");
-    Hash::from_parts(&[ABANDONMENT_LEAF_TAG, &bytes])
-}
+impl LeafRoot for AbandonmentRoot {
+    type Leaf = AbandonmentRecord;
 
-/// Inputs the [`AbandonmentRoot`] verifier reads against.
-#[derive(Debug, Clone, Copy)]
-pub struct AbandonmentRootContext<'a> {
-    /// The block's records — each contributes one leaf.
-    pub records: &'a [AbandonmentRecord],
-}
+    const ZERO: Self = Self::ZERO;
 
-/// Failure modes of [`AbandonmentRoot`] verification.
-#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
-pub enum AbandonmentRootVerifyError {
-    /// The root computed from the supplied records does not match the
-    /// claimed root.
-    #[error("computed abandonment root {computed:?} ≠ claimed {expected:?}")]
-    Mismatch {
-        /// Header's claimed root.
-        expected: AbandonmentRoot,
-        /// Root computed from the supplied records.
-        computed: AbandonmentRoot,
-    },
-}
-
-impl Verified<AbandonmentRoot> {
-    /// Compute the root from `records`. Verified by construction.
-    #[must_use]
-    pub fn compute(records: &[AbandonmentRecord]) -> Self {
-        Self::new_unchecked(abandonment_root_from_records(records))
+    fn from_raw(raw: Hash) -> Self {
+        Self::from_raw(raw)
     }
-}
 
-impl Verify<&AbandonmentRootContext<'_>> for AbandonmentRoot {
-    type Error = AbandonmentRootVerifyError;
-
-    fn verify(&self, context: &AbandonmentRootContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        let computed = abandonment_root_from_records(context.records);
-        if computed != *self {
-            return Err(AbandonmentRootVerifyError::Mismatch {
-                expected: *self,
-                computed,
-            });
-        }
-        Ok(Verified::new_unchecked(*self))
+    /// One record's leaf: the tag and its canonical encoding, which
+    /// covers the shard, the evidence whole, and every figure of every
+    /// name — a figure the root does not commit to is a figure two
+    /// bodies can disagree on under one certificate.
+    ///
+    /// # Panics
+    ///
+    /// If the record does not encode, which a value built through
+    /// [`AbandonmentRecord::new`] under its caps always does.
+    fn leaf(record: &Self::Leaf) -> Hash {
+        let bytes = hbor_to_vec(record).expect("an abandonment record encodes");
+        Hash::from_parts(&[ABANDONMENT_LEAF_TAG, &bytes])
     }
 }
 
@@ -89,7 +38,8 @@ mod tests {
     use super::*;
     use crate::{
         AbortCharge, Address, AddressClass, Deadline, Hash, Heard, LocalKey, Probed, Question,
-        ShardId, SubstateKey, TransactionDecision, TxHash, UnsettledTx, WeightedTimestamp, Word,
+        RootMismatch, ShardId, SubstateKey, TransactionDecision, TxHash, UnsettledTx, Verified,
+        Verify, WeightedTimestamp, Word,
     };
 
     fn tx(seed: u8) -> UnsettledTx {
@@ -116,14 +66,14 @@ mod tests {
     }
 
     fn root_of(record: &AbandonmentRecord) -> AbandonmentRoot {
-        abandonment_root_from_records(std::slice::from_ref(record))
+        AbandonmentRoot::over(std::slice::from_ref(record))
     }
 
     /// A block carrying no records commits nothing, which is a value of
     /// its own rather than the root of an empty tree.
     #[test]
     fn no_records_is_the_zero_root() {
-        assert_eq!(abandonment_root_from_records(&[]), AbandonmentRoot::ZERO);
+        assert_eq!(AbandonmentRoot::over(&[]), AbandonmentRoot::ZERO);
     }
 
     /// The leaf covers what the record claims: change the shard, the
@@ -241,16 +191,17 @@ mod tests {
     #[test]
     fn a_root_the_records_do_not_produce_is_refused() {
         let records = vec![record(ShardId::ROOT, &[1])];
-        let claimed = abandonment_root_from_records(&records);
-        let context = AbandonmentRootContext { records: &records };
-
+        let claimed = AbandonmentRoot::over(&records);
         assert_eq!(
-            claimed.verify(&context).map(Verified::into_inner),
+            claimed.verify(&records[..]).map(Verified::into_inner),
             Ok(claimed)
         );
-        assert!(matches!(
-            AbandonmentRoot::ZERO.verify(&context),
-            Err(AbandonmentRootVerifyError::Mismatch { .. }),
-        ));
+        assert_eq!(
+            AbandonmentRoot::ZERO.verify(&records[..]),
+            Err(RootMismatch {
+                expected: AbandonmentRoot::ZERO,
+                computed: claimed,
+            }),
+        );
     }
 }

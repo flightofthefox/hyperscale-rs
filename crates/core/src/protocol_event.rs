@@ -11,19 +11,19 @@ use std::sync::Arc;
 use hyperscale_types::{
     Anchor, BeaconBlockHash, BeaconProposal, BeaconWitnessRoot, BeaconWitnessRootVerifyError,
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
-    CandidateBeaconBlockVerifyError, CertRootVerifyError, CertificateRoot, CertifiedBeaconBlock,
+    CandidateBeaconBlockVerifyError, CertificateRoot, CertifiedBeaconBlock,
     CertifiedBeaconBlockVerifyError, CertifiedBlock, CertifiedBlockHeader,
     CertifiedHeaderVerifyError, Epoch, ExecutionCertificate, ExecutionCertificateVerifyError,
     ExecutionVote, Finalization, FinalizationVerifyError, Hash, LeafIndex, LocalReceiptRoot,
-    LocalReceiptRootVerifyError, MerkleInclusionProof, PcVote1, PcVote1VerifyError, PcVote2,
-    PcVote2VerifyError, PcVote3, PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap,
-    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError,
-    QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal,
-    Resolutions, Round, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
-    SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
-    SpcProposalObject, SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError,
-    StoredReceipt, SubstateKey, TickId, Timeout, Transaction, TransactionRoot, TxHash, TxOutcome,
-    TxResolution, TxRootVerifyError, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    MerkleInclusionProof, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
+    PcVote3VerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
+    ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate, RatifyPhase,
+    RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal, Resolutions, RootMismatch, Round,
+    ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg,
+    SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
+    SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError, StoredReceipt,
+    SubstateKey, TickId, Timeout, Transaction, TransactionRoot, TxHash, TxOutcome, TxResolution,
+    TxRootVerifyError, ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 
 /// What one tick's batch produced.
@@ -376,7 +376,7 @@ pub enum ProtocolEvent {
         /// Block whose root was verified.
         block_hash: BlockHash,
         /// Typed verification result.
-        result: Result<Verified<CertificateRoot>, CertRootVerifyError>,
+        result: Result<Verified<CertificateRoot>, RootMismatch<CertificateRoot>>,
     },
 
     /// Local-receipt-root verification completed for a pending block.
@@ -390,7 +390,7 @@ pub enum ProtocolEvent {
         /// Block whose root was verified.
         block_hash: BlockHash,
         /// Typed verification result.
-        result: Result<Verified<LocalReceiptRoot>, LocalReceiptRootVerifyError>,
+        result: Result<Verified<LocalReceiptRoot>, RootMismatch<LocalReceiptRoot>>,
     },
 
     /// Provisions-root verification completed for a pending block.
@@ -398,7 +398,7 @@ pub enum ProtocolEvent {
         /// Block whose root was verified.
         block_hash: BlockHash,
         /// Typed verification result.
-        result: Result<Verified<ProvisionsRoot>, ProvisionRootVerifyError>,
+        result: Result<Verified<ProvisionsRoot>, RootMismatch<ProvisionsRoot>>,
     },
 
     /// Provision-tx-roots map verification completed for a pending block.

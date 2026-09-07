@@ -38,17 +38,15 @@ use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
     BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError, Block, BlockHash,
-    BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError,
-    CertificateRoot, CertificateRootContext, CertifiedBlock, ConsensusPublicKey, ConsensusReceipt,
-    Epoch, Finalization, Hash, HborSigned, LocalReceiptRoot, LocalReceiptRootContext,
-    LocalReceiptRootVerifyError, LocalTimestamp, NetworkDefinition, ProposerTimestamp,
-    ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
-    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
-    QcVerifyError, QuorumCertificate, ReadySignal, Round, ShardId, ShardLoad,
-    ShardVoteEquivocation, ShardWitnessPayload, Signer, StateRoot, StateRootContext,
-    StateRootVerifyError, StoredReceipt, SweepFrontier, Timeout, TimeoutContext, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash,
-    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, VrfProof,
+    BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockVote, CertificateRoot,
+    CertifiedBlock, ConsensusPublicKey, ConsensusReceipt, Epoch, Finalization, Hash, HborSigned,
+    LocalReceiptRoot, LocalTimestamp, NetworkDefinition, ProposerTimestamp,
+    ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
+    ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, ReadySignal, RootMismatch, Round,
+    ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload, Signer, StateRoot,
+    StateRootContext, StateRootVerifyError, StoredReceipt, SweepFrontier, Timeout, TimeoutContext,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext,
+    TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, VrfProof,
     WeightedTimestamp, WorkInFlight, local_settled_tx_hashes, shard_reveal_sign, signed_bytes,
 };
 
@@ -237,15 +235,15 @@ enum SimEvent {
     },
     CertificateRootVerified {
         block_hash: BlockHash,
-        result: Result<Verified<CertificateRoot>, CertRootVerifyError>,
+        result: Result<Verified<CertificateRoot>, RootMismatch<CertificateRoot>>,
     },
     LocalReceiptRootVerified {
         block_hash: BlockHash,
-        result: Result<Verified<LocalReceiptRoot>, LocalReceiptRootVerifyError>,
+        result: Result<Verified<LocalReceiptRoot>, RootMismatch<LocalReceiptRoot>>,
     },
     ProvisionsRootVerified {
         block_hash: BlockHash,
-        result: Result<Verified<ProvisionsRoot>, ProvisionRootVerifyError>,
+        result: Result<Verified<ProvisionsRoot>, RootMismatch<ProvisionsRoot>>,
     },
     ProvisionTxRootsVerified {
         block_hash: BlockHash,
@@ -1676,10 +1674,7 @@ impl ShardCoordinatorSim {
                 expected_root,
                 certificates,
             } => {
-                let cert_ctx = CertificateRootContext {
-                    certificates: &certificates,
-                };
-                let result = expected_root.verify(&cert_ctx);
+                let result = expected_root.verify(certificates.as_slice());
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
                     event: SimEvent::CertificateRootVerified { block_hash, result },
@@ -1692,10 +1687,7 @@ impl ShardCoordinatorSim {
             } => {
                 let raw_batch_hashes: Vec<Hash> =
                     batch_hashes.iter().map(|h| h.into_raw()).collect();
-                let pr_ctx = ProvisionsRootContext {
-                    batch_hashes: &raw_batch_hashes,
-                };
-                let result = expected_root.verify(&pr_ctx);
+                let result = expected_root.verify(raw_batch_hashes.as_slice());
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
                     event: SimEvent::ProvisionsRootVerified { block_hash, result },
@@ -1808,10 +1800,7 @@ impl ShardCoordinatorSim {
                     .iter()
                     .flat_map(|fw| fw.receipts().iter().cloned())
                     .collect();
-                let receipt_ctx = LocalReceiptRootContext {
-                    receipts: &stored_receipts,
-                };
-                let receipt_result = expected_local_receipt_root.verify(&receipt_ctx);
+                let receipt_result = expected_local_receipt_root.verify(stored_receipts.as_slice());
                 let receipt_ok = receipt_result.is_ok();
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,

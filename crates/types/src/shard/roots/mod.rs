@@ -23,6 +23,7 @@ pub mod abandonment;
 pub mod beacon_witness;
 pub mod certificate;
 pub mod committed_txs;
+pub mod leaf;
 pub mod local_receipt;
 pub mod provision_tx;
 pub mod provisions;
@@ -33,30 +34,20 @@ pub mod state_proofs;
 pub mod terminal;
 pub mod transaction;
 
-pub use abandonment::{
-    AbandonmentRootContext, AbandonmentRootVerifyError, abandonment_root_from_records,
-};
 pub use beacon_witness::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, commit_witness_window, derive_leaves,
     derive_reshape_trigger, missed_proposals_since_prev_commit, ready_leaf_payload,
-};
-pub use certificate::{
-    CertRootVerifyError, CertificateRootContext, certificate_root_from_receipt_hashes,
 };
 pub use committed_txs::{
     CommittedTxAbsence, committed_tx_leaf, committed_txs_root_from_hashes,
     prove_committed_tx_absent,
 };
-pub use local_receipt::{LocalReceiptRootContext, LocalReceiptRootVerifyError};
+pub use leaf::{LeafRoot, RootMismatch};
 pub use provision_tx::{
     ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, committed_crossings,
 };
-pub use provisions::{ProvisionRootVerifyError, ProvisionsRootContext};
 pub use reveal_chain::{REVEAL_CHAIN_DOMAIN_TAG, extend_reveal_chain, next_reveal_chain};
 pub use settled_txs::{local_settled_tx_hashes, settled_txs_root_from_hashes};
 pub use state::{SplitChildRoots, StateRootContext, StateRootVerifyError};
-pub use state_proofs::{
-    StateProofsRootContext, StateProofsRootVerifyError, state_proofs_root_from_bundles,
-};
 pub use terminal::TerminalRoots;
 pub use transaction::{TransactionRootContext, TxRootVerifyError};
