@@ -174,8 +174,8 @@ pub enum Probed {
     /// A delivering shard's claim cell, past the crossing's lapse.
     Delivery,
     /// A core consumer's claim cell, past the transaction's deadline:
-    /// present says the core took the crossing, and the record here is
-    /// retired on it. Absent says the core never took it where the core
+    /// present says the core took the crossing, and its certificate
+    /// speaks next. Absent says the core never took it where the core
     /// is one shard, whose one execution wrote the claim by the deadline
     /// or never will; where the core is more, only that a sibling is
     /// pending, and the committed cell answers instead.
@@ -195,7 +195,8 @@ impl Probed {
     ///
     /// A claim is asked from the deadline, as the committed cell is.
     /// Presence says the consumer took the crossing wherever it is
-    /// proved. Absence past the deadline is the core never taking it,
+    /// proved, and its certificate is what settles the record here.
+    /// Absence past the deadline is the core never taking it,
     /// for a core of one shard, whose success the deadline fences; a
     /// core of more settles on its siblings' clock, and the fold reads
     /// its claim's absence as nothing.

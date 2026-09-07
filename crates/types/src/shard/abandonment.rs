@@ -22,9 +22,9 @@
 //! refused.
 //!
 //! A sixth establishes the opposite and is written down the same way:
-//! that a consumer *did* claim what a leg here issued. A record cell is
-//! a balance held for that claim, and the claim proved present is what
-//! lets the issuer retire it — the family's one settling arm.
+//! that a consumer *did* take what a leg here issued. Its certificate
+//! says it succeeded, and that is what lets the issuer retire the record
+//! cell it held for the claim — the family's one settling arm.
 //!
 //! So the answer is written down while it can still be read. A record
 //! names the transactions this chain still owes an outcome for, with the
@@ -287,18 +287,14 @@ pub enum CounterpartEvidence {
         /// cell's sweep, or the proof says nothing.
         probed_wt: WeightedTimestamp,
     },
-    /// The consumer claimed it, as of one of its blocks: an inclusion
-    /// proof of the crossing's claim cell against that block's state
-    /// root is the proof. The one arm read off a presence rather than an
-    /// absence — what it licenses is the retirement of the record cell
-    /// the issuer held for that claim, never an abort. A claim is one
-    /// fact at every anchor from its commit to its own sweep, so the
-    /// proof may sit anywhere short of the sweep.
-    Claimed {
-        /// The weighted timestamp of the block the presence was proved
-        /// against. Short of every named crossing's claim cell sweep, or
-        /// the proof says nothing.
-        probed_wt: WeightedTimestamp,
+    /// The consumer accepted it. Its certificate is the proof, as a
+    /// refusal's is — a core's, or a delivery's, whichever consumed the
+    /// crossing. The one arm that licenses a settlement rather than an
+    /// abort: the retirement of the record cell the issuer held for the
+    /// consumer's claim.
+    Accepted {
+        /// The weighted timestamp of the accepting certificate's anchor.
+        accepted_wt: WeightedTimestamp,
     },
     /// The core never took it, as of one of its blocks inside the
     /// absence window. A non-inclusion proof of the core consumer's
@@ -325,9 +321,9 @@ impl CounterpartEvidence {
         match self {
             Self::Departed { terminal_wt } => *terminal_wt,
             Self::Refused { refused_wt } => *refused_wt,
+            Self::Accepted { accepted_wt } => *accepted_wt,
             Self::Unclaimed { probed_wt }
             | Self::Lapsed { probed_wt }
-            | Self::Claimed { probed_wt }
             | Self::Untaken { probed_wt } => *probed_wt,
         }
     }
@@ -343,7 +339,7 @@ impl CounterpartEvidence {
             Self::Refused { .. } => 1,
             Self::Unclaimed { .. } => 2,
             Self::Lapsed { .. } => 3,
-            Self::Claimed { .. } => 4,
+            Self::Accepted { .. } => 4,
             Self::Untaken { .. } => 5,
         }
     }
@@ -352,7 +348,7 @@ impl CounterpartEvidence {
     /// settle — rather than a retirement, where it did.
     #[must_use]
     pub const fn abandons(&self) -> bool {
-        !matches!(self, Self::Claimed { .. })
+        !matches!(self, Self::Accepted { .. })
     }
 }
 
@@ -403,18 +399,18 @@ pub struct Absence {
     pub floor: WeightedTimestamp,
 }
 
-/// A consumer's claim of a crossing a leg here issued for, as a state
-/// proof the chain committed proved it present off the consumer's
-/// commit-proven state.
+/// A consumer's acceptance of a transaction a leg here issued for, as
+/// mirrored off its signature-verified certificate.
 ///
-/// What a `Claimed` record restates and what a voter checks it against:
-/// the committed proof, folded by every replica at the same height, so
-/// the record's anchor is held to the mirror's exactly.
+/// What an `Accepted` record restates and what a voter checks it
+/// against, on a refusal's terms: the anchor the accepting certificate
+/// carried, and its attested digest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClaimProof {
-    /// The weighted timestamp of the block the presence was proved
-    /// against — short of the claim cell's sweep.
-    pub probed_wt: WeightedTimestamp,
+pub struct Acceptance {
+    /// The weighted timestamp of the accepting certificate's anchor.
+    pub accepted_wt: WeightedTimestamp,
+    /// The certificate's attested digest: its signed identity.
+    pub digest: Hash,
 }
 
 /// One counterpart's remainder as this chain sees it: what it can never
@@ -518,15 +514,18 @@ impl AbandonmentRecord {
         Self::new(shard, CounterpartEvidence::Untaken { probed_wt }, unsettled)
     }
 
-    /// A record over what `shard`, consuming, had claimed as of its
-    /// block at `probed_wt`.
+    /// A record over what `shard`, consuming, accepted at `accepted_wt`.
     #[must_use]
-    pub fn claimed(
+    pub fn accepted(
         shard: ShardId,
-        probed_wt: WeightedTimestamp,
+        accepted_wt: WeightedTimestamp,
         unsettled: impl IntoIterator<Item = UnsettledTx>,
     ) -> Self {
-        Self::new(shard, CounterpartEvidence::Claimed { probed_wt }, unsettled)
+        Self::new(
+            shard,
+            CounterpartEvidence::Accepted { accepted_wt },
+            unsettled,
+        )
     }
 
     /// The counterpart shard.
@@ -786,7 +785,7 @@ mod tests {
             CounterpartEvidence::Refused { refused_wt: wt() },
             CounterpartEvidence::Unclaimed { probed_wt: wt() },
             CounterpartEvidence::Lapsed { probed_wt: wt() },
-            CounterpartEvidence::Claimed { probed_wt: wt() },
+            CounterpartEvidence::Accepted { accepted_wt: wt() },
             CounterpartEvidence::Untaken { probed_wt: wt() },
         ];
         let mut bytes: Vec<u8> = arms.iter().map(CounterpartEvidence::discriminant).collect();

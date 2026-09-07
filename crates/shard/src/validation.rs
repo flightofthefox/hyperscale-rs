@@ -298,12 +298,13 @@ pub fn validate_no_duplicate_transactions(
 /// finalizations this node has not yet fetched contributes nothing to
 /// `qc_chain_resolved_txs` and is caught here instead.
 ///
-/// A boundary record is held to the same rule. It licenses an abort and
+/// An abandoning record is held to the same rule. It licenses an abort and
 /// carries the terms of one, so a record naming a transaction the chain
 /// has already resolved is a request for a second verdict on it — and one
 /// every replica would honour, since a replica reconstructs the entry from
 /// the record precisely when it cannot check the name against an account
-/// of its own.
+/// of its own. A settling record is held only to its own block: it names
+/// a transaction the chain resolved before its consumer could accept.
 ///
 /// Both proposer and validator hit `record_block_committed` synchronously
 /// during their respective commit handlers, so their `dedup_index` reflects
@@ -360,7 +361,13 @@ pub fn validate_no_duplicate_resolutions(
                     "abandonment record names {tx_hash}, which the same block resolves"
                 ));
             }
-            reject_if_resolved(tx_hash, qc_chain_resolved_txs, dedup_index)?;
+            // A settling record names a transaction the chain resolved
+            // by design — the issuer's own verdict committed before its
+            // consumer could accept — so only an abandoning one is a
+            // request for a second verdict.
+            if verdict.evidence().abandons() {
+                reject_if_resolved(tx_hash, qc_chain_resolved_txs, dedup_index)?;
+            }
         }
     }
     Ok(())
@@ -1557,7 +1564,7 @@ mod tests {
         // transactions, in arm order.
         let two_arms = vec![
             verdict(left, &[1]),
-            AbandonmentRecord::claimed(
+            AbandonmentRecord::accepted(
                 left,
                 WeightedTimestamp::from_millis(9),
                 [named(TxHash::from(Hash::from_bytes(&[2; 32])))],
@@ -1568,7 +1575,7 @@ mod tests {
             validate_abandonment_records_well_formed(&block_with_verdicts(two_arms, root)).is_ok()
         );
         let arms_reversed = vec![
-            AbandonmentRecord::claimed(
+            AbandonmentRecord::accepted(
                 left,
                 WeightedTimestamp::from_millis(9),
                 [named(TxHash::from(Hash::from_bytes(&[2; 32])))],

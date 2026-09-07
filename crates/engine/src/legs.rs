@@ -133,10 +133,10 @@ impl Shape<'_> {
     /// For every crossing an inbound leg here produces whose consumer is a
     /// core node: that consumer's claim cell and the shard holding it —
     /// the consumer's own home, since a claim sits under its target
-    /// wherever else the core runs it. What a presence probe asks the core
-    /// about once the transaction's deadline has passed: a claim present
-    /// there says the core took the crossing, and the record here is
-    /// retired on it. Empty when the shape runs whole.
+    /// wherever else the core runs it. What a probe asks the core about
+    /// once the transaction's deadline has passed: a claim absent there,
+    /// on a core of one shard, says the core never took the crossing.
+    /// Empty when the shape runs whole.
     #[must_use]
     pub fn core_claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
         if !self.decomposed {

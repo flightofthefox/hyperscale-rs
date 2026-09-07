@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Absence, Address, BlockHeight, ClaimProof, CounterpartEvidence,
+    AbandonmentRecord, AbortCharge, Absence, Address, BlockHeight, CounterpartEvidence,
     Finalization, Probed, ShardId, ShardTrie, StateAnchor, SubstateKey, Transaction,
     TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
     WeightedTimestamp, delivery_window_close, leg_entry_horizon, verdict_window_close,
@@ -68,14 +68,12 @@ pub struct Probe {
 /// and what the record arms are offered from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer {
-    /// The core took it: its certificate is what speaks next.
+    /// The counterpart took it: its certificate is what speaks next, and
+    /// is fetched rather than waited for.
     Committed,
     /// The counterpart had not taken it past the floor: what an
-    /// `Unclaimed` or `Lapsed` record is offered from.
+    /// `Unclaimed`, `Lapsed` or `Untaken` record is offered from.
     Absent(Absence),
-    /// The consumer's claim is present: what a `Claimed` record is
-    /// offered from, licensing the retirement of the record here.
-    Present(ClaimProof),
 }
 
 /// Let go of every fetch `owed` still has out, so a counterpart that
@@ -567,6 +565,35 @@ impl UnresolvedTxs {
             .is_some_and(|core| core.contains(&shard))
     }
 
+    /// Whether a consumer's acceptance of `tx_hash` still wants writing
+    /// down: the entry is a leg's, no record has named `shard` as having
+    /// accepted, and no tick has taken the entry's records. Past any of
+    /// those an `Accepted` record adds nothing, and a proposer that kept
+    /// offering one would carry it into a block its voters can no longer
+    /// check, once their mirrors go with the entry.
+    #[must_use]
+    pub fn acceptance_unrecorded(&self, tx_hash: TxHash, shard: ShardId) -> bool {
+        self.owed.get(&tx_hash).is_some_and(|owed| {
+            owed.kind.is_leg()
+                && owed.unsettled_by.is_none()
+                && owed.taken.is_none()
+                && !owed.claimed_by.contains(&shard)
+        })
+    }
+
+    /// Whether `shard` consumes a crossing this shard issued for the
+    /// transaction — a core consumer's or a delivery's — so that its
+    /// acceptance is the claim the record here was held for.
+    #[must_use]
+    pub fn consumer_holds(&self, tx_hash: TxHash, shard: ShardId) -> bool {
+        self.kept.get(&tx_hash).is_some_and(|kept| {
+            kept.claims
+                .iter()
+                .chain(&kept.deliveries)
+                .any(|(consumer, _)| *consumer == shard)
+        })
+    }
+
     /// Mirror a core shard's acceptance, and say whether it was the last
     /// the transaction was waiting on.
     ///
@@ -856,7 +883,7 @@ impl UnresolvedTxs {
         let mut reconstructed = 0usize;
         for verdict in verdicts {
             for entry in verdict.unsettled() {
-                // The settling arm: a consumer claimed, and the entry
+                // The settling arm: a consumer accepted, and the entry
                 // holds its records for the retirement rather than for a
                 // reclaim. A name this ledger does not hold is left
                 // alone — nothing here is owed for it.
@@ -1135,7 +1162,7 @@ impl UnresolvedTxs {
                         ) => TxResolution::Decided(TransactionDecision::Aborted),
                         Some(
                             CounterpartEvidence::Lapsed { .. }
-                            | CounterpartEvidence::Claimed { .. },
+                            | CounterpartEvidence::Accepted { .. },
                         )
                         | None => {
                             continue;
@@ -2395,7 +2422,7 @@ mod tests {
         ledger.certify(tx.hash());
         assert!(ledger.retirable().is_empty(), "nothing retires on a clock");
 
-        ledger.record_abandonment_records(&[AbandonmentRecord::claimed(
+        ledger.record_abandonment_records(&[AbandonmentRecord::accepted(
             PARTNER,
             ms(70_000),
             [names(&tx)],

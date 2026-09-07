@@ -460,13 +460,18 @@ pub fn select_abandonment_records(
                 || topology_schedule.terminal_evidence_readable(verdict.shard(), anchor_wt)
         })
         .filter_map(|verdict| {
+            // A settling record names a transaction the chain resolved
+            // by design, so only an abandoning one is held against what
+            // the chain already decided.
+            let abandons = verdict.evidence().abandons();
             let kept: Vec<UnsettledTx> = verdict
                 .unsettled()
                 .iter()
                 .filter(|entry| {
                     !resolved_here.contains(&entry.tx_hash)
-                        && !qc_chain_resolved_txs.contains(&entry.tx_hash)
-                        && !dedup_index.contains_resolved_tx(&entry.tx_hash)
+                        && !(abandons
+                            && (qc_chain_resolved_txs.contains(&entry.tx_hash)
+                                || dedup_index.contains_resolved_tx(&entry.tx_hash)))
                 })
                 .copied()
                 .collect();

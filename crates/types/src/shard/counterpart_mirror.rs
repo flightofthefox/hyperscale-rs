@@ -3,8 +3,8 @@
 //!
 //! Three facts live here, each about one `(transaction, counterpart)`
 //! pair: a core shard's refusal, read off its certificate; a
-//! counterpart's proved absence of a cell; and a consumer's proved claim
-//! of a crossing. Each licenses an abandonment record, and each is asked
+//! counterpart's proved absence of a cell; and a consumer's acceptance,
+//! read off its certificate. Each licenses an abandonment record, and each is asked
 //! about twice — once by the execution coordinator, composing the record
 //! to offer, and once by the vote fence, checking a record a block
 //! carries against what this validator itself holds.
@@ -35,7 +35,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::RwLock;
 
-use crate::{Absence, ClaimProof, Probed, Refusal, SettledTxSet, ShardId, TxHash};
+use crate::{Absence, Acceptance, Probed, Refusal, SettledTxSet, ShardId, TxHash};
 
 /// The facts, under one lock: they are written together at a commit and
 /// read together at a vote, so splitting them would buy contention
@@ -47,7 +47,7 @@ struct Mirrored {
     /// is not a delivery's claim proved absent, and they license
     /// different records held to different floors.
     absences: HashMap<(TxHash, ShardId, Probed), Absence>,
-    presences: HashMap<(TxHash, ShardId), ClaimProof>,
+    acceptances: HashMap<(TxHash, ShardId), Acceptance>,
     /// Complete settled-transaction sets of shards that have terminated,
     /// each verified against its beacon-attested terminal root. Absence
     /// from a set is proof, not ignorance.
@@ -110,17 +110,25 @@ impl CounterpartMirror {
             .or_insert(absence);
     }
 
-    /// Record a consumer's proved claim of a crossing, first proof
-    /// winning.
+    /// Record a consumer's acceptance, first word winning.
+    ///
+    /// `true` when this is the first acceptance held for the pair.
     ///
     /// # Panics
     ///
     /// If the lock is poisoned.
-    pub fn record_presence(&self, tx_hash: TxHash, shard: ShardId, presence: ClaimProof) {
-        self.write()
-            .presences
-            .entry((tx_hash, shard))
-            .or_insert(presence);
+    pub fn record_acceptance(
+        &self,
+        tx_hash: TxHash,
+        shard: ShardId,
+        acceptance: Acceptance,
+    ) -> bool {
+        let mut mirrored = self.write();
+        let vacant = !mirrored.acceptances.contains_key(&(tx_hash, shard));
+        if vacant {
+            mirrored.acceptances.insert((tx_hash, shard), acceptance);
+        }
+        vacant
     }
 
     /// The refusal held for one pair.
@@ -143,14 +151,14 @@ impl CounterpartMirror {
         self.read().absences.get(&(tx_hash, shard, probed)).copied()
     }
 
-    /// The claim held for one pair.
+    /// The acceptance held for one pair.
     ///
     /// # Panics
     ///
     /// If the lock is poisoned.
     #[must_use]
-    pub fn presence(&self, tx_hash: TxHash, shard: ShardId) -> Option<ClaimProof> {
-        self.read().presences.get(&(tx_hash, shard)).copied()
+    pub fn acceptance(&self, tx_hash: TxHash, shard: ShardId) -> Option<Acceptance> {
+        self.read().acceptances.get(&(tx_hash, shard)).copied()
     }
 
     /// Every refusal held, with the pair it speaks for.
@@ -183,17 +191,17 @@ impl CounterpartMirror {
             .collect()
     }
 
-    /// Every claim held, with the pair it speaks for.
+    /// Every acceptance held, with the pair it speaks for.
     ///
     /// # Panics
     ///
     /// If the lock is poisoned.
     #[must_use]
-    pub fn presences(&self) -> Vec<(TxHash, ShardId, ClaimProof)> {
+    pub fn acceptances(&self) -> Vec<(TxHash, ShardId, Acceptance)> {
         self.read()
-            .presences
+            .acceptances
             .iter()
-            .map(|(&(tx_hash, shard), &presence)| (tx_hash, shard, presence))
+            .map(|(&(tx_hash, shard), &acceptance)| (tx_hash, shard, acceptance))
             .collect()
     }
 
@@ -260,7 +268,9 @@ impl CounterpartMirror {
         let mut mirrored = self.write();
         mirrored.refusals.retain(|&(tx_hash, _), _| held(tx_hash));
         mirrored.absences.retain(|&(tx_hash, ..), _| held(tx_hash));
-        mirrored.presences.retain(|&(tx_hash, _), _| held(tx_hash));
+        mirrored
+            .acceptances
+            .retain(|&(tx_hash, _), _| held(tx_hash));
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Mirrored> {

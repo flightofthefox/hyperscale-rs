@@ -45,8 +45,8 @@ use hyperscale_metrics::{
 };
 use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
 use hyperscale_types::{
-    AbandonmentRecord, Absence, Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader,
-    BlockHeight, BloomFilter, CertifiedBlock, ClaimProof, CounterpartClaim, CounterpartMirror,
+    AbandonmentRecord, Absence, Acceptance, Attempt, AwaitingTopologyBuffer, Block, BlockHash,
+    BlockHeader, BlockHeight, BloomFilter, CertifiedBlock, CounterpartClaim, CounterpartMirror,
     DeclaredKey, Derivation, ExecutionCertificate, ExecutionCertificateVerifyError,
     ExecutionOutcome, ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError,
     GlobalReceiptRoot, Hash, Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
@@ -298,25 +298,6 @@ fn inherited_member_name(issued_by: TxHash, records: &[SubstateKey]) -> TxHash {
 fn delivery_floor(side: Side, validity_end: WeightedTimestamp) -> Option<WeightedTimestamp> {
     (side == Side::Delivering).then(|| lapse_probe_anchor(validity_end))
 }
-
-/// Whether a proposer offers `Claimed` records from the claims the
-/// chain has proved.
-///
-/// Off, and waiting on two things that are not the offer's own. A
-/// transfer sent `Departing` and included by the leaving shard reaches
-/// `Completed(Aborted)` where it owes `Settled`, which is the shape the
-/// train's fate map exists to refuse. And a retirement runs a member
-/// whose membership decides nothing, which is never cleared from what a
-/// proposer offers — clearing keys off resolution, and a member that
-/// resolves no transaction gives it nothing to key on. Measured on a
-/// shard composing them: the finalization is re-offered every block, the
-/// settlement frontier never advances, and block production falls to the
-/// view-change cadence.
-///
-/// The retirement machinery itself is live and pinned, and this is the
-/// only caller that would exercise it — which is why the second defect
-/// has never appeared in a simulation.
-const CLAIMED_RECORDS_OFFERED: bool = false;
 
 /// Execution state machine.
 ///
@@ -2655,11 +2636,12 @@ impl ExecutionCoordinator {
     /// replica had a probe out, and wherever its own probe sat — so a
     /// replica that never fetched reads the same answer as the one that
     /// did. A key found present means the counterpart took the
-    /// transaction: a core's own certificate speaks for it next — a
-    /// refusal there is mirrored on arrival, and a success leaves
-    /// nothing to reclaim — and a claim present is the consumer's
-    /// settlement. A core consumer's claim absent says only that the
-    /// core has not claimed yet, and is asked again at the next header.
+    /// transaction, and its own certificate speaks for it next: a
+    /// refusal there is mirrored on arrival, and an acceptance is what
+    /// settles the record held for the consumer's claim. A core
+    /// consumer's claim absent on a core of more than one shard says
+    /// only that a sibling is pending, and is asked again at the next
+    /// header.
     /// The first proof to answer a cell is the answer; a later one adds
     /// nothing. The hand-off is a continuation emitted here rather than
     /// a map the fence reads later, so an answer is never collected
@@ -2730,12 +2712,7 @@ impl ExecutionCoordinator {
                         continue;
                     };
                     let answer = match (inclusion, probed) {
-                        (Inclusion::Present(_), Probed::Core) => Answer::Committed,
-                        (Inclusion::Present(_), Probed::Claim | Probed::Delivery) => {
-                            Answer::Present(ClaimProof {
-                                probed_wt: bundle.anchor_ts,
-                            })
-                        }
+                        (Inclusion::Present(_), _) => Answer::Committed,
                         // A claim absent on a core of one shard is the
                         // core never taking the crossing: its one
                         // execution wrote the claim by the deadline or
@@ -2766,24 +2743,20 @@ impl ExecutionCoordinator {
                             self.evidence
                                 .record_absence(entry.tx_hash, shard, probed, absence);
                         }
-                        Answer::Present(presence) => {
-                            self.evidence
-                                .record_presence(entry.tx_hash, shard, presence);
-                        }
                     }
                     record_reclaim_probe_answered(inclusion.is_present());
                     let tx_hash = entry.tx_hash;
                     actions.push(match answer {
-                        // The core took it, and its certificate says how.
-                        // Its broadcast may have missed this shard, so it
-                        // is fetched rather than waited for.
+                        // The counterpart took it, and its certificate
+                        // says how. Its broadcast may have missed this
+                        // shard, so it is fetched rather than waited for.
                         Answer::Committed => Action::Fetch(FetchRequest::ExecutionCerts {
                             source_shard: shard,
                             tx_hash,
                             preferred: None,
                             class: None,
                         }),
-                        Answer::Present(_) | Answer::Absent(_) => {
+                        Answer::Absent(_) => {
                             Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
                         }
                     });
@@ -3544,22 +3517,25 @@ impl ExecutionCoordinator {
                 .map(|(tx_hash, shard, absence)| (tx_hash, shard, absence.probed_wt));
             self.offer_at_earliest_anchor(&mut records, &mut budget, absent, record);
         }
-        // Proved claims, under the one settling arm: a consumer's claim
-        // of a crossing a leg here issued, whichever cell it was proved
-        // at, licensing the record's retirement rather than a reclaim.
-        if CLAIMED_RECORDS_OFFERED {
-            let claimed = self
-                .evidence
-                .presences()
-                .into_iter()
-                .map(|(tx_hash, shard, presence)| (tx_hash, shard, presence.probed_wt));
-            self.offer_at_earliest_anchor(
-                &mut records,
-                &mut budget,
-                claimed,
-                AbandonmentRecord::claimed,
-            );
-        }
+        // Mirrored acceptances, under the one settling arm: a consumer's
+        // certificate saying it took what a leg here issued, licensing
+        // the record's retirement rather than a reclaim. Offered until
+        // the chain has it written down and no longer: the mirror lives
+        // to the entry, and the entry to the retirement, so a record
+        // offered past its own commit could reach a block after the
+        // evidence every voter checks it against has gone.
+        let accepted = self
+            .evidence
+            .acceptances()
+            .into_iter()
+            .filter(|(tx_hash, shard, _)| self.unresolved.acceptance_unrecorded(*tx_hash, *shard))
+            .map(|(tx_hash, shard, acceptance)| (tx_hash, shard, acceptance.accepted_wt));
+        self.offer_at_earliest_anchor(
+            &mut records,
+            &mut budget,
+            accepted,
+            AbandonmentRecord::accepted,
+        );
         records.into_values().collect()
     }
 
@@ -3878,20 +3854,39 @@ impl ExecutionCoordinator {
         let mut resolutions = Vec::new();
         for outcome in ec.tx_outcomes() {
             let tx_hash = outcome.tx_hash();
-            if !self
-                .unresolved
-                .leg_core(tx_hash)
-                .is_some_and(|core| core.contains(&shard))
-            {
+            let in_core = self.unresolved.core_holds(tx_hash, shard);
+            let consumes = self.unresolved.consumer_holds(tx_hash, shard);
+            if !in_core && !consumes {
                 continue;
             }
             if matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }) {
-                if self.unresolved.record_acceptance(tx_hash, shard) {
+                // A consumer that succeeded took the crossing a leg here
+                // issued: its word is what settles the record held for
+                // its claim, and the fence checks an `Accepted` record
+                // against it as it checks a `Refused` one.
+                if consumes
+                    && self.evidence.record_acceptance(
+                        tx_hash,
+                        shard,
+                        Acceptance {
+                            accepted_wt: ec.vote_anchor_ts(),
+                            digest: ec.attested_digest(),
+                        },
+                    )
+                {
+                    actions.push(Action::Continuation(
+                        ProtocolEvent::CounterpartEvidenceObserved,
+                    ));
+                }
+                if in_core && self.unresolved.record_acceptance(tx_hash, shard) {
                     resolutions.push((
                         tx_hash,
                         TxResolution::CoreDecided(TransactionDecision::Accept),
                     ));
                 }
+                continue;
+            }
+            if !in_core {
                 continue;
             }
             let Some(figures) = self.unresolved.unsettled_leg_figures(tx_hash) else {
@@ -9023,29 +9018,41 @@ mod tests {
         );
     }
 
-    /// A core consumer's claim proved present is the consumer's
-    /// settlement: it reaches the vote fence, and once a `Claimed`
-    /// record naming it commits the next commit composes the retirement
-    /// into its tick — a dispatched member running no node, awaiting
-    /// nobody, charged nothing.
-    #[test]
-    fn a_claim_proved_present_composes_the_retirement() {
-        let schedule = two_shard_topology();
+    /// A leg entry on `HOME` whose core consumer's claim sits on `PEER`
+    /// under `local`, with the transaction, its figures and the claim
+    /// key beside it.
+    fn consumer_claim_fixture(
+        local: u8,
+    ) -> (
+        Arc<Verifiable<Transaction>>,
+        UnsettledTx,
+        SubstateKey,
+        ExecutionCoordinator,
+    ) {
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
-        let tx_hash = transaction.hash();
         let figures = UnsettledTx::for_transaction(&transaction);
         let claim = SubstateKey {
             owner: committed_tx_cell_key(
                 PEER,
-                tx_hash,
+                transaction.hash(),
                 transaction.validity_range().end_timestamp_exclusive,
             )
             .owner,
-            local: LocalKey([0x7C; 16]),
+            local: LocalKey([local; 16]),
         };
-        let mut state = claimed_leg_state(&transaction, claim);
+        let state = claimed_leg_state(&transaction, claim);
+        (transaction, figures, claim, state)
+    }
+
+    /// A consumer's claim proved present is not evidence on its own: the
+    /// consumer's certificate is fetched and speaks next.
+    #[test]
+    fn a_claim_proved_present_fetches_the_consumers_certificate() {
+        let schedule = two_shard_topology();
+        let (transaction, figures, claim, mut state) = consumer_claim_fixture(0x7C);
+        let tx_hash = transaction.hash();
         let probed_wt = figures.deadline.plus(Duration::from_secs(2));
         let (bundle, opened) = proven_at(
             &mut state,
@@ -9073,21 +9080,67 @@ mod tests {
         assert!(
             folded.iter().any(|action| matches!(
                 action,
-                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
-            )) && state
-                .evidence
-                .presence(tx_hash, PEER)
-                .is_some_and(|presence| presence.probed_wt == probed_wt),
-            "a present claim reaches the mirror the vote fence reads"
+                Action::Fetch(FetchRequest::ExecutionCerts { source_shard, tx_hash: fetched, .. })
+                    if *source_shard == PEER && *fetched == tx_hash
+            )),
+            "a present claim fetches the consumer's certificate"
         );
         assert!(
-            state.pending_abandonment_records().is_empty(),
-            "the offer is gated; what the fold and the retirement do with a record is not"
+            state.evidence.acceptance(tx_hash, PEER).is_none(),
+            "and is not itself evidence"
+        );
+        assert!(state.pending_abandonment_records().is_empty());
+    }
+
+    /// A consumer's acceptance is mirrored off its certificate, handed to
+    /// the vote fence, and offered as an `Accepted` record under the
+    /// certificate's anchor; once the record commits the next commit
+    /// composes the retirement into its tick — a dispatched member
+    /// running no node, awaiting nobody, charged nothing.
+    #[test]
+    fn a_consumers_acceptance_composes_the_retirement() {
+        let schedule = two_shard_topology();
+        let (transaction, figures, _, mut state) = consumer_claim_fixture(0x7D);
+        let tx_hash = transaction.hash();
+        let probed_wt = figures.deadline.plus(Duration::from_secs(2));
+        let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+            TickId::new(PEER, BlockHeight::new(5)),
+            probed_wt,
+            GlobalReceiptRoot::ZERO,
+            vec![TxOutcome::new(
+                tx_hash,
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            )],
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        )));
+        let heard = state.handle_attestation(&schedule, &certificate);
+        assert!(
+            heard.iter().any(|action| matches!(
+                action,
+                Action::Continuation(ProtocolEvent::CounterpartEvidenceObserved)
+            )),
+            "the fence is told the acceptance landed"
+        );
+        assert_eq!(
+            state
+                .evidence
+                .acceptance(tx_hash, PEER)
+                .map(|acceptance| acceptance.accepted_wt),
+            Some(probed_wt),
+            "the acceptance reaches the mirror the vote fence reads"
+        );
+        assert_eq!(
+            state.pending_abandonment_records(),
+            vec![AbandonmentRecord::accepted(PEER, probed_wt, [figures])],
+            "and a record is offered under the certificate's anchor"
         );
 
         state
             .unresolved
-            .record_abandonment_records(&[AbandonmentRecord::claimed(PEER, probed_wt, [figures])]);
+            .record_abandonment_records(&[AbandonmentRecord::accepted(PEER, probed_wt, [figures])]);
         let actions = commit_carrying(&mut state, &schedule, 2, probed_wt.as_millis(), Vec::new());
         let request = actions
             .iter()
