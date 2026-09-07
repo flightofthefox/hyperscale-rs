@@ -3,13 +3,12 @@
 //! Abstracts the prepare-then-commit pattern used by both runners.
 //! `prepare_block_commit` returns a [`PreparedCommit`] closure that
 //! carries precomputed work; invoking the closure with a
-//! [`SyncHint`] applies it efficiently.
+//! [`hyperscale_types::SyncHint`] applies it efficiently.
 
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, StateRoot,
-    SubstateKey, Verifiable, Verified,
+    BlockHeight, Finalization, PreparedCommit, StateRoot, SubstateKey, Verifiable,
 };
 
 use crate::{Anchored, BaseReadCache, JmtSnapshot};
@@ -54,17 +53,16 @@ pub struct ParentAnchor<'a> {
 
 /// Abstracts state commitment for both simulation and production storage.
 ///
-/// The prepare/commit flow:
-/// 1. `prepare_block_commit` computes the speculative state root and returns
-///    `(state_root, jmt_snapshot, prepared)`. The closure captures
-///    everything needed to perform the commit; the snapshot rides into
-///    `PendingChain` so child verifications can chain on top of speculative
-///    state.
-/// 2. The runner stores the closure (keyed by block hash or however it likes).
-/// 3. At commit time, the runner invokes each closure with a `SyncHint`,
-///    batching fsyncs across the flush.
-/// 4. If no closure is available (e.g. sync blocks without verification),
-///    `commit_block` recomputes from scratch.
+/// One commit path. `prepare_block_commit` computes the speculative
+/// state root and returns `(state_root, jmt_snapshot, prepared)`: the
+/// closure captures everything needed to perform the commit, and the
+/// snapshot rides into `PendingChain` so child verifications can chain on
+/// top of speculative state. The runner stores the closure and, at commit
+/// time, invokes each with a `SyncHint`, batching fsyncs across the
+/// flush. A block that reaches the store any other way — a synced block,
+/// a reshape successor's first blocks — is prepared the same way against
+/// the tip it lands on; nothing recomputes a root from scratch, so no
+/// path can commit a root no verifier compared with the header's.
 ///
 /// Execution certificates are extracted from `block.certificates` (finalizations
 /// contain the ECs directly) — no separate parameter needed.
@@ -100,28 +98,4 @@ pub trait ShardChainWriter: Send + Sync + 'static {
         removals: &[SubstateKey],
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit);
-
-    /// Commit a block's state writes from scratch (no prepared closure).
-    ///
-    /// Extracts receipts and execution certificates from `block.certificates`,
-    /// merges the writes internally. The `witness` carries the
-    /// beacon-witness leaves to fold into the same atomic batch. Used when
-    /// no `PreparedCommit` is available.
-    ///
-    /// `creations` and `removals` are the caller's, on the same terms as
-    /// [`Self::prepare_block_commit`]. The committed cells the block
-    /// writes are decided by placement, which the store does not hold;
-    /// the removals need the parent's frontier and a store known to sit
-    /// at the parent, which this path cannot establish. Deriving either
-    /// here under assumptions would produce a state that silently differs
-    /// from every node that prepared the block, which is the one failure
-    /// a commit path must not have. A block that writes or sweeps nothing
-    /// passes an empty slice.
-    fn commit_block(
-        &self,
-        certified: &Arc<Verified<CertifiedBlock>>,
-        creations: &[(SubstateKey, Vec<u8>)],
-        removals: &[SubstateKey],
-        witness: &BeaconWitnessCommit,
-    ) -> StateRoot;
 }

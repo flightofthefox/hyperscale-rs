@@ -792,8 +792,8 @@ mod settled_txs_tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
-    use hyperscale_storage::test_helpers::make_test_certified;
-    use hyperscale_storage::{PendingChain, ShardChainWriter};
+    use hyperscale_storage::PendingChain;
+    use hyperscale_storage::test_helpers::{commit_settled_at, make_test_certified};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
@@ -882,7 +882,8 @@ mod settled_txs_tests {
                 witness_sources: Arc::new(WitnessSources::empty()),
             };
             parent = block.hash();
-            storage.commit_block(
+            commit_settled_at(
+                storage.as_ref(),
                 &make_test_certified(block),
                 &[],
                 &[],

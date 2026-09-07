@@ -22,7 +22,7 @@ use hyperscale_vm_types::ARTIFACT_GRACE_MS;
 use crate::tree::JmtSnapshot;
 use crate::{
     Anchored, filter_state_writes_to_prefix, filter_writes_to_prefix, key_under_prefix,
-    merge_receipts, merge_writes_from_receipts, settle_writes,
+    merge_receipts, settle_writes,
 };
 
 /// When a committed cell stops being needed, or `None` for every cell a
@@ -472,32 +472,6 @@ pub fn sweep_through(
         .map(|(key, _)| key)
         .filter(|key| SweepFrontier::of_leaf(*key) <= frontier)
         .collect()
-}
-
-/// What a block writes, composed once for every path that commits one.
-///
-/// The receipts its ticks settled, resolved against `prior`; the
-/// committed cells the block's committer derived, `creations`; and the
-/// `removals` its sweep names. Both lists are the caller's: which
-/// transactions write a cell is a fact of placement the store does not
-/// hold, and which cells the sweep retires needs the parent's frontier.
-#[must_use]
-pub fn block_settled_writes(
-    block: &Block,
-    prior: &dyn Anchored,
-    creations: &[(SubstateKey, Vec<u8>)],
-    removals: &[SubstateKey],
-) -> SettledWrites {
-    let settling: Vec<StoredReceipt> = block
-        .certificates()
-        .iter()
-        .flat_map(|fw| fw.settling_receipts())
-        .collect();
-    with_sweep(
-        merge_writes_from_receipts(&settling, prior),
-        creations,
-        removals,
-    )
 }
 
 /// What a followed block writes under `prefix`, composed as the chain

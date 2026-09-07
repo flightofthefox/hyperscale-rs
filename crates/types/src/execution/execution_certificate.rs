@@ -738,8 +738,8 @@ impl Verified<ExecutionCertificate> {
 
     /// Re-wrap a certificate that satisfied the predicate at write
     /// time. ECs ride into storage embedded inside `Verified<Finalization>`
-    /// values inside the `Verified<CertifiedBlock>` argument to
-    /// `commit_block`, so unverified ECs can't reach the write path.
+    /// values inside the `Verified<CertifiedBlock>` argument to the
+    /// prepared commit, so unverified ECs can't reach the write path.
     /// Storage rehydration paths use this gate to avoid re-running
     /// aggregation on every load.
     #[must_use]

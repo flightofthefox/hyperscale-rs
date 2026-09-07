@@ -882,7 +882,7 @@ mod test_helpers {
 
     impl RocksDbShardStorage {
         /// Test helper: commits database updates with auto-incrementing JMT version.
-        /// Production uses `commit_block` / `commit_prepared_block` instead.
+        /// Production goes through the prepared commit.
         ///
         /// # Errors
         ///

@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use hyperscale_storage::lock_recover::read_or_recover;
 use hyperscale_storage::test_helpers::{
-    make_settled_writes, make_test_block, make_test_block_at, make_test_block_with_anchor_wt,
-    make_test_certified, make_test_qc, state_key, test_entries_commit_serve_and_history,
-    test_sweep_index_tracks_the_leaves, test_sweep_stops_at_the_ceiling_or_the_cap,
+    commit_settled_at, make_settled_writes, make_test_block, make_test_block_at,
+    make_test_block_with_anchor_wt, make_test_certified, make_test_qc, state_key,
+    test_entries_commit_serve_and_history, test_sweep_index_tracks_the_leaves,
+    test_sweep_stops_at_the_ceiling_or_the_cap,
 };
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
@@ -63,7 +64,7 @@ impl SimShardStorage {
     }
 
     /// Test helper: commits database updates with auto-incrementing JMT version.
-    /// Not used in production (use `commit_block` instead).
+    /// Production goes through the prepared commit.
     ///
     /// # Panics
     ///
@@ -181,7 +182,7 @@ fn commit_with(
     let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
         CertifiedBlock::new_unchecked(block, <Verified<_>>::clone(qc)),
     ));
-    storage.commit_block(&certified, &[], &[], &no_witness())
+    commit_settled_at(storage, &certified, &[], &[], &no_witness())
 }
 
 /// Helper: commit a block with empty updates and no ECs/receipts.
@@ -525,40 +526,6 @@ fn test_commit_block_empty() {
     assert_eq!(storage.jmt_height(), BlockHeight::new(1));
 }
 
-#[test]
-fn test_prepare_then_commit_fast_path() {
-    // Two identical storage instances: one uses prepare+commit, other uses commit_block.
-    // Both should produce the same result.
-    let s_prepared = Arc::new(SimShardStorage::default());
-    let s_direct = SimShardStorage::default();
-    let block = make_test_block(BlockHeight::new(1));
-    let qc = make_test_qc(&block);
-
-    // Prepare path
-    let parent_root = s_prepared.state_root();
-    let (spec_root, _jmt_snapshot, prepared) = s_prepared.prepare_block_commit(
-        ParentAnchor {
-            state_root: parent_root,
-            height: BlockHeight::GENESIS,
-            state: &s_prepared.snapshot(),
-            pending: &[],
-            base_reads: None,
-        },
-        &[],
-        &[],
-        &[],
-        BlockHeight::new(1),
-    );
-    let certified = make_test_certified(block.clone());
-    let result_prepared = prepared(SyncHint::FlushNow, &certified, &no_witness());
-
-    // Direct path
-    let result_direct = commit_empty(&s_direct, &block, &qc);
-
-    assert_eq!(result_prepared, result_direct);
-    assert_eq!(spec_root, result_prepared);
-}
-
 /// A prepared commit for a block the store already holds — landed by a
 /// sync commit between prepare and flush, or by a second vnode on the
 /// store — applies nothing: the block is in, and its history would
@@ -600,9 +567,8 @@ fn a_prepared_commit_for_a_committed_block_applies_nothing() {
 
 #[test]
 fn a_prepared_commit_writes_its_committed_cells() {
-    let prepared = Arc::new(SimShardStorage::default());
-    let direct = SimShardStorage::default();
-    test_helpers::test_prepared_commit_writes_committed_cells(&prepared, &direct);
+    let storage = Arc::new(SimShardStorage::default());
+    test_helpers::test_prepared_commit_writes_committed_cells(&storage);
 }
 
 #[test]

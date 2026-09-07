@@ -219,8 +219,8 @@ impl RocksDbShardStorage {
     /// [`BeaconWitnessesCf`](crate::column_families::BeaconWitnessesCf),
     /// and a carried retention floor range-deletes the leaves below it.
     ///
-    /// Called from `commit_prepared_blocks` and `commit_block` so the
-    /// witness writes commit in the same atomic batch as the block + JMT.
+    /// Called from the prepared commit so the witness writes commit in
+    /// the same atomic batch as the block + JMT.
     pub(crate) fn append_beacon_witnesses_to_batch(
         &self,
         batch: &mut WriteBatch,
@@ -702,8 +702,8 @@ mod test_helpers {
         }
 
         /// Test-only deferred-commit shim for a single finalization
-        /// plus its state writes. Production goes through `commit_block`,
-        /// which folds the cert and state writes into the atomic
+        /// plus its state writes. Production goes through the prepared
+        /// commit, which folds the cert and state writes into the atomic
         /// JMT-update batch under `commit_lock`.
         ///
         /// # Panics

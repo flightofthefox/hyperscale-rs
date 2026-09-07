@@ -37,7 +37,7 @@ pub trait Anchored: Substates {
 ///
 /// All implementations use a binary Blake3 Jellyfish Merkle Tree (JMT)
 /// internally to maintain cryptographic state roots, updated on each
-/// `commit_block()`.
+/// commit.
 ///
 /// Runner storage types (`SimShardStorage`, `RocksDbShardStorage`) implement this trait
 /// along with `Substates`. They additionally implement [`VersionedStore`]

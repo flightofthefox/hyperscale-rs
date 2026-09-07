@@ -590,8 +590,8 @@ impl BlockCommitCoordinator {
         // whose child arrived via sync rather than consensus, so the
         // 2-chain commit rule never triggered. Dropping the block here
         // leaves its prepared commit orphaned in the cache, and the
-        // next block to reach flush trips the strict ordering assert
-        // in `commit_block_inner` because its parent was never applied.
+        // next block to reach flush is refused because its parent was
+        // never applied.
         if height <= self.persisted_height {
             return QcOnlyDecision::Skip;
         }

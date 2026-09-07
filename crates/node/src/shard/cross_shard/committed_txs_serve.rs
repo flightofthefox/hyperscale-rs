@@ -132,8 +132,7 @@ pub fn serve_committed_txs_request<S: ShardStorage>(
 mod tests {
     use std::sync::Arc;
 
-    use hyperscale_storage::ShardChainWriter;
-    use hyperscale_storage::test_helpers::make_test_certified;
+    use hyperscale_storage::test_helpers::{commit_settled_at, make_test_certified};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
@@ -194,7 +193,8 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let hash = block.hash();
-        storage.commit_block(
+        commit_settled_at(
+            storage,
             &make_test_certified(block),
             &[],
             &[],

@@ -127,9 +127,9 @@ impl RocksDbShardStorage {
     /// This is the fast path for block commit. Applies the pre-built `WriteBatch`
     /// atomically with one fsync, including all JMT nodes from the snapshot.
     ///
-    /// Returns `true` if successfully applied (fast path),
-    /// or `false` if the JMT state has changed since preparation
-    /// (caller should fall back to slow path).
+    /// Returns `true` if successfully applied (fast path), or `false`
+    /// if the JMT state has changed since preparation, which the caller
+    /// judges: benign only when the store already holds this block.
     ///
     /// # Panics
     /// Only panics on unrecoverable errors (`RocksDB` write failure).

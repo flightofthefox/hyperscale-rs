@@ -8,17 +8,16 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, block_settled_writes,
-    covers_strictly_more, merge_writes_from_receipts, widest_tick_copies, with_sweep,
+    JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, covers_strictly_more,
+    merge_writes_from_receipts, widest_tick_copies, with_sweep,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, Finalization, PreparedCommit,
-    QuorumCertificate, SettledWrites, StateRoot, StoredReceipt, SubstateKey, SyncHint, Verifiable,
-    Verified,
+    SettledWrites, StateRoot, StoredReceipt, SubstateKey, SyncHint, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
-use super::state::{ConsensusState, apply_state_writes, apply_writes};
+use super::state::{ConsensusState, apply_writes};
 
 impl ShardChainWriter for SimShardStorage {
     fn prepare_block_commit(
@@ -118,25 +117,6 @@ impl ShardChainWriter for SimShardStorage {
 
         (result_root, snapshot, prepared)
     }
-
-    fn commit_block(
-        &self,
-        certified: &Arc<Verified<CertifiedBlock>>,
-        creations: &[(SubstateKey, Vec<u8>)],
-        removals: &[SubstateKey],
-        witness: &BeaconWitnessCommit,
-    ) -> StateRoot {
-        let block = certified.block();
-        let qc = certified.qc_verified();
-        let receipts: Vec<StoredReceipt> = block
-            .certificates()
-            .iter()
-            .flat_map(|fw| fw.receipts().iter().cloned())
-            .collect();
-        let merged_writes = block_settled_writes(block, &self.snapshot(), creations, removals);
-        self.append_beacon_witnesses(witness);
-        self.commit_block_inner(&merged_writes, block, qc, &receipts)
-    }
 }
 
 /// Build the closure that performs the in-memory atomic block commit.
@@ -222,8 +202,7 @@ fn build_prepared_commit(
 impl SimShardStorage {
     /// Fold a block's beacon-witness commit into the in-memory map:
     /// append `witness.leaves` and drop entries below a carried
-    /// retention floor. Lives next to the commit paths so both
-    /// prepared-commit and from-scratch commits share one entry point.
+    /// retention floor.
     fn append_beacon_witnesses(&self, witness: &BeaconWitnessCommit) {
         if witness.leaves.is_empty() && witness.prune_persisted_below.is_none() {
             return;
@@ -237,69 +216,6 @@ impl SimShardStorage {
             c.beacon_witnesses
                 .insert(start + offset as u64, payload.clone());
         }
-    }
-}
-
-impl SimShardStorage {
-    /// Internal commit path used by `commit_block` (sync blocks without a `PreparedCommit`).
-    fn commit_block_inner(
-        &self,
-        merged_writes: &SettledWrites,
-        block: &Block,
-        qc: &Verified<QuorumCertificate>,
-        receipts: &[StoredReceipt],
-    ) -> StateRoot {
-        let block_height = block.height();
-        let mut s = write_or_recover(&self.state);
-
-        // A genesis commit re-records the height the install already wrote
-        // (the chain's genesis height — 0 only for chains born at network
-        // genesis); every other block advances the version by exactly one.
-        assert!(
-            block_height == s.current_block_height + 1
-                || (block.is_genesis() && block_height == s.current_block_height),
-            "commit_block: block_height ({block_height}) must be exactly current_version + 1 ({})",
-            s.current_block_height
-        );
-
-        let new_root = apply_state_writes(&mut s, merged_writes, block_height);
-        let floor = s.advance_retention_floor(block_height.inner(), qc.weighted_timestamp());
-
-        drop(s);
-
-        // Store block + certificate + consensus state atomically.
-        {
-            let mut c = write_or_recover(&self.consensus);
-            for tx in block.transactions().iter() {
-                c.transactions.insert(tx.hash(), (***tx).clone());
-            }
-            // SAFETY: sync-path commit; certified value is already
-            // verified upstream.
-            c.blocks.insert(
-                block.height(),
-                CertifiedBlock::new_unchecked(block.clone().into_sealed(), qc.clone()),
-            );
-            for fw in block.certificates().iter() {
-                let tick_id = *fw.tick_id();
-                c.certificates.insert(fw.receipt_hash(), fw.attestation());
-                c.finalizations_by_height
-                    .entry(tick_id.block_height())
-                    .or_default()
-                    .push(tick_id);
-            }
-            c.record_provisions(block, floor);
-            // Store receipts atomically with block commit.
-            c.insert_receipts(receipts);
-            // Store execution certificates (extracted from finalizations) atomically.
-            record_execution_certs(&mut c, block);
-            c.committed_height = block.height();
-            c.committed_hash = Some(block.hash());
-            c.committed_qc = Some(qc.as_ref().clone());
-            c.prune_receipts(block.height());
-            c.drop_voted_blocks_through(block.height());
-        }
-
-        new_root
     }
 }
 
