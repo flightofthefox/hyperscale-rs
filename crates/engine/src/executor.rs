@@ -49,7 +49,7 @@ use hyperscale_vm_types::{
 
 use crate::backend::EngineBackend;
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
-use crate::legs::{Member, Runs, ShardPlan};
+use crate::legs::{Licence, Member, Runs, ShardPlan};
 use crate::records::BatchRecords;
 use crate::sharding::writes_root;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
@@ -89,17 +89,6 @@ pub struct PreparedTx {
     /// What this shard runs of the transaction and the scope it judges
     /// under — the one part of an entry that differs per participant.
     pub plan: ShardPlan,
-}
-
-/// What kind of member a transaction is in its batch: whether it
-/// declares cells beyond this shard, whether a counterpart's verdict can
-/// still discard it, what it runs of the transaction, and what arrived
-/// for the legs this shard runs.
-struct MemberShape {
-    reaches_beyond: bool,
-    abortable: bool,
-    runs: Runs,
-    arrivals: Vec<EscrowedValue>,
 }
 
 /// The component address a record's own contents derive, or `None` for
@@ -508,139 +497,65 @@ impl Executor {
         Ok(entry)
     }
 
-    /// The entry a reclaim runs: no call, no nullifier, and a declaration
-    /// of its own over exactly the cells a reclaim touches — each record
-    /// read and deleted, each claim written, each origin credited in the
-    /// resource the record names.
+    /// The entry a settlement runs: no call, no nullifier, and a
+    /// declaration of its own over exactly the cells it touches — each
+    /// record read and deleted, and where a crossing is taken back, its
+    /// claim written and its origin credited in the resource the record
+    /// names.
     ///
-    /// A reclaim derives from the cell, not the manifest, so it carries
-    /// none of the transaction's declaration: no node is invoked, so no
-    /// table position matters, and the transaction's own mode on the
-    /// origin — a reservation, where the value left — is not the credit
-    /// a reclaim makes. Every term is the record's: the edge it names,
-    /// the claim key its expiry derives, the resource, the amount and the
-    /// cell to credit. A record this shard cannot read is a refusal,
-    /// since nothing else says what the value was.
+    /// A settlement derives from the cell, not the manifest, so it
+    /// carries none of the transaction's declaration: no node is
+    /// invoked, so no table position matters, and the transaction's own
+    /// mode on the origin — a reservation, where the value left — is not
+    /// the credit a reclaim makes. Every term is the record's: the edge
+    /// it names, the claim key its expiry derives, the resource, the
+    /// amount and the cell to credit.
+    ///
+    /// What each record takes is the licence's to say. On a
+    /// counterpart's committed evidence every record takes the same arm,
+    /// and a record this shard cannot read is a refusal, since one that
+    /// is not there was retired or taken back already. On this shard's
+    /// own leaf each record takes the arm its claim cell decides —
+    /// present means the crossing was taken and the record is a balance
+    /// for a claim that happened, which is deleted; absent, inside the
+    /// claim window its expiry reads back to, means no consumer can
+    /// still take it and none did, which is credited back — and a
+    /// record already gone is skipped rather than refused, since a
+    /// member admitted for several records is one member, and one of
+    /// them having been settled by the shard's own evidence path in
+    /// between is not a reason to strand the rest.
     ///
     /// The scope is this shard's own subtree, whatever the transaction's
-    /// placement was. Every cell a reclaim touches sits under the
+    /// placement was. Every cell a settlement touches sits under the
     /// record's owner, which is a prefix this shard holds or the record
-    /// would not be here; and a batch of housekeeping members alone
-    /// reaches beyond nothing, so its writes are unfiltered — a credit to
-    /// an origin owned elsewhere has to trap here rather than land in a
+    /// would not be here; and a batch of settlements alone reaches
+    /// beyond nothing, so its writes are unfiltered — a credit to an
+    /// origin owned elsewhere has to trap here rather than land in a
     /// store that does not own it.
-    fn prepare_reclaim(
+    fn prepare_settle(
         records: &[SubstateKey],
+        on: Licence,
         ctx: &TickBatchContext<'_>,
         snapshot: &(dyn Substates + Sync),
     ) -> Result<PreparedTx, String> {
         if records.is_empty() {
-            return Err("this shard has no crossing to reclaim".to_string());
+            return Err("this shard has no record to settle".to_string());
         }
-        let mut plan = housekeeping_plan(ctx, records.len());
-        let mut declaration = Declaration::default();
-        for (at, key) in records.iter().enumerate() {
-            let record = read_record(snapshot, *key)
-                .ok_or_else(|| format!("reclaim of record {key:?} reads no record"))?;
-            let origin = record
-                .origin
-                .ok_or_else(|| format!("reclaim of record {key:?} names no origin"))?;
-            let claim = CrossingSite::claim(
-                &ProtocolHasher,
-                key.owner,
-                record.intent,
-                record.local,
-                record.output,
-                record.expiry_ms,
-            );
-            let slot = u32::try_from(at).map_err(|_| "a plan past its own width".to_string())?;
-            plan.legs
-                .reclaims(
-                    slot,
-                    0,
-                    Reclaim {
-                        record: *key,
-                        claim,
-                    },
-                )
-                .map_err(|fault| format!("reclaim plan refuses record {key:?}: {fault}"))?;
-            for (effect, holds) in [
-                (
-                    Effect {
-                        target: EffectTarget::Point(*key),
-                        mode: Mode::Write { moves: Moves::Both },
-                    },
-                    None,
-                ),
-                (
-                    Effect {
-                        target: EffectTarget::Point(claim.key()),
-                        mode: Mode::Write { moves: Moves::Both },
-                    },
-                    None,
-                ),
-                (
-                    Effect {
-                        target: EffectTarget::Point(origin),
-                        mode: Mode::Delta { moves: Moves::Both },
-                    },
-                    Some(record.resource),
-                ),
-            ] {
-                declare(&mut declaration, effect, holds).map_err(|conflict| {
-                    format!("reclaim cell contradicts the declaration: {conflict}")
-                })?;
-            }
-        }
-        Ok(PreparedTx {
-            calls: Vec::new(),
-            declaration,
-            nullifiers: Vec::new(),
-            gas_limit: 0,
-            plan,
-        })
-    }
-
-    /// The entry an inherited record runs: the reclaim and the
-    /// retirement together, each record taking the arm its own claim
-    /// cell decides.
-    ///
-    /// The claim is the record's to name and this shard's to read: the
-    /// coordinator admitted only records whose claim routes here, so an
-    /// absent cell is an absence this shard is entitled to read. Present
-    /// means the crossing was taken and the record is a balance for a
-    /// claim that happened, which the retirement deletes. Absent, inside
-    /// the claim window its expiry reads back to, means no consumer can
-    /// still take it and none did, which the reclaim credits back.
-    ///
-    /// A record already gone is skipped rather than refused: a member
-    /// admitted for several records is one member, and one of them
-    /// having been settled by the shard's own evidence path in between
-    /// is not a reason to strand the rest.
-    fn prepare_inherited(
-        records: &[SubstateKey],
-        ctx: &TickBatchContext<'_>,
-        snapshot: &(dyn Substates + Sync),
-    ) -> Result<PreparedTx, String> {
         let mut plan = housekeeping_plan(ctx, records.len());
         let mut declaration = Declaration::default();
         let mut decided = 0usize;
         for (at, key) in records.iter().enumerate() {
-            let Some(record) = read_record(snapshot, *key) else {
-                continue;
+            let record = match (read_record(snapshot, *key), on) {
+                (Some(record), _) => record,
+                (None, Licence::OwnLeaf) => continue,
+                (None, Licence::Accepted | Licence::Unclaimed) => {
+                    return Err(format!("settlement of record {key:?} reads no record"));
+                }
             };
-            let claim = CrossingSite::claim(
-                &ProtocolHasher,
-                key.owner,
-                record.intent,
-                record.local,
-                record.output,
-                record.expiry_ms,
-            );
             let slot = u32::try_from(at).map_err(|_| "a plan past its own width".to_string())?;
             let mut declare_here = |effect, holds| {
                 declare(&mut declaration, effect, holds).map_err(|conflict| {
-                    format!("inherited cell contradicts the declaration: {conflict}")
+                    format!("settled cell contradicts the declaration: {conflict}")
                 })
             };
             declare_here(
@@ -650,115 +565,59 @@ impl Executor {
                 },
                 None,
             )?;
-            if snapshot.cell(record.consumer_claim).is_some() {
+            if takes_back(on, *key, &record, ctx, snapshot)? {
+                let origin = record
+                    .origin
+                    .ok_or_else(|| format!("reclaim of record {key:?} names no origin"))?;
+                let claim = CrossingSite::claim(
+                    &ProtocolHasher,
+                    key.owner,
+                    record.intent,
+                    record.local,
+                    record.output,
+                    record.expiry_ms,
+                );
+                declare_here(
+                    Effect {
+                        target: EffectTarget::Point(claim.key()),
+                        mode: Mode::Write { moves: Moves::Both },
+                    },
+                    None,
+                )?;
+                declare_here(
+                    Effect {
+                        target: EffectTarget::Point(origin),
+                        mode: Mode::Delta { moves: Moves::Both },
+                    },
+                    Some(record.resource),
+                )?;
                 plan.legs
-                    .retires(
+                    .reclaims(
                         slot,
                         0,
-                        Retire {
-                            record: CrossingSite::record(
-                                &ProtocolHasher,
-                                key.owner,
-                                record.intent,
-                                record.local,
-                                record.output,
-                                record.expiry_ms,
-                            ),
+                        Reclaim {
+                            record: *key,
+                            claim,
                         },
                     )
-                    .map_err(|fault| format!("plan refuses record {key:?}: {fault}"))?;
-                decided = decided.saturating_add(1);
-                continue;
+                    .map_err(|fault| format!("reclaim plan refuses record {key:?}: {fault}"))?;
+            } else {
+                let site = CrossingSite::record(
+                    &ProtocolHasher,
+                    key.owner,
+                    record.intent,
+                    record.local,
+                    record.output,
+                    record.expiry_ms,
+                );
+                plan.legs
+                    .retires(slot, 0, Retire { record: site })
+                    .map_err(|fault| format!("retirement plan refuses record {key:?}: {fault}"))?;
             }
-            if !Window::Claim
-                .of(Deadline::from_escrow_expiry(record.expiry_ms))
-                .contains(&ctx.tick_ts)
-            {
-                return Err(format!(
-                    "record {key:?} is read outside the window its claim answers in"
-                ));
-            }
-            let origin = record
-                .origin
-                .ok_or_else(|| format!("reclaim of record {key:?} names no origin"))?;
-            declare_here(
-                Effect {
-                    target: EffectTarget::Point(claim.key()),
-                    mode: Mode::Write { moves: Moves::Both },
-                },
-                None,
-            )?;
-            declare_here(
-                Effect {
-                    target: EffectTarget::Point(origin),
-                    mode: Mode::Delta { moves: Moves::Both },
-                },
-                Some(record.resource),
-            )?;
-            plan.legs
-                .reclaims(
-                    slot,
-                    0,
-                    Reclaim {
-                        record: *key,
-                        claim,
-                    },
-                )
-                .map_err(|fault| format!("plan refuses record {key:?}: {fault}"))?;
             decided = decided.saturating_add(1);
         }
         if decided == 0 {
             return Err("every inherited record was settled already".to_string());
-        }
-        Ok(PreparedTx {
-            calls: Vec::new(),
-            declaration,
-            nullifiers: Vec::new(),
-            gas_limit: 0,
-            plan,
-        })
-    }
-
-    /// The entry a retirement runs: no call, no nullifier, and a
-    /// declaration of its own over exactly the records it deletes.
-    ///
-    /// A record this shard cannot read is a refusal, as it is for a
-    /// reclaim: a record that is not there was retired or taken back
-    /// already.
-    fn prepare_retire(
-        records: &[SubstateKey],
-        ctx: &TickBatchContext<'_>,
-        snapshot: &(dyn Substates + Sync),
-    ) -> Result<PreparedTx, String> {
-        if records.is_empty() {
-            return Err("this shard has no record to retire".to_string());
-        }
-        let mut plan = housekeeping_plan(ctx, records.len());
-        let mut declaration = Declaration::default();
-        for (at, key) in records.iter().enumerate() {
-            let record = read_record(snapshot, *key)
-                .ok_or_else(|| format!("retirement of record {key:?} reads no record"))?;
-            let site = CrossingSite::record(
-                &ProtocolHasher,
-                key.owner,
-                record.intent,
-                record.local,
-                record.output,
-                record.expiry_ms,
-            );
-            let slot = u32::try_from(at).map_err(|_| "a plan past its own width".to_string())?;
-            plan.legs
-                .retires(slot, 0, Retire { record: site })
-                .map_err(|fault| format!("retirement plan refuses record {key:?}: {fault}"))?;
-            declare(
-                &mut declaration,
-                Effect {
-                    target: EffectTarget::Point(*key),
-                    mode: Mode::Write { moves: Moves::Both },
-                },
-                None,
-            )
-            .map_err(|conflict| format!("retired cell contradicts the declaration: {conflict}"))?;
         }
         Ok(PreparedTx {
             calls: Vec::new(),
@@ -1394,6 +1253,39 @@ fn housekeeping_plan(ctx: &TickBatchContext<'_>, records: usize) -> ShardPlan {
     }
 }
 
+/// Whether the settlement of `record` under `on` takes the crossing
+/// back rather than deleting a record whose claim happened: what the
+/// licence says, or for a record on this shard's own leaf what its
+/// claim cell says — present is a claim that happened; absent inside
+/// the claim window its expiry reads back to is one that never will,
+/// and absent outside it is a cell this shard may not read.
+fn takes_back(
+    on: Licence,
+    key: SubstateKey,
+    record: &CrossingCell,
+    ctx: &TickBatchContext<'_>,
+    snapshot: &(dyn Substates + Sync),
+) -> Result<bool, String> {
+    match on {
+        Licence::Accepted => Ok(false),
+        Licence::Unclaimed => Ok(true),
+        Licence::OwnLeaf => {
+            if snapshot.cell(record.consumer_claim).is_some() {
+                Ok(false)
+            } else if Window::Claim
+                .of(Deadline::from_escrow_expiry(record.expiry_ms))
+                .contains(&ctx.tick_ts)
+            {
+                Ok(true)
+            } else {
+                Err(format!(
+                    "record {key:?} is read outside the window its claim answers in"
+                ))
+            }
+        }
+    }
+}
+
 /// The record a leaf holds, or nothing where the cell is absent or is
 /// not one.
 fn read_record(snapshot: &(dyn Substates + Sync), key: SubstateKey) -> Option<CrossingCell> {
@@ -1405,27 +1297,42 @@ fn read_record(snapshot: &(dyn Substates + Sync), key: SubstateKey) -> Option<Cr
 impl Executor {
     /// The batch pipeline every dispatch arm shares: derive, pre-read the
     /// local baseline, layer provisioned remote cells, execute under the
-    /// shard's locality, fold local keys, and project. `shapes` says what
-    /// kind of member each transaction is; a batch in which no member
+    /// shard's locality, fold local keys, and project. Each input says
+    /// what kind of member its transaction is; a batch in which no member
     /// declares a cell beyond this shard executes under total locality.
     #[allow(clippy::too_many_lines)] // one pipeline, stages in order
     fn run_batch(
         &self,
         ctx: &TickBatchContext<'_>,
         snapshot: &(dyn Substates + Sync),
-        members: &[BatchMember],
-        provisions_by_tx: &BTreeMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
-        env_by_tx: &BTreeMap<TxHash, EnvInputs>,
-        shapes: &BTreeMap<TxHash, MemberShape>,
+        inputs: &[TickTxInput<'_>],
     ) -> Vec<ExecutedTx> {
-        if members.is_empty() {
+        if inputs.is_empty() {
             return Vec::new();
         }
+        let members: Vec<BatchMember> = inputs
+            .iter()
+            .map(|i| BatchMember {
+                tx_hash: i.tx_hash,
+                body: i.transaction.map(Arc::clone),
+            })
+            .collect();
+        let provisions_by_tx: BTreeMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>> = inputs
+            .iter()
+            .filter(|i| !i.provisions.is_empty())
+            .map(|i| (i.tx_hash, i.provisions.to_vec()))
+            .collect();
+        let env_by_tx: BTreeMap<TxHash, EnvInputs> = inputs
+            .iter()
+            .map(|i| (i.tx_hash, env_at(ctx, i.clock)))
+            .collect();
+        let shapes: BTreeMap<TxHash, &TickTxInput<'_>> =
+            inputs.iter().map(|i| (i.tx_hash, i)).collect();
         // A member declaring remote cells has its writes filtered to the
         // local subtree; a batch of genuinely single-shard members owns
         // every key it declares and total locality is the same filter
         // without the trie walk.
-        let locality = if shapes.values().all(|shape| !shape.reaches_beyond) {
+        let locality = if inputs.iter().all(|i| !i.runs.reaches_beyond()) {
             Locality::All
         } else {
             let trie = ctx.shard_trie.clone();
@@ -1453,7 +1360,7 @@ impl Executor {
         let records = BatchRecords::new(
             self.world.cache.load(),
             self.world.instances.seeded(),
-            provisions_by_tx,
+            &provisions_by_tx,
             snapshot,
         );
 
@@ -1461,40 +1368,25 @@ impl Executor {
         // failures without touching the batch.
         let mut prepared: BTreeMap<TxHash, PreparedTx> = BTreeMap::new();
         let mut refused: BTreeMap<TxHash, String> = BTreeMap::new();
-        for member in members {
-            let vm_tx = member.tx_hash;
+        for input in inputs {
+            let vm_tx = input.tx_hash;
             if publishes.contains_key(&vm_tx) {
                 continue;
             }
             // What this shard runs of the member: the whole shape unless
             // the coordinator froze a division, and then the legs its
-            // placement gives it — or, for housekeeping, no node at all. A
-            // plan that cannot be built is a deterministic refusal like a
-            // derivation that cannot be — every replica reads the same
+            // placement gives it — or, for a settlement, no node at all.
+            // A plan that cannot be built is a deterministic refusal like
+            // a derivation that cannot be — every replica reads the same
             // legs and the same arrivals.
-            let planned = match shapes
-                .get(&vm_tx)
-                .map(|shape| (&shape.runs, shape.arrivals.as_slice()))
-            {
-                Some((Runs::Reclaim { records, .. }, _)) => {
-                    Self::prepare_reclaim(records, ctx, snapshot)
+            let planned = match &input.runs {
+                Runs::Settle { records, on, .. } => {
+                    Self::prepare_settle(records, *on, ctx, snapshot)
                 }
-                Some((Runs::Retire { records }, _)) => Self::prepare_retire(records, ctx, snapshot),
-                Some((Runs::Inherited { records }, _)) => {
-                    Self::prepare_inherited(records, ctx, snapshot)
-                }
-                Some((Runs::Shape(shape), arrivals)) => member
-                    .body
-                    .as_ref()
+                Runs::Shape(shape) => input
+                    .transaction
                     .ok_or_else(|| "a member running a shape holds no body".to_string())
-                    .and_then(|tx| Self::prepare_shape(tx, &records, shape, arrivals)),
-                None => member
-                    .body
-                    .as_ref()
-                    .ok_or_else(|| "a member running a shape holds no body".to_string())
-                    .and_then(|tx| {
-                        Self::prepare_shape(tx, &records, &Member::whole(ctx.local_shard), &[])
-                    }),
+                    .and_then(|tx| Self::prepare_shape(tx, &records, shape, input.arrivals)),
             };
             match planned {
                 Ok(entry) => {
@@ -1592,19 +1484,10 @@ impl Executor {
                 // delivering member of a mixed shard, whose issuing member
                 // did. The reclaim of a leg that never ran is the one
                 // receipt of this shard's that can still carry it.
-                let already_charged = match shapes.get(&tx.hash()).map(|shape| &shape.runs) {
-                    Some(Runs::Reclaim { charged, .. }) => *charged,
-                    // A retirement is housekeeping on a transaction whose
-                    // price its leg settled: it charges nothing.
-                    // Housekeeping on a record this shard inherited:
-                    // the chain that debited the payer settled the price
-                    // before it dissolved, and this shard holds no body
-                    // to price it against.
-                    Some(Runs::Retire { .. } | Runs::Inherited { .. }) => true,
-                    Some(Runs::Shape(member)) => member.is_second(),
-                    None => false,
-                };
-                if already_charged {
+                if shapes
+                    .get(&tx.hash())
+                    .is_some_and(|input| input.runs.charged_already())
+                {
                     return None;
                 }
                 Some((
@@ -1613,7 +1496,9 @@ impl Executor {
                         vault,
                         max_fee: vm.max_fee,
                         price: tx.price(),
-                        abortable: shapes.get(&tx.hash()).is_some_and(|shape| shape.abortable),
+                        abortable: shapes
+                            .get(&tx.hash())
+                            .is_some_and(|input| input.runs.abortable()),
                     },
                 ))
             })
@@ -1780,9 +1665,7 @@ impl Executor {
     ///
     /// The unit is the batch: the whole of it goes to the
     /// deterministic-parallel executor at once, which returns one
-    /// [`ExecutedTx`] per input transaction, in input order. The
-    /// per-member environments a tick resolves are
-    /// [`execute_tick_batch`](Self::execute_tick_batch)'s business.
+    /// [`ExecutedTx`] per input transaction, in input order.
     #[must_use]
     pub fn execute_batch(
         &self,
@@ -1790,27 +1673,21 @@ impl Executor {
         snapshot: &(dyn Substates + Sync),
         transactions: &[Arc<Verified<Transaction>>],
     ) -> Vec<ExecutedTx> {
-        // Every member reads the context's own clock: one block
-        // committed them all, so one epoch seals them all.
-        let members: Vec<BatchMember> = transactions
+        // Every member runs whole on its own shard and reads the
+        // context's own clock: one block committed them all, so one
+        // epoch seals them all.
+        let inputs: Vec<TickTxInput<'_>> = transactions
             .iter()
-            .map(|tx| BatchMember {
+            .map(|tx| TickTxInput {
                 tx_hash: tx.hash(),
-                body: Some(Arc::clone(tx)),
+                transaction: Some(tx),
+                provisions: &[],
+                clock: ctx.tick_ts,
+                runs: Runs::Shape(Member::whole(ctx.local_shard)),
+                arrivals: &[],
             })
             .collect();
-        let env_by_tx: BTreeMap<TxHash, EnvInputs> = members
-            .iter()
-            .map(|m| (m.tx_hash, env_at(ctx, ctx.tick_ts)))
-            .collect();
-        self.run_batch(
-            ctx,
-            snapshot,
-            &members,
-            &BTreeMap::new(),
-            &env_by_tx,
-            &BTreeMap::new(),
-        )
+        self.run_batch(ctx, snapshot, &inputs)
     }
 
     /// Execute one tick's whole batch — single-shard members beside
@@ -1827,44 +1704,7 @@ impl Executor {
         snapshot: &(dyn Substates + Sync),
         inputs: &[TickTxInput<'_>],
     ) -> Vec<ExecutedTx> {
-        let members: Vec<BatchMember> = inputs
-            .iter()
-            .map(|i| BatchMember {
-                tx_hash: i.tx_hash,
-                body: i.transaction.map(Arc::clone),
-            })
-            .collect();
-        let provisions_by_tx: BTreeMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>> = inputs
-            .iter()
-            .filter(|i| !i.provisions.is_empty())
-            .map(|i| (i.tx_hash, i.provisions.to_vec()))
-            .collect();
-        let env_by_tx: BTreeMap<TxHash, EnvInputs> = inputs
-            .iter()
-            .map(|i| (i.tx_hash, env_at(ctx, i.clock)))
-            .collect();
-        let shapes: BTreeMap<TxHash, MemberShape> = inputs
-            .iter()
-            .map(|i| {
-                (
-                    i.tx_hash,
-                    MemberShape {
-                        reaches_beyond: i.reaches_beyond,
-                        abortable: i.abortable,
-                        runs: i.runs.clone(),
-                        arrivals: i.arrivals.to_vec(),
-                    },
-                )
-            })
-            .collect();
-        self.run_batch(
-            ctx,
-            snapshot,
-            &members,
-            &provisions_by_tx,
-            &env_by_tx,
-            &shapes,
-        )
+        self.run_batch(ctx, snapshot, inputs)
     }
 }
 

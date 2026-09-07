@@ -319,8 +319,6 @@ impl TickCandidates {
                         Vec::new()
                     },
                     clock: anchor.map_or(candidate.committed_ts, |a| a.clock),
-                    reaches_beyond,
-                    abortable,
                     runs: Runs::Shape(candidate.member.clone()),
                     arrivals,
                 },
@@ -443,7 +441,7 @@ mod tests {
         );
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].request.tx_hash, hash);
-        assert!(!admitted[0].request.reaches_beyond);
+        assert!(!admitted[0].request.runs.reaches_beyond());
         assert!(candidates.is_empty(), "and leaves the pool with the tick");
     }
 
@@ -475,7 +473,7 @@ mod tests {
         let admitted =
             candidates.compose(&provisioning, &mut ProvisionalCells::default(), ms(1_000));
         assert_eq!(admitted.len(), 1);
-        assert!(admitted[0].request.reaches_beyond);
+        assert!(admitted[0].request.runs.reaches_beyond());
     }
 
     /// A delivering candidate the window has closed on is dropped, not
@@ -626,7 +624,7 @@ mod tests {
             &BTreeSet::from([local, venue])
         );
         assert!(
-            admitted[0].request.reaches_beyond,
+            admitted[0].request.runs.reaches_beyond(),
             "reach is what the request carries"
         );
     }
@@ -666,7 +664,7 @@ mod tests {
         let mut held = ProvisionalCells::default();
         let admitted = whole.compose(&provisioning, &mut held, ms(1_000));
         assert_eq!(admitted.len(), 1, "a whole member claims the cell");
-        assert!(admitted[0].request.abortable);
+        assert!(admitted[0].request.runs.abortable());
         assert_eq!(whole.len(), 1, "and the other waits on its fate");
 
         let classified = Classified::freeze(&swap(), &[], &trie);
@@ -679,7 +677,11 @@ mod tests {
         let mut held = ProvisionalCells::default();
         let admitted = divided.compose(&provisioning, &mut held, ms(1_000));
         assert_eq!(admitted.len(), 2, "both core members clear in one tick");
-        assert!(admitted.iter().all(|member| !member.request.abortable));
+        assert!(
+            admitted
+                .iter()
+                .all(|member| !member.request.runs.abortable())
+        );
         assert!(held.is_empty(), "and neither claimed anything");
         assert!(divided.is_empty());
     }

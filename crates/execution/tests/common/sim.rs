@@ -452,7 +452,7 @@ impl ExecutionSim {
                     self.local_shard,
                     request.tx_hash,
                     tx,
-                    request.abortable,
+                    request.runs.abortable(),
                 ))
             })
             .collect();

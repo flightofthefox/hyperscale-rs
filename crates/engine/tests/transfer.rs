@@ -12,7 +12,7 @@ use hyperscale_effects_bridge::{
 use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
 };
-use hyperscale_engine::legs::{Classified, Member, PlanDefect, Runs, Side};
+use hyperscale_engine::legs::{Classified, Licence, Member, PlanDefect, Runs, Side};
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PreviewGrants, PreviewInputs, PreviewOutcome,
@@ -1317,10 +1317,7 @@ fn a_transfer_executes_divided_on_both_shards() {
             transaction: Some(&tx),
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
-            reaches_beyond: true,
             // A leg awaiting nobody but its own shard: nothing retracts
-            // it, so no charge is held in reserve against an abort.
-            abortable: false,
             runs: Runs::Shape(Member::of(
                 classified.clone(),
                 local_shard,
@@ -1404,7 +1401,7 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
         .remove(0);
 
     let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
-    let run = |store: &MapDb, runs: Runs, reaches_beyond: bool| {
+    let run = |store: &MapDb, runs: Runs| {
         let ctx = TickBatchContext {
             local_shard: near_shard,
             shard_trie: &trie,
@@ -1417,8 +1414,6 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
             transaction: Some(&tx),
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
-            reaches_beyond,
-            abortable: false,
             runs,
             arrivals: &[],
         };
@@ -1435,7 +1430,6 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
                 .chain(edge.to.iter().copied())
                 .collect(),
         )),
-        true,
     );
     let ConsensusReceipt::Succeeded { writes, .. } = &sent.consensus else {
         panic!("the sender's legs must succeed: {:?}", sent.metadata);
@@ -1449,13 +1443,14 @@ fn a_reclaim_restores_the_senders_vault_exactly() {
 
     let reclaimed = run(
         &store,
-        Runs::Reclaim {
+        Runs::Settle {
+            member: Member::whole(near_shard),
             records: classified
                 .shape(tx.legs(), tx.crossings())
                 .records_issued(near_shard),
+            on: Licence::Unclaimed,
             charged: true,
         },
-        false,
     );
     let ConsensusReceipt::Succeeded { writes, .. } = &reclaimed.consensus else {
         panic!("the reclaim must succeed: {:?}", reclaimed.metadata);
@@ -1497,7 +1492,7 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
         .remove(0);
 
     let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
-    let run = |store: &MapDb, runs: Runs, reaches_beyond: bool| {
+    let run = |store: &MapDb, runs: Runs| {
         let ctx = TickBatchContext {
             local_shard: near_shard,
             shard_trie: &trie,
@@ -1510,8 +1505,6 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
             transaction: Some(&tx),
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
-            reaches_beyond,
-            abortable: false,
             runs,
             arrivals: &[],
         };
@@ -1528,7 +1521,6 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
                 .chain(edge.to.iter().copied())
                 .collect(),
         )),
-        true,
     );
     let ConsensusReceipt::Succeeded { writes, .. } = &sent.consensus else {
         panic!("the sender's legs must succeed: {:?}", sent.metadata);
@@ -1538,12 +1530,14 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
 
     let retired = run(
         &store,
-        Runs::Retire {
+        Runs::Settle {
+            member: Member::whole(near_shard),
             records: classified
                 .shape(tx.legs(), tx.crossings())
                 .records_issued(near_shard),
+            on: Licence::Accepted,
+            charged: true,
         },
-        false,
     );
     let ConsensusReceipt::Succeeded { writes, .. } = &retired.consensus else {
         panic!("the retirement must succeed: {:?}", retired.metadata);
@@ -1560,12 +1554,14 @@ fn a_retirement_deletes_the_record_and_moves_nothing() {
 
     let again = run(
         &store,
-        Runs::Retire {
+        Runs::Settle {
+            member: Member::whole(near_shard),
             records: classified
                 .shape(tx.legs(), tx.crossings())
                 .records_issued(near_shard),
+            on: Licence::Accepted,
+            charged: true,
         },
-        false,
     );
     assert!(
         matches!(again.consensus, ConsensusReceipt::Failed),
@@ -1611,8 +1607,6 @@ fn an_inherited_record_decides_itself_against_its_claim() {
             transaction: Some(&tx),
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
-            reaches_beyond: true,
-            abortable: false,
             runs: Runs::Shape(Member::of(
                 classified.clone(),
                 near_shard,
@@ -1641,10 +1635,11 @@ fn an_inherited_record_decides_itself_against_its_claim() {
             transaction: None,
             provisions: &[],
             clock: WeightedTimestamp::from_millis(at),
-            reaches_beyond: false,
-            abortable: false,
-            runs: Runs::Inherited {
+            runs: Runs::Settle {
+                member: Member::whole(near_shard),
                 records: vec![edge.record],
+                on: Licence::OwnLeaf,
+                charged: true,
             },
             arrivals: &[],
         };
@@ -1751,12 +1746,12 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
             transaction: Some(&tx),
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
-            reaches_beyond: false,
-            abortable: false,
-            runs: Runs::Reclaim {
+            runs: Runs::Settle {
+                member: Member::whole(near_shard),
                 records: Classified::freeze(tx.legs(), tx.owners(), &trie)
                     .shape(tx.legs(), tx.crossings())
                     .records_issued(near_shard),
+                on: Licence::Unclaimed,
                 charged,
             },
             arrivals: &[],
@@ -1822,8 +1817,6 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
             transaction: Some(&tx),
             provisions: &[],
             clock: WeightedTimestamp::from_millis(1_000),
-            reaches_beyond: true,
-            abortable: true,
             runs: Runs::Shape(Member::of(
                 Classified::whole(),
                 local_shard,

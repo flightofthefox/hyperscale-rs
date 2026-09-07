@@ -133,22 +133,15 @@ pub struct TickTxInput<'a> {
     /// committing block's parent-QC weighted timestamp for a cross-shard
     /// leg.
     pub clock: WeightedTimestamp,
-    /// Whether the transaction declares cells beyond the executing
-    /// shard. Decides the batch's write locality: a member declaring
-    /// remote cells has its writes filtered to the subtree this shard
-    /// owns.
-    pub reaches_beyond: bool,
-    /// Whether a counterpart's verdict can still discard this member's
-    /// effects after execution — a whole cross-shard leg, or a member of
-    /// a core that spans shards. Decides the reserve fee receipt: an
-    /// abort settles the floor in place of the discarded effects, so
-    /// only a member that can be aborted holds one.
-    pub abortable: bool,
     /// What this member runs: the transaction as its block froze it —
     /// carried, never re-derived, since a reshape landing between
     /// composition and execution would otherwise leave one shard running
     /// a whole manifest while its counterpart waits to be sent half of
-    /// it — or the reclaim of what a leg here issued.
+    /// it — or a settlement of what a leg here issued. What it says of
+    /// the member decides the batch's write locality — a member
+    /// declaring remote cells has its writes filtered to the subtree
+    /// this shard owns — and the reserve fee receipt, which only a
+    /// member a counterpart's verdict can still discard holds.
     pub runs: Runs,
     /// What committed bundles attested for the edges this shard's legs
     /// consume. Empty for a member that runs whole.

@@ -678,52 +678,110 @@ impl Member {
     }
 }
 
+/// What licenses a member to settle the records a producer here left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Licence {
+    /// Every consumer claimed, on the evidence of its certificate: the
+    /// records are deleted.
+    Accepted,
+    /// No consumer ever claimed, on the evidence of a committed record:
+    /// the crossings are credited back and the records deleted.
+    Unclaimed,
+    /// This shard's own state: records it inherited with a prefix, each
+    /// decided against the claim cell it names — credited back where
+    /// that cell is absent inside the window an absence means something
+    /// in, deleted where it is there. The one licence that is this
+    /// shard's own evidence: a record arriving with a prefix has no
+    /// counterpart left to ask, and the shard that inherited it holds
+    /// both halves of the crossing or cannot decide it at all.
+    OwnLeaf,
+}
+
 /// What a member runs of its transaction: the shape its committing
-/// block froze, or housekeeping on the records a producer here left.
+/// block froze, or a settlement of the records a producer here left.
 ///
-/// The two housekeeping arms name cells and not a manifest. That is what
-/// lets a shard holding the record and no body compose them — a reshape
+/// A settlement names cells and not a manifest. That is what lets a
+/// shard holding the record and no body compose one — a reshape
 /// successor, whose store arrives as a prefix of leaves and whose ledger
-/// begins empty — and it is why neither carries the classification the
-/// shape arm does: the record leaf says which cells the member touches,
+/// begins empty: the record leaf says which cells the member touches,
 /// and the transaction is a name on the receipt rather than an input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Runs {
     /// The transaction as classified at commit — whole, or the legs
     /// this shard's placement gives it on its side.
     Shape(Member),
-    /// No node at all: the records of the crossings a producer here
-    /// issued, deleted on the evidence that every consumer claimed them.
-    Retire {
-        /// The record cells to delete.
+    /// No node at all: the records of crossings a producer here issued,
+    /// settled on `on`.
+    Settle {
+        /// The member the settlement runs as: whole, on its own shard,
+        /// reaching nobody else.
+        member: Member,
+        /// The record cells to settle.
         records: Vec<SubstateKey>,
-    },
-    /// No node at all: records this shard inherited with a prefix, each
-    /// decided against the claim cell it names — credited back where
-    /// that cell is absent inside the window an absence means something
-    /// in, deleted where it is there.
-    ///
-    /// The one housekeeping member whose evidence is this shard's own
-    /// state. The other two rest on a counterpart's committed record;
-    /// a record arriving with a prefix has no counterpart left to ask,
-    /// and the shard that inherited it holds both halves of the crossing
-    /// or cannot decide it at all.
-    Inherited {
-        /// The record cells to decide.
-        records: Vec<SubstateKey>,
-    },
-    /// No node at all: the crossings a producer here issued, taken back
-    /// on the evidence that no consumer ever claimed them.
-    Reclaim {
-        /// The record cells to credit back and delete.
-        records: Vec<SubstateKey>,
-        /// Whether this shard's own certificate of the leg settled the
-        /// price already. A leg that ran is determined, and burned it
-        /// inside its writes at its own finalization; one that never ran
-        /// — held for a bundle that never came — owes it still, and the
-        /// reclaim's receipt is the one of this shard's left to carry it.
+        /// What licenses the settlement, and so what it does to each
+        /// record.
+        on: Licence,
+        /// Whether this shard settled the transaction's price already.
+        /// A leg that ran burned it inside its writes at its own
+        /// finalization; one that never ran — held for a bundle that
+        /// never came — owes it still, and the reclaim's receipt is the
+        /// one of this shard's left to carry it. A retirement is
+        /// housekeeping on a transaction whose price its leg settled,
+        /// and an inherited record's price was settled by the chain
+        /// that dissolved.
         charged: bool,
     },
+}
+
+impl Runs {
+    /// The member this runs as.
+    #[must_use]
+    pub const fn member(&self) -> &Member {
+        match self {
+            Self::Shape(member) | Self::Settle { member, .. } => member,
+        }
+    }
+
+    /// Whether the transaction reaches beyond the running shard. A
+    /// settlement reaches nobody: every cell it touches is a record this
+    /// shard holds.
+    #[must_use]
+    pub fn reaches_beyond(&self) -> bool {
+        match self {
+            Self::Shape(member) => member.reaches_beyond(),
+            Self::Settle { .. } => false,
+        }
+    }
+
+    /// Whether a counterpart's verdict can still discard this member's
+    /// effects after it executes. Nothing retracts a settlement.
+    #[must_use]
+    pub fn abortable(&self) -> bool {
+        match self {
+            Self::Shape(member) => member.abortable(),
+            Self::Settle { .. } => false,
+        }
+    }
+
+    /// Whether the transaction's price was levied on this shard already,
+    /// so this member charges nothing: the delivering member of a mixed
+    /// shard, whose issuing member charged; a settlement on a leg that
+    /// ran, or on a record whose transaction was priced elsewhere.
+    #[must_use]
+    pub fn charged_already(&self) -> bool {
+        match self {
+            Self::Shape(member) => member.is_second(),
+            Self::Settle {
+                on: Licence::Unclaimed,
+                charged,
+                ..
+            } => *charged,
+            Self::Settle {
+                on: Licence::Accepted | Licence::OwnLeaf,
+                ..
+            } => true,
+        }
+    }
 }
 
 /// The star `legs` implies under `trie` — the anchored half of the

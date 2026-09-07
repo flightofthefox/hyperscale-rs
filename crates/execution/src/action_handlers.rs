@@ -101,7 +101,7 @@ pub fn accumulate_tick_output(
     // moment it executes.
     let abortable: HashSet<TxHash> = requests
         .iter()
-        .filter(|r| r.abortable)
+        .filter(|r| r.runs.abortable())
         .map(|r| r.tx_hash)
         .collect();
     let (beyond, local): (Vec<&ExecutedTx>, Vec<&ExecutedTx>) = ordered
@@ -294,8 +294,6 @@ where
                     transaction: r.transaction.as_ref(),
                     provisions: &r.provisions,
                     clock: r.clock,
-                    reaches_beyond: r.reaches_beyond,
-                    abortable: r.abortable,
                     runs: r.runs.clone(),
                     arrivals: &r.arrivals,
                 })

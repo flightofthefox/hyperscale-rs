@@ -10,12 +10,12 @@
 //! every declared reservation was granted at its declared amount, and a
 //! receipt without writes granted none.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::ExecutedTx;
-use hyperscale_engine::legs::{Member, Runs};
+use hyperscale_engine::legs::{Classified, Member, Runs, Side};
 use hyperscale_execution::action_handlers::accumulate_tick_output;
 use hyperscale_storage::TickOutput;
 use hyperscale_types::{
@@ -127,15 +127,22 @@ fn reserving_transaction(seed: u8) -> Arc<Verified<Transaction>> {
     Arc::new(Verified::<Transaction>::from_persisted(tx))
 }
 
+/// A request for `tx` as a whole shape reaching a counterpart: a member
+/// whose verdict that counterpart can still discard, so its declared
+/// cells are held against it.
 fn request_for(tx: &Arc<Verified<Transaction>>) -> CrossShardExecutionRequest {
+    let (local, counterpart) = ShardId::ROOT.children();
     CrossShardExecutionRequest {
         tx_hash: tx.hash(),
         transaction: Some(Arc::clone(tx)),
         provisions: Vec::new(),
         clock: WeightedTimestamp::from_millis(1_000),
-        reaches_beyond: true,
-        abortable: true,
-        runs: Runs::Shape(Member::whole(ShardId::ROOT)),
+        runs: Runs::Shape(Member::of(
+            Classified::whole(),
+            local,
+            Side::Issuing,
+            BTreeSet::from([local, counterpart]),
+        )),
         arrivals: Vec::new(),
     }
 }

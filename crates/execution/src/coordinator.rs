@@ -37,7 +37,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::{Classified, Runs, Side};
+use hyperscale_engine::legs::{Classified, Licence, Member, Runs, Side};
 use hyperscale_engine::{TickEnvironment, build_fee_receipt};
 use hyperscale_metrics::{
     record_rebuilt_verdict_entry, record_reclaim_admitted, record_reclaim_probe_answered,
@@ -1134,12 +1134,12 @@ impl ExecutionCoordinator {
                 tx_hash,
                 provisions: Vec::new(),
                 clock: tick_ts,
-                reaches_beyond: false,
-                abortable: false,
-                runs: Runs::Reclaim {
+                runs: Runs::Settle {
+                    member: Member::whole(local_shard),
                     records: classified
                         .shape(transaction.legs(), transaction.crossings())
                         .records_issued(local_shard),
+                    on: Licence::Unclaimed,
                     charged,
                 },
                 arrivals: Vec::new(),
@@ -1219,9 +1219,12 @@ impl ExecutionCoordinator {
                 transaction: None,
                 provisions: Vec::new(),
                 clock: tick_ts,
-                reaches_beyond: false,
-                abortable: false,
-                runs: Runs::Inherited { records },
+                runs: Runs::Settle {
+                    member: Member::whole(local_shard),
+                    records,
+                    on: Licence::OwnLeaf,
+                    charged: true,
+                },
                 arrivals: Vec::new(),
             });
         }
@@ -1265,12 +1268,13 @@ impl ExecutionCoordinator {
                 tx_hash,
                 provisions: Vec::new(),
                 clock: tick_ts,
-                reaches_beyond: false,
-                abortable: false,
-                runs: Runs::Retire {
+                runs: Runs::Settle {
+                    member: Member::whole(local_shard),
                     records: classified
                         .shape(transaction.legs(), transaction.crossings())
                         .records_issued(local_shard),
+                    on: Licence::Accepted,
+                    charged: true,
                 },
                 arrivals: Vec::new(),
             });
@@ -1360,7 +1364,7 @@ impl ExecutionCoordinator {
             );
         }
         if let Some((_, body)) = &shape
-            && member.request.abortable
+            && member.request.runs.abortable()
         {
             ticked.legs.insert(member.request.tx_hash);
             ticked
@@ -7930,10 +7934,17 @@ mod tests {
             })
             .expect("the reclaim is dispatched to the engine");
         assert!(
-            matches!(request.runs, Runs::Reclaim { charged: true, .. }),
+            matches!(
+                request.runs,
+                Runs::Settle {
+                    on: Licence::Unclaimed,
+                    charged: true,
+                    ..
+                }
+            ),
             "the leg's finalization committed here, so its certificate settled the price"
         );
-        assert!(!request.abortable, "nothing retracts a reclaim");
+        assert!(!request.runs.abortable(), "nothing retracts a reclaim");
         assert!(
             state.unresolved.reclaimable().is_empty(),
             "and the ledger has handed it to the tick"
@@ -9044,8 +9055,14 @@ mod tests {
                 _ => None,
             })
             .expect("the retirement is dispatched to the engine");
-        assert!(matches!(request.runs, Runs::Retire { .. }));
-        assert!(!request.abortable, "nothing retracts a retirement");
+        assert!(matches!(
+            request.runs,
+            Runs::Settle {
+                on: Licence::Accepted,
+                ..
+            }
+        ));
+        assert!(!request.runs.abortable(), "nothing retracts a retirement");
         assert!(
             state.unresolved.retirable().is_empty(),
             "and the ledger has handed it to the tick"
