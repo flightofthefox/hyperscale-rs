@@ -1294,11 +1294,37 @@ fn a_route_the_departing_venue_settled_is_settled_by_the_survivor_sim() {
     cluster.run_faultable(a_route_the_departing_venue_settled_is_settled_by_the_survivor);
 }
 
+/// Drive a train of transfers into the splitter across its split at `seed`.
+fn a_train_into_a_splitter_strands_nothing_at_seed(seed: u64) {
+    let mut cluster =
+        SimCluster::with_accounts(&straddler_config(), seed, &split_train_genesis_accounts());
+    a_train_into_a_splitter_strands_nothing(&mut cluster);
+}
+
 #[test]
 fn a_train_into_a_splitter_strands_nothing_sim() {
-    let mut cluster =
-        SimCluster::with_accounts(&straddler_config(), 11, &split_train_genesis_accounts());
-    a_train_into_a_splitter_strands_nothing(&mut cluster);
+    a_train_into_a_splitter_strands_nothing_at_seed(11);
+}
+
+#[test]
+fn a_train_into_a_splitter_strands_nothing_seed_3_sim() {
+    a_train_into_a_splitter_strands_nothing_at_seed(3);
+}
+#[test]
+fn a_train_into_a_splitter_strands_nothing_seed_5_sim() {
+    a_train_into_a_splitter_strands_nothing_at_seed(5);
+}
+#[test]
+fn a_train_into_a_splitter_strands_nothing_seed_7_sim() {
+    a_train_into_a_splitter_strands_nothing_at_seed(7);
+}
+#[test]
+fn a_train_into_a_splitter_strands_nothing_seed_13_sim() {
+    a_train_into_a_splitter_strands_nothing_at_seed(13);
+}
+#[test]
+fn a_train_into_a_splitter_strands_nothing_seed_17_sim() {
+    a_train_into_a_splitter_strands_nothing_at_seed(17);
 }
 
 #[test]

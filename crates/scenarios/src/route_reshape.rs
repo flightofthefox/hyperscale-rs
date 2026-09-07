@@ -71,16 +71,21 @@ enum Phase {
     /// No reshape pending: the transfer divides and its delivery lands.
     Live,
     /// The reshape admitted and pending — a split admitted, a merge
-    /// paired: the shard is departing, still including, and the transfer
-    /// divides and settles as it would anywhere.
+    /// paired: the shard is departing and still including. The transfer
+    /// divides and settles as it would anywhere, unless the shard's
+    /// terminal overtakes it first: the shard includes content up to its
+    /// cut and its terminal sweep abandons whatever is still in flight
+    /// there, so a transfer sent late in this phase can meet the fate a
+    /// draining one does.
     Departing,
     /// The gate drained: the reshape no longer pends, the shard still
     /// includes for a while, then coasts on empty blocks to its terminal.
-    /// A transfer it included settles; one it never included is accepted
-    /// on the payer's chain and delivered by the shard's successor once
-    /// the cut has landed the recipient's prefix there, or, where the
-    /// delivery window closes first, reclaimed on the successor's proof
-    /// that it never was.
+    /// A transfer it settled before the terminal settles; one it never
+    /// settled — never included, or included and overtaken by the cut —
+    /// is aborted on the payer's chain, or accepted there and delivered
+    /// by the shard's successor once the cut has landed the recipient's
+    /// prefix there, or, where nothing delivers it, reclaimed on the
+    /// successor's proof that nothing did.
     Draining,
 }
 
@@ -1045,11 +1050,12 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
 /// A transfer every few blocks from before the vote until the splitter
 /// has coasted, so the train holds every [`Phase`] — transfers the payer
 /// committed before the admission fold, ones committed while the split
-/// pended, and ones the coasting splitter never included — and, around the fold, the pair whose payer committed on
-/// one side of it and whose delivery landed on the other. A transfer the
-/// splitter included settles and credits its recipient once; one it
-/// never included credits its recipient exactly when the payer accepted
-/// it, by the child's delivery, and never otherwise.
+/// pended, and ones the coasting splitter never included — and, around
+/// the fold, the pair whose payer committed on one side of it and whose
+/// delivery landed on the other. A transfer the splitter settled credits
+/// its recipient once; one its terminal overtook, included or not,
+/// credits its recipient exactly when the payer accepted it and a chain
+/// holding the recipient delivered it, and never otherwise.
 ///
 /// # Panics
 ///
@@ -1212,16 +1218,17 @@ fn drive_train<C: Cluster>(
 }
 
 /// Every transfer's fate, once `terminating` has reached its terminal and
-/// nothing more can be included: whether it took the transfer is what
-/// decides between settling and refusal, and a recipient is credited
-/// exactly when its payer's transfer was accepted.
+/// nothing more can be included: whether it settled the transfer before
+/// its terminal is what decides between a settlement there and the
+/// successor's delivery or a reclaim, and a recipient is credited exactly
+/// when its payer's transfer was accepted and some chain delivered it.
 ///
 /// # Panics
 ///
 /// Panics if a successor is not served within budget, if a transfer sent
-/// before the drain was never included, if any transfer reaches a fate
-/// its phase does not allow, if a credit disagrees with a verdict, or if
-/// the train never reached the coast.
+/// while the shard was live was not settled by it, if any transfer
+/// reaches a fate its phase does not allow, if a credit disagrees with a
+/// verdict, or if the train never reached the coast.
 fn assert_train_fates<C: Cluster>(
     c: &mut C,
     terminating: ShardId,
@@ -1236,20 +1243,21 @@ fn assert_train_fates<C: Cluster>(
     }
     let mut never_included = 0;
     for (hash, to, phase) in sent {
-        let included = c.chain_fate(terminating, *hash).0.is_some();
+        let (included, settled) = c.chain_fate(terminating, *hash);
+        let settled = settled.is_some();
         assert!(
-            included || *phase == Phase::Draining,
-            "a transfer sent {phase:?} must be included by the leaving shard",
+            settled || *phase != Phase::Live,
+            "a transfer sent {phase:?} must be settled by the leaving shard",
         );
-        never_included += usize::from(!included);
-        let taken = if included {
-            "included"
-        } else {
-            "never included"
+        never_included += usize::from(included.is_none());
+        let taken = match (included.is_some(), settled) {
+            (_, true) => "settled",
+            (true, false) => "included but never settled",
+            (false, false) => "never included",
         };
         let status = await_tx_terminal(c, *hash, epochs(12));
         // The credit is the recipient's chain's to give: the leaving
-        // shard's or, for a transfer it never included, whichever
+        // shard's or, for a transfer it never settled, whichever
         // successor took the recipient's prefix. A transfer accepted by
         // its payer and by no chain holding the recipient is one whose
         // delivery lapsed, and the reclaim returns the payment — the
@@ -1261,7 +1269,7 @@ fn assert_train_fates<C: Cluster>(
                     .1
                     .is_some_and(|(_, decision)| decision == TransactionDecision::Accept)
             });
-        let credited = match (fate_owed(*phase, included), status, delivered) {
+        let credited = match (fate_owed(*phase, settled), status, delivered) {
             (
                 Fate::Settled | Fate::CarriedOrReclaimed,
                 Some(TransactionStatus::Completed(TransactionDecision::Accept)),
@@ -1296,26 +1304,27 @@ fn assert_train_fates<C: Cluster>(
 /// terminated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fate {
-    /// Settled on a chain that credited the recipient. The leaving shard
-    /// included it and settled it, whatever it was doing at the time.
+    /// Settled on a chain that credited the recipient: the leaving shard
+    /// settled it before its terminal, whatever it was doing at the time.
     Settled,
-    /// Carried by the successor that took the recipient's prefix, or, if
-    /// the delivery window closed before the successor could serve,
-    /// reclaimed on the successor's proof that it never delivered.
+    /// Aborted on the payer's chain, carried by the successor that took
+    /// the recipient's prefix, or, if nothing delivered it, reclaimed on
+    /// the successor's proof that nothing did.
     CarriedOrReclaimed,
 }
 
 /// The fate a phase owes a transfer the leaving shard did or did not
-/// include.
+/// settle.
 ///
 /// One shape takes two fates, and it is the one the reshape opens: a
-/// transfer the coasting shard never included races the delivery
-/// window's close. Everything else settles, so a run that crossed no cut
-/// satisfies no disjunction here.
-const fn fate_owed(phase: Phase, included: bool) -> Fate {
-    match (phase, included) {
-        (Phase::Live | Phase::Departing, _) | (Phase::Draining, true) => Fate::Settled,
-        (Phase::Draining, false) => Fate::CarriedOrReclaimed,
+/// transfer the leaving shard's terminal overtook — never included, or
+/// included and abandoned by the terminal sweep — races the delivery
+/// window's close. A live shard settles everything it takes, so a run
+/// that crossed no cut satisfies no disjunction here.
+const fn fate_owed(phase: Phase, settled: bool) -> Fate {
+    match (phase, settled) {
+        (Phase::Live, _) | (Phase::Departing | Phase::Draining, true) => Fate::Settled,
+        (Phase::Departing | Phase::Draining, false) => Fate::CarriedOrReclaimed,
     }
 }
 
