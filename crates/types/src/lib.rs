@@ -86,7 +86,7 @@ pub use execution::finalization::{
     MAX_EXECUTION_CERTIFICATES_PER_TICK, ReceiptValidationError, Settles, TickHalf,
     refused_transactions, settles,
 };
-pub use execution::outcome::{EscrowedValue, ExecutionOutcome, TxOutcome};
+pub use execution::outcome::{EscrowedValue, ExecutionOutcome, Role, TxOutcome};
 pub use execution::receipt_tree::{
     compute_global_receipt_root, compute_global_receipt_root_with_proof, tx_outcome_leaf,
 };

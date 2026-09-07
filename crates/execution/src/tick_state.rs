@@ -40,8 +40,8 @@ use std::time::Duration;
 use hyperscale_engine::legs::Member;
 use hyperscale_types::{
     BlockHash, BlockHeight, EscrowedValue, ExecutionCertificate, ExecutionOutcome, Finalization,
-    GlobalReceiptRoot, MAX_FINALIZATION_DELAY, Settles, ShardId, StoredReceipt, TickHalf, TickId,
-    TransactionDecision, TxHash, TxOutcome, Verified, WeightedTimestamp,
+    GlobalReceiptRoot, MAX_FINALIZATION_DELAY, Role, Settles, ShardId, StoredReceipt, TickHalf,
+    TickId, TransactionDecision, TxHash, TxOutcome, Verified, WeightedTimestamp,
     compute_global_receipt_root, refused_transactions, settles,
 };
 
@@ -97,13 +97,11 @@ pub struct Divergence {
 pub struct Membership {
     awaited: BTreeSet<ShardId>,
     reach: BTreeSet<ShardId>,
-    decides: bool,
-    delivers: bool,
-    executes: bool,
+    role: Role,
 }
 
 impl Membership {
-    /// The two sets and the two bits `member` answers — a cache of its
+    /// The two sets and the role `member` answers — a cache of its
     /// derivation, in the shape a tick carries.
     #[must_use]
     pub fn of(member: &Member) -> Self {
@@ -112,12 +110,19 @@ impl Membership {
             awaited.is_subset(member.reach()),
             "a member awaits only shards the transaction reaches"
         );
+        let role = if !member.classified().decomposed().holds() {
+            Role::Whole
+        } else if member.in_core() {
+            Role::Core
+        } else if member.delivers() {
+            Role::Delivery
+        } else {
+            Role::Leg
+        };
         Self {
             awaited,
             reach: member.reach().clone(),
-            decides: member.decides(),
-            delivers: member.delivers(),
-            executes: true,
+            role,
         }
     }
 
@@ -128,9 +133,7 @@ impl Membership {
         Self {
             awaited: participating.clone(),
             reach: participating,
-            decides: true,
-            delivers: false,
-            executes: true,
+            role: Role::Whole,
         }
     }
 
@@ -144,40 +147,37 @@ impl Membership {
         Self {
             awaited: BTreeSet::from([local]),
             reach: BTreeSet::from([local]),
-            decides: false,
-            delivers: false,
-            executes: false,
+            role: Role::Retiring,
         }
     }
 
     /// This membership for a member that settles what an execution left
     /// rather than executing the transaction: a reclaim, an abandonment,
-    /// an inherited record's. The verdict and the awaited set stay as
-    /// stated; only the attestation that it executed is withdrawn.
+    /// an inherited record's. The awaited set stays as stated; the
+    /// member decides and executes nothing.
     #[must_use]
     pub const fn settling(mut self) -> Self {
-        self.executes = false;
+        self.role = Role::Settling;
         self
+    }
+
+    /// What this shard is to the transaction.
+    #[must_use]
+    pub const fn role(&self) -> Role {
+        self.role
     }
 
     /// Whether this member executes the transaction itself.
     #[must_use]
     pub const fn executes(&self) -> bool {
-        self.executes
-    }
-
-    /// Whether this shard's certificate bears the verdict on the
-    /// transaction.
-    #[must_use]
-    pub const fn decides(&self) -> bool {
-        self.decides
+        self.role.executes()
     }
 
     /// Whether this shard only delivers for the transaction, so that no
     /// outcome of its own — a failure included — bears the verdict.
     #[must_use]
     pub const fn delivers(&self) -> bool {
-        self.delivers
+        self.role.delivers()
     }
 
     /// The shards whose certificates settlement waits on, this one
@@ -794,15 +794,6 @@ impl TickState {
                     .iter()
                     .copied()
                     .filter(|&shard| shard != local);
-                // Whether this certificate decides the transaction. A
-                // leg's success decides nothing — its core does — but
-                // a leg that failed is the transaction's end here, unless
-                // it only delivered: a failed delivery leaves the value
-                // in its cell for a later claim and decides nothing.
-                let membership = self.membership.get(tx_hash);
-                let decides = membership.is_none_or(Membership::decides)
-                    || (!membership.is_some_and(Membership::delivers)
-                        && !matches!(outcome, ExecutionOutcome::Succeeded { .. }));
                 let charge = self
                     .fee_receipts
                     .get(tx_hash)
@@ -827,9 +818,11 @@ impl TickState {
                 .awaiting(counterparts)
                 .escrowing(escrowed)
                 .crossing_to(targets)
-                .deciding(decides)
-                .reaching_beyond(membership.is_some_and(|m| m.reaches_beyond(local)))
-                .executing(membership.is_none_or(Membership::executes))
+                .as_role(
+                    self.membership
+                        .get(tx_hash)
+                        .map_or(Role::Whole, Membership::role),
+                )
             })
             .collect();
 
@@ -1632,7 +1625,11 @@ mod tests {
             "a leg awaits itself"
         );
         assert_eq!(caller.reach(), &participating);
-        assert!(!caller.decides(), "and its core decides the transaction");
+        assert_eq!(
+            caller.role(),
+            Role::Leg,
+            "and its core decides the transaction"
+        );
         let venue = Membership::of(&member_of(&swap, high, &participating));
         assert_eq!(
             venue.awaited(),
@@ -1640,7 +1637,7 @@ mod tests {
             "a single-shard core awaits itself"
         );
         assert_eq!(venue.reach(), &participating);
-        assert!(venue.decides(), "and decides");
+        assert_eq!(venue.role(), Role::Core, "and decides");
 
         let route = Classified::freeze(&route(), &[], &trie);
         let participating = BTreeSet::from([low, high, third]);
@@ -1705,7 +1702,7 @@ mod tests {
             participating.clone(),
         ));
         assert!(membership.delivers());
-        assert!(!membership.decides());
+        assert_eq!(membership.role(), Role::Delivery);
         tick.admit(delivery, membership, 10, Admission::Executes);
         let issuer = tx(2);
         tick.admit(

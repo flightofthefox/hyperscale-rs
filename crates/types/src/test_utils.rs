@@ -17,7 +17,7 @@ use crate::{
     ConsensusPublicKey, ConsensusSignature, DeclaredKey, Derivation, DerivationError, Derived,
     EnvelopeExt, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
     MerkleInclusionProof, NetworkDefinition, NetworkId, ProposerTimestamp, ProtocolStatics,
-    QuorumCertificate, Round, Routing, ShardForkProof, ShardId, SignerBitfield, StateRoot,
+    QuorumCertificate, Role, Round, Routing, ShardForkProof, ShardId, SignerBitfield, StateRoot,
     SubintentSig, TickHalf, TickId, TimestampRange, TopologySnapshot, Transaction, TransactionBody,
     TransactionDecision, TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo,
     ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources,
@@ -833,7 +833,10 @@ pub fn make_finalization_awaiting(
 pub fn make_settling_finalization(block_height: BlockHeight, tx_hash: TxHash) -> Finalization {
     finalization_of(
         block_height,
-        vec![TxOutcome::new(tx_hash, outcome_of(TransactionDecision::Accept)).executing(false)],
+        vec![
+            TxOutcome::new(tx_hash, outcome_of(TransactionDecision::Accept))
+                .as_role(Role::Settling),
+        ],
     )
 }
 
@@ -884,7 +887,7 @@ pub fn make_undecided_finalization(
 ) -> Finalization {
     finalization_of(
         block_height,
-        vec![TxOutcome::new(tx_hash, outcome_of(decision)).deciding(false)],
+        vec![TxOutcome::new(tx_hash, outcome_of(decision)).as_role(Role::Delivery)],
     )
 }
 

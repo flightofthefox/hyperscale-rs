@@ -116,7 +116,7 @@ mod tests {
     use hyperscale_vm_types::{Address, AddressClass, LocalKey, ResourceAddr, SubstateKey};
 
     use super::*;
-    use crate::{EscrowedValue, ExecutionOutcome, GlobalReceiptHash, ShardId, TxHash};
+    use crate::{EscrowedValue, ExecutionOutcome, GlobalReceiptHash, Role, ShardId, TxHash};
 
     /// Whether an outcome decides its transaction is under the signed
     /// leaf: a leg's success and a core's are otherwise identical bytes.
@@ -134,7 +134,7 @@ mod tests {
         );
         assert_ne!(
             tx_outcome_leaf(&outcome),
-            tx_outcome_leaf(&outcome.clone().deciding(false)),
+            tx_outcome_leaf(&outcome.clone().as_role(Role::Leg)),
         );
     }
 
@@ -155,7 +155,7 @@ mod tests {
         );
         assert_ne!(
             tx_outcome_leaf(&outcome),
-            tx_outcome_leaf(&outcome.clone().executing(false)),
+            tx_outcome_leaf(&outcome.clone().as_role(Role::Settling)),
         );
     }
 

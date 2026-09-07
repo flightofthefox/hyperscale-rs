@@ -34,6 +34,59 @@ pub struct EscrowedValue {
 
 /// Per-transaction execution outcome within a tick.
 ///
+/// What the attesting shard was to a transaction, as its certificate
+/// says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
+pub enum Role {
+    /// The whole shape: a transaction on one shard, or a participant of
+    /// one that runs undivided across several.
+    Whole,
+    /// A member of a divided transaction's core, whose certificate is a
+    /// share of the verdict.
+    Core,
+    /// A leg outside the core: its success is its own part and the core
+    /// decides, but a leg that could not issue is the transaction's end
+    /// on its shard.
+    Leg,
+    /// A delivery: claims what crossed to it and decides nothing either
+    /// way, since a delivery that failed leaves the value in its cell
+    /// for a later claim.
+    Delivery,
+    /// A member settling what an execution left, with a verdict of its
+    /// own: a reclaim, an abandonment, an inherited record's member.
+    Settling,
+    /// Housekeeping deciding nothing: a retirement, deleting records
+    /// whose claims committed elsewhere, where a verdict here would be a
+    /// second one on a chain that may already hold the first.
+    Retiring,
+}
+
+impl Role {
+    /// Whether an outcome with this role and `outcome` bears the verdict
+    /// on the transaction for the certifying shard.
+    #[must_use]
+    pub const fn decides(self, outcome: &ExecutionOutcome) -> bool {
+        match self {
+            Self::Whole | Self::Core | Self::Settling => true,
+            Self::Leg => !matches!(outcome, ExecutionOutcome::Succeeded { .. }),
+            Self::Delivery | Self::Retiring => false,
+        }
+    }
+
+    /// Whether the outcome is the transaction's own execution, rather
+    /// than a member settling what one left.
+    #[must_use]
+    pub const fn executes(self) -> bool {
+        matches!(self, Self::Whole | Self::Core | Self::Leg | Self::Delivery)
+    }
+
+    /// Whether the member only delivers.
+    #[must_use]
+    pub const fn delivers(self) -> bool {
+        matches!(self, Self::Delivery)
+    }
+}
+
 /// Carried inside execution certificates so remote shards can extract
 /// individual transaction results for cross-shard finalization.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
@@ -120,36 +173,17 @@ pub struct TxOutcome {
     /// resolve the trie the issuer used.
     #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
     crossing_targets: Vec<ShardId>,
-    /// Whether this outcome bears the verdict on the transaction for the
-    /// certifying shard.
-    ///
-    /// False for a leg that succeeded: it ran only its own part, and the
-    /// transaction is decided by its core, so the finalization carrying
-    /// it resolves nothing and a later one — the reclaim's — may name
-    /// the hash again. True for everything else, a failed leg included:
-    /// a leg that could not issue is the transaction's end on its shard.
+    /// What the attesting shard was to the transaction: the one fact
+    /// that says whether this outcome bears the verdict, whether it is
+    /// the transaction's own execution, and whether a counterpart could
+    /// ask about it.
     ///
     /// Attested rather than derived because it cannot be: a leg and a
-    /// single-shard core both await nobody and both may escrow, and only
-    /// the classification the certifying shard froze tells them apart.
-    decides: bool,
-    /// Whether the transaction reaches a shard other than the attesting
-    /// one — what makes a counterpart able to ask about this verdict,
-    /// whatever certificates the finalization carrying it collected. A
-    /// member that answers to nobody leaves no other trace of the shards
-    /// that will ask.
-    reaches_beyond: bool,
-    /// Whether this outcome is the transaction's own execution, rather
-    /// than a member settling what one left — a reclaim, a retirement,
-    /// an abandonment, or an inherited record's.
-    ///
-    /// Attested rather than derived because it cannot be: a reclaim and
-    /// a single-shard core both decide, both await nobody and both
-    /// succeed, and only the tick that admitted the member knows which
-    /// it composed. What reads it is the deadline: a success that
-    /// executes past it is one a leg may already have reclaimed against,
-    /// where a settling member is past it by construction.
-    executes: bool,
+    /// single-shard core both await nobody and both may escrow, a
+    /// reclaim and a single-shard core both decide and both succeed, and
+    /// only the classification the certifying shard froze and the tick
+    /// that admitted the member tell them apart.
+    role: Role,
 }
 
 impl TxOutcome {
@@ -171,9 +205,7 @@ impl TxOutcome {
             counterparts: Vec::new(),
             escrowed: Vec::new(),
             crossing_targets: Vec::new(),
-            decides: true,
-            reaches_beyond: false,
-            executes: true,
+            role: Role::Whole,
         }
     }
 
@@ -218,47 +250,45 @@ impl TxOutcome {
         self
     }
 
-    /// Bind whether this outcome bears the verdict on the transaction.
+    /// Bind what the attesting shard was to the transaction.
     #[must_use]
-    pub const fn deciding(mut self, decides: bool) -> Self {
-        self.decides = decides;
+    pub const fn as_role(mut self, role: Role) -> Self {
+        self.role = role;
         self
     }
 
-    /// State whether the transaction reaches a shard other than the
-    /// attesting one.
+    /// What the attesting shard was to the transaction.
     #[must_use]
-    pub const fn reaching_beyond(mut self, reaches_beyond: bool) -> Self {
-        self.reaches_beyond = reaches_beyond;
-        self
+    pub const fn role(&self) -> Role {
+        self.role
     }
 
     /// Whether the transaction reaches a shard other than the attesting
-    /// one — whether any counterpart could ask about this verdict.
+    /// one — whether any counterpart could ask about this verdict. A
+    /// divided transaction's members reach beyond by construction; a
+    /// whole shape or a settling member reaches exactly the shards its
+    /// settlement waits on.
     #[must_use]
     pub const fn reaches_beyond(&self) -> bool {
-        self.reaches_beyond
+        match self.role {
+            Role::Core | Role::Leg | Role::Delivery => true,
+            Role::Whole | Role::Settling => !self.counterparts.is_empty(),
+            Role::Retiring => false,
+        }
     }
 
     /// Whether this outcome bears the verdict on the transaction for the
     /// certifying shard — what lets its finalization resolve the hash.
     #[must_use]
     pub const fn decides(&self) -> bool {
-        self.decides
-    }
-
-    /// State whether this outcome is the transaction's own execution.
-    #[must_use]
-    pub const fn executing(mut self, executes: bool) -> Self {
-        self.executes = executes;
-        self
+        self.role.decides(&self.outcome)
     }
 
     /// Whether this outcome is the transaction's own execution, rather
     /// than a member settling what one left.
     #[must_use]
     pub const fn executes(&self) -> bool {
-        self.executes
+        self.role.executes()
     }
 
     /// Create a `TxOutcome` that settles the payer's charge through the
@@ -286,9 +316,7 @@ impl TxOutcome {
             counterparts: Vec::new(),
             escrowed: Vec::new(),
             crossing_targets: Vec::new(),
-            decides: true,
-            reaches_beyond: false,
-            executes: true,
+            role: Role::Whole,
         }
     }
 

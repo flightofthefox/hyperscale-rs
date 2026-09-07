@@ -103,7 +103,7 @@ mod tests {
     use super::*;
     use crate::{
         AggregateSignature, BlockHeight, ExecutionCertificate, GlobalReceiptHash,
-        GlobalReceiptRoot, SignerBitfield, TickHalf, TickId, WeightedTimestamp,
+        GlobalReceiptRoot, Role, SignerBitfield, TickHalf, TickId, WeightedTimestamp,
     };
 
     fn tx(seed: u8) -> TxHash {
@@ -174,13 +174,10 @@ mod tests {
                     local,
                     vec![
                         TxOutcome::new(jointly_aborted, ExecutionOutcome::Aborted)
-                            .awaiting([remote])
-                            .reaching_beyond(true),
-                        TxOutcome::new(claim, succeeded()).reaching_beyond(true),
-                        TxOutcome::new(refusal, ExecutionOutcome::Failed).reaching_beyond(true),
-                        TxOutcome::new(abandonment, ExecutionOutcome::Aborted)
-                            .awaiting([remote])
-                            .reaching_beyond(true),
+                            .awaiting([remote]),
+                        TxOutcome::new(claim, succeeded()).as_role(Role::Delivery),
+                        TxOutcome::new(refusal, ExecutionOutcome::Failed).as_role(Role::Leg),
+                        TxOutcome::new(abandonment, ExecutionOutcome::Aborted).awaiting([remote]),
                         TxOutcome::new(alone, succeeded()),
                     ],
                 ),
