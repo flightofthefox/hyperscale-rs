@@ -12,7 +12,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use hyperscale_engine::committed_cells;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_node::reshape::PreparedStore;
@@ -30,8 +29,8 @@ use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{GetRemoteHeadersRequest, GetStateRangeRequest};
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, EpochWindows, PredecessorTerminal, ReshapeSeat, ShardAnchor,
-    ShardId, StateRoot, SubstateLeaf, ValidatorId,
+    Block, BlockHeight, ChainOrigin, PredecessorTerminal, ReshapeSeat, ShardAnchor, ShardId,
+    StateRoot, SubstateKey, SubstateLeaf, ValidatorId,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -128,8 +127,8 @@ impl ShardSupervisor {
     /// populates its own duty maps — the window in which an ordinary join would
     /// otherwise race the reshape duty for the shard's store directory.
     pub(super) fn reshape_owns(&self, shard: ShardId) -> bool {
-        let topology_snapshot = self.process.topology_snapshot().load_full();
-        let view = ReshapeView::new(&topology_snapshot, self.epoch_duration_ms);
+        let schedule = self.process.topology_schedule();
+        let view = ReshapeView::new(&schedule);
         host_reshape_owns(
             view.parent_half_cohorts(),
             view.observer_cohorts(),
@@ -146,8 +145,8 @@ impl ShardSupervisor {
     pub(crate) fn reshape_step(&mut self, events: Vec<ReshapeEvent>) {
         self.resume_pending_reshape_prep();
         let requests = {
-            let topology_snapshot = self.process.topology_snapshot().load_full();
-            let view = ReshapeView::new(&topology_snapshot, self.epoch_duration_ms);
+            let schedule = self.process.topology_schedule();
+            let view = ReshapeView::new(&schedule);
             self.reshape
                 .step(&view, self.verifier.as_ref(), events, wall_clock_local())
         };
@@ -218,7 +217,11 @@ impl ShardSupervisor {
             ReshapeRequest::FinalizeImport { shard, height } => {
                 self.reshape_finalize(shard, height);
             }
-            ReshapeRequest::ApplyFollow { shard, block } => self.reshape_apply(shard, block),
+            ReshapeRequest::ApplyFollow {
+                shard,
+                block,
+                creations,
+            } => self.reshape_apply(shard, block, creations),
             ReshapeRequest::BroadcastReady {
                 validator,
                 child,
@@ -573,7 +576,12 @@ impl ShardSupervisor {
 
     /// Apply a followed parent block's writes into a reshape duty's store
     /// off the loop, answering with [`ReshapeIo::Applied`].
-    fn reshape_apply(&self, shard: ShardId, block: Arc<Block>) {
+    fn reshape_apply(
+        &self,
+        shard: ShardId,
+        block: Arc<Block>,
+        creations: Vec<(SubstateKey, Vec<u8>)>,
+    ) {
         let Some(storage) = self
             .reshape_stores
             .get(&shard)
@@ -581,30 +589,6 @@ impl ShardSupervisor {
         else {
             warn!(shard = ?shard, "Reshape follow apply for an unopened store; dropped");
             return;
-        };
-        // The block is the parent's, classified under the parent's own
-        // window: once the cut has landed the current snapshot places the
-        // parent's owners on its children, and no core would contain it.
-        // A block carrying no transactions creates nothing and needs no
-        // window.
-        let creations = if block.transactions().is_empty() {
-            Vec::new()
-        } else {
-            let anchor = block.header().parent_qc().weighted_timestamp();
-            let epoch = EpochWindows::new(self.epoch_duration_ms).epoch_for(anchor);
-            let Some(topology) = self.process.topology_at(epoch) else {
-                warn!(
-                    shard = ?shard,
-                    ?epoch,
-                    "Reshape follow apply for a window this host holds no topology for; dropped"
-                );
-                return;
-            };
-            committed_cells(
-                block.header().shard_id(),
-                topology.shard_trie(),
-                block.transactions().iter().map(|tx| tx.as_unverified()),
-            )
         };
         let events = self.events_tx.clone();
         self.tokio_handle.spawn_blocking(move || {

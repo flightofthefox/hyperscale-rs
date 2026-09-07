@@ -16,7 +16,7 @@ use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
     BeaconProposal, BeaconWitnessCommit, CertifiedBlock, Epoch, PredecessorTerminal,
-    RoutingCommittees, TopologySnapshot, TransactionStatus, TxHash, ValidatorId, Verified,
+    TopologySchedule, TransactionStatus, TxHash, ValidatorId, Verified,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -265,18 +265,8 @@ where
                 let now = self.now;
                 self.io.tx_phase_times.record_ec_created(&tx_hashes, now);
             }
-            Action::TopologyChanged {
-                epoch,
-                topology_snapshot,
-                lookahead,
-                routing_committees,
-            } => {
-                self.handle_topology_changed(
-                    epoch,
-                    &topology_snapshot,
-                    lookahead,
-                    routing_committees,
-                );
+            Action::TopologyChanged { epoch, schedule } => {
+                self.handle_topology_changed(epoch, schedule);
             }
             Action::ReconfigureParticipation(change) => {
                 self.pending_participation_changes.push(change);
@@ -916,26 +906,25 @@ where
         });
     }
 
-    /// Adopt a fresh topology snapshot: publish it through the lock-free
-    /// `ArcSwap` so off-thread closures pick it up on their next `.load()`,
-    /// and push it to the network adapter (which keys validator pubkeys
-    /// and shard committees off the snapshot). Every hosted shard's
-    /// `Action::TopologyChanged` lands here as it folds the beacon at `epoch`;
-    /// `apply_topology` gates the store monotonically so a slower shard thread
-    /// cannot regress the shared snapshot to an older epoch's view.
+    /// Adopt a freshly folded schedule: publish its head through the
+    /// lock-free `ArcSwap` so off-thread closures pick it up on their
+    /// next `.load()`, and push it to the network adapter (which keys
+    /// validator pubkeys and shard committees off the snapshot). Every
+    /// hosted shard's `Action::TopologyChanged` lands here as it folds
+    /// the beacon at `epoch`; `apply_topology` gates the store
+    /// monotonically so a slower shard thread cannot regress the shared
+    /// schedule to an older epoch's view.
     pub(in crate::shard) fn handle_topology_changed(
         &self,
         epoch: Epoch,
-        topology_snapshot: &Arc<TopologySnapshot>,
-        lookahead: Arc<TopologySnapshot>,
-        routing_committees: Arc<RoutingCommittees>,
+        schedule: Arc<TopologySchedule>,
     ) {
-        self.process
-            .apply_topology(epoch, topology_snapshot, lookahead, routing_committees);
+        let committee_size = schedule.head().committee_for_shard(self.shard).len();
+        self.process.apply_topology(epoch, schedule);
 
         tracing::info!(
             local_shard = self.shard.inner(),
-            committee_size = topology_snapshot.committee_for_shard(self.shard).len(),
+            committee_size,
             "Network topology updated"
         );
     }

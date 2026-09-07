@@ -83,6 +83,26 @@ pub fn anchor_trie(schedule: &TopologySchedule, anchor: WeightedTimestamp) -> Sh
     }
 }
 
+/// The committed cells `block` writes.
+///
+/// One per transaction it carries whose core spans more than one shard,
+/// the block's own among them, classified under the trie of the window
+/// the block is anchored in. Which transactions write a cell is a fact
+/// of placement, so every reader of the block's root — the proposer's
+/// voters, a replica committing it on its certificate alone, a split
+/// child following it — derives the set here, under the one trie.
+#[must_use]
+pub fn committed_cells_for(
+    block: &Block,
+    schedule: &TopologySchedule,
+) -> Vec<(SubstateKey, Vec<u8>)> {
+    committed_cells(
+        block.header().shard_id(),
+        &anchor_trie(schedule, block.header().parent_qc().weighted_timestamp()),
+        block.transactions().iter().map(|tx| tx.as_unverified()),
+    )
+}
+
 /// Every transaction the block's finalizations resolve without deciding.
 fn undecided_names(block: &Block) -> Vec<TxHash> {
     block
@@ -2276,18 +2296,7 @@ impl VerificationPipeline {
             block.certificates().iter().cloned().collect();
         let block_tx_hashes: Vec<TxHash> =
             block.transactions().iter().map(|tx| tx.hash()).collect();
-        // Under the block's own window: which transactions write a cell
-        // is a fact of placement, and the root a voter recomputes has to
-        // be the one the proposer derived under the same trie.
-        let trie = anchor_trie(
-            topology_schedule,
-            block.header().parent_qc().weighted_timestamp(),
-        );
-        let creations = committed_cells(
-            block.header().shard_id(),
-            &trie,
-            block.transactions().iter().map(|tx| tx.as_unverified()),
-        );
+        let creations = committed_cells_for(block, topology_schedule);
         Some(ReadyStateRootVerification {
             block_hash: pending.block_hash,
             parent_block_hash: pending.parent_block_hash,

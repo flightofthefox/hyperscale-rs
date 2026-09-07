@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_shard::committed_cells_for;
 use hyperscale_storage::ImportProgress;
 use hyperscale_types::network::request::{
     GetBlockRequest, GetRemoteHeadersRequest, GetStateRangeRequest,
@@ -32,8 +33,8 @@ use hyperscale_types::network::response::{
 };
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, LocalTimestamp, NetworkDefinition,
-    PredecessorTerminal, QuorumCertificate, ShardAnchor, ShardId, StateRoot, SubstateLeaf,
-    ValidatorId, Verifier, WeightedTimestamp,
+    PredecessorTerminal, QuorumCertificate, ShardAnchor, ShardId, StateRoot, SubstateKey,
+    SubstateLeaf, ValidatorId, Verifier, WeightedTimestamp,
 };
 
 use crate::bootstrap::{BootstrapRequest, ShardBootstrap, StateRangeOutcome};
@@ -145,10 +146,10 @@ pub enum ReshapeRequest {
         shard: ShardId,
         /// The followed block, whole: its settled receipts, the
         /// transactions it committed, and the sweep its header names.
-        /// The driver derives the committed cells it wrote under the
-        /// block's own window, which it holds and this orchestrator
-        /// does not.
         block: Arc<Block>,
+        /// The committed cells the block wrote, classified under its own
+        /// window.
+        creations: Vec<(SubstateKey, Vec<u8>)>,
     },
     /// Sign a ready signal for `validator` attesting the sync of `child`,
     /// anchored at `anchor`, and notify `recipients` — the target committee
@@ -1228,9 +1229,11 @@ impl ReshapeOrchestrator {
                     });
                 }
                 if let Some(block) = tail.take_apply() {
+                    let creations = committed_cells_for(&block, view.schedule());
                     out.push(ReshapeRequest::ApplyFollow {
                         shard: child,
                         block,
+                        creations,
                     });
                 }
             }
@@ -1886,9 +1889,9 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHash, BlockHeight, Hash, LocalTimestamp, NetworkDefinition,
-        ReshapeSeat, ShardAnchor, ShardId, Signer, StateRoot, TopologySnapshot, ValidatorId,
-        ValidatorInfo, ValidatorSet, WeightedTimestamp,
+        BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Hash, LocalTimestamp,
+        NetworkDefinition, ReshapeSeat, ShardAnchor, ShardId, Signer, StateRoot, TopologySchedule,
+        TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, WeightedTimestamp,
     };
 
     use super::{
@@ -1928,6 +1931,11 @@ mod tests {
             terminal_roots: None,
             handoff_complete: None,
         }
+    }
+
+    /// A schedule headed by `snapshot`, cut into one-second windows.
+    fn windowed(snapshot: &TopologySnapshot) -> TopologySchedule {
+        TopologySchedule::new(1_000, Epoch::GENESIS, std::sync::Arc::new(snapshot.clone()))
     }
 
     /// Project a snapshot with the given committees, observer cohort seats
@@ -2087,7 +2095,7 @@ mod tests {
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
         let requests = orch.step(
-            &ReshapeView::new(&snap, 1_000),
+            &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
             Vec::new(),
             at(0),
@@ -2108,7 +2116,7 @@ mod tests {
 
         assert!(
             orch.step(
-                &ReshapeView::new(&snap, 1_000),
+                &ReshapeView::new(&windowed(&snap)),
                 &BlsVerifier,
                 Vec::new(),
                 at(0)
@@ -2134,7 +2142,7 @@ mod tests {
         );
 
         let requests = orch.step(
-            &ReshapeView::new(&snap, 1_000),
+            &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
             Vec::new(),
             at(0),
@@ -2173,7 +2181,7 @@ mod tests {
         orch.observers.insert(child, duty);
 
         let requests = orch.step(
-            &ReshapeView::new(&snap, 1_000),
+            &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
             Vec::new(),
             at(0),
@@ -2190,7 +2198,7 @@ mod tests {
         // step's advance re-emits it, leaving it unacked again — the
         // finalize gate stays closed until a Staged ack lands.
         let requests = orch.step(
-            &ReshapeView::new(&snap, 1_000),
+            &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
             vec![ReshapeEvent::StageFailed {
                 shard: child,
@@ -2227,7 +2235,7 @@ mod tests {
         );
 
         let requests = orch.step(
-            &ReshapeView::new(&snap, 1_000),
+            &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
             Vec::new(),
             at(0),
@@ -2267,7 +2275,8 @@ mod tests {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
         let snap = snapshot(&[(parent, &[1, 2, 3, 5])], &[], &[parent]);
-        let view = ReshapeView::new(&snap, 1_000);
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
         let mut orch = following_observer(parent, child);
 
         // A minute of pumping at the production tick's cadence.
@@ -2299,7 +2308,8 @@ mod tests {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
         let snap = snapshot(&[(parent, &[1, 2, 3, 5])], &[], &[parent]);
-        let view = ReshapeView::new(&snap, 1_000);
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
         let mut orch = following_observer(parent, child);
 
         let asserts = (0..64)
@@ -2328,7 +2338,8 @@ mod tests {
 
         // Run the first window out to where it has backed off well past the
         // tick.
-        let view = ReshapeView::new(&snap, 1_000);
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
         for ms in (0..60_000).step_by(1_000) {
             let _ = orch.step(&view, &BlsVerifier, Vec::new(), at(ms));
         }
@@ -2349,7 +2360,7 @@ mod tests {
             anchor_at(WeightedTimestamp::from_millis(30_000)),
         );
         let requests = orch.step(
-            &ReshapeView::new(&rolled, 1_000),
+            &ReshapeView::new(&windowed(&rolled)),
             &BlsVerifier,
             Vec::new(),
             at(60_000),
@@ -2375,7 +2386,8 @@ mod tests {
             &[(parent, 5, child, true)],
             &[parent],
         );
-        let view = ReshapeView::new(&snap, 1_000);
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
         orch.observers.insert(
             child,
@@ -2409,7 +2421,8 @@ mod tests {
             &[(own_child, 5, parent, true)],
             &[own_child],
         );
-        let view = ReshapeView::new(&snap, 1_000);
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
         for step in 0..8 {
@@ -2430,7 +2443,8 @@ mod tests {
         // Both children seeded → the gate fires; the terminal fetch addresses
         // the child committee.
         let snap = snapshot(&[(child, &[1, 2])], &[], &[parent, child, sibling]);
-        let view = ReshapeView::new(&snap, 1_000);
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
         orch.observers.insert(
             child,
@@ -2470,7 +2484,7 @@ mod tests {
         );
 
         let requests = orch.step(
-            &ReshapeView::new(&snap, 1_000),
+            &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
             Vec::new(),
             at(0),
@@ -2496,7 +2510,7 @@ mod tests {
 
         assert!(
             orch.step(
-                &ReshapeView::new(&snap, 1_000),
+                &ReshapeView::new(&windowed(&snap)),
                 &BlsVerifier,
                 Vec::new(),
                 at(0)
@@ -2519,7 +2533,7 @@ mod tests {
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
         let requests = orch.step(
-            &ReshapeView::new(&snap, 1_000),
+            &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
             Vec::new(),
             at(0),
@@ -2546,7 +2560,8 @@ mod tests {
             &[(left, 5, parent)],
             &[parent, left, right],
         );
-        let view = ReshapeView::new(&snap, 1_000);
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
         // First step fires the gate (ReassertingReady → Building); the second
@@ -2609,7 +2624,7 @@ mod tests {
         );
 
         let requests = orch.step(
-            &ReshapeView::new(&snap, 1_000),
+            &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
             Vec::new(),
             at(0),
@@ -2631,7 +2646,7 @@ mod tests {
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
         let requests = orch.step(
-            &ReshapeView::new(&snap, 1_000),
+            &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
             Vec::new(),
             at(0),
@@ -2652,7 +2667,8 @@ mod tests {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
         let snap = snapshot_parent_halves(&[(child, &[1, 5])], &[(child, 5, parent)], &[child]);
-        let view = ReshapeView::new(&snap, 1_000);
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
         // The first step seeds; the seed is one-shot, so the next is quiet.
@@ -2691,7 +2707,7 @@ mod tests {
         let mut orch = ReshapeOrchestrator::new(vec![vid(5), vid(6)]);
 
         let requests = orch.step(
-            &ReshapeView::new(&snap, 1_000),
+            &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
             Vec::new(),
             at(0),
@@ -2730,7 +2746,7 @@ mod tests {
         // Placed on the child committee → seat, then persist while the
         // projection still lists the cohort.
         let requests = orch.step(
-            &ReshapeView::new(&snap, 1_000),
+            &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
             Vec::new(),
             at(0),
@@ -2748,7 +2764,7 @@ mod tests {
         // cohort, and the seated duty is dropped.
         let released = snapshot_parent_halves(&[(child, &[1, 5])], &[], &[child]);
         let _ = orch.step(
-            &ReshapeView::new(&released, 1_000),
+            &ReshapeView::new(&windowed(&released)),
             &BlsVerifier,
             Vec::new(),
             at(0),
@@ -2783,7 +2799,7 @@ mod tests {
             .insert(child, adopted_duty(parent, child, anchor().block_hash));
 
         let requests = orch.step(
-            &ReshapeView::new(&snap, 1_000),
+            &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
             Vec::new(),
             at(0),
@@ -2819,7 +2835,7 @@ mod tests {
             .insert(child, adopted_duty(parent, child, derived));
 
         let requests = orch.step(
-            &ReshapeView::new(&snap, 1_000),
+            &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
             Vec::new(),
             at(0),
@@ -2851,7 +2867,7 @@ mod tests {
             .insert(child, adopted_duty(parent, child, forged));
 
         let requests = orch.step(
-            &ReshapeView::new(&snap, 1_000),
+            &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
             Vec::new(),
             at(0),
@@ -2895,7 +2911,8 @@ mod tests {
             },
         );
 
-        let view = ReshapeView::new(&snap, 1_000);
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
         // The first step leaves `Recognizing`; the second emits the seed the
         // anchor path opens with.
         let _ = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
@@ -2956,7 +2973,8 @@ mod tests {
             },
         );
 
-        let view = ReshapeView::new(&snap, 1_000);
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
         let _ = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
         assert!(
             matches!(

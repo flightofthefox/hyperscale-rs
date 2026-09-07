@@ -18,12 +18,13 @@ use hyperscale_types::{
     PcVoteEquivocation, PrincipalAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap,
     Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote,
     ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round,
-    RoutingCommittees, ShardForkProof, ShardId, ShardLoad, ShardTrie, ShardVoteEquivocation,
-    SharedCertificates, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
-    SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry,
-    SubstateKey, SweepFrontier, TerminalEvidence, TerminalRoots, TickId, Timeout, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome, UnsettledTx, ValidatorId,
-    Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp, WorkInFlight,
+    ShardForkProof, ShardId, ShardLoad, ShardTrie, ShardVoteEquivocation, SharedCertificates,
+    SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
+    SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry, SubstateKey,
+    SweepFrontier, TerminalEvidence, TerminalRoots, TickId, Timeout, TopologySchedule,
+    TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
+    UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
+    WorkInFlight,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -1276,32 +1277,21 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Topology
     // ═══════════════════════════════════════════════════════════════════════
-    /// Propagate updated topology to the `io_loop` / network layer.
+    /// Propagate the folded topology to the `io_loop` / network layer.
     ///
-    /// Emitted by the state machine after any topology mutation. The
-    /// `io_loop` stores the snapshot into its shared topology snapshot
-    /// (`ArcSwap`), rebuilds `cached_local_peers`, and updates
-    /// `local_shard` / `num_shards`.
+    /// Emitted by the state machine on every beacon commit. The io side
+    /// publishes the schedule's head as its shared topology snapshot,
+    /// keys fetch routing on the schedule's terminal-clamped committees,
+    /// and resolves a followed block's window through the schedule.
     TopologyChanged {
-        /// Beacon epoch this snapshot was derived at — the monotonic key the
-        /// `io_loop` gates the shared `ArcSwap` on, so a slower co-hosted shard
-        /// thread folding an older epoch cannot overwrite a newer snapshot a
-        /// sibling thread already published.
+        /// Beacon epoch the schedule was folded at — the monotonic key the
+        /// `io_loop` gates its publish on, so a slower co-hosted shard
+        /// thread folding an older epoch cannot overwrite a newer schedule
+        /// a sibling thread already published.
         epoch: Epoch,
-        /// New topology snapshot to propagate.
-        topology_snapshot: Arc<TopologySnapshot>,
-        /// The snapshot the schedule holds for `epoch.next()`, derived a
-        /// full epoch ahead. A block can be anchored inside a window
-        /// before the beacon commit that opens it is folded here; a
-        /// reshape follow classifying such a block reads its window from
-        /// the history this entry fills ahead of the head.
-        lookahead: Arc<TopologySnapshot>,
-        /// Terminal-clamped per-shard routing committees, covering every
-        /// shard the schedule still retains — including a split parent
-        /// draining out of the head, whose committee the head snapshot no
-        /// longer carries. The network keys fetch routing on this so a
-        /// request to a dissolved shard still reaches its draining members.
-        routing_committees: Arc<RoutingCommittees>,
+        /// The beacon's window schedule as of this fold: the head, the
+        /// retained windows and the lookahead, one clone per epoch.
+        schedule: Arc<TopologySchedule>,
     },
 
     /// The lookahead committees move this vnode's validator onto or off

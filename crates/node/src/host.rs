@@ -164,6 +164,13 @@ where
     ) -> Self {
         assert!(!vnodes.is_empty(), "NodeHost requires at least one Vnode");
         let process_verifier = Arc::clone(vnodes[0].state.beacon_coordinator().verifier());
+        let topology_schedule = Arc::new(
+            vnodes[0]
+                .state
+                .beacon_coordinator()
+                .topology_schedule()
+                .clone(),
+        );
 
         let network = Arc::new(network);
 
@@ -245,6 +252,7 @@ where
             shard_event_senders,
             beacon_event_sender,
             topology_snapshot,
+            topology_schedule,
             dispatch_handles,
             beacon_storage,
         ));

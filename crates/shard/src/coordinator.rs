@@ -15,7 +15,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
-use hyperscale_engine::committed_cells;
 use hyperscale_metrics::record_verdict_claim_deferred;
 use hyperscale_types::{
     AbandonmentRecord, BlockHash, CounterpartClaim, CounterpartEvidence, CounterpartMirror, Epoch,
@@ -134,7 +133,7 @@ use crate::validation::{
 };
 use crate::verification::{
     InFlightCheck, ReadyStateRootVerification, SubstateCountBlocked, SubstateCountSource,
-    VerificationKind, VerificationPipeline, anchor_trie,
+    VerificationKind, VerificationPipeline, committed_cells_for,
 };
 use crate::view_change::ViewChangeController;
 use crate::vote_keeper::VoteKeeper;
@@ -5959,18 +5958,7 @@ impl ShardCoordinator {
                 parent_state_root,
                 parent_block_height,
                 parent_sweep_frontier,
-                creations: committed_cells(
-                    self.local_shard,
-                    &anchor_trie(
-                        topology_schedule,
-                        certified.block().header().parent_qc().weighted_timestamp(),
-                    ),
-                    certified
-                        .block()
-                        .transactions()
-                        .iter()
-                        .map(|tx| tx.as_unverified()),
-                ),
+                creations: committed_cells_for(certified.block(), topology_schedule),
                 source,
                 witness,
             }

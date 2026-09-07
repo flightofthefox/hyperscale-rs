@@ -23,8 +23,8 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage};
 use hyperscale_types::{
-    Address, Derivation, Epoch, RatifyPhase, RatifyRound, RoutingCommittees, ShardId, SpcView,
-    TopologySnapshot, Transaction, ValidatorId, Verifier,
+    Address, Derivation, Epoch, RatifyPhase, RatifyRound, ShardId, SpcView, TopologySchedule,
+    Transaction, ValidatorId, Verifier,
 };
 pub(crate) use network_handlers::register_shard_request_handlers;
 pub use tx_status::TxStatusCache;
@@ -176,9 +176,8 @@ where
     beacon_route_active: Arc<AtomicBool>,
 
     /// Lock-free topology snapshot shared with network handler closures
-    /// and delegated dispatch jobs. Every hosted shard (and the pool) writes
-    /// it via `Action::TopologyChanged` as it folds the beacon; readers
-    /// `.load()` for an atomic snapshot.
+    /// and delegated dispatch jobs: the head of [`Self::topology_schedule`],
+    /// published with it. Readers `.load()` for an atomic snapshot.
     pub(crate) topology_snapshot: SharedTopologySnapshot,
 
     /// Highest beacon epoch whose `Action::TopologyChanged` has been applied to
@@ -189,14 +188,14 @@ where
     /// `apply_topology` holds this lock across the epoch check and the publish,
     /// so the highest epoch's snapshot wins and the stores never reorder.
     apply_topology_epoch: Mutex<Epoch>,
-    /// The snapshots of the last [`TOPOLOGY_HISTORY_EPOCHS`] epochs
-    /// applied, by epoch, plus the lookahead for the epoch after the
-    /// last. What a reshape follow classifies a followed parent block
-    /// under: the parent's own window, which the current snapshot no
-    /// longer describes once its cut has landed, and which the parent's
-    /// committee can anchor into before this host folds the commit that
-    /// opens it.
-    topology_history: Mutex<BTreeMap<Epoch, Arc<TopologySnapshot>>>,
+    /// The beacon's window schedule as last folded by a hosted vnode:
+    /// the head [`Self::topology_snapshot`] publishes, the routing
+    /// committees the network keys fetches on, and the retained windows
+    /// a reshape follow classifies a followed parent block under — the
+    /// parent's own window, which the head no longer describes once its
+    /// cut has landed, and which the parent's committee can anchor into
+    /// before this host folds the commit that opens it.
+    topology_schedule: ArcSwap<TopologySchedule>,
 
     /// See [`DispatchHandles`]. Cloned once per delegated-action dispatch.
     pub(crate) dispatch_handles: Arc<DispatchHandles<S, N>>,
@@ -260,10 +259,10 @@ where
         shard_event_senders: BTreeMap<ShardId, Sender<HostEvent>>,
         beacon_event_sender: Sender<HostEvent>,
         topology_snapshot: SharedTopologySnapshot,
+        topology_schedule: Arc<TopologySchedule>,
         dispatch_handles: Arc<DispatchHandles<S, N>>,
         beacon_storage: Arc<dyn BeaconStorage>,
     ) -> Self {
-        let genesis_topology = topology_snapshot.load_full();
         Self {
             network,
             verifier,
@@ -273,10 +272,7 @@ where
             beacon_route_active: Arc::new(AtomicBool::new(false)),
             topology_snapshot,
             apply_topology_epoch: Mutex::new(Epoch::GENESIS),
-            // The snapshot a process starts on is its genesis epoch's, on the
-            // watermark's own terms: `apply_topology` admits only epochs past
-            // `GENESIS`, so this one never arrives through it.
-            topology_history: Mutex::new(BTreeMap::from([(Epoch::GENESIS, genesis_topology)])),
+            topology_schedule: ArcSwap::new(topology_schedule),
             dispatch_handles,
             beacon_storage,
             beacon_commit: BeaconCommitCoordinator::new(),
@@ -384,20 +380,10 @@ where
         &self.network
     }
 
-    /// The topology for `epoch`, if it is among the last
-    /// [`TOPOLOGY_HISTORY_EPOCHS`] this host applied or the lookahead
-    /// past them.
-    ///
-    /// # Panics
-    ///
-    /// If the history lock is poisoned.
+    /// The beacon's window schedule as last folded on this host.
     #[must_use]
-    pub fn topology_at(&self, epoch: Epoch) -> Option<Arc<TopologySnapshot>> {
-        self.topology_history
-            .lock()
-            .expect("topology history lock")
-            .get(&epoch)
-            .cloned()
+    pub fn topology_schedule(&self) -> Arc<TopologySchedule> {
+        self.topology_schedule.load_full()
     }
 
     /// Shared lock-free topology snapshot handle, refreshed on every
@@ -592,11 +578,11 @@ where
     N: Network,
     D: Dispatch,
 {
-    /// Adopt a fresh topology snapshot derived at beacon `epoch`: publish it
+    /// Adopt the schedule folded at beacon `epoch`: publish its head
     /// through the lock-free `ArcSwap` so off-thread closures pick it up on
     /// their next `.load()`, and push it to the network adapter (which keys
-    /// validator pubkeys and shard committees off the snapshot, and fetch
-    /// routing off the terminal-clamped committees).
+    /// validator pubkeys and shard committees off the head, and fetch
+    /// routing off the schedule's terminal-clamped committees).
     ///
     /// Every hosted shard (and the pool) calls this as it folds the beacon,
     /// concurrently across pinned threads. The store is gated monotonically on
@@ -604,13 +590,7 @@ where
     /// dropped, so a slower thread cannot regress the shared snapshot to an
     /// older trie / `advanced` set under another thread's newer one. A genuine
     /// same-epoch re-apply is a no-op (the value is identical for an epoch).
-    pub(crate) fn apply_topology(
-        &self,
-        epoch: Epoch,
-        topology_snapshot: &Arc<TopologySnapshot>,
-        lookahead: Arc<TopologySnapshot>,
-        routing_committees: Arc<RoutingCommittees>,
-    ) {
+    pub(crate) fn apply_topology(&self, epoch: Epoch, schedule: Arc<TopologySchedule>) {
         let mut applied = self
             .apply_topology_epoch
             .lock()
@@ -620,23 +600,14 @@ where
         }
         // Publish under the lock so the highest epoch's stores never reorder
         // behind a slower thread that admitted an earlier epoch.
-        self.topology_snapshot.store(Arc::clone(topology_snapshot));
-        {
-            let mut history = self.topology_history.lock().expect("topology history lock");
-            history.insert(epoch, Arc::clone(topology_snapshot));
-            history.insert(epoch.next(), lookahead);
-            let floor = epoch.inner().saturating_sub(TOPOLOGY_HISTORY_EPOCHS);
-            history.retain(|held, _| held.inner() >= floor);
-        }
-        self.network.update_topology(Arc::clone(topology_snapshot));
+        let head = Arc::clone(schedule.head());
+        let routing_committees = Arc::new(schedule.routing_committees());
+        self.topology_snapshot.store(Arc::clone(&head));
+        self.topology_schedule.store(schedule);
+        self.network.update_topology(head);
         self.network.update_routing_committees(routing_committees);
     }
 }
-
-/// How many applied epochs' snapshots a host keeps behind the current
-/// one. A reshape follow reads the parent's window, at most a cut behind
-/// the current epoch; the rest is slack for a follow that lags.
-const TOPOLOGY_HISTORY_EPOCHS: u64 = 8;
 
 /// Advance the highest-applied topology epoch to `incoming`, returning whether
 /// it supersedes what was already applied. An epoch at or below `applied` is

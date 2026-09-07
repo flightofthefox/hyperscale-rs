@@ -48,7 +48,7 @@ pub type RoutingCommittees = BTreeMap<ShardId, Vec<ValidatorId>>;
 /// A schedule built with [`single`](Self::single) carries one committee for
 /// all time (`epoch_duration_ms == 0` folds every timestamp to genesis) — the
 /// pre-rotation / single-epoch case used by tests and within-epoch callers.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TopologySchedule {
     /// Window length in milliseconds; `epoch = floor(wt / epoch_duration_ms)`.
     /// Zero means a single fixed committee (every timestamp maps to genesis).

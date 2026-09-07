@@ -2064,7 +2064,7 @@ impl BeaconCoordinator {
                 .derive_next_topology_snapshot(self.network.clone()),
         );
         self.topology_schedule
-            .insert_lookahead(epoch.next(), Arc::clone(&lookahead));
+            .insert_lookahead(epoch.next(), lookahead);
         self.topology_schedule.evict_below(retention_floor(
             &self.state,
             self.local_committee_anchor,
@@ -2107,9 +2107,7 @@ impl BeaconCoordinator {
             },
             Action::TopologyChanged {
                 epoch: self.state.current_epoch,
-                topology_snapshot: Arc::clone(self.topology_schedule.head()),
-                lookahead,
-                routing_committees: Arc::new(self.topology_schedule.routing_committees()),
+                schedule: Arc::new(self.topology_schedule.clone()),
             },
             // Re-arm the skip-trigger timer against the new tip. Fires
             // `skip_timeout` after the upcoming epoch's boundary if no
