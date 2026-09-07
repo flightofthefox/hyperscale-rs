@@ -730,6 +730,13 @@ mod tests {
         Address::new(body, AddressClass::Component)
     }
 
+    /// An owner on the `path`th leaf of a uniform depth-2 trie.
+    fn owner_at(seed: u8, path: u8) -> Address {
+        let mut body = [seed; 31];
+        body[0] = (path << 6) | (seed & 0x3F);
+        Address::new(body, AddressClass::Component)
+    }
+
     fn cell(owner: Address, slot: u8) -> SubstateKey {
         SubstateKey {
             owner,
@@ -1051,11 +1058,6 @@ mod tests {
     /// each plans the withdraw beside the venues.
     #[test]
     fn an_inbound_leg_on_a_core_shard_is_replicated_with_the_core() {
-        fn owner_at(seed: u8, path: u8) -> Address {
-            let mut body = [seed; 31];
-            body[0] = (path << 6) | (seed & 0x3F);
-            Address::new(body, AddressClass::Component)
-        }
         let trie = ShardTrie::uniform(2);
         let (leaf0, leaf1, leaf2) = (
             ShardId::leaf(2, 0),
@@ -1089,6 +1091,64 @@ mod tests {
             assert!(plan.legs.departure(1, 0).is_none());
             assert!(plan.legs.departure(3, 0).is_some());
         }
+    }
+
+    /// A leg beside the core folds even where what makes it beside the
+    /// core folds in the same pass, so no edge is left crossing between
+    /// two nodes one member runs.
+    ///
+    /// Left unfolded, the shard running both ends files neither a
+    /// departure nor an arrival for that edge while the core's other
+    /// shards demand one, and a multi-shard core has no clock to give up
+    /// on it — so the shape holds its cells until a reshape.
+    #[test]
+    fn a_leg_whose_consumer_folds_beside_the_core_leaves_no_crossing() {
+        let trie = ShardTrie::uniform(2);
+        let (leaf0, leaf1, leaf2) = (
+            ShardId::leaf(2, 0),
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 2),
+        );
+        // A route across two venues, with a top-up beside the first one
+        // feeding the same sink the route ends in.
+        let legs = vec![
+            leg(owner_at(0x11, 1), LegRole::Inbound, &[], 0),
+            leg(owner_at(0x12, 0), LegRole::Core, &[(0, 0)], 1),
+            leg(owner_at(0x13, 2), LegRole::Core, &[(1, 0)], 2),
+            leg(owner_at(0x14, 0), LegRole::Inbound, &[], 3),
+            leg(owner_at(0x15, 0), LegRole::Outbound, &[(2, 0), (3, 0)], 4),
+        ];
+        let classified = Classified::freeze(&legs, &[], &trie);
+        assert!(classified.decomposed());
+        assert_eq!(classified.core(), &BTreeSet::from([leaf0, leaf2]));
+        assert_eq!(
+            classified
+                .edges()
+                .iter()
+                .map(|edge| edge.producer)
+                .collect::<Vec<_>>(),
+            vec![0],
+            "only the caller's leg crosses",
+        );
+
+        for shard in [leaf0, leaf2] {
+            let plan = classified
+                .plan(&[arrival(0, 0, 5)], shard, Side::Issuing)
+                .expect("every core shard plans the whole core");
+            assert!(
+                (1..5).all(|node| plan.legs.runs(node)) && !plan.legs.runs(0),
+                "the core and everything folded beside it, and not the caller's leg",
+            );
+            assert!(
+                plan.legs.departure(3, 0).is_none(),
+                "the top-up's value stays inside the execution",
+            );
+        }
+        assert!(
+            classified.records_issued(leaf0).is_empty(),
+            "a core shard issues no record for an edge it runs both ends of",
+        );
+        assert_eq!(classified.plan(&[], leaf1, Side::Issuing).err(), None);
     }
 
     /// A sink fed beside itself issues: an outbound leg whose producer
