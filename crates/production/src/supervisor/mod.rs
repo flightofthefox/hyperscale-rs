@@ -33,7 +33,7 @@ use hyperscale_node::{NodeConfig, TimerOp};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::RecoveredState;
-use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
+use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
     GenesisConfigHash, NetworkDefinition, ShardId, Signer, ValidatorId, Verifier,
 };
@@ -53,7 +53,7 @@ use pool::PoolThread;
 use reshape::ReshapeIo;
 
 /// The process-scoped resource bundle as the production runner types it.
-type ProdProcessIo = ProcessIo<SharedStorage, Libp2pNetwork, PooledDispatch>;
+type ProdProcessIo = ProcessIo<RocksDbShardStorage, Libp2pNetwork, PooledDispatch>;
 
 /// Opens (or creates) one shard's `RocksDB` storage at the host's
 /// data-dir convention. Supplied by the validator binary, which owns

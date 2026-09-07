@@ -60,6 +60,7 @@ impl RocksDbShardStorage {
     /// Read the local-only metadata. `None` when the tx was synced from
     /// a peer (peers don't ship their metadata) or pruned earlier than
     /// the consensus portion.
+    #[must_use]
     pub fn get_execution_metadata(&self, tx_hash: &TxHash) -> Option<ExecutionMetadata> {
         self.cf_get::<ExecutionMetadataCf>(&Hash::from(*tx_hash))
     }

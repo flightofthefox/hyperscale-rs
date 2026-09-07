@@ -52,7 +52,7 @@ use hyperscale_node::{
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, ShardChainReader};
-use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
+use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, GenesisValidators, LocalTimestamp, MAX_DRAIN_WORK,
     NetworkDefinition, ShardId, Signer, StakePoolSeat, Transaction, ValidatorId, ValidatorStatus,
@@ -531,13 +531,11 @@ impl ProductionRunnerBuilder {
             }));
         }
 
-        // Wrap each per-shard `RocksDbShardStorage` in a `SharedStorage` for
-        // `NodeHost::new`'s `HashMap<ShardId, S>` argument; the
-        // runner keeps the bare `Arc<RocksDbShardStorage>`s alive for GC +
-        // metrics.
-        let shared_storages: HashMap<ShardId, SharedStorage> = storages
+        // A handle per shard for `NodeHost::new`; the runner keeps its own
+        // handles for GC and metrics.
+        let storage_handles: HashMap<ShardId, RocksDbShardStorage> = storages
             .iter()
-            .map(|(shard, st)| (*shard, SharedStorage::new(Arc::clone(st))))
+            .map(|(shard, st)| (*shard, (**st).clone()))
             .collect();
         let network_definition = self
             .network_definition
@@ -572,7 +570,7 @@ impl ProductionRunnerBuilder {
         let (beacon_event_tx, beacon_event_rx) = unbounded::<HostEvent>();
         let host = NodeHost::new(
             vnode_inits,
-            shared_storages,
+            storage_handles,
             self.beacon_storage,
             beacon_network.clone(),
             executor,
@@ -1224,10 +1222,10 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
 }
 
 /// Concrete `NodeHost` type for the production runner.
-type ProdHost = NodeHost<SharedStorage, Libp2pNetwork, PooledDispatch>;
+type ProdHost = NodeHost<RocksDbShardStorage, Libp2pNetwork, PooledDispatch>;
 
 /// Concrete `ShardLoop` type for the production runner.
-pub type ProdShardLoop = ShardLoop<SharedStorage, Libp2pNetwork, PooledDispatch>;
+pub type ProdShardLoop = ShardLoop<RocksDbShardStorage, Libp2pNetwork, PooledDispatch>;
 
 /// Per-shard receivers driving a single shard's pinned thread. Built
 /// during construction and consumed when [`ProductionRunner::run`]
@@ -1585,7 +1583,7 @@ pub fn spawn_shard_loop(
 
 /// Concrete `PoolLoop` type for the production runner: the host's
 /// shard-less beacon followers.
-pub type ProdPoolLoop = PoolLoop<SharedStorage, Libp2pNetwork, PooledDispatch>;
+pub type ProdPoolLoop = PoolLoop<RocksDbShardStorage, Libp2pNetwork, PooledDispatch>;
 
 /// Configuration for a host's pinned pool thread — the lightweight sibling
 /// of [`ShardLoopConfig`]. A follower runs no shard consensus, so there are

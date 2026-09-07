@@ -149,6 +149,7 @@ impl RocksDbShardStorage {
     /// # Returns
     ///
     /// The number of entries deleted.
+    #[allow(clippy::must_use_candidate)] // run for its effect; the count is a log line
     pub fn run_state_history_gc(&self) -> usize {
         let cutoff = self.retention_floor();
 

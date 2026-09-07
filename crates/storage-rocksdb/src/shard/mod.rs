@@ -1,6 +1,5 @@
-//! Shard-side `RocksDB` backend — `RocksDbShardStorage`, its `SharedStorage`
-//! Arc wrapper, JMT integration, per-shard column families, GC, and
-//! recovery flows.
+//! Shard-side `RocksDB` backend — `RocksDbShardStorage`, JMT integration,
+//! per-shard column families, GC, and recovery flows.
 //!
 //! Top-level [`crate::typed_cf`](crate::typed_cf) and
 //! [`crate::config`](crate::config) host shared abstractions reused
@@ -21,7 +20,6 @@ pub(crate) mod metadata;
 pub(crate) mod receipts;
 pub(crate) mod recovery;
 pub(crate) mod retention;
-pub(crate) mod shared;
 pub(crate) mod snapshot;
 pub(crate) mod split;
 pub(crate) mod store;

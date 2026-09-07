@@ -47,10 +47,9 @@ use super::state::{ConsensusState, SharedState, apply_writes};
 ///   Separate because consensus metadata is independent of substate/JMT state.
 ///
 /// Every field is behind a shared handle, so a [`Clone`] is another
-/// handle onto the *same* store — the in-memory analogue of
-/// production's `SharedStorage` wrapper over one `RocksDB` instance. A
-/// shard's storage can therefore be retained across a runtime
-/// leave/rejoin cycle.
+/// handle onto the *same* store, as a `RocksDbShardStorage` clone is
+/// onto one database. A shard's storage can therefore be retained
+/// across a runtime leave/rejoin cycle.
 #[derive(Clone)]
 pub struct SimShardStorage {
     /// Substate data + JMT state (single `RwLock`).

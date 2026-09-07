@@ -39,6 +39,7 @@ impl RocksDbShardStorage {
     /// Returns blocks in ascending height order. Uses `get_block_denormalized`
     /// for each height to properly reconstruct blocks from metadata + individual
     /// transaction/certificate entries.
+    #[must_use]
     pub fn get_blocks_range(&self, from: BlockHeight, to: BlockHeight) -> Vec<CertifiedBlock> {
         let mut result = Vec::new();
         let mut h = from.inner();
@@ -64,6 +65,7 @@ impl RocksDbShardStorage {
     }
 
     /// Get a transaction by hash.
+    #[must_use]
     pub fn get_transaction(&self, hash: &TxHash) -> Option<Transaction> {
         let start = Instant::now();
         let result = self.cf_get::<TransactionsCf>(&Hash::from(*hash));
@@ -75,6 +77,7 @@ impl RocksDbShardStorage {
     ///
     /// Uses `RocksDB`'s `multi_get_cf` for efficient batch retrieval.
     /// Returns only transactions that were found (missing hashes are skipped).
+    #[must_use]
     pub fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<Transaction> {
         if hashes.is_empty() {
             return vec![];
@@ -373,6 +376,7 @@ impl RocksDbShardStorage {
     ///
     /// Used for partial sync responses when the full block cannot be
     /// reconstructed (e.g., missing transactions or certificates).
+    #[must_use]
     pub fn get_block_metadata(&self, height: BlockHeight) -> Option<BlockMetadata> {
         let start = Instant::now();
         let metadata = self.cf_get::<BlocksCf>(&height.inner())?;
@@ -570,6 +574,7 @@ impl RocksDbShardStorage {
     /// Reads all three chain metadata keys in one call. Use the individual
     /// `read_committed_height`, `read_committed_hash`, `read_latest_qc`
     /// methods when only one value is needed.
+    #[must_use]
     pub fn get_chain_metadata(
         &self,
     ) -> (
@@ -615,6 +620,7 @@ impl RocksDbShardStorage {
     }
 
     /// Get a finalization's attestation by identity.
+    #[must_use]
     pub fn get_certificate(&self, id: &FinalizationHash) -> Option<Finalization> {
         self.cf_get::<CertificatesCf>(id)
     }
@@ -623,6 +629,7 @@ impl RocksDbShardStorage {
     ///
     /// Uses `RocksDB`'s `multi_get_cf` for efficient batch retrieval.
     /// Returns only certificates that were found (missing ids are skipped).
+    #[must_use]
     pub fn get_certificates_batch(&self, ids: &[FinalizationHash]) -> Vec<Finalization> {
         if ids.is_empty() {
             return vec![];

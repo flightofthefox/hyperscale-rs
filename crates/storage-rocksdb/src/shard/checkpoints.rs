@@ -328,6 +328,7 @@ impl RocksDbShardStorage {
 /// oldest beyond that. Entries are
 /// discovered by scanning the ring directory, so the ring picks up
 /// where it left off after a restart.
+#[derive(Clone)]
 pub struct CheckpointRing {
     db: Arc<DB>,
     dir: PathBuf,

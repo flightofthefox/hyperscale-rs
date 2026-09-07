@@ -71,14 +71,18 @@ use crate::typed_cf::{DbEncode, TypedCf, batch_delete, batch_put, get, multi_get
 /// (version and root hash) is in the default CF under `jmt:metadata` and read
 /// directly from `RocksDB` on demand — always hot in the memtable since they're
 /// written on every commit.
+///
+/// Every field is behind a shared handle, so a [`Clone`] is another
+/// handle onto the *same* database: the pinned shard thread and the
+/// async tasks beside it each hold one, and the commit lock they
+/// serialize on is the one lock.
+#[derive(Clone)]
 pub struct RocksDbShardStorage {
     pub(crate) db: Arc<DB>,
 
     /// Serializes JMT-mutating commits to prevent interleaved read-modify-write
     /// sequences (e.g., `read_jmt_metadata` + `WriteBatch` write).
-    pub(crate) commit_lock: Mutex<()>,
-
-    /// Number of block heights of JMT history to retain before garbage collection.
+    pub(crate) commit_lock: Arc<Mutex<()>>,
 
     /// Path this store's JMT is rooted at — its shard's prefix, so the root is
     /// the global tree's subtree at that prefix. Empty for a single-shard /
@@ -94,7 +98,7 @@ pub struct RocksDbShardStorage {
     /// `persist_vote_position`, keeping concurrent writes monotone
     /// and letting a write that raises nothing (e.g. a timeout
     /// retransmit) skip the fsync entirely.
-    pub(crate) vote_registers: Mutex<HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>>,
+    pub(crate) vote_registers: Arc<Mutex<HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>>>,
 }
 
 /// Fold what a batch `moved` in the sweep index into the rows it holds.
@@ -277,10 +281,10 @@ impl RocksDbShardStorage {
 
         Ok(Self {
             db,
-            commit_lock: Mutex::new(()),
+            commit_lock: Arc::new(Mutex::new(())),
             root_path,
             checkpoints,
-            vote_registers: Mutex::new(HashMap::new()),
+            vote_registers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -422,6 +426,7 @@ impl RocksDbShardStorage {
     /// Committed substate byte total after the commit at `version`,
     /// or `None` if no commit at that version recorded one (never
     /// committed, or pruned past the retention horizon).
+    #[must_use]
     pub fn substate_bytes_at_version(&self, version: u64) -> Option<u64> {
         let cf = self.cf();
         get::<SubstateBytesCf>(&*self.db, SubstateBytesCf::handle(&cf), &version)
@@ -763,6 +768,7 @@ impl RocksDbShardStorage {
     ///
     /// Panics if called after the JMT has already been initialized, or
     /// if the underlying `RocksDB` write fails.
+    #[must_use]
     pub fn finalize_genesis_jmt(&self, merged: &SettledWrites) -> StateRoot {
         let _commit_guard = self.commit_lock.lock().unwrap();
 
