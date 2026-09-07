@@ -19,18 +19,18 @@ use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, BeaconBlock,
     BeaconBlockHash, BeaconCert, BeaconChainConfig, BeaconState, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts,
-    BlockHeight, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId, ConsensusReceipt,
-    EntryKey, EntryLeaf, Epoch, Event, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome,
-    FeeSummary, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LEG_ENTRY_HORIZON,
-    LocalKey, LogLevel, MerkleInclusionProof, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof,
-    ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions,
-    QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, Round,
-    SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload,
-    SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt,
-    SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, Transaction,
-    TransactionDecision, TxHash, TxOutcome, UnsettledTx, ValidatorId, Verifiable, Verified,
-    VotePosition, WeightedTimestamp, WitnessSources, WorkInFlight, compute_global_receipt_root,
-    compute_merkle_root, entry_leaf_key,
+    BlockHeight, CLAIM_WINDOW, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId,
+    ConsensusReceipt, Deadline, EntryKey, EntryLeaf, Epoch, Event, ExecutionCertificate,
+    ExecutionMetadata, ExecutionOutcome, FeeSummary, Finalization, GlobalReceiptHash,
+    GlobalReceiptRoot, Hash, LocalKey, LogLevel, MerkleInclusionProof, PcQc2, PcQc3,
+    PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp, ProtocolHasher, ProvisionEntry,
+    ProvisionHash, Provisions, QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert,
+    RatifyRound, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId,
+    ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
+    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint,
+    TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome, UnsettledTx,
+    ValidatorId, Verifiable, Verified, VotePosition, WeightedTimestamp, WitnessSources,
+    WorkInFlight, compute_global_receipt_root, compute_merkle_root, entry_leaf_key,
 };
 
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
@@ -1949,7 +1949,7 @@ pub fn test_undischarged_record_holds_the_floor(
         WeightedTimestamp::from_millis(1_000),
         [UnsettledTx {
             tx_hash: stranded.hash(),
-            deadline: WeightedTimestamp::from_millis(500),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(500)),
             declared_work: stranded.work(),
             charge: AbortCharge {
                 vault: stranded.fee_vault(),
@@ -2000,7 +2000,7 @@ pub fn test_undischarged_record_holds_the_floor(
 ///
 /// A whole entry's fate is decided inside [`RETENTION_HORIZON`] of its
 /// commit, and that is as far as a rebuild reads for one. A leg entry
-/// stands [`LEG_ENTRY_HORIZON`] past its deadline, so its commit sits
+/// stands one [`CLAIM_WINDOW`] past its deadline, so its commit sits
 /// below that reach while the entry is still live — and the fold has to
 /// reach it, or a restart drops a reclaim the ledger was still owed.
 ///
@@ -2038,7 +2038,7 @@ pub fn test_a_leg_entry_holds_the_floor_to_its_horizon(
         "past the retention horizon a whole entry is gone, but a leg entry \
          stands, so its commit still holds the floor",
     );
-    let past_horizon = past_retention.plus(LEG_ENTRY_HORIZON);
+    let past_horizon = past_retention.plus(CLAIM_WINDOW);
     assert_eq!(
         unresolved_replay_floor(storage, BlockHeight::new(2), past_horizon),
         None,

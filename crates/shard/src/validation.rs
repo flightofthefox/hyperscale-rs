@@ -827,13 +827,13 @@ mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
-        BlockHeader, BlockHeaderParts, ChainOrigin, CounterpartClaim, Finalization, Hash, LocalKey,
-        MAX_SUBINTENTS, MerkleInclusionProof, NetworkDefinition, PrincipalAddr, ProposerTimestamp,
-        ProvisionEntry, Provisions, QuorumCertificate, Round, ShardId, ShardLoad, Signer,
-        SignerBitfield, StateAnchor, StateProofBundle, StateProofsRoot, StateRoot, SubstateKey,
-        TimestampRange, Transaction, TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo,
-        ValidatorSet, VerdictClaim, Verifiable, Verified, WeightedTimestamp, WitnessSources,
-        test_utils,
+        BlockHeader, BlockHeaderParts, ChainOrigin, CounterpartClaim, Deadline, Finalization, Hash,
+        LocalKey, MAX_SUBINTENTS, MerkleInclusionProof, NetworkDefinition, PrincipalAddr,
+        ProposerTimestamp, ProvisionEntry, Provisions, QuorumCertificate, Round, ShardId,
+        ShardLoad, Signer, SignerBitfield, StateAnchor, StateProofBundle, StateProofsRoot,
+        StateRoot, SubstateKey, TimestampRange, Transaction, TransactionDecision, UnsettledTx,
+        ValidatorId, ValidatorInfo, ValidatorSet, VerdictClaim, Verifiable, Verified,
+        WeightedTimestamp, WitnessSources, test_utils,
     };
 
     use super::*;
@@ -1482,7 +1482,7 @@ mod tests {
     fn named(tx_hash: TxHash) -> UnsettledTx {
         UnsettledTx {
             tx_hash,
-            deadline: WeightedTimestamp::from_millis(900),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(900)),
             declared_work: 11,
             charge: stub_abort_charge(11),
         }

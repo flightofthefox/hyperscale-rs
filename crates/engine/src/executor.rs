@@ -28,10 +28,10 @@ use hyperscale_effects_bridge::{
 use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
 use hyperscale_types::{
-    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EscrowedValue, Event,
-    EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement,
+    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Deadline, Derivation, EscrowedValue,
+    Event, EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement,
     PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
-    Transaction, TxHash, Verified, WeightedTimestamp, claim_readable_at, compute_merkle_root,
+    Transaction, TxHash, Verified, WeightedTimestamp, Window, compute_merkle_root,
     install_protocol_statics,
 };
 use hyperscale_vm_effects::{
@@ -610,7 +610,7 @@ impl Executor {
     /// absent cell is an absence this shard is entitled to read. Present
     /// means the crossing was taken and the record is a balance for a
     /// claim that happened, which the retirement deletes. Absent, inside
-    /// the window [`claim_readable_at`] opens, means no consumer can
+    /// the claim window its expiry reads back to, means no consumer can
     /// still take it and none did, which the reclaim credits back.
     ///
     /// A record already gone is skipped rather than refused: a member
@@ -670,7 +670,10 @@ impl Executor {
                 decided = decided.saturating_add(1);
                 continue;
             }
-            if !claim_readable_at(record.expiry_ms, ctx.tick_ts) {
+            if !Window::Claim
+                .of(Deadline::from_escrow_expiry(record.expiry_ms))
+                .contains(&ctx.tick_ts)
+            {
                 return Err(format!(
                     "record {key:?} is read outside the window its claim answers in"
                 ));

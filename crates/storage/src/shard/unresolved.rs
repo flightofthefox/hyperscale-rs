@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, EPOCH_DURATION, LEG_ENTRY_HORIZON, Provisions, RETENTION_HORIZON,
+    BlockHeight, CLAIM_WINDOW, CertifiedBlock, EPOCH_DURATION, Provisions, RETENTION_HORIZON,
     TERMINAL_EVIDENCE_EPOCHS, TxHash, Verifiable, Verified, WeightedTimestamp,
 };
 
@@ -28,10 +28,10 @@ use super::chain_reader::ShardChainReader;
 ///
 /// A transaction committed at time `T` states a deadline at most
 /// [`RETENTION_HORIZON`] beyond it — a validity end at most one range
-/// on, and the reclaim probe anchor one finalization delay past that. A
-/// whole entry goes at its deadline; a leg entry stands
-/// [`LEG_ENTRY_HORIZON`] past it, to where the claim cell both its
-/// members are proved against is swept. So this spans every entry whose
+/// on, and the deadline one finalization delay past that. A whole entry
+/// goes at its deadline; a leg entry stands one [`CLAIM_WINDOW`] past
+/// it, to where the claim cell both its members are proved against is
+/// swept. So this spans every entry whose
 /// fate is its own clock's to settle, leg entries included.
 ///
 /// It does **not** span every entry the ledger holds. One a certificate
@@ -42,7 +42,7 @@ use super::chain_reader::ShardChainReader;
 /// [`RECORD_WINDOW`] is what reaches those. It is the wider of the two,
 /// so the scan's reach is the record's and this window costs it nothing.
 const FOLD_WINDOW: Duration =
-    Duration::from_secs(RETENTION_HORIZON.as_secs() + LEG_ENTRY_HORIZON.as_secs());
+    Duration::from_secs(RETENTION_HORIZON.as_secs() + CLAIM_WINDOW.as_secs());
 
 /// How far back a rebuild reads for a transaction a committed boundary
 /// record decides.

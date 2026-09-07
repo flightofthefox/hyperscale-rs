@@ -22,9 +22,8 @@ use hyperscale_engine::{
 };
 use hyperscale_hbor::from_slice;
 use hyperscale_types::{
-    AccountSigner, Address, BlockHeight, Epoch, Hash, SWEEP_BUCKET_MS, SchemeId, SeedLookup,
-    ShardId, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp,
-    delivery_window_close, lapse_probe_anchor,
+    AccountSigner, Address, BlockHeight, Deadline, Epoch, Hash, SWEEP_BUCKET_MS, SchemeId,
+    SeedLookup, ShardId, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{InstanceMeta, nullifier_key, package_hash};
 use hyperscale_vm_fixtures::lottery;
@@ -1599,7 +1598,9 @@ pub fn a_delivery_cut_off_past_its_window_is_reclaimed<C: FaultableCluster>(c: &
 
     // Past the lapse, with the cut standing the whole way: the window
     // closed on a delivery that never had a bundle to claim from.
-    let lapse = lapse_probe_anchor(validity.end_timestamp_exclusive);
+    let lapse = Window::Lapse
+        .of(Deadline::of(validity.end_timestamp_exclusive))
+        .start;
     let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
     assert!(
         c.run_until(epochs(12), |c| clock(c) >= lapse),
@@ -1692,9 +1693,9 @@ pub fn a_healed_network_does_not_revive_a_closed_delivery<C: FaultableCluster>(c
 
     // Past the close, with the cut standing the whole way: the window
     // shuts on a delivery whose bundle never reached it.
-    let validity_end = validity.end_timestamp_exclusive;
-    let close = delivery_window_close(validity_end);
-    let lapse = lapse_probe_anchor(validity_end);
+    let deadline = Deadline::of(validity.end_timestamp_exclusive);
+    let close = Window::Delivery.of(deadline).end;
+    let lapse = Window::Lapse.of(deadline).start;
     let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
     assert!(
         c.run_until(epochs(12), |c| clock(c) >= close),

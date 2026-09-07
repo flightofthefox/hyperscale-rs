@@ -23,11 +23,11 @@ use hyperscale_engine::legs::Classified;
 use hyperscale_engine::writes_committed_cell;
 use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, CounterpartClaim,
-    CounterpartEvidence, Epoch, Finalization, FinalizationHash, Hash, LocalTimestamp,
+    CounterpartEvidence, Deadline, Epoch, Finalization, FinalizationHash, Hash, LocalTimestamp,
     MAX_PROVISIONS_PER_BLOCK, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal,
     ReshapeTrigger, RevealChain, Round, ScheduleLookup, ShardId, TopologySchedule,
     TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, delivery_admissible, sweep_admits_block,
+    WeightedTimestamp, Window, sweep_admits_block,
 };
 use tracing::debug;
 
@@ -235,7 +235,9 @@ pub fn select_transactions(
             let range = tx.validity_range();
             let admitted = range.contains(validity_anchor)
                 || (late_deliveries.contains(&h)
-                    && delivery_admissible(validity_anchor, range.end_timestamp_exclusive));
+                    && Window::Delivery
+                        .of(Deadline::of(range.end_timestamp_exclusive))
+                        .contains(&validity_anchor));
             if !range.is_well_formed(validity_anchor) || !admitted {
                 expired += 1;
                 return false;
@@ -756,7 +758,6 @@ mod tests {
         CommittedTxsRoot, Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_SUBINTENTS,
         MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
         PredecessorTerminal, TimestampRange, TransactionDecision, UnsettledTx, ValidatorSet,
-        delivery_window_close,
     };
 
     use super::*;
@@ -808,7 +809,7 @@ mod tests {
     fn stranded() -> UnsettledTx {
         UnsettledTx {
             tx_hash: TxHash::from(Hash::from_bytes(b"stranded")),
-            deadline: WeightedTimestamp::from_millis(5_000),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(5_000)),
             declared_work: 3,
             charge: stub_abort_charge(3),
         }
@@ -1414,12 +1415,17 @@ mod tests {
             "at the end only the delivery"
         );
         assert_eq!(
-            select(delivery_window_close(end).minus(Duration::from_millis(1))),
+            select(
+                Window::Delivery
+                    .of(Deadline::of(end))
+                    .end
+                    .minus(Duration::from_millis(1))
+            ),
             vec![delivery.hash()],
             "and to the last moment of its window"
         );
         assert!(
-            select(delivery_window_close(end)).is_empty(),
+            select(Window::Delivery.of(Deadline::of(end)).end).is_empty(),
             "the close drops it"
         );
     }

@@ -452,11 +452,11 @@ mod tests {
     use hyperscale_types::test_utils::{stub_abort_charge, test_transaction};
     use hyperscale_types::{
         AbandonmentRecord, AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts,
-        CertificateRoot, ChainOrigin, ConsensusReceipt, CounterpartClaim, ExecutionCertificate,
-        ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
-        ProposerTimestamp, QuorumCertificate, Round, ShardId, SignerBitfield, TickHalf, TickId,
-        TransactionRoot, TxHash, TxOutcome, UnsettledTx, Verifiable, WeightedTimestamp,
-        WitnessSources,
+        CertificateRoot, ChainOrigin, ConsensusReceipt, CounterpartClaim, Deadline,
+        ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
+        LocalReceiptRoot, ProposerTimestamp, QuorumCertificate, Round, ShardId, SignerBitfield,
+        TickHalf, TickId, TransactionRoot, TxHash, TxOutcome, UnsettledTx, Verifiable,
+        WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
@@ -735,7 +735,7 @@ mod tests {
             WeightedTimestamp::from_millis(2_000),
             [UnsettledTx {
                 tx_hash: TxHash::from(Hash::from_bytes(b"stranded")),
-                deadline: WeightedTimestamp::from_millis(1_500),
+                deadline: Deadline::of(WeightedTimestamp::from_millis(1_500)),
                 declared_work: 7,
                 charge: stub_abort_charge(7),
             }],

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::{
-    Hash, Transaction, TransactionRoot, TxHash, Verifiable, Verified, Verify, WeightedTimestamp,
-    compute_merkle_root, delivery_admissible,
+    Deadline, Hash, Transaction, TransactionRoot, TxHash, Verifiable, Verified, Verify,
+    WeightedTimestamp, Window, compute_merkle_root,
 };
 
 /// Inputs the [`TransactionRoot`] verifier reads against.
@@ -114,7 +114,9 @@ impl Verify<&TransactionRootContext<'_>> for TransactionRoot {
             // so its window is the record's rather than the transaction's.
             let admitted = range.contains(ctx.validity_anchor)
                 || (ctx.late_deliveries.contains(&tx.hash())
-                    && delivery_admissible(ctx.validity_anchor, range.end_timestamp_exclusive));
+                    && Window::Delivery
+                        .of(Deadline::of(range.end_timestamp_exclusive))
+                        .contains(&ctx.validity_anchor));
             if !range.is_well_formed(ctx.validity_anchor) || !admitted {
                 return Err(TxRootVerifyError::ValidityWindowExpired {
                     tx_hash: tx.hash(),

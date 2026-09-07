@@ -49,8 +49,8 @@
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    Hash, MAX_UNSETTLED_PER_BLOCK, ShardId, SubstateKey, Transaction, TransactionDecision, TxHash,
-    WeightedTimestamp, reclaim_probe_anchor,
+    Deadline, Hash, MAX_UNSETTLED_PER_BLOCK, ShardId, SubstateKey, Transaction,
+    TransactionDecision, TxHash, WeightedTimestamp,
 };
 
 /// What an abort of one transaction burns, and out of whose vault.
@@ -73,14 +73,11 @@ pub struct AbortCharge {
 pub struct UnsettledTx {
     /// The transaction.
     pub tx_hash: TxHash,
-    /// The moment past which it can no longer finalize anywhere:
-    /// `validity_range.end_timestamp_exclusive + MAX_FINALIZATION_DELAY`.
-    ///
-    /// Also the anchor an [`CounterpartEvidence::Unclaimed`] or
-    /// [`CounterpartEvidence::Untaken`] probe has to sit at
-    /// or past, so a voter checks the proof's block against this figure
-    /// rather than against a clock.
-    pub deadline: WeightedTimestamp,
+    /// The moment past which it can no longer finalize anywhere, and
+    /// the anchor every absence window a record restates is read off,
+    /// so a voter checks a proof's block against this figure rather
+    /// than against a clock.
+    pub deadline: Deadline,
     /// The reservation its committing block took against the drain, which
     /// the abandonment returns exactly.
     pub declared_work: u64,
@@ -94,7 +91,7 @@ impl UnsettledTx {
     ///
     /// The one place every figure is derived, so a proposer restating
     /// them and a voter checking the restatement compute one value: the
-    /// deadline is the reclaim probe anchor, the reservation is the
+    /// deadline is the transaction's own, the reservation is the
     /// declared work, and the charge is the fee vault at the declared
     /// price.
     ///
@@ -105,7 +102,7 @@ impl UnsettledTx {
     pub fn for_transaction(tx: &Transaction) -> Self {
         Self {
             tx_hash: tx.hash(),
-            deadline: reclaim_probe_anchor(tx.validity_range().end_timestamp_exclusive),
+            deadline: Deadline::of_transaction(tx),
             declared_work: tx.work(),
             charge: AbortCharge {
                 vault: tx.fee_vault(),
@@ -356,15 +353,11 @@ impl CounterpartEvidence {
 /// mirrored off its signature-verified certificate.
 ///
 /// What a `Refused` record restates and what a voter checks it against:
-/// the anchor the refusing certificate carried, and the transaction's
-/// own deadline, which is the clock the mirror lives on — a refusal is
-/// held exactly as long as the leg entry it licenses a reclaim of.
+/// the anchor the refusing certificate carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Refusal {
     /// The weighted timestamp of the refusing certificate's anchor.
     pub refused_wt: WeightedTimestamp,
-    /// The refused transaction's deadline, as the leg's ledger holds it.
-    pub deadline: WeightedTimestamp,
     /// What the certificate decided — a rejection or an abort, never an
     /// acceptance, which settles the transaction and licenses nothing.
     pub decision: TransactionDecision,
@@ -377,26 +370,19 @@ pub struct Refusal {
 /// A counterpart's failure to take a transaction a leg here issued for,
 /// as proved off its commit-proven state.
 ///
-/// Proved at a block past the anchor the question is meaningful at: a
-/// core's committed cell past the transaction's deadline, or a
+/// Proved at a block inside the window the question is meaningful in:
+/// a core's committed cell past the transaction's deadline, or a
 /// delivery's claim cell past its lapse.
 ///
-/// What an `Unclaimed` or a `Lapsed` record restates and what a voter
-/// checks it against: the proof the chain committed, folded by every
-/// replica at the same height, so the record's anchor is held to the
-/// mirror's exactly. The floor is the clock the mirror lives on, as a
-/// refusal's deadline is, and what says which cell the proof asked
-/// about.
+/// What an `Unclaimed`, a `Lapsed` or an `Untaken` record restates and
+/// what a voter checks it against: the proof the chain committed,
+/// folded by every replica at the same height, so the record's anchor
+/// is held to the mirror's exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Absence {
     /// The weighted timestamp of the block the absence was proved
-    /// against — at or past `floor`, and short of the probed cell's
-    /// sweep, one validity range on.
+    /// against.
     pub probed_wt: WeightedTimestamp,
-    /// The anchor the proof has to sit at or past: the transaction's
-    /// deadline for a core's committed cell, its lapse — the deadline
-    /// plus one validity range — for a delivery's claim cell.
-    pub floor: WeightedTimestamp,
 }
 
 /// A consumer's acceptance of a transaction a leg here issued for, as
@@ -581,7 +567,7 @@ mod tests {
     fn tx(seed: u8) -> UnsettledTx {
         UnsettledTx {
             tx_hash: TxHash::from(Hash::from_bytes(&[seed; 32])),
-            deadline: WeightedTimestamp::from_millis(u64::from(seed) * 100),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(u64::from(seed) * 100)),
             declared_work: u64::from(seed) * 7,
             charge: AbortCharge {
                 vault: SubstateKey {
@@ -638,7 +624,9 @@ mod tests {
         );
         assert_eq!(
             restated(UnsettledTx {
-                deadline: tx(1).deadline.plus(Duration::from_millis(1)),
+                deadline: Deadline::of(
+                    tx(1).deadline.validity_end().plus(Duration::from_millis(1))
+                ),
                 ..tx(1)
             }),
             wrong,

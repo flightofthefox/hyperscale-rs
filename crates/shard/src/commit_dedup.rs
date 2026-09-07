@@ -34,13 +34,13 @@ use std::sync::Arc;
 
 use hyperscale_storage::DedupWindow;
 use hyperscale_types::{
-    DEDUP_WINDOW, Finalization, FinalizationHash, ProvisionHash, Provisions, RETENTION_HORIZON,
-    ShardId, Transaction, TxHash, Verifiable, WeightedTimestamp, delivery_window_close,
+    DEDUP_WINDOW, Deadline, Finalization, FinalizationHash, ProvisionHash, Provisions,
+    RETENTION_HORIZON, ShardId, Transaction, TxHash, Verifiable, WeightedTimestamp, Window,
 };
 
 #[allow(clippy::struct_field_names)] // shared `_retention` postfix is the artifact-tier convention
 pub struct CommitDedupIndex {
-    /// `tx_hash → delivery_window_close(end_timestamp_exclusive)`. Pruned
+    /// `tx_hash → the close of its delivery window`. Pruned
     /// when the deadline is at or below `current_committed_ts`.
     tx_retention: HashMap<TxHash, WeightedTimestamp>,
     /// `tx_hash → vote_anchor_ts + RETENTION_HORIZON` of the finalization
@@ -167,12 +167,12 @@ impl CommitDedupIndex {
     }
 
     /// Record a block's transactions in the retention lookup. Each entry's
-    /// stored value is [`delivery_window_close`] of the tx's validity end
-    /// — the last anchor a block may carry the transaction at.
+    /// stored value is the close of the tx's delivery window — the last
+    /// anchor a block may carry the transaction at.
     pub fn register_committed_txs(&mut self, transactions: &[Arc<Verifiable<Transaction>>]) {
         for tx in transactions {
             let tx_hash = tx.hash();
-            let deadline = delivery_window_close(tx.validity_range().end_timestamp_exclusive);
+            let deadline = Window::Delivery.of(Deadline::of_transaction(tx)).end;
             self.tx_retention.entry(tx_hash).or_insert(deadline);
         }
     }
@@ -370,7 +370,9 @@ mod tests {
         let mut idx = CommitDedupIndex::new();
         let tx = tx_with_end(1, 100);
         let tx_hash = tx.hash();
-        let close = delivery_window_close(WeightedTimestamp::from_millis(100));
+        let close = Window::Delivery
+            .of(Deadline::of(WeightedTimestamp::from_millis(100)))
+            .end;
         idx.register_committed_txs(std::slice::from_ref(&tx));
 
         idx.prune(WeightedTimestamp::from_millis(101));
@@ -398,7 +400,11 @@ mod tests {
         let later_hash = later.hash();
         idx.register_committed_txs(&[early, later]);
 
-        idx.prune(delivery_window_close(WeightedTimestamp::from_millis(500)));
+        idx.prune(
+            Window::Delivery
+                .of(Deadline::of(WeightedTimestamp::from_millis(500)))
+                .end,
+        );
 
         assert!(!idx.contains_tx(&early_hash));
         assert!(idx.contains_tx(&later_hash));

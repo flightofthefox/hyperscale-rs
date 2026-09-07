@@ -25,18 +25,18 @@ use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote,
     BlockVoteMessage, CertificateRoot, CertificateRootContext, CertifiedBlockHeader,
     CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError, ConsensusPublicKey,
-    ConsensusReceipt, CounterpartClaim, Derivation, Epoch, Finalization, Hash, LocalReceiptRoot,
-    LocalReceiptRootContext, NetworkDefinition, PreparedCommit, PrincipalAddr as AccountAddr,
-    ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
-    ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
-    ReshapeTrigger, Resolutions, RevealChain, Round, ShardId, ShardLoad, SplitChildRoots,
-    StateProofsRoot, StateRoot, StateRootContext, StateRootVerifyError, Stopwatch, StoredReceipt,
-    SubstateKey, SweepFrontier, TerminalRoots, Timeout, TimeoutContext, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionRootContext, TxHash, UnsettledTx, ValidatorId,
-    Verifiable, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
-    WorkInFlight, absorb_committed_cells, commit_witness_window, derive_leaves, lapse_probe_anchor,
-    local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
-    protocol_statics, reclaim_probe_anchor, shard_reveal_sign, signed_bytes, vrf_output_from_proof,
+    ConsensusReceipt, CounterpartClaim, Deadline, Derivation, Epoch, Finalization, Hash,
+    LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, PreparedCommit,
+    PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
+    ProvisionTxRootsMap, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
+    QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, ShardId,
+    ShardLoad, SplitChildRoots, StateProofsRoot, StateRoot, StateRootContext, StateRootVerifyError,
+    Stopwatch, StoredReceipt, SubstateKey, SweepFrontier, TerminalRoots, Timeout, TimeoutContext,
+    TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, UnsettledTx,
+    ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp,
+    Window, WitnessSources, WorkInFlight, absorb_committed_cells, commit_witness_window,
+    derive_leaves, local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
+    protocol_statics, shard_reveal_sign, signed_bytes, vrf_output_from_proof,
     work_over_certificates,
 };
 
@@ -759,7 +759,7 @@ where
                 // frozen divided with this shard delivering.
                 held.get(&tx_hash).map(|tx| {
                     Classified::freeze(tx.legs(), tx.owners(), &trie).delivers_at(ctx.shard)
-                        && anchor >= lapse_probe_anchor(tx.validity_range().end_timestamp_exclusive)
+                        && anchor >= Window::Lapse.of(Deadline::of_transaction(tx)).start
                 })
             })
             .and_successes(successes, |tx_hash| {
@@ -767,9 +767,8 @@ where
                 // already have reclaimed against. That the members held
                 // to it awaited nobody is the outcome's own attestation,
                 // read where the names were gathered.
-                held.get(&tx_hash).map(|tx| {
-                    anchor >= reclaim_probe_anchor(tx.validity_range().end_timestamp_exclusive)
-                })
+                held.get(&tx_hash)
+                    .map(|tx| Deadline::of_transaction(tx).passed(anchor))
             });
             match verdict {
                 Resolutions::Wrong(tx_hash) => tracing::warn!(
@@ -1470,7 +1469,7 @@ mod tests {
     };
     use hyperscale_types::{
         CertificateRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Signer,
-        StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError, delivery_window_close,
+        StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError,
     };
 
     use super::*;
@@ -2010,13 +2009,16 @@ mod tests {
         assert!(verify(end, &late), "admitted at the validity end");
         assert!(
             verify(
-                delivery_window_close(end).minus(Duration::from_millis(1)),
+                Window::Delivery
+                    .of(Deadline::of(end))
+                    .end
+                    .minus(Duration::from_millis(1)),
                 &late
             ),
             "and to the last moment of the window"
         );
         assert!(
-            !verify(delivery_window_close(end), &late),
+            !verify(Window::Delivery.of(Deadline::of(end)).end, &late),
             "refused at the close"
         );
         assert!(!verify(end, &HashSet::new()), "and refused unnamed");

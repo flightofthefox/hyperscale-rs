@@ -21,8 +21,8 @@
 //! one here, so the gap is reported instead of erasing the window.
 
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, FinalizationHash, ProvisionHash,
-    RETENTION_HORIZON, TxHash, WeightedTimestamp, delivery_window_close,
+    Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, Deadline, FinalizationHash, ProvisionHash,
+    RETENTION_HORIZON, TxHash, WeightedTimestamp, Window,
 };
 
 use super::chain_reader::ShardChainReader;
@@ -37,8 +37,8 @@ use super::chain_reader::ShardChainReader;
 /// that committed it.
 #[derive(Debug, Clone, Default)]
 pub struct DedupWindow {
-    /// `(tx_hash, delivery_window_close(end_timestamp_exclusive))` for
-    /// every transaction the window's blocks committed.
+    /// `(tx_hash, close of the delivery window)` for every transaction
+    /// the window's blocks committed.
     pub committed: Vec<(TxHash, WeightedTimestamp)>,
     /// `(tx_hash, deadline)` for every transaction a committed
     /// finalization in the window reached a verdict for.
@@ -151,7 +151,7 @@ impl DedupWindow {
     fn fold_block(&mut self, block: &Block, anchor: WeightedTimestamp) {
         self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
         for tx in block.transactions().iter() {
-            let deadline = delivery_window_close(tx.validity_range().end_timestamp_exclusive);
+            let deadline = Window::Delivery.of(Deadline::of_transaction(tx)).end;
             self.committed.push((tx.hash(), deadline));
         }
         for finalization in block.certificates().iter() {

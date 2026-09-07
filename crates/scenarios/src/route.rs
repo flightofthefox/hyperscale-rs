@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use hyperscale_engine::XRD;
 use hyperscale_types::{
-    Address, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey, TransactionDecision,
-    TransactionStatus, TxHash, WeightedTimestamp, delivery_window_close, reclaim_probe_anchor,
+    Address, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey, TransactionDecision,
+    TransactionStatus, TxHash, WeightedTimestamp, Window,
 };
 
 use crate::straddler::isolate_ec_intake;
@@ -205,7 +205,7 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
     // the scenario fails where the evidence is instead of wherever a
     // timer happened to land.
     let validity_end = validity.end_timestamp_exclusive;
-    let anchor = reclaim_probe_anchor(validity_end);
+    let anchor = Deadline::of(validity_end).at();
     let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
     assert!(
         c.run_until(epochs(8), |c| clock(c) >= anchor),
@@ -225,7 +225,7 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         "the certificate channel must actually have been exercised and cut",
     );
     assert!(
-        clock(c) < delivery_window_close(validity_end),
+        clock(c) < Window::Delivery.of(Deadline::of(validity_end)).end,
         "the cut has to lift inside the delivery window, or the core's output has nowhere to land",
     );
     for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {

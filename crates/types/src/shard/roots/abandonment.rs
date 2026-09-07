@@ -42,7 +42,7 @@ fn record_leaf(record: &AbandonmentRecord) -> Hash {
     bytes.extend_from_slice(&record.evidence().moment().as_millis().to_le_bytes());
     for entry in record.unsettled() {
         bytes.extend_from_slice(entry.tx_hash.as_bytes());
-        bytes.extend_from_slice(&entry.deadline.as_millis().to_le_bytes());
+        bytes.extend_from_slice(&entry.deadline.at().as_millis().to_le_bytes());
         bytes.extend_from_slice(&entry.declared_work.to_le_bytes());
         bytes.extend_from_slice(&entry.charge.vault.to_bytes());
         bytes.extend_from_slice(&entry.charge.amount.to_le_bytes());
@@ -98,14 +98,14 @@ impl Verify<&AbandonmentRootContext<'_>> for AbandonmentRoot {
 mod tests {
     use super::*;
     use crate::{
-        AbortCharge, Address, AddressClass, CounterpartEvidence, LocalKey, ShardId, SubstateKey,
-        TxHash, UnsettledTx, WeightedTimestamp,
+        AbortCharge, Address, AddressClass, CounterpartEvidence, Deadline, LocalKey, ShardId,
+        SubstateKey, TxHash, UnsettledTx, WeightedTimestamp,
     };
 
     fn tx(seed: u8) -> UnsettledTx {
         UnsettledTx {
             tx_hash: TxHash::from(Hash::from_bytes(&[seed; 32])),
-            deadline: WeightedTimestamp::from_millis(500),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(500)),
             declared_work: 7,
             charge: AbortCharge {
                 vault: SubstateKey {
@@ -176,7 +176,7 @@ mod tests {
         assert_ne!(
             root,
             restated(UnsettledTx {
-                deadline: WeightedTimestamp::from_millis(501),
+                deadline: Deadline::of(WeightedTimestamp::from_millis(501)),
                 ..tx(1)
             })
         );

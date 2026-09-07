@@ -18,7 +18,7 @@ use std::sync::Arc;
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::legs::{Classified, Member, Runs, Side};
 use hyperscale_types::{
-    EscrowedValue, ShardId, Transaction, TxHash, Verified, WeightedTimestamp, delivery_window_close,
+    Deadline, EscrowedValue, ShardId, Transaction, TxHash, Verified, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::CrossingCell;
 
@@ -268,7 +268,9 @@ impl TickCandidates {
             // already have taken back. It is abandoned at the close.
             if candidate.member.side() == Side::Delivering
                 && now
-                    >= delivery_window_close(candidate.tx.validity_range().end_timestamp_exclusive)
+                    >= Window::Delivery
+                        .of(Deadline::of_transaction(&candidate.tx))
+                        .end
             {
                 continue;
             }
@@ -361,9 +363,9 @@ impl TickCandidates {
             .filter(|(_, candidate)| {
                 candidate.member.side() == Side::Delivering
                     && now
-                        >= delivery_window_close(
-                            candidate.tx.validity_range().end_timestamp_exclusive,
-                        )
+                        >= Window::Delivery
+                            .of(Deadline::of_transaction(&candidate.tx))
+                            .end
             })
             .map(|(tx_hash, _)| *tx_hash)
             .collect();
@@ -497,14 +499,17 @@ mod tests {
         assert!(
             candidates
                 .drop_closed_deliveries(
-                    delivery_window_close(end).minus(std::time::Duration::from_millis(1))
+                    Window::Delivery
+                        .of(Deadline::of(end))
+                        .end
+                        .minus(std::time::Duration::from_millis(1))
                 )
                 .is_empty(),
             "short of the close the delivery may still be admitted",
         );
 
         assert_eq!(
-            candidates.drop_closed_deliveries(delivery_window_close(end)),
+            candidates.drop_closed_deliveries(Window::Delivery.of(Deadline::of(end)).end),
             vec![delivered],
         );
         assert!(!candidates.contains(delivered));

@@ -25,12 +25,12 @@ use hyperscale_storage::{
 };
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
-    BeaconWitnessEvent, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt,
+    BeaconWitnessEvent, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, Deadline,
     DeclaredRange, Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt,
     EventRoot, GlobalReceipt, Hash, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PrincipalAddr,
     ProvisionalHolds, SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites,
     SubstateKey, TimestampRange, Transaction, TransactionBody, TransactionEnvelope, TxHash,
-    Verified, WeightedTimestamp, absorb_committed_cells, claim_readable_at, compute_merkle_root,
+    Verified, WeightedTimestamp, Window, absorb_committed_cells, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
     AbiParam, Composed, CrossingCell, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader,
@@ -1664,10 +1664,11 @@ fn an_inherited_record_decides_itself_against_its_claim() {
     // The window opens where the consumer can no longer claim and closes
     // where the claim cell it names is swept.
     let inside = record.expiry_ms - 1;
-    assert!(claim_readable_at(
-        record.expiry_ms,
-        WeightedTimestamp::from_millis(inside)
-    ));
+    assert!(
+        Window::Claim
+            .of(Deadline::from_escrow_expiry(record.expiry_ms))
+            .contains(&WeightedTimestamp::from_millis(inside))
+    );
 
     // A store where the claim is present is the same store plus that one
     // cell, so the two runs differ in nothing else.

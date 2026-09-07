@@ -47,16 +47,15 @@ use hyperscale_storage::{RecoveredState, TickResolution, committed_tx_cell_key};
 use hyperscale_types::{
     AbandonmentRecord, Absence, Acceptance, Attempt, AwaitingTopologyBuffer, Block, BlockHash,
     BlockHeader, BlockHeight, BloomFilter, CertifiedBlock, CounterpartClaim, CounterpartMirror,
-    DeclaredKey, Derivation, ExecutionCertificate, ExecutionCertificateVerifyError,
+    Deadline, DeclaredKey, Derivation, ExecutionCertificate, ExecutionCertificateVerifyError,
     ExecutionOutcome, ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError,
     GlobalReceiptRoot, Hash, Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
     MAX_PROVISIONS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Mode, Probed,
     ProvenAnchors, Provisions, Refusal, ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId,
     ShardTrie, StateAnchor, StateProofBundle, StoredReceipt, SubstateKey, TickId, TopologySchedule,
     TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution,
-    UnsettledTx, ValidatorId, VerdictClaim, Verifiable, Verified, WeightedTimestamp,
-    claim_readable_at, derive_block_transactions, lapse_probe_anchor, reclaim_probe_anchor,
-    settled_set_verdict, tick_leader, tick_leader_at,
+    UnsettledTx, ValidatorId, VerdictClaim, Verifiable, Verified, WeightedTimestamp, Window,
+    derive_block_transactions, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use hyperscale_vm_effects::CrossingCell;
 use tracing::instrument;
@@ -222,7 +221,7 @@ pub struct ExecutionMemoryStats {
 
 /// One counterpart cell a leg entry asks about: the shard holding it,
 /// the cell, the anchor an answer is held to, and which question it is.
-type CounterpartCell = (ShardId, SubstateKey, WeightedTimestamp, Probed);
+type CounterpartCell = (ShardId, SubstateKey, Probed);
 
 /// Every cell `entry` asks a counterpart about, under `trie`: one core
 /// shard's committed cell, each delivery's claim on the shard that was
@@ -247,27 +246,19 @@ fn counterpart_cells(entry: &Probeable, trie: &ShardTrie) -> Vec<CounterpartCell
         .map(|&shard| {
             (
                 shard,
-                committed_tx_cell_key(shard, entry.tx_hash, entry.validity_end),
-                entry.deadline,
+                committed_tx_cell_key(shard, entry.tx_hash, entry.deadline.validity_end()),
                 Probed::Core,
             )
         });
     let deliveries = entry.deliveries.iter().flat_map(|&(delivered_by, claim)| {
         BTreeSet::from([delivered_by, trie.shard_for_prefix(claim.owner)])
             .into_iter()
-            .map(move |shard| {
-                (
-                    shard,
-                    claim,
-                    lapse_probe_anchor(entry.validity_end),
-                    Probed::Delivery,
-                )
-            })
+            .map(move |shard| (shard, claim, Probed::Delivery))
     });
     let claims = entry.claims.iter().flat_map(|&(shard, claim)| {
         BTreeSet::from([shard, trie.shard_for_prefix(claim.owner)])
             .into_iter()
-            .map(move |shard| (shard, claim, entry.deadline, Probed::Claim))
+            .map(move |shard| (shard, claim, Probed::Claim))
     });
     core.into_iter().chain(deliveries).chain(claims).collect()
 }
@@ -299,7 +290,7 @@ fn inherited_member_name(issued_by: TxHash, records: &[SubstateKey]) -> TxHash {
 /// crossing its deliverer could have taken. Every other member waits
 /// inside the horizon and takes no floor.
 fn delivery_floor(side: Side, validity_end: WeightedTimestamp) -> Option<WeightedTimestamp> {
-    (side == Side::Delivering).then(|| lapse_probe_anchor(validity_end))
+    (side == Side::Delivering).then(|| Window::Lapse.of(Deadline::of(validity_end)).start)
 }
 
 /// Execution state machine.
@@ -899,8 +890,7 @@ impl ExecutionCoordinator {
             // window's clock instead.
             if classified.decomposed().holds() && !classified.core().contains(&local_shard) {
                 if classified.delivers_at(local_shard) {
-                    self.unresolved
-                        .mark_delivery(tx.hash(), tx.validity_range().end_timestamp_exclusive);
+                    self.unresolved.mark_delivery(tx.hash());
                 } else {
                     let shape = classified.shape(tx.legs(), tx.crossings());
                     self.unresolved.mark_leg(
@@ -932,7 +922,7 @@ impl ExecutionCoordinator {
             self.candidates.record_engagement_wait(
                 tx_hash,
                 counterparts,
-                reclaim_probe_anchor(validity_end),
+                Deadline::of(validity_end).at(),
             );
         }
     }
@@ -1186,7 +1176,9 @@ impl ExecutionCoordinator {
         let mut due: BTreeMap<TxHash, Vec<SubstateKey>> = BTreeMap::new();
         for (key, record) in &self.inherited {
             if trie.shard_for_prefix(record.consumer_claim.owner) != local_shard
-                || !claim_readable_at(record.expiry_ms, tick_ts)
+                || !Window::Claim
+                    .of(Deadline::from_escrow_expiry(record.expiry_ms))
+                    .contains(&tick_ts)
             {
                 continue;
             }
@@ -2547,7 +2539,7 @@ impl ExecutionCoordinator {
         let trie = self.counterpart_trie(topology_schedule);
         let mut wanted: BTreeMap<StateAnchor, Vec<SubstateKey>> = BTreeMap::new();
         for entry in self.unresolved.probeable(self.committed_ts) {
-            for (shard, key, floor, probed) in counterpart_cells(&entry, trie) {
+            for (shard, key, probed) in counterpart_cells(&entry, trie) {
                 // The chain has answered: nothing is asked again.
                 if self.unresolved.answered(entry.tx_hash, shard, probed) {
                     continue;
@@ -2557,7 +2549,7 @@ impl ExecutionCoordinator {
                 // a bounded history behind its tip.
                 let Some((height, source)) = self
                     .proven_anchors
-                    .newest_licensed(shard, |ts| probed.licenses(ts, entry.validity_end))
+                    .newest_licensed(shard, |ts| probed.licenses(ts, entry.deadline))
                 else {
                     continue;
                 };
@@ -2585,7 +2577,6 @@ impl ExecutionCoordinator {
                         anchor,
                         key,
                         probed_wt: source.ts,
-                        floor,
                         probed,
                         answered: false,
                     },
@@ -2704,9 +2695,9 @@ impl ExecutionCoordinator {
         };
         {
             for (entry, cells) in cells {
-                for &(shard, key, floor, probed) in cells {
+                for &(shard, key, probed) in cells {
                     if shard != bundle.anchor.shard
-                        || !probed.licenses(bundle.anchor_ts, entry.validity_end)
+                        || !probed.licenses(bundle.anchor_ts, entry.deadline)
                     {
                         continue;
                     }
@@ -2724,7 +2715,6 @@ impl ExecutionCoordinator {
                         Inclusion::Present(_) => Answer::Committed,
                         Inclusion::Absent => Answer::Absent(Absence {
                             probed_wt: bundle.anchor_ts,
-                            floor,
                         }),
                     };
                     // The question is answered, and a fetch still out
@@ -2775,12 +2765,15 @@ impl ExecutionCoordinator {
         if verdict.shard == self.local_shard || !verdict.refuses() {
             return Vec::new();
         }
-        let Some(figures) = self.unresolved.unsettled_leg_figures(verdict.tx_hash) else {
+        if self
+            .unresolved
+            .unsettled_leg_figures(verdict.tx_hash)
+            .is_none()
+        {
             return Vec::new();
-        };
+        }
         let refusal = Refusal {
             refused_wt: verdict.anchor_ts,
-            deadline: figures.deadline,
             decision: verdict.decision,
             digest: verdict.digest,
         };
@@ -3884,9 +3877,9 @@ impl ExecutionCoordinator {
             if !in_core {
                 continue;
             }
-            let Some(figures) = self.unresolved.unsettled_leg_figures(tx_hash) else {
+            if self.unresolved.unsettled_leg_figures(tx_hash).is_none() {
                 continue;
-            };
+            }
             let decision = if outcome.is_aborted() {
                 TransactionDecision::Aborted
             } else {
@@ -3894,7 +3887,6 @@ impl ExecutionCoordinator {
             };
             let refusal = Refusal {
                 refused_wt: ec.vote_anchor_ts(),
-                deadline: figures.deadline,
                 decision,
                 digest: ec.attested_digest(),
             };
@@ -4723,7 +4715,7 @@ mod tests {
         MAX_VALIDITY_RANGE, NetworkDefinition, QuorumCertificate, RETENTION_HORIZON, Randomness,
         RecoveryCause, SeedRing, SeedSource, ShardAnchor, ShardRecovery, Signer, SignerBitfield,
         StateRoot, StoredReceipt, SubstateKey, TickHalf, TransactionDecision, TxResolution,
-        UnsettledTx, ValidatorInfo, ValidatorSet, delivery_window_close,
+        UnsettledTx, ValidatorInfo, ValidatorSet, Window,
     };
     use hyperscale_vm_types::Seeded;
 
@@ -8120,7 +8112,6 @@ mod tests {
             state.evidence.refusal(tx_hash, PEER),
             Some(Refusal {
                 refused_wt: anchor,
-                deadline: UnsettledTx::for_transaction(&transaction).deadline,
                 decision: TransactionDecision::Reject,
                 digest,
             }),
@@ -8211,7 +8202,6 @@ mod tests {
             mirrored,
             Some(Refusal {
                 refused_wt: WeightedTimestamp::from_millis(7_000),
-                deadline: UnsettledTx::for_transaction(&transaction).deadline,
                 decision: TransactionDecision::Reject,
                 digest: mirrored.expect("mirrored above").digest,
             }),
@@ -8468,7 +8458,7 @@ mod tests {
         ));
         let tx_hash = transaction.hash();
         let figures = UnsettledTx::for_transaction(&transaction);
-        let deadline = figures.deadline;
+        let deadline = figures.deadline.at();
         let lapse = deadline.plus(MAX_VALIDITY_RANGE);
         let claim = SubstateKey {
             owner: test_prefix(0x81),
@@ -8512,10 +8502,7 @@ mod tests {
         let _ = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert_eq!(
             absences_observed(&state, tx_hash),
-            vec![Absence {
-                probed_wt: later,
-                floor: lapse
-            }],
+            vec![Absence { probed_wt: later }],
         );
         assert_eq!(
             state.pending_abandonment_records(),
@@ -8534,7 +8521,7 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let deadline = UnsettledTx::for_transaction(&transaction).deadline;
+        let deadline = UnsettledTx::for_transaction(&transaction).deadline.at();
         let later = deadline
             .plus(MAX_VALIDITY_RANGE)
             .plus(Duration::from_secs(1));
@@ -8599,7 +8586,7 @@ mod tests {
         ));
         let tx_hash = transaction.hash();
         let figures = UnsettledTx::for_transaction(&transaction);
-        let deadline = figures.deadline;
+        let deadline = figures.deadline.at();
         let lapse = deadline.plus(MAX_VALIDITY_RANGE);
         // An owner under the peer's left child, as the trie cuts it.
         let claim = SubstateKey {
@@ -8661,10 +8648,7 @@ mod tests {
         let _ = commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert_eq!(
             absences_observed_at(&state, successor, tx_hash),
-            vec![Absence {
-                probed_wt: later,
-                floor: lapse
-            }],
+            vec![Absence { probed_wt: later }],
         );
         assert_eq!(
             state.pending_abandonment_records(),
@@ -8693,7 +8677,7 @@ mod tests {
         ));
         let tx_hash = transaction.hash();
         let figures = UnsettledTx::for_transaction(&transaction);
-        let deadline = figures.deadline;
+        let deadline = figures.deadline.at();
         let key = committed_tx_cell_key(
             CORE,
             tx_hash,
@@ -8785,10 +8769,7 @@ mod tests {
         );
         assert_eq!(
             absences_observed_at(&state, CORE, tx_hash),
-            vec![Absence {
-                probed_wt: later,
-                floor: deadline
-            }],
+            vec![Absence { probed_wt: later }],
             "the absence reaches the mirror the vote fence reads"
         );
         assert_eq!(
@@ -8818,7 +8799,7 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let deadline = UnsettledTx::for_transaction(&transaction).deadline;
+        let deadline = UnsettledTx::for_transaction(&transaction).deadline.at();
         let key = committed_tx_cell_key(
             CORE,
             tx_hash,
@@ -8883,7 +8864,7 @@ mod tests {
             vec![(PEER, claim)],
         );
         state.unresolved.certify(transaction.hash());
-        state.committed_ts = UnsettledTx::for_transaction(transaction).deadline;
+        state.committed_ts = UnsettledTx::for_transaction(transaction).deadline.at();
         state
     }
 
@@ -8900,7 +8881,7 @@ mod tests {
         ));
         let tx_hash = transaction.hash();
         let figures = UnsettledTx::for_transaction(&transaction);
-        let deadline = figures.deadline;
+        let deadline = figures.deadline.at();
         let core_key = committed_tx_cell_key(
             PEER,
             tx_hash,
@@ -8960,7 +8941,7 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let deadline = UnsettledTx::for_transaction(&transaction).deadline;
+        let deadline = UnsettledTx::for_transaction(&transaction).deadline.at();
         let core_key = committed_tx_cell_key(
             CORE,
             tx_hash,
@@ -9048,7 +9029,7 @@ mod tests {
         let schedule = two_shard_topology();
         let (transaction, figures, claim, mut state) = consumer_claim_fixture(0x7C);
         let tx_hash = transaction.hash();
-        let probed_wt = figures.deadline.plus(Duration::from_secs(2));
+        let probed_wt = figures.deadline.at().plus(Duration::from_secs(2));
         let (bundle, opened) = proven_at(
             &mut state,
             &schedule,
@@ -9097,7 +9078,7 @@ mod tests {
         let schedule = two_shard_topology();
         let (transaction, figures, _, mut state) = consumer_claim_fixture(0x7D);
         let tx_hash = transaction.hash();
-        let probed_wt = figures.deadline.plus(Duration::from_secs(2));
+        let probed_wt = figures.deadline.at().plus(Duration::from_secs(2));
         let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
             TickId::new(PEER, BlockHeight::new(5)),
             probed_wt,
@@ -9165,7 +9146,10 @@ mod tests {
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
         let validity_end = tx.validity_range().end_timestamp_exclusive;
-        let close_ms = delivery_window_close(validity_end).as_millis();
+        let close_ms = Window::Delivery
+            .of(Deadline::of(validity_end))
+            .end
+            .as_millis();
 
         state.on_block_committed(
             &schedule,
@@ -9179,7 +9163,7 @@ mod tests {
                 1_000,
             ),
         );
-        state.unresolved.mark_delivery(tx_hash, validity_end);
+        state.unresolved.mark_delivery(tx_hash);
         state.unresolved.certify(tx_hash);
         let held_by = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         assert_eq!(state.ticks.tick_assignment(tx_hash), Some(held_by));
@@ -9475,7 +9459,7 @@ mod tests {
                 WeightedTimestamp::from_millis(60_000),
                 vec![UnsettledTx {
                     tx_hash,
-                    deadline: WeightedTimestamp::from_millis(30_000),
+                    deadline: Deadline::of(WeightedTimestamp::from_millis(30_000)),
                     declared_work: 1,
                     charge: AbortCharge {
                         vault: SubstateKey {

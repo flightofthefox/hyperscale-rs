@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use hyperscale_engine::XRD;
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, Epoch, PrincipalAddr, ShardId, SubstateKey,
-    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, lapse_probe_anchor,
+    BlockHeight, Deadline, Ed25519PrivateKey, Epoch, PrincipalAddr, ShardId, SubstateKey,
+    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
 };
 
 use crate::reshape::split_lifecycle;
@@ -431,6 +431,7 @@ pub fn a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed<C: Faultable
     let validity = validity_around(c.now());
     let tx = build_transfer_tx(payer_key, *payer, *recipient, STRADDLER_PAYMENT, validity);
     let price = declared_price(c, &tx);
+    let lapse = Window::Lapse.of(Deadline::of_transaction(&tx)).start;
     let hash = charges.submit(c, tx);
     assert!(
         c.run_until(epochs(2), |c| c.chain_fate(survivor, hash).0.is_some()),
@@ -477,7 +478,6 @@ pub fn a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed<C: Faultable
 
     // Past the lapse, with the cut standing the whole way: no chain that
     // ever held the recipient had a bundle to claim from.
-    let lapse = lapse_probe_anchor(validity.end_timestamp_exclusive);
     let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
     assert!(
         c.run_until(epochs(12), |c| clock(c) >= lapse),

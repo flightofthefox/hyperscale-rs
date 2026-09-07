@@ -42,10 +42,10 @@ use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
 use hyperscale_engine::legs::Classified;
 use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, CompletedRecovery, ForkFence, LocalTimestamp, MAX_DRAIN_WORK,
-    MAX_GAS_LIMIT, MessageClass, RETENTION_HORIZON, ShardId, TopologySnapshot, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, TxResolution, Verified, WeightedTimestamp,
-    delivery_window_close, leg_entry_horizon, reclaim_probe_anchor,
+    BlockHeight, CertifiedBlock, CompletedRecovery, Deadline, ForkFence, LocalTimestamp,
+    MAX_DRAIN_WORK, MAX_GAS_LIMIT, MessageClass, RETENTION_HORIZON, ShardId, TopologySnapshot,
+    Transaction, TransactionDecision, TransactionStatus, TxHash, TxResolution, Verified,
+    WeightedTimestamp, Window,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -906,7 +906,7 @@ impl MempoolCoordinator {
             && Classified::freeze(tx.legs(), tx.owners(), topology_snapshot.shard_trie())
                 .delivers_at(self.local_shard);
         if delivers {
-            delivery_window_close(validity_end)
+            Window::Delivery.of(Deadline::of(validity_end)).end
         } else {
             validity_end
         }
@@ -1187,9 +1187,7 @@ impl MempoolCoordinator {
             .filter(|(_, entry)| match entry.status {
                 TransactionStatus::Pending => entry.admissible_until <= now,
                 TransactionStatus::LegFinalized => {
-                    leg_entry_horizon(reclaim_probe_anchor(
-                        entry.tx.validity_range().end_timestamp_exclusive,
-                    )) <= now
+                    Window::LegEntry.of(Deadline::of_transaction(&entry.tx)).end <= now
                 }
                 TransactionStatus::Committed(_) | TransactionStatus::Completed(_) => false,
             })
@@ -2006,8 +2004,9 @@ mod tests {
         mempool.on_block_committed(&topology_snapshot, &certify(block, 1_000));
         mempool.on_resolutions(&[(tx_hash, TxResolution::LegFinalized)]);
 
-        let horizon =
-            leg_entry_horizon(reclaim_probe_anchor(WeightedTimestamp::from_millis(end_ms)));
+        let horizon = Window::LegEntry
+            .of(Deadline::of(WeightedTimestamp::from_millis(end_ms)))
+            .end;
         set_current_ts(&mut mempool, horizon.minus(Duration::from_millis(1)));
         assert_eq!(mempool.cleanup_expired_pending(), 0);
         assert!(mempool.has_transaction(&tx_hash));
@@ -2825,7 +2824,7 @@ mod tests {
             "and so is a whole shape's, wherever its payer sits"
         );
 
-        set_current_ts(&mut mempool, delivery_window_close(end));
+        set_current_ts(&mut mempool, Window::Delivery.of(Deadline::of(end)).end);
         assert_eq!(mempool.cleanup_expired_pending(), 1, "the close sweeps it");
         assert!(mempool.status(&delivery.hash()).is_none());
     }

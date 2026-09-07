@@ -18,11 +18,11 @@ use hyperscale_types::test_utils::{
 };
 use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
-    CertifiedBlock, ChainOrigin, ConsensusReceipt, Finalization, GlobalReceiptHash, Hash, LocalKey,
-    ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, SafeVoteRegisters,
+    CertifiedBlock, ChainOrigin, ConsensusReceipt, Deadline, Finalization, GlobalReceiptHash, Hash,
+    LocalKey, ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, SafeVoteRegisters,
     SettledWrites, ShardId, StateRoot, StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId,
     TimestampRange, Transaction, TxHash, ValidatorId, Verifiable, Verified, VotePosition,
-    WeightedTimestamp, WitnessSources, delivery_window_close,
+    WeightedTimestamp, Window, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -1266,7 +1266,9 @@ fn dedup_window_recovers_committed_txs_with_their_own_deadlines() {
         window.committed,
         vec![(
             tx_hash,
-            delivery_window_close(WeightedTimestamp::from_millis(90_000))
+            Window::Delivery
+                .of(Deadline::of(WeightedTimestamp::from_millis(90_000)))
+                .end
         )],
     );
 }
@@ -1338,7 +1340,9 @@ fn dedup_window_stops_short_without_claiming_the_origin() {
         window.committed,
         vec![(
             tx_hash,
-            delivery_window_close(WeightedTimestamp::from_millis(900_000))
+            Window::Delivery
+                .of(Deadline::of(WeightedTimestamp::from_millis(900_000)))
+                .end
         )],
     );
     assert!(

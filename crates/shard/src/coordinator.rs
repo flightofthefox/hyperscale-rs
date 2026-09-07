@@ -101,7 +101,7 @@ use hyperscale_types::{
     StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, Transaction,
     TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier,
     Verify, VoteCount, VotePosition, derive_leaves, missed_proposals_since_prev_commit,
-    ready_leaf_payload, validity_end_of,
+    ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -1399,8 +1399,7 @@ impl ShardCoordinator {
         probed: Probed,
         block_hash: BlockHash,
     ) -> bool {
-        let validity_end = validity_end_of(entry.deadline);
-        if !probed.licenses(probed_wt, validity_end) {
+        if !probed.licenses(probed_wt, entry.deadline) {
             warn!(
                 validator = ?self.me,
                 block_hash = ?block_hash,
@@ -7577,12 +7576,12 @@ mod tests {
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
     use hyperscale_types::{
         Absence, Acceptance, AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot,
-        BlockHeaderParts, CommittedTxsRoot, ConsensusSignature, Epoch, Hash, MAX_TIMESTAMP_DELAY,
-        MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, SettledTxSet, SettledTxsRoot,
-        ShardAnchor, ShardId, Signer, SignerBitfield, TerminalRoots, TimestampRange,
-        TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, UnsettledTx,
-        ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources,
-        abandonment_root_from_records, reclaim_probe_anchor, test_utils,
+        BlockHeaderParts, CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash,
+        MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, SettledTxSet,
+        SettledTxsRoot, ShardAnchor, ShardId, Signer, SignerBitfield, TerminalRoots,
+        TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision,
+        UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
+        WitnessSources, abandonment_root_from_records, test_utils,
     };
 
     use super::*;
@@ -12180,7 +12179,6 @@ mod tests {
             peer,
             Refusal {
                 refused_wt: anchor,
-                deadline: WeightedTimestamp::from_millis(9_000),
                 decision: TransactionDecision::Reject,
                 digest,
             },
@@ -12235,7 +12233,7 @@ mod tests {
     fn figures_of(tx: &[u8]) -> UnsettledTx {
         UnsettledTx {
             tx_hash: TxHash::from(Hash::from_bytes(tx)),
-            deadline: reclaim_probe_anchor(WeightedTimestamp::from_millis(60_000)),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(60_000)),
             declared_work: 5,
             charge: stub_abort_charge(5),
         }
@@ -12479,7 +12477,6 @@ mod tests {
         let tx_hash = figures_of(b"tx").tx_hash;
         let mirror = |refused_wt: WeightedTimestamp| Refusal {
             refused_wt,
-            deadline: figures_of(b"tx").deadline,
             decision: TransactionDecision::Reject,
             digest: Hash::from_bytes(b"digest"),
         };
@@ -12520,12 +12517,9 @@ mod tests {
     #[test]
     fn an_absence_record_stands_or_falls_on_the_mirror() {
         let sched = make_terminating_schedule(4);
-        let deadline = figures_of(b"tx").deadline;
+        let deadline = figures_of(b"tx").deadline.at();
         let tx_hash = figures_of(b"tx").tx_hash;
-        let mirror = |probed_wt: WeightedTimestamp| Absence {
-            probed_wt,
-            floor: deadline,
-        };
+        let mirror = |probed_wt: WeightedTimestamp| Absence { probed_wt };
         let record = |probed_wt: WeightedTimestamp| {
             block_with_records(
                 AFTER_CUT_MS,
@@ -12588,11 +12582,10 @@ mod tests {
     #[test]
     fn an_untaken_record_stands_on_the_claims_own_mirror() {
         let sched = make_terminating_schedule(4);
-        let deadline = figures_of(b"tx").deadline;
+        let deadline = figures_of(b"tx").deadline.at();
         let tx_hash = figures_of(b"tx").tx_hash;
         let absence = Absence {
             probed_wt: deadline,
-            floor: deadline,
         };
         let record = block_with_records(
             AFTER_CUT_MS,
@@ -12630,13 +12623,10 @@ mod tests {
     #[test]
     fn a_lapse_record_is_held_to_the_deadline_plus_a_validity_range() {
         let sched = make_terminating_schedule(4);
-        let deadline = figures_of(b"tx").deadline;
+        let deadline = figures_of(b"tx").deadline.at();
         let lapse = deadline.plus(MAX_VALIDITY_RANGE);
         let tx_hash = figures_of(b"tx").tx_hash;
-        let mirror = |probed_wt: WeightedTimestamp| Absence {
-            probed_wt,
-            floor: lapse,
-        };
+        let mirror = |probed_wt: WeightedTimestamp| Absence { probed_wt };
         let record = |probed_wt: WeightedTimestamp| {
             block_with_records(
                 AFTER_CUT_MS,
@@ -12676,7 +12666,6 @@ mod tests {
             Probed::Delivery,
             Absence {
                 probed_wt: deadline,
-                floor: deadline,
             },
         );
         assert!(
@@ -12689,10 +12678,7 @@ mod tests {
             tx_hash,
             ShardId::ROOT,
             Probed::Core,
-            Absence {
-                probed_wt: lapse,
-                floor: deadline,
-            },
+            Absence { probed_wt: lapse },
         );
         assert!(
             cores.fence_abandonment_records(&sched, &record(lapse), BlockHash::ZERO),
@@ -12708,7 +12694,7 @@ mod tests {
     fn an_accepted_record_stands_or_falls_on_the_mirror() {
         let sched = make_terminating_schedule(4);
         let figures = figures_of(b"tx");
-        let accepted_wt = figures.deadline;
+        let accepted_wt = figures.deadline.at();
         let record = |at: WeightedTimestamp| {
             block_with_records(
                 AFTER_CUT_MS,

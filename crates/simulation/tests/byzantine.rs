@@ -24,8 +24,8 @@ use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{Cluster, FaultHandle, FaultableCluster, ScenarioConfig, epochs};
 use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{
-    Provisions, ShardId, TransactionDecision, TransactionStatus, WeightedTimestamp,
-    lapse_probe_anchor,
+    Deadline, Provisions, ShardId, TransactionDecision, TransactionStatus, WeightedTimestamp,
+    Window,
 };
 use support::SimCluster;
 
@@ -111,7 +111,9 @@ fn a_forged_state_proof_convinces_nobody() {
             "the leg pays the payment and the price",
         );
 
-        let lapse = lapse_probe_anchor(validity.end_timestamp_exclusive);
+        let lapse = Window::Lapse
+            .of(Deadline::of(validity.end_timestamp_exclusive))
+            .start;
         assert!(
             c.run_until(epochs(12), |c| WeightedTimestamp::ZERO.plus(c.now())
                 >= lapse),

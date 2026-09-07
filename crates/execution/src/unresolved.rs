@@ -19,14 +19,15 @@
 //! [`TickRegistry`]: crate::ticks::TickRegistry
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Range;
 use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Absence, Address, BlockHeight, CounterpartEvidence,
-    Finalization, Probed, ShardId, ShardTrie, StateAnchor, SubstateKey, Transaction,
-    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
-    WeightedTimestamp, delivery_window_close, leg_entry_horizon, verdict_window_close,
+    AbandonmentRecord, AbortCharge, Absence, Address, BlockHeight, CounterpartEvidence, Deadline,
+    Finalization, MAX_VALIDITY_RANGE, Probed, ShardId, ShardTrie, StateAnchor, SubstateKey,
+    Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
+    WeightedTimestamp, Window,
 };
 
 /// One transaction the ledger will let a tick abandon, with everything
@@ -44,9 +45,7 @@ pub struct Abandonable {
 }
 
 /// What this shard has asked a silent counterpart about one transaction:
-/// a proof of `key` against `anchor`, whose block sits at `probed_wt`;
-/// `floor` is the anchor the answer is held to, kept beside it so the
-/// answer can be dated without the ledger.
+/// a proof of `key` against `anchor`, whose block sits at `probed_wt`.
 ///
 /// A probe is the fetch and nothing more. Its answer is read off the
 /// block that carries the proof, by every replica alike, so the probe
@@ -58,7 +57,6 @@ pub struct Probe {
     pub anchor: StateAnchor,
     pub key: SubstateKey,
     pub probed_wt: WeightedTimestamp,
-    pub floor: WeightedTimestamp,
     pub probed: Probed,
     pub answered: bool,
 }
@@ -93,8 +91,9 @@ fn release_fetches(released: &mut Vec<(StateAnchor, SubstateKey)>, owed: &Owed) 
 struct Owed {
     /// The moment past which the transaction can no longer finalize
     /// anywhere: the last block that could have included it, plus the
-    /// longest a cross-shard transaction can take to finalize.
-    deadline: WeightedTimestamp,
+    /// longest a cross-shard transaction can take to finalize. Every
+    /// window the entry is held to is read off it.
+    deadline: Deadline,
     /// The reservation its committing block took against the drain, held
     /// here because an abandonment has no execution to read it from and
     /// must release exactly what was taken.
@@ -209,6 +208,24 @@ enum Taken {
 }
 
 impl Owed {
+    /// The moment the entry stops being settleable and becomes the
+    /// shard's to abandon: the transaction's deadline, or for a delivery
+    /// the close of its window, past which the crossing it would claim
+    /// lapses and its issuer may reclaim it.
+    fn opens(&self) -> WeightedTimestamp {
+        match self.kind {
+            Kind::Delivery => Window::Delivery.of(self.deadline).end,
+            Kind::Whole | Kind::Leg | Kind::Remainder => self.deadline.at(),
+        }
+    }
+
+    /// Where a tick may abandon the entry: from its opening, for the one
+    /// validity range every abandonment gets to commit.
+    fn abandon_window(&self) -> Range<WeightedTimestamp> {
+        let opens = self.opens();
+        opens..opens.plus(MAX_VALIDITY_RANGE)
+    }
+
     /// Whether `shard`, leaving at `cut`, was party to this entry: it
     /// owned one of the entry's remote prefixes, and the transaction
     /// committed before it left.
@@ -361,11 +378,10 @@ pub struct Probeable {
     /// The transaction.
     pub tx_hash: TxHash,
     /// Its deadline: the earliest core anchor at which absence means
-    /// anything, and the figure a core's answer is dated against.
-    pub deadline: WeightedTimestamp,
-    /// Its validity end, which names the committed cell the core would
-    /// have written and dates the lapse a delivery's answer is held to.
-    pub validity_end: WeightedTimestamp,
+    /// anything, which every window an answer is held to is read off,
+    /// and whose validity end names the committed cell the core would
+    /// have written.
+    pub deadline: Deadline,
     /// The core set. Any one core shard's absence suffices — no core
     /// shard finalizes without every other's certificate — so the probe
     /// goes to one of them. Empty for a shape with no core, whose
@@ -527,10 +543,9 @@ impl UnresolvedTxs {
     /// A delivery never run by then is abandoned there like any other
     /// unresolved entry, returning its reservation; one that ran is
     /// released by its own finalization.
-    pub fn mark_delivery(&mut self, tx_hash: TxHash, validity_end: WeightedTimestamp) {
+    pub fn mark_delivery(&mut self, tx_hash: TxHash) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
             owed.kind = Kind::Delivery;
-            owed.deadline = delivery_window_close(validity_end);
         }
     }
 
@@ -719,7 +734,7 @@ impl UnresolvedTxs {
     pub fn probeable(&self, now: WeightedTimestamp) -> Vec<Probeable> {
         self.cells()
             .into_iter()
-            .filter(|entry| now >= entry.deadline)
+            .filter(|entry| entry.deadline.passed(now))
             .collect()
     }
 
@@ -737,7 +752,6 @@ impl UnresolvedTxs {
                 Some(Probeable {
                     tx_hash: *tx_hash,
                     deadline: owed.deadline,
-                    validity_end: leg.body.validity_range().end_timestamp_exclusive,
                     core: leg.core.clone(),
                     deliveries: leg.deliveries.clone(),
                     claims: leg.claims.clone(),
@@ -1258,8 +1272,8 @@ impl UnresolvedTxs {
             .iter()
             .filter(|(_, owed)| !owed.kind.is_leg())
             .filter(|(_, owed)| {
-                now >= owed.deadline
-                    && (owed.unsettled_by.is_some() || now < verdict_window_close(owed.deadline))
+                let window = owed.abandon_window();
+                now >= window.start && (owed.unsettled_by.is_some() || now < window.end)
             })
             .map(|(tx_hash, owed)| Abandonable {
                 tx_hash: *tx_hash,
@@ -1325,7 +1339,7 @@ impl UnresolvedTxs {
                     // be composed, whatever evidence lands. Short of it
                     // only the finalization that decides it ends it.
                     if owed.kind.is_leg() {
-                        return leg_entry_horizon(owed.deadline) > now;
+                        return Window::LegEntry.of(owed.deadline).end > now;
                     }
                     if let Some(shard) = owed.unsettled_by {
                         if self.departed.get(&shard).is_some_and(|departure| {
@@ -1360,7 +1374,7 @@ impl UnresolvedTxs {
                         });
                         return false;
                     }
-                    verdict_window_close(owed.deadline) > now
+                    owed.abandon_window().end > now
                 });
         self.owed = kept;
         for owed in dropped.values() {
@@ -1478,10 +1492,7 @@ mod tests {
     fn names(tx: &Arc<Verifiable<Transaction>>) -> UnsettledTx {
         UnsettledTx {
             tx_hash: tx.hash(),
-            deadline: tx
-                .validity_range()
-                .end_timestamp_exclusive
-                .plus(MAX_FINALIZATION_DELAY),
+            deadline: Deadline::of_transaction(tx),
             declared_work: tx.work(),
             charge: charge(tx),
         }
@@ -2029,10 +2040,10 @@ mod tests {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(4, 60_000);
         commit(&mut ledger, &tx);
-        ledger.mark_delivery(tx.hash(), ms(60_000));
+        ledger.mark_delivery(tx.hash());
         assert!(ledger.is_delivery(tx.hash()));
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
-        let close = delivery_window_close(ms(60_000));
+        let close = Window::Delivery.of(Deadline::of(ms(60_000))).end;
 
         assert!(
             ledger.past_deadline(deadline).is_empty(),
@@ -2052,7 +2063,7 @@ mod tests {
 
         let mut delivered = UnresolvedTxs::default();
         commit(&mut delivered, &tx);
-        delivered.mark_delivery(tx.hash(), ms(60_000));
+        delivered.mark_delivery(tx.hash());
         delivered.certify(tx.hash());
         let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Accept);
         delivered.release_resolved(&[Arc::new(Verifiable::from(own))]);
@@ -2088,8 +2099,7 @@ mod tests {
             ledger.probeable(deadline),
             vec![Probeable {
                 tx_hash: leg.hash(),
-                deadline,
-                validity_end: ms(60_000),
+                deadline: Deadline::of(ms(60_000)),
                 core: BTreeSet::from([PARTNER]),
                 deliveries: Vec::new(),
                 claims: Vec::new(),
@@ -2140,8 +2150,7 @@ mod tests {
             ledger.probeable(deadline),
             vec![Probeable {
                 tx_hash: leg.hash(),
-                deadline,
-                validity_end: ms(60_000),
+                deadline: Deadline::of(ms(60_000)),
                 core: BTreeSet::from([PARTNER]),
                 deliveries: vec![(PARTNER, claim)],
                 claims: Vec::new(),
@@ -2197,8 +2206,7 @@ mod tests {
             ledger.probeable(deadline),
             vec![Probeable {
                 tx_hash: tx.hash(),
-                deadline,
-                validity_end: ms(60_000),
+                deadline: Deadline::of(ms(60_000)),
                 core: BTreeSet::new(),
                 deliveries: vec![(PARTNER, claim)],
                 claims: Vec::new(),
@@ -2376,7 +2384,7 @@ mod tests {
 
         let delivery = tx(3, 60_000);
         commit(&mut ledger, &delivery);
-        ledger.mark_delivery(delivery.hash(), ms(60_000));
+        ledger.mark_delivery(delivery.hash());
         assert_eq!(
             fw(
                 &ledger,
@@ -2560,7 +2568,7 @@ mod tests {
     /// ends it, and a record covering it neither extends nor shortens it.
     #[test]
     fn a_leg_entry_dies_where_its_evidence_does() {
-        let horizon = leg_entry_horizon(ms(60_000).plus(MAX_FINALIZATION_DELAY));
+        let horizon = Window::LegEntry.of(Deadline::of(ms(60_000))).end;
         for covered in [false, true] {
             let mut ledger = UnresolvedTxs::default();
             let tx = tx(5, 60_000);

@@ -414,7 +414,7 @@ impl ProvisioningTracker {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, ShardTrie, lapse_probe_anchor,
+        BlockHeight, Deadline, Hash, MerkleInclusionProof, ProvisionEntry, ShardTrie, Window,
     };
 
     use super::*;
@@ -855,7 +855,7 @@ mod tests {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"delivery"));
         let validity_end = WeightedTimestamp::from_millis(100_000);
-        let floor = lapse_probe_anchor(validity_end);
+        let floor = Window::Lapse.of(Deadline::of(validity_end)).start;
         t.advance_clock(WeightedTimestamp::from_millis(1_000));
         t.record_required(
             tx,

@@ -15,8 +15,8 @@
 
 use hyperscale_engine::XRD;
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey, TransactionDecision,
-    TransactionStatus, TxHash, WeightedTimestamp, WorkInFlight, delivery_window_close,
+    BlockHeight, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey,
+    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window, WorkInFlight,
 };
 
 use crate::reshape::split_lifecycle;
@@ -1002,7 +1002,7 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
     let banked = c.run_until(epochs(8), |c| held(c, route.trader.address(), *XRD) > paid);
     let clock = WeightedTimestamp::ZERO.plus(c.now());
     let burned = charges.burned(c);
-    if banked || clock < delivery_window_close(validity_end) {
+    if banked || clock < Window::Delivery.of(Deadline::of(validity_end)).end {
         assert!(
             banked,
             "the route must bank its output for the trader while its delivery window is open; \
