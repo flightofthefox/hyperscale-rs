@@ -409,12 +409,22 @@ impl ExecutionCertificate {
     /// What this certificate says of each transaction, as a counterpart
     /// hears it: an acceptance or a refusal, at the vote anchor, named
     /// by the attested digest.
+    ///
+    /// A success speaks only in a role that claims. A leg's success is
+    /// its own side going through, which says nothing about the crossings
+    /// it consumed — and an issuer that heard it as an acceptance would
+    /// take it for the claim its record is held for. A refusal speaks
+    /// whatever the role, since a member that could not do its part ends
+    /// the transaction on its shard.
     pub fn verdicts(&self) -> impl Iterator<Item = (TxHash, Heard)> + '_ {
         let digest = self.attested_digest();
         let at = self.vote_anchor_ts;
-        self.tx_outcomes.iter().map(move |outcome| {
+        self.tx_outcomes.iter().filter_map(move |outcome| {
             let word = match outcome.outcome() {
-                ExecutionOutcome::Succeeded { .. } => Word::Accepted { digest },
+                ExecutionOutcome::Succeeded { .. } => outcome
+                    .role()
+                    .success_claims()
+                    .then_some(Word::Accepted { digest })?,
                 ExecutionOutcome::Failed => Word::Refused {
                     decision: TransactionDecision::Reject,
                     digest,
@@ -424,14 +434,14 @@ impl ExecutionCertificate {
                     digest,
                 },
             };
-            (
+            Some((
                 outcome.tx_hash(),
                 Heard {
                     question: Question::Verdict,
                     word,
                     at,
                 },
-            )
+            ))
         })
     }
 
@@ -759,7 +769,7 @@ mod tests {
     use hyperscale_hbor::from_slice as hbor_from_slice;
 
     use super::*;
-    use crate::{BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, TxHash};
+    use crate::{BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, Role, TxHash};
 
     fn outcome(seed: u8) -> TxOutcome {
         TxOutcome::new(
@@ -1136,6 +1146,52 @@ mod tests {
         );
         let keep: HashSet<TxHash> = outcomes.iter().map(TxOutcome::tx_hash).collect();
         assert_eq!(cert.project_to(&keep).expect("all kept"), cert);
+    }
+
+    /// A success speaks an acceptance only in a role that claims what
+    /// crossed to it. A leg's success is its own side going through, and
+    /// an issuer that heard it as an acceptance would take it for the
+    /// claim its record is held for — which on a shard that is both a
+    /// caller and a recipient of one swap is every swap.
+    #[test]
+    fn only_a_claiming_success_speaks_an_acceptance() {
+        let outcomes = vec![
+            outcome(1).as_role(Role::Delivery),
+            outcome(2).as_role(Role::Leg),
+            outcome(3).as_role(Role::Core),
+            TxOutcome::new(
+                TxHash::from(Hash::from_bytes(&[4u8; 4])),
+                ExecutionOutcome::Failed,
+            )
+            .as_role(Role::Leg),
+        ];
+        let spoken: Vec<(TxHash, Word)> = ExecutionCertificate::new(
+            tick_id(),
+            WeightedTimestamp::from_millis(11),
+            compute_global_receipt_root(&outcomes),
+            outcomes.clone(),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        )
+        .verdicts()
+        .map(|(tx_hash, heard)| (tx_hash, heard.word))
+        .collect();
+
+        assert_eq!(
+            spoken
+                .iter()
+                .map(|(tx_hash, _)| *tx_hash)
+                .collect::<Vec<_>>(),
+            vec![
+                outcomes[0].tx_hash(),
+                outcomes[2].tx_hash(),
+                outcomes[3].tx_hash()
+            ],
+            "the leg's success says nothing; its refusal still ends the transaction here",
+        );
+        assert!(matches!(spoken[0].1, Word::Accepted { .. }));
+        assert!(matches!(spoken[1].1, Word::Accepted { .. }));
+        assert!(matches!(spoken[2].1, Word::Refused { .. }));
     }
 
     /// A recipient party to nothing in the tick gets no certificate: an
