@@ -286,7 +286,28 @@ mod tests {
         latest_qc: Option<&Verified<QuorumCertificate>>,
         f: impl FnOnce(&ChainView<'_>) -> R,
     ) -> R {
-        let certified = HashMap::new();
+        run_view_over(
+            committed_height,
+            committed_hash,
+            committed_state_root,
+            pending,
+            &HashMap::new(),
+            latest_qc,
+            f,
+        )
+    }
+
+    /// [`run_view`] with a populated verified-certified cache — the home
+    /// of a block admitted through sync, which never becomes pending.
+    fn run_view_over<R>(
+        committed_height: u64,
+        committed_hash: BlockHash,
+        committed_state_root: StateRoot,
+        pending: &PendingBlocks,
+        certified: &HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>,
+        latest_qc: Option<&Verified<QuorumCertificate>>,
+        f: impl FnOnce(&ChainView<'_>) -> R,
+    ) -> R {
         let view = ChainView {
             local_shard: ShardId::ROOT,
             chain_origin: ChainOrigin::ROOT,
@@ -296,7 +317,7 @@ mod tests {
             committed_tip: None,
             latest_qc,
             pending,
-            certified: &certified,
+            certified,
         };
         f(&view)
     }
@@ -395,6 +416,81 @@ mod tests {
                 assert!(
                     tx_hashes.contains(&tx_hash),
                     "assembled ancestor below an unassembled one dropped from dedup set",
+                );
+            },
+        );
+    }
+
+    /// A sync-admitted ancestor contributes its names to the dedup set.
+    ///
+    /// Such a block is certified without ever being constructed as
+    /// pending, and a halt recovery's fresh committee extends exactly
+    /// one as its proposal parent. A walk over `pending` alone stops at
+    /// it and reads nothing of the chain above the committed tip, so a
+    /// name it already carries would be refused by nothing: the commit
+    /// dedup index covers the committed window, and this covers the
+    /// uncommitted prefix.
+    #[test]
+    fn a_sync_admitted_ancestor_is_walked_for_its_names() {
+        let tx: Arc<Verifiable<Transaction>> =
+            Arc::new(Verifiable::from(test_utils::test_transaction(4)));
+        let tx_hash = tx.hash();
+        let low = Block::Live {
+            header: make_header(1, BlockHash::ZERO),
+            transactions: Arc::new(vec![tx]),
+            certificates: Arc::new(Vec::new()),
+            provisions: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_proofs: Arc::new(Vec::new()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let low_hash = low.hash();
+        let qc = QuorumCertificate::new(
+            low_hash,
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::ZERO,
+        );
+        let certified: HashMap<BlockHash, Arc<Verified<CertifiedBlock>>> = HashMap::from([(
+            low_hash,
+            Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
+                CertifiedBlock::new_unchecked(
+                    low,
+                    Verified::<QuorumCertificate>::new_unchecked_for_test(qc),
+                ),
+            )),
+        )]);
+
+        let middle = PendingBlock::from_manifest(
+            make_header(2, low_hash),
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        );
+        let middle_hash = middle.header().hash();
+        let mut pending = PendingBlocks::new();
+        pending.insert(middle);
+
+        run_view_over(
+            0,
+            BlockHash::ZERO,
+            StateRoot::ZERO,
+            &pending,
+            &certified,
+            None,
+            |view| {
+                assert!(
+                    view.get_pending(low_hash).is_none(),
+                    "the fixture's ancestor is certified only",
+                );
+                assert!(
+                    QcChainSets::behind(view, middle_hash)
+                        .txs
+                        .contains(&tx_hash),
+                    "a sync-admitted ancestor's names must reach the dedup set",
                 );
             },
         );

@@ -63,20 +63,41 @@ impl QcChainSets {
     pub fn behind(chain: &ChainView<'_>, parent_block_hash: BlockHash) -> Self {
         let mut sets = Self::default();
         let mut current_hash = parent_block_hash;
-        while let Some(pending) = chain.get_pending(current_hash) {
-            if pending.header().height() <= chain.committed_height() {
+        // Headers, not pending entries: a block admitted through sync is
+        // certified without ever being constructed as pending, and a
+        // halt recovery's fresh committee extends exactly such a block
+        // as its proposal parent. Walking `pending` alone stops at it
+        // and reads nothing of the chain above the committed tip, so a
+        // name it already carries is refused by nothing — the dedup
+        // index covers the committed window, and this covers the
+        // uncommitted prefix, leaving no gap between them.
+        while let Some(header) = chain.get_header(current_hash) {
+            if header.height() <= chain.committed_height() {
                 break;
             }
-            let manifest = pending.manifest();
-            sets.txs.extend(manifest.tx_hashes().iter().copied());
-            sets.provisions
-                .extend(manifest.provision_hashes().iter().copied());
-            sets.finalizations
-                .extend(manifest.cert_ids().iter().copied());
-            for fw in pending.finalizations() {
-                sets.resolved.extend(fw.deciding_tx_hashes());
+            // A pending block carries its manifest before its body
+            // assembles, which is the whole point of reading it there;
+            // a certified one carries the body and nothing else.
+            if let Some(pending) = chain.get_pending(current_hash) {
+                let manifest = pending.manifest();
+                sets.txs.extend(manifest.tx_hashes().iter().copied());
+                sets.provisions
+                    .extend(manifest.provision_hashes().iter().copied());
+                sets.finalizations
+                    .extend(manifest.cert_ids().iter().copied());
+                for fw in pending.finalizations() {
+                    sets.resolved.extend(fw.deciding_tx_hashes());
+                }
+            } else if let Some(block) = chain.get_block(current_hash) {
+                sets.txs
+                    .extend(block.transactions().iter().map(|tx| tx.hash()));
+                sets.provisions.extend(block.provision_hashes());
+                for fw in block.certificates().iter() {
+                    sets.finalizations.insert(fw.receipt_hash());
+                    sets.resolved.extend(fw.deciding_tx_hashes());
+                }
             }
-            current_hash = pending.header().parent_block_hash();
+            current_hash = header.parent_block_hash();
         }
         sets
     }
