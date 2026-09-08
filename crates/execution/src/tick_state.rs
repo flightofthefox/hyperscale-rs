@@ -1032,11 +1032,22 @@ impl TickState {
     /// a committed block, and their finalization has not been taken.
     #[must_use]
     pub fn determined_pending(&self) -> bool {
-        !self.determined_emitted
-            && self
-                .determined_members()
-                .iter()
-                .any(|tx_hash| self.seats.get(tx_hash).is_some_and(|seat| !seat.settled))
+        !self.determined_emitted && self.determined_unsettled()
+    }
+
+    /// Whether the *chain* still owes this tick's determined half: the
+    /// tick holds members that await nobody but this shard and no
+    /// committed block has settled them.
+    ///
+    /// Wider than [`Self::determined_pending`], which also asks whether
+    /// this validator has yet to hand the half off. Settlement order is
+    /// measured over what the chain carries, so a half already emitted
+    /// and not yet committed is one a later half must not settle past.
+    #[must_use]
+    pub fn determined_unsettled(&self) -> bool {
+        self.determined_members()
+            .iter()
+            .any(|tx_hash| self.seats.get(tx_hash).is_some_and(|seat| !seat.settled))
     }
 
     /// Whether the determined half is out of the way — emitted, or never

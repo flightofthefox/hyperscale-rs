@@ -128,6 +128,14 @@ impl NodeStateMachine {
             actions.extend(s.execution_coordinator.abort_pending_ticks());
         }
 
+        // Settlement order is judged over the execution fold, and only a
+        // commit moves it — a member settles when a block carries the
+        // half that settles it. Mirror the fold's answer into shard
+        // consensus, where the proposer's selection and the vote path
+        // both read it, so the two run one rule.
+        s.shard_coordinator
+            .set_owed_determined(s.execution_coordinator.owed_determined_ticks());
+
         s.shard_coordinator.queue_ready_proposal();
 
         // The fork-proof dedup fence clears once the attested recovery for

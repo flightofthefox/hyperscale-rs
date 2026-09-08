@@ -3607,31 +3607,36 @@ impl ExecutionCoordinator {
     /// `(shard, height)`, so iterating the store is already the order
     /// receipts have to be applied in.
     ///
-    /// A determined half above a tick whose own determined half is still
-    /// owed is held back. Admission refuses a determined half at or below
-    /// the frontier the chain has reached, and a certificate can lag its
-    /// tick — the tick leader's aggregation fails and the vote rotates —
-    /// so offering the later half first would carry the frontier past
-    /// the earlier tick and refuse its half for good. A half the store
-    /// already holds, built here or fetched, is not owed; legs halves
-    /// are not held at all, since admission does not judge their order.
+    /// Order is all this offers: which of them a block may carry is
+    /// [`Self::owed_determined_ticks`] answered at admission, where a
+    /// voter runs the same rule over its own fold.
     #[must_use]
     pub fn get_finalizations(&self) -> Vec<Arc<Verifiable<Finalization>>> {
-        let floor = self
-            .ticks
+        self.finalized.all()
+    }
+
+    /// Every tick whose determined half the chain still owes, by the
+    /// block height its `TickId` names.
+    ///
+    /// A determined half settles writes a later tick has already read, so
+    /// the halves settle in tick order or the chain agrees on a state
+    /// nothing can detect afterwards. Admission holds that order by
+    /// refusing a half that settles past a tick in this set, which is why
+    /// the set is read here rather than filtered here: a proposer's own
+    /// ticks are the wrong authority for a rule every voter has to reach
+    /// the same answer on, and a validator that never composed the
+    /// earlier tick offers the later half in good faith.
+    ///
+    /// A validator missing the earlier tick holds it in no set and so
+    /// enforces nothing, which is the safe direction: the rule can refuse
+    /// a block no honest proposer would build, and never accepts one a
+    /// composing quorum refuses.
+    #[must_use]
+    pub fn owed_determined_ticks(&self) -> BTreeSet<BlockHeight> {
+        self.ticks
             .ticks_iter()
-            .filter(|(tick_id, tick)| {
-                tick.determined_pending() && !self.finalized.holds_determined(tick_id)
-            })
+            .filter(|(_, tick)| tick.determined_unsettled())
             .map(|(tick_id, _)| tick_id.block_height())
-            .min();
-        self.finalized
-            .all()
-            .into_iter()
-            .filter(|fw| {
-                let fw = fw.as_unverified();
-                !fw.is_determined() || floor.is_none_or(|floor| fw.tick_id().block_height() < floor)
-            })
             .collect()
     }
 
@@ -6157,12 +6162,13 @@ mod tests {
         );
     }
 
-    /// A determined half is offered only once every earlier tick's
-    /// determined half has been taken: offered first, it would carry the
-    /// settlement frontier past the earlier tick, and admission would
-    /// refuse that tick's half for good once its late certificate lands.
+    /// The fold names the tick whose determined half the chain still
+    /// owes, and offers every half it holds beside it. Which of them a
+    /// block may carry is admission's to judge against this set, so a
+    /// validator whose own ticks are incomplete cannot silently carry
+    /// the frontier past one and refuse its half for good.
     #[test]
-    fn get_finalizations_holds_a_determined_half_behind_an_owed_one() {
+    fn a_tick_holding_unsettled_determined_members_is_owed() {
         let mut state = make_test_state();
         let topo = make_test_topology();
         let owed_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
@@ -6181,23 +6187,18 @@ mod tests {
         let _actions = state.finalize(&topo, &later_id);
         assert!(state.finalized.contains(&later_id));
 
-        assert!(
-            state.get_finalizations().is_empty(),
-            "the later tick's determined half waits behind the owed one",
+        assert_eq!(
+            state.owed_determined_ticks(),
+            BTreeSet::from([BlockHeight::new(1), BlockHeight::new(2)]),
+            "a half emitted and not yet committed is still one the chain owes",
         );
-
-        // The late certificate arrives and the owed half is taken.
-        state.ticks.remove_tick(&owed_id);
-        let (owed_id, owed) = make_ready_local_tick_at(BlockHeight::new(1), &[7]);
-        state.ticks.insert_tick(owed_id, owed);
-        let _actions = state.finalize(&topo, &owed_id);
 
         let offered: Vec<BlockHeight> = state
             .get_finalizations()
             .iter()
             .map(|fw| fw.as_unverified().tick_id().block_height())
             .collect();
-        assert_eq!(offered, vec![BlockHeight::new(1), BlockHeight::new(2)]);
+        assert_eq!(offered, vec![BlockHeight::new(2)]);
     }
 
     #[test]

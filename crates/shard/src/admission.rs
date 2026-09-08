@@ -18,8 +18,9 @@
 //! recomputes — a root, a validity window, a reservation — is the
 //! pipeline's.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::marker::PhantomData;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use hyperscale_engine::writes_committed_cell;
@@ -105,6 +106,13 @@ pub struct Admission<'a> {
     /// leaves the order unjudged here: such a block is verified but not
     /// voted on.
     pub parent_settled_frontier: Option<BlockHeight>,
+    /// Ticks whose determined half this chain still owes, by height —
+    /// the fold's answer, which a proposer and every voter reach
+    /// independently over the same committed blocks. A half may not
+    /// settle past one of these; a validator that never composed the
+    /// tick holds it in no set and enforces nothing, so the rule refuses
+    /// only what a composing quorum would refuse anyway.
+    pub owed_determined: &'a BTreeSet<BlockHeight>,
 }
 
 /// One section of a block, and the rule that admits an item to it.
@@ -407,6 +415,23 @@ impl Section for FinalizationsSection {
                      settle under",
                     tick.inner(),
                     parent_frontier.inner()
+                ));
+            }
+            // Nothing between the running frontier and this half may
+            // still owe one of its own. Admitting it would carry the
+            // frontier past a tick whose half is refused for good the
+            // moment its certificate lands, leaving its members
+            // committed and never finalized.
+            if let Some(skipped) = ctx
+                .owed_determined
+                .range((Bound::Excluded(parent_frontier), Bound::Excluded(tick)))
+                .next()
+            {
+                return Err(format!(
+                    "determined half of tick {} settles past tick {}, whose own determined half \
+                     the chain still owes",
+                    tick.inner(),
+                    skipped.inner()
                 ));
             }
             frontier = Some(tick);
@@ -715,6 +740,7 @@ pub(crate) mod fixtures {
         pub chain: QcChainSets,
         pub dedup: CommitDedupIndex,
         pub parent_settled_frontier: Option<BlockHeight>,
+        pub owed_determined: BTreeSet<BlockHeight>,
     }
 
     impl Against {
@@ -736,6 +762,7 @@ pub(crate) mod fixtures {
                 chain: QcChainSets::default(),
                 dedup: CommitDedupIndex::new(),
                 parent_settled_frontier: Some(BlockHeight::GENESIS),
+                owed_determined: BTreeSet::new(),
             }
         }
 
@@ -749,6 +776,7 @@ pub(crate) mod fixtures {
                 chain: &self.chain,
                 dedup: &self.dedup,
                 parent_settled_frontier: self.parent_settled_frontier,
+                owed_determined: &self.owed_determined,
             }
         }
     }

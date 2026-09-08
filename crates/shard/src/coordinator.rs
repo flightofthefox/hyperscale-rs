@@ -388,6 +388,12 @@ pub struct ShardCoordinator {
     /// provides a bounded retention window for historical dedup.
     dedup_index: CommitDedupIndex,
 
+    /// Ticks whose determined half the chain still owes, mirrored from
+    /// the execution fold so the proposer and the vote path judge
+    /// settlement order by one rule. Empty until the node reports one,
+    /// which enforces nothing — the safe direction.
+    owed_determined: BTreeSet<BlockHeight>,
+
     /// Validator "ready on shard" signals waiting for inclusion in the
     /// next proposed block. Drained at proposal time.
     ready_signal_pool: ReadySignalPool,
@@ -638,6 +644,7 @@ impl ShardCoordinator {
             block_sync: BlockSyncManager::new(),
             proposal: ProposalTracker::new(),
             dedup_index,
+            owed_determined: BTreeSet::new(),
             ready_signal_pool: ReadySignalPool::new(),
             detected_equivocators: BTreeSet::new(),
             beacon_witness_accumulator: BeaconWitnessAccumulator::from_leaves(
@@ -1708,7 +1715,14 @@ impl ShardCoordinator {
             chain,
             dedup: &self.dedup_index,
             parent_settled_frontier,
+            owed_determined: &self.owed_determined,
         }
+    }
+
+    /// Mirror the execution fold's owed determined halves, which
+    /// settlement order at admission is judged against.
+    pub fn set_owed_determined(&mut self, owed: BTreeSet<BlockHeight>) {
+        self.owed_determined = owed;
     }
 
     /// Try to build and broadcast a new block proposal.

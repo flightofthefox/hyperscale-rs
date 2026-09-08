@@ -1617,6 +1617,52 @@ mod tests {
         assert!(admit(&above_frontier(3), &block_settling(&[4, 6], &[])).is_ok());
     }
 
+    /// Admission above `frontier` with the chain owing determined
+    /// halves for `owed`.
+    fn owing(frontier: u64, owed: &[u64]) -> Against {
+        let mut against = above_frontier(frontier);
+        against.owed_determined = owed.iter().map(|h| BlockHeight::new(*h)).collect();
+        against
+    }
+
+    /// The half that skips an owed one is the half refused, not the owed
+    /// one when it finally arrives.
+    ///
+    /// Carrying tick 6 while tick 4 still owes its half would put the
+    /// frontier past 4, and 4's certificate — late because its tick
+    /// leader's aggregation rotated — is then refused for good, leaving
+    /// its members committed and never finalized.
+    #[test]
+    fn a_determined_half_may_not_settle_past_a_tick_still_owing_one() {
+        let err = admit(&owing(3, &[4]), &block_settling(&[6], &[])).unwrap_err();
+        assert!(err.contains("still owes"), "{err}");
+    }
+
+    /// The block that carries both carries them in order, and the owed
+    /// tick is owed no longer once its own half is admitted ahead of the
+    /// later one.
+    #[test]
+    fn a_block_carrying_the_owed_half_first_carries_the_later_one_too() {
+        assert!(admit(&owing(3, &[4]), &block_settling(&[4, 6], &[])).is_ok());
+    }
+
+    /// The rule measures the gap and nothing else: a tick owed at or
+    /// below the frontier is already settled or already refused, and one
+    /// above the half being admitted has not been skipped.
+    #[test]
+    fn only_a_tick_between_the_frontier_and_the_half_is_a_skip() {
+        assert!(admit(&owing(4, &[4]), &block_settling(&[6], &[])).is_ok());
+        assert!(admit(&owing(3, &[9]), &block_settling(&[6], &[])).is_ok());
+    }
+
+    /// A validator that never composed the earlier tick owes nothing for
+    /// it and enforces nothing — it offers and accepts the later half in
+    /// good faith, and the composing quorum is what refuses the block.
+    #[test]
+    fn a_validator_holding_no_owed_tick_judges_only_the_frontier() {
+        assert!(admit(&owing(3, &[]), &block_settling(&[6], &[])).is_ok());
+    }
+
     /// A legs half is unconstrained. It waits on a counterpart and may
     /// land arbitrarily late; its declared cells are claimed against
     /// every later tick from the moment it executes, so it has nothing
