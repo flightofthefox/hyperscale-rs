@@ -164,6 +164,10 @@ impl Window {
                 validity_end..validity_end.plus(MAX_VALIDITY_RANGE)
             }
             Self::Core => at..at.plus(MAX_VALIDITY_RANGE),
+            // Two questions, one span, and the coincidence is meant: a
+            // leg entry stands exactly as long as the claim cell its
+            // members are proved against, so neither outlives evidence
+            // the other could still be decided by.
             Self::Claim | Self::LegEntry => at..at.plus(CLAIM_WINDOW),
             Self::Lapse => at.plus(MAX_VALIDITY_RANGE)..at.plus(CLAIM_WINDOW),
         }
@@ -188,6 +192,10 @@ pub enum Probed {
 }
 
 impl Probed {
+    /// Every cell a probe asks about, in the order a block carries their
+    /// records.
+    pub const ALL: [Self; 3] = [Self::Core, Self::Delivery, Self::Claim];
+
     /// The window an answer to this question is read in.
     #[must_use]
     pub const fn window(self) -> Window {

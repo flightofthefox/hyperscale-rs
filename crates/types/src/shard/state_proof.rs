@@ -14,7 +14,7 @@
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    Anchor, Inclusion, MAX_COMMITTED_TX_QUERY, MerkleInclusionProof, StateProofError, SubstateKey,
+    Anchor, Inclusion, MAX_PROOFS_PER_QUERY, MerkleInclusionProof, StateProofError, SubstateKey,
 };
 
 /// One fetch's answer: a multiproof over `keys` against `anchor`.
@@ -27,7 +27,7 @@ pub struct StateProofBundle {
     /// The commit-proven state the proof reconstructs.
     pub anchor: Anchor,
     /// The keys the proof answers for, sorted and without repeats.
-    #[hbor(max = MAX_COMMITTED_TX_QUERY)]
+    #[hbor(max = MAX_PROOFS_PER_QUERY)]
     pub keys: Vec<SubstateKey>,
     /// The multiproof over every key against the anchor's root.
     pub proof: MerkleInclusionProof,
@@ -60,7 +60,7 @@ impl StateProofBundle {
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         !self.keys.is_empty()
-            && self.keys.len() <= MAX_COMMITTED_TX_QUERY
+            && self.keys.len() <= MAX_PROOFS_PER_QUERY
             && self.keys.windows(2).all(|pair| pair[0] < pair[1])
     }
 

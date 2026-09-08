@@ -2,7 +2,7 @@
 
 use hyperscale_hbor::Hbor;
 
-use crate::{CommittedTxAbsence, MAX_COMMITTED_TX_QUERY, MessageClass, NetworkMessage};
+use crate::{CommittedTxAbsence, MAX_PROOFS_PER_QUERY, MessageClass, NetworkMessage};
 
 /// What a terminated shard says about one queried transaction.
 ///
@@ -34,7 +34,7 @@ pub struct GetCommittedTxsResponse {
     /// A requester must check the length against what it asked before
     /// pairing them up; a short list is a malformed answer, not a
     /// partial one.
-    #[hbor(max = MAX_COMMITTED_TX_QUERY)]
+    #[hbor(max = MAX_PROOFS_PER_QUERY)]
     pub verdicts: Option<Vec<CommittedTxVerdict>>,
 }
 

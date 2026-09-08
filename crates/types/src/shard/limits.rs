@@ -196,16 +196,21 @@ pub const MAX_PROVISION_TARGET_SHARDS: usize = 1_024;
 /// same cap.
 pub const MAX_FINALIZED_TX_PER_BLOCK: usize = 8_192;
 
-/// Cap on the transactions a successor asks about in one
-/// committed-transaction query.
+/// Cap on the things one query asks a counterpart to prove.
 ///
-/// Bounds the response, whose per-entry cost is an absence proof rather
-/// than a hash. The population it draws from is small by construction:
-/// only transactions submitted to the successor whose validity window
-/// opened before its origin, and only until the chain outlives that
-/// origin by `MAX_VALIDITY_RANGE`. A successor with more than this
+/// Bounds the response, whose per-entry cost is a merkle path rather
+/// than a hash. Two questions share it, because a proof costs the same
+/// whichever of them asked: the transactions a successor asks a
+/// predecessor about, and the substate keys a leg's probe asks a
+/// counterpart to prove present or absent — one probe asks about one
+/// transaction's cell, so the two are the same size of question.
+///
+/// Each population is small by construction. A successor asks only about
+/// transactions whose validity window opened before its origin, and only
+/// until the chain outlives that origin by `MAX_VALIDITY_RANGE`; a leg
+/// asks only about the crossings it issued. Anything with more than this
 /// outstanding asks across several requests.
-pub const MAX_COMMITTED_TX_QUERY: usize = 256;
+pub const MAX_PROOFS_PER_QUERY: usize = 256;
 
 /// Hard cap on the number of provision batches any single block can carry.
 ///

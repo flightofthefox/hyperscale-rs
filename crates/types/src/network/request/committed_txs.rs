@@ -16,7 +16,7 @@ use hyperscale_hbor::Hbor;
 
 use crate::network::response::GetCommittedTxsResponse;
 use crate::{
-    BlockHash, BlockHeight, MAX_COMMITTED_TX_QUERY, MessageClass, NetworkMessage, Request, TxHash,
+    BlockHash, BlockHeight, MAX_PROOFS_PER_QUERY, MessageClass, NetworkMessage, Request, TxHash,
 };
 
 /// Ask whether a terminated shard committed each of `tx_hashes`.
@@ -29,7 +29,7 @@ pub struct GetCommittedTxsRequest {
     /// answers `not_found` on a hash mismatch.
     pub terminal_block_hash: BlockHash,
     /// The transactions to resolve, in the order the answers come back.
-    #[hbor(max = MAX_COMMITTED_TX_QUERY)]
+    #[hbor(max = MAX_PROOFS_PER_QUERY)]
     pub tx_hashes: Vec<TxHash>,
 }
 

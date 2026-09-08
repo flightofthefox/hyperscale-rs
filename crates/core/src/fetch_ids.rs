@@ -14,9 +14,13 @@ use hyperscale_types::{
     ValidatorId,
 };
 
-/// A batch of ids under the binding that fetches them — one variant per
-/// [`crate::FetchRequest`] payload, keyed exactly as that binding's state
-/// machine is.
+/// A batch of ids under the binding that fetches them, keyed exactly as
+/// that binding's state machine is.
+///
+/// One variant per binding, which is not quite one per
+/// [`crate::FetchRequest`]: a payload the node fetches without a request
+/// variant of its own — a package artifact, an instance record — still
+/// has ids to release, and so still has a variant here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchIds {
     /// Transactions by hash.

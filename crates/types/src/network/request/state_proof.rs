@@ -12,7 +12,7 @@ use hyperscale_hbor::Hbor;
 
 use crate::network::response::GetStateProofResponse;
 use crate::{
-    BlockHeight, MAX_COMMITTED_TX_QUERY, MessageClass, NetworkMessage, Request, SubstateKey,
+    BlockHeight, MAX_PROOFS_PER_QUERY, MessageClass, NetworkMessage, Request, SubstateKey,
 };
 
 /// The keys to prove and the committed height to prove them at.
@@ -20,10 +20,8 @@ use crate::{
 pub struct GetStateProofRequest {
     /// The committed height whose state root the proof reconstructs.
     pub height: BlockHeight,
-    /// The keys to prove, present or absent. Bounded by the
-    /// committed-transaction query cap: one probe asks about one
-    /// transaction's committed cell, so the two questions share a size.
-    #[hbor(max = MAX_COMMITTED_TX_QUERY)]
+    /// The keys to prove, present or absent.
+    #[hbor(max = MAX_PROOFS_PER_QUERY)]
     pub keys: Vec<SubstateKey>,
 }
 

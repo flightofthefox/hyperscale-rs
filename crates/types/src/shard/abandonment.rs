@@ -283,6 +283,12 @@ impl Question {
     ];
 }
 
+// A cell question per [`Probed`] and the verdict beside them. Held at
+// compile time because the array is written out: a `Probed` variant
+// added without a line here would leave the order a block carries its
+// records silently short of one.
+const _: () = assert!(Question::ALL.len() == Probed::ALL.len() + 1);
+
 /// What a counterpart said in answer.
 ///
 /// A certificate answers a [`Question::Verdict`] with a refusal, named
