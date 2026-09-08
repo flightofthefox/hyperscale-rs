@@ -320,7 +320,7 @@ pub fn select_abandonment_records(
                     RecordsSection::name_stands(ctx, fold, verdict.evidence(), entry.tx_hash)
                         .is_ok()
                 })
-                .copied()
+                .cloned()
                 .collect();
             (!kept.is_empty())
                 .then(|| AbandonmentRecord::new(verdict.shard(), verdict.evidence(), kept))
@@ -598,6 +598,7 @@ mod tests {
             deadline: Deadline::of(WeightedTimestamp::from_millis(5_000)),
             declared_work: 3,
             charge: stub_abort_charge(3),
+            reach: Vec::new(),
         }
     }
 

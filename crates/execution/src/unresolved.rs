@@ -81,18 +81,16 @@ struct Owed {
     /// them from and must release exactly what was taken, and because a
     /// record naming the transaction restates exactly these.
     figures: UnsettledTx,
-    /// The frontier its committing block anchored at, which dates the
-    /// question below: a shard that left before this never held the
-    /// transaction, whatever its keyspace covers now.
-    committed_ts: WeightedTimestamp,
     /// The owner prefixes it reaches outside this shard.
     ///
     /// Who was party to the transaction is a question about these and the
     /// trie of the moment, and the trie of the moment is not something a
     /// rebuild can recover — windows evict, and a shard that has since
     /// split answers for a keyspace it no longer owns. The prefixes are
-    /// the transaction's own and its body outlives every window, so a
-    /// rebuild reaches the same set from the same block at any distance.
+    /// the transaction's own, and [`UnsettledTx::reach`] states them, so
+    /// this reaches the same set from the committing block and from a
+    /// record naming the transaction alike — which is what a replica
+    /// rotated in after that block has.
     remote_prefixes: BTreeSet<Address>,
     /// Whether a tick of this shard's took the transaction as a member.
     ///
@@ -217,7 +215,7 @@ impl Owed {
     /// owned one of the entry's remote prefixes, and the transaction
     /// committed before it left.
     fn party_to(&self, shard: ShardId, cut: WeightedTimestamp) -> bool {
-        cut > self.committed_ts
+        cut > self.figures.first_commit()
             && self
                 .remote_prefixes
                 .iter()
@@ -536,6 +534,22 @@ pub struct UnresolvedTxs {
     departed: BTreeMap<ShardId, Departure>,
 }
 
+/// The share of a transaction's reach that is somebody else's — the
+/// prefixes `local` does not own.
+///
+/// The one derivation, run by the block that commits the transaction and
+/// by a record that names it alike, so a replica meeting the transaction
+/// either way holds the same entry. The reach is the transaction's own;
+/// which part of it is remote is the reader's.
+fn remote_share(local: ShardId, figures: &UnsettledTx) -> BTreeSet<Address> {
+    figures
+        .reach
+        .iter()
+        .copied()
+        .filter(|prefix| !ShardTrie::shard_owns_prefix(local, *prefix))
+        .collect()
+}
+
 impl UnresolvedTxs {
     /// Record what a committed block puts in flight: each transaction it
     /// carries, with the classification its block froze it under, from
@@ -553,19 +567,13 @@ impl UnresolvedTxs {
     pub fn register_committed<'a>(
         &mut self,
         local_shard: ShardId,
-        committed_ts: WeightedTimestamp,
         members: impl IntoIterator<Item = (&'a Arc<Verifiable<Transaction>>, &'a Classified)>,
     ) {
         for (tx, classified) in members {
+            let figures = UnsettledTx::for_transaction(tx);
             let owed = Owed {
-                committed_ts,
-                figures: UnsettledTx::for_transaction(tx),
-                remote_prefixes: tx
-                    .routing()
-                    .all_prefixes()
-                    .into_iter()
-                    .filter(|prefix| !ShardTrie::shard_owns_prefix(local_shard, *prefix))
-                    .collect(),
+                remote_prefixes: remote_share(local_shard, &figures),
+                figures,
                 certified: false,
                 spoken_for: false,
                 charged: false,
@@ -606,7 +614,7 @@ impl UnresolvedTxs {
         self.owed
             .get(&tx_hash)
             .filter(|owed| owed.part.kept().is_some() && owed.covered.is_none())
-            .map(|owed| owed.figures)
+            .map(|owed| owed.figures.clone())
     }
 
     /// Whether `shard` is one of the transaction's core — whose refusal
@@ -982,8 +990,16 @@ impl UnresolvedTxs {
     /// answered them.
     ///
     /// Returns how many it reconstructed, which is how far short this
-    /// replica's replay window fell.
-    pub fn record_abandonment_records(&mut self, verdicts: &[AbandonmentRecord]) -> usize {
+    /// replica's replay window fell — or how long after the block it was
+    /// seated, for a validator rotated into the committee. A
+    /// reconstructed entry is the entry: the record restates every figure
+    /// the transaction fixes and the reach it touches, so what this
+    /// derives from it is what a replica that held the block derives.
+    pub fn record_abandonment_records(
+        &mut self,
+        local_shard: ShardId,
+        verdicts: &[AbandonmentRecord],
+    ) -> usize {
         let mut reconstructed = 0usize;
         for verdict in verdicts {
             for entry in verdict.unsettled() {
@@ -1005,12 +1021,8 @@ impl UnresolvedTxs {
                 self.owed.insert(
                     entry.tx_hash,
                     Owed {
-                        figures: *entry,
-                        // The record dates it no later than the moment its
-                        // evidence was taken at, which is the one bound on
-                        // its commit the record itself establishes.
-                        committed_ts: verdict.evidence().moment(),
-                        remote_prefixes: BTreeSet::new(),
+                        figures: entry.clone(),
+                        remote_prefixes: remote_share(local_shard, entry),
                         certified: true,
                         spoken_for: false,
                         charged: false,
@@ -1059,7 +1071,7 @@ impl UnresolvedTxs {
                     && owed.covered.is_none()
                     && owed.party_to(shard, cut)
             })
-            .map(|(_, owed)| owed.figures)
+            .map(|(_, owed)| owed.figures.clone())
             .collect()
     }
 
@@ -1159,7 +1171,7 @@ impl UnresolvedTxs {
         self.departed
             .iter()
             .filter(|(shard, _)| ShardTrie::shard_owns_prefix(**shard, prefix))
-            .filter(|(_, departure)| departure.cut > owed.committed_ts)
+            .filter(|(_, departure)| departure.cut > owed.figures.first_commit())
             .map(|(_, departure)| *departure)
             .min_by_key(|departure| departure.cut)
     }
@@ -1186,7 +1198,7 @@ impl UnresolvedTxs {
                     .iter()
                     .filter(|(shard, departure)| {
                         ShardTrie::shard_owns_prefix(**shard, *prefix)
-                            && departure.cut > owed.committed_ts
+                            && departure.cut > owed.figures.first_commit()
                     })
                     .map(|(shard, _)| *shard),
             );
@@ -1323,7 +1335,7 @@ impl UnresolvedTxs {
                 let window = owed.abandon_window();
                 now >= window.start && (owed.covered.is_some() || now < window.end)
             })
-            .map(|(_, owed)| owed.figures)
+            .map(|(_, owed)| owed.figures.clone())
             .collect()
     }
 
@@ -1437,7 +1449,7 @@ impl UnresolvedTxs {
         self.departed.retain(|shard, departure| {
             owed.values().any(|entry| {
                 entry.covered.is_some_and(|(covered, _)| covered == *shard)
-                    || (departure.cut > entry.committed_ts
+                    || (departure.cut > entry.figures.first_commit()
                         && entry
                             .remote_prefixes
                             .iter()
@@ -1563,7 +1575,7 @@ mod tests {
     }
 
     fn commit(ledger: &mut UnresolvedTxs, tx: &Arc<Verifiable<Transaction>>) {
-        ledger.register_committed(LOCAL, WeightedTimestamp::ZERO, [(tx, &Classified::whole())]);
+        ledger.register_committed(LOCAL, [(tx, &Classified::whole())]);
     }
 
     /// The part a leg plays, with the cells a fixture names for it.
@@ -1606,6 +1618,7 @@ mod tests {
             deadline: Deadline::of_transaction(tx),
             declared_work: tx.work(),
             charge: charge(tx),
+            reach: tx.routing().all_prefixes(),
         }
     }
 
@@ -1832,11 +1845,10 @@ mod tests {
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
         assert_eq!(
-            ledger.record_abandonment_records(&[AbandonmentRecord::departed(
-                PARTNER,
-                cut,
-                [names(&tx)]
-            )]),
+            ledger.record_abandonment_records(
+                LOCAL,
+                &[AbandonmentRecord::departed(PARTNER, cut, [names(&tx)])]
+            ),
             0,
             "the ledger holds the transaction the record names",
         );
@@ -1865,11 +1877,14 @@ mod tests {
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
 
         assert_eq!(
-            ledger.record_abandonment_records(&[AbandonmentRecord::departed(
-                PARTNER,
-                cut,
-                [names(&one), names(&two)],
-            )]),
+            ledger.record_abandonment_records(
+                LOCAL,
+                &[AbandonmentRecord::departed(
+                    PARTNER,
+                    cut,
+                    [names(&one), names(&two)],
+                )]
+            ),
             2,
             "neither was held, so both are rebuilt",
         );
@@ -1898,11 +1913,10 @@ mod tests {
         let tx = tx(21, 60_000);
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
-            PARTNER,
-            cut,
-            [names(&tx)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::departed(PARTNER, cut, [names(&tx)])],
+        );
 
         assert!(
             ledger.prune(cut).unanswerable.is_empty(),
@@ -1939,11 +1953,14 @@ mod tests {
             "on its own clock the shard has stopped speaking for it",
         );
 
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
-            PARTNER,
-            ms(500_000),
-            [names(&tx)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::departed(
+                PARTNER,
+                ms(500_000),
+                [names(&tx)],
+            )],
+        );
         assert_eq!(
             ledger.past_deadline(past),
             vec![abandons(&tx)],
@@ -1961,11 +1978,14 @@ mod tests {
         let tx = tx(18, 60_000);
         commit(&mut ledger, &tx);
         ledger.certify(tx.hash());
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
-            PARTNER,
-            ms(500_000),
-            [names(&tx)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::departed(
+                PARTNER,
+                ms(500_000),
+                [names(&tx)],
+            )],
+        );
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         assert!(
@@ -2075,17 +2095,29 @@ mod tests {
         assert_eq!(after.len(), 2, "and the one that holds it now");
     }
 
-    /// A shard that left before the transaction committed never held it,
-    /// whatever its keyspace covers now — so its terminal says nothing
-    /// about this transaction's fate, and cannot be the silence that
-    /// strands it.
+    /// A shard that left before the transaction could have been committed
+    /// anywhere never held it, whatever its keyspace covers now — so its
+    /// terminal says nothing about this transaction's fate, and cannot be
+    /// the silence that strands it.
+    ///
+    /// Dated by the transaction rather than by the block that committed
+    /// it here: two shards commit one transaction at two frontiers and a
+    /// replica meeting it in a record has neither, so the only instant
+    /// every reader agrees on is the transaction's own earliest possible
+    /// commit — one validity range before it expires.
     #[test]
     fn a_terminal_older_than_the_transaction_is_not_its_counterpart_leaving() {
         let mut ledger = UnresolvedTxs::default();
-        let tx = tx(14, 60_000);
-        ledger.register_committed(LOCAL, ms(600_000), [(&tx, &Classified::whole())]);
+        let tx = tx(14, 600_000);
+        ledger.register_committed(LOCAL, [(&tx, &Classified::whole())]);
         ledger.certify(tx.hash());
-        let stale = ms(500_000);
+        // Before the earliest instant the transaction could have been
+        // committed on any shard, which its validity end fixes.
+        let stale = ms(400_000);
+        assert!(
+            stale < names(&tx).first_commit(),
+            "the terminal has to predate every commit of the transaction",
+        );
         ledger.record_terminal(PARTNER, stale, Some(expiry(stale)));
 
         assert!(
@@ -2110,11 +2142,10 @@ mod tests {
         ledger.certify(tx.hash());
         let cut = ms(100_000);
         ledger.record_terminal(PARTNER, cut, None);
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
-            PARTNER,
-            cut,
-            [names(&tx)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::departed(PARTNER, cut, [names(&tx)])],
+        );
         assert_eq!(ledger.unstamped_departures(), vec![PARTNER]);
 
         let far = expiry(cut).plus(EPOCH_DURATION * 100);
@@ -2227,11 +2258,14 @@ mod tests {
             "at the deadline the leg is probeable and the whole entry is not"
         );
 
-        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
-            PARTNER,
-            absent(Probed::Core, deadline),
-            [names(&leg)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::heard(
+                PARTNER,
+                absent(Probed::Core, deadline),
+                [names(&leg)],
+            )],
+        );
         assert!(
             ledger.probeable(deadline).is_empty(),
             "a covered entry is asked about once"
@@ -2273,11 +2307,14 @@ mod tests {
                 claims: Vec::new(),
             }],
         );
-        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
-            PARTNER,
-            absent(Probed::Delivery, deadline.plus(MAX_VALIDITY_RANGE)),
-            [names(&leg)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::heard(
+                PARTNER,
+                absent(Probed::Delivery, deadline.plus(MAX_VALIDITY_RANGE)),
+                [names(&leg)],
+            )],
+        );
         assert!(ledger.probeable(deadline).is_empty(), "covered once");
         assert_eq!(
             ledger.reclaimable().len(),
@@ -2332,11 +2369,14 @@ mod tests {
                 claims: Vec::new(),
             }],
         );
-        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
-            PARTNER,
-            absent(Probed::Delivery, deadline.plus(MAX_VALIDITY_RANGE)),
-            [names(&tx)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::heard(
+                PARTNER,
+                absent(Probed::Delivery, deadline.plus(MAX_VALIDITY_RANGE)),
+                [names(&tx)],
+            )],
+        );
         let reclaims = ledger.reclaimable();
         assert_eq!(reclaims.len(), 1);
         assert!(
@@ -2376,11 +2416,14 @@ mod tests {
             "a leg is never abandoned"
         );
 
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
-            PARTNER,
-            ms(1_000),
-            [names(&tx)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::departed(
+                PARTNER,
+                ms(1_000),
+                [names(&tx)],
+            )],
+        );
         assert!(
             ledger.past_deadline(past).is_empty(),
             "a record licenses a reclaim of it, never an abort"
@@ -2403,11 +2446,14 @@ mod tests {
             leg_part(body(&tx), classified(), Vec::new(), Vec::new()),
         );
         ledger.certify(tx.hash());
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
-            PARTNER,
-            ms(1_000),
-            [names(&tx)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::departed(
+                PARTNER,
+                ms(1_000),
+                [names(&tx)],
+            )],
+        );
         assert!(
             !ledger.reclaimable()[0].charged,
             "admission to a tick settles nothing"
@@ -2472,31 +2518,40 @@ mod tests {
             fw(&ledger, reclaim.clone()).is_empty(),
             "a deciding success on a leg entry no record covers says nothing"
         );
-        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
-            PARTNER,
-            refused(ms(70_000)),
-            [names(&leg)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::heard(
+                PARTNER,
+                refused(ms(70_000)),
+                [names(&leg)],
+            )],
+        );
         assert_eq!(
             fw(&ledger, reclaim.clone()),
             decided(&leg, TransactionDecision::Reject),
             "the reclaim of a refused leg reports the refusal"
         );
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
-            PARTNER,
-            ms(1_000),
-            [names(&leg)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::departed(
+                PARTNER,
+                ms(1_000),
+                [names(&leg)],
+            )],
+        );
         assert_eq!(
             fw(&ledger, reclaim.clone()),
             decided(&leg, TransactionDecision::Aborted),
             "the reclaim of a leg its core never took reports an abort"
         );
-        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
-            PARTNER,
-            absent(Probed::Delivery, ms(200_000)),
-            [names(&leg)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::heard(
+                PARTNER,
+                absent(Probed::Delivery, ms(200_000)),
+                [names(&leg)],
+            )],
+        );
         assert!(
             fw(&ledger, reclaim).is_empty(),
             "a lapse reclaim says nothing: the core accepted, and its certificates say so"
@@ -2520,6 +2575,58 @@ mod tests {
             ),
             vec![(delivery.hash(), TxResolution::LegFinalized)],
             "a delivery that failed decides nothing, and the value waits for a later claim"
+        );
+    }
+
+    /// A reconstructed entry answers "who was party" the same as the
+    /// entry it stands in for.
+    ///
+    /// A validator rotated into a committee never saw the block that
+    /// committed the transaction, so it holds no entry until a record
+    /// naming it commits and it reconstructs one. That entry is read by
+    /// the same derivations the registered one is, and the abandonment's
+    /// participant set is one of them — it reaches a `TxOutcome` and so
+    /// the receipt root, which two replicas of one shard cannot answer
+    /// differently and stay a shard.
+    #[test]
+    fn a_reconstructed_entry_names_the_same_parties_as_a_registered_one() {
+        let tx = tx(8, 60_000);
+        // The keyspace has since divided, so `PARTNER` is a departed
+        // owner and not the shard the prefix routes to now — which is
+        // what makes the dating decide something.
+        let trie = ShardTrie::uniform(2);
+        let record = AbandonmentRecord::departed(PARTNER, ms(70_000), [names(&tx)]);
+
+        // The replica that was seated when the block committed.
+        let mut seated = UnresolvedTxs::default();
+        commit(&mut seated, &tx);
+        seated.certify(tx.hash());
+        seated.record_abandonment_records(LOCAL, std::slice::from_ref(&record));
+
+        // The replica rotated in afterwards, which meets the transaction
+        // for the first time in the record.
+        let mut entrant = UnresolvedTxs::default();
+        entrant.record_abandonment_records(LOCAL, &[record]);
+
+        // A departure between the two instants the entry could be dated
+        // by: past anything that could have committed the transaction,
+        // and short of the record that names it. Which of the two the
+        // ledger reads is what decides whether the departed shard was
+        // party, so both replicas have to read the same one.
+        for ledger in [&mut seated, &mut entrant] {
+            ledger.record_terminal(PARTNER, ms(65_000), None);
+        }
+
+        let parties = seated.counterparts(tx.hash(), &trie);
+        assert!(
+            !parties.is_empty(),
+            "the fixture has to reach beyond this shard, or the two agree on nothing",
+        );
+        assert_eq!(
+            entrant.counterparts(tx.hash(), &trie),
+            parties,
+            "a rotated-in replica must name the same parties the seated one does, \
+             or the abandonment it composes carries a different receipt root",
         );
     }
 
@@ -2554,11 +2661,14 @@ mod tests {
             "the shard holding the claim's prefix consumes what the leg issued",
         );
 
-        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
-            SUCCESSOR,
-            accepted(ms(70_000)),
-            [names(&tx)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::heard(
+                SUCCESSOR,
+                accepted(ms(70_000)),
+                [names(&tx)],
+            )],
+        );
         let retirable = ledger.retirable();
         assert_eq!(
             retirable.len(),
@@ -2589,11 +2699,14 @@ mod tests {
         ledger.certify(tx.hash());
         assert!(ledger.retirable().is_empty(), "nothing retires on a clock");
 
-        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
-            PARTNER,
-            accepted(ms(70_000)),
-            [names(&tx)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::heard(
+                PARTNER,
+                accepted(ms(70_000)),
+                [names(&tx)],
+            )],
+        );
         let retirable = ledger.retirable();
         assert_eq!(retirable.len(), 1, "every consumer claimed");
         assert_eq!(retirable[0].tx_hash, tx.hash());
@@ -2644,11 +2757,14 @@ mod tests {
             "and the body goes with it"
         );
 
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
-            PARTNER,
-            ms(1_000),
-            [names(&tx)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::departed(
+                PARTNER,
+                ms(1_000),
+                [names(&tx)],
+            )],
+        );
         assert!(
             ledger.reclaimable().is_empty(),
             "a record naming it afterwards rebuilds an entry with no body to reclaim from"
@@ -2673,11 +2789,14 @@ mod tests {
             "nothing is reclaimed on a clock"
         );
 
-        ledger.record_abandonment_records(&[AbandonmentRecord::departed(
-            PARTNER,
-            ms(1_000),
-            [names(&tx)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::departed(
+                PARTNER,
+                ms(1_000),
+                [names(&tx)],
+            )],
+        );
         let reclaimable = ledger.reclaimable();
         assert_eq!(
             reclaimable.len(),
@@ -2711,11 +2830,14 @@ mod tests {
     fn a_refusal_record_naming_an_unheld_transaction_rebuilds_a_leg_entry() {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(7, 60_000);
-        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
-            PARTNER,
-            refused(ms(1_000)),
-            [names(&tx)],
-        )]);
+        ledger.record_abandonment_records(
+            LOCAL,
+            &[AbandonmentRecord::heard(
+                PARTNER,
+                refused(ms(1_000)),
+                [names(&tx)],
+            )],
+        );
         assert_eq!(ledger.len(), 1);
         let past = ms(60_000)
             .plus(MAX_FINALIZATION_DELAY)
@@ -2750,11 +2872,14 @@ mod tests {
             );
             ledger.certify(tx.hash());
             if covered {
-                ledger.record_abandonment_records(&[AbandonmentRecord::departed(
-                    PARTNER,
-                    ms(1_000),
-                    [names(&tx)],
-                )]);
+                ledger.record_abandonment_records(
+                    LOCAL,
+                    &[AbandonmentRecord::departed(
+                        PARTNER,
+                        ms(1_000),
+                        [names(&tx)],
+                    )],
+                );
             }
             assert!(
                 ledger

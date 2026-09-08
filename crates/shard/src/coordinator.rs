@@ -11244,6 +11244,7 @@ mod tests {
             deadline: Deadline::of(WeightedTimestamp::from_millis(60_000)),
             declared_work: 5,
             charge: stub_abort_charge(5),
+            reach: Vec::new(),
         }
     }
 

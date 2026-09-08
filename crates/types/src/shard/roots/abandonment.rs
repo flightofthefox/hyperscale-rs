@@ -54,6 +54,7 @@ mod tests {
                 },
                 amount: 11,
             },
+            reach: vec![Address::new([seed; 31], AddressClass::Component)],
         }
     }
 

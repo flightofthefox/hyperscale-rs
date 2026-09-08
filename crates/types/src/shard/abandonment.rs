@@ -47,8 +47,8 @@
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    Deadline, Hash, MAX_UNSETTLED_PER_BLOCK, Probed, ShardId, SubstateKey, Transaction,
-    TransactionDecision, TxHash, WeightedTimestamp,
+    Address, Deadline, Hash, MAX_PREFIXES_PER_TX, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE,
+    Probed, ShardId, SubstateKey, Transaction, TransactionDecision, TxHash, WeightedTimestamp,
 };
 
 /// What an abort of one transaction burns, and out of whose vault.
@@ -67,7 +67,7 @@ pub struct AbortCharge {
 
 /// One transaction a counterpart can never settle, with what abandoning
 /// it takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct UnsettledTx {
     /// The transaction.
     pub tx_hash: TxHash,
@@ -82,6 +82,22 @@ pub struct UnsettledTx {
     /// What the abandonment burns, settled by the shard holding the
     /// vault and by no other.
     pub charge: AbortCharge,
+    /// Every owner prefix the transaction touches, ascending — the whole
+    /// reach, not one shard's share of it.
+    ///
+    /// Stated because a record is read by shards that never held the
+    /// transaction. A validator rotated into a committee after the block
+    /// that committed it meets the transaction here for the first time,
+    /// and what it derives from the entry it builds — who was party to
+    /// an abandonment — reaches a receipt root, so it has to reach the
+    /// same set its peers do. The prefixes are the transaction's own, so
+    /// stating them makes the derivation the same from the record as
+    /// from the block.
+    ///
+    /// The whole reach rather than the composer's remote share: each
+    /// reader owns a different part of it and filters its own.
+    #[hbor(max = MAX_PREFIXES_PER_TX)]
+    pub reach: Vec<Address>,
 }
 
 impl UnsettledTx {
@@ -106,7 +122,24 @@ impl UnsettledTx {
                 vault: tx.fee_vault(),
                 amount: tx.price(),
             },
+            reach: tx.routing().all_prefixes(),
         }
+    }
+
+    /// The earliest instant any shard could have committed the
+    /// transaction: one validity range before its validity ends.
+    ///
+    /// What dates a departure against the entry — a shard that left
+    /// before this never held the transaction, whatever its keyspace
+    /// covers now. Read off the transaction rather than off the block
+    /// that committed it, because the block differs per shard and the
+    /// question does not: two shards commit one transaction at two
+    /// frontiers, and a replica meeting it in a record has neither.
+    /// Erring early is the safe direction — it can only widen who counts
+    /// as party, never narrow it.
+    #[must_use]
+    pub fn first_commit(&self) -> WeightedTimestamp {
+        self.deadline.validity_end().minus(MAX_VALIDITY_RANGE)
     }
 }
 
@@ -493,6 +526,7 @@ mod tests {
                 },
                 amount: u128::from(seed) * 3,
             },
+            reach: vec![Address::new([seed; 31], AddressClass::Component)],
         }
     }
 

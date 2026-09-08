@@ -2357,6 +2357,7 @@ pub fn test_undischarged_record_holds_the_floor(storage: &(impl ShardChainReader
                 vault: stranded.fee_vault(),
                 amount: stranded.price(),
             },
+            reach: stranded.routing().all_prefixes(),
         }],
     );
 

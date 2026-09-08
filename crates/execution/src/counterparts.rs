@@ -203,7 +203,7 @@ impl Counterparts {
         // prune below reads what is still answerable.
         let rebuilt = self
             .ledger
-            .record_abandonment_records(block.abandonment_records());
+            .record_abandonment_records(self.local_shard, block.abandonment_records());
         for _ in 0..rebuilt {
             record_rebuilt_verdict_entry();
         }

@@ -9,9 +9,9 @@
 //! limits down on a single node only degrades that node's responsiveness
 //! without reducing the protocol-wide load it has to keep up with.
 
-use hyperscale_vm_types::TX_UNITS;
+use hyperscale_vm_types::{MAX_TX_BYTES_LEN, TX_UNITS};
 
-use crate::{Question, WorkInFlight};
+use crate::{Address, LocalKey, Question, WorkInFlight};
 
 /// Hard cap on the number of live transactions any single block can carry.
 ///
@@ -129,6 +129,19 @@ pub const fn sweep_admits_block(sweepable: usize) -> bool {
 /// block carry the budget once per record, which is why the sum is
 /// checked as well.
 pub const MAX_UNSETTLED_PER_BLOCK: usize = (MAX_DRAIN_WORK / TX_UNITS) as usize;
+
+/// Hard cap on the owner prefixes one transaction's routing names.
+///
+/// A wire bound on the reach a record restates, and the only structural
+/// one there is: a prefix enters a transaction's routing through a
+/// declared key, and a declared key costs its owner and its local half
+/// inside the envelope, so the envelope's own cap divides. Every real
+/// transaction sits orders below it — a transfer names two, a route
+/// half a dozen — and what the bound is for is that a decoder allocates
+/// against an envelope a sender actually paid for rather than against a
+/// length it claims.
+pub const MAX_PREFIXES_PER_TX: usize =
+    MAX_TX_BYTES_LEN / (size_of::<Address>() + size_of::<LocalKey>());
 
 /// Hard cap on the abandonment records one block may carry.
 ///

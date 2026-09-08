@@ -1000,7 +1000,7 @@ impl VerificationPipeline {
             .abandonment_records()
             .iter()
             .flat_map(AbandonmentRecord::unsettled)
-            .copied()
+            .cloned()
             .collect();
         let deliveries = block.undecided_names();
         let successes = block.successes_decided_alone();
