@@ -2956,6 +2956,11 @@ impl ExecutionCoordinator {
         // member abandoned here would be refused by every voter, and
         // would keep offering it.
         self.finalized.remove_tick(&tick_id);
+        // And its certificate, which no finalization of this shard's will
+        // ever commit. Left in the cache it is answered to a counterpart
+        // asking by transaction, for a verdict this shard has retracted
+        // and beside the abort that replaced it.
+        self.exec_certs.evict(&tick_id);
         tracing::info!(
             tick = %tick_id,
             released = counts.assignments,
@@ -9579,6 +9584,41 @@ mod tests {
                 .abandonable(TickId::new(HOME, BlockHeight::new(9)))
                 .is_empty(),
             "the certificate is out there whether or not the tick still is",
+        );
+    }
+
+    /// A discarded tick's certificate leaves the serving cache with it.
+    ///
+    /// No finalization of this shard's will ever commit it, so it never
+    /// reaches storage and nothing else drops it — and a counterpart
+    /// asking by transaction is answered with a verdict this shard has
+    /// retracted, beside the abort that replaced it.
+    #[test]
+    fn a_discarded_ticks_certificate_stops_being_served() {
+        let sched = peer_terminating_schedule(600_000);
+        let (mut state, tick_id, tx_hash) = state_stranded_on(&sched, 1);
+        state
+            .exec_certs
+            .insert(Arc::new(Verified::new_unchecked_for_test(
+                ExecutionCertificate::new(
+                    tick_id,
+                    WeightedTimestamp::ZERO,
+                    GlobalReceiptRoot::ZERO,
+                    vec![TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)],
+                    AggregateSignature::ZERO,
+                    quorum_signers(),
+                ),
+            )));
+
+        state.discard_tick(tick_id);
+
+        assert!(
+            state.exec_certs.get(&tick_id).is_none(),
+            "the tick's own entry goes with it",
+        );
+        assert!(
+            state.exec_certs.certificates_for_tx(tx_hash).is_empty(),
+            "and so does the index a counterpart asks by",
         );
     }
 
