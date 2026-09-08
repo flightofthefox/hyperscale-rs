@@ -1814,8 +1814,18 @@ impl ShardCoordinator {
         // bounded by MAX_VALIDITY_RANGE.
         let chain = QcChainSets::behind(&self.chain_view(), parent_block_hash);
         let validity_anchor = parent_qc.weighted_timestamp();
+        // The committee governing the block being built, not the schedule's
+        // newest entry: package usability, the recovery fences, payer routing
+        // and the sweep cap all read it, and a voter judges the block under
+        // the committee its parent names. Reading the head instead disagrees
+        // for the block after every fold, and while the parent QC lags the
+        // beacon. Stall where the build itself would.
+        let Some(committee) = self.committee_for_child_of(topology_schedule, parent_block_hash)
+        else {
+            return vec![];
+        };
         let ctx = self.admission(
-            topology_schedule.head(),
+            committee,
             topology_schedule,
             &chain,
             parent_block_hash,

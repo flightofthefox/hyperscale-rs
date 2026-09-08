@@ -421,7 +421,10 @@ impl ShardCoordinatorSim {
         sim
     }
 
-    fn with_schedule(
+    /// A sim on whatever schedule `build` makes of the committee's
+    /// snapshot — for tests that need windows differing in content, where
+    /// [`Self::with_epoch_grid`] holds the committee identical across them.
+    pub fn with_schedule(
         n: usize,
         seed: u64,
         build: impl FnOnce(Arc<TopologySnapshot>) -> TopologySchedule,
