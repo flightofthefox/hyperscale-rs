@@ -27,6 +27,7 @@ use crate::{
 /// Domain tag separating a certificate's attested digest from every
 /// other preimage the codebase hashes.
 const CERTIFICATE_DIGEST_TAG: &[u8] = b"hyperscale.execution_certificate.attested.v1";
+
 /// What a certificate says of one transaction, as a counterpart hears
 /// it.
 ///

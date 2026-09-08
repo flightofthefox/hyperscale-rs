@@ -1,35 +1,47 @@
-//! Execution state machine.
+//! Execution state machine: what this shard runs of each committed
+//! transaction, and what it owes once it has.
 //!
-//! Drives transaction execution after blocks are committed. Transactions are
-//! grouped into ticks (same provision dependency set within a block) and each
-//! tick runs through its lifecycle inside a [`TickState`](crate::TickState).
+//! Transactions are grouped into ticks — one provision dependency set
+//! within a block — and each tick runs its lifecycle inside a
+//! [`TickState`](crate::TickState). What a shard runs of a transaction
+//! is its [`Member`], frozen against the trie its committing block
+//! carried and read off the [`Classified`] star.
 //!
-//! # Transaction Types
+//! # What a shard runs
 //!
-//! - **Single-shard**: Dispatched immediately at block commit; local quorum
-//!   votes produce an execution certificate.
-//! - **Cross-shard**: Dispatched once the tick's provisions assemble, then
-//!   voted and cross-shard-finalized.
+//! - **Whole.** A transaction on one shard, or one that reaches several
+//!   and does not divide: every participant runs every node and settles
+//!   on every participant's certificate.
+//! - **Divided.** The star is a core with legs around it. A leg runs
+//!   where its own state lives and certifies alone; the core bears the
+//!   verdict; value between them crosses as an escrow record the
+//!   consumer claims. A shard with legs on both sides of the core runs
+//!   two members — one issuing at the commit, one delivering once the
+//!   core's output has crossed back.
+//! - **Settling.** No node at all: a reclaim taking back a crossing
+//!   nobody claimed, a retirement deleting records whose claims
+//!   committed, or an inherited record a reshape seat decides from the
+//!   leaf alone.
 //!
-//! # Cross-Shard Atomic Execution Protocol
+//! # How a tick settles
 //!
-//! ## Phase 1: State Provisioning
-//! When a block commits with cross-shard transactions, the block proposer broadcasts
-//! state provisions (with merkle inclusion proofs) to target shards. Provisions are
-//! committed in blocks via `provision_root` — all validators have the same data.
+//! A block commits, its cross-shard members are provisioned, and the
+//! whole tick dispatches atomically. Validators vote; the tick leader
+//! aggregates 2f+1 agreeing on one receipt hash into an execution
+//! certificate and broadcasts it. A member settles once every shard it
+//! awaits has certified — the core set for a core member, itself for a
+//! leg — and the result is a [`Finalization`].
 //!
-//! ## Phase 2: Tick-Atomic Execution
-//! Once every tx in a tick is provisioned (or at block commit for single-shard
-//! ticks), the whole tick dispatches atomically via `ExecuteTransactions`.
+//! # When a counterpart goes silent
 //!
-//! ## Phase 3: Vote Aggregation
-//! Validators send execution votes to the tick leader. When the leader collects
-//! 2f+1 voting power agreeing on the same receipt hash, it aggregates an
-//! execution certificate and broadcasts it to local peers and remote shards.
-//!
-//! ## Phase 5: Finalization
-//! Validators collect shard execution proofs from all participating shards. When all
-//! proofs are received, a `Finalization` is created.
+//! A leg that issued a crossing is owed an answer. Past the deadline it
+//! probes the silent counterpart's cells through a state proof, and what
+//! comes back licenses a reclaim, a retirement, or an abandonment
+//! record. The ledger of what is still owed is
+//! [`UnresolvedTxs`](crate::unresolved::UnresolvedTxs); what counterparts
+//! were heard to say is the [`CounterpartMirror`], shared with the vote
+//! fence so a record passes exactly where its composer would have
+//! offered it.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
@@ -7349,12 +7361,13 @@ mod tests {
         );
     }
 
-    /// A tick whose receipts disagree with the quorum's still fail-stops.
+    /// A tick whose receipts disagree with the quorum's fail-stops.
     ///
-    /// The replay closes the disagreement that a restart used to cause,
-    /// upstream of this check rather than by loosening it — so the check
-    /// has to still bite on the thing it exists for: a replica computing
-    /// state nobody else can reproduce.
+    /// A restarted replica reaches the quorum's receipts because the
+    /// replay puts it back on the chain's own fold, upstream of this
+    /// check rather than by loosening it — so the check still bites on
+    /// the thing it exists for: a replica computing state nobody else
+    /// can reproduce.
     #[test]
     #[should_panic(expected = "BFT CRITICAL")]
     fn a_divergent_fold_fail_stops() {

@@ -614,81 +614,78 @@ impl Counterparts {
                 return actions;
             }
         };
-        {
-            for (entry, cells) in cells {
-                for &(shard, key, probed) in cells {
-                    if shard != bundle.anchor.shard {
-                        continue;
+        for (entry, cells) in cells {
+            for &(shard, key, probed) in cells {
+                if shard != bundle.anchor.shard {
+                    continue;
+                }
+                let Some(&(_, inclusion)) = inclusions.iter().find(|(asked, _)| *asked == key)
+                else {
+                    continue;
+                };
+                // Judged per word, not per anchor: an absence is
+                // read only inside its window, a presence wherever
+                // it was taken.
+                if !probed.licenses(bundle.anchor.ts, entry.deadline, inclusion) {
+                    continue;
+                }
+                // Read by the one arity rule, whoever fetched the
+                // proof: a probe never sent may still be answered
+                // by a proof a block carries.
+                let Some(inclusion) = probed.read(inclusion, entry.core.len()) else {
+                    continue;
+                };
+                // The question is answered, and a fetch still out
+                // for it is released with it.
+                let Some(Released(released)) =
+                    self.ledger.close_question(entry.tx_hash, shard, probed)
+                else {
+                    continue;
+                };
+                self.released_fetches.extend(released);
+                record_reclaim_probe_answered(inclusion.is_present());
+                let tx_hash = entry.tx_hash;
+                match inclusion {
+                    // The counterpart took it, and its certificate
+                    // says how. Its broadcast may have missed this
+                    // shard, so it is fetched rather than waited for.
+                    Inclusion::Present(_) => {
+                        actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
+                            source_shard: shard,
+                            tx_hash,
+                            preferred: None,
+                            class: None,
+                        }));
                     }
-                    let Some(&(_, inclusion)) = inclusions.iter().find(|(asked, _)| *asked == key)
-                    else {
-                        continue;
-                    };
-                    // Judged per word, not per anchor: an absence is
-                    // read only inside its window, a presence wherever
-                    // it was taken.
-                    if !probed.licenses(bundle.anchor.ts, entry.deadline, inclusion) {
-                        continue;
-                    }
-                    // Read by the one arity rule, whoever fetched the
-                    // proof: a probe never sent may still be answered
-                    // by a proof a block carries.
-                    let Some(inclusion) = probed.read(inclusion, entry.core.len()) else {
-                        continue;
-                    };
-                    // The question is answered, and a fetch still out
-                    // for it is released with it.
-                    let Some(Released(released)) =
-                        self.ledger.close_question(entry.tx_hash, shard, probed)
-                    else {
-                        continue;
-                    };
-                    self.released_fetches.extend(released);
-                    record_reclaim_probe_answered(inclusion.is_present());
-                    let tx_hash = entry.tx_hash;
-                    match inclusion {
-                        // The counterpart took it, and its certificate
-                        // says how. Its broadcast may have missed this
-                        // shard, so it is fetched rather than waited for.
-                        Inclusion::Present(_) => {
-                            actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
-                                source_shard: shard,
-                                tx_hash,
-                                preferred: None,
-                                class: None,
-                            }));
-                        }
-                        Inclusion::Absent => {
-                            self.mirror.record(
-                                tx_hash,
-                                shard,
-                                Heard {
-                                    question: Question::Cell(probed),
-                                    word: Word::Absent,
-                                    at: bundle.anchor.ts,
-                                },
-                            );
-                        }
-                    }
-                    // A claim cell present is the settling word: that
-                    // cell is written by the consuming execution and by
-                    // nothing else, so its presence is the consumer
-                    // holding the crossing. A committed cell present
-                    // says only that the core committed the
-                    // transaction, which settles no record — its
-                    // certificate speaks to that, and is fetched above.
-                    if inclusion.is_present() && matches!(probed, Probed::Claim | Probed::Delivery)
-                    {
+                    Inclusion::Absent => {
                         self.mirror.record(
                             tx_hash,
                             shard,
                             Heard {
                                 question: Question::Cell(probed),
-                                word: Word::Present,
+                                word: Word::Absent,
                                 at: bundle.anchor.ts,
                             },
                         );
                     }
+                }
+                // A claim cell present is the settling word: that
+                // cell is written by the consuming execution and by
+                // nothing else, so its presence is the consumer
+                // holding the crossing. A committed cell present
+                // says only that the core committed the
+                // transaction, which settles no record — its
+                // certificate speaks to that, and is fetched above.
+                if inclusion.is_present() && matches!(probed, Probed::Claim | Probed::Delivery) {
+                    self.mirror.record(
+                        tx_hash,
+                        shard,
+                        Heard {
+                            question: Question::Cell(probed),
+                            word: Word::Present,
+                            at: bundle.anchor.ts,
+                        },
+                    );
                 }
             }
         }
