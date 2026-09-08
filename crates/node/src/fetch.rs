@@ -475,6 +475,26 @@ pub enum Refusal {
     Unusable(&'static str),
 }
 
+/// What a refusal says about the peer that gave it.
+///
+/// Only one of the two is the peer's fault. A scope it does not hold is
+/// an honest answer about a height it has pruned or a terminal it never
+/// served, and every member of a committee asked below its own retention
+/// floor gives the same one — so scoring it would deprioritize a whole
+/// honest committee for answering correctly, and the requester would
+/// rotate away from the only peers there are. An answer that does not
+/// lift to the scope is the peer's fault and is scored.
+///
+/// `Accept` is not a reward: the transports act on `Reject` alone, so
+/// this leaves an honest refusal costing a round trip and nothing else.
+/// The ids release the same way either way.
+const fn scored(refusal: Refusal) -> ResponseVerdict {
+    match refusal {
+        Refusal::NotHeld => ResponseVerdict::Accept,
+        Refusal::Unusable(_) => ResponseVerdict::Reject,
+    }
+}
+
 /// Issue one request per scope in `ids` and route each answer through
 /// [`ScopedAnswer::answer`]. The ids are released before the event goes
 /// out, so the freed capacity is available if handling the delivery
@@ -547,7 +567,7 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
                             local_shard,
                             ShardScopedInput::FetchFailed(B::ids(requested)),
                         );
-                        ResponseVerdict::Reject
+                        scored(refusal)
                     }
                 }
             }),
@@ -676,6 +696,23 @@ mod tests {
 
     fn tx(n: u8) -> TxHash {
         TxHash::from(Hash::from_bytes(&[n; 32]))
+    }
+
+    /// A peer that does not hold the scope is not the peer at fault.
+    ///
+    /// Every member of a committee asked about a height below its own
+    /// retention floor answers the same way, so scoring it would
+    /// deprioritize the whole committee for being honest and send the
+    /// requester rotating away from the only peers that exist. An answer
+    /// that does not lift to the scope is a different matter and is
+    /// scored.
+    #[test]
+    fn only_an_unusable_answer_is_the_serving_peers_fault() {
+        assert_eq!(scored(Refusal::NotHeld), ResponseVerdict::Accept);
+        assert_eq!(
+            scored(Refusal::Unusable("short list")),
+            ResponseVerdict::Reject,
+        );
     }
 
     fn vid(n: u64) -> ValidatorId {
