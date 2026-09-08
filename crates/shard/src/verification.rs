@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
-use hyperscale_engine::committed_cells;
+use hyperscale_storage::committed_tx_cells;
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
     ChainOrigin, Demands, Finalization, LinkageError, LocalReceiptRoot, QuorumCertificate,
@@ -54,7 +54,7 @@ pub fn anchor_trie(schedule: &TopologySchedule, anchor: WeightedTimestamp) -> Op
 /// it.
 #[must_use]
 pub fn committed_cells_for(block: &Block) -> Vec<(SubstateKey, Vec<u8>)> {
-    committed_cells(
+    committed_tx_cells(
         block.header().shard_id(),
         block.transactions().iter().map(|tx| tx.as_unverified()),
     )

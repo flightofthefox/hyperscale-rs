@@ -17,7 +17,7 @@ use hyperscale_types::{
 };
 
 use crate::output::ExecutedTx;
-use crate::sharding::filter_writes_for_shard;
+use crate::sharding::{filter_writes_for_shard, owned_by};
 
 /// Cached projection of an execution receipt.
 ///
@@ -130,7 +130,8 @@ pub fn project_to_shard(
             gas_consumed,
             escrowed,
         } => {
-            let writes = filter_writes_for_shard(raw_writes, local_shard, shard_trie);
+            let owned = owned_by(local_shard, shard_trie);
+            let writes = filter_writes_for_shard(raw_writes, owned);
             // A fact's emitter is a substate prefix, so the shard that
             // keeps the fact is the one that keeps the event it was read
             // from — the same rule applied a few lines below, and the
@@ -139,7 +140,7 @@ pub fn project_to_shard(
             // shard owns its emitter.
             let beacon_witness_events: Vec<BeaconWitnessEvent> = witnesses
                 .iter()
-                .filter(|(emitter, _)| shard_trie.shard_for_prefix(*emitter) == local_shard)
+                .filter(|(emitter, _)| owned(*emitter))
                 .map(|(_, event)| event.clone())
                 .collect();
             // An event is stored where its emitter lives, so each shard
@@ -148,7 +149,7 @@ pub fn project_to_shard(
             // stored is what was signed over.
             let events: Vec<Event> = events
                 .iter()
-                .filter(|event| shard_trie.shard_for_prefix(event.emitter) == local_shard)
+                .filter(|event| owned(event.emitter))
                 .cloned()
                 .collect();
             let consensus = ConsensusReceipt::Succeeded {

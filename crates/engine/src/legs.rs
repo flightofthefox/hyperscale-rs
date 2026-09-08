@@ -203,36 +203,42 @@ impl Classified {
         }
     }
 
-    /// The claim cells core consumers write for the crossings a leg on
-    /// `local` issued, each under the shard holding the consumer's
-    /// target — the consumer's own home, since a claim sits under its
-    /// target wherever else the core runs it. What a probe asks the core
-    /// about once the transaction's deadline has passed: a claim absent
-    /// there, on a core of one shard, says the core never took the
-    /// crossing.
-    #[must_use]
-    pub fn core_claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
+    /// The claim cells consumers of what `local` issued write, each
+    /// under the shard holding the consumer's target — the consumer's
+    /// own home, since a claim sits under its target wherever else the
+    /// core runs it.
+    ///
+    /// One fold, asked for by name in two halves rather than returned as
+    /// one list: a delivery's claim is probed at the lapse and a core
+    /// consumer's at the deadline, so a caller that took them together
+    /// would have to split them again before asking.
+    fn claims_issued(&self, local: ShardId, delivered: bool) -> Vec<(ShardId, SubstateKey)> {
         self.edges()
             .iter()
-            .filter(|edge| edge.from == local && !edge.delivers)
+            .filter(|edge| edge.from == local && edge.delivers == delivered)
             .map(|edge| (self.home(edge.consumer), edge.claim.key()))
             .collect()
     }
 
+    /// The claim cells core consumers write for the crossings a leg on
+    /// `local` issued. What a probe asks the core about once the
+    /// transaction's deadline has passed: a claim absent there, on a
+    /// core of one shard, says the core never took the crossing.
+    #[must_use]
+    pub fn core_claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
+        self.claims_issued(local, false)
+    }
+
     /// The claim cells deliveries elsewhere write for the crossings a
     /// node on `local` issued — an inbound leg's, or the core's on a
-    /// core shard — each under the delivering shard.
+    /// core shard.
     ///
     /// A delivery that never claimed leaves exactly this cell absent,
     /// which is what a lapse probe asks the delivering shard about, and
     /// the crossing is then the producer's to take back.
     #[must_use]
     pub fn delivered_claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
-        self.edges()
-            .iter()
-            .filter(|edge| edge.from == local && edge.delivers)
-            .map(|edge| (self.home(edge.consumer), edge.claim.key()))
-            .collect()
+        self.claims_issued(local, true)
     }
 
     /// Every record cell a producer on `local` writes for a consumer

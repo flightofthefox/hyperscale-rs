@@ -31,8 +31,20 @@ impl ShardResolver for TrieShardResolver<'_> {
     }
 }
 
-/// Filter genesis writes to the cells whose owner prefix routes to
-/// `local_shard`, for building that shard's prefix-rooted JMT.
+/// Whether `local_shard` owns the cells under an address, under `trie`.
+///
+/// The predicate the filters below take and every other reading of
+/// "this shard's own keys" builds from, so a caller that filters writes
+/// and events in one pass states the rule once. A borrowing closure
+/// rather than an [`OwnerSet`](hyperscale_vm_kernel::OwnerSet): the
+/// kernel's set owns what it captures, which would clone the trie per
+/// transaction on a path that projects one receipt at a time.
+pub fn owned_by(local_shard: ShardId, trie: &ShardTrie) -> impl Fn(Address) -> bool + Copy {
+    move |owner| trie.shard_for_prefix(owner) == local_shard
+}
+
+/// Filter genesis writes to the cells `owned` holds, for building a
+/// shard's prefix-rooted JMT.
 ///
 /// The stdlib package is replicated to every shard's substate store for
 /// read availability, but the prefix-rooted JMT must contain only this
@@ -43,48 +55,46 @@ impl ShardResolver for TrieShardResolver<'_> {
 #[must_use]
 pub fn filter_genesis_writes_for_shard(
     merged: &SettledWrites,
-    local_shard: ShardId,
-    shard_trie: &ShardTrie,
+    owned: impl Fn(Address) -> bool,
 ) -> SettledWrites {
     SettledWrites::from_parts(
         merged
             .cells()
             .iter()
-            .filter(|(key, _)| shard_trie.shard_for_prefix(key.owner) == local_shard)
+            .filter(|(key, _)| owned(key.owner))
             .map(|(key, change)| (*key, change.clone()))
             .collect(),
         merged
             .entries()
             .iter()
-            .filter(|(key, _)| shard_trie.shard_for_prefix(key.owner) == local_shard)
+            .filter(|(key, _)| owned(key.owner))
             .map(|(key, change)| (*key, change.clone()))
             .collect(),
     )
 }
 
-/// Filter [`StateWrites`] for a single shard.
+/// Filter [`StateWrites`] to the cells `owned` holds.
 ///
 /// A substate key carries its owner prefix — the identity leaf's routing
 /// half — so shard assignment is a prefix walk and nothing else.
 #[must_use]
 pub fn filter_writes_for_shard(
     writes: &StateWrites,
-    local_shard: ShardId,
-    shard_trie: &ShardTrie,
+    owned: impl Fn(Address) -> bool,
 ) -> StateWrites {
     let mut filtered = StateWrites::default();
     for (key, change) in &writes.cells {
-        if shard_trie.shard_for_prefix(key.owner) == local_shard {
+        if owned(key.owner) {
             filtered.cells.insert(*key, change.clone());
         }
     }
     for (key, movement) in &writes.movements {
-        if shard_trie.shard_for_prefix(key.owner) == local_shard {
+        if owned(key.owner) {
             filtered.movements.insert(*key, *movement);
         }
     }
     for (key, change) in &writes.entries {
-        if shard_trie.shard_for_prefix(key.owner) == local_shard {
+        if owned(key.owner) {
             filtered.entries.insert(*key, change.clone());
         }
     }
@@ -179,7 +189,7 @@ mod tests {
         assert_ne!(trie.shard_for_prefix(left), trie.shard_for_prefix(right));
         let all = writes(&[(left, [1; 16], vec![1]), (right, [1; 16], vec![2])]);
 
-        let filtered = filter_writes_for_shard(&all, trie.shard_for_prefix(left), &trie);
+        let filtered = filter_writes_for_shard(&all, owned_by(trie.shard_for_prefix(left), &trie));
         assert_eq!(filtered.cells.len(), 1);
         assert_eq!(filtered.cells.keys().next().unwrap().owner, left);
     }
@@ -190,8 +200,8 @@ mod tests {
             (test_principal(1), [1; 16], vec![1]),
             (test_principal(9), [2; 16], vec![2]),
         ]);
-        let filtered =
-            filter_writes_for_shard(&all, ShardId::ROOT, &ShardTrie::uniform_from_count(1));
+        let single = ShardTrie::uniform_from_count(1);
+        let filtered = filter_writes_for_shard(&all, owned_by(ShardId::ROOT, &single));
         assert_eq!(filtered, all);
     }
 }
