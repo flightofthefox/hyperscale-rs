@@ -445,11 +445,11 @@ mod tests {
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, Anchor,
         BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Deadline, Finalization, Hash, Heard,
         LocalKey, MAX_SUBINTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-        MerkleInclusionProof, NetworkDefinition, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
-        Provisions, Question, QuorumCertificate, Round, ShardId, ShardLoad, Signer, SignerBitfield,
-        StateProofBundle, StateProofsRoot, StateRoot, SubstateKey, TimestampRange, Transaction,
-        TransactionDecision, TxHash, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet,
-        Verifiable, Verified, WeightedTimestamp, WitnessSources, Word, test_utils,
+        MerkleInclusionProof, NetworkDefinition, PrincipalAddr, Probed, ProposerTimestamp,
+        ProvisionEntry, Provisions, Question, QuorumCertificate, Round, ShardId, ShardLoad, Signer,
+        SignerBitfield, StateProofBundle, StateProofsRoot, StateRoot, SubstateKey, TimestampRange,
+        Transaction, TransactionDecision, TxHash, UnsettledTx, ValidatorId, ValidatorInfo,
+        ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources, Word, test_utils,
     };
 
     use super::*;
@@ -1174,18 +1174,16 @@ mod tests {
 
         // One shard under two arms is two answers about two sets of
         // transactions, in arm order.
-        let accepted = Heard {
-            question: Question::Verdict,
-            word: Word::Accepted {
-                digest: Hash::from_bytes(b"digest"),
-            },
+        let claimed = Heard {
+            question: Question::Cell(Probed::Claim),
+            word: Word::Present,
             at: WeightedTimestamp::from_millis(9),
         };
         let two_arms = vec![
             verdict(left, &[1]),
             AbandonmentRecord::heard(
                 left,
-                accepted,
+                claimed,
                 [named(TxHash::from(Hash::from_bytes(&[2; 32])))],
             ),
         ];
@@ -1194,7 +1192,7 @@ mod tests {
         let arms_reversed = vec![
             AbandonmentRecord::heard(
                 left,
-                accepted,
+                claimed,
                 [named(TxHash::from(Hash::from_bytes(&[2; 32])))],
             ),
             verdict(left, &[1]),

@@ -558,8 +558,8 @@ impl Member {
 /// What licenses a member to settle the records a producer here left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Licence {
-    /// Every consumer claimed, on the evidence of its certificate: the
-    /// records are deleted.
+    /// Every consumer claimed, on the evidence of its claim cell proved
+    /// present: the records are deleted.
     Accepted,
     /// No consumer ever claimed, on the evidence of a committed record:
     /// the crossings are credited back and the records deleted.

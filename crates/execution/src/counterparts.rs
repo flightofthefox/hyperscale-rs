@@ -20,10 +20,10 @@ use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, Block, CounterpartEvidence, CounterpartMirror, ExecutionCertificate,
     Heard, Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed, ProvenAnchors, Question,
-    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateProofBundle, SubstateKey,
-    TerminalEvidence, TopologySchedule, TransactionDecision, TxClaim, TxHash, TxResolution,
-    UnsettledTx, Verifiable, Verified, WeightedTimestamp, Word, settled_set_verdict,
+    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed, ProvenAnchors, Question, SettledTxSet,
+    ShardId, ShardTrie, StateProofBundle, SubstateKey, TerminalEvidence, TopologySchedule,
+    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
+    WeightedTimestamp, Word,
 };
 
 use crate::unresolved::{Probeable, Released, Unanswerable, UnresolvedTxs};
@@ -268,13 +268,12 @@ impl Counterparts {
             .collect()
     }
 
-    /// What this validator holds to offer in a block it proposes, judged
-    /// at `now`, the committed frontier.
+    /// What this validator holds to offer in a block it proposes.
     #[must_use]
-    pub fn offers(&self, schedule: &TopologySchedule, now: WeightedTimestamp) -> Offers {
+    pub fn offers(&self) -> Offers {
         Offers {
             state_proofs: self.state_proofs(),
-            abandonment_records: self.abandonment_records(schedule, now),
+            abandonment_records: self.abandonment_records(),
         }
     }
 
@@ -323,12 +322,17 @@ impl Counterparts {
                 if self.ledger.answered(entry.tx_hash, shard, probed) {
                     continue;
                 }
-                // The newest licensed header held: the one the shard is
-                // likeliest to still serve, since a proof is taken from
-                // a bounded history behind its tip.
+                // The newest header an absence would answer at: the one
+                // the shard is likeliest to still serve, since a proof is
+                // taken from a bounded history behind its tip. Where no
+                // header answers one — the cue fired before the window
+                // opened — the newest held will do, because the reading
+                // the cue is after is a presence, and a presence answers
+                // wherever it was taken.
                 let Some(anchor) = self
                     .proven_anchors
-                    .newest_licensed(shard, |ts| probed.licenses(ts, entry.deadline))
+                    .newest_licensed(shard, |ts| probed.absence_answers_at(ts, entry.deadline))
+                    .or_else(|| self.proven_anchors.newest_licensed(shard, |_| true))
                 else {
                     continue;
                 };
@@ -466,15 +470,19 @@ impl Counterparts {
         {
             for (entry, cells) in cells {
                 for &(shard, key, probed) in cells {
-                    if shard != bundle.anchor.shard
-                        || !probed.licenses(bundle.anchor.ts, entry.deadline)
-                    {
+                    if shard != bundle.anchor.shard {
                         continue;
                     }
                     let Some(&(_, inclusion)) = inclusions.iter().find(|(asked, _)| *asked == key)
                     else {
                         continue;
                     };
+                    // Judged per word, not per anchor: an absence is
+                    // read only inside its window, a presence wherever
+                    // it was taken.
+                    if !probed.licenses(bundle.anchor.ts, entry.deadline, inclusion) {
+                        continue;
+                    }
                     // Read by the one arity rule, whoever fetched the
                     // proof: a probe never sent may still be answered
                     // by a proof a block carries.
@@ -515,6 +523,25 @@ impl Counterparts {
                             );
                         }
                     }
+                    // A claim cell present is the settling word: that
+                    // cell is written by the consuming execution and by
+                    // nothing else, so its presence is the consumer
+                    // holding the crossing. A committed cell present
+                    // says only that the core committed the
+                    // transaction, which settles no record — its
+                    // certificate speaks to that, and is fetched above.
+                    if inclusion.is_present() && matches!(probed, Probed::Claim | Probed::Delivery)
+                    {
+                        self.mirror.record(
+                            tx_hash,
+                            shard,
+                            Heard {
+                                question: Question::Cell(probed),
+                                word: Word::Present,
+                                at: bundle.anchor.ts,
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -547,11 +574,11 @@ impl Counterparts {
     /// record restates a decision already held.
     ///
     /// Only a word this shard has a use for is kept. A core's refusal
-    /// is the transaction's verdict, where a leg here issued for it; a
-    /// consumer's acceptance — a core's or a delivery's — is what
-    /// settles the record held for its claim; and a core shard's
-    /// acceptance counts toward the transaction being accepted, which
-    /// is every core shard saying so.
+    /// is the transaction's verdict, where a leg here issued for it, and
+    /// a core shard's acceptance counts toward the transaction being
+    /// accepted, which is every core shard saying so. A consumer's
+    /// acceptance keeps nothing: it opens the probe whose answer settles
+    /// the record held for its claim.
     pub fn fold_verdict(&mut self, shard: ShardId, tx_hash: TxHash, heard: Heard) -> Vec<Action> {
         if shard == self.local_shard || heard.question != Question::Verdict {
             return Vec::new();
@@ -561,8 +588,14 @@ impl Counterparts {
         let mut actions = Vec::new();
         match heard.word {
             Word::Accepted { .. } => {
+                // The cue, not the licence. A success says the
+                // counterpart's execution went through; whether it wrote
+                // the claim that success promises is a fact of its
+                // committed state, and its own finalization can still be
+                // refused afterwards. So the certificate opens the probe
+                // and the probe's answer is what a record stands on.
                 if consumes {
-                    self.mirror.record(tx_hash, shard, heard);
+                    self.ledger.cue_probe(tx_hash);
                 }
                 if in_core && self.ledger.record_acceptance(tx_hash, shard) {
                     actions.push(Action::Continuation(ProtocolEvent::TransactionsResolved {
@@ -583,7 +616,7 @@ impl Counterparts {
                     }));
                 }
             }
-            Word::Absent => {}
+            Word::Absent | Word::Present => {}
         }
         actions
     }
@@ -636,11 +669,7 @@ impl Counterparts {
     ///
     /// Ascending by shard, which is the one order a block may carry them
     /// in.
-    fn abandonment_records(
-        &self,
-        schedule: &TopologySchedule,
-        now: WeightedTimestamp,
-    ) -> Vec<AbandonmentRecord> {
+    fn abandonment_records(&self) -> Vec<AbandonmentRecord> {
         let mut budget = MAX_UNSETTLED_PER_BLOCK;
         // One record per shard and arm, ascending: a departure first,
         // since it covers everything the shard was party to, then one
@@ -682,31 +711,16 @@ impl Counterparts {
         // checks it against has gone.
         let mut heard: HeardByQuestion = BTreeMap::new();
         for (tx_hash, shard, word) in self.mirror.all() {
-            if matches!(word.word, Word::Accepted { .. })
-                && !self.ledger.acceptance_unrecorded(tx_hash, shard)
-            {
+            // An acceptance is a cue and never evidence, so no record
+            // carries one — which is also why none of this has to ask
+            // whether the shard that spoke it can still be cut before
+            // its finalization lands. The presence its probe reads is a
+            // fact of committed state and needs no such holding.
+            if matches!(word.word, Word::Accepted { .. }) {
                 continue;
             }
-            // An acceptance is a settlement claim on the shard that spoke
-            // it, and its certificate alone is not one: a live chain
-            // settles what it certifies, but a chain whose termination is
-            // scheduled can be cut before the finalization lands, and its
-            // terminal sweep abandons the tick. The claim is held to the
-            // verdict a finalization's would be — deferred while the
-            // termination is scheduled, decided by the settled set once
-            // the shard has left — and the retirement it licenses waits
-            // with it.
-            if word.question == Question::Verdict
-                && matches!(word.word, Word::Accepted { .. })
-                && self.mirror.with_settled(|sets| {
-                    settled_set_verdict(
-                        sets,
-                        schedule,
-                        self.local_shard,
-                        now,
-                        [(shard, tx_hash, TxClaim::Settled)],
-                    )
-                }) != SettledSetVerdict::Pass
+            if matches!(word.word, Word::Present)
+                && !self.ledger.acceptance_unrecorded(tx_hash, shard)
             {
                 continue;
             }

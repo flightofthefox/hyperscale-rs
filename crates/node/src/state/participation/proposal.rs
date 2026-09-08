@@ -57,7 +57,7 @@ impl ShardParticipation {
         let Offers {
             state_proofs,
             abandonment_records,
-        } = self.execution_coordinator.offers(sched);
+        } = self.execution_coordinator.offers();
         let queued = self.provisions_coordinator.queued_provisions(self.now);
 
         // The engagement gate: a non-payer shard proposes a cross-shard

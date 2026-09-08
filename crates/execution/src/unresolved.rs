@@ -139,6 +139,16 @@ struct Owed {
     /// entry issued. Once every consumer has, the records here have
     /// nothing left to hold and the retirement is licensed.
     claimed_by: BTreeSet<ShardId>,
+    /// Whether a consumer's certificate has spoken a claiming success
+    /// for this transaction.
+    ///
+    /// The cue to ask, never the answer. A certificate says a
+    /// counterpart's execution succeeded; whether it wrote the claim its
+    /// success promises is a question about that shard's committed
+    /// state, and only its state answers. Opening the probe here rather
+    /// than at the deadline is what keeps a retirement as prompt as the
+    /// certificate that prompts it.
+    cued: bool,
     /// What this shard has heard from the counterparts of the
     /// transaction, mirrored off their certificates as they arrive.
     ///
@@ -450,6 +460,9 @@ pub struct Probeable {
     /// prefix by then: present says the core took it, and absent, where
     /// the core is one shard, that it never will.
     pub claims: Vec<(ShardId, SubstateKey)>,
+    /// Whether a consumer's claiming success has been heard, which opens
+    /// the probe ahead of the deadline.
+    pub cued: bool,
 }
 
 /// What one name on a committed finalization means for the entry it
@@ -505,9 +518,14 @@ const fn decided_by(evidence: CounterpartEvidence) -> Option<TransactionDecision
             (Question::Cell(Probed::Core | Probed::Claim), Word::Absent) => {
                 Some(TransactionDecision::Aborted)
             }
+            // A presence decides nothing about the transaction: it
+            // says the consumer holds the crossing, which retires the
+            // record and leaves the verdict to the core.
             (Question::Cell(Probed::Delivery), _)
-            | (Question::Verdict, Word::Accepted { .. } | Word::Absent)
-            | (Question::Cell(_), Word::Refused { .. } | Word::Accepted { .. }) => None,
+            | (Question::Verdict, Word::Accepted { .. } | Word::Absent | Word::Present)
+            | (Question::Cell(_), Word::Refused { .. } | Word::Accepted { .. } | Word::Present) => {
+                None
+            }
         },
     }
 }
@@ -570,6 +588,7 @@ impl UnresolvedTxs {
                 taken: None,
                 covered: None,
                 claimed_by: BTreeSet::new(),
+                cued: false,
                 asked: Asked::default(),
             };
             self.owed.entry(tx.hash()).or_insert(owed);
@@ -775,19 +794,27 @@ impl UnresolvedTxs {
     /// took the transaction: past the deadline and covered by no record
     /// yet.
     ///
-    /// The deadline gates the probe and nothing else. Before it the core
-    /// may still legitimately commit, so absence says nothing; past it
-    /// absence is proof, and the proof is what a record is composed on.
-    /// A delivery's answer is held to a later floor still, the lapse,
-    /// which the prober applies to the header it reads. Read off
-    /// committed content alone, like [`Self::past_deadline`], so every
-    /// replica at the same frontier asks about the same set.
+    /// Two things open a probe, because the two words answer different
+    /// questions. The deadline opens the absence: before it the core may
+    /// still legitimately commit, so absence says nothing, and past it
+    /// absence is proof. A consumer's claiming success opens the
+    /// presence, which needs no window at all — asking early costs a
+    /// reading of a cell that is not there yet, and waiting for the
+    /// deadline would hold every crossing's record to it.
     #[must_use]
     pub fn probeable(&self, now: WeightedTimestamp) -> Vec<Probeable> {
         self.cells()
             .into_iter()
-            .filter(|entry| entry.deadline.passed(now))
+            .filter(|entry| entry.deadline.passed(now) || entry.cued)
             .collect()
+    }
+
+    /// Note that a consumer's certificate spoke a claiming success for
+    /// `tx_hash`, which opens its probe.
+    pub fn cue_probe(&mut self, tx_hash: TxHash) {
+        if let Some(owed) = self.owed.get_mut(&tx_hash) {
+            owed.cued = true;
+        }
     }
 
     /// Every leg entry no record has answered for, with the counterpart
@@ -818,6 +845,7 @@ impl UnresolvedTxs {
                     core: kept.core.clone(),
                     deliveries,
                     claims,
+                    cued: owed.cued,
                 })
             })
             .collect()
@@ -1013,6 +1041,7 @@ impl UnresolvedTxs {
                         taken: None,
                         covered: Some((verdict.shard(), verdict.evidence())),
                         claimed_by: BTreeSet::new(),
+                        cued: false,
                         asked: Asked::default(),
                     },
                 );
@@ -1479,12 +1508,11 @@ mod tests {
     }
 
     /// An acceptance at `at`.
-    fn accepted(at: WeightedTimestamp) -> Heard {
+    /// The settling word: a consumer's claim cell read present.
+    fn claimed(at: WeightedTimestamp) -> Heard {
         Heard {
-            question: Question::Verdict,
-            word: Word::Accepted {
-                digest: Hash::from_bytes(b"digest"),
-            },
+            question: Question::Cell(Probed::Claim),
+            word: Word::Present,
             at,
         }
     }
@@ -2226,6 +2254,7 @@ mod tests {
                 core: BTreeSet::from([PARTNER]),
                 deliveries: Vec::new(),
                 claims: Vec::new(),
+                cued: false,
             }],
             "at the deadline the leg is probeable and the whole entry is not"
         );
@@ -2277,6 +2306,7 @@ mod tests {
                 core: BTreeSet::from([PARTNER]),
                 deliveries: vec![(PARTNER, claim)],
                 claims: Vec::new(),
+                cued: false,
             }],
         );
         ledger.record_abandonment_records(
@@ -2339,6 +2369,7 @@ mod tests {
                 core: BTreeSet::new(),
                 deliveries: vec![(PARTNER, claim)],
                 claims: Vec::new(),
+                cued: false,
             }],
         );
         ledger.record_abandonment_records(
@@ -2637,7 +2668,7 @@ mod tests {
             LOCAL,
             &[AbandonmentRecord::heard(
                 SUCCESSOR,
-                accepted(ms(70_000)),
+                claimed(ms(70_000)),
                 [names(&tx)],
             )],
         );
@@ -2675,7 +2706,7 @@ mod tests {
             LOCAL,
             &[AbandonmentRecord::heard(
                 PARTNER,
-                accepted(ms(70_000)),
+                claimed(ms(70_000)),
                 [names(&tx)],
             )],
         );

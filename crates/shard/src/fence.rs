@@ -257,7 +257,8 @@ impl VoteFence<'_> {
         heard: Heard,
     ) -> Result<(), Withheld> {
         if let Question::Cell(probed) = heard.question
-            && !probed.licenses(heard.at, entry.deadline)
+            && heard.word != Word::Present
+            && !probed.absence_answers_at(heard.at, entry.deadline)
         {
             return Err(Withheld::Refused(format!(
                 "abandonment record probes {shard:?} for {} at {:?}, outside the window its \
@@ -265,8 +266,17 @@ impl VoteFence<'_> {
                 entry.tx_hash, heard.at, entry.deadline
             )));
         }
+        // A presence is compared as a word and not as a moment. Its
+        // anchor carries no meaning — the cell is written by the one
+        // execution that consumes the crossing, so it is there or it is
+        // not, whenever the reading was taken — and two validators that
+        // probed at different headers of the same chain read the same
+        // fact. Holding them to one header would refuse a record for a
+        // race neither of them lost.
         match self.evidence.heard(entry.tx_hash, shard, heard.question) {
-            Some(mirrored) if mirrored == heard => {}
+            Some(mirrored)
+                if mirrored == heard
+                    || (heard.word == Word::Present && mirrored.word == Word::Present) => {}
             Some(mirrored) => {
                 return Err(Withheld::Refused(format!(
                     "abandonment record restates {heard:?} of {shard:?} for {}, which this \

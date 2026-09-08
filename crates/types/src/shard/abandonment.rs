@@ -288,8 +288,8 @@ impl Question {
 /// A certificate answers a [`Question::Verdict`] with a refusal or an
 /// acceptance, named by its attested digest so a claim to it can be
 /// held to the copy a voter holds. A proof answers a [`Question::Cell`]
-/// with an absence; a presence is never written down here, since the
-/// counterpart's certificate then speaks for it and is fetched instead.
+/// either way: absent, and the crossing is the issuer's to take back;
+/// present, and the consumer has it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
 pub enum Word {
     /// The counterpart refused the transaction: a rejection or an abort.
@@ -307,6 +307,14 @@ pub enum Word {
     },
     /// The probed cell was absent.
     Absent,
+    /// The probed cell was present.
+    ///
+    /// A claim cell is written by the consuming execution and by
+    /// nothing else, so its presence is the consumer holding the
+    /// crossing — which is what licenses the issuer to retire the
+    /// record it left. Unlike an absence it needs no window: a swept
+    /// cell reads absent, so presence is never a stale reading.
+    Present,
 }
 
 /// One thing a counterpart's chain said about one transaction, and when.
@@ -324,8 +332,15 @@ pub struct Heard {
 }
 
 impl Heard {
-    /// Whether the word answers the question: a certificate speaks to a
-    /// verdict, a proof to a cell, and a refusal is never an acceptance.
+    /// Whether the word answers the question in a form a record may
+    /// carry: a certificate speaks to a verdict, a proof to a cell, and
+    /// a refusal is never an acceptance.
+    ///
+    /// An acceptance is not among them. A certificate says the
+    /// counterpart's execution succeeded, which is the cue to ask
+    /// whether it claimed — not the answer. Its own finalization can
+    /// still be refused, and a record standing on it would retire a
+    /// crossing nobody ever took.
     #[must_use]
     pub const fn is_well_formed(&self) -> bool {
         match (self.question, self.word) {
@@ -335,16 +350,21 @@ impl Heard {
                     TransactionDecision::Reject | TransactionDecision::Aborted
                 )
             }
-            (Question::Verdict, Word::Accepted { .. }) | (Question::Cell(_), Word::Absent) => true,
-            (Question::Verdict, Word::Absent) | (Question::Cell(_), _) => false,
+            (Question::Cell(_), Word::Absent | Word::Present) => true,
+            (Question::Verdict, Word::Accepted { .. } | Word::Absent | Word::Present)
+            | (Question::Cell(_), _) => false,
         }
     }
 
     /// Whether the word licenses a reclaim — the counterpart can never
     /// settle — rather than a retirement, where it did.
+    ///
+    /// Total over what [`Self::is_well_formed`] admits: presence is the
+    /// one settling word, and every other answer a record may carry
+    /// leaves the crossing the issuer's.
     #[must_use]
     pub const fn abandons(&self) -> bool {
-        !matches!(self.word, Word::Accepted { .. })
+        !matches!(self.word, Word::Present)
     }
 }
 
@@ -734,10 +754,11 @@ mod tests {
         let arms = [
             CounterpartEvidence::Departed { terminal_wt: wt() },
             CounterpartEvidence::Heard(heard(Question::Verdict, refused)),
-            CounterpartEvidence::Heard(heard(Question::Verdict, accepted)),
             CounterpartEvidence::Heard(heard(Question::Cell(Probed::Core), Word::Absent)),
             CounterpartEvidence::Heard(heard(Question::Cell(Probed::Delivery), Word::Absent)),
             CounterpartEvidence::Heard(heard(Question::Cell(Probed::Claim), Word::Absent)),
+            CounterpartEvidence::Heard(heard(Question::Cell(Probed::Delivery), Word::Present)),
+            CounterpartEvidence::Heard(heard(Question::Cell(Probed::Claim), Word::Present)),
         ];
         for arm in arms {
             assert_eq!(arm.moment(), wt());
@@ -746,6 +767,7 @@ mod tests {
         }
         let malformed = [
             heard(Question::Verdict, Word::Absent),
+            heard(Question::Verdict, Word::Present),
             heard(Question::Cell(Probed::Core), refused),
             heard(Question::Cell(Probed::Claim), accepted),
             heard(
@@ -760,7 +782,19 @@ mod tests {
             assert!(!heard.is_well_formed(), "{heard:?}");
             assert!(!AbandonmentRecord::heard(ShardId::ROOT, heard, [tx(1)]).is_well_formed());
         }
-        assert!(!CounterpartEvidence::Heard(heard(Question::Verdict, accepted)).abandons());
+        // An acceptance is the cue to ask and never an answer, so no
+        // record carries one however the question is put.
+        for question in Question::ALL {
+            assert!(!heard(question, accepted).is_well_formed());
+        }
+        assert!(
+            !CounterpartEvidence::Heard(heard(Question::Cell(Probed::Claim), Word::Present))
+                .abandons()
+        );
+        assert!(
+            CounterpartEvidence::Heard(heard(Question::Cell(Probed::Claim), Word::Absent))
+                .abandons()
+        );
         assert!(CounterpartEvidence::Departed { terminal_wt: wt() }.abandons());
     }
 }

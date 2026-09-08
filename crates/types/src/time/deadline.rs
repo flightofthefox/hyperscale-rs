@@ -179,11 +179,34 @@ impl Probed {
         }
     }
 
+    /// Whether an *absence* taken at `probed_wt` answers this question
+    /// for a transaction with this `deadline`.
+    ///
+    /// The window the probe anchors in. Before it the counterpart may
+    /// still write the cell, and past it the sweep may have taken one
+    /// that was there, so an absence outside says nothing either way.
+    #[must_use]
+    pub fn absence_answers_at(self, probed_wt: WeightedTimestamp, deadline: Deadline) -> bool {
+        self.window().of(deadline).contains(&probed_wt)
+    }
+
     /// Whether an answer taken at `probed_wt` says anything about what
     /// this question asks of a transaction with this `deadline`.
+    ///
+    /// A presence is bounded by neither end of the window: these cells
+    /// are written by the one execution that consumes the crossing and
+    /// by nothing else, so a cell that is there was written by it,
+    /// whenever the reading was taken — and a swept one reads absent
+    /// rather than present. That asymmetry is the whole of why a
+    /// retirement can be licensed across a cut and a reclaim cannot.
     #[must_use]
-    pub fn licenses(self, probed_wt: WeightedTimestamp, deadline: Deadline) -> bool {
-        self.window().of(deadline).contains(&probed_wt)
+    pub fn licenses(
+        self,
+        probed_wt: WeightedTimestamp,
+        deadline: Deadline,
+        inclusion: Inclusion,
+    ) -> bool {
+        matches!(inclusion, Inclusion::Present(_)) || self.absence_answers_at(probed_wt, deadline)
     }
 
     /// What `inclusion` of the probed cell says, for a core of `core_len`
@@ -258,9 +281,9 @@ mod tests {
         assert_eq!(deadline.validity_end(), validity_end);
 
         let at = deadline.at();
-        assert!(!Probed::Core.licenses(at.minus(Duration::from_millis(1)), deadline));
-        assert!(Probed::Core.licenses(at, deadline));
-        assert!(Probed::Core.licenses(at.plus(Duration::from_millis(1)), deadline));
+        assert!(!Probed::Core.absence_answers_at(at.minus(Duration::from_millis(1)), deadline));
+        assert!(Probed::Core.absence_answers_at(at, deadline));
+        assert!(Probed::Core.absence_answers_at(at.plus(Duration::from_millis(1)), deadline));
         assert!(!deadline.passed(at.minus(Duration::from_millis(1))));
         assert!(deadline.passed(at));
     }
@@ -277,9 +300,11 @@ mod tests {
         let core = Window::Core.of(deadline);
         assert_eq!(core.end, validity_end.plus(RETENTION_HORIZON));
         assert_eq!(core.end.elapsed_since(core.start), MAX_VALIDITY_RANGE);
-        assert!(Probed::Core.licenses(core.end.minus(Duration::from_millis(1)), deadline));
-        assert!(!Probed::Core.licenses(core.end, deadline));
-        assert!(!Probed::Core.licenses(core.end.plus(Duration::from_secs(60)), deadline));
+        assert!(
+            Probed::Core.absence_answers_at(core.end.minus(Duration::from_millis(1)), deadline)
+        );
+        assert!(!Probed::Core.absence_answers_at(core.end, deadline));
+        assert!(!Probed::Core.absence_answers_at(core.end.plus(Duration::from_secs(60)), deadline));
 
         let lapse = Window::Lapse.of(deadline);
         assert_eq!(
@@ -288,8 +313,11 @@ mod tests {
             "the claim cell's grace, keyed to a window never earlier than this one",
         );
         assert_eq!(lapse.end.elapsed_since(lapse.start), MAX_VALIDITY_RANGE);
-        assert!(Probed::Delivery.licenses(lapse.end.minus(Duration::from_millis(1)), deadline));
-        assert!(!Probed::Delivery.licenses(lapse.end, deadline));
+        assert!(
+            Probed::Delivery
+                .absence_answers_at(lapse.end.minus(Duration::from_millis(1)), deadline)
+        );
+        assert!(!Probed::Delivery.absence_answers_at(lapse.end, deadline));
         assert_eq!(Window::Claim.of(deadline), core.start..lapse.end);
         assert_eq!(Window::LegEntry.of(deadline), Window::Claim.of(deadline));
     }
@@ -303,7 +331,7 @@ mod tests {
         let validity_end = ms(60_000);
         let deadline = Deadline::of(validity_end);
         let latest_core_admission = validity_end.minus(Duration::from_millis(1));
-        assert!(!Probed::Core.licenses(validity_end, deadline));
+        assert!(!Probed::Core.absence_answers_at(validity_end, deadline));
         assert!(
             deadline.at().elapsed_since(latest_core_admission) > MAX_FINALIZATION_DELAY,
             "the anchor sits a full delay past the last block the core could admit",
@@ -323,11 +351,16 @@ mod tests {
         assert_eq!(lapse.start, deadline.at().plus(MAX_VALIDITY_RANGE));
         let close = Window::Delivery.of(deadline).end;
         assert_eq!(lapse.start, close.plus(MAX_FINALIZATION_DELAY));
-        assert!(!Probed::Delivery.licenses(lapse.start.minus(Duration::from_millis(1)), deadline));
-        assert!(Probed::Delivery.licenses(lapse.start, deadline));
-        assert!(Probed::Delivery.licenses(lapse.start.plus(Duration::from_secs(1)), deadline));
         assert!(
-            !Probed::Delivery.licenses(close, deadline),
+            !Probed::Delivery
+                .absence_answers_at(lapse.start.minus(Duration::from_millis(1)), deadline)
+        );
+        assert!(Probed::Delivery.absence_answers_at(lapse.start, deadline));
+        assert!(
+            Probed::Delivery.absence_answers_at(lapse.start.plus(Duration::from_secs(1)), deadline)
+        );
+        assert!(
+            !Probed::Delivery.absence_answers_at(close, deadline),
             "the close itself is not the lapse: a claim admitted under it may still commit",
         );
     }
