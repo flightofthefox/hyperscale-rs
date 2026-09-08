@@ -45,6 +45,16 @@
 //     is `FENCED` here, and what lets the claim's absence past D be read.
 //     A core of more shards settles on its siblings' clock and is not
 //     fenced, so its answer stays the committed cell (`LICENCE_CLAIM`).
+//   - The retirement, and the second seat that takes it: a claim cell
+//     proved present licenses the record's deletion rather than its
+//     credit back — `Licence::Accepted` and `Licence::OwnLeaf` in
+//     crates/engine/src/legs.rs, over `Word::Present` in
+//     crates/types/src/shard/abandonment.rs. Presence is bounded by no
+//     window, since a swept cell reads absent, which is why a
+//     retirement survives a cut and a reclaim does not. A reshape
+//     successor inherits the record with the leaf that names its
+//     consumer's claim key and decides it against the same cell: one
+//     predicate, two seats.
 //   - Once-only disposal on one shard — the claim-cell checks in
 //     vm/crates/kernel/src/executor.rs (`BatchTx::claim_cells`). Across two
 //     shards nothing reads the other's cell, so exclusivity rests on the
@@ -109,11 +119,13 @@
 //   quint verify --main=early_lapse_probe    --invariant=invExclusive  --max-steps=12 specs/crossing_lifecycle.qnt
 //   quint verify --main=late_lapse_probe     --invariant=invExclusive  --max-steps=12 specs/crossing_lifecycle.qnt
 //   quint verify --main=no_lapse_reclaim     --invariant=invDisposed   --max-steps=9  specs/crossing_lifecycle.qnt
+//   quint verify --main=stranded_successor --invariant=invRecordDisposed --max-steps=10 specs/crossing_lifecycle.qnt
 //   # healthy instances, as deep as an affordable run reaches (wall-clock
 //   # on an Apple M-series laptop: exclusivity 6s at 10, 12s at 12, 26s at
 //   # 14, 109s at 16; delivery about 5s through 14, 5s at 16):
 //   quint verify --main=exclusivity_ok --invariant=invAll --max-steps=16 specs/crossing_lifecycle.qnt
 //   quint verify --main=claim_licence_ok --invariant=invAll --max-steps=16 specs/crossing_lifecycle.qnt
+//   quint verify --main=inherited_record_ok --invariant=invAll --max-steps=16 specs/crossing_lifecycle.qnt
 //   quint verify --main=delivery_ok    --invariant=invAll --max-steps=16 specs/crossing_lifecycle.qnt
 //   # random search walks a twin up to its floor sub-second per point:
 //   quint run --main=<twin> --invariant=<inv> --max-steps=N --max-samples=20000 --seed=7 specs/crossing_lifecycle.qnt
@@ -162,6 +174,15 @@ module exclusivity_core {
   // this bounds is the drift, and the window's own width is the figure —
   // any skew inside it leaves the producer a licensed header to ask at.
   const MAX_SKEW: int
+  // Whether the producer's chain is cut and the record passes to a
+  // reshape successor holding the leaf and no body.
+  const CUT: bool
+  // Whether a successor can decide an inherited record: the leaf names
+  // its consumer's claim key, so the successor reads the same cell the
+  // producer would have asked a counterpart about. Twin
+  // `stranded_successor`: false, and an inherited record is disposed by
+  // nobody.
+  const INHERIT_DECIDES: bool
   // Max clock advance per step, and where clocks stop.
   const MAX_TICK: int
   const MAX_CLOCK: int
@@ -196,6 +217,16 @@ module exclusivity_core {
   var absenceProved: bool
   // The producer took the crossing back.
   var reclaimed: bool
+  // The producer holds a presence proof of the consumer's claim cell.
+  // Unlike an absence this needs no window: the cell is written by the
+  // one execution that consumes the crossing and by nothing else, and a
+  // swept cell reads absent, so a reading taken at any anchor is sound.
+  var presenceProved: bool
+  // The record was retired on that proof — deleted rather than credited
+  // back, because the consumer holds the crossing.
+  var retired: bool
+  // The record passed to a reshape successor at a cut.
+  var inherited: bool
 
   action init = all {
     clock' = SHARDS.mapBy(s => 0),
@@ -209,6 +240,9 @@ module exclusivity_core {
     absenceProved' = false,
     reclaimed' = false,
     claimCommittedAt' = NONE,
+    presenceProved' = false,
+    retired' = false,
+    inherited' = false,
   }
 
   action unchangedButClock = all {
@@ -216,6 +250,8 @@ module exclusivity_core {
     claimed' = claimed, refused' = refused, refusalDelivered' = refusalDelivered,
     swept' = swept, absenceProved' = absenceProved, reclaimed' = reclaimed,
     claimCommittedAt' = claimCommittedAt,
+    presenceProved' = presenceProved, retired' = retired,
+    inherited' = inherited,
   }
 
   action tick = {
@@ -248,6 +284,8 @@ module exclusivity_core {
     claimed' = claimed, refused' = refused, refusalDelivered' = refusalDelivered,
     swept' = swept, absenceProved' = absenceProved, reclaimed' = reclaimed,
     claimCommittedAt' = claimCommittedAt,
+    presenceProved' = presenceProved, retired' = retired,
+    inherited' = inherited,
   }
 
   // The core's chain admits the block carrying the transaction, at an
@@ -260,6 +298,8 @@ module exclusivity_core {
     claimed' = claimed, refused' = refused, refusalDelivered' = refusalDelivered,
     swept' = swept, absenceProved' = absenceProved, reclaimed' = reclaimed,
     claimCommittedAt' = claimCommittedAt,
+    presenceProved' = presenceProved, retired' = retired,
+    inherited' = inherited,
   }
 
   // That block commits, within the finalization delay of its anchor: the
@@ -274,6 +314,8 @@ module exclusivity_core {
     claimed' = claimed, refused' = refused, refusalDelivered' = refusalDelivered,
     swept' = swept, absenceProved' = absenceProved, reclaimed' = reclaimed,
     claimCommittedAt' = claimCommittedAt,
+    presenceProved' = presenceProved, retired' = retired,
+    inherited' = inherited,
   }
 
   // The core's verdict, once it holds the crossing: it claims, or it
@@ -288,6 +330,8 @@ module exclusivity_core {
     refusalDelivered' = refusalDelivered, swept' = swept,
     absenceProved' = absenceProved, reclaimed' = reclaimed,
     claimCommittedAt' = claimCommittedAt,
+    presenceProved' = presenceProved, retired' = retired,
+    inherited' = inherited,
   }
   // The block carrying the core's success commits, and the claim cell
   // is in its state from here. Fenced at the probe anchor: past it the
@@ -302,6 +346,8 @@ module exclusivity_core {
     committedAt' = committedAt, claimed' = claimed, refused' = refused,
     refusalDelivered' = refusalDelivered, swept' = swept,
     absenceProved' = absenceProved, reclaimed' = reclaimed,
+    presenceProved' = presenceProved, retired' = retired,
+    inherited' = inherited,
   }
   val canRefuse = committedAt != NONE and not(claimed) and not(refused)
   action refuse = all {
@@ -312,6 +358,8 @@ module exclusivity_core {
     refusalDelivered' = refusalDelivered, swept' = swept,
     absenceProved' = absenceProved, reclaimed' = reclaimed,
     claimCommittedAt' = claimCommittedAt,
+    presenceProved' = presenceProved, retired' = retired,
+    inherited' = inherited,
   }
 
   // The refusal certificate reaches the producer, whenever the network
@@ -324,6 +372,8 @@ module exclusivity_core {
     committedAt' = committedAt, claimed' = claimed, refused' = refused,
     swept' = swept, absenceProved' = absenceProved, reclaimed' = reclaimed,
     claimCommittedAt' = claimCommittedAt,
+    presenceProved' = presenceProved, retired' = retired,
+    inherited' = inherited,
   }
 
   // The core's frontier retires the committed cell at its expiry. Past
@@ -338,6 +388,8 @@ module exclusivity_core {
     refusalDelivered' = refusalDelivered, absenceProved' = absenceProved,
     reclaimed' = reclaimed,
     claimCommittedAt' = claimCommittedAt,
+    presenceProved' = presenceProved, retired' = retired,
+    inherited' = inherited,
   }
 
   // The producer, past D on its own clock, reads the core's committed set
@@ -361,13 +413,16 @@ module exclusivity_core {
     committedAt' = committedAt, claimed' = claimed, refused' = refused,
     refusalDelivered' = refusalDelivered, swept' = swept, reclaimed' = reclaimed,
     claimCommittedAt' = claimCommittedAt,
+    presenceProved' = presenceProved, retired' = retired,
+    inherited' = inherited,
   }
 
   // The reclaim, on the evidence the rule licenses and nothing else. The
   // twin adds the producer's own clock as a license.
   val licensed = refusalDelivered or absenceProved
     or (RECLAIM_ON_CLOCK and clock.get(PRODUCER) >= DEADLINE)
-  val canReclaim = RECLAIM_ENABLED and issued and not(reclaimed) and licensed
+  val canReclaim = RECLAIM_ENABLED and issued and not(reclaimed)
+    and not(retired) and licensed and holderDecides
   action reclaim = all {
     canReclaim,
     reclaimed' = true,
@@ -376,6 +431,60 @@ module exclusivity_core {
     refusalDelivered' = refusalDelivered, swept' = swept,
     absenceProved' = absenceProved,
     claimCommittedAt' = claimCommittedAt,
+    presenceProved' = presenceProved, retired' = retired,
+    inherited' = inherited,
+  }
+
+  // The producer reads the consumer's claim cell present. No window
+  // gates it: a swept cell reads absent, so presence is never a stale
+  // reading, which is the whole of why a retirement can be licensed
+  // across a cut and a reclaim cannot.
+  val canProvePresence = issued and not(presenceProved) and claimCellPresent
+  action provePresence = all {
+    canProvePresence,
+    presenceProved' = true,
+    clock' = clock, issued' = issued, proposedAt' = proposedAt,
+    committedAt' = committedAt, claimed' = claimed, refused' = refused,
+    refusalDelivered' = refusalDelivered, swept' = swept,
+    absenceProved' = absenceProved, reclaimed' = reclaimed,
+    claimCommittedAt' = claimCommittedAt,
+    retired' = retired, inherited' = inherited,
+  }
+
+  // The producer's chain is cut and the record passes to a successor,
+  // which holds the leaf and no body. The leaf names the consumer's
+  // claim key, so the successor decides the record against the same
+  // cell: one predicate, a second seat.
+  val canCut = CUT and issued and not(inherited)
+    and not(reclaimed) and not(retired)
+  action cut = all {
+    canCut,
+    inherited' = true,
+    clock' = clock, issued' = issued, proposedAt' = proposedAt,
+    committedAt' = committedAt, claimed' = claimed, refused' = refused,
+    refusalDelivered' = refusalDelivered, swept' = swept,
+    absenceProved' = absenceProved, reclaimed' = reclaimed,
+    claimCommittedAt' = claimCommittedAt,
+    presenceProved' = presenceProved, retired' = retired,
+  }
+
+  // Whoever holds the record can decide it: the producer always, a
+  // successor only where the leaf carries what it needs.
+  val holderDecides = not(inherited) or INHERIT_DECIDES
+
+  // The retirement: the record is deleted on the claim proved present.
+  // The crossing was disposed by the claim, so nothing comes back.
+  val canRetire = issued and not(retired) and not(reclaimed)
+    and presenceProved and holderDecides
+  action retire = all {
+    canRetire,
+    retired' = true,
+    clock' = clock, issued' = issued, proposedAt' = proposedAt,
+    committedAt' = committedAt, claimed' = claimed, refused' = refused,
+    refusalDelivered' = refusalDelivered, swept' = swept,
+    absenceProved' = absenceProved, reclaimed' = reclaimed,
+    claimCommittedAt' = claimCommittedAt,
+    presenceProved' = presenceProved, inherited' = inherited,
   }
 
   // Nothing but the clocks can move, and the clocks have stopped.
@@ -383,6 +492,7 @@ module exclusivity_core {
     and not(canIssue) and not(canPropose) and not(canCommit)
     and not(canClaim) and not(canCommitClaim) and not(canRefuse) and not(canDeliverRefusal)
     and not(canSweep) and not(canProbe) and not(canReclaim)
+    and not(canProvePresence) and not(canCut) and not(canRetire)
 
   // A terminal state stutters: the model ends there, not in a deadlock.
   action idle = all {
@@ -393,18 +503,30 @@ module exclusivity_core {
 
   action step = any {
     tick, issue, propose, commit, claim, commitClaim, refuse, deliverRefusal,
-    sweep, probe, reclaim, idle
+    sweep, probe, reclaim, provePresence, cut, retire, idle
   }
 
   // INV-EXEC-11: a crossing is disposed at most once. A claim the core
   // executed but never committed disposed of nothing: its block was
-  // refused, and the value stays in the record for the reclaim.
+  // refused, and the value stays in the record for the reclaim. The
+  // retirement is the other disposal of the record, so a record is never
+  // both credited back and deleted, and never retired against a claim
+  // that is not there.
   val invExclusive = not(claimCellPresent and reclaimed)
+    and not(retired and reclaimed)
+    and (retired implies claimCellPresent)
 
   // INV-EXEC-12: at a terminal state an issued crossing is disposed.
   val invDisposable = quiescent implies (not(issued) or claimCellPresent or reclaimed)
 
-  val invAll = invExclusive and invDisposable
+  // And the record it was issued against leaves the state, whichever
+  // seat holds it: credited back where no consumer took the crossing,
+  // deleted where one did. A successor that cannot decide what it
+  // inherited is what this catches.
+  val invRecordDisposed =
+    quiescent implies (not(issued) or reclaimed or retired)
+
+  val invAll = invExclusive and invDisposable and invRecordDisposed
 }
 
 module delivery_core {
@@ -636,6 +758,7 @@ module exclusivity_ok {
     DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 3, PROBE_CEILING = 5,
     SWEEP_AT = 5, RECLAIM_ON_CLOCK = false, RECLAIM_ENABLED = true,
     LICENCE_CLAIM = false, FENCED = false,
+    CUT = false, INHERIT_DECIDES = true,
     MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
@@ -647,6 +770,7 @@ module claim_licence_ok {
     DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 3, PROBE_CEILING = 5,
     SWEEP_AT = 5, RECLAIM_ON_CLOCK = false, RECLAIM_ENABLED = true,
     LICENCE_CLAIM = true, FENCED = true,
+    CUT = false, INHERIT_DECIDES = true,
     MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
@@ -659,6 +783,7 @@ module unfenced_claim_commit {
     DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 3, PROBE_CEILING = 5,
     SWEEP_AT = 5, RECLAIM_ON_CLOCK = false, RECLAIM_ENABLED = true,
     LICENCE_CLAIM = true, FENCED = false,
+    CUT = false, INHERIT_DECIDES = true,
     MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
@@ -670,6 +795,7 @@ module clock_fenced_reclaim {
     DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 3, PROBE_CEILING = 5,
     SWEEP_AT = 5, RECLAIM_ON_CLOCK = true, RECLAIM_ENABLED = true,
     LICENCE_CLAIM = false, FENCED = false,
+    CUT = false, INHERIT_DECIDES = true,
     MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
@@ -682,6 +808,7 @@ module early_absence_probe {
     DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 2, PROBE_CEILING = 5,
     SWEEP_AT = 5, RECLAIM_ON_CLOCK = false, RECLAIM_ENABLED = true,
     LICENCE_CLAIM = false, FENCED = false,
+    CUT = false, INHERIT_DECIDES = true,
     MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
@@ -695,6 +822,7 @@ module late_absence_probe {
     DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 3, PROBE_CEILING = 6,
     SWEEP_AT = 5, RECLAIM_ON_CLOCK = false, RECLAIM_ENABLED = true,
     LICENCE_CLAIM = false, FENCED = false,
+    CUT = false, INHERIT_DECIDES = true,
     MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
@@ -706,6 +834,35 @@ module no_reclaim {
     DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 3, PROBE_CEILING = 5,
     SWEEP_AT = 5, RECLAIM_ON_CLOCK = false, RECLAIM_ENABLED = false,
     LICENCE_CLAIM = false, FENCED = false,
+    CUT = false, INHERIT_DECIDES = true,
+    MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
+  ).*
+}
+
+// Healthy inherited record: the producer's chain is cut and a successor
+// holds the leaf. The leaf names the consumer's claim key, so the
+// successor decides the record against the same cell the producer would
+// have asked about — retiring it where the claim is there, crediting it
+// back where an absence inside the window says it never will be.
+module inherited_record_ok {
+  import exclusivity_core(
+    DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 3, PROBE_CEILING = 5,
+    SWEEP_AT = 5, RECLAIM_ON_CLOCK = false, RECLAIM_ENABLED = true,
+    LICENCE_CLAIM = false, FENCED = false,
+    CUT = true, INHERIT_DECIDES = true,
+    MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
+  ).*
+}
+
+// Twin: the successor inherits a record it cannot decide — a leaf that
+// names no claim key, so there is no counterpart left to ask and no cell
+// to read. The record is disposed by nobody and the crossing strands.
+module stranded_successor {
+  import exclusivity_core(
+    DEADLINE = 2, FINALIZATION_DELAY = 1, PROBE_ANCHOR = 3, PROBE_CEILING = 5,
+    SWEEP_AT = 5, RECLAIM_ON_CLOCK = false, RECLAIM_ENABLED = true,
+    LICENCE_CLAIM = false, FENCED = false,
+    CUT = true, INHERIT_DECIDES = false,
     MAX_SKEW = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
