@@ -1930,7 +1930,7 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
 
     // One window for both: the offer stands exactly as long as the
     // transaction binding it, so the nullifier's life is that window
-    // plus the grace every transaction-derived artifact gets.
+    // plus the grace every transaction-derived artifact takes.
     let window = validity_around(c.now());
     let request = payment_request_for(requester, REQUEST, window);
     let expiry_ms = window

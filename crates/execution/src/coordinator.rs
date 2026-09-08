@@ -9744,7 +9744,7 @@ mod tests {
     /// carry them in, and `settled_sets` is a hash map, so the walk cannot
     /// take its iteration order.
     #[test]
-    fn two_departures_over_one_transaction_share_the_block_s_budget() {
+    fn two_departures_over_one_transaction_share_one_block_budget() {
         let sched = siblings_terminating_schedule(60_000);
         let (mut state, _, tx_hash) = state_stranded_between(&sched, 1);
 

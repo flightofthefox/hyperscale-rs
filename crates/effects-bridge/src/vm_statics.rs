@@ -779,7 +779,7 @@ mod tests {
     use hyperscale_vm_effects::{
         Binding, Claim, Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Hash32, Hasher,
         InstanceMeta, InstanceRegistry, IntentDecl, ManifestGraph, MetadataCache, PackageHash,
-        Socket, StoredRule, Subintent, SubintentHash, child_key, intent_expiry_ms, never,
+        Socket, StoredRule, Subintent, SubintentHash, child_key, never, nullifier_expiry_ms,
         nullifier_key, package_slot,
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
@@ -1280,7 +1280,7 @@ mod tests {
             &ProtocolHasher,
             bob_addr(),
             hash,
-            intent_expiry_ms(&tree.subintents[0].decl.header),
+            nullifier_expiry_ms(&tree.subintents[0].decl.header),
         );
         assert!(derived.routing.write_keys.contains(&DeclaredKey::substate(
             bob_addr().address(),

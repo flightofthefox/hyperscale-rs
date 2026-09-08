@@ -18,9 +18,9 @@
 
 use std::time::Duration;
 
-use hyperscale_vm_types::ARTIFACT_GRACE_MS;
+use hyperscale_vm_types::{ARTIFACT_GRACE_MS, CROSSING_GRACE_MS};
 
-use crate::{CLAIM_WINDOW, MAX_VALIDITY_RANGE};
+use crate::{CLAIM_WINDOW, MAX_VALIDITY_RANGE, TERMINAL_EVIDENCE_EPOCHS};
 
 /// The longest a cross-shard transaction may take to finalize, past the
 /// last block that could have included it.
@@ -82,19 +82,36 @@ const _: () = assert!(
     "the dedup walk covers every tier of the index it rebuilds",
 );
 
-/// Every tx-derived artifact's life is one bound, asserted rather than
-/// assumed: the VM keys and values a nullifier, a committed cell and an
-/// escrow cell by an expiry it computes from its own constant, and this
-/// is where the two spellings are held together. The lapse of a
-/// crossing is proved no earlier than one validity range past the
-/// deadline, and the reclaim then has one more to commit before the
-/// record it takes back is swept — so the grace is the deadline plus the
-/// claim window, and a cell swept earlier would license a reclaim of
-/// state already gone, while one retained past it is state nobody can
-/// retire.
+/// The VM keys and values each sweepable family by an expiry it derives
+/// from the family alone, and this is where the two spellings are held
+/// together. Two graces, so two asserts: the default, and the one
+/// exception.
+///
+/// The default is the bound every transaction-derived artifact already
+/// answers to. A nullifier's floor is the last transaction that could
+/// have bound the subintent, admitted before the intent's window ends
+/// and terminated one [`MAX_FINALIZATION_DELAY`] later; a committed
+/// cell's is `Window::Core`, which opens at the deadline and runs one
+/// [`MAX_VALIDITY_RANGE`] on, and the cell is swept exactly where that
+/// window closes — earlier and an absence inside it would be a swept
+/// cell read as a shard that never committed. `RETENTION_HORIZON` is
+/// both.
 const _: () = assert!(
-    (MAX_FINALIZATION_DELAY.as_secs() + CLAIM_WINDOW.as_secs()) * 1_000 == ARTIFACT_GRACE_MS,
-    "an artifact's grace is the deadline plus the claim window",
+    RETENTION_HORIZON.as_secs() * 1_000 == ARTIFACT_GRACE_MS,
+    "an artifact lives its signed window plus the retention horizon",
+);
+
+/// The exception is the crossing, whose cells are swept where the claim
+/// window closes: swept earlier and the proof would license a reclaim of
+/// state already gone, retained later and it is state nobody can retire.
+/// And the claim window is the terminal evidence span, so a record a
+/// successor inherits across a cut stays decidable for as long as any
+/// other reshape evidence is readable — which is the whole reason this
+/// family is not on the default.
+const _: () = assert!(
+    (MAX_FINALIZATION_DELAY.as_secs() + CLAIM_WINDOW.as_secs()) * 1_000 == CROSSING_GRACE_MS
+        && EPOCH_DURATION.as_secs() * TERMINAL_EVIDENCE_EPOCHS * 1_000 == CROSSING_GRACE_MS,
+    "a crossing's grace is the deadline plus the claim window, sized at the reshape span",
 );
 
 /// The horizon must not outlive the epoch that produced what it retains.

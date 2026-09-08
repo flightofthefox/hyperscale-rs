@@ -906,9 +906,9 @@ mod tests {
     /// it, so a sweep that could reach it would burn value on a clock.
     #[test]
     fn a_claim_is_judged_off_its_leaf_and_a_record_is_swept_by_nothing() {
-        use hyperscale_vm_effects::{CrossingSite, IntentHeader, intent_expiry_ms};
+        use hyperscale_vm_effects::{CrossingSite, IntentHeader, crossing_expiry_ms};
         use hyperscale_vm_types::{
-            ARTIFACT_GRACE_MS, AddressClass, NetworkId, SubintentHash, TxHash,
+            AddressClass, CROSSING_GRACE_MS, NetworkId, SubintentHash, TxHash,
         };
 
         let header = IntentHeader {
@@ -917,8 +917,8 @@ mod tests {
             validity_end_ms: 300_000,
             discriminator: 0,
         };
-        let expiry_ms = intent_expiry_ms(&header);
-        assert_eq!(expiry_ms, 300_000 + ARTIFACT_GRACE_MS);
+        let expiry_ms = crossing_expiry_ms(&header);
+        assert_eq!(expiry_ms, 300_000 + CROSSING_GRACE_MS);
 
         let producer = Address::new([0x5A; 31], AddressClass::Component);
         let taker = Address::new([0x5C; 31], AddressClass::Component);

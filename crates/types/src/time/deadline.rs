@@ -16,17 +16,32 @@ use std::time::Duration;
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    Inclusion, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, RETENTION_HORIZON, Transaction,
-    WeightedTimestamp,
+    EPOCH_DURATION, Inclusion, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, RETENTION_HORIZON,
+    TERMINAL_EVIDENCE_EPOCHS, Transaction, WeightedTimestamp,
 };
 
-/// Two validity ranges.
-///
 /// The span past the deadline in which the claim cell a crossing's
-/// consumer writes is still standing: one range for the delivery window
-/// to close and the lapse to be proved, one more for the reclaim that
-/// proves it to commit.
-pub const CLAIM_WINDOW: Duration = Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() * 2);
+/// consumer writes is still standing, and so the whole of the span in
+/// which a record can be disposed of at all.
+///
+/// Two validity ranges is the floor — one for the delivery window to
+/// close and the lapse to be proved, one more for the reclaim that
+/// proves it to commit — and the figure sits far above it. A record
+/// written near a reshape cut is inherited by a successor that decides
+/// it against a claim cell now on some other chain, so the window has to
+/// be the one every other bound on reshape evidence is:
+/// [`TERMINAL_EVIDENCE_EPOCHS`] windows, less the deadline the cell's
+/// expiry is measured from. Shorter and the record is one nobody can
+/// dispose of, its value stranded where presence and absence are both
+/// unprovable.
+pub const CLAIM_WINDOW: Duration = Duration::from_secs(
+    EPOCH_DURATION.as_secs() * TERMINAL_EVIDENCE_EPOCHS - MAX_FINALIZATION_DELAY.as_secs(),
+);
+
+const _: () = assert!(
+    CLAIM_WINDOW.as_secs() >= MAX_VALIDITY_RANGE.as_secs() * 2,
+    "a lapse has a range to be proved in and its reclaim a range to commit in",
+);
 
 /// How long a transaction's evidence outlives the moment it was
 /// committed: everything its shape reaches, ends by.
@@ -237,7 +252,7 @@ impl Probed {
 mod tests {
     use std::time::Duration;
 
-    use hyperscale_vm_types::ARTIFACT_GRACE_MS;
+    use hyperscale_vm_types::{ARTIFACT_GRACE_MS, CROSSING_GRACE_MS};
 
     use super::{CLAIM_WINDOW, Deadline, Probed, Window};
     use crate::{
@@ -290,15 +305,24 @@ mod tests {
 
     /// The core window closes where the committed cell may be swept: a
     /// proof there is a true proof of a cell that was present, so it
-    /// licenses nothing. The claim windows close at the escrow families'
-    /// grace, the claim cell's own sweep, and every absence window is
-    /// one validity range wide.
+    /// licenses nothing. The claim windows close at the crossing
+    /// family's grace, the claim cell's own sweep.
+    ///
+    /// Each window's own end is the sweep of the cell its absence asks
+    /// about, and the two families are sized apart: the core window is
+    /// one validity range wide, and the lapse runs from the same offset
+    /// to a sweep the crossing family sets far later.
     #[test]
     fn an_absence_licenses_nothing_once_the_cell_it_asks_about_may_be_swept() {
         let validity_end = ms(60_000);
         let deadline = Deadline::of(validity_end);
         let core = Window::Core.of(deadline);
         assert_eq!(core.end, validity_end.plus(RETENTION_HORIZON));
+        assert_eq!(
+            core.end,
+            validity_end.plus(Duration::from_millis(ARTIFACT_GRACE_MS)),
+            "which is where the committed cell it asks about is swept",
+        );
         assert_eq!(core.end.elapsed_since(core.start), MAX_VALIDITY_RANGE);
         assert!(
             Probed::Core.absence_answers_at(core.end.minus(Duration::from_millis(1)), deadline)
@@ -309,10 +333,10 @@ mod tests {
         let lapse = Window::Lapse.of(deadline);
         assert_eq!(
             lapse.end,
-            validity_end.plus(Duration::from_millis(ARTIFACT_GRACE_MS)),
+            validity_end.plus(Duration::from_millis(CROSSING_GRACE_MS)),
             "the claim cell's grace, keyed to a window never earlier than this one",
         );
-        assert_eq!(lapse.end.elapsed_since(lapse.start), MAX_VALIDITY_RANGE);
+        assert_eq!(lapse.start, core.start.plus(MAX_VALIDITY_RANGE));
         assert!(
             Probed::Delivery
                 .absence_answers_at(lapse.end.minus(Duration::from_millis(1)), deadline)
@@ -370,7 +394,7 @@ mod tests {
     #[test]
     fn an_escrow_expiry_reads_back_to_its_deadline() {
         let validity_end = ms(60_000);
-        let expiry_ms = validity_end.as_millis() + ARTIFACT_GRACE_MS;
+        let expiry_ms = validity_end.as_millis() + CROSSING_GRACE_MS;
         let deadline = Deadline::from_expiry(expiry_ms);
         assert_eq!(deadline, Deadline::of(validity_end));
         let claim = Window::Claim.of(deadline);

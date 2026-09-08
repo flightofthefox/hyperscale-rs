@@ -17,7 +17,6 @@ use hyperscale_types::{
     WeightedTimestamp, protocol_statics, protocol_statics_installed,
 };
 use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
-use hyperscale_vm_types::ARTIFACT_GRACE_MS;
 
 use crate::tree::JmtSnapshot;
 use crate::{
@@ -528,11 +527,7 @@ pub fn committed_tx_cells<'a>(
         .into_iter()
         .map(|tx| {
             let validity_end = tx.validity_range().end_timestamp_exclusive;
-            let cell = Marker {
-                tx: tx.hash(),
-                expiry_ms: committed_tx_expiry_ms(validity_end),
-                marks: Marked::Committed,
-            };
+            let cell = Marker::of(tx.hash(), validity_end.as_millis(), Marked::Committed);
             (
                 committed_tx_cell_key(local_shard, cell.tx, validity_end),
                 cell.to_bytes(),
@@ -557,14 +552,8 @@ pub fn committed_tx_cell_key(
         &ProtocolHasher,
         ShardTrie::shard_owner(shard),
         tx,
-        committed_tx_expiry_ms(validity_end),
+        Marked::Committed.expiry_ms(validity_end.as_millis()),
     )
-}
-
-/// When a committed cell stops being needed: the transaction's validity
-/// end plus the grace, on the nullifier's clock.
-const fn committed_tx_expiry_ms(validity_end: WeightedTimestamp) -> u64 {
-    validity_end.as_millis().saturating_add(ARTIFACT_GRACE_MS)
 }
 
 #[cfg(test)]

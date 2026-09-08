@@ -2903,9 +2903,7 @@ mod tests {
             ledger.reclaimable().is_empty(),
             "and nothing to reclaim with"
         );
-        let horizon = ms(60_000)
-            .plus(MAX_FINALIZATION_DELAY)
-            .plus(MAX_VALIDITY_RANGE * 2);
+        let horizon = Window::LegEntry.of(Deadline::of(ms(60_000))).end;
         assert!(ledger.prune(horizon).unanswerable.is_empty());
         assert_eq!(ledger.len(), 0, "gone at its horizon");
     }

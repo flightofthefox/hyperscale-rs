@@ -118,8 +118,10 @@ pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
     // counterpart can still answer, which is the counterpart's clock —
     // it may run for hours past the commit and only then depart, and
     // the entry survives to that departure's terminal-evidence expiry.
-    // `RECORD_WINDOW` is what reaches those, and being the wider of the
-    // two it already sets the scan's reach above.
+    // `RECORD_WINDOW` is what reaches those. Which of the two is wider
+    // is not fixed — the claim window puts the transaction horizon a
+    // validity range past it — so the scan takes the greater of them
+    // and each cutoff is applied where it belongs.
     let fold_cutoff = committed_ts.minus(TRANSACTION_EVIDENCE_HORIZON);
     let mut unresolved: BTreeMap<TxHash, BlockHeight> = BTreeMap::new();
     let mut undischarged: BTreeMap<TxHash, BlockHeight> = BTreeMap::new();
