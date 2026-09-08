@@ -55,8 +55,8 @@ use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, GenesisValidators, LocalTimestamp, MAX_DRAIN_WORK,
-    NetworkDefinition, ShardId, Signer, StakePoolSeat, Transaction, ValidatorId, ValidatorStatus,
-    Verifier, WorkInFlight,
+    NetworkDefinition, ShardBoundary, ShardId, Signer, StakePoolSeat, Transaction, ValidatorId,
+    ValidatorStatus, Verifier, WorkInFlight,
 };
 use libp2p::identity::Keypair;
 use thiserror::Error;
@@ -450,7 +450,25 @@ impl ProductionRunnerBuilder {
                 _ => pooled.push((v.validator_id, Arc::clone(&v.signer))),
             }
         }
-        let local_shards: HashSet<ShardId> = seated_by_shard.keys().copied().collect();
+        let mut local_shards: HashSet<ShardId> = seated_by_shard.keys().copied().collect();
+        // A shard this host ran before a cut still holds what its
+        // counterparts read from it — the settled sets a departure record
+        // is held to, the terminal evidence a successor derives from —
+        // and routing names its ex-members for as long as the beacon
+        // keeps its boundary. Seating is a placement question and the
+        // answer stays no: the chain terminated. Serving is a storage
+        // one, and the store is on disk. Without this a restart inside
+        // the window leaves a counterpart asking for a set nobody
+        // answers until the evidence expires, and the legs it would
+        // abandon stay in their records.
+        let served = served_departed_shards(&beacon_state.boundaries, &local_shards, |shard| {
+            (self.storage_dir)(shard).exists()
+        });
+        for shard in served {
+            info!(?shard, "Serving a departed shard's store from disk");
+            local_shards.insert(shard);
+        }
+        let local_shards = local_shards;
 
         // Open each seated shard's storage through the same factory a runtime
         // join uses. A fresh store's genesis is installed by
@@ -1747,4 +1765,90 @@ pub fn spawn_pool_loop(pool: ProdPoolLoop, config: PoolLoopConfig) -> std::threa
         .name("pool-loop".to_string())
         .spawn(move || run_pool_loop(pool, config))
         .expect("failed to spawn pool-loop thread")
+}
+
+/// Which departed shards this host serves from disk beside the ones it
+/// is seated on.
+///
+/// A shard the beacon still holds a terminal boundary for is one whose
+/// ex-members routing still names, so its counterparts still ask it for
+/// the settled sets and terminal evidence it left. Seating is a
+/// placement question and the answer is no — the chain terminated — but
+/// serving is a storage one, and the store is there or it is not.
+fn served_departed_shards(
+    boundaries: &BTreeMap<ShardId, ShardBoundary>,
+    seated: &HashSet<ShardId>,
+    on_disk: impl Fn(ShardId) -> bool,
+) -> Vec<ShardId> {
+    boundaries
+        .iter()
+        .filter(|(shard, boundary)| {
+            boundary.terminal_epoch.is_some() && !seated.contains(shard) && on_disk(**shard)
+        })
+        .map(|(shard, _)| *shard)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_types::{
+        BeaconWitnessLeafCount, BlockHash, Epoch, StateRoot, WeightedTimestamp,
+    };
+
+    use super::*;
+
+    /// A boundary record that is terminal or live; nothing else here
+    /// reads any other field.
+    fn boundary(terminal: Option<u64>) -> ShardBoundary {
+        ShardBoundary {
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::ZERO,
+            height: BlockHeight::GENESIS,
+            weighted_timestamp: WeightedTimestamp::ZERO,
+            witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            attested_work: 0,
+            substate_bytes: 0,
+            last_live_epoch: Epoch::GENESIS,
+            consecutive_misses: 0,
+            terminal_epoch: terminal.map(Epoch::new),
+            handoff_complete: None,
+            terminal_delivered: false,
+            terminal_roots: None,
+            reshape_admitted_epoch: None,
+        }
+    }
+
+    /// The three terms, each shown to matter: a live shard is not
+    /// departed, a seated one is already served, and a shard whose store
+    /// this host never kept has nothing to answer with.
+    #[test]
+    fn a_departed_shard_is_served_where_its_store_is_on_disk() {
+        let departed = ShardId::leaf(1, 0);
+        let live = ShardId::leaf(1, 1);
+        let seated = ShardId::ROOT;
+        let elsewhere = ShardId::leaf(2, 3);
+        let boundaries = BTreeMap::from([
+            (departed, boundary(Some(4))),
+            (live, boundary(None)),
+            (seated, boundary(Some(4))),
+            (elsewhere, boundary(Some(4))),
+        ]);
+        let hosted = HashSet::from([seated]);
+
+        assert_eq!(
+            served_departed_shards(&boundaries, &hosted, |shard| shard != elsewhere),
+            vec![departed],
+        );
+    }
+
+    /// A boundary the beacon has dropped is a shard nobody asks about,
+    /// so a store left on disk past the window opens for nothing.
+    #[test]
+    fn a_shard_the_beacon_no_longer_bounds_is_not_served() {
+        assert!(
+            served_departed_shards(&BTreeMap::new(), &HashSet::new(), |_| true).is_empty(),
+            "the retention window is the beacon's to keep"
+        );
+    }
 }

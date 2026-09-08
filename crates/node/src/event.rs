@@ -321,6 +321,12 @@ pub enum ShardScopedInput {
     /// so the next tick retries against another peer.
     FetchFailed(FetchIds),
 
+    /// A fetch that never reached a peer — no committee resolves the
+    /// shard, or none of its members is up. Released like
+    /// [`Self::FetchFailed`], but the retry waits for the tick rather
+    /// than leaving at once into the same wall.
+    FetchUnroutable(FetchIds),
+
     /// A fetch was answered and verified for these ids: release their
     /// slots. Keyed by the *request* ids, not the response's contents,
     /// so a peer's payload cannot leave a slot pinned. The payload
@@ -445,6 +451,7 @@ impl ShardScopedInput {
             | Self::GossipTransaction { .. } => EventPriority::Client,
             Self::FetchTick => EventPriority::Timer,
             Self::BlockSyncResponseReceived { .. }
+            | Self::FetchUnroutable(..)
             | Self::BlockSyncFetchFailed { .. }
             | Self::BeaconBlockSyncResponseReceived { .. }
             | Self::BeaconBlockSyncFetchFailed { .. }

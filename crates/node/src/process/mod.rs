@@ -262,7 +262,17 @@ where
         topology_schedule: Arc<TopologySchedule>,
         dispatch_handles: Arc<DispatchHandles<S, N>>,
         beacon_storage: Arc<dyn BeaconStorage>,
-    ) -> Self {
+    ) -> Self
+    where
+        N: Network,
+    {
+        // Routing is otherwise empty until the beacon's first commit
+        // folds a topology, which is up to an epoch after a restart.
+        // Inside that window every fetch to a shard outside the head —
+        // a successor's queries at its predecessor, a probe of a
+        // departed counterpart — resolves no committee and fails at the
+        // transport before it reaches a peer.
+        network.update_routing_committees(Arc::new(topology_schedule.routing_committees()));
         Self {
             network,
             verifier,

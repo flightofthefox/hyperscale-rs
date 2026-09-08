@@ -495,6 +495,7 @@ where
 
             // ── Fetch protocol ─────────────────────────────────────────
             ShardScopedInput::FetchFailed(ids) => self.release_fetch(ids, Release::Failed),
+            ShardScopedInput::FetchUnroutable(ids) => self.release_fetch(ids, Release::Unroutable),
             ShardScopedInput::FetchFulfilled(ids) => self.release_fetch(ids, Release::Admitted),
             ShardScopedInput::TransactionsFetched { batch } => {
                 self.handle_fetched_txs_for_validation(batch);

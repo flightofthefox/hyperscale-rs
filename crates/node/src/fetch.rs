@@ -94,6 +94,12 @@ pub enum FetchInput<Id> {
         /// Ids whose fetch has been cancelled by the originating coordinator.
         ids: Vec<Id>,
     },
+    /// A chunk that never reached a peer: release the slots and leave
+    /// the retry to [`Self::Tick`].
+    Unroutable {
+        /// Ids in the chunk.
+        ids: Vec<Id>,
+    },
     /// Drive pending fetches: emit chunks up to per-tick and global caps.
     Tick,
 }
@@ -178,7 +184,8 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 preferred,
                 class,
             } => self.handle_request(ids, shard, preferred, class),
-            FetchInput::Failed { ids } => self.handle_failed(&ids),
+            FetchInput::Failed { ids } => self.handle_failed(&ids, Respawn::Now),
+            FetchInput::Unroutable { ids } => self.handle_failed(&ids, Respawn::OnTick),
             FetchInput::Admitted { ids } => self.handle_drop(&ids, DropKind::Admitted),
             FetchInput::Abandoned { ids } => self.handle_drop(&ids, DropKind::Abandoned),
             FetchInput::Tick => self.spawn_pending_fetches(),
@@ -258,7 +265,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
         self.spawn_pending_fetches()
     }
 
-    fn handle_failed(&mut self, ids: &[Id]) -> Vec<FetchOutput<Id>> {
+    fn handle_failed(&mut self, ids: &[Id], respawn: Respawn) -> Vec<FetchOutput<Id>> {
         let mut released = 0usize;
         for id in ids {
             if let Some(entry) = self.pending.get_mut(id)
@@ -275,7 +282,10 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
             }
             trace!(count = released, "Id fetch chunk failed");
         }
-        self.spawn_pending_fetches()
+        match respawn {
+            Respawn::Now => self.spawn_pending_fetches(),
+            Respawn::OnTick => Vec::new(),
+        }
     }
 
     fn handle_drop(&mut self, ids: &[Id], kind: DropKind) -> Vec<FetchOutput<Id>> {
@@ -500,11 +510,15 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
                         if matches!(error, RequestError::PeerError(_)) {
                             record_fetch_response_refused(B::NAME, "unusable_answer");
                         }
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::FetchFailed(B::ids(requested)),
-                        );
+                        let input = if matches!(
+                            error,
+                            RequestError::NoPeers | RequestError::PeerUnreachable(_)
+                        ) {
+                            ShardScopedInput::FetchUnroutable(B::ids(requested))
+                        } else {
+                            ShardScopedInput::FetchFailed(B::ids(requested))
+                        };
+                        push_shard_input(&es, local_shard, input);
                         return ResponseVerdict::Accept;
                     }
                 };
@@ -546,8 +560,12 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
 /// its binding whichever way it is being released.
 #[derive(Debug, Clone, Copy)]
 pub enum Release {
-    /// The attempt failed or went unanswered; retry on the next tick.
+    /// The attempt failed or went unanswered; retry at once, since the
+    /// transport already spent a round trip on it.
     Failed,
+    /// The request never reached a peer. Retry on the tick — see
+    /// [`Respawn`].
+    Unroutable,
     /// The payload landed; the ids are done.
     Admitted,
     /// The consumer no longer wants them.
@@ -559,10 +577,29 @@ impl Release {
     pub const fn input<Id>(self, ids: Vec<Id>) -> FetchInput<Id> {
         match self {
             Self::Failed => FetchInput::Failed { ids },
+            Self::Unroutable => FetchInput::Unroutable { ids },
             Self::Admitted => FetchInput::Admitted { ids },
             Self::Abandoned => FetchInput::Abandoned { ids },
         }
     }
+}
+
+/// When a released chunk goes out again.
+///
+/// A request the transport answered — a timeout, an exhausted rotation,
+/// a peer that held nothing, an answer this node could not use — has
+/// already cost a round trip and its peer budget, so the next attempt
+/// leaves at once. A request that never reached a peer has not: no
+/// committee resolves it, or none of its members is up, and it fails
+/// again as fast as it is asked. Re-sending that here spins between this
+/// thread and the transport for as long as the cause stands, which after
+/// a restart is until the beacon folds a topology.
+#[derive(Debug, Clone, Copy)]
+enum Respawn {
+    /// Send what the released slots make room for, now.
+    Now,
+    /// Leave it to the tick.
+    OnTick,
 }
 
 /// Result of partitioning a fetch response against the requested set.
@@ -672,6 +709,9 @@ mod tests {
         assert_eq!(p.in_flight_count(), 5);
     }
 
+    /// A chunk the transport answered goes out again at once: the round
+    /// trip is already spent, and the next attempt rotates to another
+    /// peer.
     #[test]
     fn failed_releases_chunk_and_redispatches() {
         let mut p = Fetch::<TxHash>::new("test", config());
@@ -685,10 +725,39 @@ mod tests {
         let FetchOutput::Send { ids, .. } = &out[0];
         let chunk_ids = ids.clone();
 
-        // handle(Failed) re-dispatches inline — no separate Tick needed.
         let retry_out = p.handle(FetchInput::Failed { ids: chunk_ids });
         assert_eq!(p.in_flight_count(), 2);
         assert_eq!(retry_out.len(), 1);
+    }
+
+    /// A chunk that never reached a peer waits for the tick. Re-sending
+    /// it here would meet the same wall in the same instant — an
+    /// unresolved committee answers as fast as it is asked — so the
+    /// slots are released, the ids stay owed, and the ticker carries it.
+    #[test]
+    fn an_unroutable_chunk_leaves_the_retry_to_the_tick() {
+        let mut p = Fetch::<TxHash>::new("test", config());
+        let out = p.handle(FetchInput::Request {
+            ids: vec![tx(1), tx(2)],
+            shard: SHARD,
+            preferred: Some(vid(1)),
+            class: None,
+        });
+        assert_eq!(out.len(), 1);
+        let FetchOutput::Send { ids, .. } = &out[0];
+        let chunk_ids = ids.clone();
+
+        assert!(
+            p.handle(FetchInput::Unroutable { ids: chunk_ids })
+                .is_empty(),
+            "an unroutable chunk re-sends nothing"
+        );
+        assert_eq!(p.in_flight_count(), 0, "and holds no slot");
+        assert!(p.has_pending(), "the ids are still owed");
+
+        let retried = p.handle(FetchInput::Tick);
+        assert_eq!(retried.len(), 1);
+        assert_eq!(p.in_flight_count(), 2);
     }
 
     #[test]

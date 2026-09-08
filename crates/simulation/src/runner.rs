@@ -35,9 +35,9 @@ use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
     BeaconChainConfig, ConsensusPublicKey, Derivation, Epoch, GenesisConfigHash, GenesisValidators,
-    LocalTimestamp, NetworkDefinition, PrincipalAddr, ShardId, Signer, StakePoolSeat,
-    TopologySnapshot, TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet,
-    Verifier, shard_prefix_path,
+    LocalTimestamp, NetworkDefinition, PrincipalAddr, RoutingCommittees, ShardId, Signer,
+    StakePoolSeat, TopologySnapshot, TransactionStatus, TxHash, ValidatorId, ValidatorInfo,
+    ValidatorSet, Verifier, shard_prefix_path,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -828,6 +828,22 @@ impl SimulationRunner {
                 .process()
                 .topology_snapshot()
                 .load_full(),
+        )
+    }
+
+    /// The routing committees host `host`'s network resolves a fetch
+    /// against, or `None` if `host` is out of range.
+    ///
+    /// Written by the topology fold, and seeded from the boot schedule
+    /// before any fold has run — which is what a restart depends on.
+    #[must_use]
+    pub fn host_routing_committees(&self, host: NodeIndex) -> Option<Arc<RoutingCommittees>> {
+        Some(
+            self.hosts
+                .get(host as usize)?
+                .process()
+                .network()
+                .routing_committees(),
         )
     }
 
