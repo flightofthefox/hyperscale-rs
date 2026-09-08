@@ -7948,7 +7948,7 @@ mod tests {
         claims: Vec<(ShardId, SubstateKey)>,
     ) -> Part {
         let core = classified.core().clone();
-        Part::Leg(Kept {
+        Part::leg(Kept {
             body,
             classified,
             core,
@@ -9122,7 +9122,7 @@ mod tests {
                 1_000,
             ),
         );
-        state.counterparts.ledger.seed(tx_hash, Part::Delivery);
+        state.counterparts.ledger.seed(tx_hash, Part::delivery());
         state.counterparts.ledger.certify(tx_hash);
         let held_by = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         assert_eq!(state.ticks.tick_assignment(tx_hash), Some(held_by));

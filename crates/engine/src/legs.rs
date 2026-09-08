@@ -25,7 +25,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use hyperscale_types::{Address, EscrowedValue, ShardId, ShardTrie, SubstateKey};
+use hyperscale_types::{Address, EscrowedValue, Role, ShardId, ShardTrie, SubstateKey};
 use hyperscale_vm_effects::{CrossingEdge as StarEdge, Star, star_at};
 use hyperscale_vm_kernel::{Crossed, Departure, LegPlan, OwnerSet, PlanFault};
 use hyperscale_vm_types::{LegRole, LegShape, ProtocolHasher};
@@ -494,11 +494,29 @@ impl Member {
         }
     }
 
-    /// Whether this shard's certificate decides the transaction: it does
-    /// unless the member is a leg, whose transaction its core decides.
+    /// What this shard is to the transaction, in the word its
+    /// certificate will carry.
+    ///
+    /// The one classification of a member, so whether its certificate
+    /// decides, whether it executes and whether a counterpart may ask
+    /// about it are all read off [`Role`] rather than off predicates
+    /// restating it here.
+    ///
+    /// Reads the side, so a shard with legs on both sides of the core is
+    /// a `Delivery` in its delivering member and a `Leg` in its issuing
+    /// one. That is a different question from what such a shard's single
+    /// ledger entry is, which is the leg's — see `Part::of`.
     #[must_use]
-    pub fn decides(&self) -> bool {
-        !self.classified.decomposed() || self.in_core()
+    pub fn role(&self) -> Role {
+        if !self.classified.decomposed() {
+            Role::Whole
+        } else if self.in_core() {
+            Role::Core
+        } else if self.delivers() {
+            Role::Delivery
+        } else {
+            Role::Leg
+        }
     }
 
     /// Whether the member only delivers: a leg that failed is the

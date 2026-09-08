@@ -121,19 +121,10 @@ impl Membership {
             awaited.is_subset(member.reach()),
             "a member awaits only shards the transaction reaches"
         );
-        let role = if !member.classified().decomposed() {
-            Role::Whole
-        } else if member.in_core() {
-            Role::Core
-        } else if member.delivers() {
-            Role::Delivery
-        } else {
-            Role::Leg
-        };
         Self {
             awaited,
             reach: member.reach().clone(),
-            role,
+            role: member.role(),
         }
     }
 
@@ -176,19 +167,6 @@ impl Membership {
     #[must_use]
     pub const fn role(&self) -> Role {
         self.role
-    }
-
-    /// Whether this member executes the transaction itself.
-    #[must_use]
-    pub const fn executes(&self) -> bool {
-        self.role.executes()
-    }
-
-    /// Whether this shard only delivers for the transaction, so that no
-    /// outcome of its own — a failure included — bears the verdict.
-    #[must_use]
-    pub const fn delivers(&self) -> bool {
-        self.role.delivers()
     }
 
     /// The shards whose certificates settlement waits on, this one
@@ -1725,7 +1703,7 @@ mod tests {
             Side::Delivering,
             participating.clone(),
         ));
-        assert!(membership.delivers());
+        assert!(membership.role().delivers());
         assert_eq!(membership.role(), Role::Delivery);
         tick.admit(delivery, membership, 10, Admission::Executes);
         let issuer = tx(2);
