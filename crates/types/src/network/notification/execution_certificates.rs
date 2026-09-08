@@ -3,8 +3,9 @@
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    ConsensusSignature, ExecutionCertificate, ExecutionCertificatesSenderMessage, MessageClass,
-    NetworkDefinition, NetworkMessage, ShardId, Signed, ValidatorId, signed_bytes,
+    ConsensusSignature, ExecutionCertificate, ExecutionCertificatesSenderMessage,
+    MAX_TXS_PER_BLOCK, MessageClass, NetworkDefinition, NetworkMessage, ShardId, Signed,
+    ValidatorId, signed_bytes,
 };
 
 /// Batched execution certificates proving quorum for execution ticks.
@@ -15,6 +16,13 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct ExecutionCertificatesNotification {
     /// The execution certificates being sent.
+    ///
+    /// One per tick of a block, and a tick is a partition of the block's
+    /// transactions, so the block's own transaction cap bounds them —
+    /// the same ceiling [`GetExecutionCertsRequest`] asks under.
+    ///
+    /// [`GetExecutionCertsRequest`]: crate::network::request::GetExecutionCertsRequest
+    #[hbor(max = MAX_TXS_PER_BLOCK)]
     pub certificates: Vec<ExecutionCertificate>,
     /// The validator who sent this batch.
     pub sender: ValidatorId,

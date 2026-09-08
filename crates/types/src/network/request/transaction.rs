@@ -3,7 +3,7 @@
 use hyperscale_hbor::Hbor;
 
 use crate::network::response::GetTransactionsResponse;
-use crate::{MessageClass, NetworkMessage, Request, TxHash};
+use crate::{MAX_TXS_PER_BLOCK, MessageClass, NetworkMessage, Request, TxHash};
 
 /// Request to fetch transactions by hash.
 ///
@@ -13,6 +13,11 @@ use crate::{MessageClass, NetworkMessage, Request, TxHash};
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetTransactionsRequest {
     /// Hashes of the transactions being requested.
+    ///
+    /// The response is capped the same way: a request asks for the
+    /// transactions a block names, and a block carries at most this
+    /// many.
+    #[hbor(max = MAX_TXS_PER_BLOCK)]
     pub tx_hashes: Vec<TxHash>,
 }
 
@@ -76,5 +81,25 @@ mod tests {
         let bytes = hbor_to_vec(&request).unwrap();
         let decoded: GetTransactionsRequest = hbor_from_slice(&bytes).unwrap();
         assert_eq!(request, decoded);
+    }
+
+    /// A claimed length past the cap is refused before any element is
+    /// decoded, so a peer cannot make the decoder allocate for a batch
+    /// no honest block could name.
+    #[test]
+    fn decode_rejects_an_oversized_request() {
+        use hyperscale_hbor::{DecodeError, varint};
+
+        let mut buf = Vec::new();
+        varint::write(&mut buf, MAX_TXS_PER_BLOCK + 1).unwrap();
+        // Filler so the claimed length clears the input-capacity check
+        // and the bound is what refuses it.
+        buf.extend(std::iter::repeat_n(0u8, (MAX_TXS_PER_BLOCK + 1) * 64));
+        let err = hbor_from_slice::<GetTransactionsRequest>(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::BoundExceeded { max, actual }
+                if max == MAX_TXS_PER_BLOCK && actual == MAX_TXS_PER_BLOCK + 1
+        ));
     }
 }
