@@ -487,6 +487,34 @@ pub fn split_straddler_setup() -> SplitStraddlerSetup {
     }
 }
 
+/// [`split_straddler_setup`] with the leg reversed: the payer in the
+/// splitting shard and the recipient in the survivor.
+///
+/// What the cut then carries is the crossing's *record* rather than its
+/// delivery — the issuer is what splits, so a successor inherits the
+/// record and has to decide it against the claim cell its leaf names.
+#[must_use]
+pub fn split_issuer_straddler_setup() -> SplitStraddlerSetup {
+    let mut accounts = split_ballast_accounts();
+    let mut taken = Vec::new();
+    let straddlers = (0..STRADDLER_COUNT)
+        .map(|_| {
+            transfer_leg(
+                STRADDLER_SPLITTER,
+                STRADDLER_SURVIVOR,
+                2,
+                &mut taken,
+                &mut accounts,
+            )
+        })
+        .collect();
+
+    SplitStraddlerSetup {
+        accounts,
+        straddlers,
+    }
+}
+
 /// [`merge_survivor_ballast`] on its own, for a scenario composing the
 /// merge topology's byte skew with funding of its own.
 #[must_use]

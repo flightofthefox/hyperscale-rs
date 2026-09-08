@@ -87,7 +87,8 @@ pub use route_reshape::{
     split_train_genesis_accounts,
 };
 pub use straddler::{
-    a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed, isolate_ec_intake,
+    a_delivery_is_reclaimed_when_its_deliverer_splits,
+    a_record_is_decided_by_the_successor_when_its_issuer_splits, isolate_ec_intake,
     merge_straddler_atomic, split_straddler_atomic, split_straddler_ec_partition_atomic,
     split_straddler_run, straddler_one_sided_count, surviving_sibling_split_seats_full_committees,
 };

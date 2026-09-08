@@ -94,7 +94,7 @@ fn run(seed: u64, capacity: usize) -> (Fingerprint, DeliveryDrain) {
 /// header is `Consensus`, and `Recovery` is what a type gets by declaring
 /// nothing.
 #[test]
-fn a_record_carries_its_sending_type_s_class() {
+fn a_record_carries_the_class_of_the_type_that_sent_it() {
     let (_, drain) = run(9001, 8192);
 
     let headers: Vec<_> = drain

@@ -25,7 +25,8 @@ use crate::support::query::{
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, STRADDLER_SPLITTER,
     STRADDLER_SURVIVOR, build_reshape_threshold_vote_tx, build_transfer_tx, merge_straddler_setup,
-    pool_operator, split_straddler_setup, stdlib_flash_bytes, validity_around,
+    pool_operator, split_issuer_straddler_setup, split_straddler_setup, stdlib_flash_bytes,
+    validity_around,
 };
 use crate::support::wait::{
     await_anchor_seeded, await_beacon_epoch, await_merge_keeper_count, await_root_matches_anchor,
@@ -381,6 +382,61 @@ pub fn split_straddler_run<C: Cluster>(
     }
 }
 
+/// A leg issued under a cut crossing bundle, with what the scenario
+/// reading its fate needs.
+struct CutLeg {
+    hash: TxHash,
+    price: u128,
+    lapse: WeightedTimestamp,
+    broadcast_dropped: FaultHandle,
+    fetch_dropped: FaultHandle,
+}
+
+/// Cast the splitter's vote, wait out its activation epoch, cut both
+/// channels a crossing bundle travels, and submit the transfer.
+///
+/// The vote goes first because it activates epochs later and the split
+/// is admitted only after that; the leg goes in at the activation epoch,
+/// while the splitter still owns its half of the transfer, so what the
+/// cut carries is the splitter's own — a leg committed after the cut
+/// names the successor from the start and asks nothing of an
+/// inheritance. As late as that so the lapse falls past the cut, which
+/// is what puts the proof on the successor.
+fn issue_a_leg_under_a_cut_bundle<C: FaultableCluster>(
+    c: &mut C,
+    charges: &mut Charges,
+    payer_key: &Ed25519PrivateKey,
+    payer: PrincipalAddr,
+    recipient: PrincipalAddr,
+) -> CutLeg {
+    let cast_at = beacon_epoch(c).expect("post-grow beacon epoch");
+    let epoch_ms = c
+        .beacon_state()
+        .expect("post-grow beacon state")
+        .chain_config
+        .epoch_duration_ms;
+    cast_splitter_vote(c, straddler_split_bytes());
+    let activation = cast_at.inner() + vote_activate_lead(c.vote_fold_budget_ms(), epoch_ms);
+    assert!(
+        await_beacon_epoch(c, activation, epochs(8)),
+        "the vote's activation epoch must open within budget",
+    );
+    let broadcast_dropped = c.drop_type("provisions.broadcast");
+    let fetch_dropped = c.drop_type("provision.request");
+    let validity = validity_around(c.now());
+    let tx = build_transfer_tx(payer_key, payer, recipient, STRADDLER_PAYMENT, validity);
+    let price = declared_price(c, &tx);
+    let lapse = Window::Lapse.of(Deadline::of_transaction(&tx)).start;
+    let hash = charges.submit(c, tx);
+    CutLeg {
+        hash,
+        price,
+        lapse,
+        broadcast_dropped,
+        fetch_dropped,
+    }
+}
+
 /// A delivery cut off across its deliverer's split is reclaimed on the
 /// successor's proof.
 ///
@@ -401,9 +457,7 @@ pub fn split_straddler_run<C: Cluster>(
 /// exercised, if the delivery lands on any chain, if the children are
 /// not served within budget, if the payment is not back within the
 /// reclaim's room, or if the world does not conserve.
-pub fn a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed<C: FaultableCluster>(
-    c: &mut C,
-) {
+pub fn a_delivery_is_reclaimed_when_its_deliverer_splits<C: FaultableCluster>(c: &mut C) {
     let splitter = STRADDLER_SPLITTER;
     let survivor = STRADDLER_SURVIVOR;
     let setup = split_straddler_setup();
@@ -415,32 +469,13 @@ pub fn a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed<C: Faultable
     let before = vault_balance(c, survivor, *payer);
     let recipient_before = held(c, recipient.address(), *XRD);
 
-    // The vote goes in first, since it activates epochs later and the
-    // split is admitted only after that; the leg goes in at the
-    // activation epoch, while the splitter still owns the recipient's
-    // prefix, so the delivery is the splitter's own — a leg committed
-    // after the cut would name the successor from the start and ask
-    // nothing of an inheritance. As late as that so the lapse falls past
-    // the cut, which is what puts the proof on the successor.
-    let cast_at = beacon_epoch(c).expect("post-grow beacon epoch");
-    let epoch_ms = c
-        .beacon_state()
-        .expect("post-grow beacon state")
-        .chain_config
-        .epoch_duration_ms;
-    cast_splitter_vote(c, straddler_split_bytes());
-    let activation = cast_at.inner() + vote_activate_lead(c.vote_fold_budget_ms(), epoch_ms);
-    assert!(
-        await_beacon_epoch(c, activation, epochs(8)),
-        "the vote's activation epoch must open within budget",
-    );
-    let broadcast_dropped = c.drop_type("provisions.broadcast");
-    let fetch_dropped = c.drop_type("provision.request");
-    let validity = validity_around(c.now());
-    let tx = build_transfer_tx(payer_key, *payer, *recipient, STRADDLER_PAYMENT, validity);
-    let price = declared_price(c, &tx);
-    let lapse = Window::Lapse.of(Deadline::of_transaction(&tx)).start;
-    let hash = charges.submit(c, tx);
+    let CutLeg {
+        hash,
+        price,
+        lapse,
+        broadcast_dropped,
+        fetch_dropped,
+    } = issue_a_leg_under_a_cut_bundle(c, &mut charges, payer_key, *payer, *recipient);
     assert!(
         c.run_until(epochs(2), |c| c.chain_fate(survivor, hash).0.is_some()),
         "the survivor must commit the leg while the splitter is live",
@@ -525,6 +560,137 @@ pub fn a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed<C: Faultable
         &charges,
         epochs(4),
         "a delivery cut off across its deliverer's split",
+    );
+}
+
+/// A record inherited across its issuer's split is decided by the
+/// successor that holds it.
+///
+/// The mirror of [`a_delivery_is_reclaimed_when_its_deliverer_splits`]:
+/// what the cut carries here is the crossing's *record*, not its
+/// delivery. The splitter's payer pays and issues the crossing, both
+/// channels the bundle travels are cut so the survivor never claims it,
+/// and the splitter is then voted down and terminates. The record
+/// passes to the child that inherits the payer's prefix, and that child
+/// — holding a leaf and no body — decides it against the claim key the
+/// leaf names, credits the payment back and deletes the record.
+///
+/// This is the case the terminal evidence span buys and the inherited
+/// seat spends: the claim cell has to outlive the cut for the successor
+/// to have anything to ask about, and the record has to carry its
+/// consumer's claim for the successor to know what to ask.
+///
+/// # Panics
+///
+/// Panics if the splitter does not commit the leg before the vote, if
+/// the leg does not accept alone, if the bundle channels are never
+/// exercised, if the delivery lands on any chain, if the children are
+/// not served within budget, if the payment is not back on the
+/// inheriting child within the reclaim's room, or if the world does not
+/// conserve.
+pub fn a_record_is_decided_by_the_successor_when_its_issuer_splits<C: FaultableCluster>(c: &mut C) {
+    let splitter = STRADDLER_SPLITTER;
+    let survivor = STRADDLER_SURVIVOR;
+    let setup = split_issuer_straddler_setup();
+    let (payer_key, payer, recipient) = &setup.straddlers[0];
+
+    split_lifecycle(c);
+    let world = World::open(c, *XRD, [payer.address(), recipient.address()], []);
+    let mut charges = Charges::default();
+    let before = vault_balance(c, splitter, *payer);
+    let recipient_before = held(c, recipient.address(), *XRD);
+
+    let CutLeg {
+        hash,
+        price,
+        lapse,
+        broadcast_dropped,
+        fetch_dropped,
+    } = issue_a_leg_under_a_cut_bundle(c, &mut charges, payer_key, *payer, *recipient);
+    assert!(
+        c.run_until(epochs(2), |c| c.chain_fate(splitter, hash).0.is_some()),
+        "the splitter must commit the leg while it still owns the payer's prefix",
+    );
+    assert!(
+        !split_admitted(c, splitter),
+        "the leg has to be committed before the cut, so the record it leaves is one \
+         a successor inherits rather than one the splitter's own chain decides",
+    );
+    let verdict = await_tx_terminal(c, hash, epochs(8));
+    assert!(
+        matches!(
+            verdict,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the payer's leg settles alone and accepts; verdict = {verdict:?}",
+    );
+    assert!(
+        c.run_until(epochs(4), |c| vault_balance(c, splitter, *payer)
+            == before - STRADDLER_PAYMENT - price),
+        "the leg pays the payment and the price",
+    );
+
+    // The splitter terminates and its children seat with its cells — the
+    // payer's among them, and the record beside it.
+    assert!(
+        await_split_admitted(c, splitter, epochs(20)),
+        "only the over-threshold splitter must admit a split",
+    );
+    assert!(
+        !split_admitted(c, survivor),
+        "the under-threshold survivor must not split",
+    );
+    let (child_left, child_right) = splitter.children();
+    assert!(
+        await_serves(c, child_left, epochs(28)) && await_serves(c, child_right, epochs(28)),
+        "both splitter children must be served within budget",
+    );
+
+    // Past the lapse with the cut standing: the survivor never had a
+    // bundle to claim from, so its claim cell is absent and stays so.
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    assert!(
+        c.run_until(epochs(12), |c| clock(c) >= lapse),
+        "the cut must stand past the lapse",
+    );
+    assert!(
+        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
+        "both bundle channels must actually have been exercised and cut"
+    );
+    let fate = c.chain_fate(survivor, hash).1.map(|(_, decision)| decision);
+    assert!(
+        fate != Some(TransactionDecision::Accept),
+        "the delivery must never have landed while its bundle was cut off; {survivor} reached \
+         {fate:?}",
+    );
+
+    // The successor decides what it inherited: the payment comes back on
+    // whichever child took the payer's prefix. The price stays paid —
+    // the leg ran and burned it.
+    let inheritor = |c: &C| {
+        [child_left, child_right]
+            .into_iter()
+            .map(|child| vault_balance(c, child, *payer))
+            .max()
+            .expect("two children")
+    };
+    assert!(
+        c.run_until(epochs(10), |c| inheritor(c) == before - price),
+        "the successor must credit the payment back once the claim is proved absent; \
+         children hold {}",
+        inheritor(c),
+    );
+    assert_eq!(
+        held(c, recipient.address(), *XRD),
+        recipient_before,
+        "the recipient was never credited",
+    );
+    c.clear_drops();
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "a record inherited across its issuer's split",
     );
 }
 

@@ -19,13 +19,15 @@ use hyperscale_scenarios::tx::{
     native_pq_genesis_accounts, nullifier_race_genesis_accounts, overdraw_genesis_accounts,
     participant_sweep_genesis_accounts, probe_train_genesis_accounts, remote_delegator,
     reshape_lifecycle_accounts, securify_genesis_accounts, shared_recipient_genesis_accounts,
-    split_straddler_setup, staking_genesis_accounts, stdlib_flash_bytes, storm_genesis_accounts,
-    unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
+    split_issuer_straddler_setup, split_straddler_setup, staking_genesis_accounts,
+    stdlib_flash_bytes, storm_genesis_accounts, unbound_genesis_accounts,
+    unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
     Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
-    a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed,
-    a_delivery_cut_off_past_its_window_is_reclaimed, a_departing_venue_clears_swaps_and_carries_on,
+    a_delivery_cut_off_past_its_window_is_reclaimed,
+    a_delivery_is_reclaimed_when_its_deliverer_splits,
+    a_departing_venue_clears_swaps_and_carries_on,
     a_departing_venues_terminal_hands_on_what_it_never_took, a_failed_attempt_still_attests_work,
     a_healed_network_does_not_revive_a_closed_delivery,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
@@ -33,6 +35,7 @@ use hyperscale_scenarios::{
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_published_package_matures_before_it_runs,
+    a_record_is_decided_by_the_successor_when_its_issuer_splits,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
     a_route_into_a_departing_venue_releases_the_survivors_hold,
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
@@ -1389,10 +1392,20 @@ fn split_straddler_ec_partition_atomic_at_seed(seed: u64) {
 }
 
 #[test]
-fn a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed_sim() {
+fn a_delivery_is_reclaimed_when_its_deliverer_splits_sim() {
     let setup = split_straddler_setup();
     let mut cluster = SimCluster::with_accounts(&straddler_config(), 11, &setup.accounts);
-    cluster.run_faultable(a_delivery_cut_off_across_its_deliverer_s_split_is_reclaimed);
+    cluster.run_faultable(a_delivery_is_reclaimed_when_its_deliverer_splits);
+}
+
+/// A record inherited across its issuer's split, decided by the child
+/// that took the payer's prefix — the case the terminal evidence span
+/// buys and the inherited seat spends.
+#[test]
+fn a_record_is_decided_by_the_successor_when_its_issuer_splits_sim() {
+    let setup = split_issuer_straddler_setup();
+    let mut cluster = SimCluster::with_accounts(&straddler_config(), 11, &setup.accounts);
+    cluster.run_faultable(a_record_is_decided_by_the_successor_when_its_issuer_splits);
 }
 
 #[test]
