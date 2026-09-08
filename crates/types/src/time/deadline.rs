@@ -16,7 +16,8 @@ use std::time::Duration;
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    Inclusion, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, Transaction, WeightedTimestamp,
+    Inclusion, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, RETENTION_HORIZON, Transaction,
+    WeightedTimestamp,
 };
 
 /// Two validity ranges.
@@ -26,6 +27,22 @@ use crate::{
 /// to close and the lapse to be proved, one more for the reclaim that
 /// proves it to commit.
 pub const CLAIM_WINDOW: Duration = Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() * 2);
+
+/// How long a transaction's evidence outlives the moment it was
+/// committed: everything its shape reaches, ends by.
+///
+/// A transaction committed at `T` states a validity end at most one
+/// [`MAX_VALIDITY_RANGE`] on and a deadline one
+/// [`MAX_FINALIZATION_DELAY`] past that — [`RETENTION_HORIZON`] in
+/// total. A leg entry stands one [`CLAIM_WINDOW`] further, to where the
+/// claim cell both its members are proved against is swept. Past this
+/// nothing of the transaction can be asked, answered or reclaimed.
+///
+/// A duration rather than a count of windows, because none of its terms
+/// is a window: a chain that runs shorter epochs measures the same span
+/// in more of them.
+pub const TRANSACTION_EVIDENCE_HORIZON: Duration =
+    Duration::from_secs(RETENTION_HORIZON.as_secs() + CLAIM_WINDOW.as_secs());
 
 /// The moment past which a transaction can no longer finalize anywhere:
 /// its validity end plus [`MAX_FINALIZATION_DELAY`].

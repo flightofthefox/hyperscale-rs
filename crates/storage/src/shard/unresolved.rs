@@ -18,31 +18,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    BlockHeight, CLAIM_WINDOW, CertifiedBlock, EPOCH_DURATION, Provisions, RETENTION_HORIZON,
-    TERMINAL_EVIDENCE_EPOCHS, TxHash, Verifiable, Verified, WeightedTimestamp,
+    BlockHeight, CertifiedBlock, EPOCH_DURATION, Provisions, TERMINAL_EVIDENCE_EPOCHS,
+    TRANSACTION_EVIDENCE_HORIZON, TxHash, Verifiable, Verified, WeightedTimestamp,
 };
 
 use super::chain_reader::ShardChainReader;
-
-/// How far back a rebuild reads for a transaction its own clock decides.
-///
-/// A transaction committed at time `T` states a deadline at most
-/// [`RETENTION_HORIZON`] beyond it — a validity end at most one range
-/// on, and the deadline one finalization delay past that. A whole entry
-/// goes at its deadline; a leg entry stands one [`CLAIM_WINDOW`] past
-/// it, to where the claim cell both its members are proved against is
-/// swept. So this spans every entry whose
-/// fate is its own clock's to settle, leg entries included.
-///
-/// It does **not** span every entry the ledger holds. One a certificate
-/// of this shard's covers lives while some counterpart can still answer,
-/// which is the counterpart's clock rather than the transaction's: a
-/// counterpart may run for hours past the commit and only then depart,
-/// and the entry survives to that departure's terminal-evidence expiry —
-/// [`RECORD_WINDOW`] is what reaches those. It is the wider of the two,
-/// so the scan's reach is the record's and this window costs it nothing.
-const FOLD_WINDOW: Duration =
-    Duration::from_secs(RETENTION_HORIZON.as_secs() + CLAIM_WINDOW.as_secs());
 
 /// How far back a rebuild reads for a transaction a committed boundary
 /// record decides.
@@ -97,7 +77,7 @@ pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
     committed_height: BlockHeight,
     committed_ts: WeightedTimestamp,
 ) -> Option<BlockHeight> {
-    let cutoff = committed_ts.minus(FOLD_WINDOW.max(RECORD_WINDOW));
+    let cutoff = committed_ts.minus(TRANSACTION_EVIDENCE_HORIZON.max(RECORD_WINDOW));
 
     // Walk back to the window's edge, then fold forward from there.
     let mut oldest = committed_height;
@@ -114,7 +94,17 @@ pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
     // record is in it from the whole of the longer one. Tracked apart so
     // the extra reach a record needs does not resurrect a transaction the
     // deadline path retired.
-    let fold_cutoff = committed_ts.minus(FOLD_WINDOW);
+    //
+    // The shorter window is the transaction's own evidence horizon,
+    // which spans every entry whose fate is its own clock's to settle,
+    // leg entries included. It does not span every entry the ledger
+    // holds: one a certificate of this shard's covers lives while some
+    // counterpart can still answer, which is the counterpart's clock —
+    // it may run for hours past the commit and only then depart, and
+    // the entry survives to that departure's terminal-evidence expiry.
+    // `RECORD_WINDOW` is what reaches those, and being the wider of the
+    // two it already sets the scan's reach above.
+    let fold_cutoff = committed_ts.minus(TRANSACTION_EVIDENCE_HORIZON);
     let mut unresolved: BTreeMap<TxHash, BlockHeight> = BTreeMap::new();
     let mut undischarged: BTreeMap<TxHash, BlockHeight> = BTreeMap::new();
     let mut height = oldest;
