@@ -162,7 +162,7 @@ pub enum Block {
         /// Proofs of counterparts' cells, retained through sealing like
         /// the records: a replay of any depth re-folds its answers off
         /// the block it reads, and the root binds at every stage.
-        #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
+        #[hbor(max = MAX_STATE_PROOFS_PER_BLOCK)]
         state_proofs: Arc<Vec<StateProofBundle>>,
         /// Proposer-supplied beacon-witness inputs — retained through
         /// sealing (unlike provisions) because the beacon-witness fold
