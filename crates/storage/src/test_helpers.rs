@@ -1979,6 +1979,65 @@ where
     commit_at(other);
 }
 
+/// Shared: a prepared commit whose base root the store has moved off
+/// applies nothing and answers with the root it computed.
+///
+/// The benign cause is the same block arriving twice — a synced copy, or
+/// a co-hosted vnode's — so the batch is dropped rather than replayed
+/// onto a store that already holds the block. The block carries a write,
+/// because a root unchanged by an empty commit is the one case both
+/// backends wave through on purpose.
+///
+/// # Panics
+///
+/// If the refused batch moved the store's root or its version.
+pub fn test_prepared_commit_for_a_committed_block_applies_nothing<S>(storage: &Arc<S>)
+where
+    S: ShardChainReader + ShardChainWriter + SubstateStore + Clone,
+{
+    let tx = test_transaction(1);
+    let block = with_transactions(
+        make_test_block(BlockHeight::new(1)),
+        vec![Arc::new(Verifiable::from(tx))],
+    );
+    let creations = committed_tx_cells(
+        block.header().shard_id(),
+        block.transactions().iter().map(|tx| tx.as_unverified()),
+    );
+    let (spec_root, _, prepared) = storage.prepare_block_commit(
+        ParentAnchor {
+            state_root: storage.state_root(),
+            height: BlockHeight::GENESIS,
+            state: &storage.snapshot(),
+            pending: &[],
+            base_reads: None,
+        },
+        &[],
+        &creations,
+        &[],
+        BlockHeight::new(1),
+    );
+
+    // The block goes in by the other route first: the store now holds it,
+    // at a root the prepared batch was not built on.
+    let certified = make_test_certified(block);
+    let direct = commit_settled_at(&**storage, &certified, &creations, &[], &empty_witness());
+    let (height, root) = (storage.jmt_height(), storage.state_root());
+
+    assert_eq!(
+        prepared(SyncHint::FlushNow, &certified, &empty_witness()),
+        spec_root,
+        "the refused batch still answers with the root it computed",
+    );
+    assert_eq!(spec_root, direct, "and the two routes computed one root");
+    assert_eq!(
+        storage.jmt_height(),
+        height,
+        "the refusal advanced no version"
+    );
+    assert_eq!(storage.state_root(), root, "and wrote nothing");
+}
+
 /// Commit a block at `height` carrying one provision bundle, and return
 /// the bundle's hash. The bundle's transaction varies with the height, so
 /// each block's bundle has its own identity.

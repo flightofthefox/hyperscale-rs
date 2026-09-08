@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use hyperscale_storage::lock_recover::read_or_recover;
 use hyperscale_storage::test_helpers::{
     commit_settled_at, commit_writes, make_settled_writes, make_test_block,
     make_test_block_with_anchor_wt, make_test_certified, make_test_qc, push_certificate, state_key,
@@ -259,35 +258,7 @@ fn test_transactions_batch_with_indexed_block() {
 #[test]
 fn a_prepared_commit_for_a_committed_block_applies_nothing() {
     let storage = Arc::new(SimShardStorage::default());
-    let block = make_test_block(BlockHeight::new(1));
-    let parent_root = storage.state_root();
-    let (spec_root, _jmt_snapshot, prepared) = storage.prepare_block_commit(
-        ParentAnchor {
-            state_root: parent_root,
-            height: BlockHeight::GENESIS,
-            state: &storage.snapshot(),
-            pending: &[],
-            base_reads: None,
-        },
-        &[],
-        &[],
-        &[],
-        BlockHeight::new(1),
-    );
-    let direct = commit_empty(&storage, &block);
-    let history_rows = read_or_recover(&storage.state).state_history.len();
-    let certified = make_test_certified(block);
-    assert_eq!(
-        prepared(SyncHint::FlushNow, &certified, &no_witness()),
-        direct
-    );
-    assert_eq!(spec_root, direct);
-    assert_eq!(storage.jmt_height(), BlockHeight::new(1));
-    assert_eq!(
-        read_or_recover(&storage.state).state_history.len(),
-        history_rows,
-        "nothing is written a second time"
-    );
+    test_helpers::test_prepared_commit_for_a_committed_block_applies_nothing(&storage);
 }
 
 #[test]

@@ -16,6 +16,7 @@ use hyperscale_storage::test_helpers::{
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
     test_entries_commit_serve_and_history, test_historical_reads_resolve_per_version,
     test_historical_reads_respect_retention, test_history_reads_through_create_delete_create,
+    test_prepared_commit_for_a_committed_block_applies_nothing,
     test_prepared_commit_refuses_a_different_block_at_one_height,
     test_prepared_commit_writes_committed_cells, test_recovery_carries_the_tip_drain_total,
     test_registers_are_monotone_and_recoverable, test_registers_ignore_a_stale_chain_incarnation,
@@ -453,6 +454,18 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             }
         }
     };
+}
+
+/// A prepared commit for a block the store already holds — landed by a
+/// sync commit between prepare and flush, or by a second vnode on the
+/// store — applies nothing: the block is in, and its batch would
+/// otherwise be replayed onto a version already written.
+#[test]
+fn a_prepared_commit_for_a_committed_block_applies_nothing() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage =
+        Arc::new(RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap());
+    test_prepared_commit_for_a_committed_block_applies_nothing(&storage);
 }
 
 #[test]
