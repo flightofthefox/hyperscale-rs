@@ -1,7 +1,14 @@
-//! A header root that is the merkle root over one leaf per item of a
-//! block section, and the one way every such root is computed and
-//! verified.
+//! Roots that are a merkle tree over one leaf per item, and the two ways
+//! the items are ordered.
+//!
+//! [`LeafRoot`] takes a block section in the order the block carries it,
+//! and is verified against that section. [`SetRoot`] takes a membership
+//! and sorts it, so the root is a pure function of what is in the set and
+//! not of the order it was discovered in — which is also what an absence
+//! proof rests on, a bracketing pair at adjacent leaf indices ruling out
+//! everything between them.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use thiserror::Error;
@@ -34,6 +41,39 @@ pub trait LeafRoot: Copy + PartialEq + fmt::Debug {
             return Self::ZERO;
         }
         let leaves: Vec<Hash> = items.iter().map(Self::leaf).collect();
+        Self::from_raw(compute_merkle_root(&leaves))
+    }
+}
+
+/// A root over a *membership*: one leaf per distinct member, in the
+/// members' own order.
+///
+/// Sorted and deduplicated, so two derivations of one set agree whatever
+/// order each discovered it in, and so a bracketing pair of adjacent
+/// leaves proves a non-member absent. The empty set is the zero root.
+pub trait SetRoot: Copy + PartialEq + fmt::Debug {
+    /// One member of the set.
+    type Member: Ord;
+
+    /// The root of an empty set.
+    const ZERO: Self;
+
+    /// The root over the merkle root `raw` of a non-empty set.
+    fn from_raw(raw: Hash) -> Self;
+
+    /// One member's leaf.
+    fn leaf(member: &Self::Member) -> Hash;
+
+    /// The root over `members`, as a set.
+    fn over<'a>(members: impl IntoIterator<Item = &'a Self::Member>) -> Self
+    where
+        Self::Member: 'a,
+    {
+        let sorted: BTreeSet<&Self::Member> = members.into_iter().collect();
+        if sorted.is_empty() {
+            return Self::ZERO;
+        }
+        let leaves: Vec<Hash> = sorted.into_iter().map(Self::leaf).collect();
         Self::from_raw(compute_merkle_root(&leaves))
     }
 }

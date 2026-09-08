@@ -16,13 +16,11 @@
 //!
 //! [`CommittedTxsRoot`]: crate::CommittedTxsRoot
 
-use std::collections::BTreeSet;
-
 use hyperscale_hbor::Hbor;
 
+use crate::shard::roots::SetRoot;
 use crate::{
-    CommittedTxsRoot, Hash, TxHash, TypedHash, compute_merkle_root, compute_range_proof,
-    verify_range_inclusion,
+    CommittedTxsRoot, Hash, TxHash, TypedHash, compute_range_proof, verify_range_inclusion,
 };
 
 /// Wire cap on an absence proof's node count.
@@ -44,6 +42,20 @@ pub fn committed_tx_leaf(tx_hash: &TxHash) -> Hash {
     Hash::from_bytes(&preimage)
 }
 
+impl SetRoot for CommittedTxsRoot {
+    type Member = TxHash;
+
+    const ZERO: Self = Self::ZERO;
+
+    fn from_raw(raw: Hash) -> Self {
+        Self::from_raw(raw)
+    }
+
+    fn leaf(tx_hash: &TxHash) -> Hash {
+        committed_tx_leaf(tx_hash)
+    }
+}
+
 /// Merkle root over a shard's committed transactions.
 ///
 /// The hashes are taken as a set — sorted and deduplicated — so the root is
@@ -55,12 +67,7 @@ pub fn committed_tx_leaf(tx_hash: &TxHash) -> Hash {
 pub fn committed_txs_root_from_hashes<'a>(
     tx_hashes: impl IntoIterator<Item = &'a TxHash>,
 ) -> CommittedTxsRoot {
-    let sorted: BTreeSet<&TxHash> = tx_hashes.into_iter().collect();
-    if sorted.is_empty() {
-        return CommittedTxsRoot::ZERO;
-    }
-    let leaves: Vec<Hash> = sorted.into_iter().map(committed_tx_leaf).collect();
-    CommittedTxsRoot::from_raw(compute_merkle_root(&leaves))
+    SetRoot::over(tx_hashes)
 }
 
 /// Proof that a transaction is **not** in a shard's committed set.

@@ -12,9 +12,10 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crate::shard::roots::SetRoot;
 use crate::{
     ExecutionOutcome, Finalization, Hash, SettledTxsRoot, ShardId, TxHash, TxOutcome, TypedHash,
-    Verifiable, compute_merkle_root,
+    Verifiable,
 };
 
 /// The cross-shard transactions `shard` reached a verdict on in
@@ -81,6 +82,20 @@ fn settled_tx_leaf(tx_hash: &TxHash) -> Hash {
     Hash::from_bytes(&preimage)
 }
 
+impl SetRoot for SettledTxsRoot {
+    type Member = TxHash;
+
+    const ZERO: Self = Self::ZERO;
+
+    fn from_raw(raw: Hash) -> Self {
+        Self::from_raw(raw)
+    }
+
+    fn leaf(tx_hash: &TxHash) -> Hash {
+        settled_tx_leaf(tx_hash)
+    }
+}
+
 /// Merkle root over a shard's settled transactions.
 ///
 /// The hashes are taken as a set — sorted and deduplicated — so the root is
@@ -90,12 +105,7 @@ fn settled_tx_leaf(tx_hash: &TxHash) -> Hash {
 pub fn settled_txs_root_from_hashes<'a>(
     tx_hashes: impl IntoIterator<Item = &'a TxHash>,
 ) -> SettledTxsRoot {
-    let sorted: BTreeSet<&TxHash> = tx_hashes.into_iter().collect();
-    if sorted.is_empty() {
-        return SettledTxsRoot::ZERO;
-    }
-    let leaves: Vec<Hash> = sorted.into_iter().map(settled_tx_leaf).collect();
-    SettledTxsRoot::from_raw(compute_merkle_root(&leaves))
+    SetRoot::over(tx_hashes)
 }
 
 #[cfg(test)]

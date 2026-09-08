@@ -42,7 +42,7 @@ pub use committed_txs::{
     CommittedTxAbsence, committed_tx_leaf, committed_txs_root_from_hashes,
     prove_committed_tx_absent,
 };
-pub use leaf::{LeafRoot, RootMismatch};
+pub use leaf::{LeafRoot, RootMismatch, SetRoot};
 pub use provision_tx::{
     ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, committed_crossings,
 };

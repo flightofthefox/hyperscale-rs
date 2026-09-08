@@ -6,9 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
-use hyperscale_storage::{
-    JmtSnapshot, LeafRows, SweepRows, entry_leaf_rows, retire_dated, sweepable_expiry,
-};
+use hyperscale_storage::{JmtSnapshot, SweepRows, entry_leaf_rows, index_leaf, retire_dated};
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, EntryKey,
     ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash,
@@ -360,23 +358,10 @@ pub fn apply_writes(
     let mut sweep_rows = SweepRows::default();
     for (key, change) in writes.cells().iter().chain(&leaf_rows) {
         let prior = state.current_state.get(key).cloned();
-        // Of the prior's rows only the sweep row moves: the package
-        // index is content-addressed and never retracts, and an entry's
-        // index row is written from the settled entries below.
-        let was = prior
-            .as_deref()
-            .and_then(|bytes| sweepable_expiry(*key, bytes));
-        let LeafRows {
-            entry: _,
-            package,
-            sweep: now,
-        } = change
-            .as_deref()
-            .map_or_else(LeafRows::default, |bytes| LeafRows::of(*key, bytes));
+        let package = index_leaf(*key, prior.as_deref(), change.as_deref(), &mut sweep_rows);
         if let (Some(package), Some(value)) = (package, change) {
             state.package_artifacts.insert(package, value.clone());
         }
-        sweep_rows.delta(key.owner, was, now);
         if write_history {
             state.state_history.insert((*key, version), prior);
         }

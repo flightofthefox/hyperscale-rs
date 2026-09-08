@@ -22,8 +22,8 @@ use hyperscale_hbor::from_slice;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_metrics::record_storage_read;
 use hyperscale_storage::{
-    BaseReadCache, GenesisCommit, JmtSnapshot, LeafRows, SubstateStore, Substates, SweepRows,
-    entry_leaf_value, pending_write, sweepable_expiry, tree,
+    BaseReadCache, GenesisCommit, JmtSnapshot, SubstateStore, Substates, SweepRows,
+    entry_leaf_value, index_leaf, pending_write, tree,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryLeaf, ProtocolHasher, QuorumCertificate,
@@ -553,20 +553,7 @@ impl RocksDbShardStorage {
         for ((key, change), prior_slot) in writes.cells().iter().zip(priors) {
             let prior =
                 prior_slot.expect("every write must have a resolved prior (cache hit or fetched)");
-            // Of the prior's rows only the sweep row moves: the package
-            // index is content-addressed and never retracts, and an
-            // entry's index row is written from the settled entries.
-            let was = prior
-                .as_deref()
-                .and_then(|bytes| sweepable_expiry(*key, bytes));
-            let LeafRows {
-                entry: _,
-                package,
-                sweep: now,
-            } = change
-                .as_deref()
-                .map_or_else(LeafRows::default, |bytes| LeafRows::of(*key, bytes));
-            sweep_rows.delta(key.owner, was, now);
+            let package = index_leaf(*key, prior.as_deref(), change.as_deref(), &mut sweep_rows);
             // A cell that self-identifies as a package lands its artifact
             // in the content-addressed index, in the same atomic batch as
             // the state that carries it.

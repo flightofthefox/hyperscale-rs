@@ -2,7 +2,7 @@
 
 use hyperscale_types::{EntryKey, Hash, SubstateKey};
 
-use crate::{entry_from_leaf, package_of_cell, sweepable_expiry};
+use crate::{SweepRows, entry_from_leaf, package_of_cell, sweepable_expiry};
 
 /// What a store indexes beside a leaf, judged from the leaf alone.
 ///
@@ -34,4 +34,34 @@ impl LeafRows {
             sweep: sweepable_expiry(key, value),
         }
     }
+}
+
+/// Fold one committed leaf's derived rows: retract the sweep row its
+/// prior held, take the one its new value holds, and hand back the
+/// package it publishes.
+///
+/// The judgement both backends share, so a family added to [`LeafRows`]
+/// reaches memory and `RocksDB` at once rather than in two edits that have
+/// to agree. What differs between them is where the package artifact
+/// lands — a map or a write batch — which is why that half is returned
+/// rather than applied.
+///
+/// Of the prior's rows only the sweep row moves: the package index is
+/// content-addressed and never retracts, and an entry's index row is
+/// written from the settled entries.
+#[must_use]
+pub fn index_leaf(
+    key: SubstateKey,
+    prior: Option<&[u8]>,
+    change: Option<&[u8]>,
+    sweep_rows: &mut SweepRows,
+) -> Option<Hash> {
+    let was = prior.and_then(|bytes| sweepable_expiry(key, bytes));
+    let LeafRows {
+        entry: _,
+        package,
+        sweep: now,
+    } = change.map_or_else(LeafRows::default, |bytes| LeafRows::of(key, bytes));
+    sweep_rows.delta(key.owner, was, now);
+    package
 }

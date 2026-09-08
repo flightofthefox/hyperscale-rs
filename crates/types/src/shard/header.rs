@@ -316,38 +316,43 @@ impl BlockHeader {
         state_root: StateRoot,
         origin: ChainOrigin,
     ) -> Self {
-        Self {
+        // Genesis QC carries no signature and is valid by definition;
+        // `Verified::<QuorumCertificate>::genesis` is the only path to a
+        // verified genesis value (the predicate's signer check would
+        // reject the zero-signers genesis bitfield).
+        Self::empty(
+            shard_id,
+            BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
+            proposer,
+            state_root,
+            origin,
+        )
+    }
+
+    /// A genesis header of any provenance: no content, every root at
+    /// zero, and the five terms that differ between one chain's birth
+    /// and another's.
+    ///
+    /// The empty half comes from [`BlockHeaderParts::default`], which is
+    /// the one place a header's zero is written down — so a root added to
+    /// the header is a field every genesis gets without a line here, and
+    /// three constructors cannot drift into three different empties.
+    fn empty(
+        shard_id: ShardId,
+        parent_block_hash: BlockHash,
+        proposer: ValidatorId,
+        state_root: StateRoot,
+        origin: ChainOrigin,
+    ) -> Self {
+        Self::new(BlockHeaderParts {
             shard_id,
             height: origin.genesis_height,
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
-            // Genesis QC carries no signature and is valid by definition;
-            // `Verified::<QuorumCertificate>::genesis` is the only path to a
-            // verified genesis value (the predicate's signer check would
-            // reject the zero-signers genesis bitfield).
+            parent_block_hash,
             parent_qc: Verified::<QuorumCertificate>::genesis(shard_id, origin).into(),
             proposer,
-            timestamp: ProposerTimestamp::ZERO,
-            round: Round::INITIAL,
-            is_fallback: false,
             state_root,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            provision_tx_roots: BTreeMap::new(),
-            abandonment_root: AbandonmentRoot::ZERO,
-            state_proofs_root: StateProofsRoot::ZERO,
-            work_in_flight: WorkInFlight::ZERO,
-            settled_tick_frontier: BlockHeight::GENESIS,
-            sweep_frontier: SweepFrontier::ZERO,
-            beacon_witness_root: BeaconWitnessRoot::ZERO,
-            beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
-            beacon_witness_base: BeaconWitnessLeafCount::ZERO,
-            reveal_chain: RevealChain::ZERO,
-            split_child_roots: None,
-            terminal_roots: None,
-            load: ShardLoad::ZERO,
-        }
+            ..BlockHeaderParts::default()
+        })
     }
 
     /// The deterministic genesis header of a split child adopting
@@ -375,34 +380,13 @@ impl BlockHeader {
             genesis_height: parent_terminal.height().next(),
             anchor_wt: parent_canonical_wt,
         };
-        Self {
-            shard_id: child,
-            height: origin.genesis_height,
-            parent_block_hash: parent_terminal.hash(),
-            parent_qc: Verified::<QuorumCertificate>::genesis(child, origin).into(),
-            proposer: parent_terminal.proposer(),
-            timestamp: ProposerTimestamp::ZERO,
-            round: Round::INITIAL,
-            is_fallback: false,
+        Self::empty(
+            child,
+            parent_terminal.hash(),
+            parent_terminal.proposer(),
             state_root,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            provision_tx_roots: BTreeMap::new(),
-            abandonment_root: AbandonmentRoot::ZERO,
-            state_proofs_root: StateProofsRoot::ZERO,
-            work_in_flight: WorkInFlight::ZERO,
-            settled_tick_frontier: BlockHeight::GENESIS,
-            sweep_frontier: SweepFrontier::ZERO,
-            beacon_witness_root: BeaconWitnessRoot::ZERO,
-            beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
-            beacon_witness_base: BeaconWitnessLeafCount::ZERO,
-            reveal_chain: RevealChain::ZERO,
-            split_child_roots: None,
-            terminal_roots: None,
-            load: ShardLoad::ZERO,
-        }
+            origin,
+        )
     }
 
     /// The deterministic genesis header of a merged parent adopting
@@ -444,34 +428,13 @@ impl BlockHeader {
             genesis_height,
             anchor_wt: cut_wt,
         };
-        Self {
-            shard_id: parent,
-            height: genesis_height,
+        Self::empty(
+            parent,
             parent_block_hash,
-            parent_qc: Verified::<QuorumCertificate>::genesis(parent, origin).into(),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::ZERO,
-            round: Round::INITIAL,
-            is_fallback: false,
+            ValidatorId::new(0),
             state_root,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            provision_tx_roots: BTreeMap::new(),
-            abandonment_root: AbandonmentRoot::ZERO,
-            state_proofs_root: StateProofsRoot::ZERO,
-            work_in_flight: WorkInFlight::ZERO,
-            settled_tick_frontier: BlockHeight::GENESIS,
-            sweep_frontier: SweepFrontier::ZERO,
-            beacon_witness_root: BeaconWitnessRoot::ZERO,
-            beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
-            beacon_witness_base: BeaconWitnessLeafCount::ZERO,
-            reveal_chain: RevealChain::ZERO,
-            split_child_roots: None,
-            terminal_roots: None,
-            load: ShardLoad::ZERO,
-        }
+            origin,
+        )
     }
 
     /// Shard group this block belongs to.
