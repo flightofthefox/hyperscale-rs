@@ -636,6 +636,12 @@ impl UnresolvedTxs {
     /// Whether `shard` consumes a crossing this shard issued for the
     /// transaction — a core consumer's or a delivery's — so that its
     /// acceptance is the claim the record here was held for.
+    ///
+    /// Matched on the claim's prefix rather than on the shard the
+    /// commit froze, because a claim cell follows its prefix across a
+    /// cut and the prober already asks whoever holds it now. Reading the
+    /// frozen shard alone would drop the successor's answer to the
+    /// question this ledger asked it.
     #[must_use]
     pub fn consumer_holds(&self, tx_hash: TxHash, shard: ShardId) -> bool {
         let kept = self.owed.get(&tx_hash).and_then(|owed| owed.part.kept());
@@ -643,7 +649,7 @@ impl UnresolvedTxs {
             kept.claims
                 .iter()
                 .chain(&kept.deliveries)
-                .any(|(consumer, _)| *consumer == shard)
+                .any(|(_, claim)| ShardTrie::shard_owns_prefix(shard, claim.owner))
         })
     }
 
@@ -868,11 +874,15 @@ impl UnresolvedTxs {
     }
 
     /// The leg entries committed records have licensed the retirement of
-    /// and no tick has taken yet: every consumer of what each issued —
-    /// a core's, a delivery's — is on record as having claimed, no
-    /// record covers the entry as unsettled, and nothing is taking it
-    /// back. Read off committed content alone, like
-    /// [`Self::reclaimable`], so every replica composes the same.
+    /// and no tick has taken yet: every crossing this shard issued has a
+    /// claim some shard on record owns the prefix of, no record covers
+    /// the entry as unsettled, and nothing is taking it back. Read off
+    /// committed content alone, like [`Self::reclaimable`], so every
+    /// replica composes the same.
+    ///
+    /// A claim is answered by whoever holds its prefix, which after a
+    /// cut is the frozen consumer's successor — the same widening
+    /// [`Self::consumer_holds`] makes, and for the same reason.
     #[must_use]
     pub fn retirable(&self) -> Vec<Retirable> {
         self.owed
@@ -885,18 +895,22 @@ impl UnresolvedTxs {
             })
             .filter_map(|(tx_hash, owed)| {
                 let kept = owed.part.kept()?;
-                let consumers: BTreeSet<ShardId> = kept
+                let claims: Vec<SubstateKey> = kept
                     .claims
                     .iter()
                     .chain(&kept.deliveries)
-                    .map(|(shard, _)| *shard)
+                    .map(|(_, claim)| *claim)
                     .collect();
-                (!consumers.is_empty() && consumers.is_subset(&owed.claimed_by)).then(|| {
-                    Retirable {
-                        tx_hash: *tx_hash,
-                        body: Arc::clone(&kept.body),
-                        classified: kept.classified.clone(),
-                    }
+                (!claims.is_empty()
+                    && claims.iter().all(|claim| {
+                        owed.claimed_by
+                            .iter()
+                            .any(|shard| ShardTrie::shard_owns_prefix(*shard, claim.owner))
+                    }))
+                .then(|| Retirable {
+                    tx_hash: *tx_hash,
+                    body: Arc::clone(&kept.body),
+                    classified: kept.classified.clone(),
                 })
             })
             .collect()
@@ -2507,6 +2521,51 @@ mod tests {
             vec![(delivery.hash(), TxResolution::LegFinalized)],
             "a delivery that failed decides nothing, and the value waits for a later claim"
         );
+    }
+
+    /// A claim follows its prefix, so the shard that answers for it
+    /// after a cut is the frozen consumer's successor — and its word
+    /// licenses the retirement exactly as the consumer's would have.
+    ///
+    /// The prober already asks whoever holds the prefix now
+    /// (`counterpart_cells`), so a ledger matching the frozen shard by
+    /// identity drops the answer to a question it asked itself, and the
+    /// record cell outlives the entry.
+    #[test]
+    fn a_successors_claim_retires_the_record_the_consumer_was_holding() {
+        // `PARTNER` splits, and the half that takes the `AWAY` prefixes
+        // is the depth-2 leaf on the same path.
+        const SUCCESSOR: ShardId = ShardId::leaf(2, 2);
+
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(8, 60_000);
+        commit(&mut ledger, &tx);
+        let claim = SubstateKey {
+            owner: test_prefix(AWAY),
+            local: LocalKey([0x77; 16]),
+        };
+        ledger.seed(
+            tx.hash(),
+            leg_part(body(&tx), classified(), Vec::new(), vec![(PARTNER, claim)]),
+        );
+        ledger.certify(tx.hash());
+        assert!(
+            ledger.consumer_holds(tx.hash(), SUCCESSOR),
+            "the shard holding the claim's prefix consumes what the leg issued",
+        );
+
+        ledger.record_abandonment_records(&[AbandonmentRecord::heard(
+            SUCCESSOR,
+            accepted(ms(70_000)),
+            [names(&tx)],
+        )]);
+        let retirable = ledger.retirable();
+        assert_eq!(
+            retirable.len(),
+            1,
+            "the successor claimed, so the record has nothing left to hold",
+        );
+        assert_eq!(retirable[0].tx_hash, tx.hash());
     }
 
     /// A committed `Claimed` record is what licenses retiring a leg's
