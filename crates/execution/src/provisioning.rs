@@ -167,6 +167,21 @@ impl Absorbed {
 
     /// Fold a later bundle from the same shard in. A bundle restating
     /// what is held changes nothing but the clock.
+    ///
+    /// The merge is anchor blind — one anchor is stamped over the whole
+    /// held set — and what makes that sound is that the two bundle kinds
+    /// a shard sends carry **disjoint keys**: its committed state for
+    /// the transaction, and the record cells its certificate wrote. A
+    /// key is therefore added by one kind or restated by a re-broadcast
+    /// of the same kind, never carried by both at two anchors with two
+    /// values. Were they to overlap, [`Self::present`] would answer from
+    /// a set mixed across anchors while `anchor` named only the latest,
+    /// and a consumer proving a reading against that anchor would be
+    /// proving it against a value taken at another.
+    ///
+    /// Stated rather than enforced, deliberately: the bundles are a
+    /// counterpart's committed content, so refusing a contradiction here
+    /// would let one shard halt another.
     fn absorb(&mut self, at: WeightedTimestamp, anchor: SourceAnchor, entries: &[SubstateEntry]) {
         self.at = at;
         self.anchor = anchor;
