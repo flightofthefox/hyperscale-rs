@@ -55,11 +55,11 @@
 //     crates/types/src/time/timeouts.rs: a claim admitted under the close
 //     has committed by L or never will, so the claim cell's absence at a
 //     recipient block past L is the lapse. The record the reclaim takes
-//     back outlives L by a validity range (`ESCROW_GRACE_MS`).
+//     back outlives L outright: no sweep reaches a record cell.
 //   - Both licenses are half-open windows, not floors: the cells a probe
 //     asks about are swept at their own expiry — `committed_tx_expiry_ms`
 //     in crates/storage/src/shard/sweep.rs for the committed cell,
-//     `ESCROW_GRACE_MS` for the claim cell — and a non-inclusion proof of
+//     `CROSSING_GRACE_MS` for the claim cell — and a non-inclusion proof of
 //     a swept cell is honest and says nothing. `absence_licenses_reclaim`
 //     and `lapse_licenses_reclaim` carry the ceiling; `sweep` and
 //     `sweepClaim` here are what make it load-bearing.
@@ -72,8 +72,8 @@
 //     within MAX_SKEW between the two shards' clocks. The skew bound is
 //     what the absence window's ceiling costs: a producer whose core's
 //     chain has already run past the window never gets to ask, and the
-//     crossing strands — the outcome the design names and the record's own
-//     grace bounds, not a disposal the model can promise. The window's own
+//     crossing strands — the outcome the design names and the claim
+//     cell's life bounds, not a disposal the model can promise. The window's own
 //     width is the figure, since any drift inside it leaves the producer a
 //     licensed header to ask at.
 //   - A probe is taken while it can be: the clock does not leave either
@@ -152,7 +152,7 @@ module exclusivity_core {
   // How far the two chains' attested clocks may drift apart. The absence
   // license has a ceiling, so a producer whose core's chain has already
   // run past the window never gets to ask: the crossing strands, which is
-  // the outcome the design names and the record's own grace bounds. What
+  // the outcome the design names and the claim cell's life bounds. What
   // this bounds is the drift, and the window's own width is the figure —
   // any skew inside it leaves the producer a licensed header to ask at.
   const MAX_SKEW: int

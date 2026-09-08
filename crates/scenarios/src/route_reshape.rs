@@ -890,9 +890,9 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
     // The departure record licenses the trader's reclaim, which reads the
     // record cell the trader's leg wrote — and reads it whenever the
     // record lands, because a record is value and value is not swept on
-    // a clock. So the input comes back however long the departure took,
-    // which is what makes this readable on either epoch clock: one whose
-    // epochs outrun the escrow grace reaches the reclaim just the same.
+    // a clock. The licence is the record itself rather than a probe, so
+    // no window bounds it either: the input comes back however long the
+    // departure took, on either epoch clock.
     assert!(
         c.run_until(epochs(12), |c| held(c, route.trader.address(), *XRD)
             == paid + ROUTE_INPUT),
@@ -1008,14 +1008,15 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
         c.committed_work_in_flight(survivor),
     );
     // The output is a delivery to the trader, admissible to the delivery
-    // window's close, and the crossing it rides is a record cell swept at
-    // the intent's end plus the escrow grace. On a clock the window
-    // outlasts, the trader banks it. On a clock whose epochs outrun the
-    // window the survivor settles after it: the output's delivery can no
-    // longer be admitted and, the survivor having settled past the grace
-    // as well, the record it issued is swept under the lapse probe that
-    // would have returned it — the output is stranded, and the world is
-    // short by exactly it, at most the input the route put in.
+    // window's close, and the crossing it rides sits in a record cell
+    // nothing sweeps. On a clock the window outlasts, the trader banks
+    // it. On a clock whose epochs outrun the window the survivor settles
+    // after it: the output's delivery can no longer be admitted, and if
+    // the survivor also settles past the claim cell's own sweep the
+    // lapse probe that would have returned the record reaches a cell
+    // that is simply gone — absence proves nothing there, so the output
+    // is stranded, and the world is short by exactly it, at most the
+    // input the route put in.
     let banked = c.run_until(epochs(8), |c| held(c, route.trader.address(), *XRD) > paid);
     let clock = WeightedTimestamp::ZERO.plus(c.now());
     let burned = charges.burned(c);

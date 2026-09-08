@@ -86,10 +86,14 @@ impl Deadline {
         Self::of(tx.validity_range().end_timestamp_exclusive)
     }
 
-    /// The deadline an escrow record's expiry was derived from: the
-    /// record is swept where its claim window closes, so the producing
-    /// intent's deadline sits one [`CLAIM_WINDOW`] before it. For a
-    /// reader holding the record and no body.
+    /// The deadline an escrow record's expiry was derived from.
+    ///
+    /// A record is never swept — no arm of the sweep reaches it, which
+    /// is what makes it a balance rather than a witness. What the expiry
+    /// names is the sweep of the claim cell the record is decided
+    /// against, keyed by the same figure so the two agree, and the
+    /// producing intent's deadline sits one [`CLAIM_WINDOW`] before it.
+    /// For a reader holding the record and no body.
     #[must_use]
     pub const fn from_expiry(expiry_ms: u64) -> Self {
         Self(WeightedTimestamp::from_millis(
