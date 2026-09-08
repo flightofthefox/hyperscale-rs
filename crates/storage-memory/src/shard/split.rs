@@ -78,8 +78,16 @@ impl SimShardStorage {
                 root
             }
         };
+        let pair = Verified::<CertifiedBlock>::genesis_certified(genesis.clone());
+        // A child's history begins here, and its genesis QC carries the
+        // chain origin's anchor: dating it is what puts the floor at the
+        // adoption rather than below everything the parent held.
+        shared.advance_retention_floor(
+            origin.genesis_height.inner(),
+            pair.qc_verified().weighted_timestamp(),
+        );
         drop(shared);
-        self.install_genesis_tip(origin, genesis);
+        self.install_genesis_tip(origin, &pair);
         Ok(adopted)
     }
 
@@ -88,8 +96,8 @@ impl SimShardStorage {
     /// deterministic certified pairing, the committed height and hash,
     /// no latest QC (the child chain holds none at its genesis), and
     /// the chain origin for recovery.
-    fn install_genesis_tip(&self, origin: ChainOrigin, genesis: &Block) {
-        let pair = Verified::<CertifiedBlock>::genesis_certified(genesis.clone());
+    fn install_genesis_tip(&self, origin: ChainOrigin, pair: &Verified<CertifiedBlock>) {
+        let genesis = pair.block();
         let mut consensus = write_or_recover(&self.consensus);
         consensus
             .blocks
@@ -272,9 +280,16 @@ mod tests {
     }
 
     fn origin_at_10() -> ChainOrigin {
+        origin_anchored(WeightedTimestamp::from_millis(42_000))
+    }
+
+    /// A height-10 chain origin anchored at `anchor_wt` — the weighted
+    /// timestamp the child's genesis QC carries, and so the date the
+    /// adoption stamps on the genesis version.
+    fn origin_anchored(anchor_wt: WeightedTimestamp) -> ChainOrigin {
         ChainOrigin {
             genesis_height: BlockHeight::new(10),
-            anchor_wt: WeightedTimestamp::from_millis(42_000),
+            anchor_wt,
         }
     }
 
@@ -285,7 +300,7 @@ mod tests {
 
     /// A deterministic split-child genesis at height 10 adopting
     /// `state_root`, derived over a synthetic parent terminal at height 9.
-    fn split_genesis(child: ShardId, state_root: StateRoot) -> Block {
+    fn split_genesis(child: ShardId, state_root: StateRoot, anchor_wt: WeightedTimestamp) -> Block {
         let terminal = Block::genesis(
             ShardId::ROOT,
             ValidatorId::new(0),
@@ -295,12 +310,7 @@ mod tests {
                 anchor_wt: WeightedTimestamp::ZERO,
             },
         );
-        Block::split_child_genesis(
-            child,
-            state_root,
-            terminal.header(),
-            WeightedTimestamp::from_millis(42_000),
-        )
+        Block::split_child_genesis(child, state_root, terminal.header(), anchor_wt)
     }
 
     /// The child-side slot of `parent`'s root node — the subtree a clone of
@@ -369,7 +379,11 @@ mod tests {
 
         for side in [0u8, 1u8] {
             let child = parent.clone_for_split_child(child_path(side));
-            let genesis = split_genesis(child_of(side), child_subtree_root(&parent, side));
+            let genesis = split_genesis(
+                child_of(side),
+                child_subtree_root(&parent, side),
+                origin_at_10().anchor_wt,
+            );
             child
                 .adopt_genesis(origin_at_10(), &genesis, AdoptSource::ParentSubtree)
                 .unwrap();
@@ -390,7 +404,7 @@ mod tests {
             // The genesis must name the subtree the clone actually holds —
             // that equality is what gates the seat.
             let expected = child_subtree_root(&parent, side);
-            let genesis = split_genesis(child_of(side), expected);
+            let genesis = split_genesis(child_of(side), expected, origin_at_10().anchor_wt);
             let root = child
                 .adopt_genesis(origin_at_10(), &genesis, AdoptSource::ParentSubtree)
                 .unwrap();
@@ -417,6 +431,43 @@ mod tests {
             Blake3Hasher::hash_internal(&[*roots[0].as_bytes(), *roots[1].as_bytes()]),
             *parent_root.as_bytes(),
             "adopted roots compose to the parent's terminal root",
+        );
+    }
+
+    /// Adoption dates the child's genesis version with the anchor its
+    /// genesis QC carries, and the floor moves past the parent's dated
+    /// versions: the parent's history is not the child's to serve.
+    #[test]
+    fn adoption_dates_the_genesis_version_and_retires_the_parent_history() {
+        let (parent, _) = split_parent();
+        {
+            let mut shared = write_or_recover(&parent.state);
+            for version in 1..=9u64 {
+                shared.version_time.insert(version, version * 1_000);
+            }
+        }
+        // Far enough past the retention horizon that every parent
+        // version the clone inherits is outside it.
+        let origin = origin_anchored(WeightedTimestamp::from_millis(1_000_000));
+        let child = parent.clone_for_split_child(child_path(0));
+        let genesis = split_genesis(
+            child_of(0),
+            child_subtree_root(&parent, 0),
+            origin.anchor_wt,
+        );
+        child
+            .adopt_genesis(origin, &genesis, AdoptSource::ParentSubtree)
+            .unwrap();
+
+        let shared = read_or_recover(&child.state);
+        assert_eq!(
+            shared.version_time.get(&10),
+            Some(&1_000_000),
+            "the genesis version is dated with the anchor",
+        );
+        assert_eq!(
+            shared.retention_floor, 10,
+            "the floor sits at the adoption, not below the parent's history",
         );
     }
 }
