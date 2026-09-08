@@ -340,13 +340,17 @@ pub struct ExecutionCoordinator {
     /// and are empty from then on.
     replay_blocks: Vec<Verified<CertifiedBlock>>,
 
-    /// The lowest height a tick may be composed at.
+    /// The lowest height a tick may be *dispatched* at.
     ///
     /// A tick reads its baseline as of the height below it, and a store
     /// answers a historical read only inside its retention horizon — so a
-    /// replay reaching further back than that folds those blocks and
-    /// composes nothing from them. `GENESIS` on every path but a replay,
-    /// where every height qualifies.
+    /// replay reaching further back than that composes its ticks and runs
+    /// none of them. Composition is what fixes which tick holds a member,
+    /// and every replica of the shard has to agree on that whatever it
+    /// can still execute; the baseline is what the store cannot answer
+    /// for. What such a tick left is seated from the receipts that
+    /// committed it instead. `GENESIS` on every path but a replay, where
+    /// every height qualifies.
     compose_from: BlockHeight,
 
     /// Tick fates known but not yet emittable, each with the tick that
@@ -717,35 +721,6 @@ impl ExecutionCoordinator {
         engagement_waits
     }
 
-    /// Fold what a committed block put in flight, for a block below the
-    /// height the replay may compose at.
-    ///
-    /// The ledger entry and nothing else. A tick composed here would read
-    /// its baseline at a height the store has retired, and there is
-    /// nothing for it to run: whatever this block committed was taken by
-    /// a tick of this shard's whose fate the replay reads off a later
-    /// block, or off the peers once it is live. So each member is
-    /// registered and then spoken for — the entry stands and its
-    /// counterparts are tracked, while this replica never offers a
-    /// verdict on a member it cannot re-run.
-    fn fold_committed_txs(
-        &mut self,
-        classification: &TopologySnapshot,
-        transactions: &[Arc<Verifiable<Transaction>>],
-    ) {
-        let local_shard = self.local_shard;
-        let members = committed_members(classification, transactions);
-        self.counterparts.ledger.register_committed(
-            local_shard,
-            members
-                .iter()
-                .map(|member| (&member.tx, &member.classified)),
-        );
-        for member in &members {
-            self.counterparts.ledger.speak_for(member.tx.hash());
-        }
-    }
-
     /// Record what a committed block puts in flight: the ledger entry it
     /// owes an outcome for, the provisions and engagement echoes its
     /// cross-shard members wait on, and the candidate itself.
@@ -828,14 +803,14 @@ impl ExecutionCoordinator {
     /// certificate for that height would come back under a root it never
     /// computed.
     ///
-    /// Two reaches, because a replay has two jobs. The ledger is folded
-    /// from every block the window holds, which runs back as far as an
-    /// undischarged record. A tick is composed over a baseline, and a
-    /// baseline is a historical read the store retires — so below
-    /// [`compose_from`](Self::compose_from) the blocks are folded and
-    /// nothing is composed. Nothing is lost there: a tick composed below
-    /// that height was settled by a fate this fold reads off the chain,
-    /// and what it left is seated from the receipts that committed it.
+    /// Two reaches, because a replay has two jobs. Composition runs over
+    /// every block the window holds, which runs back as far as an
+    /// undischarged record; execution runs only over what the store can
+    /// still anchor a baseline at. Below
+    /// [`compose_from`](Self::compose_from) the ticks compose and none is
+    /// dispatched — nothing is lost there, because such a tick was
+    /// settled by a fate the replay reads off the chain, and what it left
+    /// is seated from the receipts that committed it.
     ///
     /// The blocks arrive with the provision bundles they carried already
     /// reattached, so a leg composes here on the evidence it composed on
@@ -885,16 +860,16 @@ impl ExecutionCoordinator {
         actions
     }
 
-    /// Seat the ticks the replay folds past on the chain, from what the
+    /// Seat the ticks the replay runs none of on the chain, from what the
     /// receipts that settled them say they left.
     ///
     /// A tick composed below [`compose_from`](Self::compose_from) is one
     /// no replay of this replica's re-runs, and its writes reach the base
     /// only at the block that committed its finalization. Every tick the
-    /// replay *does* compose below that block reads a baseline the base
-    /// has not caught up to and the chain no longer holds — a baseline
-    /// nobody else computed. The receipts state exactly what the base
-    /// gains and where, which is all such a baseline is missing.
+    /// replay *does* run below that block reads a baseline the base has
+    /// not caught up to and the chain no longer holds — a baseline nobody
+    /// else computed. The receipts state exactly what the base gains and
+    /// where, which is all such a baseline is missing.
     ///
     /// Ahead of the replay rather than inside it, because the block that
     /// settles a tick can sit above the block the settlement is owed to.
@@ -2799,17 +2774,14 @@ impl ExecutionCoordinator {
         let anchored =
             self.classification_committee(topology_schedule, self.committed_committee_anchor_wt);
 
-        // Below where a baseline is readable there is a fold and no
-        // composition. The provisions this block carried go with it: they
-        // are the evidence its own members ran on, and no member left to
-        // compose waits for them.
-        if height < self.compose_from {
-            self.fold_committed_txs(anchored, transactions);
-            return actions;
-        }
+        // Below where a baseline is readable a tick composes and never
+        // runs: which tick holds a member is what every replica has to
+        // agree on, and the baseline is the only part of it the store
+        // cannot answer for.
+        let runnable = height >= self.compose_from;
 
         // ── Provision broadcasting (proposer only) ─────────────────────
-        if self.me == header.proposer() {
+        if runnable && self.me == header.proposer() {
             let local_shard = self.local_shard;
             if let Some((requests, shard_recipients)) =
                 build_provision_requests(anchored, transactions, certificates, self.me, local_shard)
@@ -2862,12 +2834,20 @@ impl ExecutionCoordinator {
             actions.extend(self.replay_early_attestations(topology_schedule, &members));
         }
         if let Some(pending) = pending {
-            tracing::debug!(
-                height = height.inner(),
-                members = pending.requests.len(),
-                "Dispatching this commit's tick"
-            );
-            self.pending_ticks.push_back(pending);
+            if runnable {
+                tracing::debug!(
+                    height = height.inner(),
+                    members = pending.requests.len(),
+                    "Dispatching this commit's tick"
+                );
+                self.pending_ticks.push_back(pending);
+            } else {
+                tracing::debug!(
+                    height = height.inner(),
+                    members = pending.requests.len(),
+                    "Composed a tick the store can no longer anchor a baseline for"
+                );
+            }
         }
         // What composition abandoned, before the tick it composed reads
         // the chain: a discarded tick's legs hold cells this one may
@@ -3041,13 +3021,6 @@ impl ExecutionCoordinator {
     /// the fence would then refuse the abort that replaced it, tearing the
     /// transaction across the two shards.
     fn beyond_every_shard(&self, composing: TickId, tx_hash: TxHash) -> bool {
-        // A tick this replica never rebuilt holds it, and abandoning
-        // would spend a verdict against a settlement its peers are still
-        // reaching. Whatever that tick's fate is arrives as committed
-        // content, which is what folded the entry in the first place.
-        if self.counterparts.ledger.is_spoken_for(tx_hash) {
-            return false;
-        }
         match self.ticks.tick_assignment(tx_hash) {
             Some(tick_id) if tick_id == composing => false,
             Some(tick_id) => {
@@ -7063,16 +7036,18 @@ mod tests {
         );
     }
 
-    /// A replay reaching below what the store can anchor folds those
-    /// blocks and composes nothing from them.
+    /// A replay reaching below what the store can anchor composes its
+    /// ticks there and dispatches none of them.
     ///
-    /// The fold's reach is what the chain is still owed an outcome for,
-    /// which runs back as far as an undischarged record; a tick's is a
-    /// baseline, and a baseline is a historical read the store retires at
-    /// `RETENTION_HORIZON`. Composing there dispatches an execution
-    /// anchored at a height the store answers with a panic.
+    /// Composition's reach is what the chain is still owed an outcome
+    /// for, which runs back as far as an undischarged record; execution's
+    /// is a baseline, and a baseline is a historical read the store
+    /// retires at `RETENTION_HORIZON`. Dispatching there reads a height
+    /// the store answers with a panic — and composing there is what fixes
+    /// which tick holds a member, which every replica of the shard reads
+    /// the same however far back its own store reaches.
     #[test]
-    fn a_replay_below_the_stores_reach_folds_without_composing() {
+    fn a_replay_below_the_stores_reach_composes_without_dispatching() {
         let schedule = make_test_topology();
         let held = test_transaction(1);
         let held_hash = held.hash();
@@ -7112,18 +7087,15 @@ mod tests {
                 .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
             "nothing is dispatched at a height whose baseline the store has retired",
         );
-        assert!(
-            restarted.candidates.is_empty(),
-            "and nothing waits to be composed there either",
-        );
         assert_eq!(
             restarted.counterparts.ledger.len(),
             1,
-            "the fold still owes the outcome the chain says it owes",
+            "the replay still owes the outcome the chain says it owes",
         );
-        assert!(
-            restarted.counterparts.ledger.is_spoken_for(held_hash),
-            "held by a tick this replica cannot rebuild",
+        assert_eq!(
+            restarted.ticks.tick_assignment(held_hash),
+            Some(TickId::new(ShardId::ROOT, BlockHeight::new(2))),
+            "and holds it in the tick a replica that never went down holds it in",
         );
     }
 
@@ -7205,19 +7177,36 @@ mod tests {
         );
     }
 
-    /// And a member of such a tick is never abandoned by this replica: a
-    /// verdict of its own would discard a tick it never held while its
-    /// peers are still settling one.
+    /// And two replicas of one shard at one frontier abandon the same
+    /// members, however far back each one's own store reaches.
+    ///
+    /// The abandonment rides the tick being composed — a member and its
+    /// fee receipt — so it reaches a `TxOutcome` and the receipt root. What
+    /// decides it is which tick holds the member and whether a
+    /// certificate of this shard's covers it, and both are composition's
+    /// output: a replay that composed nothing there would have to assert
+    /// them, and either answer diverges from the replica that never went
+    /// down.
     #[test]
-    fn a_member_a_replay_could_not_recompose_is_never_abandoned() {
+    fn a_replay_abandons_what_a_seated_replica_at_the_same_frontier_does() {
         let schedule = make_test_topology();
         let held = test_transaction(1);
+        let held_hash = held.hash();
+        let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
         let committing = make_live_block(
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
             vec![Arc::new(held)],
         );
+
+        // The replica that was seated when the block committed.
+        let mut seated = make_test_state();
+        seated.on_block_committed(&schedule, &test_certify(seed, 1_000));
+        seated.on_block_committed(&schedule, &test_certify(committing.clone(), 2_000));
+
+        // The replica restarted with the store no longer able to anchor a
+        // baseline at the committing height.
         let recovered = RecoveredState {
             committed_height: BlockHeight::new(2),
             replay: ReplayWindow {
@@ -7239,10 +7228,22 @@ mod tests {
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
 
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
-        let outcomes = abandonment_vote(&mut restarted, &schedule, 3, deadline_ms);
-        assert!(
-            outcomes.is_empty(),
-            "the fate arrives as committed content, not as a verdict of ours",
+        let aborted = |outcomes: Vec<TxOutcome>| {
+            outcomes
+                .into_iter()
+                .map(|outcome| outcome.tx_hash())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            aborted(abandonment_vote(&mut seated, &schedule, 3, deadline_ms)),
+            vec![held_hash],
+            "fixture precondition: past the deadline the seated replica abandons it",
+        );
+        assert_eq!(
+            aborted(abandonment_vote(&mut restarted, &schedule, 3, deadline_ms)),
+            vec![held_hash],
+            "and the restarted one abandons it too, or the ticks the two \
+             compose carry different receipt roots",
         );
     }
 

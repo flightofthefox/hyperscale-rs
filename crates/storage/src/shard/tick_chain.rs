@@ -120,9 +120,9 @@ pub enum TickResolution {
     /// that committed it.
     ///
     /// A replay reaches further back than the store answers a historical
-    /// read at, so the blocks below that reach are folded and no tick is
-    /// composed from them. What such a tick left is still owed to every
-    /// tick the replay *does* compose below the height it settled at —
+    /// read at, so the ticks below that reach compose and none of them
+    /// runs. What such a tick left is still owed to every tick the replay
+    /// *does* run below the height it settled at —
     /// the base does not carry it yet, and a baseline missing it is a
     /// baseline no other replica computed. The receipts state it exactly,
     /// so the entry is seated from them and stamped where they committed.
@@ -1106,10 +1106,10 @@ mod tests {
     /// it, and only below the height they committed at.
     ///
     /// The case is a replay reaching further back than the store answers
-    /// a historical read at: those blocks are folded and no tick is
-    /// composed from them, so a tick the replay does compose below the
-    /// height one of them settled at reads a baseline the base has not
-    /// caught up to. The receipts state what it is missing.
+    /// a historical read at: those ticks compose and none of them runs,
+    /// so a tick the replay does run below the height one of them settled
+    /// at reads a baseline the base has not caught up to. The receipts
+    /// state what it is missing.
     #[test]
     fn a_restored_tick_folds_until_the_base_carries_it() {
         let store = Arc::new(StubStore {

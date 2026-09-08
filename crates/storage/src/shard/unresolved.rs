@@ -152,18 +152,20 @@ pub struct ReplayWindow {
     /// tip, each with the provision bundles it carried reattached. Empty
     /// when nothing is owed an outcome.
     pub blocks: Vec<Verified<CertifiedBlock>>,
-    /// The lowest height the replay may compose a tick at: the first one
-    /// whose baseline — the settled state as of the height below it — the
-    /// store still answers for.
+    /// The lowest height the replay may *dispatch* a tick at: the first
+    /// one whose baseline — the settled state as of the height below it —
+    /// the store still answers for.
     ///
-    /// The replay has two reaches because it has two jobs. The ledger is
-    /// folded from every block above [`unresolved_replay_floor`], which
-    /// runs back as far as an undischarged record; a tick is composed
-    /// over a baseline, and a baseline is a historical read the store
-    /// retires at [`RETENTION_HORIZON`]. Below this, blocks are folded
-    /// and nothing is composed — which costs nothing, because a tick
-    /// composed there was taken by a fate the fold already reads off the
-    /// chain.
+    /// The replay has two reaches because it has two jobs. Composition
+    /// runs over every block above [`unresolved_replay_floor`], which
+    /// runs back as far as an undischarged record, because which tick
+    /// holds a member is what every replica of the shard has to agree on
+    /// whatever its own store still reaches; execution runs over a
+    /// baseline, and a baseline is a historical read the store retires at
+    /// [`RETENTION_HORIZON`]. Below this a tick composes and never runs,
+    /// which costs nothing: it was taken by a fate the replay reads off
+    /// the chain, and what it left is seated from the receipts that
+    /// committed it.
     pub compose_from: BlockHeight,
     /// The parent-QC weighted timestamp of the block *below* the first
     /// one replayed — the clock execution resumes at, so the block above
