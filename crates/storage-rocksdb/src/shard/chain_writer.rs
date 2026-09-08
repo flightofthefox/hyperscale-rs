@@ -6,7 +6,7 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    JmtSnapshot, ParentAnchor, ShardChainWriter, SweepRows, merge_writes_from_receipts, with_sweep,
+    JmtSnapshot, ParentAnchor, ShardChainWriter, SweepRows, settled_writes_at,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, StateRoot,
@@ -78,16 +78,8 @@ impl ShardChainWriter for RocksDbShardStorage {
         // The type says the baseline was fixed when it was made; which
         // block it was fixed at is this caller's to check, and a movement
         // resolved against any other is as wrong as one resolved live.
-        assert_eq!(
-            parent.state.anchor(),
-            parent.height,
-            "a movement's baseline is anchored at the wrong height",
-        );
-        let settled = with_sweep(
-            merge_writes_from_receipts(&settling, parent.state),
-            creations,
-            removals,
-        );
+        let settled =
+            settled_writes_at(&settling, parent.state, parent.height, creations, removals);
 
         let (computed_root, collected) = if parent.pending.is_empty() {
             put_at_version(

@@ -9,7 +9,7 @@ use hyperscale_storage::tree::{
 };
 use hyperscale_storage::{
     JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, covers_strictly_more,
-    holds_this_block_at, merge_writes_from_receipts, widest_tick_copies, with_sweep,
+    holds_this_block_at, settled_writes_at, widest_tick_copies,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, Finalization, PreparedCommit,
@@ -78,16 +78,8 @@ impl ShardChainWriter for SimShardStorage {
         // The type says the baseline was fixed when it was made; which
         // block it was fixed at is this caller's to check, and a movement
         // resolved against any other is as wrong as one resolved live.
-        assert_eq!(
-            parent.state.anchor(),
-            parent.height,
-            "a movement's baseline is anchored at the wrong height",
-        );
-        let settled = with_sweep(
-            merge_writes_from_receipts(&settling, parent.state),
-            creations,
-            removals,
-        );
+        let settled =
+            settled_writes_at(&settling, parent.state, parent.height, creations, removals);
 
         let (result_root, collected) = if parent.pending.is_empty() {
             put_at_version(

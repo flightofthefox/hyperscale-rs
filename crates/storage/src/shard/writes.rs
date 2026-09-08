@@ -6,13 +6,14 @@ use std::sync::Arc;
 use hyperscale_hbor::{from_slice, to_vec};
 use hyperscale_jmt::{Key as JmtKey, NibblePath};
 use hyperscale_types::{
-    Address, AddressClass, CollectionId, Compose, EntryKey, EntryLeaf, LocalKey, Movement,
-    ProtocolHasher, SettledEntries, SettledWrites, StateWrites, StoredReceipt, SubstateKey,
-    entry_leaf_key,
+    Address, AddressClass, BlockHeight, CollectionId, Compose, EntryKey, EntryLeaf, LocalKey,
+    Movement, ProtocolHasher, SettledEntries, SettledWrites, StateWrites, StoredReceipt,
+    SubstateKey, entry_leaf_key,
 };
 use hyperscale_vm_kernel::Substates;
 
 use crate::shard::store::Anchored;
+use crate::shard::sweep::with_sweep;
 use crate::tree::JmtSnapshot;
 
 /// Extract and merge the writes from stored receipts, resolving what
@@ -56,6 +57,45 @@ pub fn merge_writes_from_receipts(
     prior: &dyn Anchored,
 ) -> SettledWrites {
     settle_writes(&merge_receipts(receipts), prior)
+}
+
+/// Everything a prepared commit lands: the settling receipts resolved
+/// against the parent's baseline, plus the sweep's own creations and
+/// removals.
+///
+/// One resolution, feeding both the tree and the substate store — they
+/// commit the same values or they disagree about state. It happens once
+/// per block rather than per receipt because a receipt says what it
+/// moved, and two receipts moving one cell compose only once something
+/// has said what they moved from.
+///
+/// The one place either backend computes it, so a rule about how a
+/// block's writes settle cannot hold on one store and not the other.
+///
+/// # Panics
+///
+/// If `baseline` is not anchored at `parent_height`. The type says the
+/// baseline was fixed when it was made; which block it was fixed at is
+/// the caller's to have got right, and a movement resolved against any
+/// other is as wrong as one resolved live.
+#[must_use]
+pub fn settled_writes_at(
+    settling: &[StoredReceipt],
+    baseline: &dyn Anchored,
+    parent_height: BlockHeight,
+    creations: &[(SubstateKey, Vec<u8>)],
+    removals: &[SubstateKey],
+) -> SettledWrites {
+    assert_eq!(
+        baseline.anchor(),
+        parent_height,
+        "a movement's baseline is anchored at the wrong height",
+    );
+    with_sweep(
+        merge_writes_from_receipts(settling, baseline),
+        creations,
+        removals,
+    )
 }
 
 /// The receipts' writes folded in commit order, unresolved.
