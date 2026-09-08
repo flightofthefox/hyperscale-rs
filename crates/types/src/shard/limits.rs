@@ -35,6 +35,20 @@ pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 /// the removal side would leave a sweep that bounds ordinary operation
 /// and not the peak, which is not a bound.
 ///
+/// The rates bound the backlog; what sets the resident *level* is how
+/// long each family's cells live, and the two are independent. A cell
+/// created here is retired one grace past the window it was derived
+/// from, so the population a family contributes is this cap times its
+/// grace measured in transaction windows — about one for the nullifier
+/// and the committed cell, which take the default artifact grace, and
+/// about twelve for the crossing family, whose claim cell has to stay
+/// readable for the whole terminal evidence span or an inherited record
+/// becomes one nobody can dispose of. So the crossing family dominates
+/// the resident set by roughly an order of magnitude over the other two,
+/// by choice, and none of that reaches the rates: the cap rationed here
+/// is family-blind and per block, so a longer grace moves the level and
+/// leaves what a block may create and remove exactly where it was.
+///
 /// Three families are sweepable and share that capacity — the nullifier,
 /// the escrow claim (a reclaim's included) and the committed-transaction
 /// cell a core spanning more than one shard writes for each transaction
