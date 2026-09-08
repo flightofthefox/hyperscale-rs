@@ -5053,7 +5053,7 @@ impl ShardCoordinator {
                 parent_state_root,
                 parent_block_height,
                 parent_sweep_frontier,
-                creations: committed_cells_for(certified.block(), topology_schedule),
+                creations: committed_cells_for(certified.block()),
                 source,
                 witness,
             }
@@ -6283,10 +6283,7 @@ impl ShardCoordinator {
     /// [`VerificationPipeline::take_ready_state_root_verifications`] and
     /// resolves each against the chain view via
     /// [`VerificationPipeline::resolve_ready_state_root_verification`].
-    pub fn drain_ready_state_root_verifications(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-    ) -> Vec<ReadyStateRootVerification> {
+    pub fn drain_ready_state_root_verifications(&mut self) -> Vec<ReadyStateRootVerification> {
         let taken = self.verification.take_ready_state_root_verifications();
         if taken.is_empty() {
             return Vec::new();
@@ -6295,11 +6292,7 @@ impl ShardCoordinator {
         taken
             .into_iter()
             .filter_map(|pending| {
-                VerificationPipeline::resolve_ready_state_root_verification(
-                    &pending,
-                    &chain,
-                    topology_schedule,
-                )
+                VerificationPipeline::resolve_ready_state_root_verification(&pending, &chain)
             })
             .collect()
     }

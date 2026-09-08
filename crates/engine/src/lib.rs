@@ -39,7 +39,7 @@ pub mod legs;
 pub mod sharding;
 
 pub use batch::{TickBatchContext, TickEnvironment, TickTxInput};
-pub use committed::{committed_cells, writes_committed_cell};
+pub use committed::committed_cells;
 pub use executor::{
     Executor, artifact_package, build_fee_receipt, instance_of_record, protocol_hash, publish_work,
 };

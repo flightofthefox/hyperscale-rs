@@ -41,20 +41,15 @@ pub fn anchor_trie(schedule: &TopologySchedule, anchor: WeightedTimestamp) -> Sh
 
 /// The committed cells `block` writes.
 ///
-/// One per transaction it carries whose core spans more than one shard,
-/// the block's own among them, classified under the trie of the window
-/// the block is anchored in. Which transactions write a cell is a fact
-/// of placement, so every reader of the block's root — the proposer's
-/// voters, a replica committing it on its certificate alone, a split
-/// child following it — derives the set here, under the one trie.
+/// One per transaction it carries, under the block's own shard. Every
+/// reader of the block's root — the proposer's voters, a replica
+/// committing it on its certificate alone, a split child following it —
+/// derives the same set from the same two facts, and no window enters
+/// it.
 #[must_use]
-pub fn committed_cells_for(
-    block: &Block,
-    schedule: &TopologySchedule,
-) -> Vec<(SubstateKey, Vec<u8>)> {
+pub fn committed_cells_for(block: &Block) -> Vec<(SubstateKey, Vec<u8>)> {
     committed_cells(
         block.header().shard_id(),
-        &anchor_trie(schedule, block.header().parent_qc().weighted_timestamp()),
         block.transactions().iter().map(|tx| tx.as_unverified()),
     )
 }
@@ -1850,7 +1845,6 @@ impl VerificationPipeline {
     pub(crate) fn resolve_ready_state_root_verification(
         pending: &PendingStateRootVerification,
         chain: &ChainView<'_>,
-        topology_schedule: &TopologySchedule,
     ) -> Option<ReadyStateRootVerification> {
         let block = chain.get_block(pending.block_hash).or_else(|| {
             debug!(
@@ -1864,7 +1858,7 @@ impl VerificationPipeline {
             block.certificates().iter().cloned().collect();
         let block_tx_hashes: Vec<TxHash> =
             block.transactions().iter().map(|tx| tx.hash()).collect();
-        let creations = committed_cells_for(block, topology_schedule);
+        let creations = committed_cells_for(block);
         Some(ReadyStateRootVerification {
             block_hash: pending.block_hash,
             parent_block_hash: pending.parent_block_hash,
@@ -2601,11 +2595,7 @@ mod tests {
         let out: Vec<_> = taken
             .into_iter()
             .filter_map(|pending| {
-                VerificationPipeline::resolve_ready_state_root_verification(
-                    &pending,
-                    &chain,
-                    &dummy_schedule(&TestCommittee::new(4, 7).topology_snapshot(1)),
-                )
+                VerificationPipeline::resolve_ready_state_root_verification(&pending, &chain)
             })
             .collect();
         assert_eq!(out.len(), 1);
@@ -2667,11 +2657,7 @@ mod tests {
             .take_ready_state_root_verifications()
             .into_iter()
             .filter_map(|pending| {
-                VerificationPipeline::resolve_ready_state_root_verification(
-                    &pending,
-                    &chain,
-                    &dummy_schedule(&TestCommittee::new(4, 7).topology_snapshot(1)),
-                )
+                VerificationPipeline::resolve_ready_state_root_verification(&pending, &chain)
             })
             .collect();
         assert_eq!(resolved.len(), 1);
@@ -2709,11 +2695,7 @@ mod tests {
             .take_ready_state_root_verifications()
             .into_iter()
             .filter_map(|pending| {
-                VerificationPipeline::resolve_ready_state_root_verification(
-                    &pending,
-                    &chain,
-                    &dummy_schedule(&TestCommittee::new(4, 7).topology_snapshot(1)),
-                )
+                VerificationPipeline::resolve_ready_state_root_verification(&pending, &chain)
             })
             .count();
         assert_eq!(

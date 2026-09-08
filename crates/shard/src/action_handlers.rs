@@ -257,13 +257,8 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         parent_qc.weighted_timestamp(),
     );
     // What the chain writes of its own accord: a committed-transaction
-    // cell for each transaction whose core spans more than one shard,
-    // this one among them.
-    let creations = committed_cells(
-        local_shard,
-        topology_snapshot.shard_trie(),
-        transactions.iter().map(|tx| &***tx),
-    );
+    // cell for every transaction the block carries.
+    let creations = committed_cells(local_shard, transactions.iter().map(|tx| &***tx));
     let (state_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
         ParentAnchor {
             state_root: parent_state_root,

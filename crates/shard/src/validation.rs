@@ -962,9 +962,9 @@ mod tests {
     #[test]
     fn a_block_may_create_sweepable_cells_up_to_the_cap() {
         // Each fully composed transaction creates its subintents'
-        // nullifiers, all on this one shard; its core is this shard
-        // alone, so the chain writes no committed cell for it.
-        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / MAX_SUBINTENTS;
+        // nullifiers, all on this one shard, and its committed cell
+        // beside them.
+        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / (MAX_SUBINTENTS + 1);
         let mut txs: Vec<Arc<Verifiable<Transaction>>> = (0..full)
             .map(|i| {
                 Arc::new(Verifiable::from(test_utils::stub_transaction_binding(
@@ -988,8 +988,8 @@ mod tests {
         let err = admit(&plain(), &over).expect_err("past the cap is refused");
         assert!(err.contains("sweepable cells"), "{err}");
 
-        // A block that binds nothing creates nothing, whatever else it
-        // carries — the common case must not pay for this rule.
+        // A block that binds nothing creates only its transactions'
+        // committed cells — the common case must not pay for this rule.
         let binding_nothing = block_with_transactions(BlockHeight::new(3), vec![tx(1)]);
         assert!(admit(&plain(), &binding_nothing).is_ok());
     }

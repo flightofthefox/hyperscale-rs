@@ -23,7 +23,6 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use hyperscale_engine::writes_committed_cell;
 use hyperscale_types::{
     AbandonmentRecord, BlockHash, BlockHeight, CounterpartEvidence, Finalization, FinalizationHash,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK, MAX_TXS_PER_BLOCK,
@@ -280,15 +279,11 @@ impl<'p> Section for TransactionsSection<'p> {
                 ));
             }
         }
-        let sweepable = fold.sweepable.saturating_add(
-            tx.sweepable_writes_on(trie, ctx.local_shard)
-                + usize::from(writes_committed_cell(
-                    tx.legs(),
-                    tx.owners(),
-                    trie,
-                    ctx.local_shard,
-                )),
-        );
+        // The committed cell is one per transaction, so the term is a
+        // constant rather than a reading of where the shape sits.
+        let sweepable = fold
+            .sweepable
+            .saturating_add(tx.sweepable_writes_on(trie, ctx.local_shard) + 1);
         if !sweep_admits_block(sweepable) {
             return Err(format!(
                 "transaction {tx_hash} carries the block past the per-block cap on sweepable cells"

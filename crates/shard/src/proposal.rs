@@ -1105,13 +1105,13 @@ mod tests {
                 stub_transaction_binding(seed, bound, range),
             ))
         };
-        // Fill the cap exactly, then offer one that cannot fit followed
-        // by one that can. Skipping rather than stopping is what keeps a
-        // large composition from starving the small ones behind it.
-        // Each fully composed transaction creates its subintents'
-        // nullifiers, all on this one shard; its core is this shard
-        // alone, so the chain writes no committed cell for it.
-        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / MAX_SUBINTENTS;
+        // Fill the cap, then offer one that cannot fit followed by one
+        // that can. Skipping rather than stopping is what keeps a large
+        // composition from starving the small ones behind it. Each fully
+        // composed transaction creates its subintents' nullifiers, all
+        // on this one shard, and its committed cell beside them — which
+        // every transaction writes, so the smallest one still costs one.
+        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / (MAX_SUBINTENTS + 1);
         let mut txs: Vec<Arc<Verified<Transaction>>> = (0..full)
             .map(|i| {
                 binding(

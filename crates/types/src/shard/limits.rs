@@ -45,15 +45,15 @@ pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 /// readable for the whole terminal evidence span or an inherited record
 /// becomes one nobody can dispose of. So the crossing family dominates
 /// the resident set by roughly an order of magnitude over the other two,
+/// even though the committed cell is the one every transaction writes,
 /// by choice, and none of that reaches the rates: the cap rationed here
 /// is family-blind and per block, so a longer grace moves the level and
 /// leaves what a block may create and remove exactly where it was.
 ///
 /// Three families are sweepable and share that capacity — the nullifier,
 /// the escrow claim (a reclaim's included) and the committed-transaction
-/// cell a core spanning more than one shard writes for each transaction
-/// it carries — because the removal capacity they draw on is one
-/// capacity. A budget per family would cost throughput as well as
+/// cell a shard writes for every transaction it commits — because the
+/// removal capacity they draw on is one capacity. A budget per family would cost throughput as well as
 /// counters: a block could be invalid on one family's peak while the
 /// shared walk had room.
 ///
@@ -66,14 +66,14 @@ pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 ///
 /// Counted per shard, since that is where a cell lands and where the
 /// sweep that retires it runs: a transaction's kernel cells whose owner
-/// the shard holds, plus the committed cell where the shard is one of a
-/// multi-shard core. Sized at three times [`MAX_TXS_PER_BLOCK`] so a
-/// full block of any shape the corpus produces stays admissible on its
-/// busiest shard — a transfer's payer writes the record, one; a swap's
-/// caller adds the claim of what the venue issued, two; a liquidity
-/// provider paying two resources writes two records and one claim,
-/// three; a venue on a route's two-shard core writes the claim of what
-/// arrived and the committed cell, two. A bound subintent adds its
+/// the shard holds, plus its committed cell, which every shard writes
+/// for every transaction it commits. Sized at four times
+/// [`MAX_TXS_PER_BLOCK`] so a full block of any shape the corpus
+/// produces stays admissible on its busiest shard — every transaction
+/// carries its committed cell, so a transfer's payer writes that and the
+/// record, two; a swap's caller adds the claim of what the venue issued,
+/// three; a liquidity provider paying two resources writes two records
+/// and one claim beside it, four. A bound subintent adds its
 /// nullifier on its signer's shard, so a subintent-heavy block packs
 /// fewer transactions, which is the trade the figure already made when
 /// nullifiers were the only family. Nothing else in the block budget
@@ -81,7 +81,7 @@ pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 /// a signature, so the work budget admits thirty-two of them per
 /// transaction and the creation ceiling would otherwise sit two orders
 /// of magnitude above any removal count a block can carry.
-pub const MAX_SWEEPABLE_CREATED_PER_BLOCK: usize = 3 * MAX_TXS_PER_BLOCK;
+pub const MAX_SWEEPABLE_CREATED_PER_BLOCK: usize = 4 * MAX_TXS_PER_BLOCK;
 
 /// Hard cap on the cells one block's sweep may remove.
 ///

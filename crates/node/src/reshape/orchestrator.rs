@@ -1229,7 +1229,7 @@ impl ReshapeOrchestrator {
                     });
                 }
                 if let Some(block) = tail.take_apply() {
-                    let creations = committed_cells_for(&block, view.schedule());
+                    let creations = committed_cells_for(&block);
                     out.push(ReshapeRequest::ApplyFollow {
                         shard: child,
                         block,
