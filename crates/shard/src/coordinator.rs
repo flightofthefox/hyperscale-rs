@@ -11404,6 +11404,42 @@ mod tests {
 
     /// The figures each name restates are checked off the committed body
     /// by a delegated verification, whose three answers fold in
+    /// A block whose anchor no retained window carries defers the check
+    /// rather than answering it.
+    ///
+    /// The trie is what a delivery is classified against, and a stand-in
+    /// is not neutral: under one shard nothing classifies as delivering
+    /// here, so no delivery reads as lapsed and the block passes the arm
+    /// that keeps a crossing from being claimed after its issuer may
+    /// have taken it back. The mark is not taken either, so the next
+    /// re-drive asks again once the beacon has caught up.
+    #[test]
+    fn a_block_anchored_outside_every_window_defers_its_resolutions_check() {
+        let sched = make_terminating_schedule(4);
+        let block = block_with_records(
+            50_000,
+            vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")],
+        );
+        let block_hash = block.hash();
+
+        let mut coord = fence_coordinator();
+        install_complete_block(&mut coord, &block);
+        let actions = coord
+            .verification
+            .initiate_resolutions_verification(block_hash, &block, &sched);
+
+        assert!(
+            actions.is_empty(),
+            "nothing is checked against a window nobody holds: {actions:?}",
+        );
+        assert!(
+            !coord
+                .verification
+                .is_root_in_flight(block_hash, VerificationKind::Resolutions),
+            "and the mark is left for the re-drive to take",
+        );
+    }
+
     /// differently: exact verifies the check, wrong refuses the block, and
     /// unknown clears the check's in-flight mark — the block pending, the
     /// vote deferred, and the check dispatched again on the next re-drive.

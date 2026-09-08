@@ -30,12 +30,18 @@ use crate::pending::{PendingBlock, PendingBlocks};
 use crate::proposal::late_deliveries;
 
 /// The trie of `anchor`'s window, which a delivered body is classified
-/// against. A block anchored in a window nobody retains is refused on
-/// other grounds, and its deliveries go unchecked under the root trie.
-pub fn anchor_trie(schedule: &TopologySchedule, anchor: WeightedTimestamp) -> ShardTrie {
+/// against, or `None` where no retained window carries the anchor.
+///
+/// A stand-in trie would not be a neutral answer. Under one shard every
+/// prefix resolves to it, so no body classifies as delivering here, no
+/// delivery is ever read as lapsed, and the block passes the arm the
+/// abandonment fence rests on — a permissive answer to the question that
+/// keeps a crossing from being claimed after its issuer may have taken it
+/// back. A window this cannot read is one to wait for.
+pub fn anchor_trie(schedule: &TopologySchedule, anchor: WeightedTimestamp) -> Option<ShardTrie> {
     match schedule.lookup(anchor) {
-        ScheduleLookup::Committee(snapshot) => snapshot.shard_trie().clone(),
-        _ => ShardTrie::single(),
+        ScheduleLookup::Committee(snapshot) => Some(snapshot.shard_trie().clone()),
+        _ => None,
     }
 }
 
@@ -990,7 +996,17 @@ impl VerificationPipeline {
         schedule: &TopologySchedule,
     ) -> Vec<Action> {
         let anchor = block.header().parent_qc().weighted_timestamp();
-        let trie = anchor_trie(schedule, anchor);
+        // No window, no check: the mark is not taken and no action goes
+        // out, so the block stays pending and the next re-drive asks
+        // again — the same shape an unknown name takes.
+        let Some(trie) = anchor_trie(schedule, anchor) else {
+            warn!(
+                ?block_hash,
+                ?anchor,
+                "Deferring resolutions verification — no retained window carries the anchor"
+            );
+            return Vec::new();
+        };
         let entries: Vec<UnsettledTx> = block
             .abandonment_records()
             .iter()
