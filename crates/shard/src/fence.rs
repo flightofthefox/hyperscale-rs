@@ -23,7 +23,7 @@ use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_metrics::record_verdict_claim_deferred;
 use hyperscale_types::{
     AbandonmentRecord, Block, CounterpartEvidence, CounterpartMirror, Heard, ProvenAnchors,
-    Question, SettledSetVerdict, ShardId, StateProofBundle, TopologySchedule, TxClaim, UnsettledTx,
+    Question, SettledSetVerdict, ShardId, StateProofBundle, TopologySchedule, UnsettledTx,
     WeightedTimestamp, Word, settled_set_verdict,
 };
 
@@ -84,7 +84,7 @@ impl VoteFence<'_> {
     pub fn judge(&self, schedule: &TopologySchedule, block: &Block) -> Result<(), Withheld> {
         let anchored_wt = block.header().parent_qc().weighted_timestamp();
         self.finalizations(schedule, block, anchored_wt)?;
-        self.records(schedule, block, anchored_wt)?;
+        self.records(block)?;
         self.state_proofs(block)?;
         self.precut(block)
     }
@@ -150,16 +150,11 @@ impl VoteFence<'_> {
     ///
     /// The first record whose evidence this validator contradicts or
     /// has not mirrored.
-    pub fn records(
-        &self,
-        schedule: &TopologySchedule,
-        block: &Block,
-        anchored_wt: WeightedTimestamp,
-    ) -> Result<(), Withheld> {
+    pub fn records(&self, block: &Block) -> Result<(), Withheld> {
         block
             .abandonment_records()
             .iter()
-            .try_for_each(|verdict| self.record_stands(schedule, anchored_wt, verdict))
+            .try_for_each(|verdict| self.record_stands(verdict))
     }
 
     /// Whether one record's evidence stands for this validator, on the
@@ -167,17 +162,13 @@ impl VoteFence<'_> {
     /// own ledger and the departed shard's settled set; what a shard was
     /// heard to say is checked against this validator's own mirror of
     /// it, equality on the word and the moment.
-    fn record_stands(
-        &self,
-        schedule: &TopologySchedule,
-        anchored_wt: WeightedTimestamp,
-        verdict: &AbandonmentRecord,
-    ) -> Result<(), Withheld> {
+    fn record_stands(&self, verdict: &AbandonmentRecord) -> Result<(), Withheld> {
         match verdict.evidence() {
             CounterpartEvidence::Departed { .. } => self.departure_stands(verdict),
-            CounterpartEvidence::Heard(heard) => verdict.unsettled().iter().try_for_each(|entry| {
-                self.heard_stands(schedule, anchored_wt, verdict.shard(), entry, heard)
-            }),
+            CounterpartEvidence::Heard(heard) => verdict
+                .unsettled()
+                .iter()
+                .try_for_each(|entry| self.heard_stands(verdict.shard(), entry, heard)),
         }
     }
 
@@ -250,8 +241,6 @@ impl VoteFence<'_> {
     /// claim would be, at the block's anchor.
     fn heard_stands(
         &self,
-        schedule: &TopologySchedule,
-        anchored_wt: WeightedTimestamp,
         shard: ShardId,
         entry: &UnsettledTx,
         heard: Heard,
@@ -293,34 +282,6 @@ impl VoteFence<'_> {
                      has not mirrored",
                     entry.tx_hash
                 )));
-            }
-        }
-        if heard.question == Question::Verdict && matches!(heard.word, Word::Accepted { .. }) {
-            let verdict = self.evidence.with_settled(|settled| {
-                settled_set_verdict(
-                    settled,
-                    schedule,
-                    self.local_shard,
-                    anchored_wt,
-                    [(shard, entry.tx_hash, TxClaim::Settled)],
-                )
-            });
-            match verdict {
-                SettledSetVerdict::Pass => {}
-                SettledSetVerdict::Defer => {
-                    return Err(Withheld::deferred(format!(
-                        "abandonment record takes an acceptance of {shard:?} for {} as settled \
-                         while its termination is scheduled and its settled set unknown",
-                        entry.tx_hash
-                    )));
-                }
-                SettledSetVerdict::Reject => {
-                    return Err(Withheld::Refused(format!(
-                        "abandonment record takes an acceptance of {shard:?} for {} as settled, \
-                         which its settled set contradicts",
-                        entry.tx_hash
-                    )));
-                }
             }
         }
         Ok(())

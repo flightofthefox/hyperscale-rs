@@ -90,11 +90,20 @@ impl CounterpartMirror {
     /// `true` when this is the first word held for the question — a
     /// second certificate or proof restates an answer already mirrored.
     ///
+    /// What is mirrored is what a record may carry, which is why a word
+    /// that is not well formed for its question is refused here rather
+    /// than filtered at each reader: the fence compares a record against
+    /// this, so a word that could never be in a record has no business
+    /// being in the mirror it is compared to.
+    ///
     /// # Panics
     ///
     /// If the lock is poisoned, which means a consumer panicked holding
     /// it — the node is already unsound at that point.
     pub fn record(&self, tx_hash: TxHash, shard: ShardId, heard: Heard) -> bool {
+        if !heard.is_well_formed() {
+            return false;
+        }
         let key = (tx_hash, shard, heard.question);
         let vacant = {
             let mut mirrored = self.write();

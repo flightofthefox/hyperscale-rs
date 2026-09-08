@@ -1114,7 +1114,7 @@ impl ExecutionCoordinator {
                 match record.answer {
                     Some(Word::Present) => Some(Licence::Accepted),
                     Some(Word::Absent) => Some(Licence::Unclaimed),
-                    Some(Word::Accepted { .. } | Word::Refused { .. }) | None => None,
+                    Some(Word::Refused { .. }) | None => None,
                 }
             };
             let Some(licence) = licence else {
@@ -7643,19 +7643,14 @@ mod tests {
             Some(anchor),
         );
 
-        // An acceptance settles the transaction and licenses no record,
-        // so it never reaches the mirror at all.
+        // A claiming success licenses no record, so it never reaches
+        // the mirror at all.
         let mut fresh = make_test_state_for_shard(ValidatorId::new(0), HOME);
         fresh
             .counterparts
             .ledger
             .register_committed(HOME, [(&transaction, &Classified::whole())]);
-        assert!(
-            fresh
-                .counterparts
-                .fold_verdict(PEER, tx_hash, accepted(anchor, digest))
-                .is_empty(),
-        );
+        assert!(fresh.counterparts.fold_claimed(PEER, tx_hash).is_empty());
         assert!(fresh.counterparts.mirror.all().is_empty());
     }
 
@@ -7986,15 +7981,6 @@ mod tests {
                 decision: TransactionDecision::Reject,
                 digest,
             },
-            at,
-        }
-    }
-
-    /// An acceptance at `at`, by the certificate `digest` names.
-    fn accepted(at: WeightedTimestamp, digest: Hash) -> Heard {
-        Heard {
-            question: Question::Verdict,
-            word: Word::Accepted { digest },
             at,
         }
     }

@@ -27,6 +27,28 @@ use crate::{
 /// Domain tag separating a certificate's attested digest from every
 /// other preimage the codebase hashes.
 const CERTIFICATE_DIGEST_TAG: &[u8] = b"hyperscale.execution_certificate.attested.v1";
+/// What a certificate says of one transaction, as a counterpart hears
+/// it.
+///
+/// Two shapes because they are two different things, and the record
+/// vocabulary holds only one of them. A refusal is evidence: the
+/// counterpart ended the transaction on its shard, and a record may
+/// carry that word. A claiming success is a cue: it says the
+/// counterpart's execution went through, not that it wrote the claim
+/// the success promises — its own finalization can still be refused
+/// afterwards — so what a record stands on is the claim cell proved
+/// present, and the certificate only opens the question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spoken {
+    /// The counterpart refused it, at the vote anchor, named by the
+    /// attested digest.
+    Refused(Heard),
+    /// The counterpart's execution claimed, in a role that claims.
+    Claimed {
+        /// The vote anchor the certificate speaks at.
+        at: WeightedTimestamp,
+    },
+}
 
 /// Aggregated certificate for an execution tick.
 ///
@@ -407,8 +429,7 @@ impl ExecutionCertificate {
     }
 
     /// What this certificate says of each transaction, as a counterpart
-    /// hears it: an acceptance or a refusal, at the vote anchor, named
-    /// by the attested digest.
+    /// hears it.
     ///
     /// A success speaks only in a role that claims. A leg's success is
     /// its own side going through, which says nothing about the crossings
@@ -416,32 +437,33 @@ impl ExecutionCertificate {
     /// take it for the claim its record is held for. A refusal speaks
     /// whatever the role, since a member that could not do its part ends
     /// the transaction on its shard.
-    pub fn verdicts(&self) -> impl Iterator<Item = (TxHash, Heard)> + '_ {
+    pub fn verdicts(&self) -> impl Iterator<Item = (TxHash, Spoken)> + '_ {
         let digest = self.attested_digest();
         let at = self.vote_anchor_ts;
         self.tx_outcomes.iter().filter_map(move |outcome| {
-            let word = match outcome.outcome() {
+            let spoken = match outcome.outcome() {
                 ExecutionOutcome::Succeeded { .. } => outcome
                     .role()
                     .success_claims()
-                    .then_some(Word::Accepted { digest })?,
-                ExecutionOutcome::Failed => Word::Refused {
-                    decision: TransactionDecision::Reject,
-                    digest,
-                },
-                ExecutionOutcome::Aborted => Word::Refused {
-                    decision: TransactionDecision::Aborted,
-                    digest,
-                },
-            };
-            Some((
-                outcome.tx_hash(),
-                Heard {
+                    .then_some(Spoken::Claimed { at })?,
+                ExecutionOutcome::Failed => Spoken::Refused(Heard {
                     question: Question::Verdict,
-                    word,
+                    word: Word::Refused {
+                        decision: TransactionDecision::Reject,
+                        digest,
+                    },
                     at,
-                },
-            ))
+                }),
+                ExecutionOutcome::Aborted => Spoken::Refused(Heard {
+                    question: Question::Verdict,
+                    word: Word::Refused {
+                        decision: TransactionDecision::Aborted,
+                        digest,
+                    },
+                    at,
+                }),
+            };
+            Some((outcome.tx_hash(), spoken))
         })
     }
 
@@ -1165,7 +1187,7 @@ mod tests {
             )
             .as_role(Role::Leg),
         ];
-        let spoken: Vec<(TxHash, Word)> = ExecutionCertificate::new(
+        let spoken: Vec<(TxHash, Spoken)> = ExecutionCertificate::new(
             tick_id(),
             WeightedTimestamp::from_millis(11),
             compute_global_receipt_root(&outcomes),
@@ -1174,7 +1196,6 @@ mod tests {
             SignerBitfield::new(4),
         )
         .verdicts()
-        .map(|(tx_hash, heard)| (tx_hash, heard.word))
         .collect();
 
         assert_eq!(
@@ -1189,9 +1210,15 @@ mod tests {
             ],
             "the leg's success says nothing; its refusal still ends the transaction here",
         );
-        assert!(matches!(spoken[0].1, Word::Accepted { .. }));
-        assert!(matches!(spoken[1].1, Word::Accepted { .. }));
-        assert!(matches!(spoken[2].1, Word::Refused { .. }));
+        assert!(matches!(spoken[0].1, Spoken::Claimed { .. }));
+        assert!(matches!(spoken[1].1, Spoken::Claimed { .. }));
+        assert!(matches!(
+            spoken[2].1,
+            Spoken::Refused(Heard {
+                word: Word::Refused { .. },
+                ..
+            })
+        ));
     }
 
     /// A recipient party to nothing in the tick gets no certificate: an

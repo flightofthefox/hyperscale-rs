@@ -79,7 +79,7 @@ pub use crypto::keys::{ed25519_keypair_from_seed, generate_ed25519_keypair};
 pub use crypto::{Ed25519PrivateKey, MlDsa65PrivateKey, Secp256k1PrivateKey};
 pub use execution::computation::{tick_leader, tick_leader_at};
 pub use execution::execution_certificate::{
-    ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,
+    ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError, Spoken,
 };
 pub use execution::finalization::{
     Finalization, FinalizationContext, FinalizationVerifyError,

@@ -522,10 +522,8 @@ const fn decided_by(evidence: CounterpartEvidence) -> Option<TransactionDecision
             // says the consumer holds the crossing, which retires the
             // record and leaves the verdict to the core.
             (Question::Cell(Probed::Delivery), _)
-            | (Question::Verdict, Word::Accepted { .. } | Word::Absent | Word::Present)
-            | (Question::Cell(_), Word::Refused { .. } | Word::Accepted { .. } | Word::Present) => {
-                None
-            }
+            | (Question::Verdict, Word::Absent | Word::Present)
+            | (Question::Cell(_), Word::Refused { .. } | Word::Present) => None,
         },
     }
 }
@@ -633,14 +631,14 @@ impl UnresolvedTxs {
             .is_some_and(|core| core.contains(&shard))
     }
 
-    /// Whether a consumer's acceptance of `tx_hash` still wants writing
-    /// down: the entry is a leg's, no record has named `shard` as having
-    /// accepted, and no tick has taken the entry's records. Past any of
-    /// those an `Accepted` record adds nothing, and a proposer that kept
-    /// offering one would carry it into a block its voters can no longer
-    /// check, once their mirrors go with the entry.
+    /// Whether a consumer's claim of `tx_hash` still wants writing down:
+    /// the entry is a leg's, no record has named `shard` as having
+    /// claimed, and no tick has taken the entry's records. Past any of
+    /// those the record adds nothing, and a proposer that kept offering
+    /// one would carry it into a block its voters can no longer check,
+    /// once their mirrors go with the entry.
     #[must_use]
-    pub fn acceptance_unrecorded(&self, tx_hash: TxHash, shard: ShardId) -> bool {
+    pub fn claim_unrecorded(&self, tx_hash: TxHash, shard: ShardId) -> bool {
         self.owed.get(&tx_hash).is_some_and(|owed| {
             owed.part.is_leg()
                 && owed.covered.is_none()

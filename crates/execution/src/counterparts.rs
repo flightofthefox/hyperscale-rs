@@ -21,9 +21,9 @@ use hyperscale_types::{
     AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartEvidence, CounterpartMirror,
     Deadline, ExecutionCertificate, Heard, Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
     MAX_STATE_PROOFS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed,
-    ProvenAnchors, Question, SettledTxSet, ShardId, ShardTrie, StateProofBundle, SubstateKey,
-    TerminalEvidence, TopologySchedule, TransactionDecision, TxHash, TxResolution, UnsettledTx,
-    Verifiable, Verified, WeightedTimestamp, Word,
+    ProvenAnchors, Question, SettledTxSet, ShardId, ShardTrie, Spoken, StateProofBundle,
+    SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision, TxHash, TxResolution,
+    UnsettledTx, Verifiable, Verified, WeightedTimestamp, Word,
 };
 use hyperscale_vm_effects::CrossingCell;
 
@@ -580,7 +580,7 @@ impl Counterparts {
     /// the counterpart's own word, folded from the chain, so a replica
     /// that never heard the certificate broadcast holds it from the
     /// block alone.
-    fn fold_verdict_records(&mut self, block: &Block) -> Vec<Action> {
+    fn fold_verdict_records(&self, block: &Block) -> Vec<Action> {
         let mut actions = Vec::new();
         for record in block.abandonment_records() {
             if let CounterpartEvidence::Heard(heard) = record.evidence()
@@ -726,46 +726,48 @@ impl Counterparts {
     /// accepted, which is every core shard saying so. A consumer's
     /// acceptance keeps nothing: it opens the probe whose answer settles
     /// the record held for its claim.
-    pub fn fold_verdict(&mut self, shard: ShardId, tx_hash: TxHash, heard: Heard) -> Vec<Action> {
+    pub fn fold_verdict(&self, shard: ShardId, tx_hash: TxHash, heard: Heard) -> Vec<Action> {
         if shard == self.local_shard || heard.question != Question::Verdict {
             return Vec::new();
         }
-        let in_core = self.ledger.core_holds(tx_hash, shard);
-        let consumes = self.ledger.consumer_holds(tx_hash, shard);
-        let mut actions = Vec::new();
-        match heard.word {
-            Word::Accepted { .. } => {
-                // The cue, not the licence. A success says the
-                // counterpart's execution went through; whether it wrote
-                // the claim that success promises is a fact of its
-                // committed state, and its own finalization can still be
-                // refused afterwards. So the certificate opens the probe
-                // and the probe's answer is what a record stands on.
-                if consumes {
-                    self.ledger.cue_probe(tx_hash);
-                }
-                if in_core && self.ledger.record_acceptance(tx_hash, shard) {
-                    actions.push(Action::Continuation(ProtocolEvent::TransactionsResolved {
-                        resolutions: vec![(
-                            tx_hash,
-                            TxResolution::CoreDecided(TransactionDecision::Accept),
-                        )],
-                    }));
-                }
-            }
-            Word::Refused { decision, .. } => {
-                if in_core
-                    && self.ledger.unsettled_figures(tx_hash).is_some()
-                    && self.mirror.record(tx_hash, shard, heard)
-                {
-                    actions.push(Action::Continuation(ProtocolEvent::TransactionsResolved {
-                        resolutions: vec![(tx_hash, TxResolution::CoreDecided(decision))],
-                    }));
-                }
-            }
-            Word::Absent | Word::Present => {}
+        let Word::Refused { decision, .. } = heard.word else {
+            return Vec::new();
+        };
+        if self.ledger.core_holds(tx_hash, shard)
+            && self.ledger.unsettled_figures(tx_hash).is_some()
+            && self.mirror.record(tx_hash, shard, heard)
+        {
+            return vec![Action::Continuation(ProtocolEvent::TransactionsResolved {
+                resolutions: vec![(tx_hash, TxResolution::CoreDecided(decision))],
+            })];
         }
-        actions
+        Vec::new()
+    }
+
+    /// Fold a counterpart's claiming success: the cue to ask whether it
+    /// wrote the claim, and — where the shard is in the core — one more
+    /// core shard saying the transaction went through.
+    ///
+    /// Nothing is written down. A success is not evidence: its own
+    /// finalization can still be refused afterwards, so what a record
+    /// stands on is the claim cell proved present, and this only opens
+    /// the question.
+    pub fn fold_claimed(&mut self, shard: ShardId, tx_hash: TxHash) -> Vec<Action> {
+        if shard == self.local_shard {
+            return Vec::new();
+        }
+        if self.ledger.consumer_holds(tx_hash, shard) {
+            self.ledger.cue_probe(tx_hash);
+        }
+        if self.ledger.core_holds(tx_hash, shard) && self.ledger.record_acceptance(tx_hash, shard) {
+            return vec![Action::Continuation(ProtocolEvent::TransactionsResolved {
+                resolutions: vec![(
+                    tx_hash,
+                    TxResolution::CoreDecided(TransactionDecision::Accept),
+                )],
+            })];
+        }
+        Vec::new()
     }
 
     /// The proofs this validator's own fetches answered that no block
@@ -859,24 +861,14 @@ impl Counterparts {
         // spanning two satisfies the fence's equality check for neither,
         // and the rest waits a block. Nothing is offered beside a
         // departure, which answers for everything the shard was party
-        // to. An acceptance is offered until the chain has it written
-        // down and no longer: the mirror lives to the entry, and the
-        // entry to the retirement, so a record offered past its own
-        // commit could reach a block after the evidence every voter
-        // checks it against has gone.
+        // to. A presence is offered until the chain has it written down
+        // and no longer: the mirror lives to the entry, and the entry to
+        // the retirement, so a record offered past its own commit could
+        // reach a block after the evidence every voter checks it against
+        // has gone.
         let mut heard: HeardByQuestion = BTreeMap::new();
         for (tx_hash, shard, word) in self.mirror.all() {
-            // An acceptance is a cue and never evidence, so no record
-            // carries one — which is also why none of this has to ask
-            // whether the shard that spoke it can still be cut before
-            // its finalization lands. The presence its probe reads is a
-            // fact of committed state and needs no such holding.
-            if matches!(word.word, Word::Accepted { .. }) {
-                continue;
-            }
-            if matches!(word.word, Word::Present)
-                && !self.ledger.acceptance_unrecorded(tx_hash, shard)
-            {
+            if matches!(word.word, Word::Present) && !self.ledger.claim_unrecorded(tx_hash, shard) {
                 continue;
             }
             let Some(figures) = self.ledger.unsettled_figures(tx_hash) else {
@@ -957,8 +949,11 @@ impl Counterparts {
     pub fn on_certificate(&mut self, ec: &Arc<Verified<ExecutionCertificate>>) -> Vec<Action> {
         let shard = ec.shard_id();
         let mut actions = Vec::new();
-        for (tx_hash, heard) in ec.verdicts() {
-            actions.extend(self.fold_verdict(shard, tx_hash, heard));
+        for (tx_hash, spoken) in ec.verdicts() {
+            actions.extend(match spoken {
+                Spoken::Refused(heard) => self.fold_verdict(shard, tx_hash, heard),
+                Spoken::Claimed { .. } => self.fold_claimed(shard, tx_hash),
+            });
         }
         actions
     }

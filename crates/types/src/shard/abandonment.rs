@@ -285,11 +285,16 @@ impl Question {
 
 /// What a counterpart said in answer.
 ///
-/// A certificate answers a [`Question::Verdict`] with a refusal or an
-/// acceptance, named by its attested digest so a claim to it can be
-/// held to the copy a voter holds. A proof answers a [`Question::Cell`]
-/// either way: absent, and the crossing is the issuer's to take back;
-/// present, and the consumer has it.
+/// A certificate answers a [`Question::Verdict`] with a refusal, named
+/// by its attested digest so a claim to it can be held to the copy a
+/// voter holds. A proof answers a [`Question::Cell`] either way: absent,
+/// and the crossing is the issuer's to take back; present, and the
+/// consumer has it.
+///
+/// A success is not among them. What a certificate says of one is that
+/// the counterpart's execution went through, which is the cue to ask
+/// whether it wrote the claim that success promises — see
+/// [`Spoken`](crate::Spoken).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
 pub enum Word {
     /// The counterpart refused the transaction: a rejection or an abort.
@@ -298,11 +303,6 @@ pub enum Word {
         decision: TransactionDecision,
         /// The certificate's attested digest: its signed identity, which
         /// is copy-invariant where its wire hash is not.
-        digest: Hash,
-    },
-    /// The counterpart accepted it.
-    Accepted {
-        /// The certificate's attested digest.
         digest: Hash,
     },
     /// The probed cell was absent.
@@ -332,15 +332,9 @@ pub struct Heard {
 }
 
 impl Heard {
-    /// Whether the word answers the question in a form a record may
-    /// carry: a certificate speaks to a verdict, a proof to a cell, and
-    /// a refusal is never an acceptance.
-    ///
-    /// An acceptance is not among them. A certificate says the
-    /// counterpart's execution succeeded, which is the cue to ask
-    /// whether it claimed — not the answer. Its own finalization can
-    /// still be refused, and a record standing on it would retire a
-    /// crossing nobody ever took.
+    /// Whether the word answers the question: a certificate speaks to a
+    /// verdict, a proof to a cell, and a verdict a record may carry is
+    /// always a refusal.
     #[must_use]
     pub const fn is_well_formed(&self) -> bool {
         match (self.question, self.word) {
@@ -351,8 +345,8 @@ impl Heard {
                 )
             }
             (Question::Cell(_), Word::Absent | Word::Present) => true,
-            (Question::Verdict, Word::Accepted { .. } | Word::Absent | Word::Present)
-            | (Question::Cell(_), _) => false,
+            (Question::Verdict, Word::Absent | Word::Present)
+            | (Question::Cell(_), Word::Refused { .. }) => false,
         }
     }
 
@@ -750,7 +744,6 @@ mod tests {
             decision: TransactionDecision::Reject,
             digest,
         };
-        let accepted = Word::Accepted { digest };
         let arms = [
             CounterpartEvidence::Departed { terminal_wt: wt() },
             CounterpartEvidence::Heard(heard(Question::Verdict, refused)),
@@ -769,7 +762,6 @@ mod tests {
             heard(Question::Verdict, Word::Absent),
             heard(Question::Verdict, Word::Present),
             heard(Question::Cell(Probed::Core), refused),
-            heard(Question::Cell(Probed::Claim), accepted),
             heard(
                 Question::Verdict,
                 Word::Refused {
@@ -781,11 +773,6 @@ mod tests {
         for heard in malformed {
             assert!(!heard.is_well_formed(), "{heard:?}");
             assert!(!AbandonmentRecord::heard(ShardId::ROOT, heard, [tx(1)]).is_well_formed());
-        }
-        // An acceptance is the cue to ask and never an answer, so no
-        // record carries one however the question is put.
-        for question in Question::ALL {
-            assert!(!heard(question, accepted).is_well_formed());
         }
         assert!(
             !CounterpartEvidence::Heard(heard(Question::Cell(Probed::Claim), Word::Present))
