@@ -210,17 +210,6 @@ impl Owed {
         let opens = self.opens();
         opens..opens.plus(MAX_VALIDITY_RANGE)
     }
-
-    /// Whether `shard`, leaving at `cut`, was party to this entry: it
-    /// owned one of the entry's remote prefixes, and the transaction
-    /// committed before it left.
-    fn party_to(&self, shard: ShardId, cut: WeightedTimestamp) -> bool {
-        cut > self.figures.first_commit()
-            && self
-                .remote_prefixes
-                .iter()
-                .any(|prefix| ShardTrie::shard_owns_prefix(shard, *prefix))
-    }
 }
 
 /// Where a departed participant's chain ended, and how long what it left
@@ -1068,7 +1057,7 @@ impl UnresolvedTxs {
                 owed.certified
                     && !matches!(owed.part, Part::Remainder(_))
                     && owed.covered.is_none()
-                    && owed.party_to(shard, cut)
+                    && self.party_to_entry(owed, shard, cut)
             })
             .map(|(_, owed)| owed.figures.clone())
             .collect()
@@ -1084,7 +1073,7 @@ impl UnresolvedTxs {
     pub fn party_to(&self, shard: ShardId, cut: WeightedTimestamp) -> BTreeSet<TxHash> {
         self.owed
             .iter()
-            .filter(|(_, owed)| owed.party_to(shard, cut))
+            .filter(|(_, owed)| self.party_to_entry(owed, shard, cut))
             .map(|(tx_hash, _)| *tx_hash)
             .collect()
     }
@@ -1166,13 +1155,34 @@ impl UnresolvedTxs {
     /// earlier ones belong to shards that were already gone and so never
     /// held it, and later ones to successors that never did either. `None`
     /// while the prefix is still owned by the shard that owned it then.
-    fn departure_over(&self, owed: &Owed, prefix: Address) -> Option<Departure> {
+    fn departure_over(&self, owed: &Owed, prefix: Address) -> Option<(ShardId, Departure)> {
         self.departed
             .iter()
             .filter(|(shard, _)| ShardTrie::shard_owns_prefix(**shard, prefix))
             .filter(|(_, departure)| departure.cut > owed.figures.first_commit())
-            .map(|(_, departure)| *departure)
-            .min_by_key(|departure| departure.cut)
+            .min_by_key(|(_, departure)| departure.cut)
+            .map(|(shard, departure)| (*shard, *departure))
+    }
+
+    /// Whether `shard`, leaving at `cut`, was party to `owed`: it held
+    /// one of the entry's remote prefixes when the transaction
+    /// committed, and left afterwards.
+    ///
+    /// Owning the prefix and leaving after the commit is not enough. A
+    /// successor owns its predecessor's keyspace, so two cuts over one
+    /// prefix inside one entry's life would name the entry to both,
+    /// where [`Self::departure_over`] reads only the first — and the
+    /// second departure would abandon what the first already settled.
+    /// The shard a record may name is the one that held the prefix
+    /// then, which is the earliest departure over it after the commit.
+    fn party_to_entry(&self, owed: &Owed, shard: ShardId, cut: WeightedTimestamp) -> bool {
+        cut > owed.figures.first_commit()
+            && owed.remote_prefixes.iter().any(|prefix| {
+                ShardTrie::shard_owns_prefix(shard, *prefix)
+                    && self
+                        .departure_over(owed, *prefix)
+                        .is_none_or(|(_, first)| first.cut >= cut)
+            })
     }
 
     /// The shards that could hold a certificate of ours for `tx_hash` —
@@ -1410,9 +1420,10 @@ impl UnresolvedTxs {
                         return false;
                     }
                     let answerable = owed.remote_prefixes.iter().any(|prefix| {
-                        self.departure_over(owed, *prefix).is_none_or(|departure| {
-                            departure.readable_until.is_none_or(|until| now <= until)
-                        })
+                        self.departure_over(owed, *prefix)
+                            .is_none_or(|(_, departure)| {
+                                departure.readable_until.is_none_or(|until| now <= until)
+                            })
                     });
                     // Having counterparts at all is what makes silence mean
                     // something: a transaction that never left this shard has
@@ -1523,6 +1534,11 @@ mod tests {
 
     /// The depth-1 shard owning every `AWAY`-topped prefix.
     const PARTNER: ShardId = ShardId::leaf(1, 1);
+
+    /// The depth-2 shard that takes the right half of `PARTNER`'s
+    /// keyspace when it splits, and so owns the prefixes `tx(30)`
+    /// reaches after `PARTNER` is gone.
+    const SUCCESSOR: ShardId = ShardId::leaf(2, 3);
 
     /// A shape frozen divided with an inbound leg on `LOCAL` feeding a
     /// core on `PARTNER`.
@@ -1797,6 +1813,45 @@ mod tests {
 
         ledger.prune(expiry(cut).plus(Duration::from_millis(1)));
         assert_eq!(ledger.len(), 0, "and never again past it");
+    }
+
+    /// Two cuts over one prefix inside one entry's life name the entry
+    /// to the shard that held the prefix when it committed, and to
+    /// nothing else. A successor inherits the keyspace, not the
+    /// business: a record naming it would abandon what the first
+    /// departure had already settled.
+    #[test]
+    fn only_the_shard_holding_the_prefix_at_the_commit_is_party_to_the_entry() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(30, 60_000);
+        assert!(
+            tx.routing()
+                .all_prefixes()
+                .iter()
+                .any(|prefix| ShardTrie::shard_owns_prefix(SUCCESSOR, *prefix)),
+            "the fixture reaches a prefix both departures own",
+        );
+        commit(&mut ledger, &tx);
+        ledger.certify(tx.hash());
+
+        let first = ms(200_000);
+        let second = ms(800_000);
+        ledger.record_terminal(PARTNER, first, None);
+        ledger.record_terminal(SUCCESSOR, second, None);
+
+        assert_eq!(
+            ledger.party_to(PARTNER, first),
+            BTreeSet::from([tx.hash()]),
+            "the shard that held the prefix then answers for the entry",
+        );
+        assert!(
+            ledger.party_to(SUCCESSOR, second).is_empty(),
+            "and its successor is a stranger to it",
+        );
+        assert!(
+            ledger.outstanding_with(SUCCESSOR, second).is_empty(),
+            "so the second cut is offered nothing to name",
+        );
     }
 
     /// The entry names itself on the way out, so its holder can let go of

@@ -9307,6 +9307,12 @@ mod tests {
     const HOME: ShardId = ShardId::leaf(1, 0);
     const PEER: ShardId = ShardId::leaf(1, 1);
 
+    /// Two peers holding a quarter of the keyspace each, neither an
+    /// ancestor of the other — the shape in which two departures can
+    /// both be party to one transaction.
+    const UPPER: ShardId = ShardId::leaf(2, 2);
+    const LOWER: ShardId = ShardId::leaf(2, 3);
+
     /// The two leaves a core of two shards spans, [`PEER`]'s children.
     /// A leg names the lower for the committed cell.
     const CORE: ShardId = ShardId::leaf(2, 2);
@@ -9511,6 +9517,98 @@ mod tests {
         (state, tick_id, tx_hash)
     }
 
+    /// A schedule in which two sibling peers leave at different cuts
+    /// while [`HOME`] runs on: [`UPPER`] at the end of epoch 0 and
+    /// [`LOWER`] at the end of epoch 1, each splitting into its own
+    /// children.
+    ///
+    /// Neither is an ancestor of the other, so a transaction reaching a
+    /// prefix of each is party to both departures — where a shard and
+    /// its descendant would leave only the first party to it.
+    fn siblings_terminating_schedule(epoch_duration_ms: u64) -> TopologySchedule {
+        let (upper_left, upper_right) = UPPER.children();
+        let (lower_left, lower_right) = LOWER.children();
+        let mut sched = TopologySchedule::new(
+            epoch_duration_ms,
+            Epoch::new(0),
+            leaves_snap(&[HOME, UPPER, LOWER], &[(UPPER, 0)]),
+        );
+        sched.insert(
+            Epoch::new(1),
+            leaves_snap_departed(
+                &[HOME, upper_left, upper_right, LOWER],
+                &[(LOWER, 1)],
+                &[(UPPER, None)],
+            ),
+        );
+        let post = leaves_snap_departed(
+            &[HOME, upper_left, upper_right, lower_left, lower_right],
+            &[],
+            &[(UPPER, None), (LOWER, None)],
+        );
+        for epoch in 2..=12u64 {
+            sched.insert(Epoch::new(epoch), Arc::clone(&post));
+        }
+        sched.set_head(post);
+        sched
+    }
+
+    /// A transaction paid for on [`HOME`] and writing to a prefix of
+    /// [`UPPER`] and one of [`LOWER`].
+    fn two_sided_transaction(seed: u8) -> Transaction {
+        test_transaction_with_prefixes(
+            &[seed & 0x7F],
+            &[test_prefix(seed & 0x7F)],
+            &[test_prefix((seed & 0x3F) | 0x80), test_prefix(seed | 0xC0)],
+        )
+    }
+
+    /// [`state_stranded_on`] for a transaction both sibling peers hold a
+    /// side of, at a frontier past both their cuts.
+    fn state_stranded_between(
+        topology_schedule: &TopologySchedule,
+        seed: u8,
+    ) -> (ExecutionCoordinator, TickId, TxHash) {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let tick_id = TickId::new(HOME, BlockHeight::new(1));
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(two_sided_transaction(seed)),
+        ));
+        let tx_hash = transaction.hash();
+        let mut tick = tick_holding(
+            tick_id,
+            WeightedTimestamp::from_millis(1_000),
+            vec![(
+                Arc::new(Verified::new_unchecked_for_test(two_sided_transaction(
+                    seed,
+                ))),
+                [HOME, UPPER, LOWER].into_iter().collect(),
+            )],
+        );
+        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::from_millis(1_000),
+                GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
+                vec![TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)],
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+        state.ticks.insert_tick(tick_id, tick);
+        state.ticks.assign_tx(tx_hash, tick_id);
+        state
+            .counterparts
+            .ledger
+            .register_committed(HOME, [(&transaction, &Classified::whole())]);
+        state.counterparts.ledger.certify(tx_hash);
+        state.committed_ts = WeightedTimestamp::from_millis(200_000);
+        state
+            .counterparts
+            .stamp_departures(topology_schedule, state.committed_ts);
+        (state, tick_id, tx_hash)
+    }
+
     /// While the counterpart is live the member stays with the tick that
     /// holds it. The counterpart's certificate is still to come, so the
     /// tick can yet speak for the member and a second verdict would
@@ -9647,18 +9745,18 @@ mod tests {
     /// take its iteration order.
     #[test]
     fn two_departures_over_one_transaction_share_the_block_s_budget() {
-        let sched = peer_terminating_schedule(60_000);
-        let (mut state, _, tx_hash) = state_stranded_on(&sched, 1);
-        let (peer_left, _) = PEER.children();
+        let sched = siblings_terminating_schedule(60_000);
+        let (mut state, _, tx_hash) = state_stranded_between(&sched, 1);
 
-        // Both cover the straddler's remote prefix — the bit test a shard
-        // and its descendant both pass — so both are party to it.
+        // Each peer held one of the transaction's two remote prefixes
+        // when it committed, so each is the shard a record over that
+        // prefix may name.
         let set = |cut_ms: u64| SettledTxSet {
             txs: BTreeSet::new(),
             terminal_wt: WeightedTimestamp::from_millis(cut_ms),
         };
-        state.record_settled_txs(&sched, peer_left, set(120_000));
-        state.record_settled_txs(&sched, PEER, set(60_000));
+        state.record_settled_txs(&sched, LOWER, set(120_000));
+        state.record_settled_txs(&sched, UPPER, set(60_000));
 
         let records = state.offers().abandonment_records;
         assert_eq!(
@@ -9666,7 +9764,7 @@ mod tests {
                 .iter()
                 .map(AbandonmentRecord::shard)
                 .collect::<Vec<_>>(),
-            vec![PEER, peer_left],
+            vec![UPPER, LOWER],
             "ascending by shard, whatever order the sets are held in",
         );
         let named: usize = records.iter().map(|r| r.unsettled().len()).sum();
@@ -9681,6 +9779,35 @@ mod tests {
         for record in &records {
             assert_eq!(record.tx_hashes().collect::<Vec<_>>(), vec![tx_hash]);
         }
+    }
+
+    /// The bit test a shard and its descendant both pass says only that
+    /// the keyspace passed on, so a successor that leaves later is not
+    /// party to what its predecessor was. A record naming the second cut
+    /// would abandon what the first departure had already settled.
+    #[test]
+    fn a_departed_shards_successor_is_offered_no_record_of_its_business() {
+        let sched = peer_terminating_schedule(60_000);
+        let (mut state, _, tx_hash) = state_stranded_on(&sched, 1);
+        let (peer_left, _) = PEER.children();
+
+        let set = |cut_ms: u64| SettledTxSet {
+            txs: BTreeSet::new(),
+            terminal_wt: WeightedTimestamp::from_millis(cut_ms),
+        };
+        state.record_settled_txs(&sched, peer_left, set(120_000));
+        state.record_settled_txs(&sched, PEER, set(60_000));
+
+        let records = state.offers().abandonment_records;
+        assert_eq!(
+            records
+                .iter()
+                .map(AbandonmentRecord::shard)
+                .collect::<Vec<_>>(),
+            vec![PEER],
+            "only the shard that held the prefix when the transaction committed",
+        );
+        assert_eq!(records[0].tx_hashes().collect::<Vec<_>>(), vec![tx_hash]);
     }
 
     /// The certificate outlives the tick that produced it, so losing the
