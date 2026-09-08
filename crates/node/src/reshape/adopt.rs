@@ -10,7 +10,7 @@
 //! rather than re-deriving any part of it.
 
 use hyperscale_storage::{AdoptSource, BoundaryStore, RecoveredState};
-use hyperscale_types::{Block, ChainOrigin, PredecessorTerminal, StateRoot, SubstateKey};
+use hyperscale_types::{Block, ChainOrigin, PredecessorTerminal, ShardId, StateRoot, SubstateKey};
 
 use super::orchestrator::AdoptKind;
 
@@ -36,6 +36,7 @@ use super::orchestrator::AdoptKind;
 /// subtree the genesis names.
 pub fn adopt_prepared_store<S: BoundaryStore>(
     storage: &S,
+    shard: ShardId,
     kind: AdoptKind,
     origin: ChainOrigin,
     genesis: &Block,
@@ -64,7 +65,7 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
     // ledger its clone-seeded peers already hold, and a child deriving
     // obligations on top of it would compose them twice.
     let inherited_records = match kind {
-        AdoptKind::Merge => storage.escrow_records(),
+        AdoptKind::Merge => storage.escrow_records(shard),
         AdoptKind::Split | AdoptKind::ParentHalf => Vec::new(),
     };
     verified_recovered_state(

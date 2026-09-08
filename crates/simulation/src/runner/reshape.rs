@@ -424,7 +424,7 @@ impl SimulationRunner {
         predecessors: Vec<PredecessorTerminal>,
     ) -> Option<ReshapeEvent> {
         let storage = self.reshape_stores.get(&(host, shard))?.storage.clone();
-        let recovered = adopt_prepared_store(&storage, kind, origin, &genesis, predecessors)
+        let recovered = adopt_prepared_store(&storage, shard, kind, origin, &genesis, predecessors)
             .expect("adopted reshape root must match the genesis it derived");
         let entry = self.reshape_stores.get_mut(&(host, shard))?;
         entry.genesis = Some(genesis);

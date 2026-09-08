@@ -6,8 +6,9 @@ use std::sync::Arc;
 use hyperscale_hbor::{from_slice, to_vec};
 use hyperscale_jmt::{Key as JmtKey, NibblePath};
 use hyperscale_types::{
-    Address, CollectionId, Compose, EntryKey, EntryLeaf, Movement, ProtocolHasher, SettledEntries,
-    SettledWrites, StateWrites, StoredReceipt, SubstateKey, entry_leaf_key,
+    Address, AddressClass, CollectionId, Compose, EntryKey, EntryLeaf, LocalKey, Movement,
+    ProtocolHasher, SettledEntries, SettledWrites, StateWrites, StoredReceipt, SubstateKey,
+    entry_leaf_key,
 };
 use hyperscale_vm_kernel::Substates;
 
@@ -433,6 +434,26 @@ pub fn merge_entry_overlay(
         limit,
     )
     .unwrap_or_default()
+}
+
+/// The lowest leaf key under `prefix`: its bits, then zeros.
+///
+/// The keyspace is owner-major and an owner is wholly one prefix's, so a
+/// prefix names a contiguous run of keys and this is where it starts —
+/// the seek point a scan of one shard's slice begins at, with
+/// [`key_under_prefix`] ending it.
+#[must_use]
+pub fn prefix_low_key(prefix: &NibblePath) -> SubstateKey {
+    let mut body = [0u8; 31];
+    let bits = prefix.as_bytes();
+    let taken = bits.len().min(body.len());
+    body[..taken].copy_from_slice(&bits[..taken]);
+    SubstateKey {
+        // The lowest assigned class tag, so the key sorts at or below
+        // every address sharing these leading bits.
+        owner: Address::new(body, AddressClass::Principal),
+        local: LocalKey([0; 16]),
+    }
 }
 
 /// Whether `key`'s leading bits equal `prefix` — the subtree-membership

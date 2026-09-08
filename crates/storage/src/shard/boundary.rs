@@ -11,8 +11,8 @@
 
 use hyperscale_jmt::{Key, NibblePath, TreeReader};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHeight, ChainOrigin, ShardWitnessPayload, StateRoot,
-    SubstateKey, SubstateLeaf,
+    BeaconWitnessLeafCount, Block, BlockHeight, ChainOrigin, ShardId, ShardWitnessPayload,
+    StateRoot, SubstateKey, SubstateLeaf,
 };
 
 use crate::Substates;
@@ -399,7 +399,8 @@ pub trait BoundaryStore {
     /// store's version line doesn't carry it.
     fn substate_bytes_at_version(&self, version: u64) -> Option<u64>;
 
-    /// Every escrow record the committed state holds, with its bytes.
+    /// Every escrow record `shard`'s slice of the committed state holds,
+    /// with its bytes.
     ///
     /// Derived on demand rather than indexed, because the state is the
     /// authority and the one caller asks once: a reshape successor whose
@@ -409,14 +410,17 @@ pub trait BoundaryStore {
     /// predecessor's ledger's, a fold over a chain the successor never
     /// replays, and the cell is outside every sweep's reach.
     ///
-    /// A scan, and affordable for being one: it follows an import that
-    /// wrote every leaf it reads.
-    fn escrow_records(&self) -> Vec<(SubstateKey, Vec<u8>)>;
+    /// Bounded by the shard's own prefix rather than run over the store:
+    /// a split child's store is a clone of its parent's and holds the
+    /// sibling's leaves too, and an obligation the sibling owns is not
+    /// this seat's to take. The keyspace is owner-major, so the prefix is
+    /// a contiguous run and the scan is that run and nothing else.
+    fn escrow_records(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)>;
 }
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{Hash, ShardId, ValidatorId, WeightedTimestamp};
+    use hyperscale_types::{Hash, ValidatorId, WeightedTimestamp};
 
     use super::*;
 

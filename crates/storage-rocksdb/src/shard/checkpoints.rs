@@ -19,9 +19,13 @@ use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeK
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
     AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, LeafRows, SubstateStore, Substates,
-    SweepRows, WitnessSeed, followed_block_writes, holds_state, is_record_cell,
+    SweepRows, WitnessSeed, followed_block_writes, holds_state, is_record_cell, key_under_prefix,
+    prefix_low_key,
 };
-use hyperscale_types::{Block, BlockHeight, ChainOrigin, StateRoot, SubstateKey, SubstateLeaf};
+use hyperscale_types::{
+    Block, BlockHeight, ChainOrigin, ShardId, StateRoot, SubstateKey, SubstateLeaf,
+    shard_prefix_path,
+};
 use hyperscale_vm_types::{Address, CollectionId};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{ColumnFamily, DB, Options, WriteBatch};
@@ -38,8 +42,8 @@ use super::jmt_stored::{StoredNode, StoredNodeKey, VersionedStoredNode};
 use super::metadata::{read_jmt_metadata, write_jmt_metadata};
 use crate::StorageError;
 use crate::typed_cf::{
-    ImportProgressEntry, TypedCf, batch_delete, batch_put, get, iter_all, meta_delete, meta_read,
-    meta_write,
+    ImportProgressEntry, TypedCf, batch_delete, batch_put, get, iter_all, iter_from, meta_delete,
+    meta_read, meta_write,
 };
 
 /// Write one import batch's leaves and re-derive every index that hangs
@@ -519,9 +523,11 @@ impl Substates for CheckpointStore {
 impl BoundaryStore for RocksDbShardStorage {
     type Boundary = CheckpointStore;
 
-    fn escrow_records(&self) -> Vec<(SubstateKey, Vec<u8>)> {
+    fn escrow_records(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)> {
         let cf = self.cf();
-        iter_all::<StateCf>(&self.db, StateCf::handle(&cf))
+        let prefix = shard_prefix_path(shard);
+        iter_from::<StateCf>(&self.db, StateCf::handle(&cf), &prefix_low_key(&prefix))
+            .take_while(|(key, _)| key_under_prefix(&key.to_bytes(), &prefix))
             .filter(|(key, value)| is_record_cell(*key, value))
             .collect()
     }

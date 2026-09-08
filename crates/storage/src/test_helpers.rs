@@ -1452,36 +1452,47 @@ where
     S: BoundaryStore + TestStore,
 {
     install_stub_protocol_statics();
+    // The left half of the keyspace. `state_key` fills all thirty-one
+    // body bytes with its owner seed, so a seed under 0x80 sits here and
+    // one at or above it sits in the sibling.
+    let shard = ShardId::leaf(1, 0);
     let commit = |writes: &SettledWrites| {
         commit_writes(storage, writes);
     };
     assert!(
-        storage.escrow_records().is_empty(),
+        storage.escrow_records(shard).is_empty(),
         "a store holding nothing owes nothing",
     );
 
     commit(&make_settled_writes(1, 1, vec![9, 9, 9]));
     assert!(
-        storage.escrow_records().is_empty(),
+        storage.escrow_records(shard).is_empty(),
         "an ordinary cell is not a record, wherever it sits",
     );
 
     let record = state_key(2, 2);
-    commit(&SettledWrites::from_absolutes(BTreeMap::from([(
-        record,
-        Some(stub_record_cell(7)),
-    )])));
+    let sibling = state_key(0x82, 2);
+    commit(&SettledWrites::from_absolutes(BTreeMap::from([
+        (record, Some(stub_record_cell(7))),
+        (sibling, Some(stub_record_cell(8))),
+    ])));
     assert_eq!(
-        storage.escrow_records(),
+        storage.escrow_records(shard),
         vec![(record, stub_record_cell(7))],
-        "a record reads back with the bytes a reclaim composes from",
+        "a record reads back with the bytes a reclaim composes from, and a \
+         record under the sibling's prefix is not this shard's to owe",
+    );
+    assert_eq!(
+        storage.escrow_records(ShardId::leaf(1, 1)),
+        vec![(sibling, stub_record_cell(8))],
+        "and the sibling's own scan answers with its own",
     );
 
     commit(&SettledWrites::from_absolutes(BTreeMap::from([(
         record, None,
     )])));
     assert!(
-        storage.escrow_records().is_empty(),
+        storage.escrow_records(shard).is_empty(),
         "a record taken back is no longer owed",
     );
 }

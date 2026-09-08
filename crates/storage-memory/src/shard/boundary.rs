@@ -14,9 +14,11 @@ use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
     AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, LeafRows, SubstateStore,
     Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state, is_record_cell,
+    key_under_prefix, prefix_low_key,
 };
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, EntryKey, StateRoot, SubstateKey, SubstateLeaf,
+    Block, BlockHeight, ChainOrigin, EntryKey, ShardId, StateRoot, SubstateKey, SubstateLeaf,
+    shard_prefix_path,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -94,10 +96,12 @@ impl Substates for SimBoundary {
 impl BoundaryStore for SimShardStorage {
     type Boundary = SimBoundary;
 
-    fn escrow_records(&self) -> Vec<(SubstateKey, Vec<u8>)> {
+    fn escrow_records(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)> {
+        let prefix = shard_prefix_path(shard);
         read_or_recover(&self.state)
             .current_state
-            .iter()
+            .range(prefix_low_key(&prefix)..)
+            .take_while(|(key, _)| key_under_prefix(&key.to_bytes(), &prefix))
             .filter(|(key, value)| is_record_cell(**key, value))
             .map(|(key, value)| (*key, value.clone()))
             .collect()

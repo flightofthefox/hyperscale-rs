@@ -659,7 +659,14 @@ impl ShardSupervisor {
         };
         let events = self.events_tx.clone();
         self.tokio_handle.spawn_blocking(move || {
-            match adopt_prepared_store(storage.as_ref(), kind, origin, &genesis, predecessors) {
+            match adopt_prepared_store(
+                storage.as_ref(),
+                shard,
+                kind,
+                origin,
+                &genesis,
+                predecessors,
+            ) {
                 Ok(recovered) => {
                     let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Adopted {
                         shard,
