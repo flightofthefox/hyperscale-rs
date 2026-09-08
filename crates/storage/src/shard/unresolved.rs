@@ -180,10 +180,10 @@ pub struct ReplayWindow {
     /// holds a member is what every replica of the shard has to agree on
     /// whatever its own store still reaches; execution runs over a
     /// baseline, and a baseline is a historical read the store retires at
-    /// [`RETENTION_HORIZON`]. Below this a tick composes and never runs,
-    /// which costs nothing: it was taken by a fate the replay reads off
-    /// the chain, and what it left is seated from the receipts that
-    /// committed it.
+    /// [`RETENTION_HORIZON`](hyperscale_types::RETENTION_HORIZON). Below
+    /// this a tick composes and never runs, which costs nothing: it was
+    /// taken by a fate the replay reads off the chain, and what it left
+    /// is seated from the receipts that committed it.
     pub compose_from: BlockHeight,
     /// The parent-QC weighted timestamp of the block *below* the first
     /// one replayed — the clock execution resumes at, so the block above
