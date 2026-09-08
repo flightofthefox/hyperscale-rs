@@ -273,7 +273,7 @@ impl Classified {
         let runs_here = |node: u32| runs(&self.star, node, local, side);
         let mut plan = LegPlan::whole(self.star.homes.len());
         let mut participant = false;
-        for node in 0..len(&self.star) {
+        for node in 0..self.star.nodes() {
             if runs_here(node) {
                 participant = true;
             } else {
@@ -341,37 +341,14 @@ impl Classified {
     }
 }
 
-fn len(star: &Star<ShardId>) -> u32 {
-    u32::try_from(star.homes.len()).expect("a manifest has fewer than u32 nodes")
-}
-
-/// The node's settled role. A node past the manifest is core, the
-/// direction every unsure answer takes.
-fn role(star: &Star<ShardId>, node: u32) -> LegRole {
-    star.roles.get(node as usize).copied().unwrap_or_default()
-}
-
-/// The shards that run `node`: every core shard for a core node, its
-/// home for a leg.
-fn running(star: &Star<ShardId>, node: u32) -> BTreeSet<ShardId> {
-    match role(star, node) {
-        LegRole::Core => star.core.clone(),
-        LegRole::Inbound | LegRole::Outbound | LegRole::Attesting => {
-            star.homes.get(node as usize).copied().into_iter().collect()
-        }
-    }
-}
-
 /// The side `node` runs on at `local`: a sink whose producers run
 /// elsewhere is a delivery, waiting on their arrival; everything else —
 /// a source, the core, a sink fed beside itself — issues.
+///
+/// `Side` is this crate's naming for the answer [`Star::delivers_at`]
+/// gives: which of a shard's at most two members runs the node.
 fn side_of(star: &Star<ShardId>, node: u32, local: ShardId) -> Side {
-    let delivers = role(star, node) == LegRole::Outbound
-        && star
-            .edges
-            .iter()
-            .any(|edge| edge.consumer == node && edge.to.contains(&local));
-    if delivers {
+    if star.delivers_at(node, local) {
         Side::Delivering
     } else {
         Side::Issuing
@@ -380,7 +357,7 @@ fn side_of(star: &Star<ShardId>, node: u32, local: ShardId) -> Side {
 
 /// Whether `node` runs in `local`'s member on `side`.
 fn runs(star: &Star<ShardId>, node: u32, local: ShardId, side: Side) -> bool {
-    running(star, node).contains(&local) && side_of(star, node, local) == side
+    star.running(node).contains(&local) && side_of(star, node, local) == side
 }
 
 /// The shards running a delivery, and the shards running anything that
@@ -388,9 +365,9 @@ fn runs(star: &Star<ShardId>, node: u32, local: ShardId, side: Side) -> bool {
 fn delivery_sides(star: &Star<ShardId>) -> (BTreeSet<ShardId>, BTreeSet<ShardId>) {
     let mut delivers = BTreeSet::new();
     let mut settles = BTreeSet::new();
-    for node in 0..len(star) {
-        for shard in running(star, node) {
-            match (role(star, node), side_of(star, node, shard)) {
+    for node in 0..star.nodes() {
+        for shard in star.running(node) {
+            match (star.role(node), side_of(star, node, shard)) {
                 (LegRole::Attesting, _) => {}
                 (_, Side::Delivering) => {
                     delivers.insert(shard);
