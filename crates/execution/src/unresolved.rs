@@ -328,6 +328,17 @@ impl Part {
     /// same commit, so a rebuilt ledger marks the same entries: the
     /// freeze is a function of the block and the placement it committed
     /// under, and the replay re-freezes both.
+    ///
+    /// Classifies **a shard's one entry**, which covers both members a
+    /// shard may run, and so asks `only_delivers_at` — every leg here is
+    /// a delivery — rather than any member's side. Not the same question
+    /// as [`Membership::of`](crate::tick_state::Membership::of), whose
+    /// branch looks alike and answers `Delivery` for the delivering
+    /// member of a shard this calls a leg. A shard with legs on both
+    /// sides of the core holds one entry, and it is the leg's: the
+    /// delivering member bears no verdict and owes no reclaim, so an
+    /// entry marked `Delivery` for it would abandon at the delivery
+    /// window's close what the leg is still owed a reclaim of.
     fn of(local: ShardId, tx: &Arc<Verifiable<Transaction>>, classified: &Classified) -> Self {
         if !classified.decomposed() {
             return Self::Whole;
@@ -849,6 +860,22 @@ impl UnresolvedTxs {
         self.owed.contains_key(&tx_hash)
     }
 
+    /// Every leg entry no tick has taken the records of yet, with what
+    /// it keeps.
+    ///
+    /// The precondition the two settlements below share, so what each of
+    /// them adds is its own licence and nothing else: a reclaim needs a
+    /// record covering the entry, a retirement needs every claim
+    /// answered and no such record. An entry keeping nothing — a leg
+    /// rebuilt from a record, with no body to settle from — is not
+    /// either shard's to compose.
+    fn untaken_legs(&self) -> impl Iterator<Item = (TxHash, &Owed, &Kept)> {
+        self.owed.iter().filter_map(|(tx_hash, owed)| {
+            let kept = owed.part.kept()?;
+            (owed.part.is_leg() && owed.taken.is_none()).then_some((*tx_hash, owed, kept))
+        })
+    }
+
     /// The leg entries a committed record has licensed a reclaim of and
     /// no tick has taken yet, each with the body the reclaim derives
     /// from.
@@ -864,19 +891,13 @@ impl UnresolvedTxs {
     /// before its finalization committed, owes it on the reclaim's.
     #[must_use]
     pub fn reclaimable(&self) -> Vec<Reclaimable> {
-        self.owed
-            .iter()
-            .filter(|(_, owed)| {
-                owed.part.is_leg() && owed.taken.is_none() && owed.covered.is_some()
-            })
-            .filter_map(|(tx_hash, owed)| {
-                let kept = owed.part.kept()?;
-                Some(Reclaimable {
-                    tx_hash: *tx_hash,
-                    body: Arc::clone(&kept.body),
-                    classified: kept.classified.clone(),
-                    charged: owed.charged,
-                })
+        self.untaken_legs()
+            .filter(|(_, owed, _)| owed.covered.is_some())
+            .map(|(tx_hash, owed, kept)| Reclaimable {
+                tx_hash,
+                body: Arc::clone(&kept.body),
+                classified: kept.classified.clone(),
+                charged: owed.charged,
             })
             .collect()
     }
@@ -902,16 +923,9 @@ impl UnresolvedTxs {
     /// [`Self::consumer_holds`] makes, and for the same reason.
     #[must_use]
     pub fn retirable(&self) -> Vec<Retirable> {
-        self.owed
-            .iter()
-            .filter(|(_, owed)| {
-                owed.part.is_leg()
-                    && owed.taken.is_none()
-                    && owed.covered.is_none()
-                    && !owed.claimed_by.is_empty()
-            })
-            .filter_map(|(tx_hash, owed)| {
-                let kept = owed.part.kept()?;
+        self.untaken_legs()
+            .filter(|(_, owed, _)| owed.covered.is_none() && !owed.claimed_by.is_empty())
+            .filter_map(|(tx_hash, owed, kept)| {
                 let claims: Vec<SubstateKey> = kept
                     .claims
                     .iter()
@@ -925,7 +939,7 @@ impl UnresolvedTxs {
                             .any(|shard| ShardTrie::shard_owns_prefix(*shard, claim.owner))
                     }))
                 .then(|| Retirable {
-                    tx_hash: *tx_hash,
+                    tx_hash,
                     body: Arc::clone(&kept.body),
                     classified: kept.classified.clone(),
                 })

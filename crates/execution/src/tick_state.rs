@@ -103,6 +103,17 @@ pub struct Membership {
 impl Membership {
     /// The two sets and the role `member` answers — a cache of its
     /// derivation, in the shape a tick carries.
+    ///
+    /// Classifies **one member**, and so reads the side it runs on. Not
+    /// the same question as [`Part::of`](crate::unresolved::Part), which
+    /// classifies a shard's one ledger entry and reads
+    /// [`Classified::only_delivers_at`]: the branches look alike and
+    /// answer differently for a shard with legs on both sides of the
+    /// core, whose delivering member is a `Delivery` here and whose
+    /// single entry is a leg there. Folding either into the other reads
+    /// a delivery's verdict off an entry that bears one.
+    ///
+    /// [`Classified::only_delivers_at`]: hyperscale_engine::legs::Classified::only_delivers_at
     #[must_use]
     pub fn of(member: &Member) -> Self {
         let awaited = member.awaited();
