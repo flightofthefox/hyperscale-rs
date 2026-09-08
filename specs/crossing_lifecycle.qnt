@@ -20,13 +20,17 @@
 //     probe anchor, an absence proof of a one-shard core consumer's claim
 //     cell anchored no earlier than the same, or an absence proof of the
 //     delivery's claim cell anchored no earlier than the lapse —
-//     `reclaimable` / `probe_silent_counterparts` in crates/execution/src/coordinator.rs,
-//     `Unsettleable` in crates/types/src/shard/abandonment.rs. The
-//     departure arm is Model D's and is not modelled here.
+//     `UnresolvedTxs::reclaimable` in crates/execution/src/unresolved.rs
+//     and `probe_silent_counterparts` in
+//     crates/execution/src/coordinator.rs, over the `Word` a
+//     counterpart's chain spoke (`CounterpartEvidence` in
+//     crates/types/src/shard/abandonment.rs). The departure arm is Model
+//     D's and is not modelled here.
 //   - The probe anchor, D = validity_end + MAX_FINALIZATION_DELAY —
-//     `reclaim_probe_anchor` / `absence_licenses_reclaim` in
-//     crates/types/src/time/timeouts.rs; the probe is gated on the
-//     producer's own clock passing D (`Unresolved::probeable`) and reads a
+//     `Deadline::at` and `Window::Core` in
+//     crates/types/src/time/deadline.rs, read through
+//     `Probed::absence_answers_at`; the probe is gated on the
+//     producer's own clock passing D (`UnresolvedTxs::probeable`) and reads a
 //     commit-proven core header whose clock is past D.
 //   - What the probe reads: the core's committed cell for the transaction,
 //     written when the block carrying it commits — `committed_tx_cells` in
@@ -42,27 +46,29 @@
 //     A core of more shards settles on its siblings' clock and is not
 //     fenced, so its answer stays the committed cell (`LICENCE_CLAIM`).
 //   - Once-only disposal on one shard — the claim-cell checks in
-//     vm/crates/kernel/src/executor.rs (`crossing_committed`). Across two
+//     vm/crates/kernel/src/executor.rs (`BatchTx::claim_cells`). Across two
 //     shards nothing reads the other's cell, so exclusivity rests on the
 //     evidence rule alone, which is what this model checks.
-//   - The outbound claim's lifetime — `delivery_admissible` /
-//     `delivery_window_close` in crates/types/src/time/timeouts.rs: the
+//   - The outbound claim's lifetime — `Window::Delivery` in
+//     crates/types/src/time/deadline.rs: the
 //     deadline opens the late-delivery window and MAX_VALIDITY_RANGE
 //     closes it; `late_deliveries` in crates/shard/src/proposal.rs admits
 //     a delivery past its validity end to that close.
 //   - The lapse anchor, L = close + MAX_FINALIZATION_DELAY —
-//     `lapse_probe_anchor` / `lapse_licenses_reclaim` in
-//     crates/types/src/time/timeouts.rs: a claim admitted under the close
+//     `Window::Lapse` in crates/types/src/time/deadline.rs, the window
+//     `Probed::Delivery` reads in: a claim admitted under the close
 //     has committed by L or never will, so the claim cell's absence at a
 //     recipient block past L is the lapse. The record the reclaim takes
 //     back outlives L outright: no sweep reaches a record cell.
 //   - Both licenses are half-open windows, not floors: the cells a probe
-//     asks about are swept at their own expiry — `committed_tx_expiry_ms`
-//     in crates/storage/src/shard/sweep.rs for the committed cell,
-//     `CROSSING_GRACE_MS` for the claim cell — and a non-inclusion proof of
-//     a swept cell is honest and says nothing. `absence_licenses_reclaim`
-//     and `lapse_licenses_reclaim` carry the ceiling; `sweep` and
-//     `sweepClaim` here are what make it load-bearing.
+//     asks about are swept at their own expiry — `sweepable_expiry` in
+//     crates/storage/src/shard/sweep.rs reads it off the cell,
+//     `ARTIFACT_GRACE_MS` for the committed cell and `CROSSING_GRACE_MS`
+//     for the claim cell — and a non-inclusion proof of a swept cell is
+//     honest and says nothing. Each window ends exactly at that sweep,
+//     which crates/types/src/time/timeouts.rs pins as a compile-time
+//     equality; `sweep` and `sweepClaim` here are what make it
+//     load-bearing.
 //
 // Modeling assumptions:
 //   - One crossing. Clocks are per-shard monotone integers advancing by

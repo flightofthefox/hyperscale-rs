@@ -109,7 +109,7 @@
 //
 // Modeling assumptions:
 //   - `GRACE > BUCKET` is the model's one arithmetic premise and it is
-//     the code's (`NULLIFIER_GRACE_MS` 144_000 against a bucket of
+//     the code's (`ARTIFACT_GRACE_MS` 144_000 against a bucket of
 //     65_536). It is what makes INV-SWEEP-7 structural rather than
 //     checked: a cell born at clock `t` expires at least a grace later,
 //     so its bucket is strictly above the bucket a block anchored at `t`
@@ -171,7 +171,7 @@ module substate_sweep {
   // Bucket width, in the model's own clock units.
   const BUCKET: int
   // How long a cell outlives the window it derives from
-  // (`NULLIFIER_GRACE_MS`). Must exceed BUCKET — see the assumptions.
+  // (`ARTIFACT_GRACE_MS`). Must exceed BUCKET — see the assumptions.
   const GRACE: int
   // The longest window a transaction may be admitted inside.
   const WINDOW: int
