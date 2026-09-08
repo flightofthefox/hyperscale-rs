@@ -3468,7 +3468,7 @@ impl ExecutionCoordinator {
     /// was unknown, and the shard's certificates parked on a commit
     /// proof the departed chain can no longer supply — the set stands in
     /// for the proof of everything it names
-    /// ([`Self::settled_set_admits`]).
+    /// ([`Counterparts::settled_set_admits`]).
     ///
     /// Also arms the fallback fetch: what the partner says it settled and
     /// we are still waiting on is exactly the certificates it owes us, and
