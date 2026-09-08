@@ -165,7 +165,7 @@ fn an_arcs_payload_reads_as_the_page_expects() {
 }
 
 #[test]
-fn the_network_view_s_payloads_read_as_the_page_expects() {
+fn the_network_view_payloads_read_as_the_page_expects() {
     // The panel indexes per-class totals as `[class, deliveries, bytes]` and
     // reads each host's duties off named fields. Both are collections of
     // tuples or structs that a derive could reshape without a type error.

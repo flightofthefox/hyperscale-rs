@@ -1072,7 +1072,7 @@ fn recovery_carries_the_tip_drain_total() {
 }
 
 #[test]
-fn a_committed_bundle_outlives_its_block_s_sealing() {
+fn a_committed_bundle_outlives_the_sealing_of_its_block() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     test_committed_bundle_outlives_sealing(&storage, || storage.load_recovered_state());

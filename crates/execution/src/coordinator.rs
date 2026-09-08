@@ -9653,7 +9653,7 @@ mod tests {
     /// settling, its set says so, this shard writes that down, and the
     /// record is what lets the abort be composed afterwards.
     #[test]
-    fn a_departed_counterpart_s_silence_is_written_down_and_licenses_the_abort() {
+    fn silence_from_a_departed_counterpart_is_written_down_and_licenses_the_abort() {
         let sched = peer_terminating_schedule(60_000);
         let (mut state, _, tx_hash) = state_stranded_on(&sched, 1);
 

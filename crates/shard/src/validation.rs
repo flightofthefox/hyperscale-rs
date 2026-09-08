@@ -1235,7 +1235,7 @@ mod tests {
     /// certificates consumes nothing, so it must repeat its parent's total
     /// rather than reset.
     #[test]
-    fn a_header_cannot_overstate_its_shard_s_work() {
+    fn a_header_cannot_overstate_the_work_of_its_shard() {
         let parent = ShardLoad::ZERO.advance(500, None);
         // The fixture carries no certificates, so the honest claim is the
         // parent's total unchanged.
