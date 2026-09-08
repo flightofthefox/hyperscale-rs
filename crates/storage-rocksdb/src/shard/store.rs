@@ -6,7 +6,7 @@ use hex::encode as hex_encode;
 use hyperscale_metrics::{record_storage_operation, record_storage_write};
 use hyperscale_storage::{
     JmtSnapshot, PackageArtifactStore, SubstateStore, Substates, SweepIndex, SweepRows,
-    VersionedStore,
+    VersionedStore, holds_this_block_at,
 };
 use hyperscale_types::{
     Block, BlockHeight, DeclaredRange, Hash, QuorumCertificate, StateRoot, SubstateKey,
@@ -149,6 +149,20 @@ impl RocksDbShardStorage {
         // Must check BOTH root AND version. Root can be unchanged with empty commits
         // (same root, different version), but the nodes are keyed by version.
         let (current_version, current_root_hash) = self.read_jmt_metadata();
+        // A store already at this block's height holds a block there,
+        // and it had better be this one. The benign cause is the same
+        // block twice — a synced copy, or a co-hosted vnode's — and the
+        // root check below waves an empty commit through on an unchanged
+        // root, so height is the only thing that would separate a second
+        // application of this block from a first application of a
+        // different one at the same height. The read is confined to that
+        // case rather than paid on every commit.
+        assert!(
+            current_version < block.height().inner()
+                || holds_this_block_at(self, block.height(), block.hash()),
+            "BFT CRITICAL: prepared commit for height {} meets a different block already there",
+            block.height().inner(),
+        );
         if current_root_hash != jmt_snapshot.base_root {
             tracing::warn!(
                 expected_root = ?jmt_snapshot.base_root,

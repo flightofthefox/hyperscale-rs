@@ -291,6 +291,13 @@ fn a_prepared_commit_for_a_committed_block_applies_nothing() {
 }
 
 #[test]
+#[should_panic(expected = "meets a different block already there")]
+fn a_prepared_commit_refuses_a_different_block_at_one_height() {
+    let storage = Arc::new(SimShardStorage::default());
+    test_helpers::test_prepared_commit_refuses_a_different_block_at_one_height(&storage);
+}
+
+#[test]
 fn a_prepared_commit_writes_its_committed_cells() {
     let storage = Arc::new(SimShardStorage::default());
     test_helpers::test_prepared_commit_writes_committed_cells(&storage);

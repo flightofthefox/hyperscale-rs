@@ -136,3 +136,32 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// keep page serving from materializing the whole accumulator.
     fn get_beacon_witness_payload_range(&self, start: u64, end: u64) -> Vec<ShardWitnessPayload>;
 }
+
+/// Whether a store whose tree has already reached `height` holds
+/// *this* block there.
+///
+/// A prepared commit that finds the tree at or past its own height has
+/// one benign cause: the block went in already, through a sync commit
+/// that landed between prepare and flush or through a second vnode on
+/// the same store. Skipping it is right, and the caller returns the root
+/// the snapshot computed.
+///
+/// A *different* block at that height is not that. Skipping it would
+/// hand back a root for a block the store never applied, and the caller
+/// would take the commit as done — so both backends refuse loudly
+/// instead, which is the only way a fork that reached the writer is
+/// visible at all.
+///
+/// `true` where the store holds nothing at `height`: a chain adopted
+/// from a checkpoint carries a committed height above its first blocks,
+/// so there is genuinely nothing to compare and nothing to conclude.
+#[must_use]
+pub fn holds_this_block_at<R: ShardChainReader + ?Sized>(
+    reader: &R,
+    height: BlockHeight,
+    block_hash: BlockHash,
+) -> bool {
+    reader
+        .get_block(height)
+        .is_none_or(|held| held.block().hash() == block_hash)
+}

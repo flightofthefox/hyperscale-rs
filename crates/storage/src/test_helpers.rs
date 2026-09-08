@@ -1934,6 +1934,51 @@ where
     );
 }
 
+/// A prepared commit whose height the tree already reached refuses when
+/// the store holds a *different* block there.
+///
+/// The benign cause of that skip is the same block going in twice — a
+/// sync commit landing between prepare and flush, or a second vnode on
+/// the store. A different block is a fork that reached the writer, and
+/// skipping it would hand back a root for a block the store never
+/// applied while the caller took the commit as done.
+///
+/// # Panics
+///
+/// By design, on the second commit: that is what the caller asserts.
+pub fn test_prepared_commit_refuses_a_different_block_at_one_height<S>(storage: &Arc<S>)
+where
+    S: ShardChainReader + ShardChainWriter + SubstateStore,
+{
+    let commit_at = |block| {
+        let (_, _, commit) = storage.prepare_block_commit(
+            ParentAnchor {
+                state_root: storage.state_root(),
+                height: BlockHeight::GENESIS,
+                state: &storage.snapshot(),
+                pending: &[],
+                base_reads: None,
+            },
+            &[],
+            &[],
+            &[],
+            BlockHeight::new(1),
+        );
+        commit(
+            SyncHint::FlushNow,
+            &make_test_certified(block),
+            &empty_witness(),
+        )
+    };
+
+    let first = make_test_block_at(BlockHeight::new(1), 1_000);
+    let other = make_test_block_at(BlockHeight::new(1), 2_000);
+    assert_ne!(first.hash(), other.hash(), "the fixture builds two blocks");
+
+    commit_at(first);
+    commit_at(other);
+}
+
 /// Commit a block at `height` carrying one provision bundle, and return
 /// the bundle's hash. The bundle's transaction varies with the height, so
 /// each block's bundle has its own identity.

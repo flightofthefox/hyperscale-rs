@@ -9,7 +9,7 @@ use hyperscale_storage::tree::{
 };
 use hyperscale_storage::{
     JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, covers_strictly_more,
-    merge_writes_from_receipts, widest_tick_copies, with_sweep,
+    holds_this_block_at, merge_writes_from_receipts, widest_tick_copies, with_sweep,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, Finalization, PreparedCommit,
@@ -146,6 +146,15 @@ fn build_prepared_commit(
             // from a checkpoint carries a committed height above its
             // first blocks, and the tree starts where the chain does.
             if storage.jmt_height() >= snapshot.new_height {
+                assert!(
+                    holds_this_block_at(
+                        storage.as_ref(),
+                        certified.block().height(),
+                        certified.block().hash(),
+                    ),
+                    "BFT CRITICAL: prepared commit for height {} meets a different block already there",
+                    certified.block().height().inner(),
+                );
                 return result_root;
             }
             storage.append_beacon_witnesses(witness);

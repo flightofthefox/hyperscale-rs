@@ -43,7 +43,7 @@ pub use shard::boundary::{
     AdoptSource, Adoption, BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, Subtree,
     Vintage, WitnessSeed, adopt_plan, holds_state,
 };
-pub use shard::chain_reader::{BlockForSync, ShardChainReader};
+pub use shard::chain_reader::{BlockForSync, ShardChainReader, holds_this_block_at};
 pub use shard::chain_writer::{ParentAnchor, ShardChainWriter};
 pub use shard::dedup_window::DedupWindow;
 pub use shard::derived::LeafRows;
