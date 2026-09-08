@@ -349,9 +349,8 @@ impl Part {
             Self::Issuer(Kept {
                 body,
                 classified: classified.clone(),
-                // The core it is part of, itself included: what its own
-                // settlement waits on, and the arity an absent committed
-                // cell is read against. The prober skips this shard.
+                // For an issuer this is also what its own settlement
+                // waits on, which a leg's never is.
                 core: classified.core().clone(),
                 deliveries,
                 claims: Vec::new(),
@@ -377,8 +376,11 @@ pub struct Kept {
     /// The classification the committing block froze, which a reclaim
     /// reads its edges and its scope from.
     pub classified: Classified,
-    /// Whose refusal is the transaction's. Empty for an issuer in the
-    /// core, whose verdict is its own.
+    /// Whose refusal is the transaction's, and the arity an absent
+    /// committed cell is read against. An issuer in the core holds the
+    /// core it is part of, itself included; the prober skips this shard,
+    /// since what it has committed is not something it fetches a proof
+    /// of. Empty for a shape with no core.
     pub core: BTreeSet<ShardId>,
     /// The claim cells deliveries elsewhere write for the crossings this
     /// shard issued, each under the shard that was to deliver it when
@@ -433,10 +435,13 @@ pub struct Probeable {
     /// and whose validity end names the committed cell the core would
     /// have written.
     pub deadline: Deadline,
-    /// The core set. Any one core shard's absence suffices — no core
-    /// shard finalizes without every other's certificate — so the probe
-    /// goes to one of them. Empty for a shape with no core, whose
-    /// counterparts are deliveries alone.
+    /// The core set, every shard of which is asked. Any one core shard's
+    /// absence is the whole answer — no core shard finalizes without
+    /// every other's certificate — while one that did include says only
+    /// that a sibling is pending, so a probe of a single shard strands
+    /// the crossing whenever that shard is the one that included. Also
+    /// the arity an absent cell is read against. Empty for a shape with
+    /// no core, whose counterparts are deliveries alone.
     pub core: BTreeSet<ShardId>,
     /// The claim cells deliveries elsewhere write for what this leg
     /// issued, each under the shard that was to deliver it at commit.

@@ -234,11 +234,6 @@ impl VoteFence<'_> {
     /// certificate, or off the proof the chain committed, which every
     /// replica folds at the same height. A voter holding no mirror
     /// cannot say and defers; one whose mirror disagrees refuses.
-    /// Whether a heard answer stands. An acceptance is also a settlement
-    /// claim on the shard that spoke it — a chain whose termination is
-    /// scheduled can be cut before the finalization its certificate
-    /// promises lands — so it is held to the verdict a finalization's
-    /// claim would be, at the block's anchor.
     fn heard_stands(
         &self,
         shard: ShardId,

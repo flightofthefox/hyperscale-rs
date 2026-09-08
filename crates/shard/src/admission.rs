@@ -263,10 +263,10 @@ impl<'p> Section for TransactionsSection<'p> {
     /// which closes the Byzantine-proposer path to engaging counterpart
     /// locks before the payer shard commits. The sweep cap bounds how
     /// fast a shard can be made to owe cells, counted off the
-    /// derivations for this shard plus the committed cell the chain
-    /// writes for a core spanning more than one shard; a transaction
-    /// that does not fit is refused on its own, so a large composition
-    /// never starves the small ones behind it.
+    /// derivations for this shard plus the one committed cell the chain
+    /// writes for every transaction it carries; a transaction that does
+    /// not fit is refused on its own, so a large composition never
+    /// starves the small ones behind it.
     fn admit(ctx: &Admission<'_>, fold: &mut Self::Fold, tx: &Transaction) -> Result<(), String> {
         let tx_hash = tx.hash();
         if ctx.chain.txs.contains(&tx_hash) {

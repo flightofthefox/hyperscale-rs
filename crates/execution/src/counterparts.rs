@@ -369,15 +369,15 @@ impl Counterparts {
     /// block past the floor is the evidence, and before it the
     /// counterpart may still legitimately act. A core of more than one
     /// shard is asked about the transaction's committed cell past the
-    /// deadline, and the probe goes to the core's lowest shard — any one
-    /// core shard's absence suffices, and the choice has to be the same
-    /// on every validator or a voter's mirror would name a shard the
-    /// record does not. A core of one shard writes no cell and is asked
-    /// about its consumer's claim instead. A
-    /// delivering shard is asked about the crossing's claim cell past
-    /// the lapse, the delivery window's close plus the finalization
-    /// delay, since a delivery admitted under the close has claimed by
-    /// then or never will. Each is asked against the newest commit-proven
+    /// deadline, and every core shard is asked: any one of them absent
+    /// is the whole answer, while the shards that did include say only
+    /// that a sibling is pending, so asking one alone strands the
+    /// crossing whenever that shard is the one that included. A core of
+    /// one shard writes no cell and is asked about its consumer's claim
+    /// instead. A delivering shard is asked about the crossing's claim
+    /// cell past the lapse, the delivery window's close plus the
+    /// finalization delay, since a delivery admitted under the close has
+    /// claimed by then or never will. Each is asked against the newest commit-proven
     /// header of that shard inside its window — at or past its floor and
     /// short of the probed cell's own sweep, since a proof against a
     /// swept cell is a true proof of nothing — which is the header the

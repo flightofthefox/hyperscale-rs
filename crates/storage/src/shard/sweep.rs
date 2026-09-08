@@ -515,9 +515,14 @@ pub fn followed_block_writes(
 /// state root every header carries. Derived from the transactions and
 /// the shard's identity, so every replica folds the same cells and a
 /// prober holding the transaction derives the same key from nothing
-/// else. Which of a block's transactions are given is the engine's to
-/// say, off placement: only a core spanning more than one shard is ever
-/// asked about its committed set.
+/// else.
+///
+/// Every transaction a block carries, and no reading of placement. A
+/// rule that gave only some of them would make a block's creations a
+/// function of the trie the reader classified under, and a split child
+/// following its parent's block classifies under the cut — so the halves
+/// would not recompose the parent's root. Which absences *answer* is a
+/// separate rule, and lives where the probe is composed.
 #[must_use]
 pub fn committed_tx_cells<'a>(
     local_shard: ShardId,

@@ -69,13 +69,10 @@ mod tests {
     /// Every transaction writes the cell, whatever shape it has and
     /// whatever the trie says about where its nodes sit.
     ///
-    /// The shape used to decide it — only a core spanning more than one
-    /// shard wrote one — which made the block's creations a function of
-    /// placement, and so of which window a reader classified under. A
-    /// split child following its parent's block classified under the
-    /// cut placed no core on the parent and derived no cell, and the
-    /// halves did not recompose the parent's root. Nothing here reads a
-    /// trie, so there is no window to get wrong.
+    /// A derivation that read the shape would make a block's creations a
+    /// function of placement, and so of which window the reader
+    /// classified under. Nothing here reads a trie, so there is no
+    /// window to get wrong.
     #[test]
     fn every_transaction_writes_the_cell_under_any_window() {
         use hyperscale_types::test_utils::{StubVmStatics, test_transaction};
@@ -111,8 +108,9 @@ mod tests {
     }
 
     /// A split child following its parent's block derives the parent's
-    /// creations and its half recomposes the parent's root — under the
-    /// child's own window, which is the case that used to fail.
+    /// creations and its half recomposes the parent's root, under the
+    /// child's own window — the window a following child classifies
+    /// under being the one a placement-dependent derivation gets wrong.
     #[test]
     fn a_followed_block_recomposes_under_the_childs_own_window() {
         use std::sync::Arc;
