@@ -159,15 +159,19 @@ pub const MAX_PREFIXES_PER_TX: usize =
 
 /// Hard cap on the abandonment records one block may carry.
 ///
-/// A block's records are in strictly ascending `(shard, arm)` order, so
-/// it carries at most one per counterpart shard per arm of the evidence
-/// vocabulary, and a record may name a live shard — a refusing core, a
-/// consumer that claimed — as readily as one that left. So the bound is
-/// the shard count times the arms, a departure and one per question:
-/// more records than that names a shard that does not exist or an arm
-/// twice. A shard with evidence at several anchors under one arm drains
-/// one anchor per block, which costs settlement rate rather than this
-/// bound.
+/// What a composer offers is one departure per counterpart shard plus
+/// one per question it heard an answer to, and a record may name a live
+/// shard — a refusing core, a consumer that claimed — as readily as one
+/// that left. So the bound is the shard count times a departure and one
+/// per question. A shard with evidence at several anchors under one
+/// question drains one anchor per block, which costs settlement rate
+/// rather than this bound.
+///
+/// This is a decode cap and is what makes it a bound: a block claiming
+/// more never decodes. The admitted ordering is finer than the count —
+/// strictly ascending `(shard, evidence)`, and evidence carries the
+/// anchor it was taken at — so the ordering alone would admit several
+/// records per shard and question, and does not imply this figure.
 pub const MAX_ABANDONMENT_RECORDS_PER_BLOCK: usize =
     MAX_PROVISION_TARGET_SHARDS * (1 + Question::ALL.len());
 
