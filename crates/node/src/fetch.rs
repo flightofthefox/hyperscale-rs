@@ -495,6 +495,21 @@ const fn scored(refusal: Refusal) -> ResponseVerdict {
     }
 }
 
+/// Whether a transport error leaves the retry to the tick.
+///
+/// Only an error that never reached a peer does: the peer set is the
+/// reason, and re-dispatching into the same empty set inside the
+/// response callback would spin. Everything the transport already
+/// answered — a timeout, an exhausted retry budget, a peer-level error —
+/// has had per-peer and per-request backoff absorbed below this seam
+/// already, so it retries inline against a rotated peer.
+const fn defers_to_the_tick(error: &RequestError) -> bool {
+    matches!(
+        error,
+        RequestError::NoPeers | RequestError::PeerUnreachable(_)
+    )
+}
+
 /// Issue one request per scope in `ids` and route each answer through
 /// [`ScopedAnswer::answer`]. The ids are released before the event goes
 /// out, so the freed capacity is available if handling the delivery
@@ -530,10 +545,7 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
                         if matches!(error, RequestError::PeerError(_)) {
                             record_fetch_response_refused(B::NAME, "unusable_answer");
                         }
-                        let input = if matches!(
-                            error,
-                            RequestError::NoPeers | RequestError::PeerUnreachable(_)
-                        ) {
+                        let input = if defers_to_the_tick(&error) {
                             ShardScopedInput::FetchUnroutable(B::ids(requested))
                         } else {
                             ShardScopedInput::FetchFailed(B::ids(requested))
@@ -696,6 +708,28 @@ mod tests {
 
     fn tx(n: u8) -> TxHash {
         TxHash::from(Hash::from_bytes(&[n; 32]))
+    }
+
+    /// Only an error that never reached a peer defers to the tick.
+    ///
+    /// The distinction is load-bearing in both directions. Deferring
+    /// what the transport already answered costs a whole tick of
+    /// latency on every timeout; retrying inline on an empty peer set
+    /// spins against nothing. The transport absorbs per-peer and
+    /// per-request backoff below this seam, so an answered error has
+    /// already waited.
+    #[test]
+    fn only_an_error_that_never_reached_a_peer_waits_for_the_tick() {
+        assert!(defers_to_the_tick(&RequestError::NoPeers));
+        assert!(defers_to_the_tick(&RequestError::PeerUnreachable(vid(3))));
+
+        assert!(!defers_to_the_tick(&RequestError::Timeout));
+        assert!(!defers_to_the_tick(&RequestError::Exhausted {
+            attempts: 4
+        }));
+        assert!(!defers_to_the_tick(&RequestError::PeerError(
+            "committee said no".into()
+        )));
     }
 
     /// A peer that does not hold the scope is not the peer at fault.
