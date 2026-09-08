@@ -467,31 +467,29 @@ pub struct Kept {
     pub claims: Vec<(ShardId, SubstateKey)>,
 }
 
-/// A leg entry a committed record has licensed the retirement of: every
-/// consumer of what it issued has claimed, so its records have nothing
-/// left to hold.
+/// A leg entry a committed record has licensed a settlement of, with
+/// what the settlement is composed from.
+///
+/// One shape for both, because the terms are the same ones: which
+/// records, off which body, under which classification, and whether the
+/// price is still owed. What differs is the licence, which is the
+/// selector's — [`UnresolvedTxs::reclaimable`] or
+/// [`UnresolvedTxs::retirable`] — and not a field here.
 #[derive(Debug, Clone)]
-pub struct Retirable {
+pub struct Settleable {
     /// The transaction.
     pub tx_hash: TxHash,
-    /// Its body, which the retirement's edges derive from.
-    pub body: Arc<Verified<Transaction>>,
-    /// The classification its committing block froze.
-    pub classified: Classified,
-}
-
-/// A leg entry a committed record has licensed the reclaim of, with what
-/// the reclaim is composed from.
-#[derive(Debug, Clone)]
-pub struct Reclaimable {
-    /// The transaction.
-    pub tx_hash: TxHash,
-    /// Its body, which the reclaim's edges derive from.
+    /// Its body, which the settlement's edges derive from.
     pub body: Arc<Verified<Transaction>>,
     /// The classification its committing block froze.
     pub classified: Classified,
     /// Whether a committed finalization of this shard's settled the
-    /// price, so the reclaim charges nothing.
+    /// price, so the settlement charges nothing.
+    ///
+    /// Always true for a retirable entry — a resolved issuer is charged
+    /// where it resolves, and a leg is charged when its own finalization
+    /// commits, which is before a retirement can be composed for it — so
+    /// only a reclaim ever reads a `false` here.
     pub charged: bool,
 }
 
@@ -953,10 +951,10 @@ impl UnresolvedTxs {
     /// certificate, and one that never ran, or whose tick was discarded
     /// before its finalization committed, owes it on the reclaim's.
     #[must_use]
-    pub fn reclaimable(&self) -> Vec<Reclaimable> {
+    pub fn reclaimable(&self) -> Vec<Settleable> {
         self.untaken_legs()
             .filter(|(_, owed, _)| owed.covered.is_some())
-            .map(|(tx_hash, owed, kept)| Reclaimable {
+            .map(|(tx_hash, owed, kept)| Settleable {
                 tx_hash,
                 body: Arc::clone(&kept.body),
                 classified: kept.classified.clone(),
@@ -985,7 +983,7 @@ impl UnresolvedTxs {
     /// cut is the frozen consumer's successor — the same widening
     /// [`Self::consumer_holds`] makes, and for the same reason.
     #[must_use]
-    pub fn retirable(&self) -> Vec<Retirable> {
+    pub fn retirable(&self) -> Vec<Settleable> {
         self.untaken_legs()
             .filter(|(_, owed, _)| owed.covered.is_none() && !owed.claimed_by.is_empty())
             .filter_map(|(tx_hash, owed, kept)| {
@@ -1001,10 +999,11 @@ impl UnresolvedTxs {
                             .iter()
                             .any(|shard| ShardTrie::shard_owns_prefix(*shard, claim.owner))
                     }))
-                .then(|| Retirable {
+                .then(|| Settleable {
                     tx_hash,
                     body: Arc::clone(&kept.body),
                     classified: kept.classified.clone(),
+                    charged: owed.charged,
                 })
             })
             .collect()

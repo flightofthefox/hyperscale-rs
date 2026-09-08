@@ -81,10 +81,18 @@ impl Attested for Arc<Verifiable<Finalization>> {
     }
 }
 
-/// What the gate answers for one certificate.
-pub enum Gated {
-    /// Verify it against these keys.
-    Keys(Vec<ConsensusPublicKey>),
+/// Why the gate did not hand back keys.
+///
+/// One vocabulary for both halves of the gate: what [`gate_certificate`]
+/// answers for one certificate, and what an artifact's whole pass
+/// answers for the several it carries. The artifact half adds
+/// [`Self::InFlight`], which is a fact about the dispatch rather than
+/// about any certificate, so a single certificate never meets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// A byte-identical dispatch is already running. Never answered for
+    /// a single certificate.
+    InFlight,
     /// This node's beacon has not reached the certificate's committee
     /// epoch, so the signing committee cannot be resolved yet. Pure
     /// catch-up: under lookahead the committee is already globally
@@ -108,24 +116,32 @@ pub enum Gated {
 /// provably terminal everywhere and never resolvable again. Then that
 /// committee's quorum power — a single Byzantine signer produces a
 /// cryptographically valid certificate — and its keys.
-#[must_use]
-pub fn gate_certificate(schedule: &TopologySchedule, ec: &ExecutionCertificate) -> Gated {
+///
+/// # Errors
+///
+/// The [`Gate`] the certificate did not pass — never [`Gate::InFlight`],
+/// which is the dispatch's fact and not a certificate's.
+pub fn gate_certificate(
+    schedule: &TopologySchedule,
+    ec: &ExecutionCertificate,
+) -> Result<Vec<ConsensusPublicKey>, Gate> {
     let shard = ec.shard_id();
     if schedule.recovery_fences(shard, ec.block_height()) {
-        return Gated::Refused("from a recovering shard past the freeze frontier");
+        return Err(Gate::Refused(
+            "from a recovering shard past the freeze frontier",
+        ));
     }
     let committee = match schedule.lookup(ec.vote_anchor_ts()) {
         ScheduleLookup::Committee(committee) => committee,
-        ScheduleLookup::NotYetCommitted => return Gated::BeaconBehind,
+        ScheduleLookup::NotYetCommitted => return Err(Gate::BeaconBehind),
         ScheduleLookup::Evicted => {
-            return Gated::Refused("committee epoch below the schedule floor");
+            return Err(Gate::Refused("committee epoch below the schedule floor"));
         }
     };
     if !ec_has_shard_quorum_power(committee, ec) {
-        return Gated::Refused("lacks quorum power on its shard");
+        return Err(Gate::Refused("lacks quorum power on its shard"));
     }
-    committee_public_keys_for_shard(committee, shard).map_or(
-        Gated::Refused("committee keys unresolvable — snapshot incomplete"),
-        Gated::Keys,
-    )
+    committee_public_keys_for_shard(committee, shard).ok_or(Gate::Refused(
+        "committee keys unresolvable — snapshot incomplete",
+    ))
 }

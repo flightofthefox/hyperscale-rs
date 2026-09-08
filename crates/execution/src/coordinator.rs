@@ -60,7 +60,7 @@ use crate::early_arrivals::{EARLY_VOTE_RETENTION, EarlyArrivalBuffer};
 use crate::exec_cert_store::ExecCertStore;
 use crate::expected_certs::ExpectedCertTracker;
 use crate::finalizations::FinalizationStore;
-use crate::gate::{Attested, Gated, gate_certificate};
+use crate::gate::{Attested, Gate, gate_certificate};
 use crate::lookups::{
     assign_participants, build_provision_requests, ec_has_shard_quorum_power, fetch_keys_covered,
     peers_excluding_self,
@@ -71,7 +71,7 @@ use crate::provisional::ProvisionalCells;
 use crate::provisioning::{ProvisioningTracker, Requirement, requirements_of};
 use crate::tick_state::{Admission, Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
-use crate::unresolved::{Reclaimable, Retirable, Unanswerable, UnresolvedTxs};
+use crate::unresolved::{Settleable, Unanswerable, UnresolvedTxs};
 use crate::vote_tracker::VoteTracker;
 
 /// One payer-side engagement wait: the transaction, the counterpart
@@ -80,22 +80,16 @@ use crate::vote_tracker::VoteTracker;
 type EngagementWait = (TxHash, BTreeSet<ShardId>, WeightedTimestamp);
 
 /// One transaction a committed block put in flight, as this shard sees
-/// it: the shards party to it and the classification frozen at that
-/// commit.
+/// it: the body, and the member this shard runs of it.
+///
+/// The member is built here rather than at each consumer, so what the
+/// transaction reaches and what this shard is to it are asked of the one
+/// type that answers them — a second `reaches_beyond` over the same set
+/// is one more place that answer can drift from the member's.
 #[derive(Clone)]
 struct CommittedMember {
     tx: Arc<Verifiable<Transaction>>,
-    participating: BTreeSet<ShardId>,
-    classified: Classified,
-}
-
-impl CommittedMember {
-    /// Whether the transaction touches a shard besides this one — asked
-    /// here, before a member of it exists, to pick the ones that need a
-    /// cross-shard registration at all.
-    fn reaches_beyond(&self, local: ShardId) -> bool {
-        self.participating.iter().any(|&shard| shard != local)
-    }
+    member: Member,
 }
 
 /// This shard's members of a committed block's transactions, each under
@@ -103,15 +97,19 @@ impl CommittedMember {
 /// the answer frozen onto each transaction from here.
 fn committed_members(
     classification: &TopologySnapshot,
+    local_shard: ShardId,
     transactions: &[Arc<Verifiable<Transaction>>],
 ) -> Vec<CommittedMember> {
     let trie = classification.shard_trie();
     assign_participants(classification, transactions)
         .into_iter()
-        .map(|(tx, participating)| CommittedMember {
-            classified: Classified::freeze(tx.legs(), tx.owners(), trie),
-            tx,
-            participating,
+        .map(|(tx, participating)| {
+            let classified = Classified::freeze(tx.legs(), tx.owners(), trie);
+            let side = classified.first_side_at(local_shard);
+            CommittedMember {
+                member: Member::of(classified, local_shard, side, participating),
+                tx,
+            }
         })
         .collect()
 }
@@ -228,17 +226,6 @@ pub struct ExecutionMemoryStats {
     /// sustained rise means a source shard certifies without proving
     /// commits — the fork/withholding signature.
     pub unproven_ecs: usize,
-}
-
-/// Why [`ExecutionCoordinator::gate`] did not hand back keys.
-enum Gate {
-    /// A byte-identical dispatch is already running.
-    InFlight,
-    /// A contained certificate's committee epoch is ahead of this
-    /// node's beacon; the caller parks the artifact for replay.
-    BeaconBehind,
-    /// Refused for good; the caller abandons the fetch.
-    Refused,
 }
 
 /// The name a housekeeping member over inherited records takes on the
@@ -642,13 +629,10 @@ impl ExecutionCoordinator {
         let local_shard = self.local_shard;
         let mut engagement_waits: Vec<EngagementWait> = Vec::new();
 
-        for CommittedMember {
-            tx,
-            participating,
-            classified,
-        } in txs
-        {
+        for CommittedMember { tx, member } in txs {
             let tx_hash = tx.hash();
+            let classified = member.classified();
+            let participating = member.reach();
             // A divided member waits on its execution scope minus itself
             // and on the crossings its legs consume, and on nothing else.
             // Its inbound escrow is its engagement — reclaimable if
@@ -657,14 +641,8 @@ impl ExecutionCoordinator {
             // engagement exchange is filed, and it runs under its own
             // committing block's clock.
             if classified.decomposed() {
-                let member = Member::of(
-                    classified.clone(),
-                    local_shard,
-                    classified.first_side_at(local_shard),
-                    participating.clone(),
-                );
                 self.provisioning
-                    .record_required(tx_hash, requirements_of(&member, tx.legs()));
+                    .record_required(tx_hash, requirements_of(member, tx.legs()));
                 continue;
             }
             let remote_participants = || -> BTreeSet<ShardId> {
@@ -743,7 +721,7 @@ impl ExecutionCoordinator {
         transactions: &[Arc<Verifiable<Transaction>>],
     ) {
         let local_shard = self.local_shard;
-        let members = committed_members(classification, transactions);
+        let members = committed_members(classification, local_shard, transactions);
         // The ledger takes the transactions themselves, each with the
         // classification frozen here. What it needs of them — when they
         // expire, what they reserved, what they reach outside this shard,
@@ -754,11 +732,11 @@ impl ExecutionCoordinator {
             local_shard,
             members
                 .iter()
-                .map(|member| (&member.tx, &member.classified)),
+                .map(|committed| (&committed.tx, committed.member.classified())),
         );
         let reaches_beyond: Vec<CommittedMember> = members
             .iter()
-            .filter(|member| member.reaches_beyond(local_shard))
+            .filter(|committed| committed.member.reaches_beyond())
             .cloned()
             .collect();
         let engagement_waits = if reaches_beyond.is_empty() {
@@ -767,12 +745,7 @@ impl ExecutionCoordinator {
             self.register_cross_shard_txs(classification, &reaches_beyond)
         };
 
-        for CommittedMember {
-            tx,
-            participating,
-            classified,
-        } in members
-        {
+        for CommittedMember { tx, member } in members {
             // Block-container entries decoded from the wire land as
             // `Unverified`; lift via `from_persisted` under the same
             // BFT-transitive trust that gates the containing block. Honest
@@ -782,8 +755,12 @@ impl ExecutionCoordinator {
                 Ok(v) => Arc::new(v),
                 Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
             };
-            self.candidates
-                .register(verified, participating, ts, classified);
+            self.candidates.register(
+                verified,
+                member.reach().clone(),
+                ts,
+                member.classified().clone(),
+            );
         }
 
         for (tx_hash, counterparts, validity_end) in engagement_waits {
@@ -1028,7 +1005,7 @@ impl ExecutionCoordinator {
         requests: &mut Vec<CrossShardExecutionRequest>,
     ) {
         let local_shard = self.local_shard;
-        for Reclaimable {
+        for Settleable {
             tx_hash,
             body: transaction,
             classified,
@@ -1169,10 +1146,11 @@ impl ExecutionCoordinator {
         requests: &mut Vec<CrossShardExecutionRequest>,
     ) {
         let local_shard = self.local_shard;
-        for Retirable {
+        for Settleable {
             tx_hash,
             body: transaction,
             classified,
+            charged,
         } in self.counterparts.ledger.retirable()
         {
             // Only once nothing this shard runs of the transaction is
@@ -1193,7 +1171,7 @@ impl ExecutionCoordinator {
                 Some(transaction),
                 records,
                 Licence::Accepted,
-                true,
+                charged,
             );
         }
     }
@@ -2163,20 +2141,18 @@ impl ExecutionCoordinator {
         let mut keys = Vec::new();
         for ec in item.certificates() {
             match gate_certificate(topology_schedule, ec) {
-                Gated::Keys(public_keys) => keys.push(public_keys),
-                Gated::BeaconBehind => {
+                Ok(public_keys) => keys.push(public_keys),
+                Err(refused) => {
+                    if let Gate::Refused(why) = refused {
+                        tracing::warn!(
+                            tick = %item.tick_id(),
+                            shard = ec.shard_id().inner(),
+                            height = ec.block_height().inner(),
+                            "Refusing a fetched certificate: {why}"
+                        );
+                    }
                     self.pending_verifications.remove(&slot);
-                    return Err(Gate::BeaconBehind);
-                }
-                Gated::Refused(why) => {
-                    tracing::warn!(
-                        tick = %item.tick_id(),
-                        shard = ec.shard_id().inner(),
-                        height = ec.block_height().inner(),
-                        "Refusing a fetched certificate: {why}"
-                    );
-                    self.pending_verifications.remove(&slot);
-                    return Err(Gate::Refused);
+                    return Err(refused);
                 }
             }
         }
@@ -2274,7 +2250,7 @@ impl ExecutionCoordinator {
                     .park(Waiting::Beacon, Parked::Certificate(Box::new(cert)));
                 vec![]
             }
-            Err(Gate::Refused) => vec![Action::AbandonFetch(cert.abandon())],
+            Err(Gate::Refused(_)) => vec![Action::AbandonFetch(cert.abandon())],
         }
     }
 
@@ -3553,7 +3529,7 @@ impl ExecutionCoordinator {
                 self.parked.park(Waiting::Beacon, Parked::Fetched(tick));
                 Vec::new()
             }
-            Err(Gate::Refused) => vec![Action::AbandonFetch(tick.abandon())],
+            Err(Gate::Refused(_)) => vec![Action::AbandonFetch(tick.abandon())],
         }
     }
 
