@@ -415,16 +415,21 @@ fn merge_lifecycle_prod() {
     merge_lifecycle(&mut cluster);
 }
 
-/// Two cohorts of pool surplus and a grow trigger above each child of the
-/// ballasted root (~29.2 KB and ~8.1 KB) but below the root itself
-/// (~37.2 KB): one cohort grows ROOT to the two siblings, the other splits
-/// the heavier one after the vote. One validator per host (each reshape
-/// seat its own store).
+/// Two cohorts of pool surplus plus the shuffle's headroom, and a grow
+/// trigger above each child of the ballasted root (~29.2 KB and ~8.1 KB)
+/// but below the root itself (~37.2 KB): one cohort grows ROOT to the two
+/// siblings, the other splits the heavier one after the vote. One
+/// validator per host (each reshape seat its own store).
+///
+/// The headroom is what makes the second split reachable at all. A split
+/// is admitted only while the pool holds a whole committee, and the
+/// shuffle draws its entrants from that same pool with no such gate —
+/// one per live shard, so two here.
 const fn straddler_config() -> ScenarioConfig {
     ScenarioConfig {
         shard_size: 4,
         vnodes_per_host: 1,
-        pool_surplus: 8,
+        pool_surplus: 10,
         num_shards: 1,
         split_bytes: 33_000,
         latency: Duration::from_millis(60),

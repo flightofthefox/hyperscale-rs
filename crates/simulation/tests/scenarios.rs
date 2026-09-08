@@ -1207,14 +1207,23 @@ fn merge_boundary_admits_an_uncommitted_precut_tx_sim() {
 /// Single-shard genesis with the grow trigger armed — `split_bytes` above
 /// each child of the ballasted root (the splitter's flash-led ballast and
 /// the survivor's ballast-plus-flash) and below the root itself, so the
-/// root splits once and the pair holds — and two cohorts of pool surplus:
-/// one grows ROOT to the two siblings, the other splits the heavier one
-/// after the vote.
+/// root splits once and the pair holds — and two cohorts of pool surplus
+/// plus the shuffle's headroom: one cohort grows ROOT to the two
+/// siblings, the other splits the heavier one after the vote.
+///
+/// The headroom is what makes the second split reachable at all. A split
+/// is admitted only while the pool holds a whole committee, and the
+/// shuffle draws its entrants from that same pool with no such gate —
+/// one per live shard, so two here. Sized for the cohorts alone, whether
+/// the vote's assertion reaches the beacon before the shuffle's next
+/// interval is a race the seed decides, and a shard that loses it never
+/// splits: the entrants that took its seats are jailed unready and the
+/// pool never refills.
 fn straddler_config() -> ScenarioConfig {
     ScenarioConfig {
         shard_size: 4,
         vnodes_per_host: 1,
-        pool_surplus: 8,
+        pool_surplus: 10,
         num_shards: 1,
         split_bytes: stdlib_flash_bytes() + 30_000,
         latency: Duration::from_millis(150),
