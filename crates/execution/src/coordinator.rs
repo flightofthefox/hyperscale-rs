@@ -569,6 +569,23 @@ impl ExecutionCoordinator {
     /// otherwise split execution votes). Falls back to the head only if the
     /// window was evicted — unreachable for a just-committed block, whose
     /// committee resolved at verification.
+    /// The committee this shard was under at `anchor_wt`, or the head
+    /// where the schedule names none.
+    ///
+    /// The fallback is reached in one shape that matters: a split child
+    /// replaying the window it inherited asks about an anchor before its
+    /// own cut, where no snapshot names it at all — `Evicted`, not a
+    /// transient lag — and there is no committee of its own to find. The
+    /// head is then the only one it has, and it classifies the inherited
+    /// content the way the child's own keyspace is cut rather than the
+    /// way its parent's was.
+    ///
+    /// That is a reading of the present, which is what the callers here
+    /// want: they ask who is party to a transaction *now*, to put a
+    /// question to a counterpart that can answer it. A caller wanting
+    /// the classification the content was committed under must not use
+    /// this — that is the block's own anchor trie, and phase 5 removed
+    /// the last consumer that confused the two.
     fn classification_committee<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
