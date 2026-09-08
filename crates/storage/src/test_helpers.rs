@@ -2241,7 +2241,12 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + TestStore)) {
     // one resolved at height 4 committed there too, and does not hold
     // the floor down: an outcome is what releases it.
     assert_eq!(
-        unresolved_replay_floor(storage, BlockHeight::new(4), WeightedTimestamp::ZERO),
+        unresolved_replay_floor(
+            storage,
+            BlockHeight::new(4),
+            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT
+        ),
         Some(BlockHeight::new(2)),
         "the replay starts at the block committing what is still owed",
     );
@@ -2269,6 +2274,7 @@ fn assert_replayed_window(storage: &(impl ShardChainReader + TestStore)) {
         BlockHeight::new(4),
         WeightedTimestamp::ZERO,
         BlockHeight::GENESIS,
+        ChainOrigin::ROOT,
     );
     let heights: Vec<BlockHeight> = window
         .blocks
@@ -2333,6 +2339,7 @@ fn assert_compose_floor_follows_retention(storage: &impl ShardChainReader) {
         BlockHeight::new(4),
         WeightedTimestamp::ZERO,
         BlockHeight::new(2),
+        ChainOrigin::ROOT,
     );
     assert_eq!(
         retired.blocks.len(),
@@ -2393,7 +2400,12 @@ pub fn test_undischarged_record_holds_the_floor(storage: &(impl ShardChainReader
     );
 
     assert_eq!(
-        unresolved_replay_floor(storage, BlockHeight::new(3), WeightedTimestamp::ZERO),
+        unresolved_replay_floor(
+            storage,
+            BlockHeight::new(3),
+            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT
+        ),
         Some(BlockHeight::new(2)),
         "the replay opens at the record, which is where the entry comes from",
     );
@@ -2416,7 +2428,12 @@ pub fn test_undischarged_record_holds_the_floor(storage: &(impl ShardChainReader
     );
 
     assert_eq!(
-        unresolved_replay_floor(storage, BlockHeight::new(4), WeightedTimestamp::ZERO),
+        unresolved_replay_floor(
+            storage,
+            BlockHeight::new(4),
+            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT
+        ),
         None,
         "a discharged record holds nothing down",
     );
@@ -2472,16 +2489,95 @@ pub fn test_a_leg_entry_holds_the_floor_to_its_horizon(
         .plus(RETENTION_HORIZON)
         .plus(Duration::from_secs(1));
     assert_eq!(
-        unresolved_replay_floor(storage, BlockHeight::new(2), past_retention),
+        unresolved_replay_floor(
+            storage,
+            BlockHeight::new(2),
+            past_retention,
+            ChainOrigin::ROOT
+        ),
         Some(BlockHeight::new(1)),
         "past the retention horizon a whole entry is gone, but a leg entry \
          stands, so its commit still holds the floor",
     );
     let past_horizon = past_retention.plus(CLAIM_WINDOW);
     assert_eq!(
-        unresolved_replay_floor(storage, BlockHeight::new(2), past_horizon),
+        unresolved_replay_floor(
+            storage,
+            BlockHeight::new(2),
+            past_horizon,
+            ChainOrigin::ROOT
+        ),
         None,
         "and past its own horizon nothing is owed, so nothing holds it down",
+    );
+}
+
+/// Shared rebuild test: the replay floor stops at the chain's own origin.
+///
+/// A split child's `RocksDB` store is a hard-linked clone of its
+/// parent's and carries the parent's whole chain under the child's
+/// genesis height. Measured in time alone the walk reads those blocks as
+/// this chain's and replays parts no peer seeded from the same clone
+/// ever held; nothing below the origin is this chain's to owe.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_the_replay_floor_stops_at_the_chain_origin(
+    storage: &(impl ShardChainReader + TestStore),
+) {
+    let inherited = test_transaction(6);
+    let own = test_transaction(7);
+
+    // Height 1 is the predecessor's: it commits a transaction no
+    // certificate resolves, exactly what would hold the floor down.
+    let below = with_transactions(
+        make_test_block(BlockHeight::new(1)),
+        vec![Arc::new(Verifiable::from(inherited))],
+    );
+    commit_settled_at(
+        storage,
+        &make_test_certified(below),
+        &[],
+        &[],
+        &empty_witness(),
+    );
+    let above = with_transactions(
+        make_test_block(BlockHeight::new(2)),
+        vec![Arc::new(Verifiable::from(own))],
+    );
+    commit_settled_at(
+        storage,
+        &make_test_certified(above),
+        &[],
+        &[],
+        &empty_witness(),
+    );
+
+    let origin = ChainOrigin {
+        genesis_height: BlockHeight::new(2),
+        anchor_wt: WeightedTimestamp::ZERO,
+    };
+    assert_eq!(
+        unresolved_replay_floor(
+            storage,
+            BlockHeight::new(2),
+            WeightedTimestamp::ZERO,
+            origin
+        ),
+        Some(BlockHeight::new(2)),
+        "the walk stops at the origin, so the predecessor's unresolved \
+         transaction is not this chain's to replay",
+    );
+    assert_eq!(
+        unresolved_replay_floor(
+            storage,
+            BlockHeight::new(2),
+            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT,
+        ),
+        Some(BlockHeight::new(1)),
+        "and a chain that really does begin at the root reaches both",
     );
 }
 
@@ -2526,7 +2622,12 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
         &empty_witness(),
     );
     assert_eq!(
-        unresolved_replay_floor(storage, BlockHeight::new(2), WeightedTimestamp::ZERO),
+        unresolved_replay_floor(
+            storage,
+            BlockHeight::new(2),
+            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT
+        ),
         Some(BlockHeight::new(1)),
         "a leg that succeeded is still owed a reclaim, so its commit holds the floor",
     );
@@ -2547,7 +2648,12 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
         &empty_witness(),
     );
     assert_eq!(
-        unresolved_replay_floor(storage, BlockHeight::new(3), WeightedTimestamp::ZERO),
+        unresolved_replay_floor(
+            storage,
+            BlockHeight::new(3),
+            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT
+        ),
         None,
         "the reclaim's finalization decides it and releases the floor",
     );

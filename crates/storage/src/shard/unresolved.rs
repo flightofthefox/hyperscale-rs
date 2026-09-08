@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, EPOCH_DURATION, Provisions, TERMINAL_EVIDENCE_EPOCHS,
+    BlockHeight, CertifiedBlock, ChainOrigin, EPOCH_DURATION, Provisions, TERMINAL_EVIDENCE_EPOCHS,
     TRANSACTION_EVIDENCE_HORIZON, TxHash, Verifiable, Verified, WeightedTimestamp,
 };
 
@@ -68,20 +68,36 @@ const RECORD_WINDOW: Duration = Duration::from_secs(
 /// committed — the reverse would drop a release whose registration had
 /// not happened yet.
 ///
-/// Bounded by what the reader holds: a snap-synced replica has no blocks
-/// below its anchor and recovers only what committed above it, which is
-/// the same limit that applies to everything else it cannot see.
+/// Bounded below by `origin`, the height this chain begins at. A split
+/// child's `RocksDB` store is a hard-linked clone of its parent's and
+/// holds the parent's whole chain, so a walk measured in time alone
+/// reads the parent's blocks as this chain's and replays parts no peer
+/// seeded from the same clone ever held. Nothing under the origin is
+/// owed here in any case: a transaction whose validity window opened
+/// before the chain did cannot be admitted at all, which is the rule
+/// [`DedupWindow::from_reader`] stops at the same height for.
+///
+/// Bounded above that by what the reader holds: a snap-synced replica
+/// has no blocks below its anchor and recovers only what committed above
+/// it, which is the same limit that applies to everything else it cannot
+/// see.
+///
+/// [`DedupWindow::from_reader`]: crate::DedupWindow::from_reader
 #[must_use]
 pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
     reader: &R,
     committed_height: BlockHeight,
     committed_ts: WeightedTimestamp,
+    origin: ChainOrigin,
 ) -> Option<BlockHeight> {
     let cutoff = committed_ts.minus(TRANSACTION_EVIDENCE_HORIZON.max(RECORD_WINDOW));
 
     // Walk back to the window's edge, then fold forward from there.
     let mut oldest = committed_height;
     while let Some(previous) = oldest.prev() {
+        if previous < origin.genesis_height {
+            break;
+        }
         match reader.get_block(previous) {
             Some(block) if block.block().header().parent_qc().weighted_timestamp() >= cutoff => {
                 oldest = previous;
@@ -192,17 +208,19 @@ pub struct ReplayWindow {
 /// that block was supposed to have contributed to.
 ///
 /// `retention_floor` is the oldest version the store answers a historical
-/// read at. A tick composed at height `H` reads its baseline at `H - 1`,
-/// so composition starts at the first height above that floor and the
-/// blocks below it are folded only.
+/// read at. A tick reads its baseline at the height below it, so a tick
+/// dispatches only from the first height above that floor and the ones
+/// below it compose without running.
 #[must_use]
 pub fn replay_window<R: ShardChainReader + ?Sized>(
     reader: &R,
     committed_height: BlockHeight,
     committed_ts: WeightedTimestamp,
     retention_floor: BlockHeight,
+    origin: ChainOrigin,
 ) -> ReplayWindow {
-    let Some(floor) = unresolved_replay_floor(reader, committed_height, committed_ts) else {
+    let Some(floor) = unresolved_replay_floor(reader, committed_height, committed_ts, origin)
+    else {
         return ReplayWindow::default();
     };
     let anchor_wt = floor

@@ -83,6 +83,7 @@ impl RocksDbShardStorage {
                 committed_height,
                 committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),
                 BlockHeight::new(self.retention_floor()),
+                chain_origin,
             ),
             dedup: DedupWindow::from_reader(
                 self,

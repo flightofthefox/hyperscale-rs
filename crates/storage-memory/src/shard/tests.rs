@@ -376,6 +376,12 @@ fn a_replay_reaches_a_record_no_verdict_has_discharged() {
 }
 
 #[test]
+fn a_replay_stops_at_the_chain_origin() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_the_replay_floor_stops_at_the_chain_origin(&storage);
+}
+
+#[test]
 fn a_replay_keeps_a_leg_its_own_finalization_settled() {
     let storage = SimShardStorage::default();
     test_helpers::test_a_legs_own_finalization_keeps_the_floor(&storage);
