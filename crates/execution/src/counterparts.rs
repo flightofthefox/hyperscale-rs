@@ -18,13 +18,14 @@ use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_reclaim_probe_answered};
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, Block, CounterpartEvidence, CounterpartMirror, ExecutionCertificate,
-    Heard, Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed, ProvenAnchors, Question, SettledTxSet,
-    ShardId, ShardTrie, StateProofBundle, SubstateKey, TerminalEvidence, TopologySchedule,
-    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
-    WeightedTimestamp, Word,
+    AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartEvidence, CounterpartMirror,
+    Deadline, ExecutionCertificate, Heard, Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
+    MAX_STATE_PROOFS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed,
+    ProvenAnchors, Question, SettledTxSet, ShardId, ShardTrie, StateProofBundle, SubstateKey,
+    TerminalEvidence, TopologySchedule, TransactionDecision, TxHash, TxResolution, UnsettledTx,
+    Verifiable, Verified, WeightedTimestamp, Word,
 };
+use hyperscale_vm_effects::CrossingCell;
 
 use crate::unresolved::{Probeable, Released, Unanswerable, UnresolvedTxs};
 
@@ -89,6 +90,56 @@ fn counterpart_cells(entry: &Probeable, local: ShardId, trie: &ShardTrie) -> Vec
     core.chain(deliveries).chain(claims).collect()
 }
 
+/// An inherited escrow record, and where its one question stands.
+///
+/// One question, to one shard: is the claim cell this record names
+/// present? So the bookkeeping is one height rather than the ledger's
+/// `Asked` — there is no set of counterparts to track, no fetch release
+/// to sequence, and no record to compose, because the answer is a state
+/// proof and a state proof is block content already.
+#[derive(Debug, Clone)]
+pub struct Inherited {
+    /// The record leaf, which carries the claim key, the issuing
+    /// transaction and the expiry every window is read off.
+    pub cell: CrossingCell,
+    /// The newest counterpart header the claim has been asked at, so
+    /// the question is not re-sent at the same one every block.
+    asked_at: Option<BlockHeight>,
+    /// What a committed proof said, once one has said anything:
+    /// present at any anchor, absent only past the lapse.
+    pub answer: Option<Word>,
+}
+
+impl Inherited {
+    /// The record as it arrives at a seat: undisposed, unasked.
+    #[must_use]
+    pub const fn seated(cell: CrossingCell) -> Self {
+        Self {
+            cell,
+            asked_at: None,
+            answer: None,
+        }
+    }
+
+    /// The deadline every window this record is read against derives
+    /// from — the producing intent's, recovered from the expiry the leaf
+    /// states.
+    #[must_use]
+    pub const fn deadline(&self) -> Deadline {
+        Deadline::from_expiry(self.cell.expiry_ms)
+    }
+}
+
+/// Whether any undisposed inherited record is still waiting on `key`.
+///
+/// Read off the keys rather than off a name, because an inherited
+/// record names no transaction this chain committed.
+fn awaited_by(inherited: &BTreeMap<SubstateKey, Inherited>, key: SubstateKey) -> bool {
+    inherited
+        .values()
+        .any(|record| record.answer.is_none() && record.cell.consumer_claim == key)
+}
+
 /// What a commit folded, and what it could not answer for.
 pub struct Committed {
     /// The fetches it releases and the probes it opens.
@@ -147,6 +198,19 @@ pub struct Counterparts {
     /// proposer comes by the bytes. A bundle leaves when a block
     /// carries it, or when every transaction it answered for is gone.
     fetched: BTreeMap<StateProofBundle, BTreeSet<TxHash>>,
+
+    /// The escrow records this shard inherited with a prefix, each still
+    /// undisposed, by cell key.
+    ///
+    /// A seat's store arrives holding value its predecessors escrowed
+    /// and nothing else names it: its ledger begins empty, no body
+    /// arrives with the leaves, and the chains that issued the crossings
+    /// have ended, so no counterpart record will ever be composed about
+    /// them. What is left is the claim cell each record names, and the
+    /// leaf carries every term needed to ask about it. Held here rather
+    /// than beside the tick machine because the question is a
+    /// counterpart's to answer, like every other question in this file.
+    pub(crate) inherited: BTreeMap<SubstateKey, Inherited>,
     /// Fetches the ledger let go of since the last commit — a question
     /// the chain answered first, or one whose entry is gone — released
     /// as one abandon at the commit, so a counterpart that never serves
@@ -167,8 +231,29 @@ impl Counterparts {
             mirror,
             proven_anchors,
             fetched: BTreeMap::new(),
+            inherited: BTreeMap::new(),
             released_fetches: Vec::new(),
         }
+    }
+
+    /// As [`Self::new`], holding the escrow records a reshape seat
+    /// imported with its prefix. A leaf that does not decode is one no
+    /// disposal could be composed from, so it is dropped rather than
+    /// held.
+    pub fn seated(
+        local_shard: ShardId,
+        proven_anchors: Arc<ProvenAnchors>,
+        evidence: Arc<CounterpartMirror>,
+        records: &[(SubstateKey, Vec<u8>)],
+    ) -> Self {
+        let mut counterparts = Self::new(local_shard, proven_anchors, evidence);
+        counterparts.inherited = records
+            .iter()
+            .filter_map(|(key, value)| {
+                Some((*key, Inherited::seated(CrossingCell::from_bytes(value)?)))
+            })
+            .collect();
+        counterparts
     }
 
     /// Fold what a committed block says about counterparts — the proofs
@@ -353,6 +438,28 @@ impl Counterparts {
                 wanted.entry(anchor).or_default().push(key);
             }
         }
+        // The records this shard inherited ask one question each, of
+        // whoever holds the claim's prefix now. Nothing is asked of a
+        // claim this shard holds itself — the tick reads that cell
+        // directly — and nothing is asked twice at one header.
+        for record in self.inherited.values_mut() {
+            if record.answer.is_some() {
+                continue;
+            }
+            let claim = record.cell.consumer_claim;
+            let shard = trie.shard_for_prefix(claim.owner);
+            if shard == self.local_shard {
+                continue;
+            }
+            let Some(anchor) = self.proven_anchors.newest_licensed(shard, |_| true) else {
+                continue;
+            };
+            if record.asked_at.is_some_and(|asked| asked >= anchor.height) {
+                continue;
+            }
+            record.asked_at = Some(anchor.height);
+            wanted.entry(anchor).or_default().push(claim);
+        }
         wanted
             .into_iter()
             .map(|(anchor, keys)| {
@@ -382,8 +489,11 @@ impl Counterparts {
         proof: MerkleInclusionProof,
     ) {
         let answered = self.ledger.mark_probes_answered(anchor, &keys);
-        // An answer nothing here asked about is nobody's to commit.
-        if !answered.is_empty() {
+        // An answer nothing here asked about is nobody's to commit. An
+        // inherited record names no transaction, so what it wants is
+        // read off the keys.
+        let inherited_wants = keys.iter().any(|key| awaited_by(&self.inherited, *key));
+        if !answered.is_empty() || inherited_wants {
             self.fetched
                 .entry(StateProofBundle::new(anchor, keys, proof))
                 .or_default()
@@ -425,8 +535,45 @@ impl Counterparts {
         let mut actions = Vec::new();
         for bundle in block.state_proofs() {
             actions.extend(self.fold_cells(bundle, &cells));
+            self.fold_inherited(bundle, trie);
         }
         actions
+    }
+
+    /// Read a committed proof against the claims the inherited records
+    /// are waiting on.
+    ///
+    /// Judged by the same per-word rule the ledger's cells are: a
+    /// presence answers wherever it was taken, since the claim cell is
+    /// written by the consuming execution and by nothing else; an
+    /// absence answers only inside the window it means something in,
+    /// which for a record whose consumer's role the leaf does not name
+    /// is the lapse — past it no core of any arity can still commit, so
+    /// the silence is final.
+    fn fold_inherited(&mut self, bundle: &StateProofBundle, trie: &ShardTrie) {
+        let Ok(inclusions) = bundle.inclusions() else {
+            return;
+        };
+        for record in self.inherited.values_mut() {
+            if record.answer.is_some() {
+                continue;
+            }
+            let claim = record.cell.consumer_claim;
+            if trie.shard_for_prefix(claim.owner) != bundle.anchor.shard {
+                continue;
+            }
+            let Some(&(_, inclusion)) = inclusions.iter().find(|(asked, _)| *asked == claim) else {
+                continue;
+            };
+            if !Probed::Delivery.licenses(bundle.anchor.ts, record.deadline(), inclusion) {
+                continue;
+            }
+            record.answer = Some(if inclusion.is_present() {
+                Word::Present
+            } else {
+                Word::Absent
+            });
+        }
     }
 
     /// Fold the verdicts a committed block's records restate: each is
@@ -638,8 +785,16 @@ impl Counterparts {
     /// that never serves the height does not pin the slot.
     fn release_answered_fetches(&mut self) -> Vec<Action> {
         let unresolved = &self.ledger;
-        self.fetched
-            .retain(|_, answered| answered.iter().any(|tx_hash| unresolved.contains(*tx_hash)));
+        // A bundle is worth carrying while something still wants what it
+        // answers: a transaction the ledger owes an outcome for, or an
+        // inherited record whose claim it speaks to. The second has no
+        // transaction here at all, which is why the keys are read rather
+        // than the names.
+        let inherited = &self.inherited;
+        self.fetched.retain(|bundle, answered| {
+            answered.iter().any(|tx_hash| unresolved.contains(*tx_hash))
+                || bundle.keys.iter().any(|key| awaited_by(inherited, *key))
+        });
         // The one retention rule for what counterparts said: an entry
         // there speaks for a transaction this ledger still owes an
         // outcome for, and the ledger is here.

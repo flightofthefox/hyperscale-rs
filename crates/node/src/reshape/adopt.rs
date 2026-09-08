@@ -53,21 +53,18 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
     let substate_bytes = storage
         .substate_bytes_at_version(origin.genesis_height.inner())
         .unwrap_or(0);
-    // A merged parent's store is opened fresh and filled by an import,
-    // so the value its predecessors escrowed arrives with the prefix and
-    // nothing naming it does: a ledger is a fold over its own chain, and
-    // a merged parent's chain begins at the import. Read the records off
-    // the state, which is the authority and is what every keeper
-    // imported.
+    // A seat's obligations come from the leaves it imported and from
+    // nothing else, whichever way it was seated. The value a predecessor
+    // escrowed arrives with the prefix and no chain here names it: a
+    // merged parent's chain begins at the import, a memory clone holds
+    // no blocks at all, and the predecessor drops its ledger at the cut.
+    // So the state is the authority for every kind, and it is what every
+    // keeper imported.
     //
-    // The split kinds take nothing: their store is a clone of the
-    // predecessor's and carries its chain, so the fold rebuilds the
-    // ledger its clone-seeded peers already hold, and a child deriving
-    // obligations on top of it would compose them twice.
-    let inherited_records = match kind {
-        AdoptKind::Merge => storage.escrow_records(shard),
-        AdoptKind::Split | AdoptKind::ParentHalf => Vec::new(),
-    };
+    // A cloned store carrying the predecessor's blocks composes nothing
+    // twice on top of this: the replay walk stops at this chain's own
+    // origin, so it never reaches a block the predecessor committed.
+    let inherited_records = storage.escrow_records(shard);
     verified_recovered_state(
         adopted,
         genesis.header().state_root(),

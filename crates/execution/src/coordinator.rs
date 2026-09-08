@@ -49,10 +49,9 @@ use hyperscale_types::{
     Provisions, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateWrites, StoredReceipt,
     SubstateKey, TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision,
     TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, Window, derive_block_transactions, settled_set_verdict, tick_leader,
+    WeightedTimestamp, Window, Word, derive_block_transactions, settled_set_verdict, tick_leader,
     tick_leader_at,
 };
-use hyperscale_vm_effects::CrossingCell;
 use tracing::instrument;
 
 use crate::candidates::{Admitted, TickCandidates};
@@ -321,18 +320,6 @@ pub struct ExecutionCoordinator {
     /// shard past the execution window — resolves nothing.
     ticked: BTreeMap<TickId, TickedBatch>,
 
-    /// The escrow records this shard inherited with a prefix, each still
-    /// unresolved, by cell key.
-    ///
-    /// A merge successor's store arrives holding value its predecessors
-    /// escrowed, and nothing else names it: its ledger begins empty, no
-    /// body arrives with the leaves, and both children's chains have
-    /// ended, so no counterpart record will ever be composed about them.
-    /// What is left is the claim cell each record names — this shard's
-    /// to read, since the merge gave it both children's prefixes — and
-    /// an entry leaves here when a tick has taken it.
-    inherited: BTreeMap<SubstateKey, CrossingCell>,
-
     /// The blocks a restart has to replay before this coordinator's
     /// account of what is in flight matches its peers'. Construction has
     /// no schedule to compose against, so they wait for
@@ -513,7 +500,12 @@ impl ExecutionCoordinator {
             None => recovered.committee_anchor_wt(),
         };
         Self {
-            counterparts: Counterparts::new(local_shard, proven_anchors, evidence),
+            counterparts: Counterparts::seated(
+                local_shard,
+                proven_anchors,
+                evidence,
+                &recovered.inherited_records,
+            ),
             finalized,
             committed_height,
             committed_ts: committed_block_anchor_wt,
@@ -523,11 +515,6 @@ impl ExecutionCoordinator {
             tick_in_flight: false,
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
-            inherited: recovered
-                .inherited_records
-                .iter()
-                .filter_map(|(key, value)| Some((*key, CrossingCell::from_bytes(value)?)))
-                .collect(),
             replay_blocks: recovered.replay.blocks.clone(),
             compose_from: recovered.replay.compose_from,
             pending_tick_resolutions: Vec::new(),
@@ -1075,11 +1062,20 @@ impl ExecutionCoordinator {
     /// credited back or deleted is the engine's to decide against the
     /// claim cell, which is the only reader holding a snapshot.
     ///
-    /// Two things bound what is admitted, and both are read off
-    /// committed content so every replica at one frontier admits the
-    /// same set. The claim must route here, or this shard cannot read
-    /// the answer at all and the record waits. And the block's clock
-    /// must be inside the window an absent claim means something in.
+    /// What bounds the admission is the answer, and every form of it is
+    /// committed content, so every replica at one frontier admits the
+    /// same set. Where the claim routes here the engine reads the cell
+    /// against its own snapshot, inside the window an absent claim means
+    /// something in. Where it routes elsewhere the answer is the proof a
+    /// block carried, folded before this composes.
+    ///
+    /// The window is the lapse for every record, not the claim. A leaf
+    /// does not name its consumer's role, so a delivery-consumed record
+    /// read under the claim window would be judged absent one validity
+    /// range before its consumer could honestly have written the cell.
+    /// The lapse is the later of the two and is honest for both — and
+    /// past it no core shard of any arity can still commit, so the
+    /// silence is final however wide the core was.
     fn admit_inherited(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -1088,7 +1084,7 @@ impl ExecutionCoordinator {
         state: &mut TickState,
         requests: &mut Vec<CrossShardExecutionRequest>,
     ) {
-        if self.inherited.is_empty() {
+        if self.counterparts.inherited.is_empty() {
             return;
         }
         let Some(committee) = topology_schedule.at(tick_ts) else {
@@ -1096,39 +1092,50 @@ impl ExecutionCoordinator {
         };
         let trie = committee.shard_trie();
         let local_shard = self.local_shard;
-        let mut due: BTreeMap<TxHash, Vec<SubstateKey>> = BTreeMap::new();
-        for (key, record) in &self.inherited {
-            if trie.shard_for_prefix(record.consumer_claim.owner) != local_shard
-                || !Window::Claim
-                    .of(Deadline::from_expiry(record.expiry_ms))
+        // One licence per issuing transaction, so records answered the
+        // same way settle together and a record still waiting holds
+        // nothing back.
+        let mut due: BTreeMap<(TxHash, Licence), Vec<SubstateKey>> = BTreeMap::new();
+        for (key, record) in &self.counterparts.inherited {
+            let claim = record.cell.consumer_claim;
+            let licence = if trie.shard_for_prefix(claim.owner) == local_shard {
+                // This shard holds the cell, so the engine reads it
+                // against its own snapshot — the same licence, answered
+                // without a fetch.
+                Window::Lapse
+                    .of(record.deadline())
                     .contains(&tick_ts)
-            {
+                    .then_some(Licence::OwnLeaf)
+            } else {
+                // The cell is elsewhere, and what decides it is the
+                // proof a block carried: present, the consumer holds
+                // the crossing and the record is deleted; absent past
+                // the lapse, nobody took it and the value goes back.
+                match record.answer {
+                    Some(Word::Present) => Some(Licence::Accepted),
+                    Some(Word::Absent) => Some(Licence::Unclaimed),
+                    Some(Word::Accepted { .. } | Word::Refused { .. }) | None => None,
+                }
+            };
+            let Some(licence) = licence else {
                 continue;
-            }
-            due.entry(record.tx).or_default().push(*key);
+            };
+            due.entry((record.cell.tx, licence)).or_default().push(*key);
         }
-        for (issued_by, records) in due {
+        for ((issued_by, licence), records) in due {
             let tx_hash = inherited_member_name(issued_by, &records);
             // Taken once: the credit deletes the cell, so a second
             // member over the same record would read nothing and the
             // records would be stranded behind a refusal.
             for key in &records {
-                self.inherited.remove(key);
+                self.counterparts.inherited.remove(key);
             }
             record_reclaim_admitted();
             // No body reached this shard: the chain that issued the
             // crossing ended at the cut, and the price it owed was
             // settled there.
             self.seat_settling(
-                tick_id,
-                tick_ts,
-                state,
-                requests,
-                tx_hash,
-                None,
-                records,
-                Licence::OwnLeaf,
-                true,
+                tick_id, tick_ts, state, requests, tx_hash, None, records, licence, true,
             );
         }
     }
@@ -3923,9 +3930,11 @@ mod tests {
         SubstateKey, TickHalf, TransactionDecision, TxClaim, TxResolution, UnsettledTx,
         ValidatorInfo, ValidatorSet, Window, Word,
     };
-    use hyperscale_vm_types::Seeded;
+    use hyperscale_vm_effects::{CrossingCell, Hash32, SubintentHash};
+    use hyperscale_vm_types::{ResourceAddr, Seeded};
 
     use super::*;
+    use crate::counterparts::Inherited;
     use crate::unresolved::{Kept, Part};
 
     fn make_test_topology() -> TopologySchedule {
@@ -8714,6 +8723,120 @@ mod tests {
             state_proof_fetches(&opened),
             vec![(later.anchor, vec![claim])],
             "only the claim is asked again: the committed cell answered"
+        );
+    }
+
+    /// An escrow record a seat inherited: the leaf a predecessor left,
+    /// naming a claim cell that sits on `PEER`.
+    fn inherited_record(local: u8, expiry_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let claim = SubstateKey {
+            owner: committed_tx_cell_key(
+                PEER,
+                transaction.hash(),
+                transaction.validity_range().end_timestamp_exclusive,
+            )
+            .owner,
+            local: LocalKey([local; 16]),
+        };
+        let record_key = SubstateKey {
+            owner: committed_tx_cell_key(
+                HOME,
+                transaction.hash(),
+                transaction.validity_range().end_timestamp_exclusive,
+            )
+            .owner,
+            local: LocalKey([local ^ 0xFF; 16]),
+        };
+        let cell = CrossingCell {
+            resource: ResourceAddr::new([0xE1; 31]),
+            amount: 1_000,
+            intent: SubintentHash(Hash32([local; 32])),
+            local: 0,
+            output: 0,
+            expiry_ms,
+            tx: transaction.hash(),
+            consumer_claim: claim,
+            origin: None,
+        };
+        (record_key, claim, cell)
+    }
+
+    /// What a seat holding one inherited record dispatches, once a block
+    /// carries a proof of its claim.
+    fn inherited_settlement(present: bool) -> Option<Runs> {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state();
+        // Past the lapse, which is where an absence answers.
+        let expiry_ms = 400_000;
+        let (record_key, claim, cell) = inherited_record(0x6A, expiry_ms);
+        let deadline = Deadline::from_expiry(expiry_ms);
+        let read_at = Window::Lapse
+            .of(deadline)
+            .start
+            .plus(Duration::from_secs(1));
+        state
+            .counterparts
+            .inherited
+            .insert(record_key, Inherited::seated(cell));
+
+        // The claim sits on PEER, so the seat asks rather than reads.
+        state.committed_ts = read_at;
+        let present_keys: Vec<SubstateKey> = if present { vec![claim] } else { Vec::new() };
+        let (bundle, opened) = proven_at(
+            &mut state,
+            &schedule,
+            PEER,
+            5,
+            read_at,
+            &present_keys,
+            &[claim],
+        );
+        assert!(
+            state_proof_fetches(&opened)
+                .iter()
+                .any(|(_, keys)| keys.contains(&claim)),
+            "the seat asks whoever holds the claim's prefix"
+        );
+        let actions = commit_carrying(&mut state, &schedule, 1, read_at.as_millis(), vec![bundle]);
+        actions.iter().find_map(|action| match action {
+            Action::ExecuteTransactions { requests, .. } => {
+                requests.first().map(|request| request.runs.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// A record inherited with a prefix whose claim routes elsewhere is
+    /// decided against that claim, proved.
+    ///
+    /// Present, the consumer holds the crossing and the record is
+    /// deleted; absent past the lapse, nobody took it and the value goes
+    /// back. Before this a seat skipped such a record on every tick
+    /// forever: the value stood on its prefix with nothing naming it.
+    #[test]
+    fn a_seat_decides_an_inherited_record_against_a_proof_of_its_claim() {
+        assert!(
+            matches!(
+                inherited_settlement(true),
+                Some(Runs::Settle {
+                    on: Licence::Accepted,
+                    ..
+                })
+            ),
+            "a claim proved present retires the record"
+        );
+        assert!(
+            matches!(
+                inherited_settlement(false),
+                Some(Runs::Settle {
+                    on: Licence::Unclaimed,
+                    ..
+                })
+            ),
+            "and proved absent past the lapse takes the crossing back"
         );
     }
 

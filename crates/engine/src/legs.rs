@@ -556,7 +556,7 @@ impl Member {
 }
 
 /// What licenses a member to settle the records a producer here left.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Licence {
     /// Every consumer claimed, on the evidence of its claim cell proved
     /// present: the records are deleted.
