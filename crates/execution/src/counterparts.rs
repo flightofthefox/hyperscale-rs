@@ -456,15 +456,21 @@ impl Counterparts {
     /// instead. A delivering shard is asked about the crossing's claim
     /// cell past the lapse, the delivery window's close plus the
     /// finalization delay, since a delivery admitted under the close has
-    /// claimed by then or never will. Each is asked against the newest commit-proven
-    /// header of that shard inside its window — at or past its floor and
-    /// short of the probed cell's own sweep, since a proof against a
-    /// swept cell is a true proof of nothing — which is the header the
-    /// shard is likeliest to still serve, a proof being taken from a
-    /// bounded history behind its tip. A shard whose header has not
-    /// reached here yet is asked when it does, and one whose every held
-    /// header is past the window is not asked at all: the entry then
-    /// waits out its horizon.
+    /// claimed by then or never will. Each is asked against that shard's
+    /// newest commit-proven header inside its window — at or past its
+    /// floor and short of the probed cell's own sweep, since a proof
+    /// against a swept cell is a true proof of nothing — of those
+    /// standing at `now`, the chain's committed clock.
+    ///
+    /// That ceiling is what makes a committee ask one question rather
+    /// than four. The answer is held to each voter's own reading, so a
+    /// proposer anchoring where its peers did not sends every one of
+    /// them to fetch bytes before it can vote; anchoring at a clock they
+    /// share, on a header old enough that all of them hold it, they have
+    /// already read the cell the block claims. A shard whose header has
+    /// not reached here yet is asked when it does, and one whose every
+    /// standing header is past the window is not asked at all: the entry
+    /// then waits out its horizon.
     ///
     /// A delivering shard that departs at a reshape may leave no header
     /// past the lapse at all, so the claim cell is asked about wherever
@@ -488,17 +494,20 @@ impl Counterparts {
                 {
                     continue;
                 }
-                // The newest header an absence would answer at: the one
-                // the shard is likeliest to still serve, since a proof is
-                // taken from a bounded history behind its tip. Where no
-                // header answers one — the cue fired before the window
-                // opened — the newest held will do, because the reading
-                // the cue is after is a presence, and a presence answers
+                // The newest header an absence would answer at, of those
+                // standing at the chain's clock: the one the shard is
+                // likeliest to still serve, and the one every member of
+                // this committee is asking of. Where no header answers
+                // one — the cue fired before the window opened — the
+                // newest standing will do, because the reading the cue
+                // is after is a presence, and a presence answers
                 // wherever it was taken.
                 let Some(anchor) = self
                     .proven_anchors
-                    .newest_licensed(shard, |ts| probed.absence_answers_at(ts, entry.deadline))
-                    .or_else(|| self.proven_anchors.newest_licensed(shard, |_| true))
+                    .newest_licensed(shard, now, |ts| {
+                        probed.absence_answers_at(ts, entry.deadline)
+                    })
+                    .or_else(|| self.proven_anchors.newest_licensed(shard, now, |_| true))
                 else {
                     continue;
                 };
@@ -532,7 +541,7 @@ impl Counterparts {
             if shard == self.local_shard {
                 continue;
             }
-            let Some(anchor) = self.proven_anchors.newest_licensed(shard, |_| true) else {
+            let Some(anchor) = self.proven_anchors.newest_licensed(shard, now, |_| true) else {
                 continue;
             };
             if record.asked_at.is_some_and(|asked| asked >= anchor.height) {
@@ -577,9 +586,6 @@ impl Counterparts {
         proof: MerkleInclusionProof,
     ) {
         let answered = self.ledger.mark_probes_answered(anchor, &keys);
-        // An inherited record names no transaction, so what it wants is
-        // read off the keys.
-        let inherited_wants = keys.iter().any(|key| awaited_by(&self.inherited, *key));
         let Some(inclusions) = self.proven_cells.record(anchor, keys, proof) else {
             tracing::warn!(
                 shard = ?anchor.shard,
@@ -588,14 +594,20 @@ impl Counterparts {
             );
             return;
         };
-        // An answer nothing here asked about is nobody's to commit: it
-        // is proven above, which licenses a vote, and offered nowhere.
-        if answered.is_empty() && !inherited_wants {
-            return;
-        }
-        // A question the proof answered is not put again; what the
+        // A question the proof answered is not put again, and the
+        // reading that answered it is the one held to offer: what the
         // answer means is still the chain's to say, and until a block
         // carries the claim nothing here has composed anything from it.
+        //
+        // One rule for both, because a reading that answers nothing is
+        // worth neither. A probe fires from the deadline, and a lapse
+        // opens a validity range past it, so the readings taken in
+        // between are absences outside their window — true of the tree
+        // and mute about the question. Offering one spends a block's
+        // cap on a cell no record can be composed from, and holds every
+        // voter to a non-answer taken at one height.
+        let mut answering: BTreeSet<SubstateKey> = BTreeSet::new();
+        let mut speaks_for: BTreeSet<TxHash> = BTreeSet::new();
         for entry in &answered {
             let Some(&(_, inclusion)) = inclusions.iter().find(|(key, _)| *key == entry.key) else {
                 continue;
@@ -605,12 +617,29 @@ impl Counterparts {
             {
                 self.verified
                     .insert((entry.tx_hash, entry.shard, entry.probed));
+                answering.insert(entry.key);
+                speaks_for.insert(entry.tx_hash);
             }
         }
+        // An inherited record names no transaction, so what it wants is
+        // read off the keys.
+        answering.extend(
+            inclusions
+                .iter()
+                .map(|(key, _)| *key)
+                .filter(|key| awaited_by(&self.inherited, *key)),
+        );
+        if answering.is_empty() {
+            return;
+        }
+        let cells = inclusions
+            .iter()
+            .copied()
+            .filter(|(key, _)| answering.contains(key));
         self.fetched
-            .entry(StateClaim::new(anchor, inclusions))
+            .entry(StateClaim::new(anchor, cells))
             .or_default()
-            .extend(answered.iter().map(|entry| entry.tx_hash));
+            .extend(speaks_for);
     }
 
     /// Fold the claims a committed block carries into the answers every

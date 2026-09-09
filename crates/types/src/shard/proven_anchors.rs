@@ -5,10 +5,10 @@
 //! block's state proofs to the anchors this validator has proven; the
 //! execution coordinator gates a cross-shard execution certificate on
 //! its source block being proven, and anchors a reclaim probe at the
-//! newest proven header a window licenses. Two mirrors of one fact would
-//! let a bundle pass the fence against an anchor the prober would never
-//! have chosen, and the difference between them would be nobody's to
-//! notice.
+//! newest proven header a window licenses that stands at the chain's
+//! clock. Two mirrors of one fact would let a bundle pass the fence
+//! against an anchor the prober would never have chosen, and the
+//! difference between them would be nobody's to notice.
 //!
 //! # Why a projection rather than the header store
 //!
@@ -88,8 +88,20 @@ impl ProvenAnchors {
     }
 
     /// The highest anchor of `shard` this node has proven that `licensed`
-    /// accepts — the one a shard is likeliest to still serve, since a
-    /// proof comes from a bounded history behind its own tip.
+    /// accepts, of those standing at `at`.
+    ///
+    /// The ceiling is what makes the choice agreed. Which headers a node
+    /// holds is its own view, and a counterpart's land a block apart, so
+    /// "the highest held" names a different header on each member of a
+    /// committee at any instant. Pass the chain's committed clock and it
+    /// names one header for all of them: every member is holding it,
+    /// since it is a header old enough for the local chain to have
+    /// committed past it, and none has a newer one to prefer.
+    ///
+    /// Highest under the ceiling rather than lowest in the window, so
+    /// the anchor stays near the counterpart's tip: a proof comes from a
+    /// bounded history behind it, and a window outruns that history by
+    /// an order of magnitude.
     ///
     /// # Panics
     ///
@@ -98,13 +110,14 @@ impl ProvenAnchors {
     pub fn newest_licensed(
         &self,
         shard: ShardId,
+        at: WeightedTimestamp,
         licensed: impl Fn(WeightedTimestamp) -> bool,
     ) -> Option<Anchor> {
         self.by_height
             .read()
             .expect("proven anchors lock poisoned")
             .values()
-            .filter(|anchor| anchor.shard == shard && licensed(anchor.ts))
+            .filter(|anchor| anchor.shard == shard && anchor.ts <= at && licensed(anchor.ts))
             .max_by_key(|anchor| anchor.height)
             .copied()
     }
@@ -189,17 +202,52 @@ mod tests {
         );
         assert_eq!(anchors.at(shard, BlockHeight::new(5)), None);
         assert_eq!(
-            anchors.newest_licensed(shard, |_| true).unwrap().height,
+            anchors
+                .newest_licensed(shard, ms(99_000), |_| true)
+                .unwrap()
+                .height,
             BlockHeight::new(9),
             "the highest of that shard's, and never another shard's",
         );
         assert_eq!(
             anchors
-                .newest_licensed(shard, |ts| ts <= ms(5_000))
+                .newest_licensed(shard, ms(99_000), |ts| ts <= ms(5_000))
                 .unwrap()
                 .height,
             BlockHeight::new(4),
             "and the highest the window reaches, not the highest held",
+        );
+    }
+
+    /// The ceiling is what two nodes holding different headers agree on:
+    /// each names the highest standing at the clock, and the one that
+    /// holds a newer header does not prefer it.
+    #[test]
+    fn the_clock_names_one_anchor_for_a_node_holding_more() {
+        let shard = ShardId::leaf(1, 1);
+        let behind = ProvenAnchors::new();
+        behind.record(anchor(shard, 4, 4, ms(4_000)));
+        let ahead = ProvenAnchors::new();
+        ahead.record(anchor(shard, 4, 4, ms(4_000)));
+        ahead.record(anchor(shard, 9, 9, ms(9_000)));
+
+        let at = ms(5_000);
+        assert_eq!(
+            ahead.newest_licensed(shard, at, |_| true),
+            behind.newest_licensed(shard, at, |_| true),
+            "the header past the clock is not the one either asks of",
+        );
+        assert_eq!(
+            ahead.newest_licensed(shard, at, |_| true).unwrap().height,
+            BlockHeight::new(4),
+        );
+        assert_eq!(
+            ahead
+                .newest_licensed(shard, ms(9_000), |_| true)
+                .unwrap()
+                .height,
+            BlockHeight::new(9),
+            "and the clock reaching it is what lets it be asked of",
         );
     }
 

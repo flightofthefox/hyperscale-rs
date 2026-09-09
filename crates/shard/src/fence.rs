@@ -296,14 +296,15 @@ impl VoteFence<'_> {
     /// tree the other did not. A reading not taken defers, and asks for
     /// the proof that would take it.
     ///
-    /// Absence is the ordinary case, not the pathological one. Which
-    /// remote headers a node has commit-proven is its own view, so two
-    /// validators probing one counterpart routinely anchor at different
-    /// heights, and a voter that read the same cell at its own anchor
-    /// has still not read it at the proposer's. The recovery is a peer
-    /// relaying the proof rather than the counterpart serving it again:
-    /// the proposer holds those bytes by construction, and so does every
-    /// member whose probe landed there.
+    /// A reading not taken is the exception, since a probe anchors at
+    /// the chain's committed clock: the members of a committee ask one
+    /// counterpart the same question, at a header old enough that all
+    /// of them hold it, so a voter has read the cell a block claims
+    /// before the block arrives. What is left is the member whose own
+    /// fetch has not landed. The recovery is a peer relaying the proof
+    /// rather than the counterpart serving it again: the proposer holds
+    /// those bytes by construction, and so does every member whose
+    /// probe answered.
     ///
     /// Everything missing is asked for in one deferral — the commit
     /// proofs for anchors not held, and the relays for cells not read —

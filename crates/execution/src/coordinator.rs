@@ -7904,6 +7904,10 @@ mod tests {
             .inclusions(state_root, shard, asked)
             .expect("the fixture proof answers for its keys");
         state.proven_anchors().record(anchor);
+        // A probe anchors at what stands at the chain's own clock, and
+        // both chains run on one wall clock: a node holding a
+        // counterpart's header at `ts` has committed to there itself.
+        state.committed_ts = state.committed_ts.max(ts);
         let opened = state.on_committed_remote_header(schedule, shard);
         (StateClaim::new(anchor, cells), opened)
     }
@@ -8069,10 +8073,9 @@ mod tests {
             state.on_committed_remote_header(&schedule, PEER);
         }
         let later = lapse.plus(Duration::from_secs(1));
-        let (bundle, _) = proven_at(&mut state, &schedule, PEER, 5, later, &[], &[claim]);
-        state.committed_ts = deadline;
+        let (bundle, opened) = proven_at(&mut state, &schedule, PEER, 5, later, &[], &[claim]);
         assert_eq!(
-            state_proof_fetches(&state.probe_silent_counterparts(&schedule)),
+            state_proof_fetches(&opened),
             vec![(bundle.anchor, vec![claim])],
             "the newest header inside the lapse window is the anchor, and the claim cell the key"
         );
@@ -8126,10 +8129,9 @@ mod tests {
             ),
         );
         state.counterparts.ledger.certify(tx_hash);
-        let (bundle, _) = proven_at(&mut state, &schedule, PEER, 5, later, &[], &[claim]);
-        state.committed_ts = deadline;
+        let (bundle, opened) = proven_at(&mut state, &schedule, PEER, 5, later, &[], &[claim]);
         assert_eq!(
-            state_proof_fetches(&state.probe_silent_counterparts(&schedule)),
+            state_proof_fetches(&opened),
             vec![(bundle.anchor, vec![claim])],
         );
         fetch_answers(&mut state, &bundle, &[]);
@@ -8168,7 +8170,6 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let deadline = UnsettledTx::for_transaction(&transaction).deadline.at();
         let claim = SubstateKey {
             owner: test_prefix(0x81),
             local: LocalKey([0xC4; 16]),
@@ -8192,10 +8193,9 @@ mod tests {
         let lapse = Window::Lapse
             .of(Deadline::of_transaction(&transaction))
             .start;
-        let (bundle, _) = proven_at(&mut state, &schedule, PEER, 5, lapse, &[], &[claim]);
-        state.committed_ts = deadline;
+        let (bundle, opened) = proven_at(&mut state, &schedule, PEER, 5, lapse, &[], &[claim]);
         assert_eq!(
-            state_proof_fetches(&state.probe_silent_counterparts(&schedule)),
+            state_proof_fetches(&opened),
             vec![(bundle.anchor, vec![claim])],
             "the cell is asked about once",
         );
@@ -8272,19 +8272,19 @@ mod tests {
             state.on_committed_remote_header(&schedule, successor);
         }
         let later = lapse.plus(Duration::from_secs(1));
-        let (bundle, _) = proven_at(&mut state, &schedule, successor, 5, later, &[], &[claim]);
-        state.committed_ts = deadline;
+        let (bundle, opened) = proven_at(&mut state, &schedule, successor, 5, later, &[], &[claim]);
         assert_eq!(
-            state_proof_fetches(&state.probe_silent_counterparts(&schedule)),
+            state_proof_fetches(&opened),
             vec![(bundle.anchor, vec![claim])],
             "the successor's newest header inside the lapse window is the anchor, and the \
              claim cell the key; the departed peer, with no header, is not asked"
         );
 
         // A header of the departed peer past the lapse is asked as well.
-        let (peer_bundle, opened) = proven_at(&mut state, &schedule, PEER, 6, lapse, &[], &[claim]);
+        let (peer_bundle, peer_opened) =
+            proven_at(&mut state, &schedule, PEER, 6, lapse, &[], &[claim]);
         assert_eq!(
-            state_proof_fetches(&opened),
+            state_proof_fetches(&peer_opened),
             vec![(peer_bundle.anchor, vec![claim])],
             "the shard that was to deliver is asked wherever it has a header past the lapse"
         );
