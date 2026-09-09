@@ -18,12 +18,13 @@ use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_reclaim_probe_answered};
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartEvidence, CounterpartMirror,
-    Deadline, ExecutionCertificate, Heard, Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed,
-    ProvenAnchors, ProvenCells, Question, SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim,
-    SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision, TxHash, TxResolution,
-    UnsettledTx, Verifiable, Verified, WeightedTimestamp, Word,
+    ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartEvidence,
+    CounterpartMirror, Deadline, ExecutionCertificate, Heard, Inclusion,
+    MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed, ProvenAnchors, ProvenCells, Question,
+    SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim, SubstateKey, TerminalEvidence,
+    TopologySchedule, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
+    WeightedTimestamp, Word,
 };
 use hyperscale_vm_effects::CrossingCell;
 
@@ -88,6 +89,60 @@ fn counterpart_cells(entry: &Probeable, local: ShardId, trie: &ShardTrie) -> Vec
             .map(move |shard| (shard, claim, Probed::Claim))
     });
     core.chain(deliveries).chain(claims).collect()
+}
+
+/// What one block's abandonment records may still spend.
+///
+/// Two figures, because the section answers to two questions. The names
+/// are the drain's: how many transactions can be owed an outcome at once
+/// is what [`MAX_UNSETTLED_PER_BLOCK`] bounds. The bytes are the wire's:
+/// a name costs its reach as well as itself, so the same count of names
+/// spans a four-fold range and only
+/// [`MAX_PROPOSAL_EVIDENCE_BYTES`] keeps the section inside the frame
+/// that carries it.
+struct Budget {
+    names: usize,
+    bytes: usize,
+}
+
+impl Budget {
+    /// A block's whole allowance, before any record is composed. The
+    /// record's own terms are charged with the first name it takes,
+    /// which is what leaves room for them.
+    const fn empty() -> Self {
+        Self {
+            names: MAX_UNSETTLED_PER_BLOCK,
+            bytes: MAX_PROPOSAL_EVIDENCE_BYTES,
+        }
+    }
+
+    /// Whether either figure is exhausted.
+    const fn spent(&self) -> bool {
+        self.names == 0 || self.bytes == 0
+    }
+
+    /// Take as many of `unsettled` as the budget still affords, in the
+    /// order offered, and charge for them. What is left is dropped: a
+    /// name a record does not carry stays uncovered and is offered
+    /// again next block.
+    fn take(&mut self, unsettled: &mut Vec<UnsettledTx>) {
+        let mut taken = 0;
+        let mut spend = ABANDONMENT_RECORD_BYTES;
+        for entry in unsettled.iter().take(self.names) {
+            let next = spend + entry.wire_weight();
+            if next > self.bytes {
+                break;
+            }
+            spend = next;
+            taken += 1;
+        }
+        unsettled.truncate(taken);
+        if taken == 0 {
+            return;
+        }
+        self.names -= taken;
+        self.bytes -= spend;
+    }
 }
 
 /// An inherited escrow record, and where its one question stands.
@@ -867,13 +922,23 @@ impl Counterparts {
     /// beacon-attested — so a transaction of ours it does not name is one
     /// that shard never settled and now never will.
     ///
-    /// Bounded by [`MAX_UNSETTLED_PER_BLOCK`], one budget across every
-    /// departure, with the remainder left for the next block.
+    /// Bounded by [`MAX_PROPOSAL_EVIDENCE_BYTES`] and by
+    /// [`MAX_UNSETTLED_PER_BLOCK`], one of each across every record,
+    /// with the remainder left for the next block. The bytes are what
+    /// stops first: a name's cost varies with its reach, so the count
+    /// alone would admit a section several frames wide.
+    ///
+    /// The departures are filled before what was heard, so which of them
+    /// the budgets reach is the same on every proposer: a departure is
+    /// composed from the settled sets, which every replica at a
+    /// committed height holds alike, while what a validator has heard is
+    /// its own. Truncating loses nothing — a name no record carries
+    /// stays uncovered and is offered again next block.
     ///
     /// Ascending by shard, which is the one order a block may carry them
     /// in.
     fn abandonment_records(&self) -> Vec<AbandonmentRecord> {
-        let mut budget = MAX_UNSETTLED_PER_BLOCK;
+        let mut budget = Budget::empty();
         // One record per shard and arm, ascending: a departure first,
         // since it covers everything the shard was party to, then one
         // per question for the shards still running, in the order the
@@ -886,17 +951,16 @@ impl Counterparts {
             let mut shards: Vec<ShardId> = sets.keys().copied().collect();
             shards.sort_unstable();
             for shard in shards {
-                if budget == 0 || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
+                if budget.spent() || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
                     break;
                 }
                 let settled = &sets[&shard];
                 let mut unsettled = self.ledger.outstanding_with(shard, settled.terminal_wt);
                 unsettled.retain(|entry| !settled.txs.contains(&entry.tx_hash));
-                unsettled.truncate(budget);
+                budget.take(&mut unsettled);
                 if unsettled.is_empty() {
                     continue;
                 }
-                budget -= unsettled.len();
                 let record = AbandonmentRecord::departed(shard, settled.terminal_wt, unsettled);
                 records.insert((shard, None), record);
             }
@@ -928,7 +992,7 @@ impl Counterparts {
                 .push(figures);
         }
         for ((shard, question), anchors) in heard {
-            if budget == 0 || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
+            if budget.spent() || records.len() == MAX_ABANDONMENT_RECORDS_PER_BLOCK {
                 break;
             }
             if records.contains_key(&(shard, None)) {
@@ -937,8 +1001,10 @@ impl Counterparts {
             let Some(((at, word), mut unsettled)) = anchors.into_iter().next() else {
                 continue;
             };
-            unsettled.truncate(budget);
-            budget -= unsettled.len();
+            budget.take(&mut unsettled);
+            if unsettled.is_empty() {
+                continue;
+            }
             let evidence = Heard { question, word, at };
             records.insert(
                 (shard, Some(question)),
@@ -1037,5 +1103,133 @@ impl Counterparts {
     fn gc_settled_sets(&self, topology_schedule: &TopologySchedule, now: WeightedTimestamp) {
         self.mirror
             .retain_departures(&|shard| topology_schedule.terminal_evidence_readable(shard, now));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_types::{
+        AbortCharge, Address, AddressClass, Hash, LocalKey, RoutePrefix, evidence_admits_block,
+    };
+
+    use super::*;
+
+    /// One name reaching `routes` prefixes, seeded by `seed`.
+    fn name(seed: usize, routes: usize) -> UnsettledTx {
+        let byte = u8::try_from(seed % 256).expect("masked");
+        UnsettledTx {
+            tx_hash: TxHash::from(Hash::from_bytes(&seed.to_le_bytes())),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(60_000)),
+            declared_work: 5,
+            charge: AbortCharge {
+                vault: SubstateKey {
+                    owner: Address::new([byte; 31], AddressClass::Component),
+                    local: LocalKey([byte; 16]),
+                },
+                amount: 1,
+            },
+            reach: (0..routes)
+                .map(|at| {
+                    RoutePrefix::from(Address::new(
+                        [u8::try_from(at % 256).expect("masked"); 31],
+                        AddressClass::Component,
+                    ))
+                })
+                .collect(),
+        }
+    }
+
+    /// A backlog wider than one block's bytes is carried across blocks
+    /// with nothing lost: each block takes a prefix of what is offered,
+    /// the next takes up where it stopped, and every name is carried by
+    /// exactly one.
+    #[test]
+    fn a_backlog_over_the_byte_budget_drains_across_blocks() {
+        let wide = name(0, 6).wire_weight();
+        let backlog: Vec<UnsettledTx> = (0..3 * MAX_PROPOSAL_EVIDENCE_BYTES / wide)
+            .map(|seed| name(seed, 6))
+            .collect();
+
+        let mut left = backlog.clone();
+        let mut carried: Vec<UnsettledTx> = Vec::new();
+        for _ in 0..8 {
+            if left.is_empty() {
+                break;
+            }
+            let mut offered = left.clone();
+            Budget::empty().take(&mut offered);
+            assert!(!offered.is_empty(), "each block carries something");
+            let record = AbandonmentRecord::departed(
+                ShardId::ROOT,
+                WeightedTimestamp::ZERO,
+                offered.clone(),
+            );
+            assert!(
+                evidence_admits_block(record.wire_weight()),
+                "and what it carries is a section a voter admits",
+            );
+            left.drain(..offered.len());
+            carried.extend(offered);
+        }
+        assert!(left.is_empty(), "the backlog drains");
+        assert_eq!(
+            carried, backlog,
+            "each name carried once, in the order offered"
+        );
+    }
+
+    /// The bytes stop the composer before the names do, which is the
+    /// whole point of the second figure: a name's reach is not something
+    /// a count can see.
+    #[test]
+    fn the_bytes_are_what_stops_a_wide_backlog() {
+        let mut wide: Vec<UnsettledTx> = (0..MAX_UNSETTLED_PER_BLOCK)
+            .map(|seed| name(seed, 6))
+            .collect();
+        Budget::empty().take(&mut wide);
+        assert!(
+            wide.len() < MAX_UNSETTLED_PER_BLOCK,
+            "the byte budget bites first",
+        );
+        assert!(evidence_admits_block(
+            ABANDONMENT_RECORD_BYTES + wide.iter().map(UnsettledTx::wire_weight).sum::<usize>()
+        ));
+    }
+
+    /// A budget with bytes to spare still stops at the drain's count:
+    /// the two figures answer different questions and neither subsumes
+    /// the other.
+    #[test]
+    fn the_names_are_what_stops_a_narrow_backlog() {
+        let narrow = name(0, 0).wire_weight();
+        assert!(
+            MAX_UNSETTLED_PER_BLOCK * narrow > MAX_PROPOSAL_EVIDENCE_BYTES,
+            "a reachless name is still wide enough that the bytes bind at the drain's count",
+        );
+        let mut budget = Budget::empty();
+        budget.bytes = usize::MAX;
+        let mut offered: Vec<UnsettledTx> = (0..MAX_UNSETTLED_PER_BLOCK + 10)
+            .map(|seed| name(seed, 0))
+            .collect();
+        budget.take(&mut offered);
+        assert_eq!(offered.len(), MAX_UNSETTLED_PER_BLOCK);
+    }
+
+    /// A record's own terms are charged once, with the first name it
+    /// takes, so a budget spent across several records still leaves room
+    /// for each one's header.
+    #[test]
+    fn a_records_own_terms_are_charged_with_its_first_name() {
+        let mut budget = Budget::empty();
+        let mut one = vec![name(0, 2)];
+        budget.take(&mut one);
+        assert_eq!(
+            MAX_PROPOSAL_EVIDENCE_BYTES - budget.bytes,
+            ABANDONMENT_RECORD_BYTES + name(0, 2).wire_weight(),
+        );
+        let mut none: Vec<UnsettledTx> = Vec::new();
+        let before = budget.bytes;
+        budget.take(&mut none);
+        assert_eq!(budget.bytes, before, "an empty take charges nothing");
     }
 }

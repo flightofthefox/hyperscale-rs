@@ -47,8 +47,9 @@
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    Deadline, Hash, MAX_PREFIXES_PER_TX, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, Probed,
-    RoutePrefix, ShardId, SubstateKey, Transaction, TransactionDecision, TxHash, WeightedTimestamp,
+    ABANDONMENT_RECORD_BYTES, Deadline, Hash, MAX_PREFIXES_PER_TX, MAX_UNSETTLED_PER_BLOCK,
+    MAX_VALIDITY_RANGE, Probed, ROUTE_PREFIX_BYTES, RoutePrefix, ShardId, SubstateKey, Transaction,
+    TransactionDecision, TxHash, UNSETTLED_TX_BYTES, WeightedTimestamp,
 };
 
 /// What an abort of one transaction burns, and out of whose vault.
@@ -127,6 +128,17 @@ impl UnsettledTx {
             },
             reach: tx.routing().all_routes(),
         }
+    }
+
+    /// An upper bound on what this name costs the block that carries it.
+    ///
+    /// A bound rather than the encoding, so a composer can spend the
+    /// section's budget as it fills it and a voter can check the same
+    /// figure without re-encoding what it just decoded. Everything but
+    /// the reach is fixed width, and the reach is a route each.
+    #[must_use]
+    pub const fn wire_weight(&self) -> usize {
+        UNSETTLED_TX_BYTES + self.reach.len() * ROUTE_PREFIX_BYTES
     }
 
     /// The earliest instant any shard could have committed the
@@ -496,6 +508,24 @@ impl AbandonmentRecord {
     #[must_use]
     pub const fn evidence(&self) -> CounterpartEvidence {
         self.evidence
+    }
+
+    /// An upper bound on what this record costs the block that carries
+    /// it: its own terms plus each name's.
+    ///
+    /// The figure the section's byte budget is spent in. It is what
+    /// bounds the section rather than the name count, because a name's
+    /// own cost varies with its reach — a transfer names two routes, a
+    /// route dozens — so the same count of names spans a four-fold
+    /// range of bytes.
+    #[must_use]
+    pub fn wire_weight(&self) -> usize {
+        ABANDONMENT_RECORD_BYTES
+            + self
+                .unsettled
+                .iter()
+                .map(UnsettledTx::wire_weight)
+                .sum::<usize>()
     }
 
     /// The transactions it can never settle, each with what abandoning

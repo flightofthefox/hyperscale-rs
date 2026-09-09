@@ -25,9 +25,10 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     AbandonmentRecord, BlockHash, BlockHeight, CounterpartEvidence, Finalization, FinalizationHash,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, ShardId, StateClaim, TopologySchedule,
-    TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp, sweep_admits_block,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, ShardId, StateClaim,
+    TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp,
+    evidence_admits_block, sweep_admits_block,
 };
 
 use crate::chain_view::ChainView;
@@ -498,6 +499,8 @@ pub struct RecordsFold<'a> {
     pub previous: Option<(ShardId, CounterpartEvidence)>,
     /// Names the admitted records carry, against the drain's own bound.
     pub named: usize,
+    /// Bytes the admitted records weigh, against the section's budget.
+    pub weight: usize,
 }
 
 impl<'a> RecordsFold<'a> {
@@ -508,6 +511,7 @@ impl<'a> RecordsFold<'a> {
             finalizations,
             previous: None,
             named: 0,
+            weight: 0,
         }
     }
 }
@@ -587,9 +591,18 @@ impl<'f> Section for RecordsSection<'f> {
     /// for one shard under one arm would leave which answer counts to
     /// the reader, and a reordering would be a second form of the same
     /// block. One shard may carry several arms: what it claimed and
-    /// what it left unclaimed are different transactions. The budget is
-    /// the sum across every record, because the per-record decode cap
-    /// alone would let a block spend it once per record.
+    /// what it left unclaimed are different transactions. Both budgets
+    /// are sums across every record, because the per-record decode cap
+    /// alone would let a block spend either once per record.
+    ///
+    /// The byte budget is what bounds the block, since a name's cost
+    /// varies with its reach and a count cannot see that. At the
+    /// figures both stand at, the bytes are reached first for a section
+    /// of any shape — the drain's count of names costs three frames at
+    /// the narrowest reach there is — so the count is checked for the
+    /// question it answers rather than for the blocks it turns away:
+    /// how many transactions the drain can have owed at once, which
+    /// binds again the moment a name gets cheaper.
     fn admit(
         ctx: &Admission<'_>,
         fold: &mut Self::Fold,
@@ -619,8 +632,16 @@ impl<'f> Section for RecordsSection<'f> {
                  {MAX_UNSETTLED_PER_BLOCK}"
             ));
         }
+        let weight = fold.weight.saturating_add(verdict.wire_weight());
+        if !evidence_admits_block(weight) {
+            return Err(format!(
+                "abandonment records weigh {weight} bytes, over the section's budget of \
+                 {MAX_PROPOSAL_EVIDENCE_BYTES}"
+            ));
+        }
         fold.previous = Some(position);
         fold.named = named;
+        fold.weight = weight;
         Ok(())
     }
 }

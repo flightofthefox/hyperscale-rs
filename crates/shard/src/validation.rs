@@ -444,13 +444,13 @@ mod tests {
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, Anchor,
         BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Deadline, Finalization, Hash, Heard,
-        Inclusion, LocalKey, MAX_SUBINTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-        MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, NetworkDefinition, PrincipalAddr, Probed,
-        ProposerTimestamp, ProvisionEntry, Provisions, Question, QuorumCertificate, Round, ShardId,
-        ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey,
-        TimestampRange, Transaction, TransactionDecision, TxHash, UnsettledTx, ValidatorId,
-        ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources, Word,
-        test_utils,
+        Inclusion, LocalKey, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SUBINTENTS,
+        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof,
+        NetworkDefinition, PrincipalAddr, Probed, ProposerTimestamp, ProvisionEntry, Provisions,
+        Question, QuorumCertificate, Round, RoutePrefix, ShardId, ShardLoad, Signer,
+        SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey, TimestampRange,
+        Transaction, TransactionDecision, TxHash, UnsettledTx, ValidatorId, ValidatorInfo,
+        ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources, Word, test_utils,
     };
 
     use super::*;
@@ -1204,32 +1204,49 @@ mod tests {
         assert!(held_records(&block_with_verdicts(arms_reversed, root)).is_err());
     }
 
-    /// The drain is one budget across every departure a block answers
-    /// for. Each record's own cap is the same figure, because one
-    /// departure may hold the whole of it — so without the sum a block
-    /// could spend the budget once per record.
+    /// The budget is one across every record a block carries, and it is
+    /// spent in bytes: a name costs its reach as well as itself, so a
+    /// section well under the drain's count can still be several frames
+    /// wide.
+    ///
+    /// The sum is what makes it a bound. Each record here is well inside
+    /// its own decode cap, so without the running total a block could
+    /// spend the whole budget once per record.
     #[test]
-    fn records_naming_more_than_the_drain_can_hold_are_refused() {
-        // Two records, each half the budget plus one, so neither trips its
-        // own cap and together they clear the block's.
-        let half = MAX_UNSETTLED_PER_BLOCK / 2 + 1;
+    fn records_weighing_more_than_the_frame_affords_are_refused() {
         let (left, right) = ShardId::ROOT.children();
+        // A name at an ordinary route's reach, and enough of them
+        // between two records to clear the byte budget while staying
+        // well under the drain's count.
+        let wide = |seed: usize| UnsettledTx {
+            reach: (0..6)
+                .map(|at| {
+                    RoutePrefix::from(Address::new(
+                        [u8::try_from(at % 256).expect("masked"); 31],
+                        AddressClass::Component,
+                    ))
+                })
+                .collect(),
+            ..named(TxHash::from(Hash::from_bytes(&seed.to_le_bytes())))
+        };
+        let per_record = MAX_PROPOSAL_EVIDENCE_BYTES / wide(0).wire_weight() / 2 + 1;
         let span = |shard: ShardId, from: usize| {
             AbandonmentRecord::departed(
                 shard,
                 WeightedTimestamp::from_millis(DEPARTURE_CUT_MS),
-                (from..from + half)
-                    .map(|i| named(TxHash::from(Hash::from_bytes(&i.to_le_bytes())))),
+                (from..from + per_record).map(wide),
             )
         };
-        let records = vec![span(left, 0), span(right, half)];
-        for record in &records {
-            assert!(record.is_well_formed(), "each record is within its own cap");
-        }
+        let records = vec![span(left, 0), span(right, per_record)];
+        let named: usize = records.iter().map(|r| r.unsettled().len()).sum();
+        assert!(
+            named < MAX_UNSETTLED_PER_BLOCK,
+            "the count admits this section, so only the weight can refuse it",
+        );
 
         let root = AbandonmentRoot::over(&records);
         let err = held_records(&block_with_verdicts(records, root)).unwrap_err();
-        assert!(err.contains("over the drain's own bound"), "{err}");
+        assert!(err.contains("over the section's budget"), "{err}");
     }
 
     /// The running work total is a validity condition, not a hint: a header

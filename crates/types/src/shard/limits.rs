@@ -11,7 +11,7 @@
 
 use hyperscale_vm_types::{MAX_TX_BYTES_LEN, TX_UNITS};
 
-use crate::{Address, LocalKey, Question, WorkInFlight};
+use crate::{Address, LocalKey, Question, RoutePrefix, WorkInFlight};
 
 /// The largest message any transport carries, compressed.
 ///
@@ -243,6 +243,77 @@ pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
 /// vote on the whole block — cannot couple every transaction in a block
 /// to the slowest proof on the abort path.
 pub const MAX_STATE_CLAIMS_PER_BLOCK: usize = 256;
+
+/// Byte budget the abandonment records of one block share.
+///
+/// The one section a block carries verbatim whose per-item cost varies:
+/// a name is 128 bytes plus its reach, and a record's reach runs from a
+/// transfer's two routes to a route's dozens. So a count cannot bound
+/// it — [`MAX_UNSETTLED_PER_BLOCK`] names at their widest run past the
+/// whole frame — and a proposer spends this instead, leaving the
+/// remainder to the next block. Nothing is lost by stopping: a name a
+/// record does not carry stays uncovered and is offered again.
+///
+/// Sized as the share of [`MAX_WIRE_MESSAGE_BYTES`] the assertion below
+/// leaves for it. At the narrowest reach it still carries some eight
+/// thousand names a block, several times the rate any drain can open
+/// them at.
+pub const MAX_PROPOSAL_EVIDENCE_BYTES: usize = 1024 * 1024;
+
+/// Whether a block may still carry records weighing `weight` between
+/// them.
+///
+/// The one reading of the budget, so the composer that fills the section
+/// and the admission that checks it stop at the same place.
+#[must_use]
+pub const fn evidence_admits_block(weight: usize) -> bool {
+    weight <= MAX_PROPOSAL_EVIDENCE_BYTES
+}
+
+/// Bytes one [`AbandonmentRecord`](crate::AbandonmentRecord) costs
+/// before the names it carries.
+pub const ABANDONMENT_RECORD_BYTES: usize = 32;
+
+/// Bytes one [`UnsettledTx`](crate::UnsettledTx) costs before its reach.
+pub const UNSETTLED_TX_BYTES: usize = 128;
+
+/// Bytes one [`RoutePrefix`](crate::RoutePrefix) of a name's reach
+/// costs.
+pub const ROUTE_PREFIX_BYTES: usize = size_of::<RoutePrefix>();
+
+/// Bytes one [`StateClaim`](crate::StateClaim) costs before its cells.
+const STATE_CLAIM_BYTES: usize = 64;
+
+/// Bytes one cell of a claim costs: the key and the reading of it.
+const STATE_CLAIM_CELL_BYTES: usize = 82;
+
+/// Bytes a hash-only entry of a manifest costs.
+const HASH_BYTES: usize = 32;
+
+/// Bytes the parts of a proposal that carry no capped list cost between
+/// them: the header, the QC, the witness sources and the framing.
+const PROPOSAL_FIXED_BYTES: usize = 64 * 1024;
+
+/// The widest a proposal can encode: every section at its own cap, and
+/// the record section at its byte budget.
+///
+/// The per-item figures above are upper bounds on the real encoding,
+/// which `wire_budget.rs` holds them to by encoding a maximal value of
+/// each and measuring it. Without that this assertion would only be
+/// arithmetic over guesses.
+const MAX_PROPOSAL_BYTES: usize = PROPOSAL_FIXED_BYTES
+    + MAX_TXS_PER_BLOCK * HASH_BYTES
+    + MAX_FINALIZED_TX_PER_BLOCK * HASH_BYTES
+    + MAX_PROVISIONS_PER_BLOCK * HASH_BYTES
+    + MAX_PROPOSAL_EVIDENCE_BYTES
+    + MAX_STATE_CLAIMS_PER_BLOCK
+        * (STATE_CLAIM_BYTES + MAX_PROOFS_PER_QUERY * STATE_CLAIM_CELL_BYTES);
+
+/// INV-WIRE-1: a proposal every section of which is at its cap still
+/// fits the frame that carries it. The transports drop an oversize
+/// message rather than truncating it, so a proposer that could build one
+/// would lose the round and lose it again on every block of that shape.
+const _: () = assert!(MAX_PROPOSAL_BYTES < MAX_WIRE_MESSAGE_BYTES);
 
 /// How far the drain's transaction *count* may run past the depth its
 /// work budget is sized for, when every transaction is as cheap as one
