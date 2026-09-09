@@ -3938,14 +3938,14 @@ mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
-        BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
-        CounterpartEvidence, EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, ExecutionOutcome,
-        GlobalReceiptHash, Hash, Heard, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK,
-        MAX_VALIDITY_RANGE, NetworkDefinition, Probed, Question, QuorumCertificate,
-        RETENTION_HORIZON, Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor,
-        ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, StoredReceipt, SubstateKey,
-        TickHalf, TransactionDecision, TxClaim, TxResolution, UnsettledTx, ValidatorInfo,
-        ValidatorSet, Window, Word,
+        BeaconWitnessLeafCount, CLAIM_VISIBILITY_LAG, ConsensusPublicKey, ConsensusReceipt,
+        ConsensusSignature, CounterpartEvidence, EPOCH_DURATION, Epoch, EpochSeed, EpochWindows,
+        ExecutionOutcome, GlobalReceiptHash, Hash, Heard, LocalKey, MAX_FINALIZATION_DELAY,
+        MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition, Probed, Question,
+        QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryCause, SeedRing, SeedSource,
+        ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, StoredReceipt,
+        SubstateKey, TickHalf, TransactionDecision, TxClaim, TxResolution, UnsettledTx,
+        ValidatorInfo, ValidatorSet, Window, Word,
     };
     use hyperscale_vm_effects::{CrossingCell, Hash32, SubintentHash};
     use hyperscale_vm_types::{ResourceAddr, Seeded};
@@ -7674,7 +7674,12 @@ mod tests {
             .counterparts
             .ledger
             .register_committed(HOME, [(&transaction, &Classified::whole())]);
-        assert!(fresh.counterparts.fold_claimed(PEER, tx_hash).is_empty());
+        assert!(
+            fresh
+                .counterparts
+                .fold_claimed(PEER, tx_hash, WeightedTimestamp::ZERO)
+                .is_empty()
+        );
         assert!(fresh.counterparts.mirror.all().is_empty());
     }
 
@@ -8949,6 +8954,53 @@ mod tests {
         };
         let state = claimed_leg_state(&transaction, claim);
         (transaction, figures, claim, state)
+    }
+
+    /// A cued claim is not asked about before the counterpart could
+    /// have written it.
+    ///
+    /// The cue names where the writing execution ran, and the cell
+    /// lands a lag past it, so a probe inside the lag is a fetch spent
+    /// on an answer that cannot be there — and, since a claim is held
+    /// to each voter's own reading, one taken at whichever height each
+    /// member's own poll happened to reach.
+    #[test]
+    fn a_cued_claim_waits_for_the_cell_to_be_readable() {
+        let schedule = two_shard_topology();
+        let (transaction, figures, claim, mut state) = consumer_claim_fixture(0x7C);
+        let claimed_at = figures.deadline.at().minus(Duration::from_secs(5));
+        state
+            .counterparts
+            .fold_claimed(PEER, transaction.hash(), claimed_at);
+
+        let (_, early) = proven_at(
+            &mut state,
+            &schedule,
+            PEER,
+            5,
+            claimed_at.plus(CLAIM_VISIBILITY_LAG / 2),
+            &[],
+            &[claim],
+        );
+        assert!(
+            state_proof_fetches(&early).is_empty(),
+            "a header inside the lag is not asked of",
+        );
+
+        let (bundle, opened) = proven_at(
+            &mut state,
+            &schedule,
+            PEER,
+            6,
+            claimed_at.plus(CLAIM_VISIBILITY_LAG),
+            &[claim],
+            &[claim],
+        );
+        assert_eq!(
+            state_proof_fetches(&opened),
+            vec![(bundle.anchor, vec![claim])],
+            "and the first one past it is",
+        );
     }
 
     /// A consumer's claim proved present is what licenses the

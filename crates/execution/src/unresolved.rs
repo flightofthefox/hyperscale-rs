@@ -139,16 +139,17 @@ struct Owed {
     /// entry issued. Once every consumer has, the records here have
     /// nothing left to hold and the retirement is licensed.
     claimed_by: BTreeSet<ShardId>,
-    /// Whether a consumer's certificate has spoken a claiming success
-    /// for this transaction.
+    /// Where a consumer's certificate spoke a claiming success for this
+    /// transaction, if one has.
     ///
     /// The cue to ask, never the answer. A certificate says a
     /// counterpart's execution succeeded; whether it wrote the claim its
     /// success promises is a question about that shard's committed
     /// state, and only its state answers. Opening the probe here rather
-    /// than at the deadline is what keeps a retirement as prompt as the
-    /// certificate that prompts it.
-    cued: bool,
+    /// than at the deadline is what keeps a retirement as prompt as that
+    /// state can show it, which is one [`CLAIM_VISIBILITY_LAG`](hyperscale_types::CLAIM_VISIBILITY_LAG) past the
+    /// anchor kept here.
+    cued: Option<WeightedTimestamp>,
     /// What this shard has heard from the counterparts of the
     /// transaction, mirrored off their certificates as they arrive.
     ///
@@ -524,9 +525,11 @@ pub struct Probeable {
     /// prefix by then: present says the core took it, and absent, where
     /// the core is one shard, that it never will.
     pub claims: Vec<(ShardId, SubstateKey)>,
-    /// Whether a consumer's claiming success has been heard, which opens
-    /// the probe ahead of the deadline.
-    pub cued: bool,
+    /// Where a consumer's claiming success was spoken, if one has been
+    /// heard: the anchor that opens the probe ahead of the deadline, and
+    /// that the cell it asks about becomes readable one
+    /// [`CLAIM_VISIBILITY_LAG`](hyperscale_types::CLAIM_VISIBILITY_LAG) past.
+    pub cued_at: Option<WeightedTimestamp>,
 }
 
 /// A question a fetch of this validator's just spoke to, with the terms
@@ -676,7 +679,7 @@ impl UnresolvedTxs {
                 taken: None,
                 covered: None,
                 claimed_by: BTreeSet::new(),
-                cued: false,
+                cued: None,
                 asked: Asked::default(),
             };
             self.owed.entry(tx.hash()).or_insert(owed);
@@ -896,15 +899,21 @@ impl UnresolvedTxs {
     pub fn probeable(&self, now: WeightedTimestamp) -> Vec<Probeable> {
         self.cells()
             .into_iter()
-            .filter(|entry| entry.deadline.passed(now) || entry.cued)
+            .filter(|entry| entry.deadline.passed(now) || entry.cued_at.is_some())
             .collect()
     }
 
     /// Note that a consumer's certificate spoke a claiming success for
-    /// `tx_hash`, which opens its probe.
-    pub fn cue_probe(&mut self, tx_hash: TxHash) {
+    /// `tx_hash` at `at`, which opens its probe.
+    ///
+    /// The anchor is kept rather than a flag: it is where the writing
+    /// execution ran, so it is what the probe holds its own anchor to,
+    /// and every member reads it off the same certificate. Where more
+    /// than one consumer speaks, the earliest stands — the entry is
+    /// asked about as soon as any cell it waits on could be there.
+    pub fn cue_probe(&mut self, tx_hash: TxHash, at: WeightedTimestamp) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
-            owed.cued = true;
+            owed.cued = Some(owed.cued.map_or(at, |cued| cued.min(at)));
         }
     }
 
@@ -936,7 +945,7 @@ impl UnresolvedTxs {
                     core: kept.core.clone(),
                     deliveries,
                     claims,
-                    cued: owed.cued,
+                    cued_at: owed.cued,
                 })
             })
             .collect()
@@ -1136,7 +1145,7 @@ impl UnresolvedTxs {
                         taken: None,
                         covered: Some((verdict.shard(), verdict.evidence())),
                         claimed_by: BTreeSet::new(),
-                        cued: false,
+                        cued: None,
                         asked: Asked::default(),
                     },
                 );
@@ -2412,7 +2421,7 @@ mod tests {
                 core: BTreeSet::from([PARTNER]),
                 deliveries: Vec::new(),
                 claims: Vec::new(),
-                cued: false,
+                cued_at: None,
             }],
             "at the deadline the leg is probeable and the whole entry is not"
         );
@@ -2464,7 +2473,7 @@ mod tests {
                 core: BTreeSet::from([PARTNER]),
                 deliveries: vec![(PARTNER, claim)],
                 claims: Vec::new(),
-                cued: false,
+                cued_at: None,
             }],
         );
         ledger.record_abandonment_records(
@@ -2527,7 +2536,7 @@ mod tests {
                 core: BTreeSet::new(),
                 deliveries: vec![(PARTNER, claim)],
                 claims: Vec::new(),
-                cued: false,
+                cued_at: None,
             }],
         );
         ledger.record_abandonment_records(

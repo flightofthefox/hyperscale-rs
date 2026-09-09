@@ -18,8 +18,8 @@ use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{record_rebuilt_verdict_entry, record_reclaim_probe_answered};
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
-    ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartEvidence,
-    CounterpartMirror, Deadline, ExecutionCertificate, Heard, Inclusion,
+    ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CLAIM_VISIBILITY_LAG,
+    CounterpartEvidence, CounterpartMirror, Deadline, ExecutionCertificate, Heard, Inclusion,
     MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
     MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed, ProvenAnchors, ProvenCells, Question,
     SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim, SubstateKey, TerminalEvidence,
@@ -499,15 +499,20 @@ impl Counterparts {
                 // likeliest to still serve, and the one every member of
                 // this committee is asking of. Where no header answers
                 // one — the cue fired before the window opened — the
-                // newest standing will do, because the reading the cue
-                // is after is a presence, and a presence answers
-                // wherever it was taken.
+                // newest standing past the cue's own visibility will do,
+                // because the reading the cue is after is a presence,
+                // and a presence answers wherever it was taken.
+                let readable = entry.cued_at.map(|at| at.plus(CLAIM_VISIBILITY_LAG));
                 let Some(anchor) = self
                     .proven_anchors
                     .newest_licensed(shard, now, |ts| {
                         probed.absence_answers_at(ts, entry.deadline)
                     })
-                    .or_else(|| self.proven_anchors.newest_licensed(shard, now, |_| true))
+                    .or_else(|| {
+                        self.proven_anchors.newest_licensed(shard, now, |ts| {
+                            readable.is_none_or(|readable| ts >= readable)
+                        })
+                    })
                 else {
                     continue;
                 };
@@ -874,12 +879,17 @@ impl Counterparts {
     /// finalization can still be refused afterwards, so what a record
     /// stands on is the claim cell proved present, and this only opens
     /// the question.
-    pub fn fold_claimed(&mut self, shard: ShardId, tx_hash: TxHash) -> Vec<Action> {
+    pub fn fold_claimed(
+        &mut self,
+        shard: ShardId,
+        tx_hash: TxHash,
+        at: WeightedTimestamp,
+    ) -> Vec<Action> {
         if shard == self.local_shard {
             return Vec::new();
         }
         if self.ledger.consumer_holds(tx_hash, shard) {
-            self.ledger.cue_probe(tx_hash);
+            self.ledger.cue_probe(tx_hash, at);
         }
         if self.ledger.core_holds(tx_hash, shard) && self.ledger.record_acceptance(tx_hash, shard) {
             return vec![Action::Continuation(ProtocolEvent::TransactionsResolved {
@@ -1093,7 +1103,7 @@ impl Counterparts {
         for (tx_hash, spoken) in ec.verdicts() {
             actions.extend(match spoken {
                 Spoken::Refused(heard) => self.fold_verdict(shard, tx_hash, heard),
-                Spoken::Claimed { .. } => self.fold_claimed(shard, tx_hash),
+                Spoken::Claimed { at } => self.fold_claimed(shard, tx_hash, at),
             });
         }
         actions
