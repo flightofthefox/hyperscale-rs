@@ -1508,6 +1508,13 @@ impl ShardCoordinator {
         // we cannot supply, and the round timer is what bounds that wait.
         // Suppressing on either prices it at `MAX_PROGRESS_WAIT` — three
         // times the nominal timeout — while the pacemaker sits on its hands.
+        //
+        // A block the vote fence withheld is excluded on the same
+        // ground. It waits on a counterpart chain to answer for a claim
+        // its proposer made, which no amount of work here completes and
+        // a silent counterpart never ends; pricing it at the progress
+        // window hands a proposer a stall worth three rounds for one
+        // claim nobody can check.
         let next_height = self.latest_qc.as_ref().map_or_else(
             || self.committed_height.inner() + 1,
             |qc| qc.height().inner() + 1,
@@ -1515,7 +1522,7 @@ impl ShardCoordinator {
         let awaiting_tip_proposal = self.last_voted_round < self.view_change.view
             && self
                 .pending_blocks
-                .has_any_at_round(BlockHeight::new(next_height), self.view_change.view);
+                .has_own_work_at_round(BlockHeight::new(next_height), self.view_change.view);
         let suppressed = self.verification.has_verification_in_flight()
             || awaiting_tip_proposal
             || self.block_sync.has_unverified_in_flight();
@@ -3227,7 +3234,8 @@ impl ShardCoordinator {
         // Otherwise fall through to the voting path directly — reachable only
         // from test fixtures; production always assembles before reaching
         // here.
-        if let Some(block) = self.pending_blocks.get_block(block_hash) {
+        if let Some(block) = self.pending_blocks.get_block(block_hash).cloned() {
+            let block = &block;
             // Content validation (`ticks` recomputation) and the beacon-witness
             // verification key on this block's own committee — the header is in
             // hand, so `None` is a beacon-behind stall, not a missing anchor.
@@ -3323,7 +3331,11 @@ impl ShardCoordinator {
             // deferral leaves the block pending and asks for what would
             // let the vote proceed.
             match self.vote_fence().judge(topology_schedule, block) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if let Some(pending) = self.pending_blocks.get_mut(block_hash) {
+                        pending.set_awaiting_counterpart(false);
+                    }
+                }
                 Err(Withheld::Refused(why)) => {
                     warn!(
                         validator = ?self.me,
@@ -3340,6 +3352,9 @@ impl ShardCoordinator {
                         %why,
                         "The vote fence cannot yet judge the block — deferring"
                     );
+                    if let Some(pending) = self.pending_blocks.get_mut(block_hash) {
+                        pending.set_awaiting_counterpart(true);
+                    }
                     return wanted;
                 }
             }
@@ -10373,6 +10388,55 @@ mod tests {
         assert_eq!(
             state.view_change.last_leader_activity,
             Some(LocalTimestamp::from_millis(100_000))
+        );
+    }
+
+    /// A block the vote fence withheld does not buy the progress
+    /// window.
+    ///
+    /// The window is for work this replica finishes on its own. A block
+    /// held at the fence waits on a counterpart to answer for a claim
+    /// its proposer made, and a silent counterpart never answers — so
+    /// the wait is bounded by the round timer, as every other wait on
+    /// somebody else is. Priced the other way, one claim nobody can
+    /// check stalls every transaction beside it for three rounds.
+    #[test]
+    fn a_block_held_at_the_fence_times_out_on_the_round_and_not_the_window() {
+        let (mut state, _) = make_test_state();
+        let round = state.view_change.view;
+        let height = BlockHeight::new(state.committed_height.inner() + 1);
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: state.local_shard,
+            height,
+            round,
+            ..Default::default()
+        });
+        let hash = header.hash();
+        state.pending_blocks.insert(PendingBlock::from_manifest(
+            header,
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        ));
+
+        // Past the round timeout, inside the progress window.
+        state.view_change.last_leader_activity = Some(LocalTimestamp::ZERO);
+        state.set_time(
+            LocalTimestamp::ZERO
+                .plus(hyperscale_types::VIEW_CHANGE_TIMEOUT + Duration::from_millis(1)),
+        );
+        assert!(
+            !state.should_advance_round(),
+            "content still landing here is worth the window",
+        );
+
+        state
+            .pending_blocks
+            .get_mut(hash)
+            .expect("the block was just inserted")
+            .set_awaiting_counterpart(true);
+        assert!(
+            state.should_advance_round(),
+            "a block waiting on a counterpart is not, and the round timer bounds it",
         );
     }
 

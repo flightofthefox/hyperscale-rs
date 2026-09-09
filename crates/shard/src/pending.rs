@@ -243,6 +243,23 @@ impl PendingBlocks {
             .any(|pending| pending.header().height() == height && pending.header().round() == round)
     }
 
+    /// True when a block at `(height, round)` is one this replica still
+    /// owes work to itself — content to gather, roots to check — rather
+    /// than one waiting on another chain to answer for a claim.
+    ///
+    /// The round timer suppresses on the first and not the second. A
+    /// replica gathering a block's own content finishes on its own and
+    /// is worth waiting the long window for; one held at the fence is
+    /// waiting on a counterpart it cannot make answer, which is the
+    /// case the ordinary round timeout is there to bound.
+    pub fn has_own_work_at_round(&self, height: BlockHeight, round: Round) -> bool {
+        self.0.values().any(|pending| {
+            pending.header().height() == height
+                && pending.header().round() == round
+                && !pending.awaiting_counterpart()
+        })
+    }
+
     /// Total transaction count across all pending blocks (manifest counts,
     /// independent of how much data has actually arrived).
     pub fn total_transaction_count(&self) -> usize {
@@ -515,6 +532,18 @@ pub struct PendingBlock {
     /// The fully constructed block (None until all transactions/ticks received).
     constructed_block: Option<Arc<Block>>,
 
+    /// Whether the vote fence withheld this block for want of evidence
+    /// from another chain.
+    ///
+    /// Held apart from the missing-content sets above because it is a
+    /// different kind of waiting. Those name content this replica is
+    /// still gathering for a block the chain has committed to; this
+    /// names a claim the proposer made about a counterpart that only
+    /// that counterpart can settle. The round timer prices the two
+    /// differently, which is the whole reason the flag exists — see
+    /// [`PendingBlocks::has_own_work_at_round`].
+    awaiting_counterpart: bool,
+
     /// Time at which this pending block was first observed. Used to schedule
     /// fetch requests for missing data after a gossip grace period.
     created_at: LocalTimestamp,
@@ -545,6 +574,7 @@ impl PendingBlock {
             missing_provision_hashes,
             manifest,
             constructed_block: None,
+            awaiting_counterpart: false,
             created_at,
         }
     }
@@ -598,6 +628,7 @@ impl PendingBlock {
             missing_provision_hashes: HashSet::new(),
             manifest,
             constructed_block: None,
+            awaiting_counterpart: false,
             created_at,
         };
         // Fill in all transactions
@@ -638,6 +669,19 @@ impl PendingBlock {
         } else {
             false
         }
+    }
+
+    /// Whether the vote fence withheld this block for want of another
+    /// chain's evidence, rather than for content still landing here.
+    pub const fn awaiting_counterpart(&self) -> bool {
+        self.awaiting_counterpart
+    }
+
+    /// Record what the vote fence said of this block: `true` where it
+    /// withheld the vote for want of a counterpart's evidence, `false`
+    /// once the evidence stands and the block is judged on its own.
+    pub const fn set_awaiting_counterpart(&mut self, awaiting: bool) {
+        self.awaiting_counterpart = awaiting;
     }
 
     /// Check if all transactions, finalizations, and provisions have been received.
@@ -851,6 +895,42 @@ mod tests {
             LocalTimestamp::ZERO,
         ));
         hash
+    }
+
+    /// A block held at the fence is not work this replica owes: the
+    /// round timer prices it at the ordinary timeout, so the query the
+    /// timer reads must not see it, while the one the pacemaker reads
+    /// for a live proposal at the round still does.
+    #[test]
+    fn a_block_held_at_the_fence_is_not_this_replicas_own_work() {
+        let mut pending = PendingBlocks::new();
+        let height = BlockHeight::new(5);
+        let round = Round::new(1);
+        let hash = insert_at(&mut pending, height, round);
+
+        assert!(pending.has_own_work_at_round(height, round));
+
+        pending
+            .get_mut(hash)
+            .expect("the block was just inserted")
+            .set_awaiting_counterpart(true);
+        assert!(
+            !pending.has_own_work_at_round(height, round),
+            "a block waiting on a counterpart is not work that finishes here",
+        );
+        assert!(
+            pending.has_any_at_round(height, round),
+            "and it is still a proposal standing at the round",
+        );
+
+        pending
+            .get_mut(hash)
+            .expect("the block is still pending")
+            .set_awaiting_counterpart(false);
+        assert!(
+            pending.has_own_work_at_round(height, round),
+            "evidence that lands puts the block back in this replica's hands",
+        );
     }
 
     #[test]

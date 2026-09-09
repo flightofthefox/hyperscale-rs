@@ -239,9 +239,13 @@ pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
 ///
 /// One claim answers one fetch against one counterpart height; the
 /// proposer offers what its own fetches read and the rest waits a
-/// block. Bounded so the vote fence's deferral — which withholds the
-/// vote on the whole block — cannot couple every transaction in a block
-/// to the slowest proof on the abort path.
+/// block. This bounds the section's bytes, and nothing else: the vote
+/// fence withholds the vote on the whole block, so a single claim no
+/// voter can check already couples every transaction beside it to a
+/// counterpart's silence, and no cap above one changes that. What
+/// bounds the coupling is the round timer, which prices a block held
+/// at the fence at the ordinary timeout rather than the progress
+/// window — see `has_own_work_at_round` in `hyperscale-shard`.
 pub const MAX_STATE_CLAIMS_PER_BLOCK: usize = 256;
 
 /// Byte budget the abandonment records of one block share.
