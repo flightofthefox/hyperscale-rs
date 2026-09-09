@@ -245,25 +245,19 @@ mod tests {
     /// block's transactions and never for a refused one.
     #[test]
     fn a_committed_crossing_is_bucketed_after_the_transactions() {
-        use hyperscale_vm_types::{Address, AddressClass, LocalKey, ResourceAddr, SubstateKey};
+        use hyperscale_vm_types::{Address, AddressClass, LocalKey, SubstateKey};
 
         use crate::{
-            AggregateSignature, BlockHeight, EscrowedValue, ExecutionCertificate, ExecutionOutcome,
-            Finalization, GlobalReceiptHash, GlobalReceiptRoot, SignerBitfield, TickHalf, TickId,
-            TxOutcome, WeightedTimestamp,
+            AggregateSignature, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
+            GlobalReceiptHash, GlobalReceiptRoot, SignerBitfield, TickHalf, TickId, TxOutcome,
+            WeightedTimestamp,
         };
 
         let local = ShardId::leaf(1, 0);
         let target = ShardId::leaf(1, 1);
-        let escrowed = |seed: u8| EscrowedValue {
-            node: 1,
-            output: 0,
-            resource: ResourceAddr::new([0xE1; 31]),
-            amount: 100,
-            record: SubstateKey {
-                owner: Address::new([seed; 31], AddressClass::Component),
-                local: LocalKey([seed; 16]),
-            },
+        let escrowed = |seed: u8| SubstateKey {
+            owner: Address::new([seed; 31], AddressClass::Component),
+            local: LocalKey([seed; 16]),
         };
         let outcome = |seed: u8, verdict: ExecutionOutcome| {
             TxOutcome::new(TxHash::from(Hash::from_bytes(&[seed; 32])), verdict)

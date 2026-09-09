@@ -93,7 +93,7 @@ impl ExecutedTx {
             ConsensusReceipt::Failed => ExecutionOutcome::Failed,
         };
         TxOutcome::attesting(self.tx_hash, outcome, self.attested_work)
-            .escrowing(self.escrowed.iter().copied())
+            .escrowing(self.escrowed.iter().map(|issued| issued.record))
     }
 }
 

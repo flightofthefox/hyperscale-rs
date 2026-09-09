@@ -183,16 +183,16 @@ pub struct TxOutcome {
     /// unanimous.
     #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
     counterparts: Vec<ShardId>,
-    /// What this shard's execution escrowed out, one entry per value
-    /// edge. Sorted on the whole entry and one per `(node, output)`, so
-    /// which of two entries naming one edge survives is never a fact
-    /// about a caller's iteration order.
+    /// The record cell this shard's execution wrote for each value edge
+    /// it escrowed out. Ascending and distinct.
     ///
-    /// Attested rather than read off the record cells because the shard
-    /// claiming an edge reads this a block before it can read the cell,
-    /// and because the leaf commits to what left, not only that it did.
+    /// The cell and not what is in it: a claiming shard reads the
+    /// crossing's resource and amount off the record itself, which
+    /// arrives under a provisions root that authenticates it. What this
+    /// names is which cells to ask for, which the certificate carries a
+    /// block earlier than the bundle answering them.
     #[hbor(max = MAX_CROSSINGS_PER_TX)]
-    escrowed: Vec<EscrowedValue>,
+    escrowed: Vec<SubstateKey>,
     /// The shards those crossings land on. Ascending and distinct.
     ///
     /// Derivable from `escrowed` and the trie, and attested anyway: the
@@ -258,10 +258,10 @@ impl TxOutcome {
     /// Bind what this execution escrowed out, in its one form: sorted on
     /// the whole entry, one per edge.
     #[must_use]
-    pub fn escrowing(mut self, escrowed: impl IntoIterator<Item = EscrowedValue>) -> Self {
-        let mut escrowed: Vec<EscrowedValue> = escrowed.into_iter().collect();
+    pub fn escrowing(mut self, escrowed: impl IntoIterator<Item = SubstateKey>) -> Self {
+        let mut escrowed: Vec<SubstateKey> = escrowed.into_iter().collect();
         escrowed.sort_unstable();
-        escrowed.dedup_by_key(|entry| (entry.node, entry.output));
+        escrowed.dedup();
         self.escrowed = escrowed;
         self
     }
@@ -374,7 +374,7 @@ impl TxOutcome {
 
     /// What this shard's execution escrowed out, one entry per edge.
     #[must_use]
-    pub fn escrowed(&self) -> &[EscrowedValue] {
+    pub fn escrowed(&self) -> &[SubstateKey] {
         &self.escrowed
     }
 

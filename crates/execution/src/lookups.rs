@@ -209,11 +209,7 @@ pub fn crossing_requests(
                     .copied()
                     .filter(|&target| target != local_shard)
                     .collect(),
-                local_keys: outcome
-                    .escrowed()
-                    .iter()
-                    .map(|escrowed| escrowed.record)
-                    .collect(),
+                local_keys: outcome.escrowed().to_vec(),
                 local_ranges: Vec::new(),
             });
         }
@@ -358,24 +354,17 @@ mod tests {
     #[test]
     fn crossing_requests_name_the_record_cells_the_outcome_escrowed() {
         use hyperscale_types::{
-            AggregateSignature, BlockHeight, EscrowedValue, ExecutionCertificate, ExecutionOutcome,
-            Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, SignerBitfield, TickHalf,
-            TickId, TxOutcome, WeightedTimestamp,
+            AggregateSignature, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
+            GlobalReceiptHash, GlobalReceiptRoot, Hash, SignerBitfield, TickHalf, TickId,
+            TxOutcome, WeightedTimestamp,
         };
-        use hyperscale_vm_types::{Address, AddressClass, LocalKey, ResourceAddr};
+        use hyperscale_vm_types::{Address, AddressClass, LocalKey};
 
         let local = ShardId::leaf(1, 0);
         let target = ShardId::leaf(1, 1);
         let record = SubstateKey {
             owner: Address::new([0xC1; 31], AddressClass::Component),
             local: LocalKey([1; 16]),
-        };
-        let escrowed = EscrowedValue {
-            node: 1,
-            output: 0,
-            resource: ResourceAddr::new([0xE1; 31]),
-            amount: 100,
-            record,
         };
         let accepted = TxHash::from(Hash::from_bytes(&[1; 32]));
         let refused = TxHash::from(Hash::from_bytes(&[2; 32]));
@@ -391,10 +380,10 @@ mod tests {
                         receipt_hash: GlobalReceiptHash::ZERO,
                     },
                 )
-                .escrowing([escrowed])
+                .escrowing([record])
                 .crossing_to([target]),
                 TxOutcome::new(refused, ExecutionOutcome::Failed)
-                    .escrowing([escrowed])
+                    .escrowing([record])
                     .crossing_to([target]),
             ],
             AggregateSignature::ZERO,

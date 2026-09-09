@@ -39,9 +39,9 @@ use std::time::Duration;
 
 use hyperscale_engine::legs::Member;
 use hyperscale_types::{
-    BlockHash, BlockHeight, EscrowedValue, ExecutionCertificate, ExecutionOutcome, Finalization,
-    GlobalReceiptRoot, MAX_FINALIZATION_DELAY, Role, Settles, ShardId, StoredReceipt, TickHalf,
-    TickId, TxHash, TxOutcome, Verified, WeightedTimestamp, compute_global_receipt_root,
+    BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
+    GlobalReceiptRoot, MAX_FINALIZATION_DELAY, Role, Settles, ShardId, StoredReceipt, SubstateKey,
+    TickHalf, TickId, TxHash, TxOutcome, Verified, WeightedTimestamp, compute_global_receipt_root,
     refused_transactions, settles,
 };
 
@@ -285,7 +285,7 @@ struct Seat {
     attested_work: u64,
     /// What the member's execution escrowed out, carried from execution
     /// onto the outcome it votes.
-    escrowed: Vec<EscrowedValue>,
+    escrowed: Vec<SubstateKey>,
     /// The shards the member's crossings land on, read off the frozen
     /// classification at admission. Attested on the outcome only where
     /// the execution escrowed something.
@@ -631,7 +631,7 @@ impl TickState {
     }
 
     /// Record what a member's execution escrowed out.
-    pub fn record_escrowed(&mut self, tx_hash: TxHash, escrowed: Vec<EscrowedValue>) {
+    pub fn record_escrowed(&mut self, tx_hash: TxHash, escrowed: Vec<SubstateKey>) {
         if let Some(seat) = self.seats.get_mut(&tx_hash) {
             seat.escrowed = escrowed;
         }

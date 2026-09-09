@@ -113,10 +113,10 @@ mod reservation_tests {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_vm_types::{Address, AddressClass, LocalKey, ResourceAddr, SubstateKey};
+    use hyperscale_vm_types::{Address, AddressClass, LocalKey, SubstateKey};
 
     use super::*;
-    use crate::{EscrowedValue, ExecutionOutcome, GlobalReceiptHash, Role, ShardId, TxHash};
+    use crate::{ExecutionOutcome, GlobalReceiptHash, Role, ShardId, TxHash};
 
     /// Whether an outcome decides its transaction is under the signed
     /// leaf: a leg's success and a core's are otherwise identical bytes.
@@ -163,16 +163,10 @@ mod tests {
         TxHash::from(Hash::from_bytes(b"leaf-tx"))
     }
 
-    fn escrowed(node: u32) -> EscrowedValue {
-        EscrowedValue {
-            node,
-            output: 0,
-            resource: ResourceAddr::new([0xE1; 31]),
-            amount: 5,
-            record: SubstateKey {
-                owner: Address::new([0xC1; 31], AddressClass::Component),
-                local: LocalKey([u8::try_from(node).expect("a test node fits a byte"); 16]),
-            },
+    fn escrowed(node: u32) -> SubstateKey {
+        SubstateKey {
+            owner: Address::new([0xC1; 31], AddressClass::Component),
+            local: LocalKey([u8::try_from(node).expect("a test node fits a byte"); 16]),
         }
     }
 
@@ -187,9 +181,9 @@ mod tests {
     #[test]
     fn two_list_splits_of_equal_length_give_different_leaves() {
         let escrowing = base().escrowing((0..3).map(escrowed));
-        let crossing = base().crossing_to((0..26).map(|path| ShardId::leaf(5, path)));
+        let crossing = base().crossing_to((0..12).map(|path| ShardId::leaf(4, path)));
         assert_eq!(
-            escrowing.escrowed().len() * 104,
+            escrowing.escrowed().len() * 48,
             crossing.crossing_targets().len() * 12,
             "the two regions have to be the same length, or this proves nothing"
         );
@@ -197,30 +191,19 @@ mod tests {
 
         // And the same shards awaited rather than crossed to is a third
         // reading of the same bytes.
-        let awaiting = base().awaiting((0..26).map(|path| ShardId::leaf(5, path)));
+        let awaiting = base().awaiting((0..12).map(|path| ShardId::leaf(4, path)));
         assert_ne!(tx_outcome_leaf(&awaiting), tx_outcome_leaf(&crossing));
     }
 
-    /// Every field of an escrowed entry is under the leaf: an aggregator
-    /// restating what left, or how much, fails the root recompute.
+    /// The cells an execution escrowed are under the leaf: an aggregator
+    /// restating which of them left fails the root recompute.
     #[test]
-    fn leaf_covers_what_was_escrowed() {
+    fn leaf_covers_which_cells_were_escrowed() {
         let one = base().escrowing([escrowed(1)]);
-        let more = base().escrowing([EscrowedValue {
-            amount: 6,
-            ..escrowed(1)
-        }]);
-        let elsewhere = base().escrowing([EscrowedValue {
-            resource: ResourceAddr::new([0xE2; 31]),
-            ..escrowed(1)
-        }]);
-        let moved = base().escrowing([EscrowedValue {
-            record: escrowed(2).record,
-            ..escrowed(1)
-        }]);
-        assert_ne!(tx_outcome_leaf(&one), tx_outcome_leaf(&more));
-        assert_ne!(tx_outcome_leaf(&one), tx_outcome_leaf(&elsewhere));
+        let moved = base().escrowing([escrowed(2)]);
+        let both = base().escrowing([escrowed(1), escrowed(2)]);
         assert_ne!(tx_outcome_leaf(&one), tx_outcome_leaf(&moved));
+        assert_ne!(tx_outcome_leaf(&one), tx_outcome_leaf(&both));
         assert_ne!(tx_outcome_leaf(&one), tx_outcome_leaf(&base()));
     }
 
