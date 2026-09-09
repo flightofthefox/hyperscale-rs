@@ -22,7 +22,8 @@ use crate::crypto::{
     verify_ml_dsa_65, verify_secp256k1,
 };
 use crate::{
-    Address, DeclaredKey, Hash, PrincipalAddr, ProtocolHasher, TimestampRange, WeightedTimestamp,
+    Address, DeclaredKey, Hash, PrincipalAddr, ProtocolHasher, RoutePrefix, TimestampRange,
+    WeightedTimestamp,
 };
 
 /// The arithmetic behind the VM's scheme registry.
@@ -193,6 +194,25 @@ pub struct Routing {
 }
 
 impl Routing {
+    /// The route every owner prefix the transaction touches takes,
+    /// ascending, deduplicated.
+    ///
+    /// Deduplicated on the route and not on the address, so two prefixes
+    /// that place together are one entry: what reads this asks only
+    /// where a prefix sits.
+    #[must_use]
+    pub fn all_routes(&self) -> Vec<RoutePrefix> {
+        let mut routes: Vec<RoutePrefix> = self
+            .read_prefixes
+            .iter()
+            .chain(self.write_prefixes.iter())
+            .map(|prefix| RoutePrefix::of(*prefix))
+            .collect();
+        routes.sort_unstable();
+        routes.dedup();
+        routes
+    }
+
     /// Every owner prefix the transaction touches, ascending, deduplicated.
     #[must_use]
     pub fn all_prefixes(&self) -> Vec<Address> {

@@ -47,8 +47,8 @@
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    Address, Deadline, Hash, MAX_PREFIXES_PER_TX, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE,
-    Probed, ShardId, SubstateKey, Transaction, TransactionDecision, TxHash, WeightedTimestamp,
+    Deadline, Hash, MAX_PREFIXES_PER_TX, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, Probed,
+    RoutePrefix, ShardId, SubstateKey, Transaction, TransactionDecision, TxHash, WeightedTimestamp,
 };
 
 /// What an abort of one transaction burns, and out of whose vault.
@@ -82,8 +82,8 @@ pub struct UnsettledTx {
     /// What the abandonment burns, settled by the shard holding the
     /// vault and by no other.
     pub charge: AbortCharge,
-    /// Every owner prefix the transaction touches, ascending — the whole
-    /// reach, not one shard's share of it.
+    /// The route every owner prefix the transaction touches takes,
+    /// ascending — the whole reach, not one shard's share of it.
     ///
     /// Stated because a record is read by shards that never held the
     /// transaction. A validator rotated into a committee after the block
@@ -96,8 +96,11 @@ pub struct UnsettledTx {
     ///
     /// The whole reach rather than the composer's remote share: each
     /// reader owns a different part of it and filters its own.
+    ///
+    /// Routes rather than addresses, because placement is the only
+    /// question asked of them and it reads no further than this.
     #[hbor(max = MAX_PREFIXES_PER_TX)]
-    pub reach: Vec<Address>,
+    pub reach: Vec<RoutePrefix>,
 }
 
 impl UnsettledTx {
@@ -122,7 +125,7 @@ impl UnsettledTx {
                 vault: tx.fee_vault(),
                 amount: tx.price(),
             },
-            reach: tx.routing().all_prefixes(),
+            reach: tx.routing().all_routes(),
         }
     }
 
@@ -546,7 +549,10 @@ mod tests {
                 },
                 amount: u128::from(seed) * 3,
             },
-            reach: vec![Address::new([seed; 31], AddressClass::Component)],
+            reach: vec![RoutePrefix::of(Address::new(
+                [seed; 31],
+                AddressClass::Component,
+            ))],
         }
     }
 

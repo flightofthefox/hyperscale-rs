@@ -24,9 +24,9 @@ use std::sync::Arc;
 
 use hyperscale_engine::legs::{Classified, Licence};
 use hyperscale_types::{
-    AbandonmentRecord, Address, Anchor, BlockHeight, CounterpartEvidence, Deadline, Finalization,
-    MAX_VALIDITY_RANGE, Probed, Question, Role, ShardId, ShardTrie, SubstateKey, Transaction,
-    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
+    AbandonmentRecord, Anchor, BlockHeight, CounterpartEvidence, Deadline, Finalization,
+    MAX_VALIDITY_RANGE, Probed, Question, Role, RoutePrefix, ShardId, ShardTrie, SubstateKey,
+    Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
     WeightedTimestamp, Window, Word,
 };
 
@@ -91,7 +91,7 @@ struct Owed {
     /// this reaches the same set from the committing block and from a
     /// record naming the transaction alike — which is what a replica
     /// rotated in after that block has.
-    remote_prefixes: BTreeSet<Address>,
+    remote_prefixes: BTreeSet<RoutePrefix>,
     /// Whether a tick of this shard's took the transaction as a member.
     ///
     /// What it answers is whether a certificate of ours is out where a
@@ -613,12 +613,12 @@ pub struct UnresolvedTxs {
 /// by a record that names it alike, so a replica meeting the transaction
 /// either way holds the same entry. The reach is the transaction's own;
 /// which part of it is remote is the reader's.
-fn remote_share(local: ShardId, figures: &UnsettledTx) -> BTreeSet<Address> {
+fn remote_share(local: ShardId, figures: &UnsettledTx) -> BTreeSet<RoutePrefix> {
     figures
         .reach
         .iter()
         .copied()
-        .filter(|prefix| !ShardTrie::shard_owns_prefix(local, *prefix))
+        .filter(|route| !ShardTrie::shard_owns_route(local, *route))
         .collect()
 }
 
@@ -1236,10 +1236,10 @@ impl UnresolvedTxs {
     /// earlier ones belong to shards that were already gone and so never
     /// held it, and later ones to successors that never did either. `None`
     /// while the prefix is still owned by the shard that owned it then.
-    fn departure_over(&self, owed: &Owed, prefix: Address) -> Option<(ShardId, Departure)> {
+    fn departure_over(&self, owed: &Owed, route: RoutePrefix) -> Option<(ShardId, Departure)> {
         self.departed
             .iter()
-            .filter(|(shard, _)| ShardTrie::shard_owns_prefix(**shard, prefix))
+            .filter(|(shard, _)| ShardTrie::shard_owns_route(**shard, route))
             .filter(|(_, departure)| departure.cut > owed.figures.first_commit())
             .min_by_key(|(_, departure)| departure.cut)
             .map(|(shard, departure)| (*shard, *departure))
@@ -1258,10 +1258,10 @@ impl UnresolvedTxs {
     /// then, which is the earliest departure over it after the commit.
     fn party_to_entry(&self, owed: &Owed, shard: ShardId, cut: WeightedTimestamp) -> bool {
         cut > owed.figures.first_commit()
-            && owed.remote_prefixes.iter().any(|prefix| {
-                ShardTrie::shard_owns_prefix(shard, *prefix)
+            && owed.remote_prefixes.iter().any(|route| {
+                ShardTrie::shard_owns_route(shard, *route)
                     && self
-                        .departure_over(owed, *prefix)
+                        .departure_over(owed, *route)
                         .is_none_or(|(_, first)| first.cut >= cut)
             })
     }
@@ -1281,13 +1281,13 @@ impl UnresolvedTxs {
             return BTreeSet::new();
         };
         let mut shards = BTreeSet::new();
-        for prefix in &owed.remote_prefixes {
-            shards.insert(trie.shard_for_prefix(*prefix));
+        for route in &owed.remote_prefixes {
+            shards.insert(trie.shard_for_route(*route));
             shards.extend(
                 self.departed
                     .iter()
                     .filter(|(shard, departure)| {
-                        ShardTrie::shard_owns_prefix(**shard, *prefix)
+                        ShardTrie::shard_owns_route(**shard, *route)
                             && departure.cut > owed.figures.first_commit()
                     })
                     .map(|(shard, _)| *shard),
@@ -1497,8 +1497,8 @@ impl UnresolvedTxs {
                         });
                         return false;
                     }
-                    let answerable = owed.remote_prefixes.iter().any(|prefix| {
-                        self.departure_over(owed, *prefix)
+                    let answerable = owed.remote_prefixes.iter().any(|route| {
+                        self.departure_over(owed, *route)
                             .is_none_or(|(_, departure)| {
                                 departure.readable_until.is_none_or(|until| now <= until)
                             })
@@ -1541,7 +1541,7 @@ impl UnresolvedTxs {
                         && entry
                             .remote_prefixes
                             .iter()
-                            .any(|prefix| ShardTrie::shard_owns_prefix(*shard, *prefix)))
+                            .any(|route| ShardTrie::shard_owns_route(*shard, *route)))
             })
         });
 
@@ -1710,7 +1710,7 @@ mod tests {
             deadline: Deadline::of_transaction(tx),
             declared_work: tx.work(),
             charge: charge(tx),
-            reach: tx.routing().all_prefixes(),
+            reach: tx.routing().all_routes(),
         }
     }
 

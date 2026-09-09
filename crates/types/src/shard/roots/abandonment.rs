@@ -38,8 +38,8 @@ mod tests {
     use super::*;
     use crate::{
         AbortCharge, Address, AddressClass, Deadline, Hash, Heard, LocalKey, Probed, Question,
-        RootMismatch, ShardId, SubstateKey, TransactionDecision, TxHash, UnsettledTx, Verified,
-        Verify, WeightedTimestamp, Word,
+        RootMismatch, RoutePrefix, ShardId, SubstateKey, TransactionDecision, TxHash, UnsettledTx,
+        Verified, Verify, WeightedTimestamp, Word,
     };
 
     fn tx(seed: u8) -> UnsettledTx {
@@ -54,7 +54,10 @@ mod tests {
                 },
                 amount: 11,
             },
-            reach: vec![Address::new([seed; 31], AddressClass::Component)],
+            reach: vec![RoutePrefix::of(Address::new(
+                [seed; 31],
+                AddressClass::Component,
+            ))],
         }
     }
 

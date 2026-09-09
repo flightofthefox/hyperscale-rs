@@ -13,6 +13,42 @@ use hyperscale_vm_types::AddressClass;
 
 use crate::{Address, ShardId};
 
+/// The leading bits of an owner prefix: everything placement reads of it.
+///
+/// A shard's path is a bit prefix of its members' keys, so routing a key
+/// consults only its first eight bytes and never the rest. Naming that
+/// much on its own keeps a routing fact from being written down as a
+/// whole address, which costs four times the bytes and invites a reader
+/// to think the remainder means something.
+///
+/// Ordered, so a set of routes sorts as the addresses they came from do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
+#[hbor(transparent)]
+pub struct RoutePrefix(u64);
+
+impl RoutePrefix {
+    /// The route `prefix` takes.
+    #[must_use]
+    pub const fn of(prefix: Address) -> Self {
+        let b = prefix.to_bytes();
+        Self(u64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    /// The bits themselves, most significant first.
+    #[must_use]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<Address> for RoutePrefix {
+    fn from(prefix: Address) -> Self {
+        Self::of(prefix)
+    }
+}
+
 /// The set of live shards, forming a complete partition of the keyspace: every
 /// infinite bit path from the root passes through exactly one leaf.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
@@ -69,10 +105,13 @@ impl ShardTrie {
     /// As [`Self::shard_for`].
     #[must_use]
     pub fn shard_for_prefix(&self, prefix: impl Into<Address>) -> ShardId {
-        let bytes = prefix.into().to_bytes();
-        self.walk(u64::from_be_bytes(
-            bytes[..8].try_into().expect("an address is 32 bytes"),
-        ))
+        self.shard_for_route(RoutePrefix::of(prefix.into()))
+    }
+
+    /// The leaf owning `route`.
+    #[must_use]
+    pub fn shard_for_route(&self, route: RoutePrefix) -> ShardId {
+        self.walk(route.bits())
     }
 
     /// The owner a shard writes its own cells under: an address whose
@@ -109,13 +148,16 @@ impl ShardTrie {
     /// # Panics
     /// As [`Self::shard_for_prefix`].
     #[must_use]
-    pub fn shard_owns_prefix(shard: ShardId, prefix: Address) -> bool {
+    pub const fn shard_owns_prefix(shard: ShardId, prefix: Address) -> bool {
+        Self::shard_owns_route(shard, RoutePrefix::of(prefix))
+    }
+
+    /// Whether `shard` owns `route`, with no trie to walk: the leading
+    /// `depth` bits of the route are the shard's path.
+    #[must_use]
+    pub const fn shard_owns_route(shard: ShardId, route: RoutePrefix) -> bool {
         let depth = shard.depth();
-        let bytes = prefix.to_bytes();
-        depth == 0
-            || (u64::from_be_bytes(bytes[..8].try_into().expect("an address is 32 bytes"))
-                >> (64 - depth))
-                == shard.path()
+        depth == 0 || (route.bits() >> (64 - depth)) == shard.path()
     }
 
     fn walk(&self, bits: u64) -> ShardId {
