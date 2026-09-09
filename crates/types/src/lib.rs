@@ -172,7 +172,7 @@ pub use shard::limits::{
     MAX_PREFIXES_PER_TX, MAX_PROOFS_PER_QUERY, MAX_PROVISION_TARGET_SHARDS,
     MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_STATE_PROOFS_PER_BLOCK, MAX_SWEEP_PER_BLOCK,
     MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    drain_admits_block, sweep_admits_block,
+    MAX_WIRE_MESSAGE_BYTES, drain_admits_block, sweep_admits_block,
 };
 pub use shard::load::ShardLoad;
 pub use shard::manifest::{BlockManifest, BlockMetadata};

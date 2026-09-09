@@ -13,6 +13,19 @@ use hyperscale_vm_types::{MAX_TX_BYTES_LEN, TX_UNITS};
 
 use crate::{Address, LocalKey, Question, WorkInFlight};
 
+/// The largest message any transport carries, compressed.
+///
+/// One figure for both paths a block travels: the framed request streams
+/// and the gossip topics. A message past it is not truncated, it is
+/// dropped — the sender warns and the round it carried is lost — so a
+/// section a proposer fills has to be budgeted against this rather than
+/// discovered at it.
+///
+/// Stated here rather than in the transport because the caps that have
+/// to fit inside it are stated here, and a bound nothing can be checked
+/// against is not a bound.
+pub const MAX_WIRE_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+
 /// Hard cap on the number of live transactions any single block can carry.
 ///
 /// Bounds the `tx_hashes` array in [`BlockManifest`](crate::BlockManifest),
