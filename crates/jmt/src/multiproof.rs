@@ -11,7 +11,11 @@
 //!   terminated (found leaf, empty slot, or divergent leaf) plus the
 //!   value hash if present.
 //! - A flat list of sibling hashes, ordered for linear consumption by
-//!   the verifier (depth-first, bucket-0-first traversal).
+//!   the verifier (depth-first, bucket-0-first traversal). Most of them
+//!   are the empty hash — a key descends the whole of its owner's
+//!   prefix before the tree branches, and every level of that descent
+//!   has an empty side — so the wire carries a bitmap of which are not,
+//!   and only those.
 //!
 //! # Construction
 //!
@@ -40,7 +44,10 @@
 //! next 4 bytes : claim_count (u32 big-endian)
 //! then         : claim_count × claim
 //! next 4 bytes : sibling_count (u32 big-endian)
-//! then         : sibling_count × hash (32 bytes each)
+//! then         : ceil(sibling_count / 8) bytes of bitmap, bit i (LSB
+//!                first within each byte) set where sibling i is not
+//!                the empty hash
+//! then         : one hash (32 bytes) per set bit, in order
 //! ```
 //!
 //! A claim has the layout:
@@ -737,8 +744,15 @@ impl MultiProof {
                 .unwrap_or(u32::MAX)
                 .to_be_bytes(),
         );
-        for sib in &self.siblings {
-            buf.extend_from_slice(sib);
+        let mut bitmap = vec![0u8; self.siblings.len().div_ceil(8)];
+        for (index, sibling) in self.siblings.iter().enumerate() {
+            if *sibling != EMPTY_HASH {
+                bitmap[index / 8] |= 1 << (index % 8);
+            }
+        }
+        buf.extend_from_slice(&bitmap);
+        for sibling in self.siblings.iter().filter(|s| **s != EMPTY_HASH) {
+            buf.extend_from_slice(sibling);
         }
         buf
     }
@@ -776,9 +790,17 @@ impl MultiProof {
                 actual: sibling_count,
             });
         }
+        let mut bitmap = vec![0u8; sibling_count.div_ceil(8)];
+        for byte in &mut bitmap {
+            *byte = r.u8()?;
+        }
         let mut siblings = Vec::with_capacity(sibling_count);
-        for _ in 0..sibling_count {
-            siblings.push(r.bytes32()?);
+        for index in 0..sibling_count {
+            siblings.push(if bitmap[index / 8] & (1 << (index % 8)) == 0 {
+                EMPTY_HASH
+            } else {
+                r.bytes32()?
+            });
         }
         if !r.is_empty() {
             return Err(DecodeError::TrailingBytes);
@@ -804,7 +826,8 @@ impl MultiProof {
                     }
             })
             .sum();
-        1 + 2 + 4 + claims_bytes + 4 + self.siblings.len() * 32
+        let carried = self.siblings.iter().filter(|s| **s != EMPTY_HASH).count();
+        1 + 2 + 4 + claims_bytes + 4 + self.siblings.len().div_ceil(8) + carried * 32
     }
 }
 
@@ -1258,6 +1281,34 @@ mod tests {
     // ========================================================
     // Wire format tests
     // ========================================================
+
+    /// The empty siblings a long descent leaves are not carried, and
+    /// the proof decodes to the same run of them either way.
+    ///
+    /// A key descends the whole of its owner's prefix before the tree
+    /// branches, so this shape — a handful of real siblings among
+    /// hundreds of empty ones — is what an ordinary counterpart probe
+    /// asks for, not a corner case.
+    #[test]
+    fn empty_siblings_cost_a_bit_each() {
+        let mut siblings = vec![EMPTY_HASH; 288];
+        siblings[3] = v(7);
+        siblings[287] = v(9);
+        let proof = MultiProof {
+            root_depth_bits: 0,
+            claims: vec![],
+            siblings,
+        };
+
+        let bytes = proof.encode();
+        // 11 bytes of header and counts, 36 of bitmap, two hashes.
+        assert_eq!(bytes.len(), 11 + 36 + 64);
+        assert_eq!(
+            MultiProof::decode(&bytes).unwrap(),
+            proof,
+            "and the run of empty siblings comes back whole",
+        );
+    }
 
     #[test]
     fn encode_decode_empty_proof() {
