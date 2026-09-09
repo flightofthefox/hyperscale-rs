@@ -199,6 +199,15 @@ pub struct Counterparts {
     /// carries it, or when every transaction it answered for is gone.
     fetched: BTreeMap<StateProofBundle, BTreeSet<TxHash>>,
 
+    /// The questions this validator has answered for itself, off a proof
+    /// it fetched and verified.
+    ///
+    /// Kept apart from the mirror, which stays fed by committed content
+    /// alone so two validators at one committed height compose the same
+    /// records. What this licenses is narrower: not asking a counterpart
+    /// again for an answer already in hand.
+    verified: BTreeSet<(TxHash, ShardId, Probed)>,
+
     /// The escrow records this shard inherited with a prefix, each still
     /// undisposed, by cell key.
     ///
@@ -231,6 +240,7 @@ impl Counterparts {
             mirror,
             proven_anchors,
             fetched: BTreeMap::new(),
+            verified: BTreeSet::new(),
             inherited: BTreeMap::new(),
             released_fetches: Vec::new(),
         }
@@ -404,7 +414,9 @@ impl Counterparts {
         for entry in self.ledger.probeable(now) {
             for (shard, key, probed) in counterpart_cells(&entry, self.local_shard, trie) {
                 // The chain has answered: nothing is asked again.
-                if self.ledger.answered(entry.tx_hash, shard, probed) {
+                if self.ledger.answered(entry.tx_hash, shard, probed)
+                    || self.verified.contains(&(entry.tx_hash, shard, probed))
+                {
                     continue;
                 }
                 // The newest header an absence would answer at: the one
@@ -493,12 +505,33 @@ impl Counterparts {
         // inherited record names no transaction, so what it wants is
         // read off the keys.
         let inherited_wants = keys.iter().any(|key| awaited_by(&self.inherited, *key));
-        if !answered.is_empty() || inherited_wants {
-            self.fetched
-                .entry(StateProofBundle::new(anchor, keys, proof))
-                .or_default()
-                .extend(answered);
+        if answered.is_empty() && !inherited_wants {
+            return;
         }
+        let bundle = StateProofBundle::new(anchor, keys, proof);
+        // What the proof settles for this validator, on the rule a
+        // committed proof is read by. A question it answers is not put
+        // again; what the answer means is still the chain's to say, and
+        // until a block carries this bundle nothing here has composed
+        // anything from it.
+        if let Ok(inclusions) = bundle.inclusions() {
+            for entry in &answered {
+                let Some(&(_, inclusion)) = inclusions.iter().find(|(key, _)| *key == entry.key)
+                else {
+                    continue;
+                };
+                if entry.probed.licenses(anchor.ts, entry.deadline, inclusion)
+                    && entry.probed.read(inclusion, entry.core).is_some()
+                {
+                    self.verified
+                        .insert((entry.tx_hash, entry.shard, entry.probed));
+                }
+            }
+        }
+        self.fetched
+            .entry(bundle)
+            .or_default()
+            .extend(answered.iter().map(|entry| entry.tx_hash));
     }
 
     /// Fold the proofs a committed block carries into the answers every
@@ -783,6 +816,11 @@ impl Counterparts {
     /// answered first, or one whose entry is gone — so a counterpart
     /// that never serves the height does not pin the slot.
     fn release_answered_fetches(&mut self) -> Vec<Action> {
+        // What this validator answered for itself goes with the entry it
+        // answered about: past that there is nothing left to not ask.
+        let held = &self.ledger;
+        self.verified
+            .retain(|(tx_hash, _, _)| held.contains(*tx_hash));
         let unresolved = &self.ledger;
         // A bundle is worth carrying while something still wants what it
         // answers: a transaction the ledger owes an outcome for, or an

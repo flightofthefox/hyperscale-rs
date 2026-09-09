@@ -8122,6 +8122,66 @@ mod tests {
         );
     }
 
+    /// A question this validator's own proof answered is not put again,
+    /// however many newer headers the counterpart commits.
+    ///
+    /// Every validator probes, not only the proposer, and a counterpart
+    /// header lands every block. Read as unanswered until the chain
+    /// carries someone's copy, one cell would be fetched from the
+    /// counterpart once per block by every member of the committee, for
+    /// bytes each of them already holds.
+    #[test]
+    fn a_proof_this_validator_fetched_stops_it_asking_again() {
+        let schedule = two_shard_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let deadline = UnsettledTx::for_transaction(&transaction).deadline.at();
+        let claim = SubstateKey {
+            owner: test_prefix(0x81),
+            local: LocalKey([0xC4; 16]),
+        };
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        state
+            .counterparts
+            .ledger
+            .register_committed(HOME, [(&transaction, &Classified::whole())]);
+        state.counterparts.ledger.seed(
+            tx_hash,
+            leg_part(
+                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                delivery_classified(),
+                vec![(PEER, claim)],
+                Vec::new(),
+            ),
+        );
+        state.counterparts.ledger.certify(tx_hash);
+
+        let lapse = Window::Lapse
+            .of(Deadline::of_transaction(&transaction))
+            .start;
+        let (bundle, _) = proven_at(&mut state, &schedule, PEER, 5, lapse, &[], &[claim]);
+        state.committed_ts = deadline;
+        assert_eq!(
+            state_proof_fetches(&state.probe_silent_counterparts(&schedule)),
+            vec![(bundle.anchor, vec![claim])],
+            "the cell is asked about once",
+        );
+        state.on_proof_fetched(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
+
+        let (_, opened) = proven_at(&mut state, &schedule, PEER, 6, lapse, &[], &[claim]);
+        assert!(
+            state_proof_fetches(&opened).is_empty(),
+            "and not again at a newer header, the answer being in hand",
+        );
+        assert_eq!(
+            state.offers().state_proofs,
+            vec![bundle],
+            "while the proof is still offered, since only a block makes it everybody's",
+        );
+    }
+
     /// A delivering shard that departed at a reshape leaves no header
     /// past the lapse, so its claim cell is asked about on the successor
     /// the trie names for the cell's owner — the child holding the

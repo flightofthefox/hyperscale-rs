@@ -529,6 +529,30 @@ pub struct Probeable {
     pub cued: bool,
 }
 
+/// A question a fetch of this validator's just spoke to, with the terms
+/// the answer is read against.
+///
+/// Carried out of the ledger rather than looked up again, because the
+/// two terms a reading needs — the entry's deadline and the arity of the
+/// core it asks about — are the entry's own and the caller holds no
+/// entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Answered {
+    /// The transaction the question was asked for.
+    pub tx_hash: TxHash,
+    /// The counterpart the question was put to.
+    pub shard: ShardId,
+    /// Which question it was.
+    pub probed: Probed,
+    /// The cell it asked about.
+    pub key: SubstateKey,
+    /// The entry's deadline, which an absence is licensed inside.
+    pub deadline: Deadline,
+    /// How many shards the core spans, which decides whether an absent
+    /// committed cell answers at all.
+    pub core: usize,
+}
+
 /// What one name on a committed finalization means for the entry it
 /// names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -813,20 +837,23 @@ impl UnresolvedTxs {
     /// The fetch is only how the proposer comes by the bytes: nothing is
     /// decided here, since the answer is the chain's once a block carries
     /// the proof.
-    pub fn mark_probes_answered(
-        &mut self,
-        anchor: Anchor,
-        keys: &[SubstateKey],
-    ) -> BTreeSet<TxHash> {
-        let mut answered = BTreeSet::new();
+    pub fn mark_probes_answered(&mut self, anchor: Anchor, keys: &[SubstateKey]) -> Vec<Answered> {
+        let mut answered = Vec::new();
         for (&tx_hash, owed) in &mut self.owed {
-            for standing in owed.asked.cells.values_mut() {
-                if let Standing::Asked { anchor: asked, key } = standing
-                    && *asked == anchor
-                    && keys.contains(key)
-                {
+            for (&(shard, probed), standing) in &mut owed.asked.cells {
+                let Standing::Asked { anchor: asked, key } = *standing else {
+                    continue;
+                };
+                if asked == anchor && keys.contains(&key) {
                     *standing = Standing::Answered(anchor);
-                    answered.insert(tx_hash);
+                    answered.push(Answered {
+                        tx_hash,
+                        shard,
+                        probed,
+                        key,
+                        deadline: owed.figures.deadline,
+                        core: owed.part.kept().map_or(0, |kept| kept.core.len()),
+                    });
                 }
             }
         }
