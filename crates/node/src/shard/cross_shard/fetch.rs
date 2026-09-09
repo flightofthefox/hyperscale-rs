@@ -17,7 +17,8 @@ use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
     GetCommittedTxsRequest, GetExecutionCertsRequest, GetFinalizationsRequest,
-    GetLocalProvisionsRequest, GetProvisionsRequest, GetSettledTxsRequest, GetStateProofRequest,
+    GetLocalProvisionsRequest, GetProvisionsRequest, GetRelayedStateProofRequest,
+    GetSettledTxsRequest, GetStateProofRequest,
 };
 use hyperscale_types::network::response::{
     CommittedTxVerdict, GetCommittedTxsResponse, GetSettledTxsResponse, GetStateProofResponse,
@@ -492,6 +493,83 @@ impl ScopedAnswer for StateProofBinding {
     }
 }
 
+/// Marker type for the state-proof relay: the same question as
+/// [`StateProofBinding`], put to this shard's own committee.
+///
+/// A separate binding rather than a routing argument on that one,
+/// because a fetch is keyed by its ids: the two ask different committees
+/// about the same `(anchor, key)`, and one slot would hold whichever
+/// asked first. The answer is the same event, since a proof is checked
+/// against the anchor's root whoever served it.
+pub struct StateProofRelayBinding;
+
+impl FetchBinding for StateProofRelayBinding {
+    /// `(anchor, key)`, as [`StateProofBinding`].
+    type Id = (Anchor, SubstateKey);
+
+    const NAME: &'static str = "relayed_state_proof";
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::RelayedStateProofs(ids)
+    }
+
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+        &mut shard.cross_shard.relayed_state_proof
+    }
+
+    fn dispatch_chunk<N: Network>(
+        ids: Vec<Self::Id>,
+        local_shard: ShardId,
+        shard: ShardId,
+        preferred: Option<ValidatorId>,
+        class: Option<MessageClass>,
+        network: &N,
+        sender: &Sender<HostEvent>,
+    ) {
+        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
+    }
+}
+
+impl ScopedAnswer for StateProofRelayBinding {
+    type Scope = Anchor;
+    type Key = SubstateKey;
+    type Request = GetRelayedStateProofRequest;
+
+    fn split(id: Self::Id) -> (Self::Scope, Self::Key) {
+        id
+    }
+
+    fn join(scope: Self::Scope, key: Self::Key) -> Self::Id {
+        (scope, key)
+    }
+
+    /// The anchor's shard rides in the body: the request goes to this
+    /// shard's committee, and what it asks about is another shard's
+    /// state.
+    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
+        GetRelayedStateProofRequest::new(scope.shard, scope.height, keys.to_vec())
+    }
+
+    /// Checked here, against the anchor the requester commit-proved, so
+    /// a peer passing on a proof of any other tree rotates rather than
+    /// being believed.
+    fn answer(
+        scope: Self::Scope,
+        keys: Vec<Self::Key>,
+        response: GetStateProofResponse,
+    ) -> Result<ProtocolEvent, Refusal> {
+        let proof = response.proof.ok_or(Refusal::NotHeld)?;
+        proof
+            .inclusions(scope.state_root, scope.shard, &keys)
+            .map_err(|_| Refusal::Unusable("unusable_proof"))?;
+        Ok(ProtocolEvent::FetchedStateProofVerified {
+            anchor: scope,
+            keys,
+            proof,
+        })
+    }
+}
+
 /// Marker type for the settled-set fetch against a departed shard's
 /// terminal.
 pub struct SettledTxsBinding;
@@ -878,7 +956,7 @@ mod settled_txs_tests {
                 certificates: Arc::new(certs.to_vec()),
                 provisions: Arc::new(Vec::new()),
                 abandonment_records: Arc::new(Vec::new()),
-                state_proofs: Arc::new(Vec::new()),
+                state_claims: Arc::new(Vec::new()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             };
             parent = block.hash();

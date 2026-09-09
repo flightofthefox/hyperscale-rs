@@ -30,7 +30,7 @@ pub mod provisions;
 pub mod reveal_chain;
 pub mod settled_txs;
 pub mod state;
-pub mod state_proofs;
+pub mod state_claims;
 pub mod terminal;
 pub mod transaction;
 

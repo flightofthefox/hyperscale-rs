@@ -213,7 +213,7 @@ fn test_transactions_batch_with_indexed_block() {
             certificates,
             provisions,
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
         Block::Sealed {
@@ -227,7 +227,7 @@ fn test_transactions_batch_with_indexed_block() {
             certificates,
             provision_hashes,
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     };
@@ -570,7 +570,7 @@ fn block_with_txs(
             certificates,
             provisions,
             abandonment_records,
-            state_proofs,
+            state_claims,
             witness_sources,
             ..
         } => Block::Live {
@@ -579,7 +579,7 @@ fn block_with_txs(
             certificates,
             provisions,
             abandonment_records,
-            state_proofs,
+            state_claims,
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,

@@ -747,6 +747,7 @@ fn build_shard_io<S: ShardStorage>(
         Arc::clone(rep.state.mempool_coordinator().tx_store()),
         Arc::clone(rep.state.execution_coordinator().exec_cert_store()),
         Arc::clone(rep.state.execution_coordinator().finalization_store()),
+        Arc::clone(rep.state.execution_coordinator().proven_cells()),
     );
     let storage = Arc::new(storage);
     let pending_chain = Arc::new(PendingChain::new(Arc::clone(&storage)));

@@ -1913,7 +1913,7 @@ mod tests {
             certificates: Arc::new(certs),
             provisions,
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         // The certifying QC carries a deliberately divergent timestamp (a
@@ -2055,7 +2055,7 @@ mod tests {
             certificates,
             provisions,
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         // A deliberately divergent certifying timestamp, as in

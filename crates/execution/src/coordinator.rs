@@ -58,11 +58,11 @@ use hyperscale_types::{
     ConsensusPublicKey, CounterpartMirror, Deadline, DeclaredKey, Derivation, ExecutionCertificate,
     ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationHash,
     FinalizationVerifyError, GlobalReceiptRoot, Hash, MerkleInclusionProof, Mode, ProvenAnchors,
-    Provisions, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateWrites, StoredReceipt,
-    SubstateKey, TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision,
-    TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, Window, Word, derive_block_transactions, settled_set_verdict, tick_leader,
-    tick_leader_at,
+    ProvenCells, Provisions, SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, StateWrites,
+    StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot, Transaction,
+    TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp, Window, Word, derive_block_transactions, settled_set_verdict,
+    tick_leader, tick_leader_at,
 };
 use tracing::instrument;
 
@@ -440,6 +440,7 @@ impl ExecutionCoordinator {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
+            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         )
     }
@@ -466,6 +467,7 @@ impl ExecutionCoordinator {
     /// frontier also gives pre-first-commit bookkeeping (expected-cert
     /// ages, conflict detection) a real clock instead of a zero one.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly
     pub fn with_shared_stores(
         me: ValidatorId,
         local_shard: ShardId,
@@ -473,6 +475,7 @@ impl ExecutionCoordinator {
         exec_certs: Arc<ExecCertStore>,
         finalized: Arc<FinalizationStore>,
         proven_anchors: Arc<ProvenAnchors>,
+        proven_cells: Arc<ProvenCells>,
         evidence: Arc<CounterpartMirror>,
     ) -> Self {
         // Execution resumes below the first block it replays, so the
@@ -502,6 +505,7 @@ impl ExecutionCoordinator {
             counterparts: Counterparts::seated(
                 local_shard,
                 proven_anchors,
+                proven_cells,
                 evidence,
                 &recovered.inherited_records,
             ),
@@ -2403,6 +2407,14 @@ impl ExecutionCoordinator {
         &self.counterparts.proven_anchors
     }
 
+    /// The shared mirror of what this validator has proven of
+    /// counterparts' cells, which the shard coordinator owns and this
+    /// coordinator's fetches fill.
+    #[must_use]
+    pub const fn proven_cells(&self) -> &Arc<ProvenCells> {
+        &self.counterparts.proven_cells
+    }
+
     /// Ask each silent counterpart what it holds, against the trie that
     /// says who was party to each transaction.
     fn probe_silent_counterparts(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
@@ -3931,9 +3943,9 @@ mod tests {
         GlobalReceiptHash, Hash, Heard, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK,
         MAX_VALIDITY_RANGE, NetworkDefinition, Probed, Question, QuorumCertificate,
         RETENTION_HORIZON, Randomness, RecoveryCause, SeedRing, SeedSource, ShardAnchor,
-        ShardRecovery, Signer, SignerBitfield, StateProofBundle, StateRoot, StoredReceipt,
-        SubstateKey, TickHalf, TransactionDecision, TxClaim, TxResolution, UnsettledTx,
-        ValidatorInfo, ValidatorSet, Window, Word,
+        ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, StoredReceipt, SubstateKey,
+        TickHalf, TransactionDecision, TxClaim, TxResolution, UnsettledTx, ValidatorInfo,
+        ValidatorSet, Window, Word,
     };
     use hyperscale_vm_effects::{CrossingCell, Hash32, SubintentHash};
     use hyperscale_vm_types::{ResourceAddr, Seeded};
@@ -6390,6 +6402,7 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
+            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
 
@@ -7043,6 +7056,7 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
+            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
 
@@ -7096,6 +7110,7 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
+            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
 
@@ -7169,6 +7184,7 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
+            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
 
@@ -7242,6 +7258,7 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
+            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
@@ -7316,6 +7333,7 @@ mod tests {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
+            Arc::new(ProvenCells::new()),
             Arc::new(CounterpartMirror::new()),
         );
         assert!(
@@ -7874,7 +7892,7 @@ mod tests {
         ts: WeightedTimestamp,
         present: &[SubstateKey],
         asked: &[SubstateKey],
-    ) -> (StateProofBundle, Vec<Action>) {
+    ) -> (StateClaim, Vec<Action>) {
         let (state_root, proof) = state_and_proof(shard, present, asked);
         let anchor = Anchor {
             shard,
@@ -7882,12 +7900,25 @@ mod tests {
             state_root,
             ts,
         };
+        let cells = proof
+            .inclusions(state_root, shard, asked)
+            .expect("the fixture proof answers for its keys");
         state.proven_anchors().record(anchor);
         let opened = state.on_committed_remote_header(schedule, shard);
-        (
-            StateProofBundle::new(anchor, asked.iter().copied(), proof),
-            opened,
-        )
+        (StateClaim::new(anchor, cells), opened)
+    }
+
+    /// Feed `state` the proof its own fetch brings back for `claim`,
+    /// against a tree holding `present` — the bytes [`proven_at`] read
+    /// the claim off.
+    fn fetch_answers(
+        state: &mut ExecutionCoordinator,
+        claim: &StateClaim,
+        present: &[SubstateKey],
+    ) {
+        let keys = claim.keys();
+        let (_, proof) = state_and_proof(claim.anchor.shard, present, &keys);
+        state.on_proof_fetched(claim.anchor, keys, proof);
     }
 
     /// Commit a block on [`HOME`] carrying `bundles` — the seam every
@@ -7897,7 +7928,7 @@ mod tests {
         schedule: &TopologySchedule,
         height: u64,
         ts_ms: u64,
-        bundles: Vec<StateProofBundle>,
+        bundles: Vec<StateClaim>,
     ) -> Vec<Action> {
         let Block::Live {
             header,
@@ -7923,7 +7954,7 @@ mod tests {
             certificates,
             provisions,
             abandonment_records,
-            state_proofs: Arc::new(bundles),
+            state_claims: Arc::new(bundles),
             witness_sources,
         };
         state.on_block_committed(schedule, &test_certify(block, ts_ms))
@@ -8101,9 +8132,9 @@ mod tests {
             state_proof_fetches(&state.probe_silent_counterparts(&schedule)),
             vec![(bundle.anchor, vec![claim])],
         );
-        state.on_proof_fetched(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
+        fetch_answers(&mut state, &bundle, &[]);
         assert_eq!(
-            state.offers().state_proofs,
+            state.offers().state_claims,
             vec![bundle.clone()],
             "dated to the clock the probe read off the header"
         );
@@ -8111,13 +8142,13 @@ mod tests {
         let deadline_ms = deadline.as_millis();
         commit_carrying(&mut state, &schedule, 1, deadline_ms, Vec::new());
         assert_eq!(
-            state.offers().state_proofs,
+            state.offers().state_claims,
             vec![bundle.clone()],
             "a block carrying no proofs leaves the offer standing"
         );
         commit_carrying(&mut state, &schedule, 2, deadline_ms, vec![bundle]);
         assert!(
-            state.offers().state_proofs.is_empty(),
+            state.offers().state_claims.is_empty(),
             "a proof the chain carries is everybody's"
         );
     }
@@ -8168,7 +8199,7 @@ mod tests {
             vec![(bundle.anchor, vec![claim])],
             "the cell is asked about once",
         );
-        state.on_proof_fetched(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
+        fetch_answers(&mut state, &bundle, &[]);
 
         let (_, opened) = proven_at(&mut state, &schedule, PEER, 6, lapse, &[], &[claim]);
         assert!(
@@ -8176,7 +8207,7 @@ mod tests {
             "and not again at a newer header, the answer being in hand",
         );
         assert_eq!(
-            state.offers().state_proofs,
+            state.offers().state_claims,
             vec![bundle],
             "while the proof is still offered, since only a block makes it everybody's",
         );
@@ -8682,7 +8713,7 @@ mod tests {
             "a core of one shard writes no committed cell, so only its consumer's claim is asked"
         );
 
-        state.on_proof_fetched(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
+        fetch_answers(&mut state, &bundle, &[]);
         let before = state.counterparts.mirror.generation();
         commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert!(
@@ -8752,7 +8783,7 @@ mod tests {
             "the committed cell and the claim are asked together"
         );
 
-        state.on_proof_fetched(bundle.anchor, bundle.keys.clone(), bundle.proof.clone());
+        fetch_answers(&mut state, &bundle, &[core_key]);
         let before = state.counterparts.mirror.generation();
         commit_carrying(&mut state, &schedule, 1, deadline.as_millis(), vec![bundle]);
         assert_eq!(

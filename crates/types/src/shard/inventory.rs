@@ -26,9 +26,8 @@ use hyperscale_hbor::Hbor;
 use crate::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock,
     Finalization, FinalizationHash, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    Provisions, QuorumCertificate, StateProofBundle, Transaction, TxHash, Verifiable,
-    WitnessSources,
+    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    Provisions, QuorumCertificate, StateClaim, Transaction, TxHash, Verifiable, WitnessSources,
 };
 
 /// Inventory of locally-known item hashes, grouped by category.
@@ -101,11 +100,10 @@ pub struct ElidedCertifiedBlock {
     /// back a block that cannot answer for itself.
     #[hbor(max = MAX_ABANDONMENT_RECORDS_PER_BLOCK)]
     abandonment_records: Vec<AbandonmentRecord>,
-    /// The block's state-proof bundles, always inline: the receiver
-    /// folds them at commit, and no other source holds the proposer's
-    /// bytes.
-    #[hbor(max = MAX_STATE_PROOFS_PER_BLOCK)]
-    state_proofs: Vec<StateProofBundle>,
+    /// The block's state claims, always inline: they are small, and the
+    /// receiver folds them at commit.
+    #[hbor(max = MAX_STATE_CLAIMS_PER_BLOCK)]
+    state_claims: Vec<StateClaim>,
     /// The block's beacon-witness inputs, always inline (never elided):
     /// they are small and the receiver needs them to reproduce the
     /// block's beacon-witness leaves at commit.
@@ -250,7 +248,7 @@ impl ElidedCertifiedBlock {
             certificates,
             provisions,
             abandonment_records: block.abandonment_records().to_vec(),
-            state_proofs: block.state_proofs().to_vec(),
+            state_claims: block.state_claims().to_vec(),
             witness_sources: block.witness_sources().as_ref().clone(),
         }
     }
@@ -354,7 +352,7 @@ impl ElidedCertifiedBlock {
                     certificates: certs,
                     provisions: Arc::new(provisions),
                     abandonment_records: Arc::new(self.abandonment_records.clone()),
-                    state_proofs: Arc::new(self.state_proofs.clone()),
+                    state_claims: Arc::new(self.state_claims.clone()),
                     witness_sources: Arc::new(self.witness_sources.clone()),
                 }
             }
@@ -364,7 +362,7 @@ impl ElidedCertifiedBlock {
                 certificates: certs,
                 provision_hashes: Arc::new(hashes.clone()),
                 abandonment_records: Arc::new(self.abandonment_records.clone()),
-                state_proofs: Arc::new(self.state_proofs.clone()),
+                state_claims: Arc::new(self.state_claims.clone()),
                 witness_sources: Arc::new(self.witness_sources.clone()),
             },
             (None, ElidedProvisions::Live(_)) => {
@@ -489,7 +487,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -529,7 +527,7 @@ mod tests {
             transactions,
             provisions,
             abandonment_records,
-            state_proofs,
+            state_claims,
             witness_sources,
             ..
         } = create_test_block()
@@ -542,7 +540,7 @@ mod tests {
             certificates: Arc::new(vec![Arc::new(fw)]),
             provisions,
             abandonment_records,
-            state_proofs,
+            state_claims,
             witness_sources,
         }
     }

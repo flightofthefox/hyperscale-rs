@@ -25,10 +25,9 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     AbandonmentRecord, BlockHash, BlockHeight, CounterpartEvidence, Finalization, FinalizationHash,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK, MAX_TXS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, ShardId, StateProofBundle,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp,
-    sweep_admits_block,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, ShardId, StateClaim, TopologySchedule,
+    TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp, sweep_admits_block,
 };
 
 use crate::chain_view::ChainView;
@@ -626,58 +625,58 @@ impl<'f> Section for RecordsSection<'f> {
     }
 }
 
-/// The block's state proofs.
-pub struct StateProofsSection;
+/// The block's state claims.
+pub struct StateClaimsSection;
 
-/// What the proofs admitted so far amount to.
+/// What the claims admitted so far amount to.
 #[derive(Debug, Default)]
-pub struct StateProofsFold {
-    /// The last admitted bundle, which the next must follow.
-    pub previous: Option<StateProofBundle>,
+pub struct StateClaimsFold {
+    /// The last admitted claim, which the next must follow.
+    pub previous: Option<StateClaim>,
     /// How many have been admitted, against the block's cap.
     pub count: usize,
 }
 
-impl Section for StateProofsSection {
-    type Item = StateProofBundle;
-    type Fold = StateProofsFold;
+impl Section for StateClaimsSection {
+    type Item = StateClaim;
+    type Fold = StateClaimsFold;
 
-    /// A well-formed bundle, in its place in the section's ascending
+    /// A well-formed claim, in its place in the section's ascending
     /// order without repeats, within the block's cap.
     ///
-    /// The canonical order — within each bundle and across them — means
-    /// one set of answers has one encoding; a bundle naming no key
+    /// The canonical order — within each claim and across them — means
+    /// one set of answers has one encoding; a claim naming no cell
     /// answers nothing, so the cap is spent on answers a record can be
-    /// offered from. Whether each proof reconstructs its anchor's root
-    /// is the delegated check, and whether the anchor is the
-    /// commit-proven header's is the vote fence's.
+    /// offered from. Whether the anchor and each reading are ones this
+    /// validator took for itself is the vote fence's question, not this
+    /// one: a claim carries nothing checkable in isolation.
     fn admit(
         _ctx: &Admission<'_>,
         fold: &mut Self::Fold,
-        bundle: &StateProofBundle,
+        claim: &StateClaim,
     ) -> Result<(), String> {
-        if !bundle.is_well_formed() {
+        if !claim.is_well_formed() {
             return Err(format!(
-                "state proof {} is empty, over its cap, or out of order",
+                "state claim {} is empty, over its cap, or out of order",
                 fold.count
             ));
         }
         if fold
             .previous
             .as_ref()
-            .is_some_and(|previous| previous >= bundle)
+            .is_some_and(|previous| previous >= claim)
         {
             return Err(format!(
-                "state proof {} repeats or precedes the one before it",
+                "state claim {} repeats or precedes the one before it",
                 fold.count
             ));
         }
-        if fold.count >= MAX_STATE_PROOFS_PER_BLOCK {
+        if fold.count >= MAX_STATE_CLAIMS_PER_BLOCK {
             return Err(format!(
-                "block carries more than {MAX_STATE_PROOFS_PER_BLOCK} state proofs"
+                "block carries more than {MAX_STATE_CLAIMS_PER_BLOCK} state claims"
             ));
         }
-        fold.previous = Some(bundle.clone());
+        fold.previous = Some(claim.clone());
         fold.count += 1;
         Ok(())
     }

@@ -14,9 +14,9 @@ use thiserror::Error;
 use crate::{
     AbandonmentRecord, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Demands, Derivation,
     ExecutionOutcome, Finalization, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    Provisions, QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots,
-    StateProofBundle, StateRoot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    Provisions, QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots, StateClaim,
+    StateRoot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
     WeightedTimestamp, WitnessSources,
 };
 
@@ -122,10 +122,10 @@ pub enum Block {
         abandonment_records: Arc<Vec<AbandonmentRecord>>,
         /// What this block commits about counterparts' chains: cells
         /// their commit-proven state holds, proved against their
-        /// headers. Committed via the header's `state_proofs_root` and
+        /// headers. Committed via the header's `state_claims_root` and
         /// folded by every replica at commit.
-        #[hbor(max = MAX_STATE_PROOFS_PER_BLOCK)]
-        state_proofs: Arc<Vec<StateProofBundle>>,
+        #[hbor(max = MAX_STATE_CLAIMS_PER_BLOCK)]
+        state_claims: Arc<Vec<StateClaim>>,
         /// Proposer-supplied beacon-witness inputs. Committed via the
         /// header's `beacon_witness_root`; carried on the body so
         /// commit-time leaf derivation is identical on every node. See
@@ -162,8 +162,8 @@ pub enum Block {
         /// Proofs of counterparts' cells, retained through sealing like
         /// the records: a replay of any depth re-folds its answers off
         /// the block it reads, and the root binds at every stage.
-        #[hbor(max = MAX_STATE_PROOFS_PER_BLOCK)]
-        state_proofs: Arc<Vec<StateProofBundle>>,
+        #[hbor(max = MAX_STATE_CLAIMS_PER_BLOCK)]
+        state_claims: Arc<Vec<StateClaim>>,
         /// Proposer-supplied beacon-witness inputs — retained through
         /// sealing (unlike provisions) because the beacon-witness fold
         /// consuming them can run well after the block sealed. See
@@ -237,7 +237,7 @@ impl Block {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -264,7 +264,7 @@ impl Block {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -294,7 +294,7 @@ impl Block {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -434,9 +434,9 @@ impl Block {
     /// variant — what every replica folds at commit to answer the
     /// ledger's probes.
     #[must_use]
-    pub fn state_proofs(&self) -> &[StateProofBundle] {
+    pub fn state_claims(&self) -> &[StateClaim] {
         match self {
-            Self::Live { state_proofs, .. } | Self::Sealed { state_proofs, .. } => state_proofs,
+            Self::Live { state_claims, .. } | Self::Sealed { state_claims, .. } => state_claims,
         }
     }
 
@@ -574,7 +574,7 @@ impl Block {
                 certificates,
                 provisions,
                 abandonment_records,
-                state_proofs,
+                state_claims,
                 witness_sources,
             } => {
                 let hashes: Vec<ProvisionHash> = provisions.iter().map(|p| p.hash()).collect();
@@ -584,7 +584,7 @@ impl Block {
                     certificates,
                     provision_hashes: Arc::new(hashes),
                     abandonment_records,
-                    state_proofs,
+                    state_claims,
                     witness_sources,
                 }
             }
@@ -608,7 +608,7 @@ impl Block {
                 transactions,
                 certificates,
                 abandonment_records,
-                state_proofs,
+                state_claims,
                 witness_sources,
                 ..
             } => Self::Live {
@@ -617,7 +617,7 @@ impl Block {
                 certificates,
                 provisions,
                 abandonment_records,
-                state_proofs,
+                state_claims,
                 witness_sources,
             },
             Self::Live { .. } => {
@@ -694,8 +694,8 @@ impl Verified<Block> {
     /// 1. The header passes [`<BlockHeader as crate::Verify>`](crate::Verify)
     ///    (which transitively asserts `parent_qc` is verified).
     /// 2. Every check in [`Block::demands`] — the roots over its
-    ///    sections, its state root, its resolutions and state proofs,
-    ///    and the reservations its voters derived — was answered in
+    ///    sections, its state root, its resolutions, and the
+    ///    reservations its voters derived — was answered in
     ///    the block's favour, witnessed by the `Verified<Demands>` the
     ///    constructor consumes.
     ///

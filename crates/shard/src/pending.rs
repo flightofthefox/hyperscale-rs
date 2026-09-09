@@ -580,7 +580,7 @@ impl PendingBlock {
             cert_ids,
             provision_hashes,
             block.abandonment_records().to_vec(),
-            block.state_proofs().to_vec(),
+            block.state_claims().to_vec(),
             block.witness_sources().as_ref().clone(),
         );
         let mut received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>> =
@@ -763,7 +763,7 @@ impl PendingBlock {
             certificates: Arc::new(certificates),
             provisions: Arc::new(provisions),
             abandonment_records: Arc::new(self.manifest.abandonment_records().clone()),
-            state_proofs: Arc::new(self.manifest.state_proofs().clone()),
+            state_claims: Arc::new(self.manifest.state_claims().clone()),
             witness_sources: Arc::new(self.manifest.witness_sources().clone()),
         });
 
@@ -1044,7 +1044,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
 
         let pending = PendingBlock::from_complete_block(

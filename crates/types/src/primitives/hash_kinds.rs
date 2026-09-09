@@ -179,16 +179,16 @@ hash_newtype!(
 );
 
 hash_newtype!(
-    /// Merkle root over the [`StateProofBundle`](crate::StateProofBundle)
+    /// Merkle root over the [`StateClaim`](crate::StateClaim)
     /// bundles a block carries.
     ///
     /// Carried in
-    /// [`BlockHeader::state_proofs_root`](crate::BlockHeader), so a
+    /// [`BlockHeader::state_claims_root`](crate::BlockHeader), so a
     /// proof of a counterpart's cell is committed content every replica
     /// folds at the same height rather than a reading one validator
     /// fetched.
-    pub StateProofsRoot,
-    "StateProofsRoot"
+    pub StateClaimsRoot,
+    "StateClaimsRoot"
 );
 
 hash_newtype!(

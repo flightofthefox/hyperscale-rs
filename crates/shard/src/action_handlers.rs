@@ -28,7 +28,7 @@ use hyperscale_types::{
     PreparedCommit, PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash,
     ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext,
     QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, ShardId,
-    ShardLoad, SplitChildRoots, StateProofBundle, StateProofsRoot, StateRoot, StateRootContext,
+    ShardLoad, SplitChildRoots, StateClaim, StateClaimsRoot, StateRoot, StateRootContext,
     Stopwatch, StoredReceipt, SubstateKey, SweepFrontier, TerminalRoots, Timeout, TimeoutContext,
     TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, UnsettledTx,
     ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof,
@@ -215,7 +215,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     topology_snapshot: &TopologySnapshot,
     provisions: Vec<Arc<Verifiable<Provisions>>>,
     abandonment_records: Vec<AbandonmentRecord>,
-    state_proofs: Vec<StateProofBundle>,
+    state_claims: Vec<StateClaim>,
     parent_in_flight: WorkInFlight,
     parent_settled_frontier: BlockHeight,
     parent_sweep_frontier: SweepFrontier,
@@ -384,7 +384,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     let abandonment_root = Verified::<AbandonmentRoot>::compute(&abandonment_records).into_inner();
     // Proofs of counterparts' cells, committed so every replica folds
     // the same answers at this height.
-    let state_proofs_root = Verified::<StateProofsRoot>::compute(&state_proofs).into_inner();
+    let state_claims_root = Verified::<StateClaimsRoot>::compute(&state_claims).into_inner();
 
     let header = BlockHeader::new(BlockHeaderParts {
         shard_id: local_shard,
@@ -402,7 +402,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         provision_root,
         provision_tx_roots,
         abandonment_root,
-        state_proofs_root,
+        state_claims_root,
         work_in_flight,
         settled_tick_frontier,
         sweep_frontier,
@@ -421,7 +421,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         certificates: Arc::new(certificates),
         provisions: Arc::new(provisions),
         abandonment_records: Arc::new(abandonment_records),
-        state_proofs: Arc::new(state_proofs),
+        state_claims: Arc::new(state_claims),
         witness_sources,
     };
 
@@ -831,28 +831,6 @@ where
             });
         }
 
-        Action::VerifyStateProofs {
-            block_hash,
-            state_proofs,
-        } => {
-            let start = Stopwatch::start();
-            let result = state_proofs.iter().try_for_each(|bundle| {
-                bundle.inclusions().map(|_| ()).map_err(|error| {
-                    format!(
-                        "state proof against {:?} at {} does not answer for its keys: {error}",
-                        bundle.anchor.shard,
-                        bundle.anchor.height.inner(),
-                    )
-                })
-            });
-            record_signature_verification_latency("state_proofs", start.elapsed().as_secs_f64());
-            ctx.notify_protocol(check_completed(
-                block_hash,
-                VerificationKind::StateProofs,
-                result,
-            ));
-        }
-
         Action::VerifyProvisionRoot {
             block_hash,
             expected_root,
@@ -1124,7 +1102,7 @@ where
             finalizations,
             provisions,
             abandonment_records,
-            state_proofs,
+            state_claims,
             fee_checks,
             fee_read_height,
             parent_in_flight,
@@ -1279,7 +1257,7 @@ where
                 &classification_topology,
                 provisions.clone(),
                 abandonment_records,
-                state_proofs,
+                state_claims,
                 parent_in_flight,
                 parent_settled_frontier,
                 parent_sweep_frontier,

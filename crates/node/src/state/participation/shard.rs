@@ -414,7 +414,7 @@ impl ShardParticipation {
             inputs.finalizations,
             inputs.provisions,
             inputs.abandonment_records,
-            inputs.state_proofs,
+            inputs.state_claims,
         )
     }
 

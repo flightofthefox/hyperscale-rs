@@ -1320,7 +1320,7 @@ mod tests {
                 certificates,
                 provisions: Arc::new(vec![Arc::new(provision.into())]),
                 abandonment_records: Arc::new(Vec::new()),
-                state_proofs: Arc::new(Vec::new()),
+                state_claims: Arc::new(Vec::new()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             },
             sealed @ Block::Sealed { .. } => sealed,

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use hyperscale_execution::{ExecCertStore, FinalizationStore};
 use hyperscale_mempool::TxStore;
 use hyperscale_provisions::{ProvisionStore, VerifiedHeaderBuffer};
-use hyperscale_types::{Finalization, FinalizationHash, Verifiable};
+use hyperscale_types::{Finalization, FinalizationHash, ProvenCells, Verifiable};
 use quick_cache::sync::Cache as QuickCache;
 
 /// Default certificate cache capacity.
@@ -62,19 +62,27 @@ pub struct SharedCaches {
     /// Per-shard finalization store, shared with every same-shard
     /// `ExecutionCoordinator`.
     pub finalization_store: Arc<FinalizationStore>,
+    /// The counterpart cells this node has proven, owned by the
+    /// `ShardCoordinator` and filled by the `ExecutionCoordinator`'s
+    /// fetches. Cloned here so the relayed-state-proof handler can pass
+    /// a peer the bytes without going through the state machine.
+    pub proven_cells: Arc<ProvenCells>,
 }
 
 impl SharedCaches {
     /// Construct caches at `io_loop` startup. The `ProvisionStore`,
-    /// `TxStore`, `ExecCertStore`, and `FinalizationStore` are owned
-    /// by their respective state machines; clones are passed in so the
-    /// same `Arc`s flow into network handler closures and sync helpers.
+    /// `TxStore`, `ExecCertStore`, `FinalizationStore` and `ProvenCells`
+    /// are owned by their respective state machines; clones are passed
+    /// in so the same `Arc`s flow into network handler closures and sync
+    /// helpers.
+    #[allow(clippy::too_many_arguments)] // one per store the handlers read
     pub fn new(
         provision_store: Arc<ProvisionStore>,
         verified_headers: Arc<VerifiedHeaderBuffer>,
         tx_store: Arc<TxStore>,
         exec_cert_store: Arc<ExecCertStore>,
         finalization_store: Arc<FinalizationStore>,
+        proven_cells: Arc<ProvenCells>,
     ) -> Self {
         Self {
             tx_store,
@@ -83,6 +91,7 @@ impl SharedCaches {
             verified_headers,
             exec_cert_store,
             finalization_store,
+            proven_cells,
         }
     }
 }

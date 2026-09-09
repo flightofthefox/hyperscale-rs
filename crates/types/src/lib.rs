@@ -117,7 +117,7 @@ pub use primitives::hash_kinds::{
     AbandonmentRoot, BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot,
     CommittedTxsRoot, EventRoot, FinalizationHash, GenesisConfigHash, GlobalReceiptHash,
     GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot,
-    RevealChain, SettledTxsRoot, StateProofsRoot, StateRoot, TransactionRoot, TxHash, WritesRoot,
+    RevealChain, SettledTxsRoot, StateClaimsRoot, StateRoot, TransactionRoot, TxHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex, RatifyRound,
@@ -170,13 +170,14 @@ pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, Rehy
 pub use shard::limits::{
     MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_DRAIN_WORK, MAX_FINALIZED_TX_PER_BLOCK, MAX_GAS_LIMIT,
     MAX_PREFIXES_PER_TX, MAX_PROOFS_PER_QUERY, MAX_PROVISION_TARGET_SHARDS,
-    MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_STATE_PROOFS_PER_BLOCK, MAX_SWEEP_PER_BLOCK,
+    MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEP_PER_BLOCK,
     MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
     MAX_WIRE_MESSAGE_BYTES, drain_admits_block, sweep_admits_block,
 };
 pub use shard::load::ShardLoad;
 pub use shard::manifest::{BlockManifest, BlockMetadata};
 pub use shard::proven_anchors::ProvenAnchors;
+pub use shard::proven_cells::ProvenCells;
 pub use shard::quorum_certificate::{QcContext, QcVerifyError, QuorumCertificate};
 pub use shard::reshape::{ReshapeThresholds, ReshapeTrigger};
 pub use shard::roots::{
@@ -189,7 +190,7 @@ pub use shard::roots::{
     missed_proposals_since_prev_commit, next_reveal_chain, prove_committed_tx_absent,
     ready_leaf_payload, settled_txs_root_from_hashes,
 };
-pub use shard::state_proof::StateProofBundle;
+pub use shard::state_claim::StateClaim;
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};

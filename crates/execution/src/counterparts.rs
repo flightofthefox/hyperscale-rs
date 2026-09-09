@@ -20,8 +20,8 @@ use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartEvidence, CounterpartMirror,
     Deadline, ExecutionCertificate, Heard, Inclusion, MAX_ABANDONMENT_RECORDS_PER_BLOCK,
-    MAX_STATE_PROOFS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed,
-    ProvenAnchors, Question, SettledTxSet, ShardId, ShardTrie, Spoken, StateProofBundle,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed,
+    ProvenAnchors, ProvenCells, Question, SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim,
     SubstateKey, TerminalEvidence, TopologySchedule, TransactionDecision, TxHash, TxResolution,
     UnsettledTx, Verifiable, Verified, WeightedTimestamp, Word,
 };
@@ -95,8 +95,8 @@ fn counterpart_cells(entry: &Probeable, local: ShardId, trie: &ShardTrie) -> Vec
 /// One question, to one shard: is the claim cell this record names
 /// present? So the bookkeeping is one height rather than the ledger's
 /// `Asked` — there is no set of counterparts to track, no fetch release
-/// to sequence, and no record to compose, because the answer is a state
-/// proof and a state proof is block content already.
+/// to sequence, and no record to compose, because the answer is a
+/// reading and a reading is block content already.
 #[derive(Debug, Clone)]
 pub struct Inherited {
     /// The record leaf, which carries the claim key, the issuing
@@ -151,9 +151,9 @@ pub struct Committed {
 
 /// What this validator holds to offer in a block it proposes.
 pub struct Offers {
-    /// Proofs its own fetches answered that no block has carried yet,
-    /// in the one order a block carries them.
-    pub state_proofs: Vec<StateProofBundle>,
+    /// Readings its own fetches took that no block has carried yet, in
+    /// the one order a block carries them.
+    pub state_claims: Vec<StateClaim>,
     /// The records it has evidence for and has not yet written down.
     pub abandonment_records: Vec<AbandonmentRecord>,
 }
@@ -186,18 +186,29 @@ pub struct Counterparts {
     /// committee can certify a sibling that never commits and export ECs
     /// computed from it. The same anchors are what a probe of a
     /// counterpart's committed set is taken against, and what this
-    /// validator's vote fence holds a block's state proofs to: one
-    /// mirror, so a bundle cannot pass the fence at an anchor no prober
+    /// validator's vote fence holds a block's state claims to: one
+    /// mirror, so a claim cannot pass the fence at an anchor no prober
     /// here would have chosen.
     pub(crate) proven_anchors: Arc<ProvenAnchors>,
 
-    /// The proofs this validator's own fetches answered, each with the
+    /// What this validator's own fetches have proven of counterparts'
+    /// cells, shared with the shard coordinator's vote fence and with
+    /// the state-proof server that relays a peer the bytes.
+    ///
+    /// Written here because a fetch lands here, and read there because
+    /// a block states a reading rather than proving it. Kept apart from
+    /// the mirror above for the reason stated on
+    /// [`ProvenCells`]: a reading licenses this validator's vote and
+    /// composes nothing.
+    pub(crate) proven_cells: Arc<ProvenCells>,
+
+    /// The readings this validator's own fetches took, each with the
     /// transactions whose probes it spoke to, held to offer in a block
-    /// this validator proposes: a proof is committed content, folded by
+    /// this validator proposes: a claim is committed content, folded by
     /// every replica at the same height, and the fetch is only how the
-    /// proposer comes by the bytes. A bundle leaves when a block
-    /// carries it, or when every transaction it answered for is gone.
-    fetched: BTreeMap<StateProofBundle, BTreeSet<TxHash>>,
+    /// proposer came by the answer. A claim leaves when a block carries
+    /// it, or when every transaction it answered for is gone.
+    fetched: BTreeMap<StateClaim, BTreeSet<TxHash>>,
 
     /// The questions this validator has answered for itself, off a proof
     /// it fetched and verified.
@@ -232,6 +243,7 @@ impl Counterparts {
     pub fn new(
         local_shard: ShardId,
         proven_anchors: Arc<ProvenAnchors>,
+        proven_cells: Arc<ProvenCells>,
         mirror: Arc<CounterpartMirror>,
     ) -> Self {
         Self {
@@ -239,6 +251,7 @@ impl Counterparts {
             ledger: UnresolvedTxs::default(),
             mirror,
             proven_anchors,
+            proven_cells,
             fetched: BTreeMap::new(),
             verified: BTreeSet::new(),
             inherited: BTreeMap::new(),
@@ -253,10 +266,11 @@ impl Counterparts {
     pub fn seated(
         local_shard: ShardId,
         proven_anchors: Arc<ProvenAnchors>,
+        proven_cells: Arc<ProvenCells>,
         evidence: Arc<CounterpartMirror>,
         records: &[(SubstateKey, Vec<u8>)],
     ) -> Self {
-        let mut counterparts = Self::new(local_shard, proven_anchors, evidence);
+        let mut counterparts = Self::new(local_shard, proven_anchors, proven_cells, evidence);
         counterparts.inherited = records
             .iter()
             .filter_map(|(key, value)| {
@@ -282,12 +296,12 @@ impl Counterparts {
         now: WeightedTimestamp,
     ) -> Committed {
         self.gc_settled_sets(topology_schedule, now);
-        // A proof the chain now carries is everybody's: its answers are
-        // folded here, and nothing offers it again.
-        for bundle in block.state_proofs() {
-            self.fetched.remove(bundle);
+        // A reading the chain now carries is everybody's: its answers
+        // are folded here, and nothing offers it again.
+        for claim in block.state_claims() {
+            self.fetched.remove(claim);
         }
-        let mut actions = self.fold_state_proofs(trie, block);
+        let mut actions = self.fold_state_claims(trie, block);
         actions.extend(self.fold_verdict_records(block));
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
@@ -367,7 +381,7 @@ impl Counterparts {
     #[must_use]
     pub fn offers(&self) -> Offers {
         Offers {
-            state_proofs: self.state_proofs(),
+            state_claims: self.state_claims(),
             abandonment_records: self.abandonment_records(),
         }
     }
@@ -485,15 +499,22 @@ impl Counterparts {
             .collect()
     }
 
-    /// Keep a fetched proof for a block this validator proposes.
+    /// Take what a fetched proof attests: hold it as proven, close the
+    /// questions it answers, and keep the reading to offer in a block
+    /// this validator proposes.
     ///
-    /// The fetch is only how the proposer comes by the bytes: nothing is
-    /// read off the answer here, since the answer is the chain's once a
-    /// block carries the proof and every replica folds it there. The
-    /// probes the proof spoke to are marked answered, so the question is
-    /// not put to the same header again, and the bundle is kept beside
-    /// the transactions it answered for, dated to the clock the probe
-    /// read off the header.
+    /// The proof is walked once, on the way into [`ProvenCells`], and
+    /// what comes back is the reading. That is what a block carries and
+    /// what this validator's vote fence holds another proposer's block
+    /// to, so it is recorded whatever the ledger wanted — a proof a peer
+    /// relayed answers for a claim rather than for a probe, and the
+    /// ledger has no entry waiting on it.
+    ///
+    /// What the ledger did ask about is what is offered. The probes the
+    /// proof spoke to are marked answered, so the question is not put to
+    /// the same header again, and the claim is kept beside the
+    /// transactions it answered for, dated to the clock the probe read
+    /// off the header.
     pub fn on_proof_fetched(
         &mut self,
         anchor: Anchor,
@@ -501,43 +522,46 @@ impl Counterparts {
         proof: MerkleInclusionProof,
     ) {
         let answered = self.ledger.mark_probes_answered(anchor, &keys);
-        // An answer nothing here asked about is nobody's to commit. An
-        // inherited record names no transaction, so what it wants is
+        // An inherited record names no transaction, so what it wants is
         // read off the keys.
         let inherited_wants = keys.iter().any(|key| awaited_by(&self.inherited, *key));
+        let Some(inclusions) = self.proven_cells.record(anchor, keys, proof) else {
+            tracing::warn!(
+                shard = ?anchor.shard,
+                height = anchor.height.inner(),
+                "A fetched state proof does not answer for its keys"
+            );
+            return;
+        };
+        // An answer nothing here asked about is nobody's to commit: it
+        // is proven above, which licenses a vote, and offered nowhere.
         if answered.is_empty() && !inherited_wants {
             return;
         }
-        let bundle = StateProofBundle::new(anchor, keys, proof);
-        // What the proof settles for this validator, on the rule a
-        // committed proof is read by. A question it answers is not put
-        // again; what the answer means is still the chain's to say, and
-        // until a block carries this bundle nothing here has composed
-        // anything from it.
-        if let Ok(inclusions) = bundle.inclusions() {
-            for entry in &answered {
-                let Some(&(_, inclusion)) = inclusions.iter().find(|(key, _)| *key == entry.key)
-                else {
-                    continue;
-                };
-                if entry.probed.licenses(anchor.ts, entry.deadline, inclusion)
-                    && entry.probed.read(inclusion, entry.core).is_some()
-                {
-                    self.verified
-                        .insert((entry.tx_hash, entry.shard, entry.probed));
-                }
+        // A question the proof answered is not put again; what the
+        // answer means is still the chain's to say, and until a block
+        // carries the claim nothing here has composed anything from it.
+        for entry in &answered {
+            let Some(&(_, inclusion)) = inclusions.iter().find(|(key, _)| *key == entry.key) else {
+                continue;
+            };
+            if entry.probed.licenses(anchor.ts, entry.deadline, inclusion)
+                && entry.probed.read(inclusion, entry.core).is_some()
+            {
+                self.verified
+                    .insert((entry.tx_hash, entry.shard, entry.probed));
             }
         }
         self.fetched
-            .entry(bundle)
+            .entry(StateClaim::new(anchor, inclusions))
             .or_default()
             .extend(answered.iter().map(|entry| entry.tx_hash));
     }
 
-    /// Fold the proofs a committed block carries into the answers every
+    /// Fold the claims a committed block carries into the answers every
     /// replica holds, and hand each to the vote fence.
     ///
-    /// A bundle answers every cell of the ledger's on the anchor's shard
+    /// A claim answers every cell of the ledger's on the anchor's shard
     /// whose window the anchor's clock sits inside — whether or not this
     /// replica had a probe out, and wherever its own probe sat — so a
     /// replica that never fetched reads the same answer as the one that
@@ -552,8 +576,8 @@ impl Counterparts {
     /// nothing. The hand-off is a continuation emitted here rather than
     /// a map the fence reads later, so an answer is never collected
     /// before it is drained.
-    fn fold_state_proofs(&mut self, trie: &ShardTrie, block: &Block) -> Vec<Action> {
-        if block.state_proofs().is_empty() {
+    fn fold_state_claims(&mut self, trie: &ShardTrie, block: &Block) -> Vec<Action> {
+        if block.state_claims().is_empty() {
             return Vec::new();
         }
         let cells: Vec<(Probeable, Vec<CounterpartCell>)> = self
@@ -566,9 +590,9 @@ impl Counterparts {
             })
             .collect();
         let mut actions = Vec::new();
-        for bundle in block.state_proofs() {
-            actions.extend(self.fold_cells(bundle, &cells));
-            self.fold_inherited(bundle, trie);
+        for claim in block.state_claims() {
+            actions.extend(self.fold_cells(claim, &cells));
+            self.fold_inherited(claim, trie);
         }
         actions
     }
@@ -583,22 +607,19 @@ impl Counterparts {
     /// which for a record whose consumer's role the leaf does not name
     /// is the lapse — past it no core of any arity can still commit, so
     /// the silence is final.
-    fn fold_inherited(&mut self, bundle: &StateProofBundle, trie: &ShardTrie) {
-        let Ok(inclusions) = bundle.inclusions() else {
-            return;
-        };
+    fn fold_inherited(&mut self, stated: &StateClaim, trie: &ShardTrie) {
         for record in self.inherited.values_mut() {
             if record.answer.is_some() {
                 continue;
             }
             let claim = record.cell.consumer_claim;
-            if trie.shard_for_prefix(claim.owner) != bundle.anchor.shard {
+            if trie.shard_for_prefix(claim.owner) != stated.anchor.shard {
                 continue;
             }
-            let Some(&(_, inclusion)) = inclusions.iter().find(|(asked, _)| *asked == claim) else {
+            let Some(inclusion) = stated.reading(claim) else {
                 continue;
             };
-            if !Probed::Delivery.licenses(bundle.anchor.ts, record.deadline(), inclusion) {
+            if !Probed::Delivery.licenses(stated.anchor.ts, record.deadline(), inclusion) {
                 continue;
             }
             record.answer = Some(if inclusion.is_present() {
@@ -627,39 +648,26 @@ impl Counterparts {
         actions
     }
 
-    /// Fold one bundle's answers into the questions the ledger is
+    /// Fold one claim's answers into the questions the ledger is
     /// waiting on.
     fn fold_cells(
         &mut self,
-        bundle: &StateProofBundle,
+        claim: &StateClaim,
         cells: &[(Probeable, Vec<CounterpartCell>)],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
-        let inclusions = match bundle.inclusions() {
-            Ok(inclusions) => inclusions,
-            Err(error) => {
-                tracing::error!(
-                    shard = ?bundle.anchor.shard,
-                    height = bundle.anchor.height.inner(),
-                    %error,
-                    "A committed state proof does not answer for its keys"
-                );
-                return actions;
-            }
-        };
         for (entry, cells) in cells {
             for &(shard, key, probed) in cells {
-                if shard != bundle.anchor.shard {
+                if shard != claim.anchor.shard {
                     continue;
                 }
-                let Some(&(_, inclusion)) = inclusions.iter().find(|(asked, _)| *asked == key)
-                else {
+                let Some(inclusion) = claim.reading(key) else {
                     continue;
                 };
                 // Judged per word, not per anchor: an absence is
                 // read only inside its window, a presence wherever
                 // it was taken.
-                if !probed.licenses(bundle.anchor.ts, entry.deadline, inclusion) {
+                if !probed.licenses(claim.anchor.ts, entry.deadline, inclusion) {
                     continue;
                 }
                 // Read by the one arity rule, whoever fetched the
@@ -697,7 +705,7 @@ impl Counterparts {
                             Heard {
                                 question: Question::Cell(probed),
                                 word: Word::Absent,
-                                at: bundle.anchor.ts,
+                                at: claim.anchor.ts,
                             },
                         );
                     }
@@ -716,7 +724,7 @@ impl Counterparts {
                         Heard {
                             question: Question::Cell(probed),
                             word: Word::Present,
-                            at: bundle.anchor.ts,
+                            at: claim.anchor.ts,
                         },
                     );
                 }
@@ -800,18 +808,18 @@ impl Counterparts {
         Vec::new()
     }
 
-    /// The proofs this validator's own fetches answered that no block
-    /// has carried yet, in the one order a block carries them, under
-    /// the block's cap.
-    fn state_proofs(&self) -> Vec<StateProofBundle> {
+    /// The readings this validator's own fetches took that no block has
+    /// carried yet, in the one order a block carries them, under the
+    /// block's cap.
+    fn state_claims(&self) -> Vec<StateClaim> {
         self.fetched
             .keys()
-            .take(MAX_STATE_PROOFS_PER_BLOCK)
+            .take(MAX_STATE_CLAIMS_PER_BLOCK)
             .cloned()
             .collect()
     }
 
-    /// Drop the bundles no transaction they answered for still needs,
+    /// Drop the claims no transaction they answered for still needs,
     /// and release every fetch the ledger let go — a question the chain
     /// answered first, or one whose entry is gone — so a counterpart
     /// that never serves the height does not pin the slot.
@@ -822,15 +830,18 @@ impl Counterparts {
         self.verified
             .retain(|(tx_hash, _, _)| held.contains(*tx_hash));
         let unresolved = &self.ledger;
-        // A bundle is worth carrying while something still wants what it
+        // A claim is worth carrying while something still wants what it
         // answers: a transaction the ledger owes an outcome for, or an
         // inherited record whose claim it speaks to. The second has no
         // transaction here at all, which is why the keys are read rather
         // than the names.
         let inherited = &self.inherited;
-        self.fetched.retain(|bundle, answered| {
+        self.fetched.retain(|claim, answered| {
             answered.iter().any(|tx_hash| unresolved.contains(*tx_hash))
-                || bundle.keys.iter().any(|key| awaited_by(inherited, *key))
+                || claim
+                    .cells
+                    .iter()
+                    .any(|(key, _)| awaited_by(inherited, *key))
         });
         // The one retention rule for what counterparts said: an entry
         // there speaks for a transaction this ledger still owes an

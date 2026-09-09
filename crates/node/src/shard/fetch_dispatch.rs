@@ -13,7 +13,7 @@ use crate::beacon::{self, BeaconProposalBinding, ShardWitnessBinding};
 use crate::fetch::{FetchBinding, FetchInput, FetchOutput, Release};
 use crate::shard::cross_shard::{
     CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
-    ProvisionBinding, SettledTxsBinding, StateProofBinding,
+    ProvisionBinding, SettledTxsBinding, StateProofBinding, StateProofRelayBinding,
 };
 use crate::shard::instances::InstanceRecordBinding;
 use crate::shard::mempool::TransactionBinding;
@@ -113,6 +113,9 @@ where
             FetchIds::ExecutionCerts(ids) => self.drive_fetch::<ExecCertBinding>(how.input(ids)),
             FetchIds::CommittedTxs(ids) => self.drive_fetch::<CommittedTxBinding>(how.input(ids)),
             FetchIds::StateProofs(ids) => self.drive_fetch::<StateProofBinding>(how.input(ids)),
+            FetchIds::RelayedStateProofs(ids) => {
+                self.drive_fetch::<StateProofRelayBinding>(how.input(ids));
+            }
             FetchIds::SettledTxs(ids) => self.drive_fetch::<SettledTxsBinding>(how.input(ids)),
             FetchIds::BeaconProposals(ids) => {
                 self.drive_fetch::<BeaconProposalBinding>(how.input(ids));

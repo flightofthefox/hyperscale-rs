@@ -18,10 +18,10 @@ use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CounterpartMirror, DeferOn, Epoch,
     FinalizationHash, Hash, LocalTimestamp, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK,
-    PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds,
-    ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateProofBundle, StoredReceipt,
-    SubstateKey, VerificationKind, WeightedTimestamp, WorkInFlight, derive_reshape_trigger,
-    ready_signal_window,
+    PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvenCells, ProvisionHash, ReadySignal,
+    ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim,
+    StoredReceipt, SubstateKey, VerificationKind, WeightedTimestamp, WorkInFlight,
+    derive_reshape_trigger, ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -101,7 +101,7 @@ use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
 
 use crate::admission::{
-    Admission, FinalizationsFold, ProvisionsFold, QcChainSets, RecordsFold, StateProofsFold,
+    Admission, FinalizationsFold, ProvisionsFold, QcChainSets, RecordsFold, StateClaimsFold,
     TransactionsFold,
 };
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
@@ -121,7 +121,7 @@ use crate::precut::Precut;
 use crate::proposal::{
     Prefilter, ProposalKind, ProposalPayload, ProposalTracker, TakeResult, assemble_build_action,
     dispatch_or_defer, late_deliveries, select_abandonment_records, select_finalizations,
-    select_provisions, select_state_proofs, select_transactions,
+    select_provisions, select_state_claims, select_transactions,
 };
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::timeout_keeper::TimeoutKeeper;
@@ -459,11 +459,12 @@ pub struct ShardCoordinator {
     /// generations the two mirrors keep for themselves.
     precut_generation: u64,
 
-    /// The three generations — the counterpart mirror's, the proven
-    /// anchors', the pre-cut answers' — at the last re-drive of the
-    /// votes the fence deferred. Compared once per dispatch, so a vote
-    /// deferred on any of them is re-driven by whatever advanced it.
-    fence_seen: (u64, u64, u64),
+    /// The generations of everything the fence reads — the counterpart
+    /// mirror's, the proven anchors', the proven cells', the pre-cut
+    /// answers' — at the last re-drive of the votes the fence deferred.
+    /// Compared once per dispatch, so a vote deferred on any of them is
+    /// re-driven by whatever advanced it.
+    fence_seen: (u64, u64, u64, u64),
 
     /// What counterparts have said about the transactions legs here
     /// issued for, as the execution coordinator mirrored and folded
@@ -486,6 +487,16 @@ pub struct ShardCoordinator {
     /// anchor. One mirror, so the fence cannot accept a bundle at an
     /// anchor the prober would not have chosen.
     proven_anchors: Arc<ProvenAnchors>,
+
+    /// The counterpart cells this validator has proven for itself, for
+    /// the state-claim check: a block states a reading, and the voter
+    /// holds it to the one it took.
+    ///
+    /// Owned here and written by the execution coordinator, whose
+    /// fetches are where a reading comes from, and read by the
+    /// state-proof server, which relays a peer the proof one was taken
+    /// from.
+    proven_cells: Arc<ProvenCells>,
 }
 
 impl std::fmt::Debug for ShardCoordinator {
@@ -658,9 +669,10 @@ impl ShardCoordinator {
             chain_origin: recovered.chain_origin,
             precut: Precut::succeeding(recovered.predecessors),
             precut_generation: 0,
-            fence_seen: (0, 0, 0),
+            fence_seen: (0, 0, 0, 0),
             evidence: Arc::new(CounterpartMirror::new()),
             proven_anchors: Arc::new(ProvenAnchors::new()),
+            proven_cells: Arc::new(ProvenCells::new()),
         }
     }
 
@@ -959,6 +971,14 @@ impl ShardCoordinator {
         &self.proven_anchors
     }
 
+    /// The cells this validator has proven, for the execution
+    /// coordinator to write what its fetches attest and the state-proof
+    /// server to relay the bytes they came from.
+    #[must_use]
+    pub const fn proven_cells(&self) -> &Arc<ProvenCells> {
+        &self.proven_cells
+    }
+
     /// Retire the commit-proven anchors nothing can probe against any
     /// more. One retirement for both consumers, since there is one
     /// mirror.
@@ -968,6 +988,8 @@ impl ShardCoordinator {
     fn retire_proven_anchors(&self) {
         self.proven_anchors
             .retire_below(self.committed_block_anchor_wt);
+        self.proven_cells
+            .retire_below(self.committed_block_anchor_wt);
     }
 
     /// The evidence a vote is fenced on, borrowed for one judgment.
@@ -975,6 +997,7 @@ impl ShardCoordinator {
         VoteFence {
             evidence: &self.evidence,
             proven_anchors: &self.proven_anchors,
+            proven_cells: &self.proven_cells,
             precut: &self.precut,
             cut: self.chain_origin.anchor_wt,
             local_shard: self.local_shard,
@@ -983,7 +1006,8 @@ impl ShardCoordinator {
 
     /// Whether anything the vote fence reads has been written since the
     /// last time this answered `true`: a counterpart's word, a settled
-    /// set, a record's cover, a proven anchor, a predecessor's answer.
+    /// set, a record's cover, a proven anchor, a proven cell, a
+    /// predecessor's answer.
     /// The state machine asks once per dispatch and re-drives the
     /// pending votes on `true`, so no writer has to know which votes
     /// were deferred on what it wrote.
@@ -991,6 +1015,7 @@ impl ShardCoordinator {
         let now = (
             self.evidence.generation(),
             self.proven_anchors.generation(),
+            self.proven_cells.generation(),
             self.precut_generation,
         );
         let advanced = now != self.fence_seen;
@@ -1745,7 +1770,7 @@ impl ShardCoordinator {
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         abandonment_records: Vec<AbandonmentRecord>,
-        state_proofs: Vec<StateProofBundle>,
+        state_claims: Vec<StateClaim>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // not the committed block — this lets the chain grow while the
@@ -1873,7 +1898,7 @@ impl ShardCoordinator {
             &mut RecordsFold::after(&finalization_fold),
             abandonment_records,
         );
-        let state_proofs = select_state_proofs(&ctx, &mut StateProofsFold::default(), state_proofs);
+        let state_claims = select_state_claims(&ctx, &mut StateClaimsFold::default(), state_claims);
 
         self.build_and_dispatch_proposal(
             topology_schedule,
@@ -1884,7 +1909,7 @@ impl ShardCoordinator {
                 finalizations,
                 provisions,
                 abandonment_records,
-                state_proofs,
+                state_claims,
             }),
         )
     }
@@ -4415,7 +4440,7 @@ impl ShardCoordinator {
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         abandonment_records: Vec<AbandonmentRecord>,
-        state_proofs: Vec<StateProofBundle>,
+        state_claims: Vec<StateClaim>,
     ) -> Vec<Action> {
         let height = qc.height();
 
@@ -4495,7 +4520,7 @@ impl ShardCoordinator {
             finalizations,
             provisions,
             abandonment_records,
-            state_proofs,
+            state_claims,
         ));
 
         actions
@@ -6655,7 +6680,7 @@ mod tests {
         CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash, Heard, LeafRoot,
         MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, Probed,
         Question, SettledSetVerdict, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId, Signer,
-        SignerBitfield, StateProofsRoot, TerminalRoots, TimestampRange, TopologySchedule,
+        SignerBitfield, StateClaimsRoot, TerminalRoots, TimestampRange, TopologySchedule,
         TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxOutcome, UnsettledTx,
         ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources,
         Word, settled_set_verdict, test_utils,
@@ -7112,7 +7137,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -7656,7 +7681,7 @@ mod tests {
                 certificates: Arc::new(Vec::new()),
                 provisions: Arc::new(Vec::new()),
                 abandonment_records: Arc::new(Vec::new()),
-                state_proofs: Arc::new(Vec::new()),
+                state_claims: Arc::new(Vec::new()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             }
         };
@@ -7861,7 +7886,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -8303,7 +8328,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let parent_block_hash = parent_block.hash();
@@ -10422,7 +10447,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
         let mut sub_quorum_signers = SignerBitfield::new(4);
         sub_quorum_signers.set(0); // single signer — far below 2f+1 = 3
@@ -10492,7 +10517,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
         let block_hash = block.hash();
         // The linkage assert fires before the committee resolves, so a
@@ -10541,7 +10566,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
         let qc = {
             let __qc = make_test_qc(block.hash(), BlockHeight::new(1));
@@ -10748,7 +10773,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
         let ancestor_hash = ancestor_block.hash();
         install_complete_block(&mut state, &ancestor_block);
@@ -10783,7 +10808,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
 
         let result = state.admit_transactions(&topology, &block);
@@ -10826,7 +10851,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
         let ancestor_hash = ancestor_block.hash();
 
@@ -10859,7 +10884,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
 
         // Ancestor is at committed height, so walk stops before checking it
@@ -11145,41 +11170,40 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(records),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
     /// A block carrying `bundles`, committed under their root.
-    fn block_with_state_proofs(bundles: Vec<StateProofBundle>) -> Block {
+    fn block_with_state_claims(bundles: Vec<StateClaim>) -> Block {
         Block::Live {
             header: BlockHeader::new(BlockHeaderParts {
                 height: BlockHeight::new(1),
-                state_proofs_root: StateProofsRoot::over(&bundles),
+                state_claims_root: StateClaimsRoot::over(&bundles),
                 ..Default::default()
             }),
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(bundles),
+            state_claims: Arc::new(bundles),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
-    /// A bundle against `shard` at height 5 under the root `root` names,
+    /// A claim against `shard` at height 5 under the root `root` names,
     /// claiming the anchor's clock is `ts_ms`.
-    fn bundle_against(shard: ShardId, root: &[u8], ts_ms: u64) -> StateProofBundle {
-        use hyperscale_types::MerkleInclusionProof;
-        StateProofBundle::new(
+    fn bundle_against(shard: ShardId, root: &[u8], ts_ms: u64) -> StateClaim {
+        use hyperscale_types::Inclusion;
+        StateClaim::new(
             Anchor {
                 shard,
                 height: BlockHeight::new(5),
                 state_root: StateRoot::from_raw(Hash::from_bytes(root)),
                 ts: WeightedTimestamp::from_millis(ts_ms),
             },
-            [stub_abort_charge(1).vault],
-            MerkleInclusionProof::dummy(),
+            [(stub_abort_charge(1).vault, Inclusion::Absent)],
         )
     }
 
@@ -11190,8 +11214,8 @@ mod tests {
     fn a_state_proof_against_an_unproven_height_defers_and_asks_for_its_proof() {
         let coord = fence_coordinator();
         let peer = ShardId::leaf(1, 1);
-        let block = block_with_state_proofs(vec![bundle_against(peer, b"root", 5_000)]);
-        let Err(Withheld::Deferred { wanted, .. }) = coord.vote_fence().state_proofs(&block) else {
+        let block = block_with_state_claims(vec![bundle_against(peer, b"root", 5_000)]);
+        let Err(Withheld::Deferred { wanted, .. }) = coord.vote_fence().state_claims(&block) else {
             panic!("the vote is withheld");
         };
         assert!(
@@ -11206,12 +11230,13 @@ mod tests {
         );
     }
 
-    /// A bundle whose root or clock disagrees with the commit-proven
-    /// header this voter holds is refused outright: the proof would
-    /// reconstruct a root the chain never committed, or date it to a
-    /// clock the chain never carried.
+    /// A claim whose root or clock disagrees with the commit-proven
+    /// header this voter holds is refused outright: its reading would
+    /// have been taken against a root the chain never committed, or
+    /// dated to a clock the chain never carried. An anchor that agrees
+    /// leaves the reading itself to answer for.
     #[test]
-    fn a_state_proof_disagreeing_with_the_held_header_is_refused() {
+    fn a_state_claim_disagreeing_with_the_held_header_is_refused() {
         let mut coord = fence_coordinator();
         let peer = ShardId::leaf(1, 1);
         coord.record_proven_anchor(Anchor {
@@ -11221,24 +11246,35 @@ mod tests {
             ts: WeightedTimestamp::from_millis(5_000),
         });
 
-        let other_root = block_with_state_proofs(vec![bundle_against(peer, b"other", 5_000)]);
+        let other_root = block_with_state_claims(vec![bundle_against(peer, b"other", 5_000)]);
         assert!(
             matches!(
-                coord.vote_fence().state_proofs(&other_root),
+                coord.vote_fence().state_claims(&other_root),
                 Err(Withheld::Refused(_))
             ),
             "refused, with nothing to wait for"
         );
-        let other_clock = block_with_state_proofs(vec![bundle_against(peer, b"root", 5_001)]);
+        let other_clock = block_with_state_claims(vec![bundle_against(peer, b"root", 5_001)]);
         assert!(matches!(
-            coord.vote_fence().state_proofs(&other_clock),
+            coord.vote_fence().state_claims(&other_clock),
             Err(Withheld::Refused(_))
         ),);
 
-        let agreeing = block_with_state_proofs(vec![bundle_against(peer, b"root", 5_000)]);
+        let agreeing = block_with_state_claims(vec![bundle_against(peer, b"root", 5_000)]);
+        let claim = &agreeing.state_claims()[0];
         assert!(
-            coord.vote_fence().state_proofs(&agreeing).is_ok(),
-            "the anchor the chain committed passes to the proof walk"
+            matches!(
+                coord.vote_fence().state_claims(&agreeing),
+                Err(Withheld::Deferred { .. })
+            ),
+            "the anchor the chain committed stands, and the reading is still owed"
+        );
+        coord
+            .proven_cells()
+            .proven(claim.anchor, claim.cells.clone());
+        assert!(
+            coord.vote_fence().state_claims(&agreeing).is_ok(),
+            "and passes once this validator has proven the cell for itself"
         );
     }
 
@@ -11786,7 +11822,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         }
     }
 
@@ -12153,7 +12189,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         }
     }
 
@@ -12248,7 +12284,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         }
     }
 
@@ -12270,7 +12306,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         }
     }
 

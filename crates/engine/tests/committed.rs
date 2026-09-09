@@ -120,7 +120,7 @@ fn a_followed_block_recomposes_under_the_childs_own_window() {
         certificates,
         provisions,
         abandonment_records,
-        state_proofs,
+        state_claims,
         witness_sources,
         ..
     } = block_settling(BlockHeight::new(1), vec![right_half])
@@ -133,7 +133,7 @@ fn a_followed_block_recomposes_under_the_childs_own_window() {
         certificates,
         provisions,
         abandonment_records,
-        state_proofs,
+        state_claims,
         witness_sources,
     };
 

@@ -43,9 +43,6 @@ pub enum VerificationKind {
     /// name: the figures its records restate, and the deliveries its
     /// finalizations carry, held short of the lapse.
     Resolutions,
-    /// The block's state-proof bundles, each reconstructing the root
-    /// its anchor names.
-    StateProofs,
 }
 
 /// The checks a block demands before a vote.
@@ -88,9 +85,6 @@ impl Demands {
         }
         if block.resolves_anything() {
             demanded.insert(VerificationKind::Resolutions);
-        }
-        if !block.state_proofs().is_empty() {
-            demanded.insert(VerificationKind::StateProofs);
         }
         Self(demanded)
     }

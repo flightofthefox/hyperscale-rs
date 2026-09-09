@@ -31,7 +31,7 @@ use crate::shard::commit::{
 use crate::shard::consensus::BlockSyncInput;
 use crate::shard::cross_shard::{
     CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
-    ProvisionBinding, SettledTxsBinding, StateProofBinding,
+    ProvisionBinding, SettledTxsBinding, StateProofBinding, StateProofRelayBinding,
 };
 use crate::shard::mempool::TransactionBinding;
 
@@ -79,7 +79,6 @@ where
             | Action::VerifyProvisionTxRoots { .. }
             | Action::VerifyReservations { .. }
             | Action::VerifyResolutions { .. }
-            | Action::VerifyStateProofs { .. }
             | Action::VerifyProvisions { .. }
             | Action::ExecuteTransactions { .. }
             | Action::FetchAndBroadcastProvisions { .. }
@@ -710,6 +709,20 @@ where
                 self.drive_fetch::<StateProofBinding>(FetchInput::Request {
                     ids: keys.into_iter().map(|key| (anchor, key)).collect(),
                     shard: anchor.shard,
+                    preferred,
+                    class,
+                });
+            }
+            FetchRequest::RelayedStateProof {
+                anchor,
+                keys,
+                shard,
+                preferred,
+                class,
+            } => {
+                self.drive_fetch::<StateProofRelayBinding>(FetchInput::Request {
+                    ids: keys.into_iter().map(|key| (anchor, key)).collect(),
+                    shard,
                     preferred,
                     class,
                 });

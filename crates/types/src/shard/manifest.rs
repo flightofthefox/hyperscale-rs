@@ -6,8 +6,8 @@ use hyperscale_hbor::Hbor;
 use crate::{
     AbandonmentRecord, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight,
     FinalizationHash, MAX_ABANDONMENT_RECORDS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_PROOFS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    QuorumCertificate, StateProofBundle, TxHash, Verifiable, WitnessSources,
+    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    QuorumCertificate, StateClaim, TxHash, Verifiable, WitnessSources,
 };
 
 /// Hash-level description of a block's contents (transactions and certificates).
@@ -32,11 +32,11 @@ pub struct BlockManifest {
     /// from, and there is no later source to fetch them from.
     #[hbor(max = MAX_ABANDONMENT_RECORDS_PER_BLOCK)]
     abandonment_records: Vec<AbandonmentRecord>,
-    /// The block's state-proof bundles, mirrored verbatim: every
-    /// validator holds a proof it fetched itself or none, and what the
-    /// block commits to is the proposer's bytes.
-    #[hbor(max = MAX_STATE_PROOFS_PER_BLOCK)]
-    state_proofs: Vec<StateProofBundle>,
+    /// The block's state claims, mirrored verbatim: they are small, and
+    /// a voter checks each against a proof of its own rather than
+    /// against anything it could fetch back from a later source.
+    #[hbor(max = MAX_STATE_CLAIMS_PER_BLOCK)]
+    state_claims: Vec<StateClaim>,
     /// The block's beacon-witness inputs, mirrored verbatim — the
     /// sync/reload path replays leaf derivation from the manifest under
     /// QC trust. See [`WitnessSources`].
@@ -53,7 +53,7 @@ impl Default for BlockManifest {
             cert_ids: Vec::new(),
             provision_hashes: Vec::new(),
             abandonment_records: Vec::new(),
-            state_proofs: Vec::new(),
+            state_claims: Vec::new(),
             witness_sources: WitnessSources::empty(),
         }
     }
@@ -68,7 +68,7 @@ impl BlockManifest {
         cert_ids: Vec<FinalizationHash>,
         provision_hashes: Vec<ProvisionHash>,
         abandonment_records: Vec<AbandonmentRecord>,
-        state_proofs: Vec<StateProofBundle>,
+        state_claims: Vec<StateClaim>,
         witness_sources: WitnessSources,
     ) -> Self {
         Self {
@@ -76,7 +76,7 @@ impl BlockManifest {
             cert_ids,
             provision_hashes,
             abandonment_records,
-            state_proofs,
+            state_claims,
             witness_sources,
         }
     }
@@ -110,10 +110,10 @@ impl BlockManifest {
         &self.abandonment_records
     }
 
-    /// The block's state-proof bundles.
+    /// The block's state claims.
     #[must_use]
-    pub const fn state_proofs(&self) -> &Vec<StateProofBundle> {
-        &self.state_proofs
+    pub const fn state_claims(&self) -> &Vec<StateClaim> {
+        &self.state_claims
     }
 
     /// The block's beacon-witness inputs.
@@ -155,7 +155,7 @@ impl BlockManifest {
             cert_ids,
             provision_hashes,
             block.abandonment_records().to_vec(),
-            block.state_proofs().to_vec(),
+            block.state_claims().to_vec(),
             block.witness_sources().as_ref().clone(),
         )
     }

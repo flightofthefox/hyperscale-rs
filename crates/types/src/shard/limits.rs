@@ -235,14 +235,14 @@ pub const MAX_PROOFS_PER_QUERY: usize = 256;
 /// revisiting.
 pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
 
-/// Hard cap on the state-proof bundles a block can carry.
+/// Hard cap on the state claims a block can carry.
 ///
-/// One bundle answers one fetch against one counterpart height; the
-/// proposer offers what its own fetches answered and the rest waits a
+/// One claim answers one fetch against one counterpart height; the
+/// proposer offers what its own fetches read and the rest waits a
 /// block. Bounded so the vote fence's deferral — which withholds the
 /// vote on the whole block — cannot couple every transaction in a block
 /// to the slowest proof on the abort path.
-pub const MAX_STATE_PROOFS_PER_BLOCK: usize = 256;
+pub const MAX_STATE_CLAIMS_PER_BLOCK: usize = 256;
 
 /// How far the drain's transaction *count* may run past the depth its
 /// work budget is sized for, when every transaction is as cheap as one

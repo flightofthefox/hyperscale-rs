@@ -19,11 +19,11 @@
 //! the composer that offered its content would have offered it against
 //! the same mirror.
 
-use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::record_verdict_claim_deferred;
 use hyperscale_types::{
     AbandonmentRecord, Block, CounterpartEvidence, CounterpartMirror, Heard, ProvenAnchors,
-    Question, SettledSetVerdict, ShardId, StateProofBundle, TopologySchedule, UnsettledTx,
+    ProvenCells, Question, SettledSetVerdict, ShardId, StateClaim, TopologySchedule, UnsettledTx,
     WeightedTimestamp, Word, settled_set_verdict,
 };
 
@@ -61,6 +61,8 @@ pub struct VoteFence<'a> {
     pub evidence: &'a CounterpartMirror,
     /// The commit-proven remote headers.
     pub proven_anchors: &'a ProvenAnchors,
+    /// The counterpart cells this validator has proven for itself.
+    pub proven_cells: &'a ProvenCells,
     /// The predecessors' answers about transactions opening before the
     /// chain's origin.
     pub precut: &'a Precut,
@@ -74,9 +76,9 @@ pub struct VoteFence<'a> {
 impl VoteFence<'_> {
     /// Judge every claim `block` makes, in the order the cheapest
     /// evidence answers: its finalizations against the settled sets, its
-    /// records against the sets and the mirror, its state proofs against
-    /// the proven anchors, and its pre-cut content against the
-    /// predecessors' answers.
+    /// records against the sets and the mirror, its state claims against
+    /// the anchors and cells this validator has proven, and its pre-cut
+    /// content against the predecessors' answers.
     ///
     /// # Errors
     ///
@@ -85,7 +87,7 @@ impl VoteFence<'_> {
         let anchored_wt = block.header().parent_qc().weighted_timestamp();
         self.finalizations(schedule, block, anchored_wt)?;
         self.records(block)?;
-        self.state_proofs(block)?;
+        self.state_claims(block)?;
         self.precut(block)
     }
 
@@ -282,54 +284,72 @@ impl VoteFence<'_> {
         Ok(())
     }
 
-    /// Whether the block's state proofs name anchors this voter can
-    /// check.
+    /// Whether the block's readings of counterparts' cells are ones this
+    /// voter has taken for itself.
     ///
-    /// A bundle claims a root and a clock for a counterpart's height.
-    /// Both are read off the commit-proven header this voter holds for
-    /// it: one that agrees passes to the delegated proof walk, one that
-    /// disagrees is refused, and a voter holding no proven header for
-    /// the height defers and asks for its commit proof — the same
-    /// deferral a provision takes on a source block not yet proven.
-    /// The proposer probed at a header it held, so an honest bundle's
-    /// anchor reaches every voter in the ordinary course. Every missing
-    /// anchor is asked for at once, so one deferral fetches them all.
+    /// A claim states what a counterpart's committed state said about a
+    /// cell, and carries no proof of it. So it is held to this
+    /// validator's own reading, twice over: the anchor against the
+    /// commit-proven header held for that height, and each cell against
+    /// what a multiproof this validator walked said of it. A reading
+    /// that disagrees refuses the block for good — one of the two read a
+    /// tree the other did not. A reading not taken defers, and asks for
+    /// the proof that would take it.
+    ///
+    /// Absence is the ordinary case, not the pathological one. Which
+    /// remote headers a node has commit-proven is its own view, so two
+    /// validators probing one counterpart routinely anchor at different
+    /// heights, and a voter that read the same cell at its own anchor
+    /// has still not read it at the proposer's. The recovery is a peer
+    /// relaying the proof rather than the counterpart serving it again:
+    /// the proposer holds those bytes by construction, and so does every
+    /// member whose probe landed there.
+    ///
+    /// Everything missing is asked for in one deferral — the commit
+    /// proofs for anchors not held, and the relays for cells not read —
+    /// so a block waits on one round trip rather than one per claim.
     ///
     /// # Errors
     ///
-    /// A bundle whose anchor this validator's proven header disagrees
-    /// with, or the set of anchors it has not proven.
-    pub fn state_proofs(&self, block: &Block) -> Result<(), Withheld> {
+    /// A claim whose anchor or whose reading this validator contradicts,
+    /// or everything it has yet to prove.
+    pub fn state_claims(&self, block: &Block) -> Result<(), Withheld> {
         let mut wanted = Vec::new();
-        for bundle in block.state_proofs() {
-            self.anchor_stands(bundle, &mut wanted)?;
+        let mut unread = 0usize;
+        for claim in block.state_claims() {
+            if self.anchor_stands(claim, &mut wanted)? {
+                unread += self.cells_stand(claim, &mut wanted)?;
+            }
         }
         if wanted.is_empty() {
             Ok(())
         } else {
             Err(Withheld::Deferred {
                 why: format!(
-                    "state proofs name {} heights this validator has not commit-proven",
-                    wanted.len()
+                    "block claims {unread} cells this validator has not proven, at {} anchors it \
+                     asks for",
+                    wanted.len(),
                 ),
                 wanted,
             })
         }
     }
 
-    /// Whether a bundle's anchor is one this voter has commit-proven, and
+    /// Whether a claim's anchor is one this voter has commit-proven, and
     /// whether every term of it — the root and the clock — agrees with
-    /// the header held for it. An anchor not held is asked for.
+    /// the header held for it. An anchor not held is asked for, and
+    /// answers `false`: its cells are not readable until it is, since a
+    /// reading is only ever taken against a root this validator proved.
     fn anchor_stands(
         &self,
-        bundle: &StateProofBundle,
+        claim: &StateClaim,
         wanted: &mut Vec<Action>,
-    ) -> Result<(), Withheld> {
-        let anchor = bundle.anchor;
+    ) -> Result<bool, Withheld> {
+        let anchor = claim.anchor;
         match self.proven_anchors.at(anchor.shard, anchor.height) {
-            Some(held) if held == anchor => Ok(()),
+            Some(held) if held == anchor => Ok(true),
             Some(held) => Err(Withheld::Refused(format!(
-                "state proof names an anchor of {:?} at height {} (root {:?}, clock {:?}) this \
+                "state claim names an anchor of {:?} at height {} (root {:?}, clock {:?}) this \
                  validator's commit-proven header disagrees with (root {:?}, clock {:?})",
                 anchor.shard,
                 anchor.height.inner(),
@@ -343,9 +363,45 @@ impl VoteFence<'_> {
                     source_shard: anchor.shard,
                     block_height: anchor.height,
                 }));
-                Ok(())
+                Ok(false)
             }
         }
+    }
+
+    /// Whether every cell a claim reads stands against this validator's
+    /// own reading of it, returning how many it has not read.
+    ///
+    /// The unread ones are asked for together, as one relay of the whole
+    /// claim: they were proven together on the proposer, so one proof
+    /// answers all of them and asking cell by cell would fetch the same
+    /// bytes repeatedly.
+    fn cells_stand(&self, claim: &StateClaim, wanted: &mut Vec<Action>) -> Result<usize, Withheld> {
+        let mut unread = Vec::new();
+        for &(key, stated) in &claim.cells {
+            match self.proven_cells.reading(claim.anchor, key) {
+                Some(mine) if mine == stated => {}
+                Some(mine) => {
+                    return Err(Withheld::Refused(format!(
+                        "state claim reads {key:?} of {:?} at height {} as {stated:?}, which this \
+                         validator proved to be {mine:?}",
+                        claim.anchor.shard,
+                        claim.anchor.height.inner(),
+                    )));
+                }
+                None => unread.push(key),
+            }
+        }
+        let count = unread.len();
+        if !unread.is_empty() {
+            wanted.push(Action::Fetch(FetchRequest::RelayedStateProof {
+                anchor: claim.anchor,
+                keys: unread,
+                shard: self.local_shard,
+                preferred: None,
+                class: None,
+            }));
+        }
+        Ok(count)
     }
 
     /// Which of `block`'s transactions belong to the chain that ran
@@ -402,5 +458,251 @@ impl VoteFence<'_> {
                 "pre-cut transaction {tx_hash} unresolved against the predecessors"
             )))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use hyperscale_types::test_utils::test_key;
+    use hyperscale_types::{
+        Anchor, BlockHeader, BlockHeaderParts, BlockHeight, Hash, Inclusion, LeafRoot, StateClaim,
+        StateClaimsRoot, StateRoot, SubstateKey, WitnessSources,
+    };
+
+    use super::*;
+
+    /// The counterpart every claim in these tests reads.
+    const COUNTERPART: ShardId = ShardId::ROOT;
+    /// The shard the fence votes on.
+    const LOCAL: ShardId = ShardId::leaf(1, 1);
+    /// A value hash, for the readings that are presences.
+    const PRESENT: Inclusion = Inclusion::Present([7u8; 32]);
+
+    fn anchor_at(seed: &[u8], height: u64) -> Anchor {
+        Anchor {
+            shard: COUNTERPART,
+            height: BlockHeight::new(height),
+            state_root: StateRoot::from_raw(Hash::from_bytes(seed)),
+            ts: WeightedTimestamp::from_millis(height * 1_000),
+        }
+    }
+
+    /// A block whose only content is `claims`.
+    fn block_claiming(claims: Vec<StateClaim>) -> Block {
+        Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                shard_id: LOCAL,
+                height: BlockHeight::new(6),
+                state_claims_root: StateClaimsRoot::over(&claims),
+                provision_tx_roots: BTreeMap::new(),
+                ..Default::default()
+            }),
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(Vec::new()),
+            provisions: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(claims),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        }
+    }
+
+    /// The evidence one validator holds, and the fence over it.
+    struct Held {
+        evidence: CounterpartMirror,
+        proven_anchors: ProvenAnchors,
+        proven_cells: ProvenCells,
+        precut: Precut,
+    }
+
+    impl Held {
+        fn nothing() -> Self {
+            Self {
+                evidence: CounterpartMirror::new(),
+                proven_anchors: ProvenAnchors::new(),
+                proven_cells: ProvenCells::new(),
+                precut: Precut::default(),
+            }
+        }
+
+        /// This validator has commit-proven `anchor` and read `cells`
+        /// against it.
+        fn proved(
+            self,
+            anchor: Anchor,
+            cells: impl IntoIterator<Item = (SubstateKey, Inclusion)>,
+        ) -> Self {
+            self.proven_anchors.record(anchor);
+            self.proven_cells.proven(anchor, cells);
+            self
+        }
+
+        fn judge(&self, block: &Block) -> Result<(), Withheld> {
+            VoteFence {
+                evidence: &self.evidence,
+                proven_anchors: &self.proven_anchors,
+                proven_cells: &self.proven_cells,
+                precut: &self.precut,
+                cut: WeightedTimestamp::ZERO,
+                local_shard: LOCAL,
+            }
+            .state_claims(block)
+        }
+    }
+
+    /// A claim reading exactly what this validator proved passes, and
+    /// asks for nothing.
+    #[test]
+    fn a_claim_this_validator_proved_for_itself_stands() {
+        let (present, absent) = (test_key(1), test_key(2));
+        let anchor = anchor_at(b"root", 4);
+        let readings = [(present, PRESENT), (absent, Inclusion::Absent)];
+        let held = Held::nothing().proved(anchor, readings);
+
+        let block = block_claiming(vec![StateClaim::new(anchor, readings)]);
+        assert!(held.judge(&block).is_ok());
+    }
+
+    /// A claim that reads a cell the other way is refused for good: one
+    /// of the two walked a tree the other did not, and no evidence
+    /// arriving later reconciles that.
+    #[test]
+    fn a_claim_this_validator_reads_the_other_way_is_refused() {
+        let key = test_key(1);
+        let anchor = anchor_at(b"root", 4);
+        let held = Held::nothing().proved(anchor, [(key, PRESENT)]);
+
+        let block = block_claiming(vec![StateClaim::new(anchor, [(key, Inclusion::Absent)])]);
+        let Withheld::Refused(why) = held.judge(&block).expect_err("the reading contradicts")
+        else {
+            panic!("a contradicted reading refuses rather than defers");
+        };
+        assert!(why.contains("this validator proved"), "{why}");
+    }
+
+    /// A cell this validator has not proven defers, and the deferral
+    /// asks a committee peer to relay the proof — every unread cell of
+    /// one claim in a single ask, since one proof answers them all.
+    #[test]
+    fn a_cell_this_validator_has_not_proven_defers_and_asks_a_peer() {
+        let (first, second) = (test_key(1), test_key(2));
+        let anchor = anchor_at(b"root", 4);
+        let held = Held::nothing().proved(anchor, []);
+
+        let block = block_claiming(vec![StateClaim::new(
+            anchor,
+            [(first, Inclusion::Absent), (second, Inclusion::Absent)],
+        )]);
+        let Withheld::Deferred { wanted, .. } = held.judge(&block).expect_err("nothing is proven")
+        else {
+            panic!("an unproven reading defers rather than refusing");
+        };
+        match wanted.as_slice() {
+            [
+                Action::Fetch(FetchRequest::RelayedStateProof {
+                    anchor: at,
+                    keys,
+                    shard,
+                    ..
+                }),
+            ] => {
+                assert_eq!(*at, anchor);
+                assert_eq!(keys, &[first, second]);
+                assert_eq!(*shard, LOCAL, "asked of this shard's own committee");
+            }
+            other => panic!("expected one relay for the claim, got {other:?}"),
+        }
+    }
+
+    /// An anchor this validator has not commit-proven asks for the
+    /// commit proof and nothing else: a reading is only ever taken
+    /// against a root this validator proved, so there is no cell to
+    /// relay until the anchor stands.
+    #[test]
+    fn an_unproven_anchor_asks_for_its_commit_proof_alone() {
+        let anchor = anchor_at(b"root", 4);
+        let held = Held::nothing();
+
+        let block = block_claiming(vec![StateClaim::new(
+            anchor,
+            [(test_key(1), Inclusion::Absent)],
+        )]);
+        let Withheld::Deferred { wanted, .. } =
+            held.judge(&block).expect_err("the anchor is not proven")
+        else {
+            panic!("an unproven anchor defers");
+        };
+        assert!(matches!(
+            wanted.as_slice(),
+            [Action::Continuation(
+                ProtocolEvent::CommitProofNeeded { .. }
+            )]
+        ));
+    }
+
+    /// An anchor whose root this validator's own proven header
+    /// disagrees with is refused before any cell is read.
+    #[test]
+    fn an_anchor_naming_another_root_is_refused() {
+        let key = test_key(1);
+        let held = Held::nothing().proved(anchor_at(b"fork", 4), [(key, PRESENT)]);
+
+        let block = block_claiming(vec![StateClaim::new(
+            anchor_at(b"root", 4),
+            [(key, PRESENT)],
+        )]);
+        assert!(matches!(
+            held.judge(&block)
+                .expect_err("the anchor is another chain's"),
+            Withheld::Refused(_)
+        ));
+    }
+
+    /// Everything outstanding is asked for at once, so a block waits on
+    /// one round trip rather than one per claim.
+    #[test]
+    fn one_deferral_asks_for_everything_outstanding() {
+        let (first, second) = (test_key(1), test_key(2));
+        let (proven, unproven) = (anchor_at(b"root", 4), anchor_at(b"root", 9));
+        let held = Held::nothing().proved(proven, []);
+
+        let block = block_claiming(vec![
+            StateClaim::new(proven, [(first, Inclusion::Absent)]),
+            StateClaim::new(unproven, [(second, Inclusion::Absent)]),
+        ]);
+        let Withheld::Deferred { wanted, .. } =
+            held.judge(&block).expect_err("neither is checkable")
+        else {
+            panic!("both are questions of absent evidence");
+        };
+        assert_eq!(
+            wanted.len(),
+            2,
+            "one relay and one commit proof: {wanted:?}"
+        );
+    }
+
+    /// A refusal wins over a deferral: a block carrying one claim this
+    /// validator contradicts never gets the vote, whatever else it also
+    /// leaves unanswered.
+    #[test]
+    fn a_contradicted_claim_refuses_a_block_that_also_defers() {
+        let (contradicted, unread) = (test_key(1), test_key(2));
+        let anchor = anchor_at(b"root", 4);
+        let held = Held::nothing().proved(anchor, [(contradicted, PRESENT)]);
+
+        let block = block_claiming(vec![StateClaim::new(
+            anchor,
+            [
+                (contradicted, Inclusion::Absent),
+                (unread, Inclusion::Absent),
+            ],
+        )]);
+        assert!(matches!(
+            held.judge(&block).expect_err("the contradiction decides"),
+            Withheld::Refused(_)
+        ));
     }
 }

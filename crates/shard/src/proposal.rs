@@ -23,15 +23,14 @@ use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Deadline, Epoch,
     Finalization, Hash, LocalTimestamp, ProposerTimestamp, Provisions, ReadySignal, ReshapeTrigger,
-    RevealChain, Round, ScheduleLookup, ShardId, StateProofBundle, TopologySchedule,
-    TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, Window,
+    RevealChain, Round, ScheduleLookup, ShardId, StateClaim, TopologySchedule, TopologySnapshot,
+    Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, Window,
 };
 use tracing::debug;
 
 use crate::admission::{
     Admission, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
-    RecordsFold, RecordsSection, StateProofsFold, StateProofsSection, TransactionsFold,
+    RecordsFold, RecordsSection, StateClaimsFold, StateClaimsSection, TransactionsFold,
     TransactionsSection, admit_each, unwrapped,
 };
 use crate::chain_view::ChainView;
@@ -64,7 +63,7 @@ pub struct ProposalPayload {
     pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
     pub provisions: Vec<Arc<Verifiable<Provisions>>>,
     pub abandonment_records: Vec<AbandonmentRecord>,
-    pub state_proofs: Vec<StateProofBundle>,
+    pub state_claims: Vec<StateClaim>,
 }
 
 #[derive(Debug, Clone)]
@@ -331,19 +330,19 @@ pub fn select_abandonment_records(
 }
 
 /// The proofs a block may carry of counterparts' cells: what
-/// [`StateProofsSection`] admits, in the one order it carries them —
+/// [`StateClaimsSection`] admits, in the one order it carries them —
 /// ascending, without repeats, and no more than the block's cap, with
 /// the rest waiting a block.
 #[must_use]
-pub fn select_state_proofs(
+pub fn select_state_claims(
     ctx: &Admission<'_>,
-    fold: &mut StateProofsFold,
-    state_proofs: Vec<StateProofBundle>,
-) -> Vec<StateProofBundle> {
-    let mut sorted = state_proofs;
+    fold: &mut StateClaimsFold,
+    state_claims: Vec<StateClaim>,
+) -> Vec<StateClaim> {
+    let mut sorted = state_claims;
     sorted.sort_unstable();
     sorted.dedup();
-    admit_each::<StateProofsSection, _>(ctx, fold, sorted, |bundle| bundle).0
+    admit_each::<StateClaimsSection, _>(ctx, fold, sorted, |bundle| bundle).0
 }
 
 /// Select provisions for inclusion: what [`ProvisionsSection`] admits
@@ -453,7 +452,7 @@ pub fn assemble_build_action(
         finalizations,
         provisions,
         abandonment_records,
-        state_proofs,
+        state_claims,
     } = payload;
 
     // The proposer's new BlockHeader will carry parent_qc in its wire
@@ -475,7 +474,7 @@ pub fn assemble_build_action(
         finalizations,
         provisions,
         abandonment_records,
-        state_proofs,
+        state_claims,
         fee_checks,
         fee_read_height,
         parent_in_flight,

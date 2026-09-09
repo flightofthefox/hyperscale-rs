@@ -1033,27 +1033,6 @@ impl VerificationPipeline {
         }]
     }
 
-    /// Initiate the state-proof check for a block: each bundle walked
-    /// against the root its anchor names. The anchor's own standing —
-    /// held, commit-proven, agreeing on root and clock — is the
-    /// coordinator's synchronous fence, run before this.
-    pub fn initiate_state_proofs_verification(
-        &mut self,
-        block_hash: BlockHash,
-        block: &Block,
-    ) -> Vec<Action> {
-        debug!(
-            ?block_hash,
-            bundles = block.state_proofs().len(),
-            "Initiating state proofs verification"
-        );
-        self.mark_root_in_flight(block_hash, VerificationKind::StateProofs);
-        vec![Action::VerifyStateProofs {
-            block_hash,
-            state_proofs: block.state_proofs().to_vec(),
-        }]
-    }
-
     /// Initiate beacon-witness root verification for a block, or defer
     /// it if the prospective-parent walk hits a missing/unassembled
     /// ancestor.
@@ -1663,9 +1642,6 @@ impl VerificationPipeline {
                         self.initiate_resolutions_verification(block_hash, block, schedule),
                     );
                 }
-                VerificationKind::StateProofs => {
-                    actions.extend(self.initiate_state_proofs_verification(block_hash, block));
-                }
                 VerificationKind::BeaconWitnessRoot => {
                     if !self.is_beacon_witness_deferred(block_hash) {
                         actions.extend(self.initiate_beacon_witness_root_verification(
@@ -2258,7 +2234,7 @@ mod tests {
             certificates: Arc::new(certificates),
             provisions: Arc::new(Vec::new()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -2316,7 +2292,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         }
     }
 
@@ -2361,7 +2337,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         }
     }
 
@@ -3074,7 +3050,7 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Vec::new()),
-            state_proofs: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
         let demands = block.demands();
         assert!(demands.contains(VerificationKind::TransactionRoot));

@@ -27,7 +27,7 @@ pub struct MerkleInclusionProof(#[hbor(max = MAX_MERKLE_PROOF_LEN)] pub Vec<u8>)
 /// weighed, and so the only statement about the value the proof is in a
 /// position to make. A consumer holding the bytes confirms them against
 /// it; one that only asked whether the cell is there ignores it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hbor)]
 pub enum Inclusion {
     /// A leaf at the key, hashing to this.
     Present(ValueHash),
