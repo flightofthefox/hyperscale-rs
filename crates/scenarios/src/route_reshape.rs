@@ -1008,45 +1008,31 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
         c.committed_work_in_flight(survivor),
     );
     // The output is a delivery to the trader, admissible to the delivery
-    // window's close, and the crossing it rides sits in a record cell
-    // nothing sweeps. On a clock the window outlasts, the trader banks
+    // window's close. On a clock the window outlasts, the trader banks
     // it. On a clock whose epochs outrun the window the survivor settles
-    // after it: the output's delivery can no longer be admitted, and if
-    // the survivor also settles past the claim cell's own sweep the
-    // lapse probe that would have returned the record reaches a cell
-    // that is simply gone — absence proves nothing there, so the output
-    // is stranded, and the world is short by exactly it, at most the
-    // input the route put in.
+    // after it and the delivery can no longer be admitted — but the
+    // claim cell the lapse probe asks about outlives the window it
+    // answers for, so the absence is proved against a live cell and the
+    // issuer takes the output back. Past the window the trader is out
+    // its input; the world is not, on either clock.
     let banked = c.run_until(epochs(8), |c| held(c, route.trader.address(), *XRD) > paid);
-    let clock = WeightedTimestamp::ZERO.plus(c.now());
-    let burned = charges.burned(c);
-    if banked || clock < Window::Delivery.of(Deadline::of(validity_end)).end {
+    if !banked {
+        let clock = WeightedTimestamp::ZERO.plus(c.now());
         assert!(
-            banked,
+            clock >= Window::Delivery.of(Deadline::of(validity_end)).end,
             "the route must bank its output for the trader while its delivery window is open; \
              holds {} against {paid}",
             held(c, route.trader.address(), *XRD),
         );
-        route.xrd.assert_settles_within(
-            c,
-            &charges,
-            epochs(8),
-            "a route settled across a departure",
-        );
-    } else {
         assert_eq!(
             held(c, route.trader.address(), *XRD),
             paid,
             "past its delivery window the output never reaches the trader",
         );
-        let stranded = route.xrd.before() - route.xrd.held(c) - burned;
-        assert!(
-            stranded > 0 && stranded <= ROUTE_INPUT,
-            "the world must be short by the stranded output alone, at most the input; short by \
-             {stranded}",
-        );
-        charges.assert_each_fits_a_full_block(c);
     }
+    route
+        .xrd
+        .assert_settles_within(c, &charges, epochs(8), "a route settled across a departure");
     route.units.assert_settles_within(
         c,
         &Charges::default(),
