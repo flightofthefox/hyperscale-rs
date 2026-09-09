@@ -23,9 +23,13 @@ use std::io;
 use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use hyperscale_network::CompressionError;
 use hyperscale_network::compression::{compress, decompress};
+use hyperscale_types::MAX_WIRE_MESSAGE_BYTES;
 
 /// Maximum frame size (compressed), shared across inbound and outbound paths.
-pub const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+///
+/// The protocol's own figure: what a block section may be built up to is
+/// stated against it, so the two cannot drift apart.
+pub const MAX_FRAME_SIZE: usize = MAX_WIRE_MESSAGE_BYTES;
 
 /// Errors from framing operations.
 #[derive(Debug)]

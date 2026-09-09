@@ -13,9 +13,9 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
     ConsensusReceipt, DeclaredRange, EntryKey, ExecutionCertificate, Finalization,
     FinalizationHash, QuorumCertificate, RETENTION_HORIZON, ShardId, ShardWitnessPayload,
-    StateRoot, SubstateKey, SweepFrontier, TerminalRoots, TickId, Transaction, TxHash, Verifiable,
-    Verified, WeightedTimestamp, committed_txs_root_from_hashes, local_settled_tx_hashes,
-    settled_txs_root_from_hashes,
+    StateRoot, SubstateKey, SweepBucket, SweepFrontier, TerminalRoots, TickId, Transaction, TxHash,
+    Verifiable, Verified, WeightedTimestamp, committed_txs_root_from_hashes,
+    local_settled_tx_hashes, settled_txs_root_from_hashes,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -987,8 +987,8 @@ impl<Snap: Substates> Anchored for ViewSnapshot<Snap> {
 impl<S: SubstateStore + VersionedStore + SweepIndex> SweepIndex for SubstateView<S> {
     fn sweep_candidates(
         &self,
-        frontier: SweepFrontier,
-        ceiling: SweepFrontier,
+        after: SweepFrontier,
+        below: SweepBucket,
         limit: usize,
     ) -> Vec<(SubstateKey, u64)> {
         // Resolved through the overlay, never against the persisted
@@ -997,13 +997,43 @@ impl<S: SubstateStore + VersionedStore + SweepIndex> SweepIndex for SubstateView
         // removal the chain owes goes unmade; a cell one retired reads
         // as live, so a removal is made twice and the second lands on a
         // key the tree no longer holds.
+        //
+        // The merge only closes the gap in one direction. The base's
+        // index answers at whatever the store has persisted, and the
+        // overlay carries the blocks from there up to the anchor — so a
+        // store *ahead* of the anchor by blocks the overlay does not hold
+        // has already retired rows this walk would still be told about,
+        // and the removal set comes out wrong. Refused here rather than
+        // computed: the alternative is a state root that differs from
+        // every peer's, which the commit path answers with the same
+        // fatality one block later and without naming the cause.
+        assert!(
+            self.base.jmt_height() <= self.anchor_height,
+            "BFT CRITICAL: a sweep walk anchored at {} reads an index persisted to {}",
+            self.anchor_height.inner(),
+            self.base.jmt_height().inner(),
+        );
         merge_sweep_overlay(
-            |widened| self.base.sweep_candidates(frontier, ceiling, widened),
+            |widened| self.base.sweep_candidates(after, below, widened),
             self.pending_snapshots(),
-            frontier,
-            ceiling,
+            after,
+            below,
             limit,
         )
+    }
+}
+
+impl<S: SubstateStore + VersionedStore> SubstateView<S> {
+    /// Whether this view answers historical reads at `height`.
+    ///
+    /// The base's retention floor, asked rather than inferred: a server
+    /// that decides by whether the tree still happens to hold a version's
+    /// nodes answers for heights the store no longer promises, and the
+    /// two servers that read history through this view would then answer
+    /// differently for the same height.
+    #[must_use]
+    pub fn serves_at(&self, height: BlockHeight) -> bool {
+        height.inner() >= self.base.retention_floor()
     }
 }
 
@@ -1160,6 +1190,9 @@ mod tests {
         /// this to assert that `view_at(hash, height)` anchors base reads
         /// at the supplied height rather than the live JMT tip.
         recorded_snapshot_at: Mutex<Vec<BlockHeight>>,
+        /// What the store has persisted, for the sweep walk's guard —
+        /// the one question that compares the base against the anchor.
+        persisted: BlockHeight,
     }
 
     impl StubStore {
@@ -1222,7 +1255,7 @@ mod tests {
             StubSnapshot
         }
         fn jmt_height(&self) -> BlockHeight {
-            BlockHeight::GENESIS
+            self.persisted
         }
         fn state_root(&self) -> StateRoot {
             StateRoot::ZERO
@@ -1245,7 +1278,20 @@ mod tests {
         }
     }
 
+    /// The empty index: what a store with nothing sweepable answers, and
+    /// enough for the walk's own guard, which reads the heights and not
+    /// the rows.
+    impl SweepIndex for StubStore {}
+
     impl VersionedStore for StubStore {
+        fn retention_floor(&self) -> u64 {
+            0
+        }
+
+        fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+            (height <= self.persisted).then(|| self.snapshot_at(height))
+        }
+
         fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
             self.recorded_snapshot_at
                 .lock()
@@ -1391,7 +1437,7 @@ mod tests {
             height,
             settled_txs: Vec::new(),
             committed_txs: Vec::new(),
-            jmt_snapshot: snapshot_of(writes.resolve(&mut |_| None)),
+            jmt_snapshot: snapshot_of(writes.resolve(&mut |_| None).expect("nothing moved")),
             certified_block: None,
             certified_uncommitted: None,
         }
@@ -1788,9 +1834,9 @@ mod tests {
         assert!(chain.latest_qc().is_none());
     }
 
-    /// A cross-shard tick keyed on `ShardId::ROOT` — the only kind whose
-    /// transactions land in the settled set, since `local_settled_tx_hashes`
-    /// drops single-shard (`is_zero`) ticks.
+    /// A tick keyed on `ShardId::ROOT`, the shard whose settled set these
+    /// tests read; `local_settled_tx_hashes` names only that shard's own
+    /// verdicts.
     fn tick(n: u64) -> TickId {
         TickId::new(ShardId::ROOT, BlockHeight::new(n))
     }
@@ -1866,7 +1912,8 @@ mod tests {
             transactions,
             certificates: Arc::new(certs),
             provisions,
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         // The certifying QC carries a deliberately divergent timestamp (a
@@ -2007,7 +2054,8 @@ mod tests {
             transactions: Arc::new(txs),
             certificates,
             provisions,
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         // A deliberately divergent certifying timestamp, as in
@@ -2236,5 +2284,39 @@ mod tests {
         );
         // Back below the memo's coverage: full recompute, no leak of block 4.
         assert_eq!(at(3), BTreeSet::from([settled_tx(&w2), settled_tx(&w3)]));
+    }
+
+    /// The sweep walk merges a base index answering at what the store has
+    /// persisted with an overlay covering the blocks above it. A store
+    /// already ahead of the anchor has retired rows the base would still
+    /// report and the overlay does not carry, so the removal set comes
+    /// out wrong — refused here rather than computed into a state root
+    /// nobody else reaches.
+    #[test]
+    #[should_panic(expected = "a sweep walk anchored at")]
+    fn a_sweep_walk_refuses_an_index_ahead_of_its_anchor() {
+        let store = Arc::new(StubStore {
+            persisted: BlockHeight::new(9),
+            ..StubStore::default()
+        });
+        let view = SubstateView::base_only(store, BlockHeight::new(4));
+        let ceiling = SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(u64::MAX));
+        let _ = view.sweep_candidates(SweepFrontier::ZERO, ceiling.bucket(), 10);
+    }
+
+    /// A store behind the anchor is what the overlay is for, and the walk
+    /// runs.
+    #[test]
+    fn a_sweep_walk_runs_where_the_overlay_covers_the_gap() {
+        let store = Arc::new(StubStore {
+            persisted: BlockHeight::new(4),
+            ..StubStore::default()
+        });
+        let view = SubstateView::base_only(store, BlockHeight::new(9));
+        let ceiling = SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(u64::MAX));
+        assert!(
+            view.sweep_candidates(SweepFrontier::ZERO, ceiling.bucket(), 10)
+                .is_empty()
+        );
     }
 }

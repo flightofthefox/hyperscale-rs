@@ -282,13 +282,8 @@ where
                 // epoch's fetch and a later sync starts from current+1.
                 beacon::on_admitted(self, epoch);
             }
-            Action::TopologyChanged {
-                epoch,
-                topology_snapshot,
-                routing_committees,
-            } => {
-                self.process
-                    .apply_topology(epoch, &topology_snapshot, routing_committees);
+            Action::TopologyChanged { epoch, schedule } => {
+                self.process.apply_topology(epoch, schedule);
             }
             Action::ReconfigureParticipation(change) => {
                 self.pending_participation_changes.push(change);

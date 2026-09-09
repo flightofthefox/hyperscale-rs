@@ -22,24 +22,25 @@ use hyperscale_engine::{
 };
 use hyperscale_hbor::from_slice;
 use hyperscale_types::{
-    AccountSigner, Address, BlockHeight, Epoch, Hash, SWEEP_BUCKET_MS, SchemeId, SeedLookup,
-    ShardId, TransactionDecision, TransactionStatus, TxHash,
+    AccountSigner, Address, BlockHeight, Deadline, Epoch, Hash, SWEEP_BUCKET_MS, SchemeId,
+    SeedLookup, ShardId, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{InstanceMeta, nullifier_key, package_hash};
 use hyperscale_vm_fixtures::lottery;
-use hyperscale_vm_types::{NULLIFIER_GRACE_MS, SEAL_MATURITY_EPOCHS};
+use hyperscale_vm_types::{ARTIFACT_GRACE_MS, SEAL_MATURITY_EPOCHS};
 
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
+use crate::support::conservation::{Charges, World};
 use crate::support::faultable::FaultableCluster;
-use crate::support::query::beacon_epoch;
+use crate::support::query::{beacon_epoch, declared_price, vault_balance};
 use crate::support::tx::{
-    OVERDRAW_AMOUNT, build_close_tx, build_composed_tx, build_draw_tx,
-    build_instance_instantiate_tx, build_instantiate_tx, build_publish_tx, build_securify_tx,
-    build_transfer_paid_by, build_transfer_tx, build_unbound_payer_tx, cross_shard_cast,
-    cross_shard_keys, lottery_on, native_pq_cast, nullifier_race_cast, overdraw_cast,
-    payment_request, payment_request_for, recipient, securify_cast, sender, shared_recipient_cast,
-    storm_artifact, storm_publishers, unbound_payer_cast, unbound_remote_payer_cast,
-    validity_around,
+    GENESIS_POOL_ID, OVERDRAW_AMOUNT, account_shard, build_close_tx, build_composed_tx,
+    build_draw_tx, build_instance_instantiate_tx, build_instantiate_tx, build_publish_tx,
+    build_securify_tx, build_stake_tx, build_transfer_paid_by, build_transfer_tx,
+    build_unbound_payer_tx, cross_shard_cast, cross_shard_keys, lottery_on, native_pq_cast,
+    nullifier_race_cast, overdraw_cast, payment_request, payment_request_for, pool_at, recipient,
+    remote_delegator, securify_cast, sender, shared_recipient_cast, storm_artifact,
+    storm_publishers, unbound_payer_cast, unbound_remote_payer_cast, validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_height, await_tx_terminal};
 use crate::support::{Cluster, epochs};
@@ -78,16 +79,22 @@ pub fn nullifier_race_admits_exactly_one(c: &mut impl Cluster) {
         vault_balance(c, shard, second),
         vault_balance(c, shard, requester),
     ];
+    let world = World::open(
+        c,
+        *XRD,
+        [first.address(), second.address(), requester.address()],
+        [],
+    );
+    let mut charges = Charges::default();
 
     let request = payment_request(requester, REQUEST);
     let window = validity_around(c.now());
     let mut hashes = Vec::new();
-    let mut floors = Vec::new();
+    let mut prices = Vec::new();
     for (composer, from) in [(&first_key, first), (&second_key, second)] {
         let tx = build_composed_tx(composer, from, &requester_key, &request, REQUEST, window);
-        floors.push(tx.body().abort_floor());
-        hashes.push(tx.hash());
-        c.submit(Arc::new(tx));
+        prices.push(declared_price(c, &tx));
+        hashes.push(charges.submit(c, tx));
     }
 
     let verdicts: Vec<Option<TransactionStatus>> = hashes
@@ -116,8 +123,8 @@ pub fn nullifier_race_admits_exactly_one(c: &mut impl Cluster) {
         "the request must be filled exactly once"
     );
 
-    // The winner paid the payment and its fee; the loser paid the class
-    // floor and nothing more.
+    // The winner paid the payment and its fee; the loser paid the
+    // declared price and nothing more.
     let won = matches!(
         verdicts[0],
         Some(TransactionStatus::Completed(TransactionDecision::Accept))
@@ -138,9 +145,10 @@ pub fn nullifier_race_admits_exactly_one(c: &mut impl Cluster) {
         "the winner paid the request plus a fee; spent = {winner_spent}"
     );
     assert_eq!(
-        loser_spent, floors[0],
-        "a lost race settles the class floor, not the ceiling"
+        loser_spent, prices[0],
+        "a lost race settles the declared price, not the ceiling"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a nullifier race");
 }
 
 /// Submit one transfer between genesis-funded accounts and assert
@@ -158,9 +166,10 @@ pub fn single_transfer(c: &mut impl Cluster) {
     let (payer, from) = sender(0);
     let to = recipient(0);
     let before = c.committed_state_root(ShardId::ROOT);
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
     let transfer = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
-    let hash = transfer.hash();
-    c.submit(Arc::new(transfer));
+    let hash = charges.submit(c, transfer);
 
     let status = await_tx_terminal(c, hash, epochs(8));
     assert!(
@@ -170,6 +179,7 @@ pub fn single_transfer(c: &mut impl Cluster) {
         ),
         "VM transfer did not accept within budget; status = {status:?}"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a transfer");
     assert!(
         await_height(c, ShardId::ROOT, 1, epochs(2)),
         "root shard did not advance past genesis"
@@ -203,9 +213,10 @@ pub fn abort_converges(c: &mut impl Cluster) {
     let (payer, from) = sender(0);
     let to = recipient(0);
 
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
     let over = build_transfer_tx(&payer, from, to, 1_000_000, validity_around(c.now()));
-    let over_hash = over.hash();
-    c.submit(Arc::new(over));
+    let over_hash = charges.submit(c, over);
     let status = await_tx_terminal(c, over_hash, epochs(8));
     assert!(
         matches!(
@@ -216,8 +227,7 @@ pub fn abort_converges(c: &mut impl Cluster) {
     );
 
     let fine = build_transfer_tx(&payer, from, to, 50, validity_around(c.now()));
-    let fine_hash = fine.hash();
-    c.submit(Arc::new(fine));
+    let fine_hash = charges.submit(c, fine);
     let status = await_tx_terminal(c, fine_hash, epochs(8));
     assert!(
         matches!(
@@ -226,6 +236,7 @@ pub fn abort_converges(c: &mut impl Cluster) {
         ),
         "a covered VM transfer must accept after an abort; status = {status:?}"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "an abort and the transfer after it");
 }
 
 /// A dependent transfer reads its own block's attested baseline.
@@ -248,11 +259,18 @@ pub fn reads_the_committed_baseline(c: &mut impl Cluster) {
     let (bob_key, bob) = sender(1);
     let carol = recipient(0);
 
+    let world = World::open(
+        c,
+        *XRD,
+        [alice.address(), bob.address(), carol.address()],
+        [],
+    );
+    let mut charges = Charges::default();
+
     // Bob holds 10_000 at genesis; after Alice's 5_000 deposit he can
     // cover 12_000.
     let first = build_transfer_tx(&alice_key, alice, bob, 5_000, validity_around(c.now()));
-    let first_hash = first.hash();
-    c.submit(Arc::new(first));
+    let first_hash = charges.submit(c, first);
     let status = await_tx_terminal(c, first_hash, epochs(10));
     assert!(
         matches!(
@@ -263,8 +281,7 @@ pub fn reads_the_committed_baseline(c: &mut impl Cluster) {
     );
 
     let second = build_transfer_tx(&bob_key, bob, carol, 12_000, validity_around(c.now()));
-    let second_hash = second.hash();
-    c.submit(Arc::new(second));
+    let second_hash = charges.submit(c, second);
     let status = await_tx_terminal(c, second_hash, epochs(10));
     assert!(
         matches!(
@@ -285,6 +302,12 @@ pub fn reads_the_committed_baseline(c: &mut impl Cluster) {
         "the dependent transfer must commit after its funding \
          ({second_committed:?} vs {first_committed:?})"
     );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "a funded transfer and its dependent",
+    );
 }
 
 /// Zipf-skewed VM payments: `senders` transfers into `recipients` payees
@@ -302,6 +325,15 @@ pub fn zipf_payments(
 ) -> ContentionReport {
     let cdf = zipf_cdf(recipients as usize, skew);
     let mut rng = Lcg(0x5eed_c0de ^ u64::from(senders) << 8 ^ u64::from(recipients));
+    let world = World::open(
+        c,
+        *XRD,
+        (0..senders)
+            .map(|index| sender(index).1.address())
+            .chain((0..recipients).map(|rank| recipient(rank).address())),
+        [],
+    );
+    let mut charges = Charges::default();
     let mut submissions = Vec::with_capacity(senders as usize);
     for index in 0..senders {
         let (payer, from) = sender(index);
@@ -310,9 +342,11 @@ pub fn zipf_payments(
         let to = recipient(u8::try_from(rank).expect("recipient rank fits"));
         let tx = build_transfer_tx(&payer, from, to, PAYMENT, validity_around(c.now()));
         submissions.push((tx.hash(), c.now()));
-        c.submit(Arc::new(tx));
+        charges.submit(c, tx);
     }
-    settle_and_report(c, &submissions, epochs(10))
+    let report = settle_and_report(c, &submissions, epochs(10));
+    world.assert_settles_within(c, &charges, epochs(4), "Zipf-skewed payments");
+    report
 }
 
 /// One hot VM recipient, composed rather than serialized.
@@ -334,12 +368,21 @@ pub fn zipf_payments(
 pub fn hot_recipient(c: &mut impl Cluster, senders: u8) -> (ContentionReport, u64) {
     let hot = recipient(0);
     let before = vault_balance(c, ShardId::ROOT, hot);
+    let world = World::open(
+        c,
+        *XRD,
+        (0..senders)
+            .map(|index| sender(index).1.address())
+            .chain([hot.address()]),
+        [],
+    );
+    let mut charges = Charges::default();
     let mut submissions = Vec::with_capacity(senders as usize);
     for index in 0..senders {
         let (payer, from) = sender(index);
         let tx = build_transfer_tx(&payer, from, hot, PAYMENT, validity_around(c.now()));
         submissions.push((tx.hash(), c.now()));
-        c.submit(Arc::new(tx));
+        charges.submit(c, tx);
     }
     let report = settle_and_report(c, &submissions, epochs(16));
 
@@ -363,6 +406,7 @@ pub fn hot_recipient(c: &mut impl Cluster, senders: u8) -> (ContentionReport, u6
         settled * PAYMENT,
         "the hot vault must hold every accepted payment: {settled} settled",
     );
+    world.assert_settles_within(c, &charges, epochs(4), "payments into one hot vault");
     (report, span)
 }
 
@@ -384,9 +428,10 @@ pub fn hot_recipient(c: &mut impl Cluster, senders: u8) -> (ContentionReport, u6
 /// shard's chain never commits it.
 pub fn cross_shard_transfer(c: &mut impl Cluster) {
     let (payer, from, to) = cross_shard_cast();
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
 
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
@@ -396,14 +441,25 @@ pub fn cross_shard_transfer(c: &mut impl Cluster) {
         ),
         "cross-shard VM transfer did not accept; status = {status:?}"
     );
-    // Atomic settlement: both legs' chains carry the transaction.
-    let (left, _) = c.chain_fate(ShardId::leaf(1, 0), hash);
-    let (right, _) = c.chain_fate(ShardId::leaf(1, 1), hash);
-    assert!(left.is_some(), "payer shard never committed the transfer");
+    // The payer's chain settled it alone; the recipient's chain commits
+    // the delivery a hop behind and credits the vault when it does.
+    let payer_shard = ShardId::leaf(1, 0);
+    let recipient_shard = ShardId::leaf(1, 1);
     assert!(
-        right.is_some(),
-        "recipient shard never committed the transfer"
+        c.chain_fate(payer_shard, hash).0.is_some(),
+        "payer shard never committed the transfer"
     );
+    assert!(
+        c.run_until(epochs(6), |c| c
+            .chain_fate(recipient_shard, hash)
+            .0
+            .is_some()
+            && vault_balance(c, recipient_shard, to) == 10 + 100),
+        "recipient shard never committed and credited the delivery; committed = {:?}, holds {}",
+        c.chain_fate(recipient_shard, hash).0,
+        vault_balance(c, recipient_shard, to),
+    );
+    world.assert_settles_within(c, &charges, epochs(4), "a cross-shard transfer");
 }
 
 /// A payer cannot spend one balance twice across two ticks.
@@ -442,6 +498,13 @@ pub fn a_payer_cannot_spend_one_balance_twice(c: &mut impl Cluster) {
         "the pair has to be jointly uncoverable to measure anything: \
          holding {payer_before}",
     );
+    let world = World::open(
+        c,
+        *XRD,
+        [from.address(), first_to.address(), second_to.address()],
+        [],
+    );
+    let mut charges = Charges::default();
 
     let first = build_transfer_tx(
         &payer,
@@ -450,8 +513,7 @@ pub fn a_payer_cannot_spend_one_balance_twice(c: &mut impl Cluster) {
         OVERDRAW_AMOUNT,
         validity_around(c.now()),
     );
-    let first_hash = first.hash();
-    c.submit(Arc::new(first));
+    let first_hash = charges.submit(c, first);
     assert!(
         c.run_until(epochs(16), |c| c
             .chain_fate(payer_shard, first_hash)
@@ -467,8 +529,7 @@ pub fn a_payer_cannot_spend_one_balance_twice(c: &mut impl Cluster) {
         OVERDRAW_AMOUNT,
         validity_around(c.now()),
     );
-    let second_hash = second.hash();
-    c.submit(Arc::new(second));
+    let second_hash = charges.submit(c, second);
 
     let verdicts: Vec<Option<TransactionStatus>> = [first_hash, second_hash]
         .iter()
@@ -488,16 +549,18 @@ pub fn a_payer_cannot_spend_one_balance_twice(c: &mut impl Cluster) {
         "only one withdrawal is covered, so only one may pass; verdicts = {verdicts:?}"
     );
 
-    // Both settlements have to persist before either vault is read.
-    c.run_until(epochs(4), |_| false);
+    // Both settlements have to persist before either vault is read: the
+    // payer gave up one payment and two prices, and the recipients banked
+    // one payment between them — a refused withdrawal credited nobody.
+    world.assert_settles_within(c, &charges, epochs(8), "two withdrawals over one balance");
     let paid = payer_before.saturating_sub(vault_balance(c, payer_shard, from));
     let banked = (vault_balance(c, recipient_shard, first_to)
         + vault_balance(c, recipient_shard, second_to))
     .saturating_sub(banked_before);
-    assert!(
-        paid >= banked,
+    assert_eq!(
+        banked, OVERDRAW_AMOUNT,
         "the payer gave up {paid} out of {payer_before} and the recipients \
-         banked {banked}: a refused withdrawal still credited its recipient"
+         banked {banked}: exactly one withdrawal was covered"
     );
 }
 
@@ -529,6 +592,13 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
     let recipient_shard = ShardId::leaf(1, 1);
     let (remote_payer, remote_from, local_payer, local_from, to) = shared_recipient_cast();
     let before = vault_balance(c, recipient_shard, to);
+    let world = World::open(
+        c,
+        *XRD,
+        [remote_from.address(), local_from.address(), to.address()],
+        [],
+    );
+    let mut charges = Charges::default();
 
     let crossing = build_transfer_tx(
         &remote_payer,
@@ -537,8 +607,7 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
         CROSSING,
         validity_around(c.now()),
     );
-    let crossing_hash = crossing.hash();
-    c.submit(Arc::new(crossing));
+    let crossing_hash = charges.submit(c, crossing);
 
     // The recipient's shard has the leg in a tick from the moment it
     // commits it; the tick cannot settle for several blocks yet, so the
@@ -559,8 +628,7 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
         LOCAL,
         validity_around(c.now()),
     );
-    let local_hash = local.hash();
-    c.submit(Arc::new(local));
+    let local_hash = charges.submit(c, local);
 
     for (hash, label) in [(crossing_hash, "crossing"), (local_hash, "local payment")] {
         let status = await_tx_terminal(c, hash, epochs(16));
@@ -585,6 +653,12 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
         "the shared vault must hold both credits: expected {expected}, holding {}",
         vault_balance(c, recipient_shard, to)
     );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "a crossing and a later local credit",
+    );
 }
 
 /// A multi-shard transaction's events land only on their emitters' home
@@ -603,9 +677,10 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
 /// on the other.
 pub fn events_land_on_their_emitters_home_shard(c: &mut impl Cluster) {
     let (payer, from, to) = cross_shard_cast();
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
 
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
@@ -641,6 +716,7 @@ pub fn events_land_on_their_emitters_home_shard(c: &mut impl Cluster) {
         vec![to],
         "the recipient shard stores its own emission and nothing else"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a transfer whose events split");
 }
 
 /// Both shards' attested load reaches the beacon, including the
@@ -671,9 +747,10 @@ pub fn attested_load_reaches_the_beacon(c: &mut impl Cluster) {
     let right = ShardId::leaf(1, 1);
 
     let (payer, from, to) = cross_shard_cast();
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
         matches!(
@@ -682,6 +759,7 @@ pub fn attested_load_reaches_the_beacon(c: &mut impl Cluster) {
         ),
         "cross-shard VM transfer did not accept; status = {status:?}"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a transfer whose load is attested");
 
     // Wait for both shards to fold a crossing carrying a non-zero mark.
     let both_attested = |c: &_| {
@@ -748,10 +826,11 @@ pub fn a_failed_attempt_still_attests_work(c: &mut impl Cluster) {
         "the beacon never folded a crossing for the shard"
     );
     let before = recorded_gas(c, shard).expect("a folded crossing");
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
 
     let over = build_transfer_tx(&payer, from, to, 1_000_000, validity_around(c.now()));
-    let over_hash = over.hash();
-    c.submit(Arc::new(over));
+    let over_hash = charges.submit(c, over);
     let status = await_tx_terminal(c, over_hash, epochs(8));
     assert!(
         matches!(
@@ -760,6 +839,7 @@ pub fn a_failed_attempt_still_attests_work(c: &mut impl Cluster) {
         ),
         "an uncovered VM withdrawal must reject deterministically; status = {status:?}"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a failed attempt");
 
     // The attempt applied nothing and still attests work: a failed
     // verdict produces no receipt, so the attestation must ride the
@@ -1010,9 +1090,10 @@ pub fn sealed_rounds_settle_on_the_seed_they_committed_to<C: Cluster>(c: &mut C)
 /// shard's chain ever includes it.
 pub fn insolvent_payer_engages_nothing(c: &mut impl Cluster) {
     let (payer, from, to) = cross_shard_cast();
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer, from, to, 5, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
 
     // Both chains keep advancing while the transaction goes nowhere.
     assert!(
@@ -1038,6 +1119,7 @@ pub fn insolvent_payer_engages_nothing(c: &mut impl Cluster) {
         counterpart_inclusion.is_none(),
         "the counterpart must not engage an insolvent payer's transaction"
     );
+    world.assert_settled(c, charges.burned(c), "an insolvent payer's transaction");
 }
 
 /// A payer whose rule does not admit the signer engages nothing
@@ -1059,9 +1141,15 @@ pub fn insolvent_payer_engages_nothing(c: &mut impl Cluster) {
 /// shard's chain ever includes it.
 pub fn unbound_payer_engages_nothing(c: &mut impl Cluster) {
     let (signer, from, to, victim) = unbound_payer_cast();
+    let world = World::open(
+        c,
+        *XRD,
+        [from.address(), to.address(), victim.address()],
+        [],
+    );
+    let mut charges = Charges::default();
     let tx = build_unbound_payer_tx(&signer, from, to, victim, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
 
     // Both chains keep advancing while the transaction goes nowhere.
     assert!(
@@ -1087,6 +1175,8 @@ pub fn unbound_payer_engages_nothing(c: &mut impl Cluster) {
         counterpart_inclusion.is_none(),
         "the counterpart must not engage an unbound payer's transaction"
     );
+    // Nothing moved, the named account's vault included.
+    world.assert_settled(c, charges.burned(c), "an unbound payer's transaction");
 }
 
 /// The same refusal when the payer's shard holds nothing else of the
@@ -1106,9 +1196,15 @@ pub fn unbound_payer_engages_nothing(c: &mut impl Cluster) {
 /// shard's chain ever includes it.
 pub fn unbound_remote_payer_engages_nothing(c: &mut impl Cluster) {
     let (signer, from, to, victim) = unbound_remote_payer_cast();
+    let world = World::open(
+        c,
+        *XRD,
+        [from.address(), to.address(), victim.address()],
+        [],
+    );
+    let mut charges = Charges::default();
     let tx = build_unbound_payer_tx(&signer, from, to, victim, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
 
     // Both chains keep advancing while the transaction goes nowhere.
     assert!(
@@ -1133,6 +1229,12 @@ pub fn unbound_remote_payer_engages_nothing(c: &mut impl Cluster) {
     assert!(
         manifest_inclusion.is_none(),
         "the manifest shard must not engage without the payer's reservation"
+    );
+    // Nothing moved, the remote victim's vault included.
+    world.assert_settled(
+        c,
+        charges.burned(c),
+        "an unbound remote payer's transaction",
     );
 }
 
@@ -1173,11 +1275,13 @@ pub fn securify_retires_the_key_at_the_payer_shard(c: &mut impl Cluster) {
         "the identity this account migrates to must be post-quantum"
     );
 
+    let world = World::open(c, *XRD, [owner.address(), to.address()], []);
+    let mut charges = Charges::default();
+
     // Baseline: the founding key pays for its own account and settles
     // cross-shard.
     let tx = build_transfer_tx(&owner_key, owner, to, 100, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
         matches!(
@@ -1190,8 +1294,7 @@ pub fn securify_retires_the_key_at_the_payer_shard(c: &mut impl Cluster) {
     // The one-way transition: the account's stored rule becomes the
     // holder's identity.
     let tx = build_securify_tx(&owner_key, owner, holder, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
         matches!(
@@ -1205,8 +1308,7 @@ pub fn securify_retires_the_key_at_the_payer_shard(c: &mut impl Cluster) {
     // identity is exactly what the stored rule no longer admits: no
     // proposer selects its transfer, and it never commits anywhere.
     let tx = build_transfer_tx(&owner_key, owner, to, 7, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
     let payer_height = c
         .committed_height(payer_shard)
         .map_or(0, BlockHeight::inner);
@@ -1233,8 +1335,7 @@ pub fn securify_retires_the_key_at_the_payer_shard(c: &mut impl Cluster) {
     // The installed rule's key signs in as the account it governs and
     // pays from it, from another shard's identity entirely.
     let tx = build_transfer_paid_by(&holder_key, owner, to, 9, owner, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
         matches!(
@@ -1253,6 +1354,12 @@ pub fn securify_retires_the_key_at_the_payer_shard(c: &mut impl Cluster) {
             == 10 + 100 + 9),
         "the recipient's balance must carry the settled transfers alone; balance = {}",
         vault_balance(c, counterpart, to)
+    );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "a securify and the transfers around it",
     );
 }
 
@@ -1291,9 +1398,10 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
         "genesis must seed a post-quantum address like any other"
     );
 
+    let world = World::open(c, *XRD, [payer.address(), to.address()], []);
+    let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer_key, payer, to, 100, validity_around(c.now()));
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
         matches!(
@@ -1320,33 +1428,48 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
         remaining < 10_000 - 100,
         "the payer must have settled a fee beyond the transfer; balance = {remaining}"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a post-quantum account's transfer");
 }
 
-/// A payer whose counterpart never engages settles the abort floor and
-/// nothing else.
+/// A leg whose core never engages refuses at the deadline.
 ///
-/// Cutting both channels the payer's bundle travels — the gossip
-/// broadcast and the fetch that backs it up — makes the counterpart's
-/// absence structural: engagement demands that evidence, so the
-/// transaction can never enter a block there. The payer's own leg is
-/// dependency-free, so it commits, reserves, and executes at once, then
-/// waits. It speaks once: with no engagement echo and the window closed,
-/// its single statement is the abort. The transaction's effects are
-/// discarded, so the recipient is never credited and the transferred
-/// amount never leaves; what leaves is the class floor, settled through
-/// the fee receipt the abort names.
+/// The payer has to sit on a leg with its core elsewhere. A transfer's
+/// payer is its own core and answers alone, so cutting its bundle away
+/// from the recipient costs it nothing; a stake into a pool on another
+/// shard is the shape that waits. The delegator's shard runs the inbound
+/// leg — the withdrawal, issued as a crossing — and the pool's shard is
+/// the core that takes the funds and hands back units, whose verdict the
+/// leg waits on.
+///
+/// Cutting both channels the leg's bundle travels — the broadcast and the
+/// fetch that backs it up — makes the core's absence structural:
+/// engagement demands that evidence, so the transaction can never enter a
+/// block there. The leg itself is dependency-free, so it commits, reserves
+/// and runs at once, then waits, its writes held apart from the vault.
+/// With no verdict back and the window closed, its single statement is a
+/// refusal, and the vault reads as if the stake had never been asked for.
 ///
 /// # Panics
 ///
-/// Panics if the harness cannot read the payer's vault, the payer never
-/// commits, the bundle is never suppressed, the transaction fails to
-/// reach a terminal abort, the counterpart engages, or the payer's
-/// balance moves by anything other than the floor.
-pub fn abort_floor_settles_on_deadline(c: &mut impl FaultableCluster) {
-    let payer_shard = ShardId::leaf(1, 0);
-    let counterpart = ShardId::leaf(1, 1);
-    let (payer, from, to) = cross_shard_cast();
-    let before = vault_balance(c, payer_shard, from);
+/// Panics if the harness cannot read the delegator's vault, the
+/// delegator's shard never commits the stake, the leg decides without
+/// waiting, the bundle is never suppressed, the stake fails to reach a
+/// terminal refusal, the core engages, or the vault ends anywhere but
+/// within the declared price of where it started.
+pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl FaultableCluster) {
+    let (payer_key, payer) = remote_delegator();
+    let pool = pool_at(GENESIS_POOL_ID);
+    let payer_shard = account_shard(payer, 2);
+    let core = account_shard(pool, 2);
+    assert_ne!(
+        payer_shard, core,
+        "the delegator has to sit off the pool's shard for its stake to be a leg",
+    );
+    let before = vault_balance(c, payer_shard, payer);
+    // The delegator and the pool: the stake never leaves the one, and
+    // the other never sees it.
+    let world = World::open(c, *XRD, [payer.address(), pool.address()], []);
+    let mut charges = Charges::default();
 
     // Both channels the bundle travels. The fetch rule names the
     // *request* type: the fault engine tags a request and its response
@@ -1354,79 +1477,320 @@ pub fn abort_floor_settles_on_deadline(c: &mut impl FaultableCluster) {
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let fetch_dropped = c.drop_type("provision.request");
 
-    let tx = build_transfer_tx(&payer, from, to, 100, validity_around(c.now()));
-    let hash = tx.hash();
-    let floor = tx.body().abort_floor();
-    c.submit(Arc::new(tx));
+    let tx = build_stake_tx(&payer_key, payer, pool, STAKE, validity_around(c.now()));
+    let price = declared_price(c, &tx);
+    let hash = charges.submit(c, tx);
 
     assert!(
         c.run_until(epochs(8), |c| c.chain_fate(payer_shard, hash).0.is_some()),
-        "the payer shard must commit and reserve for the transaction"
+        "the delegator's shard must commit and reserve for the stake"
+    );
+    // The leg waits on its core rather than deciding on its own: a
+    // verdict within a few blocks of its commit would be the leg refusing
+    // the stake itself, which is a different scenario from a core that
+    // never answers. Measured in blocks, since a deadline is a span of
+    // weighted time and an epoch is whatever the harness makes it.
+    let committed_at = c
+        .chain_fate(payer_shard, hash)
+        .0
+        .expect("the stake's commit height was just observed");
+    assert!(
+        await_height(
+            c,
+            payer_shard,
+            committed_at.inner() + WAITING_BLOCKS,
+            epochs(4)
+        ),
+        "the delegator's shard must keep committing past the stake",
+    );
+    assert!(
+        !c.tx_status(hash).is_some_and(|s| s.is_final()),
+        "the leg must wait on its core; status = {:?}",
+        c.tx_status(hash),
     );
 
     let verdict = await_tx_terminal(c, hash, epochs(90));
     assert!(
         matches!(
             verdict,
-            Some(TransactionStatus::Completed(TransactionDecision::Aborted))
+            Some(TransactionStatus::Completed(TransactionDecision::Reject))
         ),
-        "an unechoed cross-shard VM transaction must abort at the deadline; \
+        "a leg whose core never answers must refuse at the deadline; \
          verdict = {verdict:?}",
     );
     assert!(
         broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
         "both bundle channels must actually have been exercised and cut"
     );
-    let (counterpart_inclusion, _) = c.chain_fate(counterpart, hash);
+    let (core_inclusion, _) = c.chain_fate(core, hash);
     assert!(
-        counterpart_inclusion.is_none(),
-        "the counterpart must never have engaged the transaction",
+        core_inclusion.is_none(),
+        "the core must never have engaged the stake",
     );
 
-    // The floor left the payer's vault; the transfer did not.
-    //
-    // A terminal status is reported the moment this shard decides the
-    // abort, which is a block or more before the finalization carrying its
-    // fee receipt commits — so the charge has to be waited for rather than
-    // read at the instant the status flips. Waiting on the balance moving
-    // at all keeps the amount itself unasserted until below.
-    assert!(
-        c.run_until(epochs(8), |c| vault_balance(c, payer_shard, from) != before),
-        "the abort's charge must reach committed state"
-    );
-    let after = vault_balance(c, payer_shard, from);
+    // The stake never left, and the price did: the leg never ran, so the
+    // reclaim that refuses it at the deadline is the receipt that carries
+    // the charge. A terminal status is reported the moment this shard
+    // decides, a block or more before that receipt commits, so the vault
+    // is given that long to settle.
+    c.run_until(epochs(4), |_| false);
+    let after = vault_balance(c, payer_shard, payer);
     assert_eq!(
-        before.saturating_sub(after),
-        floor,
-        "the abort must burn exactly the class floor: before = {before}, after = {after}",
+        after,
+        before - price,
+        "the refusal must charge exactly the declared price: \
+         before = {before}, after = {after}, price = {price}",
+    );
+    world.assert_settled(c, charges.burned(c), "a leg refused at its deadline");
+}
+
+/// A delivery cut off past its window is reclaimed by its payer.
+///
+/// A transfer's payer settles alone: its leg pays, issues the crossing
+/// and accepts, and the recipient's shard delivers a hop behind by
+/// claiming the crossing off the bundle the payer's shard provisions.
+/// Cutting both channels that bundle travels leaves the recipient with
+/// nothing to claim from, and once the delivery window closes nothing
+/// can admit the delivery at all — the payer is debited and the crossing
+/// sits issued with no claimant. What licenses the payer to take it back
+/// is a proof, never the clock: absence of the recipient's claim cell
+/// from its committed state at a block past the lapse, the window's
+/// close plus the finalization delay. The recipient's chain keeps
+/// committing and its headers keep flowing, since only provisions are
+/// cut, so the proof is reachable while the crossing still stands.
+///
+/// # Panics
+///
+/// Panics if the payer's leg does not accept, if the bundle channels
+/// are never exercised, if the delivery lands despite the cut, if the
+/// payment is not back in the payer's vault within the reclaim's room,
+/// or if the world does not conserve.
+pub fn a_delivery_cut_off_past_its_window_is_reclaimed<C: FaultableCluster>(c: &mut C) {
+    let (payer_key, from, to) = cross_shard_cast();
+    let payer_shard = ShardId::leaf(1, 0);
+    let recipient_shard = ShardId::leaf(1, 1);
+    let before = vault_balance(c, payer_shard, from);
+    let recipient_before = vault_balance(c, recipient_shard, to);
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
+
+    let broadcast_dropped = c.drop_type("provisions.broadcast");
+    let fetch_dropped = c.drop_type("provision.request");
+
+    let validity = validity_around(c.now());
+    let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
+    let price = declared_price(c, &tx);
+    let hash = charges.submit(c, tx);
+
+    let verdict = await_tx_terminal(c, hash, epochs(8));
+    assert!(
+        matches!(
+            verdict,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the payer's leg settles alone and accepts; verdict = {verdict:?}",
+    );
+    assert!(
+        c.run_until(epochs(4), |c| vault_balance(c, payer_shard, from)
+            == before - 100 - price),
+        "the leg pays the payment and the price",
+    );
+
+    // Past the lapse, with the cut standing the whole way: the window
+    // closed on a delivery that never had a bundle to claim from.
+    let lapse = Window::Lapse
+        .of(Deadline::of(validity.end_timestamp_exclusive))
+        .start;
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    assert!(
+        c.run_until(epochs(12), |c| clock(c) >= lapse),
+        "the cut must stand past the lapse",
+    );
+    assert!(
+        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
+        "both bundle channels must actually have been exercised and cut"
+    );
+    assert!(
+        c.chain_fate(recipient_shard, hash).0.is_none(),
+        "the delivery must never have landed while its bundle was cut off",
+    );
+
+    // The reclaim: the recipient's chain passes the lapse, the payer's
+    // shard proves the claim cell absent there, and the payment comes
+    // back. The price stays paid — the leg ran and burned it.
+    assert!(
+        c.run_until(epochs(10), |c| vault_balance(c, payer_shard, from)
+            == before - price),
+        "the payer must get its payment back once the lapse is proved; holds {}",
+        vault_balance(c, payer_shard, from),
+    );
+    assert!(
+        c.chain_fate(recipient_shard, hash).0.is_none(),
+        "the reclaim must not be answered by a late delivery",
+    );
+    assert_eq!(
+        vault_balance(c, recipient_shard, to),
+        recipient_before,
+        "the recipient was never credited",
+    );
+    c.clear_drops();
+    world.assert_settles_within(c, &charges, epochs(4), "a delivery cut off past its window");
+}
+
+/// A recipient whose network heals after the delivery window closed
+/// stops chasing the bundle, and the crossing is reclaimed instead.
+///
+/// The sibling of [`a_delivery_cut_off_past_its_window_is_reclaimed`],
+/// and the case that separates the window from the cut. There the cut
+/// stands the whole way, so a delivery that never landed might have been
+/// waiting on a channel rather than on a rule. Here the network is whole
+/// again between the window's close and the lapse — nothing is
+/// suppressed, every host can reach every other — and the delivery still
+/// never lands, because the close took it out of the candidate set: it
+/// is abandoned out of any tick holding it and composition refuses it
+/// past the close, so the shard neither admits it nor goes on asking for
+/// what it would need. That is what makes the issuer's reclaim safe;
+/// both dispositions of one crossing is the conservation break the
+/// window exists to prevent.
+///
+/// # Panics
+///
+/// Panics if the payer's leg does not accept, if the bundle channels are
+/// never exercised, if the cut cannot be lifted inside the window
+/// between the close and the lapse, if the delivery lands on the healed
+/// network, if the recipient goes on fetching for it, if the payment
+/// does not come back, or if the world does not conserve.
+pub fn a_healed_network_does_not_revive_a_closed_delivery<C: FaultableCluster>(c: &mut C) {
+    let (payer_key, from, to) = cross_shard_cast();
+    let payer_shard = ShardId::leaf(1, 0);
+    let recipient_shard = ShardId::leaf(1, 1);
+    let before = vault_balance(c, payer_shard, from);
+    let recipient_before = vault_balance(c, recipient_shard, to);
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
+
+    let broadcast_dropped = c.drop_type("provisions.broadcast");
+    let fetch_dropped = c.drop_type("provision.request");
+
+    let validity = validity_around(c.now());
+    let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
+    let price = declared_price(c, &tx);
+    let hash = charges.submit(c, tx);
+
+    let verdict = await_tx_terminal(c, hash, epochs(8));
+    assert!(
+        matches!(
+            verdict,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the payer's leg settles alone and accepts; verdict = {verdict:?}",
+    );
+    assert!(
+        c.run_until(epochs(4), |c| vault_balance(c, payer_shard, from)
+            == before - 100 - price),
+        "the leg pays the payment and the price",
+    );
+
+    // Past the close, with the cut standing the whole way: the window
+    // shuts on a delivery whose bundle never reached it.
+    let deadline = Deadline::of(validity.end_timestamp_exclusive);
+    let close = Window::Delivery.of(deadline).end;
+    let lapse = Window::Lapse.of(deadline).start;
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    assert!(
+        c.run_until(epochs(12), |c| clock(c) >= close),
+        "the cut must stand past the delivery window's close",
+    );
+    assert!(
+        broadcast_dropped.fired() > 0 && fetch_dropped.fired() > 0,
+        "both bundle channels must actually have been exercised and cut"
+    );
+    assert!(
+        c.chain_fate(recipient_shard, hash).0.is_none(),
+        "the delivery must never have landed while its bundle was cut off",
+    );
+
+    // The bundle flows again, inside the window between the close and
+    // the lapse: the recipient can now read the crossing's record and
+    // still must not claim it.
+    // The network is whole again, inside the window between the close
+    // and the lapse.
+    let carried = c.metric("fetch_items_received", Some("provision"));
+    c.clear_drops();
+    assert!(
+        clock(c) < lapse,
+        "the cut has to lift short of the lapse, or the reclaim is what \
+         kept the delivery out rather than the window",
+    );
+    assert!(
+        c.run_until(epochs(12), |c| clock(c) >= lapse),
+        "the run must reach the lapse the issuer proves against",
+    );
+    assert!(
+        c.chain_fate(recipient_shard, hash).0.is_none(),
+        "a delivery past its window is inadmissible on a whole network",
+    );
+    assert_eq!(
+        c.metric("fetch_items_received", Some("provision")),
+        carried,
+        "a shard that abandoned the delivery at the close stops asking for \
+         the bundle it would have claimed from",
+    );
+
+    // And the crossing comes back to its payer, once and to it alone.
+    assert!(
+        c.run_until(epochs(10), |c| vault_balance(c, payer_shard, from)
+            == before - price),
+        "the payer must get its payment back on the lapse; holds {}",
+        vault_balance(c, payer_shard, from),
+    );
+    assert_eq!(
+        vault_balance(c, recipient_shard, to),
+        recipient_before,
+        "the recipient was never credited",
+    );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "a delivery whose bundle arrived past its window",
     );
 }
 
-/// A transaction that fails still pays, and what it pays depends on whose
-/// fault the failure was.
+/// What the deadline scenario stakes: well under its funding, so the
+/// vault's reading is legible against the price.
+const STAKE: u128 = 1_000;
+
+/// Blocks a waiting leg is watched for past its commit before the
+/// deadline is awaited: enough that a leg refusing on its own would
+/// have spoken.
+const WAITING_BLOCKS: u64 = 8;
+
+/// A transaction that fails still pays, and what it pays is the one
+/// declared price.
 ///
 /// Failing must never be the cheaper way to buy execution. An uncovered
 /// withdrawal loses a deterministic race it could not have foreseen — the
-/// sender declared honestly and another transaction got there first — so
-/// it settles the class floor, not the ceiling. What matters is that it
-/// settles something: an attempt that cost nothing would make trapping
-/// strictly cheaper than succeeding for identical work.
+/// sender declared honestly and another transaction got there first — and
+/// it settles the price like every other attempt: the network routed,
+/// provisioned and ran a batch for it either way.
 ///
 /// # Panics
 ///
 /// Panics if the uncovered withdrawal does not reject, if the covered
 /// transfer that follows does not accept, or if the rejected attempt
-/// moves the payer's vault by anything other than the floor.
+/// moves the payer's vault by anything other than the price.
 pub fn failure_charges_its_payer(c: &mut impl Cluster) {
     let shard = ShardId::ROOT;
     let (payer, from) = sender(0);
     let to = recipient(0);
 
     let before = vault_balance(c, shard, from);
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
     let over = build_transfer_tx(&payer, from, to, 1_000_000, validity_around(c.now()));
-    let floor = over.body().abort_floor();
-    let over_hash = over.hash();
-    c.submit(Arc::new(over));
+    let price = declared_price(c, &over);
+    let over_hash = charges.submit(c, over);
     let status = await_tx_terminal(c, over_hash, epochs(8));
     assert!(
         matches!(
@@ -1439,15 +1803,14 @@ pub fn failure_charges_its_payer(c: &mut impl Cluster) {
     let after = vault_balance(c, shard, from);
     assert_eq!(
         before.saturating_sub(after),
-        floor,
-        "a rejected attempt must settle exactly the class floor: \
-         before = {before}, after = {after}, floor = {floor}"
+        price,
+        "a rejected attempt must settle exactly the declared price: \
+         before = {before}, after = {after}, price = {price}"
     );
 
     // The charge is the only thing that moved: the payer can still spend.
     let fine = build_transfer_tx(&payer, from, to, 50, validity_around(c.now()));
-    let fine_hash = fine.hash();
-    c.submit(Arc::new(fine));
+    let fine_hash = charges.submit(c, fine);
     let status = await_tx_terminal(c, fine_hash, epochs(8));
     assert!(
         matches!(
@@ -1456,6 +1819,7 @@ pub fn failure_charges_its_payer(c: &mut impl Cluster) {
         ),
         "a covered VM transfer must accept after a charged failure; status = {status:?}"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a charged failure and a transfer");
 }
 
 /// Many withdrawals in one validity window, all drawing on one vault.
@@ -1483,8 +1847,9 @@ pub fn withdrawals_compose_over_one_vault(c: &mut impl Cluster, count: u8) -> u6
     let shard = ShardId::ROOT;
     let (payer, from) = sender(0);
     let to = recipient(0);
-    let payer_before = vault_balance(c, shard, from);
     let recipient_before = vault_balance(c, shard, to);
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
 
     let amount_for = |index: u8| -> u128 { 1 + u128::from(index) };
     let mut submissions = Vec::with_capacity(count as usize);
@@ -1497,7 +1862,7 @@ pub fn withdrawals_compose_over_one_vault(c: &mut impl Cluster, count: u8) -> u6
             validity_around(c.now()),
         );
         submissions.push((tx.hash(), c.now()));
-        c.submit(Arc::new(tx));
+        charges.submit(c, tx);
     }
     settle_and_report(c, &submissions, epochs(16));
 
@@ -1508,10 +1873,12 @@ pub fn withdrawals_compose_over_one_vault(c: &mut impl Cluster, count: u8) -> u6
         "the recipient must hold every withdrawal — a shared baseline would \
          leave only the last one",
     );
-    let spent = payer_before - vault_balance(c, shard, from);
-    assert!(
-        spent >= moved,
-        "the payer settled every withdrawal it moved: spent = {spent}, moved = {moved}",
+    // The payer settled every withdrawal it moved, and one price each.
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "withdrawals composed over one vault",
     );
 
     // How tightly the set packed. One block per withdrawal is the
@@ -1533,17 +1900,6 @@ pub fn withdrawals_compose_over_one_vault(c: &mut impl Cluster, count: u8) -> u6
         heights.len(),
     );
     heights.len() as u64
-}
-
-/// The committed balance of a account's native vault, read through the
-/// harness's client-proven snapshot seam.
-fn vault_balance(c: &impl Cluster, shard: ShardId, owner: impl Into<Address>) -> u128 {
-    let vault = vault_key(owner, *XRD);
-    c.substate(shard, vault.owner, vault.local.0)
-        .map_or(0, |bytes| {
-            let cell: [u8; 16] = bytes.as_slice().try_into().expect("an amount cell");
-            u128::from_le_bytes(cell)
-        })
 }
 
 /// A spent nullifier outlives every chain that could read it, and no
@@ -1574,13 +1930,13 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
 
     // One window for both: the offer stands exactly as long as the
     // transaction binding it, so the nullifier's life is that window
-    // plus the grace every transaction-derived artifact gets.
+    // plus the grace every transaction-derived artifact takes.
     let window = validity_around(c.now());
     let request = payment_request_for(requester, REQUEST, window);
     let expiry_ms = window
         .end_timestamp_exclusive
         .as_millis()
-        .saturating_add(NULLIFIER_GRACE_MS);
+        .saturating_add(ARTIFACT_GRACE_MS);
     let nullifier = nullifier_key(
         &ProtocolHasher,
         requester,
@@ -1588,6 +1944,8 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
         expiry_ms,
     );
 
+    let world = World::open(c, *XRD, [composer.address(), requester.address()], []);
+    let mut charges = Charges::default();
     let tx = build_composed_tx(
         &composer_key,
         composer,
@@ -1596,8 +1954,7 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
         REQUEST,
         window,
     );
-    let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    let hash = charges.submit(c, tx);
     assert!(
         matches!(
             await_tx_terminal(c, hash, epochs(4)),
@@ -1605,6 +1962,7 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
         ),
         "the composition fills the request"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a filled request");
     assert!(
         c.substate(shard, nullifier.owner, nullifier.local.0)
             .is_some(),
@@ -1750,7 +2108,9 @@ pub fn preview_reports_resource_changes(c: &mut impl Cluster) {
     );
 
     // The same envelope for real: the report was the truth about it.
-    c.submit(Arc::new(candidate));
+    let world = World::open(c, *XRD, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
+    charges.submit(c, candidate);
     let status = await_tx_terminal(c, hash, epochs(8));
     assert!(
         matches!(
@@ -1769,6 +2129,7 @@ pub fn preview_reports_resource_changes(c: &mut impl Cluster) {
         recipient.after,
         "the commit landed on the figure the preview named for the recipient"
     );
+    world.assert_settles_within(c, &charges, epochs(4), "a previewed transfer");
 }
 
 /// A published package runs only once the chain says it may — and when
@@ -1814,9 +2175,10 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     let registered = Hash::from(package.0);
     let cell = package_key(*publisher, package);
 
+    let world = World::open(c, *XRD, [publisher.address()], []);
+    let mut charges = Charges::default();
     let publish = build_publish_tx(key, artifact.clone(), validity_around(c.now()));
-    let publish_hash = publish.hash();
-    c.submit(Arc::new(publish));
+    let publish_hash = charges.submit(c, publish);
     let status = await_tx_terminal(c, publish_hash, epochs(24));
     assert!(
         matches!(
@@ -1839,8 +2201,7 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     // not list it.
     let unregistered =
         build_instance_instantiate_tx(key, &artifact, UNREGISTERED_SALT, validity_around(c.now()));
-    let unregistered_hash = unregistered.hash();
-    c.submit(Arc::new(unregistered));
+    let unregistered_hash = charges.submit(c, unregistered);
     c.run_until(epochs(8), |c| {
         c.tx_status(unregistered_hash).is_some_and(|s| s.is_final())
             || c.beacon_state()
@@ -1864,8 +2225,7 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     // the whole of the guarantee, since a transaction committed here
     // could be handed to a node whose fetch had not landed.
     let early = build_instance_instantiate_tx(key, &artifact, EARLY_SALT, validity_around(c.now()));
-    let early_hash = early.hash();
-    c.submit(Arc::new(early));
+    let early_hash = charges.submit(c, early);
     c.run_until(epochs(8), |c| {
         c.tx_status(early_hash).is_some_and(|s| s.is_final())
             || c.beacon_state().is_some_and(|state| {
@@ -1885,8 +2245,7 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     // the code reached the nodes that never committed the publish —
     // every shard the transaction touches runs the whole of it.
     let late = build_instance_instantiate_tx(key, &artifact, LATE_SALT, validity_around(c.now()));
-    let late_hash = late.hash();
-    c.submit(Arc::new(late));
+    let late_hash = charges.submit(c, late);
     let status = await_tx_terminal(c, late_hash, epochs(24));
     assert!(
         matches!(
@@ -1894,6 +2253,12 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
             Some(TransactionStatus::Completed(TransactionDecision::Accept))
         ),
         "a matured package's call did not settle; status = {status:?}"
+    );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "a publish and the calls that waited on it",
     );
 }
 
@@ -1928,6 +2293,13 @@ pub fn deploy_storm_rides_out(c: &mut impl Cluster) {
         .collect();
 
     let validity = validity_around(c.now());
+    let world = World::open(
+        c,
+        *XRD,
+        publishers.iter().map(|(_, publisher)| publisher.address()),
+        [],
+    );
+    let mut charges = Charges::default();
     let mut submitted: Vec<(TxHash, ShardId)> = Vec::new();
     let mut cells: Vec<(ShardId, Address, [u8; 16])> = Vec::new();
     for (index, (key, publisher)) in (0u16..).zip(publishers.iter()) {
@@ -1938,9 +2310,8 @@ pub fn deploy_storm_rides_out(c: &mut impl Cluster) {
             let cell = package_key(*publisher, package_hash(&ProtocolHasher, &artifact));
             let tx = build_publish_tx(key, artifact, validity);
             let shard = shards[usize::from(index)];
-            submitted.push((tx.hash(), shard));
             cells.push((shard, cell.owner, cell.local.0));
-            c.submit(Arc::new(tx));
+            submitted.push((charges.submit(c, tx), shard));
         }
     }
     assert_eq!(
@@ -1992,4 +2363,5 @@ pub fn deploy_storm_rides_out(c: &mut impl Cluster) {
             "{shard:?} did not advance through the storm: {height:?} -> {after:?}"
         );
     }
+    world.assert_settles_within(c, &charges, epochs(4), "a deploy storm");
 }

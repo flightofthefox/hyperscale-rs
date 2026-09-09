@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{
-    Action, FetchAbandon, FetchRequest, KeepDelta, ObserveDelta, ParticipationChange, TimerId,
+    Action, FetchIds, FetchRequest, KeepDelta, ObserveDelta, ParticipationChange, TimerId,
 };
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, BeaconProposalVerifyContext,
@@ -264,7 +264,7 @@ pub struct BeaconCoordinator {
     /// hasn't observed, tracks the fetches that resolve them, and decides
     /// when assembly is ready. `adopt_block` advancing `current_epoch`
     /// past a stash evicts it via `prune_stale`, whose returned ids the
-    /// coordinator turns into [`FetchAbandon::BeaconProposal`].
+    /// coordinator turns into [`FetchIds::BeaconProposals`].
     commit_assembly: CommitAssembler,
 
     /// Per-epoch committee schedule. Its head is the current epoch's
@@ -379,10 +379,9 @@ impl BeaconCoordinator {
         // The head and the latest epoch's active committee are the same
         // snapshot; derive it once and let the schedule share the handle.
         // Seed every other loaded state's active committee under its own epoch
-        // and its lookahead under the next, skipping anything that targets
-        // `latest_epoch` so the shared head stays in place. Consecutive states
-        // agree on that boundary entry (one's lookahead is the next's active),
-        // so the skip drops only a redundant re-derivation.
+        // and its lookahead under the next, oldest first so each window's
+        // projection is kept as the fold before it published it, then
+        // reinstate the head so the latest epoch shares its handle.
         let head = Arc::new(latest.derive_topology_snapshot(network.clone()));
         let mut topology_schedule =
             TopologySchedule::new(epoch_duration_ms, latest_epoch, Arc::clone(&head));
@@ -393,14 +392,12 @@ impl BeaconCoordinator {
                     Arc::new(state.derive_topology_snapshot(network.clone())),
                 );
             }
-            let lookahead = state.current_epoch.next();
-            if lookahead != latest_epoch {
-                topology_schedule.insert(
-                    lookahead,
-                    Arc::new(state.derive_next_topology_snapshot(network.clone())),
-                );
-            }
+            topology_schedule.insert_lookahead(
+                state.current_epoch.next(),
+                Arc::new(state.derive_next_topology_snapshot(network.clone())),
+            );
         }
+        topology_schedule.insert(latest_epoch, Arc::clone(&head));
         // The tip epoch's signer sets come from the state *before* its
         // fold when the loaded history carries one; the live state
         // stands in otherwise (see the field docs).
@@ -2062,13 +2059,12 @@ impl BeaconCoordinator {
         let epoch = self.state.current_epoch;
         self.topology_schedule.set_head(Arc::clone(&head));
         self.topology_schedule.insert(epoch, head);
-        self.topology_schedule.insert(
-            epoch.next(),
-            Arc::new(
-                self.state
-                    .derive_next_topology_snapshot(self.network.clone()),
-            ),
+        let lookahead = Arc::new(
+            self.state
+                .derive_next_topology_snapshot(self.network.clone()),
         );
+        self.topology_schedule
+            .insert_lookahead(epoch.next(), lookahead);
         self.topology_schedule.evict_below(retention_floor(
             &self.state,
             self.local_committee_anchor,
@@ -2111,8 +2107,7 @@ impl BeaconCoordinator {
             },
             Action::TopologyChanged {
                 epoch: self.state.current_epoch,
-                topology_snapshot: Arc::clone(self.topology_schedule.head()),
-                routing_committees: Arc::new(self.topology_schedule.routing_committees()),
+                schedule: Arc::new(self.topology_schedule.clone()),
             },
             // Re-arm the skip-trigger timer against the new tip. Fires
             // `skip_timeout` after the upcoming epoch's boundary if no
@@ -2138,18 +2133,18 @@ impl BeaconCoordinator {
 
         let abandoned_proposals = self.commit_assembly.prune_stale(self.state.current_epoch);
         if !abandoned_proposals.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::BeaconProposal {
-                ids: abandoned_proposals,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::BeaconProposals(
+                abandoned_proposals,
+            )));
         }
         // Release in-flight witness fetches the boundary fold just consumed
         // — their leaves are below the advanced watermark, so a future
         // contribution can't include them and the runner's slot should
         // free rather than pin on a payload the tracker would only evict.
         if !abandoned_witness_ids.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::ShardWitnesses {
-                ids: abandoned_witness_ids,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::ShardWitnesses(
+                abandoned_witness_ids,
+            )));
         }
         actions.extend(self.redrive_terminal_witness_fetches());
 
@@ -4670,7 +4665,7 @@ mod tests {
 
     /// A commit that rotates the local validator off the beacon
     /// committee drops the pooled witness chunks and releases in-flight
-    /// witness fetches as `FetchAbandon::ShardWitnesses`, so the
+    /// witness fetches as `FetchIds::ShardWitnesses`, so the
     /// runner's fetch slots don't pin on payloads an off-committee vnode
     /// no longer wants.
     #[test]
@@ -4700,13 +4695,13 @@ mod tests {
         let abandoned = actions.iter().any(|a| {
             matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::ShardWitnesses { ids })
+                Action::AbandonFetch(FetchIds::ShardWitnesses(ids))
                     if ids.contains(&(shard, height, anchor, LeafIndex::new(0), LeafIndex::new(2)))
             )
         });
         assert!(
             abandoned,
-            "expected FetchAbandon::ShardWitnesses naming the in-flight fetch, got {actions:?}",
+            "expected FetchIds::ShardWitnesses naming the in-flight fetch, got {actions:?}",
         );
     }
 

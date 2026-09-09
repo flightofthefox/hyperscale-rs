@@ -23,8 +23,8 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage};
 use hyperscale_types::{
-    Address, Derivation, Epoch, RatifyPhase, RatifyRound, RoutingCommittees, ShardId, SpcView,
-    TopologySnapshot, Transaction, ValidatorId, Verifier,
+    Address, Derivation, Epoch, RatifyPhase, RatifyRound, ShardId, SpcView, TopologySchedule,
+    Transaction, ValidatorId, Verifier,
 };
 pub(crate) use network_handlers::register_shard_request_handlers;
 pub use tx_status::TxStatusCache;
@@ -176,9 +176,8 @@ where
     beacon_route_active: Arc<AtomicBool>,
 
     /// Lock-free topology snapshot shared with network handler closures
-    /// and delegated dispatch jobs. Every hosted shard (and the pool) writes
-    /// it via `Action::TopologyChanged` as it folds the beacon; readers
-    /// `.load()` for an atomic snapshot.
+    /// and delegated dispatch jobs: the head of [`Self::topology_schedule`],
+    /// published with it. Readers `.load()` for an atomic snapshot.
     pub(crate) topology_snapshot: SharedTopologySnapshot,
 
     /// Highest beacon epoch whose `Action::TopologyChanged` has been applied to
@@ -189,6 +188,14 @@ where
     /// `apply_topology` holds this lock across the epoch check and the publish,
     /// so the highest epoch's snapshot wins and the stores never reorder.
     apply_topology_epoch: Mutex<Epoch>,
+    /// The beacon's window schedule as last folded by a hosted vnode:
+    /// the head [`Self::topology_snapshot`] publishes, the routing
+    /// committees the network keys fetches on, and the retained windows
+    /// a reshape follow classifies a followed parent block under — the
+    /// parent's own window, which the head no longer describes once its
+    /// cut has landed, and which the parent's committee can anchor into
+    /// before this host folds the commit that opens it.
+    topology_schedule: ArcSwap<TopologySchedule>,
 
     /// See [`DispatchHandles`]. Cloned once per delegated-action dispatch.
     pub(crate) dispatch_handles: Arc<DispatchHandles<S, N>>,
@@ -252,9 +259,20 @@ where
         shard_event_senders: BTreeMap<ShardId, Sender<HostEvent>>,
         beacon_event_sender: Sender<HostEvent>,
         topology_snapshot: SharedTopologySnapshot,
+        topology_schedule: Arc<TopologySchedule>,
         dispatch_handles: Arc<DispatchHandles<S, N>>,
         beacon_storage: Arc<dyn BeaconStorage>,
-    ) -> Self {
+    ) -> Self
+    where
+        N: Network,
+    {
+        // Routing is otherwise empty until the beacon's first commit
+        // folds a topology, which is up to an epoch after a restart.
+        // Inside that window every fetch to a shard outside the head —
+        // a successor's queries at its predecessor, a probe of a
+        // departed counterpart — resolves no committee and fails at the
+        // transport before it reaches a peer.
+        network.update_routing_committees(Arc::new(topology_schedule.routing_committees()));
         Self {
             network,
             verifier,
@@ -264,6 +282,7 @@ where
             beacon_route_active: Arc::new(AtomicBool::new(false)),
             topology_snapshot,
             apply_topology_epoch: Mutex::new(Epoch::GENESIS),
+            topology_schedule: ArcSwap::new(topology_schedule),
             dispatch_handles,
             beacon_storage,
             beacon_commit: BeaconCommitCoordinator::new(),
@@ -369,6 +388,12 @@ where
     #[must_use]
     pub const fn network(&self) -> &Arc<N> {
         &self.network
+    }
+
+    /// The beacon's window schedule as last folded on this host.
+    #[must_use]
+    pub fn topology_schedule(&self) -> Arc<TopologySchedule> {
+        self.topology_schedule.load_full()
     }
 
     /// Shared lock-free topology snapshot handle, refreshed on every
@@ -563,11 +588,11 @@ where
     N: Network,
     D: Dispatch,
 {
-    /// Adopt a fresh topology snapshot derived at beacon `epoch`: publish it
+    /// Adopt the schedule folded at beacon `epoch`: publish its head
     /// through the lock-free `ArcSwap` so off-thread closures pick it up on
     /// their next `.load()`, and push it to the network adapter (which keys
-    /// validator pubkeys and shard committees off the snapshot, and fetch
-    /// routing off the terminal-clamped committees).
+    /// validator pubkeys and shard committees off the head, and fetch
+    /// routing off the schedule's terminal-clamped committees).
     ///
     /// Every hosted shard (and the pool) calls this as it folds the beacon,
     /// concurrently across pinned threads. The store is gated monotonically on
@@ -575,12 +600,7 @@ where
     /// dropped, so a slower thread cannot regress the shared snapshot to an
     /// older trie / `advanced` set under another thread's newer one. A genuine
     /// same-epoch re-apply is a no-op (the value is identical for an epoch).
-    pub(crate) fn apply_topology(
-        &self,
-        epoch: Epoch,
-        topology_snapshot: &Arc<TopologySnapshot>,
-        routing_committees: Arc<RoutingCommittees>,
-    ) {
+    pub(crate) fn apply_topology(&self, epoch: Epoch, schedule: Arc<TopologySchedule>) {
         let mut applied = self
             .apply_topology_epoch
             .lock()
@@ -590,8 +610,11 @@ where
         }
         // Publish under the lock so the highest epoch's stores never reorder
         // behind a slower thread that admitted an earlier epoch.
-        self.topology_snapshot.store(Arc::clone(topology_snapshot));
-        self.network.update_topology(Arc::clone(topology_snapshot));
+        let head = Arc::clone(schedule.head());
+        let routing_committees = Arc::new(schedule.routing_committees());
+        self.topology_snapshot.store(Arc::clone(&head));
+        self.topology_schedule.store(schedule);
+        self.network.update_topology(head);
         self.network.update_routing_committees(routing_committees);
     }
 }

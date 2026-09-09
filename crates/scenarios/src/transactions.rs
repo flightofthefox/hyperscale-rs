@@ -1,10 +1,10 @@
 //! Transaction scenarios.
 
-use std::sync::Arc;
-
+use hyperscale_engine::XRD;
 use hyperscale_types::{TransactionDecision, TransactionStatus};
 
 use crate::reshape::split_lifecycle;
+use crate::support::conservation::{Charges, World};
 use crate::support::tx::{PROBE_PAYMENT, build_transfer_tx, livelock_pair, validity_around};
 use crate::support::wait::await_tx_terminal;
 use crate::support::{Cluster, epochs};
@@ -42,12 +42,12 @@ pub fn livelock_resolves_promptly(c: &mut impl Cluster) {
     let (key_a, acc_a) = &pair[0];
     let (key_b, acc_b) = &pair[1];
 
+    let world = World::open(c, *XRD, [acc_a.address(), acc_b.address()], []);
+    let mut charges = Charges::default();
     let tx_a = build_transfer_tx(key_a, *acc_a, *acc_b, PROBE_PAYMENT, validity);
     let tx_b = build_transfer_tx(key_b, *acc_b, *acc_a, PROBE_PAYMENT, validity);
-    let hash_a = tx_a.hash();
-    let hash_b = tx_b.hash();
-    c.submit(Arc::new(tx_a));
-    c.submit(Arc::new(tx_b));
+    let hash_a = charges.submit(c, tx_a);
+    let hash_b = charges.submit(c, tx_b);
 
     // The budget has to outlast a payer's deadline, which is its signed
     // window's end plus the evidence margin — wall-clock, and longer than
@@ -70,8 +70,7 @@ pub fn livelock_resolves_promptly(c: &mut impl Cluster) {
         PROBE_PAYMENT,
         validity_around(c.now()),
     );
-    let hash = after.hash();
-    c.submit(Arc::new(after));
+    let hash = charges.submit(c, after);
     let status = await_tx_terminal(c, hash, epochs(8));
     assert!(
         matches!(
@@ -80,4 +79,5 @@ pub fn livelock_resolves_promptly(c: &mut impl Cluster) {
         ),
         "the contention must clear behind the pair; status = {status:?}",
     );
+    world.assert_settles_within(c, &charges, epochs(8), "a livelocked pair and its control");
 }

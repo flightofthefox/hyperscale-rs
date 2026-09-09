@@ -154,6 +154,18 @@ pub struct Metrics {
     /// across a shard's replicas: an outlier is one whose rebuild missed
     /// the transaction's own block.
     pub rebuilt_verdict_entries: Counter,
+    /// Counterpart cells a committed proof answered for, by whether the
+    /// cell was present. An absent answer is what licenses a reclaim.
+    pub reclaim_probes_answered: CounterVec,
+    /// Reclaims admitted into a tick — escrowed value taken back on
+    /// committed evidence.
+    pub reclaims_admitted: Counter,
+    /// Votes withheld because a block's verdict claim names a
+    /// certificate this validator does not hold.
+    pub verdict_claims_deferred: Counter,
+    /// Fetch responses a requester's own check refused, by fetch kind and
+    /// the check that refused them.
+    pub fetch_responses_refused: CounterVec,
 
     // === Network class accounting ===
     /// Per-class in-flight request slot count.
@@ -747,6 +759,32 @@ impl Metrics {
             )
             .unwrap(),
 
+            reclaim_probes_answered: register_counter_vec!(
+                "hyperscale_reclaim_probes_answered_total",
+                "Counterpart cells a committed state proof answered for, by presence",
+                &["presence"]
+            )
+            .unwrap(),
+
+            reclaims_admitted: register_counter!(
+                "hyperscale_reclaims_admitted_total",
+                "Reclaims admitted into a tick on committed evidence"
+            )
+            .unwrap(),
+
+            verdict_claims_deferred: register_counter!(
+                "hyperscale_verdict_claims_deferred_total",
+                "Votes withheld on a verdict claim whose certificate this validator lacks"
+            )
+            .unwrap(),
+
+            fetch_responses_refused: register_counter_vec!(
+                "hyperscale_fetch_responses_refused_total",
+                "Fetch responses refused by the requester's own check",
+                &["kind", "reason"]
+            )
+            .unwrap(),
+
             request_slots_in_flight: register_gauge_vec!(
                 "hyperscale_request_slots_in_flight",
                 "In-flight request slots, broken down by message class",
@@ -1049,6 +1087,29 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.rebuilt_verdict_entries.inc();
     }
 
+    fn record_reclaim_probe_answered(&self, present: bool) {
+        let label = if present { "present" } else { "absent" };
+        self.metrics
+            .reclaim_probes_answered
+            .with_label_values(&[label])
+            .inc();
+    }
+
+    fn record_reclaim_admitted(&self) {
+        self.metrics.reclaims_admitted.inc();
+    }
+
+    fn record_verdict_claim_deferred(&self) {
+        self.metrics.verdict_claims_deferred.inc();
+    }
+
+    fn record_fetch_response_refused(&self, kind: &str, reason: &str) {
+        self.metrics
+            .fetch_responses_refused
+            .with_label_values(&[kind, reason])
+            .inc();
+    }
+
     fn set_request_slots_in_flight(&self, class: &str, count: usize) {
         #[allow(clippy::cast_precision_loss)]
         // count is bounded by RequestManagerConfig::max_concurrent (≤ 64)
@@ -1323,16 +1384,12 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.exec_expected_exec_certs as f64);
         self.metrics
             .memory_exec
-            .with_label_values(&["verified_provisions"])
-            .set(m.exec_verified_provisions as f64);
+            .with_label_values(&["absorbed_provisions"])
+            .set(m.exec_absorbed_provisions as f64);
         self.metrics
             .memory_exec
             .with_label_values(&["required_provision_shards"])
             .set(m.exec_required_provision_shards as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["received_provision_shards"])
-            .set(m.exec_received_provision_shards as f64);
         self.metrics
             .memory_exec
             .with_label_values(&["ticks_with_ec"])

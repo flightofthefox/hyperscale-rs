@@ -64,10 +64,14 @@ impl SimulationRunner {
     /// Drive one host's orchestrator to a fixpoint: step it, perform each
     /// request, feed the results back, and repeat until a step produces no io.
     fn reshape_step_host(&mut self, host: NodeIndex) {
-        let Some(topology_snapshot) = self.host_topology(host) else {
+        let Some(schedule) = self
+            .hosts
+            .get(host as usize)
+            .map(|h| h.process().topology_schedule())
+        else {
             return;
         };
-        let view = ReshapeView::new(&topology_snapshot, self.epoch_duration_ms);
+        let view = ReshapeView::new(&schedule);
         let mut orch = std::mem::take(&mut self.reshape[host as usize]);
         let mut broadcasted: HashSet<ValidatorId> = HashSet::new();
         // Last slice's not-yet-committed block fetches re-arm their sequencers
@@ -153,14 +157,14 @@ impl SimulationRunner {
             }
             ReshapeRequest::ApplyFollow {
                 shard,
-                height,
-                receipts,
+                block,
+                creations,
             } => {
                 let root = self
                     .reshape_stores
                     .get(&(host, shard))?
                     .storage
-                    .follow_block_writes(height, &receipts)
+                    .follow_block_writes(&block, &creations)
                     .expect("reshape follow apply into the opened store");
                 Some(ReshapeEvent::Applied { shard, root })
             }
@@ -420,7 +424,7 @@ impl SimulationRunner {
         predecessors: Vec<PredecessorTerminal>,
     ) -> Option<ReshapeEvent> {
         let storage = self.reshape_stores.get(&(host, shard))?.storage.clone();
-        let recovered = adopt_prepared_store(&storage, kind, origin, &genesis, predecessors)
+        let recovered = adopt_prepared_store(&storage, shard, kind, origin, &genesis, predecessors)
             .expect("adopted reshape root must match the genesis it derived");
         let entry = self.reshape_stores.get_mut(&(host, shard))?;
         entry.genesis = Some(genesis);

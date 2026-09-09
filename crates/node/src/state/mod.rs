@@ -97,7 +97,7 @@ impl NodeStateMachine {
         derivation: Arc<dyn Derivation>,
         local_shard: ShardId,
         shard_config: &ShardConsensusConfig,
-        recovered: RecoveredState,
+        recovered: &RecoveredState,
         beacon_coordinator: BeaconCoordinator,
         mempool_config: MempoolConfig,
         provision_config: ProvisionConfig,
@@ -343,14 +343,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::QuorumCertificateResult { .. }
             | ProtocolEvent::QcSignatureVerified { .. }
             | ProtocolEvent::RemoteHeaderQcVerified { .. }
-            | ProtocolEvent::TransactionRootVerified { .. }
-            | ProtocolEvent::CertificateRootVerified { .. }
-            | ProtocolEvent::LocalReceiptRootVerified { .. }
-            | ProtocolEvent::ProvisionsRootVerified { .. }
-            | ProtocolEvent::ProvisionTxRootsVerified { .. }
-            | ProtocolEvent::ReservationsVerified { .. }
-            | ProtocolEvent::BeaconWitnessRootVerified { .. }
-            | ProtocolEvent::StateRootVerified { .. }
+            | ProtocolEvent::BlockCheckCompleted { .. }
             | ProtocolEvent::ProposalBuilt { .. }
             | ProtocolEvent::BlockPersisted { .. }
             | ProtocolEvent::FinalizationsAdmitted { .. }
@@ -451,7 +444,8 @@ impl StateMachine for NodeStateMachine {
             // ── Transactions ─────────────────────────────────────────────
             evt @ (ProtocolEvent::TransactionValidated { .. }
             | ProtocolEvent::TransactionsReceived { .. }
-            | ProtocolEvent::TransactionsAdmitted { .. }) => {
+            | ProtocolEvent::TransactionsAdmitted { .. }
+            | ProtocolEvent::TransactionsResolved { .. }) => {
                 self.with_shard(move |s, sched| s.handle_transaction(sched, evt))
             }
 
@@ -460,6 +454,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::BlockSyncComplete { .. }
             | ProtocolEvent::RemoteHeaderSyncComplete { .. }
             | ProtocolEvent::SettledTxsReconstructed { .. }
+            | ProtocolEvent::FetchedStateProofVerified { .. }
             | ProtocolEvent::PrecutResolutionsReceived { .. }) => {
                 self.with_shard(move |s, sched| s.handle_sync(sched, evt))
             }
@@ -514,6 +509,7 @@ impl StateMachine for NodeStateMachine {
         // event, then re-enter `try_propose` once if a proposal-retry latched.
         // Both touch shard state, so they only run on a seated vnode.
         if let Some(s) = self.shard.as_mut() {
+            let topology_schedule = self.beacon_coordinator.topology_schedule();
             for ready in s.shard_coordinator.drain_ready_state_root_verifications() {
                 actions.push(Action::VerifyStateRoot {
                     block_hash: ready.block_hash,
@@ -524,6 +520,7 @@ impl StateMachine for NodeStateMachine {
                     expected_local_receipt_root: ready.expected_local_receipt_root,
                     finalizations: ready.finalizations,
                     block_tx_hashes: ready.block_tx_hashes,
+                    creations: ready.creations,
                     block_height: ready.block_height,
                     claimed_split_child_roots: ready.claimed_split_child_roots,
                     split_child_roots_required: ready.split_child_roots_required,
@@ -544,6 +541,15 @@ impl StateMachine for NodeStateMachine {
                 let proposal =
                     s.try_event_driven_proposal(self.beacon_coordinator.topology_schedule());
                 actions.extend(proposal);
+            }
+
+            // Whatever this dispatch wrote into the evidence the vote
+            // fence reads — a counterpart's word, a settled set, a proven
+            // anchor, a predecessor's answer — re-drives the votes that
+            // deferred for want of it, once, here, so no writer has to
+            // know which votes were waiting.
+            if s.shard_coordinator.take_fence_evidence_advanced() {
+                actions.extend(s.shard_coordinator.redrive_pending_votes(topology_schedule));
             }
         }
 

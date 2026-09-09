@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
-use hyperscale_core::ProtocolEvent;
+use hyperscale_core::{FetchIds, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::artifact_package;
 use hyperscale_network::{Network, ResponseVerdict};
@@ -67,6 +67,10 @@ impl FetchBinding for PackageArtifactBinding {
 
     const NAME: &'static str = "package_artifact";
 
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::PackageArtifacts(ids)
+    }
+
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Hash> {
         &mut shard.packages.fetch
     }
@@ -114,9 +118,7 @@ impl FetchBinding for PackageArtifactBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::PackageArtifactsFetchFailed {
-                                ids: split.missing.clone(),
-                            },
+                            ShardScopedInput::FetchFailed(Self::ids(split.missing.clone())),
                         );
                     }
                     if split.unsolicited > 0 || !split.missing.is_empty() {
@@ -128,7 +130,7 @@ impl FetchBinding for PackageArtifactBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::PackageArtifactsFetchFailed { ids: requested },
+                        ShardScopedInput::FetchFailed(Self::ids(requested)),
                     );
                     ResponseVerdict::Accept
                 }

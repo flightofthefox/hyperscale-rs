@@ -4,24 +4,24 @@ use std::time::Instant;
 
 use hex::encode as hex_encode;
 use hyperscale_metrics::{record_storage_operation, record_storage_write};
-use hyperscale_storage::tree::carry_noop_root;
 use hyperscale_storage::{
-    JmtSnapshot, PackageArtifactStore, SubstateStore, SweepIndex, VersionedStore, sweepable_expiry,
+    JmtSnapshot, PackageArtifactStore, SubstateStore, Substates, SweepIndex, SweepRows,
+    VersionedStore, holds_this_block_at,
 };
 use hyperscale_types::{
     Block, BlockHeight, DeclaredRange, Hash, QuorumCertificate, StateRoot, SubstateKey,
-    SweepFrontier, Verified,
+    SweepBucket, SweepFrontier, Verified,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 
 use super::column_families::{PackageArtifactsCf, StateCf, SweepIndexCf};
-use super::core::RocksDbShardStorage;
+use super::core::{RocksDbShardStorage, fold_sweep_rows};
 use super::execution_certs::append_block_certs_to_batch;
-use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::metadata::read_jmt_metadata;
+use super::retention::retention_floor;
 use super::snapshot::RocksDbSnapshot;
 use super::substate_key::SubstateKeyCodec;
-use super::sweep_key::{SweepRowCodec, leaf_bucket_bounds, row_seek};
+use super::sweep_key::{SweepRowCodec, row_seek};
 use crate::typed_cf::{DbCodec, TypedCf, get, iter_all};
 
 impl SubstateStore for RocksDbShardStorage {
@@ -55,23 +55,7 @@ impl SubstateStore for RocksDbShardStorage {
         key: SubstateKey,
         block_height: BlockHeight,
     ) -> Option<Option<Vec<u8>>> {
-        use hyperscale_storage::Substates;
-        let snapshot = self.db.snapshot();
-        let (current_version, _) = read_jmt_metadata(&snapshot);
-        if block_height.inner() > current_version {
-            return None;
-        }
-        let floor = current_version.saturating_sub(self.jmt_history_length);
-        if block_height.inner() < floor {
-            return None;
-        }
-        let snap = RocksDbSnapshot {
-            snapshot,
-            db: &self.db,
-            version: block_height.inner(),
-            current_version,
-        };
-        Some(snap.cell(key))
+        Some(self.snapshot_held_at(block_height)?.cell(key))
     }
 
     fn get_entries_at_height(
@@ -79,23 +63,7 @@ impl SubstateStore for RocksDbShardStorage {
         range: DeclaredRange,
         block_height: BlockHeight,
     ) -> Option<Vec<(u128, Vec<u8>)>> {
-        use hyperscale_storage::Substates;
-        let snapshot = self.db.snapshot();
-        let (current_version, _) = read_jmt_metadata(&snapshot);
-        if block_height.inner() > current_version {
-            return None;
-        }
-        let floor = current_version.saturating_sub(self.jmt_history_length);
-        if block_height.inner() < floor {
-            return None;
-        }
-        let snap = RocksDbSnapshot {
-            snapshot,
-            db: &self.db,
-            version: block_height.inner(),
-            current_version,
-        };
-        Some(snap.entries_in_range(
+        Some(self.snapshot_held_at(block_height)?.entries_in_range(
             range.owner,
             range.collection,
             range.lo,
@@ -106,33 +74,35 @@ impl SubstateStore for RocksDbShardStorage {
 }
 
 impl VersionedStore for RocksDbShardStorage {
-    fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
-        // Take the DB snapshot FIRST, then read metadata THROUGH it.
-        // Reading metadata from the live DB and then taking the snapshot
-        // races with concurrent commits: a commit between the two reads
-        // leaves `current_version` stale relative to the snapshot's LSN.
-        // If `version == stale_current_version`, the trivial branch fires
-        // and returns post-commit StateCf values — a torn read.
-        // Capturing both from the same snapshot gives one consistent view.
+    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+        // Take the DB snapshot FIRST, then read the tip and the floor
+        // THROUGH it. Reading either from the live DB and then taking the
+        // snapshot races with concurrent commits: a commit between the
+        // two reads leaves `current_version` stale relative to the
+        // snapshot's LSN, and a reader told a version is retained by one
+        // and gone by the other. Capturing everything from the one
+        // snapshot gives one consistent view.
         let snapshot = self.db.snapshot();
         let (current_version, _) = read_jmt_metadata(&snapshot);
+        let held =
+            height.inner() <= current_version && height.inner() >= retention_floor(&snapshot);
+        held.then(|| RocksDbSnapshot {
+            snapshot,
+            db: &self.db,
+            version: height.inner(),
+            current_version,
+        })
+    }
 
-        // Retention invariant: below the configured floor we can't
-        // serve historical reads reliably (history entries have been GC'd).
-        // This is an internal DA-assumption check — external APIs that
-        // accept network-supplied versions (e.g. `list_substates_for_node_at_height`)
-        // must check retention themselves and return None, not call
-        // through here.
-        //
-        // `floor` MUST match the cutoff in `run_state_history_gc` — see the
-        // boundary invariant there. Zero-margin by design.
-        let floor = current_version.saturating_sub(self.jmt_history_length);
+    fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
+        let snapshot = self.db.snapshot();
+        let (current_version, _) = read_jmt_metadata(&snapshot);
+        let floor = retention_floor(&snapshot);
         assert!(
             height.inner() >= floor,
             "snapshot_at({height}) below retention floor {floor} \
-             (current_version={current_version}, jmt_history_length={}) — \
+             (current_version={current_version}) — \
              Shard consensus + DA invariant broken; caller must anchor within retention",
-            self.jmt_history_length,
         );
         RocksDbSnapshot {
             snapshot,
@@ -145,6 +115,10 @@ impl VersionedStore for RocksDbShardStorage {
     fn substate_bytes_at(&self, height: BlockHeight) -> Option<u64> {
         self.substate_bytes_at_version(height.inner())
     }
+
+    fn retention_floor(&self) -> u64 {
+        Self::retention_floor(self)
+    }
 }
 
 impl RocksDbShardStorage {
@@ -153,15 +127,16 @@ impl RocksDbShardStorage {
     /// This is the fast path for block commit. Applies the pre-built `WriteBatch`
     /// atomically with one fsync, including all JMT nodes from the snapshot.
     ///
-    /// Returns `true` if successfully applied (fast path),
-    /// or `false` if the JMT state has changed since preparation
-    /// (caller should fall back to slow path).
+    /// Returns `true` if successfully applied (fast path), or `false`
+    /// if the JMT state has changed since preparation, which the caller
+    /// judges: benign only when the store already holds this block.
     ///
     /// # Panics
     /// Only panics on unrecoverable errors (`RocksDB` write failure).
     pub(crate) fn try_apply_prepared_commit(
         &self,
         mut write_batch: WriteBatch,
+        sweep_rows: &SweepRows,
         jmt_snapshot: &JmtSnapshot,
         block: &Block,
         qc: &Verified<QuorumCertificate>,
@@ -174,6 +149,20 @@ impl RocksDbShardStorage {
         // Must check BOTH root AND version. Root can be unchanged with empty commits
         // (same root, different version), but the nodes are keyed by version.
         let (current_version, current_root_hash) = self.read_jmt_metadata();
+        // A store already at this block's height holds a block there,
+        // and it had better be this one. The benign cause is the same
+        // block twice — a synced copy, or a co-hosted vnode's — and the
+        // root check below waves an empty commit through on an unchanged
+        // root, so height is the only thing that would separate a second
+        // application of this block from a first application of a
+        // different one at the same height. The read is confined to that
+        // case rather than paid on every commit.
+        assert!(
+            current_version < block.height().inner()
+                || holds_this_block_at(self, block.height(), block.hash()),
+            "BFT CRITICAL: prepared commit for height {} meets a different block already there",
+            block.height().inner(),
+        );
         if current_root_hash != jmt_snapshot.base_root {
             tracing::warn!(
                 expected_root = ?jmt_snapshot.base_root,
@@ -196,23 +185,18 @@ impl RocksDbShardStorage {
         let new_version = jmt_snapshot.new_height.inner();
         let new_root = jmt_snapshot.result_root;
 
-        // A no-op snapshot prepared before its parent's tree existed (the
-        // recovery bridge over a sync-admitted parent) carries no nodes;
-        // the parent's root is durable by this height-ordered write, so
-        // complete the carry the prepare couldn't.
-        if let Some((key, node)) = carry_noop_root(
-            &SnapshotTreeStore::new(&self.db, self.root_path.clone()),
-            jmt_snapshot,
-        ) {
-            self.append_jmt_node_to_batch(&mut write_batch, &key, &node);
-        }
-
         self.append_jmt_to_batch(&mut write_batch, jmt_snapshot, new_version);
 
         // Certificates append here rather than at prepare time: choosing
         // which copy of a tick to keep reads the stored copy, and that
         // read has to sit under `commit_lock` with the write it decides.
         append_block_certs_to_batch(self, &mut write_batch, block);
+
+        // The sweep index is a total over what has committed, so its
+        // fold reads the persisted rows and belongs here for the same
+        // reason: a batch prepared over unpersisted ancestors has not
+        // seen what they moved.
+        fold_sweep_rows(&self.db, &mut write_batch, &self.cf(), sweep_rows);
 
         // Fold consensus metadata into the same batch for crash-safe atomicity.
         Self::append_consensus_to_batch(&mut write_batch, block, qc);
@@ -250,47 +234,42 @@ impl RocksDbShardStorage {
 impl SweepIndex for RocksDbShardStorage {
     fn sweep_candidates(
         &self,
-        frontier: SweepFrontier,
-        ceiling: SweepFrontier,
+        after: SweepFrontier,
+        below: SweepBucket,
         limit: usize,
     ) -> Vec<(SubstateKey, u64)> {
-        if limit == 0 || frontier >= ceiling {
-            return Vec::new();
-        }
         let cf = self.cf();
         let state_cf = StateCf::handle(&cf);
-        let mut found = Vec::new();
-        // Index rows first, in (bucket, owner) order; then that pair's
-        // leaves, in local order. The two walks composed are already
-        // sweep order, so nothing sorts and the cap stops the walk.
-        let mut rows = self.db.raw_iterator_cf(SweepIndexCf::handle(&cf));
-        rows.seek(row_seek(frontier.bucket()));
-        while rows.valid() && found.len() < limit {
-            let Some(raw) = rows.key() else { break };
-            let (bucket, owner) = SweepRowCodec.decode(raw);
-            if bucket >= ceiling.bucket() {
-                break;
-            }
-            let (start, end) = leaf_bucket_bounds(owner, bucket);
-            let mut leaves = self.db.raw_iterator_cf(state_cf);
-            leaves.seek(&start);
-            while leaves.valid() && found.len() < limit {
-                let Some(raw_key) = leaves.key() else { break };
-                if raw_key >= end.as_slice() {
-                    break;
+        SweepRows::walk(
+            after,
+            below,
+            limit,
+            |bucket| {
+                let mut rows = self.db.raw_iterator_cf(SweepIndexCf::handle(&cf));
+                rows.seek(row_seek(bucket));
+                std::iter::from_fn(move || {
+                    let row = SweepRowCodec.decode(rows.key()?);
+                    rows.next();
+                    Some(row)
+                })
+            },
+            |lo, hi, each| {
+                let mut leaves = self.db.raw_iterator_cf(state_cf);
+                leaves.seek(lo.to_bytes());
+                let end = hi.to_bytes();
+                while leaves.valid() {
+                    let Some(raw) = leaves.key() else { break };
+                    if raw > end.as_slice() {
+                        break;
+                    }
+                    let key = SubstateKeyCodec.decode(raw);
+                    if !each(key, leaves.value().unwrap_or_default()) {
+                        break;
+                    }
+                    leaves.next();
                 }
-                let key = SubstateKeyCodec.decode(raw_key);
-                let value = leaves.value().unwrap_or_default();
-                if SweepFrontier::of_leaf(key) > frontier
-                    && let Some(expiry) = sweepable_expiry(key, value)
-                {
-                    found.push((key, expiry));
-                }
-                leaves.next();
-            }
-            rows.next();
-        }
-        found
+            },
+        )
     }
 }
 

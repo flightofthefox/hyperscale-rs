@@ -16,10 +16,12 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Epoch, EpochWindows, ProvisionalHolds, ShardId, ShardTrie, SubstateEntry, TopologySnapshot,
-    Transaction, Verified, WeightedTimestamp,
+    Epoch, EpochWindows, EscrowedValue, ProvisionalHolds, ShardId, ShardTrie, SubstateEntry,
+    TopologySnapshot, Transaction, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::SeedWindow;
+
+use crate::legs::Runs;
 
 /// What a block fixes about the environment its tick executes under.
 ///
@@ -115,8 +117,14 @@ pub struct TickBatchContext<'a> {
 /// one batch, so the executor's canonical order and conflict groups
 /// sequence members across ticks.
 pub struct TickTxInput<'a> {
-    /// The transaction to execute.
-    pub transaction: &'a Arc<Verified<Transaction>>,
+    /// What names the member, and what its receipt is keyed by. Carried
+    /// rather than hashed off the body, because a housekeeping member
+    /// has no body: the record cell names the transaction that issued
+    /// the crossing, and that is the name its own receipt takes.
+    pub tx_hash: TxHash,
+    /// The transaction to execute, for a member that runs its shape.
+    /// `None` for a housekeeping member, whose cells `runs` names.
+    pub transaction: Option<&'a Arc<Verified<Transaction>>>,
     /// Verified provision entry lists, one per source shard contribution.
     /// Empty for a single-shard member.
     pub provisions: &'a [Arc<Vec<SubstateEntry>>],
@@ -125,8 +133,17 @@ pub struct TickTxInput<'a> {
     /// committing block's parent-QC weighted timestamp for a cross-shard
     /// leg.
     pub clock: WeightedTimestamp,
-    /// Whether a tick verdict can still discard this member's effects
-    /// after execution — true for a cross-shard leg. Decides both the
-    /// reserve fee receipt and the batch's write locality.
-    pub abortable: bool,
+    /// What this member runs: the transaction as its block froze it —
+    /// carried, never re-derived, since a reshape landing between
+    /// composition and execution would otherwise leave one shard running
+    /// a whole manifest while its counterpart waits to be sent half of
+    /// it — or a settlement of what a leg here issued. What it says of
+    /// the member decides the batch's write locality — a member
+    /// declaring remote cells has its writes filtered to the subtree
+    /// this shard owns — and the reserve fee receipt, which only a
+    /// member a counterpart's verdict can still discard holds.
+    pub runs: Runs,
+    /// What committed bundles attested for the edges this shard's legs
+    /// consume. Empty for a member that runs whole.
+    pub arrivals: &'a [EscrowedValue],
 }

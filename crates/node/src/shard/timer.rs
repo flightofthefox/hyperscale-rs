@@ -12,12 +12,12 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 
-use crate::beacon;
+use crate::beacon::{self, BeaconProposalBinding, ShardWitnessBinding};
 use crate::fetch::FetchInput;
 use crate::shard::ShardLoop;
 use crate::shard::cross_shard::{
     CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
-    ProvisionBinding,
+    ProvisionBinding, SettledTxsBinding, StateProofBinding,
 };
 use crate::shard::instances::InstanceRecordBinding;
 use crate::shard::mempool::TransactionBinding;
@@ -39,14 +39,16 @@ where
         let outputs = self.io.cross_shard.remote_header_tick(now);
         self.process_remote_header_sync_outputs(outputs);
 
-        self.settled_set_tick();
-
         self.drive_fetch::<TransactionBinding>(FetchInput::Tick);
         self.drive_fetch::<LocalProvisionBinding>(FetchInput::Tick);
         self.drive_fetch::<FinalizationBinding>(FetchInput::Tick);
         self.drive_fetch::<ProvisionBinding>(FetchInput::Tick);
         self.drive_fetch::<ExecCertBinding>(FetchInput::Tick);
         self.drive_fetch::<CommittedTxBinding>(FetchInput::Tick);
+        self.drive_fetch::<StateProofBinding>(FetchInput::Tick);
+        self.drive_fetch::<SettledTxsBinding>(FetchInput::Tick);
+        self.drive_fetch::<ShardWitnessBinding>(FetchInput::Tick);
+        self.drive_fetch::<BeaconProposalBinding>(FetchInput::Tick);
         self.drive_fetch::<PackageArtifactBinding>(FetchInput::Tick);
         self.drive_fetch::<InstanceRecordBinding>(FetchInput::Tick);
     }

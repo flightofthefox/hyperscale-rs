@@ -1,5 +1,7 @@
 //! Time-domain types for consensus.
 //!
+//! - [`deadline`]: a transaction's [`Deadline`](deadline::Deadline) and
+//!   every [`Window`](deadline::Window) the protocol reads off it.
 //! - [`epoch_windows`]: the [`EpochWindows`](epoch_windows::EpochWindows) grid
 //!   mapping weighted timestamps to epochs and detecting boundary crossings.
 //! - [`limits`]: hard caps applied at admission time on peer-supplied
@@ -12,6 +14,7 @@
 //! - [`timestamp`]: typed wall-clocks ([`WeightedTimestamp`], [`ProposerTimestamp`],
 //!   [`LocalTimestamp`]) with distinct trust guarantees.
 
+pub mod deadline;
 pub mod epoch_windows;
 pub mod limits;
 pub mod range;

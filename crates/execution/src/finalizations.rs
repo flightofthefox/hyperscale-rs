@@ -131,6 +131,34 @@ impl FinalizationStore {
         }
     }
 
+    /// Remove every finalization of `tick_id`, if any.
+    pub fn remove_tick(&self, tick_id: &TickId) {
+        let hashes: Vec<FinalizationHash> = self
+            .inner
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finalizations
+            .keys()
+            .filter(|(tick, _)| tick == tick_id)
+            .map(|(_, hash)| *hash)
+            .collect();
+        for hash in hashes {
+            self.remove(&hash);
+        }
+    }
+
+    /// Whether the store holds `tick_id`'s determined half.
+    #[must_use]
+    pub fn holds_determined(&self, tick_id: &TickId) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finalizations
+            .range((*tick_id, FinalizationHash::ZERO)..)
+            .take_while(|((tick, _), _)| tick == tick_id)
+            .any(|(_, fw)| fw.is_determined())
+    }
+
     /// All finalizations in tick order. Used by the proposer to include
     /// finalizations in the next block.
     #[must_use]

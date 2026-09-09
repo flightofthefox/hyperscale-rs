@@ -293,7 +293,7 @@ impl Verified<QuorumCertificate> {
     /// [`<QuorumCertificate as Verify>::verify`](Verify::verify) at
     /// admission, so re-reading them post-restart returns values whose
     /// predicate already held at write-time. The shard storage write
-    /// entry point (`commit_block`) takes
+    /// entry point (the prepared commit) takes
     /// `&Arc<Verified<CertifiedBlock>>` with the QC embedded, so
     /// unverified QCs can't reach the write path. Callers in storage
     /// adapters or recovery paths use this constructor; any other

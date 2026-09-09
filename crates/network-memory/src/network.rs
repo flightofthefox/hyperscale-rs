@@ -36,7 +36,9 @@ use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network::fault::{Decision, Engine, FaultBuilder, HostId, MessageContext, Tier};
+use hyperscale_network::fault::{
+    Decision, DropSpec, Engine, FaultBuilder, HostId, MessageContext, Rewrite, RuleHandle, Tier,
+};
 use hyperscale_network::{HandlerRegistry, RequestError, ResponseVerdict, compression};
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use rand::RngExt;
@@ -615,6 +617,29 @@ impl SimulatedNetwork {
         FaultBuilder::new(&mut self.faults)
     }
 
+    /// Install a rewrite over the responses `host` serves for `type_id`.
+    ///
+    /// The byzantine seam: the host answers, and answers wrongly. A drop
+    /// rule can only make it silent, which every fetch path already has a
+    /// fallback for; what an evidence check is exercised by is a
+    /// well-formed answer that says the wrong thing.
+    pub fn rewrite_responses(
+        &mut self,
+        host: NodeIndex,
+        type_id: &'static str,
+        rewrite: Rewrite,
+    ) -> RuleHandle {
+        self.faults.install_rewrite(
+            &DropSpec {
+                type_id: Some(type_id),
+                from: Some(HostId(host)),
+                tier: Some(Tier::Response),
+                ..DropSpec::default()
+            },
+            rewrite,
+        )
+    }
+
     /// Set the traffic analyzer for bandwidth metrics recording.
     pub fn set_traffic_analyzer(&mut self, analyzer: Arc<NetworkTrafficAnalyzer>) {
         self.traffic_analyzer = Some(analyzer);
@@ -1083,7 +1108,19 @@ impl SimulatedNetwork {
         else {
             return AttemptOutcome::HardError { rtt };
         };
-        let response_bytes = handler(body);
+        // The answering host's own bytes, before any rewrite installed on
+        // it: a byzantine responder is one that answers wrongly, which is
+        // the one thing a drop rule cannot model.
+        let response_bytes = self.faults.rewrite(
+            &MessageContext {
+                sender: HostId(peer),
+                recipient: HostId(requester),
+                type_id,
+                tier: Tier::Response,
+            },
+            body,
+            handler(body),
+        );
         if response_bytes.is_empty() {
             return AttemptOutcome::HardError { rtt };
         }
@@ -1336,13 +1373,22 @@ impl SimulatedNetwork {
         let message_type = entry.message_type;
 
         // Compute content-based message ID for dedup, matching production
-        // gossipsub's message_id_fn: hash(data || topic).
-        // Wire bytes (compressed) are used as the data, message_type as the topic.
+        // gossipsub's message_id_fn: hash(data || topic). Wire bytes
+        // (compressed) are the data; the topic is the message type and
+        // the shard it is published to, since a shard-scoped type has one
+        // topic per shard and a host serving two of them is owed the
+        // same batch once on each — a transaction touching both shards
+        // is published to both, and the second copy is what the other
+        // shard's loop admits from.
         let msg_id = {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             entry.data.hash(&mut hasher);
             message_type.hash(&mut hasher);
+            match entry.target {
+                BroadcastTarget::Shard(shard) => shard.hash(&mut hasher),
+                BroadcastTarget::Global => (),
+            }
             hasher.finish()
         };
 
@@ -2252,6 +2298,47 @@ mod tests {
         assert_eq!(handlers[1].count(), 1);
         assert_eq!(handlers[2].count(), 0); // different shard
         assert_eq!(handlers[3].count(), 0); // different shard
+    }
+
+    /// One batch published to two shard topics reaches a host serving
+    /// both shards once on each: the dedup key is the payload under its
+    /// topic, as production's is, so the second shard's copy — the one
+    /// that shard's loop admits from — is not read as a replay of the
+    /// first.
+    #[test]
+    fn the_same_batch_on_a_second_shard_topic_is_delivered_again() {
+        let (left, right) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let hosted = vec![
+            std::iter::once(left).collect(),
+            [left, right].into_iter().collect(),
+        ];
+        let validator_to_host = (0..2u64)
+            .map(|host| (ValidatorId::new(host), host as NodeIndex))
+            .collect();
+        let mut network = SimulatedNetwork::new(
+            NetworkConfig {
+                packet_loss_rate: 0.0,
+                ..Default::default()
+            },
+            HostLayout {
+                hosted,
+                validator_to_host,
+            },
+            0,
+        );
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let on_left = make_gossip_entry(BroadcastTarget::Shard(left));
+        let on_right = make_gossip_entry(BroadcastTarget::Shard(right));
+        let first = network.accept_gossip(0, Duration::ZERO, on_left, &mut rng);
+        let second = network.accept_gossip(0, Duration::ZERO, on_right, &mut rng);
+        network.flush_gossip(FAR_FUTURE);
+
+        assert_eq!(first.messages_sent, 1);
+        assert_eq!(second.messages_sent, 1);
+        assert_eq!(second.messages_deduplicated, 0);
+        assert_eq!(handlers[1].count(), 2, "once per topic the host serves");
     }
 
     #[test]

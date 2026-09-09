@@ -7,8 +7,9 @@
 use std::sync::Arc;
 
 use hyperscale_core::Action;
+use hyperscale_execution::Offers;
 use hyperscale_types::{
-    Finalization, MAX_TXS_PER_BLOCK, Provisions, TerminalVerdict, TopologySchedule,
+    AbandonmentRecord, Finalization, MAX_TXS_PER_BLOCK, Provisions, StateClaim, TopologySchedule,
     TopologySnapshot, Transaction, Verifiable, Verified,
 };
 
@@ -19,7 +20,8 @@ pub(in crate::state) struct ProposalInputs {
     pub ready_txs: Vec<Arc<Verified<Transaction>>>,
     pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
     pub provisions: Vec<Arc<Verifiable<Provisions>>>,
-    pub terminal_verdicts: Vec<TerminalVerdict>,
+    pub abandonment_records: Vec<AbandonmentRecord>,
+    pub state_claims: Vec<StateClaim>,
 }
 
 impl ShardParticipation {
@@ -36,13 +38,11 @@ impl ShardParticipation {
         // how many are actually offered is the work budget inside
         // `ready_transactions`. The overhead compensates for QC-chain
         // duplicates shard consensus filters during proposal building.
-        let parent = self.shard_coordinator.proposal_parent_block_hash();
         // The transactions the ancestor chain above the committed tip
         // already carries. Proposal building drops them as duplicates, so
         // the budget has to be raised by what will be dropped or the
         // block comes out short.
-        let (ancestor_txs, _) = self.shard_coordinator.collect_qc_chain_hashes(parent);
-        let max_txs = MAX_TXS_PER_BLOCK + ancestor_txs.len();
+        let max_txs = MAX_TXS_PER_BLOCK + self.shard_coordinator.dedup_overhead();
         // The budget reads the chain, not a local claim set: the parent
         // header carries what this shard still owes in work.
         let in_flight = self.shard_coordinator.proposal_parent_in_flight();
@@ -51,8 +51,13 @@ impl ShardParticipation {
                 .ready_transactions(max_txs, in_flight.inner(), self.now);
         let finalizations = self.execution_coordinator.get_finalizations();
         // What departed counterparts left of this chain's business, while
-        // the settled sets that say so can still be read.
-        let terminal_verdicts = self.execution_coordinator.pending_terminal_verdicts();
+        // the settled sets that say so can still be read, and the proofs
+        // of counterparts' cells this validator's fetches answered, for
+        // every replica to fold at commit.
+        let Offers {
+            state_claims,
+            abandonment_records,
+        } = self.execution_coordinator.offers();
         let queued = self.provisions_coordinator.queued_provisions(self.now);
 
         // The engagement gate: a non-payer shard proposes a cross-shard
@@ -80,7 +85,8 @@ impl ShardParticipation {
             ready_txs,
             finalizations,
             provisions,
-            terminal_verdicts,
+            abandonment_records,
+            state_claims,
         }
     }
 
@@ -125,7 +131,8 @@ impl ShardParticipation {
             &inputs.ready_txs,
             inputs.finalizations,
             inputs.provisions,
-            inputs.terminal_verdicts,
+            inputs.abandonment_records,
+            inputs.state_claims,
         )
     }
 }

@@ -2,17 +2,17 @@
 //!
 //! Contains the internal state structures protected by `RwLocks` in `SimShardStorage`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use hyperscale_storage::tree::{carry_noop_root, jmt_parent_height, put_at_version};
-use hyperscale_storage::{JmtSnapshot, entry_leaf_rows, package_of_cell, sweepable_expiry};
+use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
+use hyperscale_storage::{JmtSnapshot, SweepRows, entry_leaf_rows, index_leaf, retire_dated};
 use hyperscale_types::{
-    Address, Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt,
-    EntryKey, ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash,
-    ProvisionHash, Provisions, QuorumCertificate, SafeVoteRegisters, SettledWrites,
-    ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, SweepBucket, TickId, Transaction,
-    TxHash, ValidatorId,
+    Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, EntryKey,
+    ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash,
+    Provisions, QuorumCertificate, SafeVoteRegisters, SettledWrites, ShardWitnessPayload,
+    StateRoot, StoredReceipt, SubstateKey, TickId, Transaction, TxHash, ValidatorId,
+    WeightedTimestamp,
 };
 
 use super::tree_store::SimTreeStore;
@@ -45,6 +45,11 @@ pub struct SharedState {
     /// Per-write prior-value entries for the entry index, mirroring
     /// `state_history` row for row.
     pub entries_history: BTreeMap<(EntryKey, u64), Option<Vec<u8>>>,
+    /// Each version's weighted timestamp, from the floor on; what
+    /// [`retire_dated`] reads.
+    pub version_time: BTreeMap<u64, u64>,
+    /// The oldest version historical reads are answered at.
+    pub retention_floor: u64,
     /// Committed substate byte total per version, written in
     /// lockstep with each applied snapshot. Consensus-critical:
     /// shard-witness derivation reads it, so it must be identical on
@@ -55,21 +60,42 @@ pub struct SharedState {
     /// cell that self-identifies as a package lands its bytes here in
     /// the same application that lands the cell.
     pub package_artifacts: BTreeMap<Hash, Vec<u8>>,
-    /// How many live sweepable cells each owner holds in each expiry
-    /// bucket — the mirror of the `RocksDB` backend's sweep index, fed
+    /// The sweep index — the mirror of the `RocksDB` backend's, fed
     /// from the same judgement so both backends enumerate the same
-    /// candidates. Bucket-major, because a sweep walks by expiry and
-    /// `current_state` is owner-major.
-    pub sweep_index: BTreeMap<(SweepBucket, Address), u32>,
+    /// candidates.
+    pub sweep_index: SweepRows,
 }
 
 impl SharedState {
+    /// Date `version` and move the floor past what that retires
+    /// ([`retire_dated`]). Returns the floor this commit establishes.
+    pub(crate) fn advance_retention_floor(
+        &mut self,
+        version: u64,
+        tip_ts: WeightedTimestamp,
+    ) -> u64 {
+        self.version_time.insert(version, tip_ts.as_millis());
+        let retired = retire_dated(
+            self.retention_floor,
+            version,
+            tip_ts,
+            self.version_time
+                .range(self.retention_floor..)
+                .map(|(dated, ts)| (*dated, *ts)),
+        );
+        for dated in &retired.versions {
+            self.version_time.remove(dated);
+        }
+        self.retention_floor = retired.floor;
+        retired.floor
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             // Pruning disabled: historical substate reads traverse the JMT at
-            // past heights and need old nodes to still exist. In production,
-            // RocksDB GC respects `jmt_history_length` (default 256).
-            // In simulation, tests are short-lived so retaining all nodes is fine.
+            // past heights and need old nodes to still exist. The floor
+            // still moves, so the contract is the persistent backend's;
+            // what differs is that nothing here reclaims behind it.
             tree_store: SimTreeStore::new(),
             current_block_height: BlockHeight::GENESIS,
             current_root_hash: StateRoot::ZERO,
@@ -77,9 +103,11 @@ impl SharedState {
             state_history: BTreeMap::new(),
             current_entries: BTreeMap::new(),
             entries_history: BTreeMap::new(),
+            version_time: BTreeMap::new(),
+            retention_floor: 0,
             substate_bytes: BTreeMap::new(),
             package_artifacts: BTreeMap::new(),
-            sweep_index: BTreeMap::new(),
+            sweep_index: SweepRows::default(),
         }
     }
 
@@ -90,22 +118,14 @@ impl SharedState {
     /// the overlay may have computed from a base state ahead of the
     /// tree store, so `base_root` mismatches are expected and safe.
     pub(crate) fn apply_jmt_snapshot(&mut self, snapshot: &JmtSnapshot) {
-        // A no-op snapshot prepared before its parent's tree existed (the
-        // recovery bridge over a sync-admitted parent) carries no nodes.
-        // Persistence is height-ordered, so the parent's root is durable
-        // now — complete the carry the prepare couldn't.
-        if let Some((key, node)) = carry_noop_root(&self.tree_store, snapshot) {
-            self.tree_store.insert(key, node);
-        }
         for (jmt_key, jmt_node) in &snapshot.nodes {
             self.tree_store
                 .insert(jmt_key.clone(), Arc::clone(jmt_node));
         }
         // Stale JMT nodes are NOT deleted here. Historical JMT nodes must be
         // retained so that provision-fetch proof generation can read the
-        // tree at past block heights. In production, RocksDB GC handles
-        // pruning after `jmt_history_length` blocks (default 256). In
-        // simulation, we retain all nodes (tests are short-lived).
+        // tree at past block heights, and a simulation's runs are short
+        // enough that keeping every one costs nothing.
 
         // Substate bytes: the byte total behind the currently applied version
         // (equal across any interleaved empty commits) plus this
@@ -194,11 +214,17 @@ pub struct ConsensusState {
     pub receipt_heights: HashMap<TxHash, BlockHeight>,
     /// Execution certificates keyed by [`TickId`].
     pub execution_certs: HashMap<TickId, ExecutionCertificate>,
-    /// Index: attested transaction → the certificate carrying its
-    /// outcome. Mirrors the production `tx_cert_index` CF so simulation
-    /// integration tests serve the by-transaction certificate fetch the
-    /// same way a real node does.
-    pub tx_cert_index: HashMap<TxHash, TickId>,
+    /// Index: attested transaction → every certificate of this shard's
+    /// carrying an outcome for it. Mirrors the production
+    /// `tx_cert_index` CF so simulation integration tests serve the
+    /// by-transaction certificate fetch the same way a real node does.
+    ///
+    /// A set rather than a slot: a shard certifies one transaction its
+    /// verdict and then again whatever settles what the verdict left —
+    /// a retirement, a reclaim, an abandonment — and a counterpart that
+    /// asks by naming the transaction cannot say which of them it
+    /// wants.
+    pub tx_cert_index: HashMap<TxHash, BTreeSet<TickId>>,
     /// Index: `block_height` → `TickId`s at that height.
     pub finalizations_by_height: HashMap<BlockHeight, Vec<TickId>>,
     /// Beacon-witness leaves keyed by leaf index. Mirrors the production
@@ -219,6 +245,15 @@ pub struct ConsensusState {
     /// production `safe_vote_registers` CF; reads ignore records whose
     /// tag differs from the current `chain_origin`.
     pub safe_vote_registers: HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>,
+    /// Blocks written beside a validator's safe-vote registers, keyed by
+    /// height then hash and tagged with the chain origin that wrote them.
+    /// Mirrors the production `voted_blocks` CF: the uncommitted chain
+    /// behind the certificate the record carries, so a restarted
+    /// validator can extend it. Dropped at or below the committed height
+    /// on every commit — the hash in the key keeps a fork sibling from
+    /// displacing its rival before then — and, like the registers,
+    /// ignored by reads once the tag no longer matches.
+    pub voted_blocks: BTreeMap<(BlockHeight, BlockHash), (ChainOrigin, Arc<Block>)>,
 }
 
 /// Maximum number of blocks worth of receipts to retain in simulation storage.
@@ -243,16 +278,17 @@ impl ConsensusState {
             provisions: BTreeMap::new(),
             chain_origin: ChainOrigin::ROOT,
             safe_vote_registers: HashMap::new(),
+            voted_blocks: BTreeMap::new(),
         }
     }
 
     /// Record the provision bodies a committing block carried, and drop
-    /// every body below `jmt_history_length` blocks back — the depth a
-    /// replay can still read state at, and so the depth one can start
-    /// from. Mirrors `RocksDbShardStorage::append_provisions_to_batch`.
-    pub(crate) fn record_provisions(&mut self, block: &Block, jmt_history_length: u64) {
+    /// every body below the retention floor — the depth a replay can
+    /// still read state at, and so the depth one can start from. Mirrors
+    /// `RocksDbShardStorage::append_provisions_to_batch`.
+    pub(crate) fn record_provisions(&mut self, block: &Block, retention_floor: u64) {
         let height = block.height();
-        let floor = height.saturating_sub(jmt_history_length);
+        let floor = BlockHeight::new(retention_floor);
         if floor > BlockHeight::GENESIS {
             self.provisions.retain(|(at, _), _| *at >= floor);
         }
@@ -262,6 +298,13 @@ impl ConsensusState {
                 Arc::new(bundle.as_unverified().clone()),
             );
         }
+    }
+
+    /// Drop the vote-justification blocks the chain has now committed.
+    /// Everything at or below `committed` is durable as chain content,
+    /// and a fork sibling at that height can no longer be extended.
+    pub(crate) fn drop_voted_blocks_through(&mut self, committed: BlockHeight) {
+        self.voted_blocks.retain(|(at, _), _| *at > committed);
     }
 
     /// Insert a slice of stored receipts into the consensus + metadata maps.
@@ -312,37 +355,12 @@ pub fn apply_writes(
     // Each entry's leaf row rides the same state/history pipeline a
     // cell does; the index rows beside them keep range scans native.
     let leaf_rows = entry_leaf_rows(writes.entries());
+    let mut sweep_rows = SweepRows::default();
     for (key, change) in writes.cells().iter().chain(&leaf_rows) {
         let prior = state.current_state.get(key).cloned();
-        // The sweep index counts live sweepable cells per owner and
-        // bucket, moved by whatever the write changes the cell into.
-        let was = prior
-            .as_deref()
-            .and_then(|bytes| sweepable_expiry(*key, bytes));
-        let now = change
-            .as_deref()
-            .and_then(|bytes| sweepable_expiry(*key, bytes));
-        if was != now {
-            if let Some(expiry) = was {
-                let row = (SweepBucket::of(expiry), key.owner);
-                let count = state
-                    .sweep_index
-                    .get(&row)
-                    .copied()
-                    .expect("a sweepable cell was counted when it was written")
-                    - 1;
-                if count == 0 {
-                    state.sweep_index.remove(&row);
-                } else {
-                    state.sweep_index.insert(row, count);
-                }
-            }
-            if let Some(expiry) = now {
-                *state
-                    .sweep_index
-                    .entry((SweepBucket::of(expiry), key.owner))
-                    .or_default() += 1;
-            }
+        let package = index_leaf(*key, prior.as_deref(), change.as_deref(), &mut sweep_rows);
+        if let (Some(package), Some(value)) = (package, change) {
+            state.package_artifacts.insert(package, value.clone());
         }
         if write_history {
             state.state_history.insert((*key, version), prior);
@@ -356,14 +374,7 @@ pub fn apply_writes(
             }
         }
     }
-    // The package index, fed exactly as the RocksDB backend feeds its CF.
-    for (key, change) in writes.cells() {
-        if let Some(value) = change
-            && let Some(package) = package_of_cell(*key, value)
-        {
-            state.package_artifacts.insert(package, value.clone());
-        }
-    }
+    state.sweep_index.fold(&sweep_rows);
     for (key, change) in writes.entries() {
         let prior = state.current_entries.get(key).cloned();
         if write_history {

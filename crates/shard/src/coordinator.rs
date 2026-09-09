@@ -12,16 +12,16 @@
 //! This provides a strong DA guarantee: if a QC forms, at least 2f+1 validators have
 //! the complete block data, making it recoverable from any honest validator in that set.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, FinalizationHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr,
-    ProposerTimestamp, ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger,
-    ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StoredReceipt,
-    SubstateKey, TerminalVerdict, TxClaim, TxOutcome, WeightedTimestamp, WorkInFlight,
-    derive_reshape_trigger, ready_signal_window, settled_set_verdict,
+    AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CounterpartMirror, DeferOn, Epoch,
+    FinalizationHash, Hash, LocalTimestamp, MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK,
+    PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvenCells, ProvisionHash, ReadySignal,
+    ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim,
+    StoredReceipt, SubstateKey, VerificationKind, WeightedTimestamp, WorkInFlight,
+    derive_reshape_trigger, ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -89,20 +89,21 @@ use std::time::Duration;
 
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
-    BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootVerifyError,
-    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError,
-    CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
-    LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, MAX_VALIDITY_RANGE,
-    PredecessorTerminal, ProvisionRootVerifyError, ProvisionTxRootsMap,
-    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext, QcVerifyError,
-    QuorumCertificate, RecoveryCause, Round, SafeVoteRegisters, StateRoot, StateRootVerifyError,
-    Timeout, TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TxHash,
-    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
-    derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
+    BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
+    BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
+    MAX_ROUND_GAP, MAX_VALIDITY_RANGE, PredecessorTerminal, Provisions, QcContext, QcVerifyError,
+    QuorumCertificate, RecoveryCause, Round, SafeVoteRegisters, StateRoot, Timeout,
+    TopologySchedule, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, Verified,
+    Verifier, Verify, VoteCount, VotePosition, derive_leaves, missed_proposals_since_prev_commit,
+    ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
 
+use crate::admission::{
+    Admission, FinalizationsFold, ProvisionsFold, QcChainSets, RecordsFold, StateClaimsFold,
+    TransactionsFold,
+};
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::block_sync::{
     BlockSyncHealthDecision, BlockSyncManager, BlockSyncVerificationResult, IngestOutcome,
@@ -113,13 +114,14 @@ use crate::commit_pipeline::CommitPipeline;
 use crate::config::ShardConsensusConfig;
 use crate::deferred_qc::DeferredQc;
 use crate::fee_ledger::FeeReservationLedger;
+use crate::fence::{VoteFence, Withheld};
 use crate::lookups::{committee_public_keys, vote_recipients};
 use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
-use crate::precut::{Precut, PrecutStatus, PrecutVerdict};
+use crate::precut::Precut;
 use crate::proposal::{
-    ProposalKind, ProposalTracker, TakeResult, assemble_build_action, dispatch_or_defer,
-    filter_engaged_transactions, select_finalizations, select_provisions, select_terminal_verdicts,
-    select_transactions,
+    Prefilter, ProposalKind, ProposalPayload, ProposalTracker, TakeResult, assemble_build_action,
+    dispatch_or_defer, late_deliveries, select_abandonment_records, select_finalizations,
+    select_provisions, select_state_claims, select_transactions,
 };
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::timeout_keeper::TimeoutKeeper;
@@ -129,7 +131,7 @@ use crate::validation::{
 };
 use crate::verification::{
     InFlightCheck, ReadyStateRootVerification, SubstateCountBlocked, SubstateCountSource,
-    VerificationKind, VerificationPipeline,
+    VerificationPipeline, committed_cells_for,
 };
 use crate::view_change::ViewChangeController;
 use crate::vote_keeper::VoteKeeper;
@@ -305,9 +307,20 @@ pub struct ShardCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
     /// Pending blocks being assembled (hash -> pending block).
     pending_blocks: PendingBlocks,
+    /// Blocks the store handed back at startup, awaiting their first
+    /// verification drive. They are assembled already; what they lack is
+    /// the state each one left, which only re-running the verification
+    /// pipeline produces — and that needs a topology schedule, which
+    /// construction has no access to. Drained by
+    /// [`Self::resume_recovered_blocks`] on the first periodic entry that
+    /// carries one.
+    recovered_blocks: Vec<BlockHash>,
     /// In-flight fee reservations at this (payer) shard — committed VM
     /// transactions whose ticks have not yet finalized.
     fee_ledger: FeeReservationLedger,
+    /// The figures an abandonment record must restate for every
+    /// committed transaction a record may still name — what the vote
+    /// fence checks a record's entries against.
     /// Fee-reservation verifications whose balance-read anchor the local
     /// commit pipeline hasn't materialized yet: block hash → (demands,
     /// anchor). The anchor is ancestry-proven, so the commit that
@@ -338,6 +351,14 @@ pub struct ShardCoordinator {
     /// emits at most one timeout per round (the timer itself retransmits).
     last_timed_out_round: Option<Round>,
 
+    /// The highest certified height a retained ex-member has offered
+    /// across a halt recovery — read off the timeouts
+    /// [`Self::harvest_retained_tip`] harvests, which is the only signal
+    /// carrying the halted tip to an incomer seated at the beacon's
+    /// frontier. Gates this member's proposals until its own `high_qc`
+    /// reaches it; see [`Self::recovery_behind_retained_tip`].
+    retained_tip_offered: Option<BlockHeight>,
+
     /// HotStuff-2 safe-vote lock: the highest `parent_qc` round we have ever
     /// voted to extend. We refuse to vote for a block whose `parent_qc` round
     /// is below this — the entire fork-safety mechanism, kept local (no
@@ -366,6 +387,12 @@ pub struct ShardCoordinator {
     /// Bridges synchronous shard commits to async mempool processing, and
     /// provides a bounded retention window for historical dedup.
     dedup_index: CommitDedupIndex,
+
+    /// Ticks whose determined half the chain still owes, mirrored from
+    /// the execution fold so the proposer and the vote path judge
+    /// settlement order by one rule. Empty until the node reports one,
+    /// which enforces nothing — the safe direction.
+    owed_determined: BTreeSet<BlockHeight>,
 
     /// Validator "ready on shard" signals waiting for inclusion in the
     /// next proposed block. Drained at proposal time.
@@ -428,14 +455,48 @@ pub struct ShardCoordinator {
     /// predates the cut.
     precut: Precut,
 
-    /// Settled-tick sets for shards that have terminated at a split,
-    /// keyed by the terminated shard. The split-boundary fence consults
-    /// this when voting on a block whose finalizations carry a
-    /// certificate from a past-terminal shard: a cross-shard tick names
-    /// that shard, so the vote may only commit if the shard actually
-    /// settled the tick. Populated by the settled-transaction acquisition via
-    /// [`Self::record_settled_txs`].
-    settled_sets: HashMap<ShardId, SettledTxSet>,
+    /// Advanced by every change to the predecessors' answers, beside the
+    /// generations the two mirrors keep for themselves.
+    precut_generation: u64,
+
+    /// The generations of everything the fence reads — the counterpart
+    /// mirror's, the proven anchors', the proven cells', the pre-cut
+    /// answers' — at the last re-drive of the votes the fence deferred.
+    /// Compared once per dispatch, so a vote deferred on any of them is
+    /// re-driven by whatever advanced it.
+    fence_seen: (u64, u64, u64, u64),
+
+    /// What counterparts have said about the transactions legs here
+    /// issued for, as the execution coordinator mirrored and folded
+    /// them: a core's refusal, a proved absence, a consumer's claim.
+    ///
+    /// A record's arm is checked against this and nothing else —
+    /// equality on the anchor — and a voter that does not hold the
+    /// evidence defers. One mirror rather than a copy, so a record
+    /// cannot pass here that its own composer would not have offered.
+    evidence: Arc<CounterpartMirror>,
+
+    /// Commit-proven anchors of remote shards — the root and parent-QC
+    /// clock each header carries — mirrored off `RemoteHeaderCommitted`
+    /// for the state-proof check: a block's bundle names an anchor, and
+    /// the voter holds it to the header it has.
+    ///
+    /// Owned here and shared with the execution coordinator, which asks
+    /// the same question of it — whether this node has proven a
+    /// counterpart's height — for the certificate gate and the probe
+    /// anchor. One mirror, so the fence cannot accept a bundle at an
+    /// anchor the prober would not have chosen.
+    proven_anchors: Arc<ProvenAnchors>,
+
+    /// The counterpart cells this validator has proven for itself, for
+    /// the state-claim check: a block states a reading, and the voter
+    /// holds it to the one it took.
+    ///
+    /// Owned here and written by the execution coordinator, whose
+    /// fetches are where a reading comes from, and read by the
+    /// state-proof server, which relays a peer the proof one was taken
+    /// from.
+    proven_cells: Arc<ProvenCells>,
 }
 
 impl std::fmt::Debug for ShardCoordinator {
@@ -456,6 +517,13 @@ impl ShardCoordinator {
     ///
     /// * `config` - Shard consensus configuration
     /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a block the store handed back cannot be assembled. The
+    /// store writes whole blocks, so an incomplete one is a corrupt
+    /// store rather than a missing delivery, and resuming on it would
+    /// build a chain no other replica agrees with.
     #[must_use]
     pub fn new(
         verifier: Arc<dyn Verifier>,
@@ -519,6 +587,26 @@ impl ShardCoordinator {
         if recovered.committed_hash.is_none() {
             dedup_index.cover_to_origin();
         }
+        // The uncommitted chain behind the restored certificate. Complete
+        // as stored — the store wrote whole blocks — so each goes back as
+        // an assembled pending block, needing no fetch. Their verification
+        // is driven from `resume_recovered_blocks`, which runs on the
+        // first periodic entry holding a topology schedule.
+        let mut pending_blocks = PendingBlocks::new();
+        let mut recovered_blocks = Vec::new();
+        for block in &recovered.voted_blocks {
+            recovered_blocks.push(block.header().hash());
+            let mut pending = PendingBlock::from_complete_block(
+                block,
+                block.certificates().iter().map(Arc::clone).collect(),
+                block.provisions().iter().map(Arc::clone).collect(),
+                LocalTimestamp::ZERO,
+            );
+            pending
+                .construct_block()
+                .expect("a stored block is complete by construction");
+            pending_blocks.insert(pending);
+        }
         Self {
             verifier,
             view_change: ViewChangeController::new(initial_view),
@@ -545,11 +633,13 @@ impl ShardCoordinator {
             latest_qc: high_qc,
             anchor_qc: recovered.anchor_qc,
             deferred_qc: DeferredQc::new(),
-            pending_blocks: PendingBlocks::new(),
+            pending_blocks,
+            recovered_blocks,
             fee_ledger: FeeReservationLedger::new(),
             votes: VoteKeeper::new(),
             timeouts: TimeoutKeeper::new(),
             last_timed_out_round: None,
+            retained_tip_offered: None,
             // Recover the registers from the durable record (which holds
             // every position this validator signed — persisted before each
             // signature left the process), floored at the high QC's round
@@ -565,6 +655,7 @@ impl ShardCoordinator {
             block_sync: BlockSyncManager::new(),
             proposal: ProposalTracker::new(),
             dedup_index,
+            owed_determined: BTreeSet::new(),
             ready_signal_pool: ReadySignalPool::new(),
             detected_equivocators: BTreeSet::new(),
             beacon_witness_accumulator: BeaconWitnessAccumulator::from_leaves(
@@ -577,7 +668,11 @@ impl ShardCoordinator {
             local_shard,
             chain_origin: recovered.chain_origin,
             precut: Precut::succeeding(recovered.predecessors),
-            settled_sets: HashMap::new(),
+            precut_generation: 0,
+            fence_seen: (0, 0, 0, 0),
+            evidence: Arc::new(CounterpartMirror::new()),
+            proven_anchors: Arc::new(ProvenAnchors::new()),
+            proven_cells: Arc::new(ProvenCells::new()),
         }
     }
 
@@ -710,7 +805,17 @@ impl ShardCoordinator {
 
     /// The committee lookup itself, for the callers that hold an anchor
     /// rather than a parent hash. Terminal-clamped and recovery-bridged;
-    /// `None` is a beacon-behind stall or an evicted window.
+    /// `None` is a beacon-behind stall, an evicted window, or a window
+    /// that seats nobody.
+    ///
+    /// That last one reads as a stall for the same reason the other two
+    /// do: a snapshot whose ready-filtered committee for this shard is
+    /// empty answers no committee question. Its quorum threshold is zero,
+    /// which `VoteCount::has_quorum` satisfies with a single vote, and its
+    /// proposer rotation has nothing to rotate over — so a caller handed
+    /// one either asserts or proceeds on a quorum that means nothing.
+    /// Stalling until a window that seats somebody governs the work is the
+    /// same discipline as stalling on a beacon that has not caught up.
     ///
     /// `anchor` must be a *committee* anchor — [`Self::committee_anchor`] of
     /// the block in question, or equivalently [`Self::block_anchor`] of its
@@ -725,6 +830,11 @@ impl ShardCoordinator {
         topology_schedule
             .at_for_shard_live(self.local_shard, anchor)
             .map(|(snapshot, _)| snapshot)
+            .filter(|snapshot| {
+                !snapshot
+                    .consensus_committee_for_shard(self.local_shard)
+                    .is_empty()
+            })
     }
 
     /// Committee anchor of the height in progress / our next proposal: the
@@ -841,41 +951,83 @@ impl ShardCoordinator {
             && self.now.as_millis() < window_start.as_millis()
     }
 
-    /// Record a terminated shard's settled-transaction set for the
-    /// split-boundary fence. A one-shot acquisition fetches the complete
-    /// window list and verifies it against the beacon-attested
-    /// `settled_txs_root` before feeding it here; voting on a block
-    /// whose finalizations name `shard` then resolves against the set
-    /// instead of deferring. Pair with [`Self::redrive_pending_votes`] to
-    /// re-drive votes that deferred at the fence before the set was known.
-    pub fn record_settled_txs(&mut self, shard: ShardId, settled: SettledTxSet) {
-        self.settled_sets.insert(shard, settled);
+    /// Mirror a commit-proven remote header for everything that asks
+    /// whether this node has proven a counterpart's height.
+    pub fn record_proven_anchor(&mut self, anchor: Anchor) {
+        self.proven_anchors.record(anchor);
     }
 
-    /// Drop settled-transaction sets past their evidence window. Once the
-    /// committed chain advances beyond it, the fence rejects any tick
-    /// naming the shard regardless of the set, so retaining it only leaks
-    /// memory.
-    fn gc_settled_sets(&mut self, topology_schedule: &TopologySchedule) {
-        let now = self.committed_block_anchor_wt;
-        self.settled_sets
-            .retain(|shard, _| topology_schedule.terminal_evidence_readable(*shard, now));
-    }
-
-    /// The settled-transaction set this validator has acquired for a terminated
-    /// shard, or `None` if it hasn't yet. The acquisition host populates
-    /// it; a test or RPC reads it to observe that the acquisition ran.
+    /// The counterpart mirror the vote fence reads, for the execution
+    /// coordinator to write.
     #[must_use]
-    pub fn settled_set(&self, shard: ShardId) -> Option<&SettledTxSet> {
-        self.settled_sets.get(&shard)
+    pub const fn evidence(&self) -> &Arc<CounterpartMirror> {
+        &self.evidence
     }
 
-    /// Re-drive the vote path for every pending complete block. Called
-    /// after a settled set is recorded ([`Self::record_settled_txs`]):
-    /// blocks that deferred at the split-boundary fence for want of that
-    /// set can now resolve. `trigger_qc_verification_or_vote` is
-    /// idempotent (already-verified / already-voted short-circuit), so
-    /// re-driving every pending block is safe.
+    /// The mirror, for the execution coordinator to read the same bytes
+    /// this validator's vote fence reads.
+    #[must_use]
+    pub const fn proven_anchors(&self) -> &Arc<ProvenAnchors> {
+        &self.proven_anchors
+    }
+
+    /// The cells this validator has proven, for the execution
+    /// coordinator to write what its fetches attest and the state-proof
+    /// server to relay the bytes they came from.
+    #[must_use]
+    pub const fn proven_cells(&self) -> &Arc<ProvenCells> {
+        &self.proven_cells
+    }
+
+    /// Retire the commit-proven anchors nothing can probe against any
+    /// more. One retirement for both consumers, since there is one
+    /// mirror.
+    ///
+    /// What counterparts said is retired by the execution coordinator
+    /// instead, against the ledger its entries speak for.
+    fn retire_proven_anchors(&self) {
+        self.proven_anchors
+            .retire_below(self.committed_block_anchor_wt);
+        self.proven_cells
+            .retire_below(self.committed_block_anchor_wt);
+    }
+
+    /// The evidence a vote is fenced on, borrowed for one judgment.
+    fn vote_fence(&self) -> VoteFence<'_> {
+        VoteFence {
+            evidence: &self.evidence,
+            proven_anchors: &self.proven_anchors,
+            proven_cells: &self.proven_cells,
+            precut: &self.precut,
+            cut: self.chain_origin.anchor_wt,
+            local_shard: self.local_shard,
+        }
+    }
+
+    /// Whether anything the vote fence reads has been written since the
+    /// last time this answered `true`: a counterpart's word, a settled
+    /// set, a record's cover, a proven anchor, a proven cell, a
+    /// predecessor's answer.
+    /// The state machine asks once per dispatch and re-drives the
+    /// pending votes on `true`, so no writer has to know which votes
+    /// were deferred on what it wrote.
+    pub fn take_fence_evidence_advanced(&mut self) -> bool {
+        let now = (
+            self.evidence.generation(),
+            self.proven_anchors.generation(),
+            self.proven_cells.generation(),
+            self.precut_generation,
+        );
+        let advanced = now != self.fence_seen;
+        self.fence_seen = now;
+        advanced
+    }
+
+    /// Re-drive the vote path for every pending complete block, for the
+    /// votes the fence deferred on evidence that has since arrived.
+    /// `trigger_qc_verification_or_vote` is idempotent (already-verified
+    /// / already-voted short-circuit), so re-driving every pending block
+    /// is safe.
     pub fn redrive_pending_votes(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let pending: Vec<BlockHash> = self
             .pending_blocks
@@ -888,216 +1040,6 @@ impl ShardCoordinator {
             actions.extend(self.trigger_qc_verification_or_vote(topology_schedule, block_hash));
         }
         actions
-    }
-
-    /// The split-boundary fence over a block's committed finalizations.
-    ///
-    /// A finalization's certificate carries one execution certificate
-    /// per participating shard. When a constituent certificate names a
-    /// shard that is **past-terminal** at the block's anchored window,
-    /// the cross-shard tick straddled that shard's split: committing this
-    /// block applies the tick's local half, so it may only commit if the
-    /// terminated shard actually settled the tick in its own chain by its
-    /// terminal block — otherwise one side of a cross-shard transaction
-    /// applies without the other.
-    ///
-    /// Past-terminal-ness is read off the **anchored** snapshot at
-    /// `anchored_wt` (the block's `parent_qc` weighted timestamp), never
-    /// the head, so every replica voting this block reaches the same
-    /// verdict. A shard evicted from every retained window is so far past
-    /// its terminal that any tick naming it is unreachable everywhere —
-    /// reject. A past-terminal shard whose settled set isn't known yet
-    /// defers the vote; past the set's evidence window the tick is
-    /// categorically unreachable and rejects.
-    ///
-    /// An abandonment carries no counterpart certificate, so it yields no
-    /// settlement claim and [`Self::abandons_a_settled_tx`] is what judges
-    /// it instead.
-    fn fence_finalizations(
-        &self,
-        topology_schedule: &TopologySchedule,
-        block: &Block,
-        anchored_wt: WeightedTimestamp,
-    ) -> SettledSetVerdict {
-        if self.abandons_a_settled_tx(block) {
-            return SettledSetVerdict::Reject;
-        }
-        let outcomes = block.certificates().iter().flat_map(|fw| {
-            fw.execution_certificates().iter().flat_map(|ec| {
-                let shard = ec.shard_id();
-                ec.tx_outcomes()
-                    .iter()
-                    .map(move |outcome| (shard, outcome.tx_hash(), TxClaim::Settled))
-            })
-        });
-        settled_set_verdict(
-            &self.settled_sets,
-            topology_schedule,
-            self.local_shard,
-            anchored_wt,
-            outcomes,
-        )
-    }
-
-    /// Whether the block abandons a transaction some terminated shard
-    /// settled — a verdict that would tear a cross-shard transaction in
-    /// half, and the one thing about an abandonment a voter can check.
-    ///
-    /// The question is put to the sets rather than to the transaction. A
-    /// settled set names only what its shard settled, so a hit is proof
-    /// the transaction reached an outcome there and this shard may not
-    /// abort it, while a shard that was never party to it cannot produce
-    /// one. That is what makes the participants unnecessary here: they are
-    /// derived at commit from the transaction body, which the block
-    /// carrying the abandonment does not hold.
-    ///
-    /// A miss is not proof of the opposite — a set this node has not
-    /// acquired could still name the transaction. So enforcement is by the
-    /// replicas holding the terminated shard's set, and a block reaches no
-    /// quorum once f+1 of them do. The composing side is stricter: its
-    /// gate defers until the set answers, so an honest proposer offers no
-    /// abandonment this scan has yet to see the evidence for.
-    fn abandons_a_settled_tx(&self, block: &Block) -> bool {
-        if self.settled_sets.is_empty() {
-            return false;
-        }
-        block.certificates().iter().any(|fw| {
-            let attested_remotely: HashSet<TxHash> = fw
-                .execution_certificates()
-                .iter()
-                .filter(|ec| ec.shard_id() != self.local_shard)
-                .flat_map(|ec| ec.tx_outcomes().iter().map(TxOutcome::tx_hash))
-                .collect();
-            fw.tx_hashes()
-                .filter(|tx_hash| !attested_remotely.contains(tx_hash))
-                .any(|tx_hash| {
-                    self.settled_sets
-                        .values()
-                        .any(|settled| settled.txs.contains(&tx_hash))
-                })
-        })
-    }
-
-    /// Apply the split-boundary fence at vote time; returns `true` (and
-    /// logs) when the vote must not proceed. `Reject` declines the vote
-    /// outright (the block can never commit here); `Defer` holds the
-    /// block pending until the settled set is acquired (the vote
-    /// re-drives on [`Self::record_settled_txs`]).
-    fn fence_blocks_vote(
-        &self,
-        topology_schedule: &TopologySchedule,
-        block: &Block,
-        block_hash: BlockHash,
-    ) -> bool {
-        match self.fence_finalizations(
-            topology_schedule,
-            block,
-            block.header().parent_qc().weighted_timestamp(),
-        ) {
-            SettledSetVerdict::Pass => false,
-            SettledSetVerdict::Reject => {
-                warn!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    "Finalization names a past-terminal shard that didn't settle it — not voting"
-                );
-                true
-            }
-            SettledSetVerdict::Defer => {
-                trace!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    "Settled set for a past-terminal shard unknown at vote; deferring"
-                );
-                true
-            }
-        }
-    }
-
-    /// Whether the block's terminal-verdict records are ones this voter
-    /// can attest to, and so whether voting on it must be withheld.
-    ///
-    /// A record makes two claims, and both have to be checked or neither
-    /// is. The first is that a shard departed, at a stated cut; the second
-    /// is that it left the named transactions unsettled when it went.
-    ///
-    /// The departure is the schedule's to answer, and it is asked first
-    /// because the second question is only meaningful once it holds. A
-    /// shard still live in the anchored window has no settled set and can
-    /// settle any of the transactions named at any time, so a record
-    /// against it is not a claim a voter could ever check — and
-    /// [`settled_set_verdict`] passes over such a shard rather than
-    /// judging it, which is right for the question it exists to ask and
-    /// would leave this one unasked. The stated cut is held to the
-    /// schedule's own for the same reason: it is what dates the record
-    /// against the transactions it speaks for, and nothing downstream
-    /// re-derives it.
-    ///
-    /// What the departed shard actually settled is then the same question
-    /// the split-boundary fence puts to its settled set, so it is asked
-    /// through the same predicate and the record's validity cannot drift
-    /// from the verdict it will later license. The set is complete and
-    /// beacon-attested, so absence from it is proof rather than ignorance.
-    ///
-    /// A voter that has not acquired the set defers rather than guessing:
-    /// the record is only proposable inside the window where the set can
-    /// be read, so a voter inside it either has the set or is about to.
-    /// After that window the record is history and nothing re-asks this.
-    fn fence_terminal_verdicts(
-        &self,
-        topology_schedule: &TopologySchedule,
-        block: &Block,
-        block_hash: BlockHash,
-    ) -> bool {
-        if block.terminal_verdicts().is_empty() {
-            return false;
-        }
-        let anchored_wt = block.header().parent_qc().weighted_timestamp();
-        for verdict in block.terminal_verdicts() {
-            let scheduled = topology_schedule.terminal_cut_for_shard(verdict.shard(), anchored_wt);
-            if scheduled != Some(verdict.terminal_wt()) {
-                warn!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    shard = ?verdict.shard(),
-                    claimed = ?verdict.terminal_wt(),
-                    ?scheduled,
-                    "Terminal-verdict record names a departure the schedule does not attest — \
-                     not voting"
-                );
-                return true;
-            }
-        }
-        let claims = block.terminal_verdicts().iter().flat_map(|verdict| {
-            verdict
-                .tx_hashes()
-                .map(move |tx_hash| (verdict.shard(), tx_hash, TxClaim::Abandoned))
-        });
-        match settled_set_verdict(
-            &self.settled_sets,
-            topology_schedule,
-            self.local_shard,
-            anchored_wt,
-            claims,
-        ) {
-            SettledSetVerdict::Pass => false,
-            SettledSetVerdict::Reject => {
-                warn!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    "Terminal-verdict record names a transaction its shard settled — not voting"
-                );
-                true
-            }
-            SettledSetVerdict::Defer => {
-                trace!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    "Settled set for a terminal-verdict record unknown at vote; deferring"
-                );
-                true
-            }
-        }
     }
 
     /// Whether `wt` lands past this shard's terminal window — the coast
@@ -1143,67 +1085,6 @@ impl ShardCoordinator {
     #[must_use]
     pub fn dissolved(&self, topology_schedule: &TopologySchedule) -> bool {
         self.quiescent(topology_schedule) && topology_schedule.successors_live(self.local_shard)
-    }
-
-    /// What in `block` belongs to the chain that ran before this one, if
-    /// anything: a transaction whose validity window opened before the
-    /// cut, or a certificate anchored before it.
-    ///
-    /// The two classes part company here. A **certificate** anchored
-    /// before the cut is refused outright and always: it names a tick on
-    /// the predecessor, resolves transactions this chain never committed,
-    /// and carries receipts computed against a state this genesis never
-    /// held. There is no harmless subset to separate out.
-    ///
-    /// A **transaction** is different. The hazard is only what the
-    /// predecessor actually *committed*; one submitted before the cut and
-    /// never committed is harmless, and landing it here is its first
-    /// inclusion. Refusing the whole class is the safe default a
-    /// successor runs under until it can ask the finer question, and
-    /// [`PrecutResolutions`] is the answer: per-predecessor, each
-    /// absence proven against a `committed_txs_root` this chain
-    /// commit-proved.
-    ///
-    /// Unresolved defers rather than refuses. Every honest validator
-    /// reaches the same verdict once the answer lands, so a slow answer
-    /// costs a wait; refusing would spend a round on it instead and make
-    /// the block look bad rather than early.
-    ///
-    /// Provisions are left out. A batch carries its *source* shard's
-    /// weighted timestamp where the cut is in this chain's, so a rule
-    /// written on that comparison would refuse honest batches near the
-    /// boundary — and a pre-cut batch can only provision transactions the
-    /// rule above already refuses, so it is inert here.
-    ///
-    /// The chains this can match at all are bounded by
-    /// [`Self::precut_window_open`].
-    fn precut_verdict(&self, block: &Block) -> PrecutVerdict {
-        let cut = self.chain_origin.anchor_wt;
-        if let Some(fw) = block
-            .certificates()
-            .iter()
-            .find(|fw| fw.local_ec().vote_anchor_ts() < cut)
-        {
-            return PrecutVerdict::Reject(format!("certificate for tick {:?}", fw.tick_id()));
-        }
-        // A proven replay refuses the block whatever else is outstanding,
-        // so the scan runs to the end rather than deferring on the first
-        // unresolved transaction it meets.
-        let mut deferred = None;
-        for tx in block
-            .transactions()
-            .iter()
-            .filter(|tx| tx.validity_range().start_timestamp_inclusive < cut)
-        {
-            match self.precut.status(&tx.hash()) {
-                PrecutStatus::Absent => {}
-                PrecutStatus::Committed => {
-                    return PrecutVerdict::Reject(format!("transaction {}", tx.hash()));
-                }
-                PrecutStatus::Unresolved => deferred = Some(tx.hash()),
-            }
-        }
-        deferred.map_or(PrecutVerdict::Pass, PrecutVerdict::Defer)
     }
 
     /// Whether content from before this chain began can still be offered
@@ -1262,6 +1143,7 @@ impl ShardCoordinator {
             "Adopted this chain's predecessors from the topology projection"
         );
         self.precut = Precut::succeeding(predecessors);
+        self.precut_generation += 1;
         true
     }
 
@@ -1279,6 +1161,7 @@ impl ShardCoordinator {
         absent: bool,
     ) {
         self.precut.record(predecessor, tx_hash, absent);
+        self.precut_generation += 1;
     }
 
     /// The `(predecessor, transaction)` pairs still owed an answer — what
@@ -1346,6 +1229,7 @@ impl ShardCoordinator {
             return false;
         }
         self.precut.retire();
+        self.precut_generation += 1;
         true
     }
 
@@ -1624,6 +1508,13 @@ impl ShardCoordinator {
         // we cannot supply, and the round timer is what bounds that wait.
         // Suppressing on either prices it at `MAX_PROGRESS_WAIT` — three
         // times the nominal timeout — while the pacemaker sits on its hands.
+        //
+        // A block the vote fence withheld is excluded on the same
+        // ground. It waits on a counterpart chain to answer for a claim
+        // its proposer made, which no amount of work here completes and
+        // a silent counterpart never ends; pricing it at the progress
+        // window hands a proposer a stall worth three rounds for one
+        // claim nobody can check.
         let next_height = self.latest_qc.as_ref().map_or_else(
             || self.committed_height.inner() + 1,
             |qc| qc.height().inner() + 1,
@@ -1631,7 +1522,7 @@ impl ShardCoordinator {
         let awaiting_tip_proposal = self.last_voted_round < self.view_change.view
             && self
                 .pending_blocks
-                .has_any_at_round(BlockHeight::new(next_height), self.view_change.view);
+                .has_own_work_at_round(BlockHeight::new(next_height), self.view_change.view);
         let suppressed = self.verification.has_verification_in_flight()
             || awaiting_tip_proposal
             || self.block_sync.has_unverified_in_flight();
@@ -1776,7 +1667,17 @@ impl ShardCoordinator {
             self.locked_round = self.locked_round.max(qc_round);
             self.last_voted_round = self.last_voted_round.max(qc_round);
         }
-        self.latest_qc = qc;
+        // The high QC only rises, for the same reason the lock does.
+        // `Self::new` restored the higher of the committed tip's
+        // certificate and the durable record's, and the record's is the
+        // one above the tip. Assigning the committed one here would drop
+        // back to a certificate beneath this node's own lock, which is
+        // what it reports in a timeout — and a bound understated is a
+        // bound another replica may vote beneath.
+        let held = self.latest_qc.as_deref().map(QuorumCertificate::round);
+        if qc.as_deref().map(QuorumCertificate::round) > held {
+            self.latest_qc = qc;
+        }
 
         self.view_change.reset_for_height_advance();
 
@@ -1819,6 +1720,43 @@ impl ShardCoordinator {
     // Proposer Logic
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /// What a block anchored at `anchor` over `parent_block_hash` is
+    /// admitted against: the chain behind the parent, walked once, and
+    /// the window the block sits in.
+    fn admission<'a>(
+        &'a self,
+        snapshot: &'a TopologySnapshot,
+        topology_schedule: &'a TopologySchedule,
+        chain: &'a QcChainSets,
+        parent_block_hash: BlockHash,
+        anchor: WeightedTimestamp,
+        genesis_parent: bool,
+    ) -> Admission<'a> {
+        let parent_settled_frontier = if genesis_parent {
+            Some(BlockHeight::GENESIS)
+        } else {
+            self.chain_view()
+                .parent_settled_frontier_checked(parent_block_hash)
+        };
+        Admission {
+            snapshot,
+            schedule: topology_schedule,
+            local_shard: self.local_shard,
+            anchor,
+            chain_origin: self.chain_origin.anchor_wt,
+            chain,
+            dedup: &self.dedup_index,
+            parent_settled_frontier,
+            owed_determined: &self.owed_determined,
+        }
+    }
+
+    /// Mirror the execution fold's owed determined halves, which
+    /// settlement order at admission is judged against.
+    pub fn set_owed_determined(&mut self, owed: BTreeSet<BlockHeight>) {
+        self.owed_determined = owed;
+    }
+
     /// Try to build and broadcast a new block proposal.
     ///
     /// This is the unified proposal entry point, called from:
@@ -1838,7 +1776,8 @@ impl ShardCoordinator {
         ready_txs: &[Arc<Verified<Transaction>>],
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
-        terminal_verdicts: Vec<TerminalVerdict>,
+        abandonment_records: Vec<AbandonmentRecord>,
+        state_claims: Vec<StateClaim>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // not the committed block — this lets the chain grow while the
@@ -1887,12 +1826,7 @@ impl ShardCoordinator {
                 topology_schedule,
                 next_height,
                 round,
-                ProposalKind::Normal {
-                    transactions: Vec::new(),
-                    finalizations: Vec::new(),
-                    provisions: Vec::new(),
-                    terminal_verdicts: Vec::new(),
-                },
+                ProposalKind::Normal(ProposalPayload::default()),
             );
         }
 
@@ -1912,76 +1846,111 @@ impl ShardCoordinator {
                 topology_schedule,
                 next_height,
                 round,
-                ProposalKind::Normal {
-                    transactions: Vec::new(),
-                    finalizations: Vec::new(),
-                    provisions: Vec::new(),
-                    terminal_verdicts: Vec::new(),
-                },
+                ProposalKind::Normal(ProposalPayload::default()),
             );
         }
 
-        // Walk the QC chain to find certificates, transactions, and
-        // provisions already in pending/certified blocks above committed
-        // height — the two-chain commit window leaves them visible and the
-        // mempool doesn't clear its ready-set until commit, so we must dedup
-        // here to avoid repeating items across consecutive blocks.
-        let (qc_chain_tx_hashes, qc_chain_provision_hashes) =
-            self.collect_qc_chain_hashes(parent_block_hash);
-        let qc_chain_resolved_txs = self.chain_view().ancestor_resolved_txs(parent_block_hash);
-
-        // Anchor validity-window filtering on the parent QC's weighted
-        // timestamp — the deterministic clock voters will use to verify
-        // this block. The one-block lag (this block's own QC may carry a
-        // slightly later timestamp) is bounded by MAX_VALIDITY_RANGE.
+        // Walk the QC chain once for what pending and certified blocks
+        // above committed height already carry — the two-chain commit
+        // window leaves them visible and the mempool doesn't clear its
+        // ready set until commit — and admit each section against it
+        // under the parent QC's weighted timestamp, the deterministic
+        // clock voters will read this block at. The one-block lag (this
+        // block's own QC may carry a slightly later timestamp) is
+        // bounded by MAX_VALIDITY_RANGE.
+        let chain = QcChainSets::behind(&self.chain_view(), parent_block_hash);
         let validity_anchor = parent_qc.weighted_timestamp();
-        let transactions = select_transactions(
-            ready_txs,
-            &qc_chain_tx_hashes,
-            &self.dedup_index,
+        // The committee governing the block being built, not the schedule's
+        // newest entry: package usability, the recovery fences, payer routing
+        // and the sweep cap all read it, and a voter judges the block under
+        // the committee its parent names. Reading the head instead disagrees
+        // for the block after every fold, and while the parent QC lags the
+        // beacon. Stall where the build itself would.
+        let Some(committee) = self.committee_for_child_of(topology_schedule, parent_block_hash)
+        else {
+            return vec![];
+        };
+        let ctx = self.admission(
+            committee,
+            topology_schedule,
+            &chain,
+            parent_block_hash,
             validity_anchor,
-            self.chain_origin.anchor_wt,
-            &self.precut,
-            topology_schedule.head(),
+            parent_qc.is_genesis(),
         );
-        let (finalizations, _finalized_tx_count) = select_finalizations(
-            finalizations,
-            &qc_chain_resolved_txs,
-            &self.dedup_index,
-            self.chain_view().parent_settled_frontier(parent_block_hash),
-            MAX_FINALIZED_TX_PER_BLOCK,
-            self.chain_origin.anchor_wt,
-        );
-        let provisions = select_provisions(
-            provisions,
-            &qc_chain_provision_hashes,
-            &self.dedup_index,
-            MAX_TXS_PER_BLOCK,
-        );
-        let terminal_verdicts =
-            select_terminal_verdicts(terminal_verdicts, topology_schedule, validity_anchor);
-        // Applied after provision selection: a cross-shard transaction
-        // rides only beside (or after) its payer bundle, the engagement
-        // evidence the voters' `validate_engagement` demands.
-        let transactions = filter_engaged_transactions(
-            topology_schedule.head(),
+        // In the order the folds depend on: provisions first, since a
+        // cross-shard transaction rides only beside (or after) its payer
+        // bundle; finalizations before the records held to their names.
+        let mut provision_fold = ProvisionsFold::default();
+        let provisions = select_provisions(&ctx, &mut provision_fold, provisions);
+        let late = late_deliveries(
+            ready_txs,
+            topology_schedule,
+            validity_anchor,
             self.local_shard,
-            transactions,
-            &provisions,
-            &self.dedup_index,
         );
+        let transactions = select_transactions(
+            &ctx,
+            &Prefilter {
+                precut: &self.precut,
+                late_deliveries: &late,
+            },
+            &mut TransactionsFold::beside(&provision_fold),
+            ready_txs,
+        );
+        let mut finalization_fold = FinalizationsFold::from(&ctx);
+        let finalizations = select_finalizations(&ctx, &mut finalization_fold, finalizations);
+        let abandonment_records = select_abandonment_records(
+            &ctx,
+            &mut RecordsFold::after(&finalization_fold),
+            abandonment_records,
+        );
+        let state_claims = select_state_claims(&ctx, &mut StateClaimsFold::default(), state_claims);
 
         self.build_and_dispatch_proposal(
             topology_schedule,
             next_height,
             round,
-            ProposalKind::Normal {
+            ProposalKind::Normal(ProposalPayload {
                 transactions,
                 finalizations,
                 provisions,
-                terminal_verdicts,
-            },
+                abandonment_records,
+                state_claims,
+            }),
         )
+    }
+
+    /// Whether this member is still short of the halted tip a retained
+    /// ex-member offered it.
+    ///
+    /// A halt recovery seats its fresh committee from a snap-synced
+    /// anchor at the beacon-attested frontier — the last boundary the
+    /// beacon folded, which sits well below the tip the old committee
+    /// certified before it stopped. The suffix between them is what the
+    /// incomers adopt, and until one of them holds a certificate over it,
+    /// the highest QC each of them has names the frontier. A whole fresh
+    /// committee proposing from there builds a second chain across
+    /// heights the halted one already holds; every replica that took the
+    /// suffix then refuses it, and the shard splits at the first
+    /// collision.
+    ///
+    /// The offer is the retained ex-members' own timeouts, which
+    /// [`Self::harvest_retained_tip`] already reads for exactly this
+    /// purpose. Holding until `high_qc` reaches the highest one seen
+    /// terminates on its own: the harvest drives the fetch that supplies
+    /// the block, and adopting the carried QC closes the gap. A shard
+    /// whose retained cohort offers nothing — no suffix above the
+    /// frontier, or no ex-member left to answer — is never held, which is
+    /// the case where extending the frontier is the only move there is.
+    fn recovery_behind_retained_tip(&self) -> bool {
+        self.retained_tip_offered.is_some_and(|offered| {
+            offered
+                > self
+                    .latest_qc
+                    .as_ref()
+                    .map_or(BlockHeight::GENESIS, |qc| qc.height())
+        })
     }
 
     /// Pre-build gate: we must be the proposer for this round, must not have
@@ -1996,6 +1965,12 @@ impl ShardCoordinator {
         // A terminated chain proposes nothing — the crossing is committed
         // and the post-split children carry on from it.
         if self.dissolved(topology_schedule) {
+            return false;
+        }
+
+        // A recovery's incomers extend the halted tip, not the frontier
+        // they seeded at.
+        if self.recovery_behind_retained_tip() {
             return false;
         }
 
@@ -2133,10 +2108,17 @@ impl ShardCoordinator {
         topology_snapshot: &TopologySnapshot,
         substate_bytes: Option<u64>,
         window: &[Hash],
+        committee_anchor_epoch: Epoch,
     ) -> Option<ReshapeTrigger> {
         let count = substate_bytes?;
         let thresholds = topology_snapshot.reshape_thresholds();
-        derive_reshape_trigger(self.local_shard, count, &thresholds, window)
+        derive_reshape_trigger(
+            self.local_shard,
+            count,
+            &thresholds,
+            window,
+            committee_anchor_epoch,
+        )
     }
 
     /// Drain dwell-eligible ready signals and preview the beacon-witness
@@ -2161,6 +2143,7 @@ impl ShardCoordinator {
         proposal_wt: WeightedTimestamp,
         parent_block_hash: BlockHash,
         substate_bytes: Option<u64>,
+        committee_anchor_epoch: Epoch,
     ) -> WitnessCommitmentPreview {
         let mut ready_signals = self.ready_signal_pool.drain_eligible(
             proposal_wt,
@@ -2218,8 +2201,12 @@ impl ShardCoordinator {
             !parent_leaves.contains(&leaf.leaf_hash())
         });
 
-        let reshape_trigger =
-            self.derive_proposal_reshape_trigger(topology_snapshot, substate_bytes, &parent_leaves);
+        let reshape_trigger = self.derive_proposal_reshape_trigger(
+            topology_snapshot,
+            substate_bytes,
+            &parent_leaves,
+            committee_anchor_epoch,
+        );
         // The block's new leaves are derived and merkle-committed in the
         // `BuildProposal` handler, where the reveal is signed off the main
         // loop. The preview resolves only the inputs to that: the trimmed
@@ -2248,10 +2235,6 @@ impl ShardCoordinator {
         round: Round,
         kind: ProposalKind,
     ) -> Vec<Action> {
-        let tickless = match &kind {
-            ProposalKind::Normal { finalizations, .. } => finalizations.is_empty(),
-            ProposalKind::Fallback | ProposalKind::Sync => true,
-        };
         let (parent_block_hash, parent_qc) = self.chain_view().proposal_parent();
         // The block we build belongs to its parent's window — the same
         // committee `can_propose` drew our slot from and the same one every
@@ -2357,13 +2340,14 @@ impl ShardCoordinator {
             parent_qc.weighted_timestamp(),
             parent_block_hash,
             substate_bytes,
+            committee_anchor_epoch,
         );
 
         // Prior demand per candidate payer: in-flight holds plus the
         // uncommitted window. The builder adds candidate ceilings on
         // top and drops what a payer cannot cover.
         let fee_checks = match &kind {
-            ProposalKind::Normal { transactions, .. } => {
+            ProposalKind::Normal(ProposalPayload { transactions, .. }) => {
                 let payer_seeds = self.local_payer_fees(
                     committee,
                     transactions.iter().map(|tx| PayerFee {
@@ -2413,24 +2397,12 @@ impl ShardCoordinator {
             self.record_leader_activity();
         }
 
-        // The build-side recovery-bridge escape, under the same conditions as
-        // the verifier's (`initiate_state_root_verification`): a tick-less
-        // block in the bridge band whose parent is a sync-admitted,
-        // QC-attested certified block dispatches without the parent tree.
-        let bridge_over_attested_parent = tickless
-            && self.recovery_bridging(topology_schedule, parent_qc.weighted_timestamp())
-            && self
-                .verification
-                .cached_verified_certified_block(plan.parent_block_hash)
-                .is_some();
-
         dispatch_or_defer(
             &mut self.proposal,
             &mut self.verification,
             plan,
             height,
             round,
-            bridge_over_attested_parent,
         )
     }
 
@@ -3262,7 +3234,8 @@ impl ShardCoordinator {
         // Otherwise fall through to the voting path directly — reachable only
         // from test fixtures; production always assembles before reaching
         // here.
-        if let Some(block) = self.pending_blocks.get_block(block_hash) {
+        if let Some(block) = self.pending_blocks.get_block(block_hash).cloned() {
+            let block = &block;
             // Content validation (`ticks` recomputation) and the beacon-witness
             // verification key on this block's own committee — the header is in
             // hand, so `None` is a beacon-behind stall, not a missing anchor.
@@ -3274,7 +3247,13 @@ impl ShardCoordinator {
             let anchor_wt = block.header().parent_qc().weighted_timestamp();
             let coasting = self.past_terminal_window(topology_schedule, anchor_wt)
                 || self.recovery_bridging(topology_schedule, anchor_wt);
-            if self.reject_invalid_block_contents(committee, block_hash, block, coasting) {
+            if self.reject_invalid_block_contents(
+                committee,
+                topology_schedule,
+                block_hash,
+                block,
+                coasting,
+            ) {
                 return vec![];
             }
 
@@ -3347,40 +3326,36 @@ impl ShardCoordinator {
                 return vec![];
             };
 
-            // Split-boundary fence over the block's finalizations.
-            if self.fence_blocks_vote(topology_schedule, block, block_hash) {
-                return vec![];
-            }
-
-            // And over the records it writes down about departed shards,
-            // which the same sets answer for.
-            if self.fence_terminal_verdicts(topology_schedule, block, block_hash) {
-                return vec![];
-            }
-
-            // Content from before this chain's origin. A certificate is
-            // refused outright; a transaction only once a predecessor is
-            // known to have committed it. Unresolved waits for the
-            // answer rather than spending a round refusing the block.
-            match self.precut_verdict(block) {
-                PrecutVerdict::Pass => {}
-                PrecutVerdict::Reject(what) => {
+            // The claims the block makes on other chains, held to what
+            // this validator has mirrored: a refusal never votes, a
+            // deferral leaves the block pending and asks for what would
+            // let the vote proceed.
+            match self.vote_fence().judge(topology_schedule, block) {
+                Ok(()) => {
+                    if let Some(pending) = self.pending_blocks.get_mut(block_hash) {
+                        pending.set_awaiting_counterpart(false);
+                    }
+                }
+                Err(Withheld::Refused(why)) => {
                     warn!(
                         validator = ?self.me,
                         block_hash = ?block_hash,
-                        %what,
-                        "Block carries content predating this chain's origin; not voting"
+                        %why,
+                        "The vote fence refuses the block — not voting"
                     );
                     return vec![];
                 }
-                PrecutVerdict::Defer(tx_hash) => {
+                Err(Withheld::Deferred { why, wanted }) => {
                     trace!(
                         validator = ?self.me,
                         block_hash = ?block_hash,
-                        ?tx_hash,
-                        "Pre-cut transaction unresolved against the predecessors; deferring"
+                        %why,
+                        "The vote fence cannot yet judge the block — deferring"
                     );
-                    return vec![];
+                    if let Some(pending) = self.pending_blocks.get_mut(block_hash) {
+                        pending.set_awaiting_counterpart(true);
+                    }
+                    return wanted;
                 }
             }
             let block_fees = self.local_payer_fees(
@@ -3556,24 +3531,26 @@ impl ShardCoordinator {
     fn reject_invalid_block_contents(
         &self,
         topology_snapshot: &TopologySnapshot,
+        topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
         block: &Block,
         coasting: bool,
     ) -> bool {
         let parent = block.header().parent_block_hash();
-        let (qc_chain_tx_hashes, qc_chain_provision_hashes) = self.collect_qc_chain_hashes(parent);
-        let qc_chain_resolved_txs = self.chain_view().ancestor_resolved_txs(parent);
-        if let Err(e) = validate_block_for_vote(
+        let chain = QcChainSets::behind(&self.chain_view(), parent);
+        let ctx = self.admission(
             topology_snapshot,
-            self.local_shard,
+            topology_schedule,
+            &chain,
+            parent,
+            block.header().parent_qc().weighted_timestamp(),
+            block.header().parent_qc().is_genesis(),
+        );
+        if let Err(e) = validate_block_for_vote(
+            &ctx,
             block,
-            &qc_chain_tx_hashes,
-            &qc_chain_resolved_txs,
-            &qc_chain_provision_hashes,
-            &self.dedup_index,
             coasting,
-            self.chain_view()
-                .parent_load_checked(block.header().parent_block_hash()),
+            self.chain_view().parent_load_checked(parent),
         ) {
             warn!(
                 validator = ?self.me,
@@ -3640,8 +3617,18 @@ impl ShardCoordinator {
         // Falls back to the head where the schedule cannot answer at all:
         // genesis has no anchor, and an evicted window is far enough back that
         // the head is the better guess.
+        // A snapshot that seats nobody for this shard answers the routing
+        // question no better than one the schedule could not resolve at
+        // all, so it falls through the same way rather than naming an
+        // empty rotation.
+        let seats_anyone = |snapshot: &Arc<TopologySnapshot>| {
+            !snapshot
+                .consensus_committee_for_shard(self.local_shard)
+                .is_empty()
+        };
         let governing = self
             .committee_for_child_of(topology_schedule, block_hash)
+            .filter(|snapshot| seats_anyone(snapshot))
             .or_else(|| {
                 // Past a terminal cut the live windows carry the shard no
                 // longer, so the coast blocks certifying the crossing route
@@ -3649,6 +3636,7 @@ impl ShardCoordinator {
                 anchored_wt
                     .and_then(|wt| topology_schedule.at_for_shard(self.local_shard, wt))
                     .map(|(snapshot, _)| snapshot)
+                    .filter(|snapshot| seats_anyone(snapshot))
             })
             .map_or_else(|| topology_schedule.head().as_ref(), Arc::as_ref);
         let next_proposers = vote_recipients(governing, self.local_shard, self.me, round);
@@ -3664,7 +3652,7 @@ impl ShardCoordinator {
             round,
             timestamp,
             next_proposers,
-            registers: self.safe_vote_registers(),
+            position: self.vote_position(Some(block_hash)),
         }]
     }
 
@@ -3994,202 +3982,52 @@ impl ShardCoordinator {
         actions
     }
 
-    /// Handle state root verification result.
+    /// One check on a pending block completed.
     ///
-    /// Called when the runner completes `Action::VerifyStateRoot`. If the state root
-    /// Handle a block root verification result (unified handler).
-    ///
-    /// Handle a completed transaction-root verification.
-    pub fn on_transaction_root_verified(
+    /// A pass records the stage and, once every check the block demands
+    /// has passed, votes — re-checking the safe-vote rule at emission,
+    /// since the round or the lock may have moved while the checks ran —
+    /// and re-drives the two-chain commit an assembled handle may have
+    /// been waiting on. A refusal drops the block. A deferral clears the
+    /// stage so the next re-drive of the vote dispatches the check again
+    /// and leaves the block pending: this validator cannot say yet, and
+    /// the block commits on a quorum's certificate like any block it did
+    /// not vote for.
+    #[instrument(skip(self, topology_schedule, outcome), fields(block_hash = ?block_hash, ?kind))]
+    pub fn on_block_check_completed(
         &mut self,
         topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
-        result: Result<Verified<TransactionRoot>, TxRootVerifyError>,
-    ) -> Vec<Action> {
-        let valid = result.is_ok();
-        if let Ok(verified) = result {
-            self.verification
-                .record_transaction_root_result(block_hash, verified);
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::TransactionRoot,
-            block_hash,
-            valid,
-        )
-    }
-
-    /// Handle a completed certificate-root verification.
-    pub fn on_certificate_root_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        result: Result<Verified<CertificateRoot>, CertRootVerifyError>,
-    ) -> Vec<Action> {
-        let valid = result.is_ok();
-        if let Ok(verified) = result {
-            self.verification
-                .record_certificate_root_result(block_hash, verified);
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::CertificateRoot,
-            block_hash,
-            valid,
-        )
-    }
-
-    /// Handle a completed local-receipt-root verification.
-    pub fn on_local_receipt_root_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        result: Result<Verified<LocalReceiptRoot>, LocalReceiptRootVerifyError>,
-    ) -> Vec<Action> {
-        let valid = result.is_ok();
-        if let Ok(verified) = result {
-            self.verification
-                .record_local_receipt_root_result(block_hash, verified);
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::LocalReceiptRoot,
-            block_hash,
-            valid,
-        )
-    }
-
-    /// Handle a completed provisions-root verification.
-    pub fn on_provisions_root_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        result: Result<Verified<ProvisionsRoot>, ProvisionRootVerifyError>,
-    ) -> Vec<Action> {
-        let valid = result.is_ok();
-        if let Ok(verified) = result {
-            self.verification
-                .record_provisions_root_result(block_hash, verified);
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::ProvisionRoot,
-            block_hash,
-            valid,
-        )
-    }
-
-    /// Handle a completed provision-tx-roots verification.
-    pub fn on_provision_tx_roots_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        result: Result<Verified<ProvisionTxRootsMap>, ProvisionTxRootsVerifyError>,
-    ) -> Vec<Action> {
-        let valid = result.is_ok();
-        if let Ok(verified) = result {
-            self.verification
-                .record_provision_tx_roots_result(block_hash, verified);
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::ProvisionTxRoots,
-            block_hash,
-            valid,
-        )
-    }
-
-    /// Handle a completed payer-shard fee-reservation verification.
-    pub fn on_reservations_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        result: &Result<(), String>,
-    ) -> Vec<Action> {
-        if let Err(reason) = result {
-            warn!(
-                block_hash = ?block_hash,
-                reason = %reason,
-                "VM fee-reservation verification FAILED"
-            );
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::Reservations,
-            block_hash,
-            result.is_ok(),
-        )
-    }
-
-    /// Handle a completed beacon-witness-root verification.
-    pub fn on_beacon_witness_root_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        result: Result<Verified<BeaconWitnessRoot>, BeaconWitnessRootVerifyError>,
-    ) -> Vec<Action> {
-        let valid = result.is_ok();
-        if let Ok(verified) = result {
-            self.verification
-                .record_beacon_witness_root_result(block_hash, verified);
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::BeaconWitnessRoot,
-            block_hash,
-            valid,
-        )
-    }
-
-    /// Handle a completed state-root verification. The `PreparedCommit`
-    /// byproduct was already side-channelled inside the action handler;
-    /// the verified handle here signals success or failure of the JMT replay.
-    pub fn on_state_root_verified(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
-        result: Result<Verified<StateRoot>, StateRootVerifyError>,
-        bytes_delta: i64,
-    ) -> Vec<Action> {
-        let valid = result.is_ok();
-        if let Ok(verified) = result {
-            self.verification
-                .record_state_root_result(block_hash, verified);
-            self.pending_bytes_deltas.insert(block_hash, bytes_delta);
-        }
-        self.on_root_verified_impl(
-            topology_schedule,
-            VerificationKind::StateRoot,
-            block_hash,
-            valid,
-        )
-    }
-
-    /// Shared completion logic for the per-kind root-verified handlers above.
-    /// If invalid, the block is rejected. If valid and every other root for
-    /// the block has been verified, proceeds to vote.
-    #[instrument(skip(self, topology_schedule), fields(block_hash = ?block_hash, ?kind, valid = valid))]
-    fn on_root_verified_impl(
-        &mut self,
-        topology_schedule: &TopologySchedule,
         kind: VerificationKind,
-        block_hash: BlockHash,
-        valid: bool,
+        outcome: CheckOutcome,
     ) -> Vec<Action> {
-        let pipeline_ok = match kind {
-            VerificationKind::StateRoot => {
-                self.verification.on_state_root_verified(block_hash, valid)
+        match outcome {
+            CheckOutcome::Refused => {
+                warn!(
+                    block_hash = ?block_hash,
+                    ?kind,
+                    "Block check FAILED — rejecting block"
+                );
+                self.verification.refused(block_hash, kind);
+                return self.remove_pending_block(block_hash);
             }
-            other => self.verification.on_root_verified(block_hash, other, valid),
-        };
-
-        if !pipeline_ok {
-            warn!(
-                block_hash = ?block_hash,
-                ?kind,
-                "Block root verification FAILED"
-            );
-            return self.remove_pending_block(block_hash);
+            CheckOutcome::Deferred(DeferOn::Bodies(names)) => {
+                trace!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    ?kind,
+                    ?names,
+                    "Block check names transactions this validator does not hold; deferring"
+                );
+                self.verification.deferred(block_hash, kind);
+                return vec![];
+            }
+            CheckOutcome::Checked { bytes_delta } => {
+                if kind == VerificationKind::StateRoot {
+                    self.pending_bytes_deltas.insert(block_hash, bytes_delta);
+                }
+                self.verification.checked(block_hash, kind);
+            }
         }
 
         let mut actions = Vec::new();
@@ -4207,7 +4045,7 @@ impl ShardCoordinator {
             debug!(
                 block_hash = ?block_hash,
                 ?kind,
-                "Verification complete but block not found in pending or synced"
+                "Check complete but block not found in pending or synced"
             );
             return actions;
         };
@@ -4220,7 +4058,7 @@ impl ShardCoordinator {
             debug!(
                 block_hash = ?block_hash,
                 ?kind,
-                "Verification done, waiting for other verifications"
+                "Check complete, waiting for the others"
             );
             return actions;
         }
@@ -4460,7 +4298,7 @@ impl ShardCoordinator {
         // Mark everything verified so the pipeline is complete. This also
         // unblocks child block verifications that need the overlay from this
         // block's PreparedCommit.
-        self.verification.mark_proposal_fully_verified(block_hash);
+        self.verification.mark_proposal_fully_verified(block);
 
         let mut actions = vec![Action::BroadcastBlockHeader {
             header: Box::new(block.header().clone()),
@@ -4616,7 +4454,8 @@ impl ShardCoordinator {
         ready_txs: &[Arc<Verified<Transaction>>],
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
-        terminal_verdicts: Vec<TerminalVerdict>,
+        abandonment_records: Vec<AbandonmentRecord>,
+        state_claims: Vec<StateClaim>,
     ) -> Vec<Action> {
         let height = qc.height();
 
@@ -4695,7 +4534,8 @@ impl ShardCoordinator {
             ready_txs,
             finalizations,
             provisions,
-            terminal_verdicts,
+            abandonment_records,
+            state_claims,
         ));
 
         actions
@@ -4807,6 +4647,33 @@ impl ShardCoordinator {
             parent_hash = parent.block().header().parent_block_hash();
             chain.push(parent);
         }
+        // The walk has to land *on* the committed tip, not merely at the
+        // height above it. A branch that reaches the right height by a
+        // different parent is a sibling of what this node committed, and
+        // splicing it would fork the chain at the tip — which is what
+        // `record_block_committed` asserts against, one step too late to
+        // do anything but abort.
+        //
+        // Two certified siblings at one height is a shape block sync
+        // already serves (`take_next_verified`), on the reasoning that
+        // only one of them can gather a round-contiguous two-chain. That
+        // holds under one committee. It does not hold while a halt
+        // recovery has two of them live — the retained committee is
+        // disarmed only once it folds the record — so the branch this
+        // node is not on arrives certified, commit-driving, and at
+        // exactly the next height.
+        if parent_hash != self.committed_hash {
+            warn!(
+                validator = ?self.me,
+                shard = ?self.local_shard,
+                height = committable.block().height().inner(),
+                committable = ?committable.block().hash(),
+                extends = ?parent_hash,
+                committed_tip = ?self.committed_hash,
+                "Refusing a commit whose prefix leaves the committed tip"
+            );
+            return None;
+        }
         chain.reverse();
         Some(chain)
     }
@@ -4897,7 +4764,7 @@ impl ShardCoordinator {
         self.committed_block_anchor_wt = block.header().parent_qc().weighted_timestamp();
         self.committed_state_root = block.header().state_root();
         self.committed_tip = Some(block.header().committed_tip());
-        self.gc_settled_sets(topology_schedule);
+        self.retire_proven_anchors();
 
         // Retire the committed block's substate delta into the count
         // frontier. Sync commits carry no delta (QC-trusted, never
@@ -5226,6 +5093,7 @@ impl ShardCoordinator {
                 parent_state_root,
                 parent_block_height,
                 parent_sweep_frontier,
+                creations: committed_cells_for(certified.block()),
                 source,
                 witness,
             }
@@ -5277,7 +5145,7 @@ impl ShardCoordinator {
             let shard = certified.qc().shard_id();
             let (block, _) = certified.into_parts();
             let verified_qc = Verified::<QuorumCertificate>::genesis(shard, self.chain_origin);
-            return self.apply_synced_block(block, verified_qc);
+            return self.apply_synced_block(topology_schedule, block, verified_qc);
         }
 
         // A fork-caused recovery pins the seed to the beacon-attested
@@ -5434,9 +5302,7 @@ impl ShardCoordinator {
         // The same fold is what carries this chain's predecessors to a seat
         // the flip never reached, so a boot that lands mid-window picks
         // them up at the first beacon block it commits.
-        if self.adopt_precut_predecessors(topology_schedule) {
-            actions.extend(self.redrive_pending_votes(topology_schedule));
-        }
+        self.adopt_precut_predecessors(topology_schedule);
         if !self.is_block_syncing() {
             actions.extend(self.maybe_emit_ready_signal(topology_schedule));
         }
@@ -5453,12 +5319,16 @@ impl ShardCoordinator {
     /// the only one that distinguishes a committed block from a
     /// certified-but-orphaned sibling at one height (both carry a valid QC). A
     /// single QC is not a commit certificate; committing on it would let a
-    /// peer-served orphan sibling fork a lagging node. The eventual commit
-    /// flows through `commit_one_buffered_block`, which selects the
-    /// synchronous inline-JMT `CommitBlockByQcOnly` path for blocks whose
-    /// state root was not locally verified.
+    /// peer-served orphan sibling fork a lagging node.
+    ///
+    /// Its tree is prepared here, at admission, through the same state-root
+    /// verification a live block gets: the QC attests the root, and the
+    /// verification is what puts the block's JMT snapshot in the overlay
+    /// for its children to build on. A block this node never verified
+    /// itself commits through `CommitBlockByQcOnly`, which prepares inline.
     fn apply_synced_block(
         &mut self,
+        topology_schedule: &TopologySchedule,
         block: Block,
         verified_qc: Verified<QuorumCertificate>,
     ) -> Vec<Action> {
@@ -5537,6 +5407,7 @@ impl ShardCoordinator {
         self.verification
             .insert_verified_certified_block(block_hash, Arc::clone(&certified));
         self.block_sync.mark_applied(height, block_hash);
+        self.initiate_synced_state_root_verification(topology_schedule, certified.block());
 
         let mut actions = self.try_two_chain_commit(certified.qc_verified(), CommitSource::Sync);
 
@@ -5547,6 +5418,45 @@ impl ShardCoordinator {
         }
 
         actions
+    }
+
+    /// Queue a sync-admitted block's state-root verification, so its tree
+    /// lands in the overlay for its children.
+    ///
+    /// Genesis is seated by the store's adoption and has no parent to
+    /// verify against. The per-window verdict bits read the block's own
+    /// window; a window the schedule has not resolved leaves the block
+    /// unverified, and its commit prepares inline instead.
+    fn initiate_synced_state_root_verification(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        block: &Block,
+    ) {
+        if block.is_genesis() || !self.verification.needs_state_root_verification(block) {
+            return;
+        }
+        let anchor_wt = block.header().parent_qc().weighted_timestamp();
+        let (Some(split_child_roots_required), Some(terminal_roots_required)) = (
+            self.split_child_roots_bit(topology_schedule, anchor_wt),
+            self.terminal_roots_bit(topology_schedule, anchor_wt),
+        ) else {
+            debug!(
+                validator = ?self.me,
+                height = block.height().inner(),
+                "Synced block's window missing from the schedule; leaving its tree to the commit"
+            );
+            return;
+        };
+        let settled_txs_window_floor =
+            topology_schedule.settled_window_floor(self.local_shard, anchor_wt);
+        self.verification.initiate_state_root_verification(
+            block.hash(),
+            block,
+            block.header().parent_qc().height(),
+            split_child_roots_required,
+            terminal_roots_required,
+            settled_txs_window_floor,
+        );
     }
 
     /// Apply all consecutive verified synced blocks, then drain the buffer
@@ -5561,7 +5471,7 @@ impl ShardCoordinator {
         while let Some((block, verified_qc)) =
             self.block_sync.take_next_verified(self.committed_height)
         {
-            actions.extend(self.apply_synced_block(block, verified_qc));
+            actions.extend(self.apply_synced_block(topology_schedule, block, verified_qc));
         }
         actions.extend(self.try_drain_buffered_synced_blocks(topology_schedule));
 
@@ -5733,7 +5643,7 @@ impl ShardCoordinator {
             round,
             high_qc: self.high_qc(),
             recipients,
-            registers: self.safe_vote_registers(),
+            position: self.vote_position(None),
         }]
     }
 
@@ -5930,6 +5840,14 @@ impl ShardCoordinator {
             carried_height = carried.height().inner(),
             committed_height = self.committed_height.inner(),
             "Harvesting the halted tip from a retained ex-member's timeout"
+        );
+        // Remember what was offered even when the QC cannot be adopted
+        // yet: the block it certifies is still being fetched, and until
+        // this member's own `high_qc` reaches it, proposing would build
+        // over heights the halted chain already holds.
+        self.retained_tip_offered = Some(
+            self.retained_tip_offered
+                .map_or_else(|| carried.height(), |seen| seen.max(carried.height())),
         );
         if carried.round() > self.high_qc_round()
             && let Some(verified) = self.verify_qc_sync(topology_schedule, carried)
@@ -6296,6 +6214,38 @@ impl ShardCoordinator {
         orphaned.into_abandon_actions()
     }
 
+    /// Drive the verification of the blocks the store handed back at
+    /// startup, lowest first.
+    ///
+    /// A restored certificate names a block above the committed tip, and
+    /// a proposer extends the block its high QC certifies — which means
+    /// executing that block over its own uncommitted ancestors. Seeding
+    /// them as pending blocks restores the bodies; only the verification
+    /// pipeline restores the state each one left, which is what the
+    /// proposal builds on. The safe-vote rule declines every one of them
+    /// (their rounds are consumed), and that is the path already taken by
+    /// a block a validator verifies without voting for.
+    ///
+    /// Runs once — a second drive would re-enter verifications already in
+    /// flight. Blocks whose parent has not been prepared yet defer inside
+    /// the pipeline and resume when it is.
+    fn resume_recovered_blocks(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        if self.recovered_blocks.is_empty() {
+            return Vec::new();
+        }
+        let mut resuming: Vec<BlockHash> = std::mem::take(&mut self.recovered_blocks);
+        resuming.sort_by_key(|hash| {
+            self.pending_blocks
+                .get_header(*hash)
+                .map_or(BlockHeight::GENESIS, BlockHeader::height)
+        });
+        let mut actions = Vec::new();
+        for hash in resuming {
+            actions.extend(self.trigger_qc_verification_or_vote(topology_schedule, hash));
+        }
+        actions
+    }
+
     /// Check pending blocks and emit fetch requests for those that have been
     /// waiting longer than the configured timeout.
     ///
@@ -6326,6 +6276,7 @@ impl ShardCoordinator {
         // committee holds the parent QC for its first block even when no
         // peer signal ever supplies a higher one.
         let mut actions = self.try_adopt_anchor_qc(topology_schedule);
+        actions.extend(self.resume_recovered_blocks(topology_schedule));
 
         let next_needed_height = self.committed_height.next();
         let has_next_block = self.has_complete_block_at_height(next_needed_height);
@@ -6589,23 +6540,12 @@ impl ShardCoordinator {
     ///
     /// Callers should request this many extra transactions from the mempool to
     /// compensate for duplicates that will be filtered during proposal building.
-    /// This avoids the caller needing to call `collect_qc_chain_hashes` separately.
     #[must_use]
     pub fn dedup_overhead(&self) -> usize {
         let parent_block_hash = self.proposal_parent_block_hash();
-        let (tx_hashes, _) = self.collect_qc_chain_hashes(parent_block_hash);
-        tx_hashes.len()
-    }
-
-    /// Walk the QC chain from `parent_block_hash` back to committed
-    /// height, collecting transaction and provision hashes from ancestor
-    /// blocks. Thin wrapper over [`ChainView::collect_ancestor_hashes`].
-    #[must_use]
-    pub fn collect_qc_chain_hashes(
-        &self,
-        parent_block_hash: BlockHash,
-    ) -> (HashSet<TxHash>, HashSet<ProvisionHash>) {
-        self.chain_view().collect_ancestor_hashes(parent_block_hash)
+        QcChainSets::behind(&self.chain_view(), parent_block_hash)
+            .txs
+            .len()
     }
 
     /// Get the shard consensus configuration.
@@ -6640,6 +6580,54 @@ impl ShardCoordinator {
             last_voted_round: self.last_voted_round,
             high_qc: self.latest_qc.as_deref().map(|qc| (*qc).clone()),
         }
+    }
+
+    /// The signing position a vote or timeout ratchets: the registers,
+    /// and the uncommitted chain behind the certificate they carry.
+    ///
+    /// The justification runs from the committed tip up to the block the
+    /// high QC certifies, oldest first — the blocks a proposer replays to
+    /// extend that certificate. A restarted committee holds the
+    /// certificate either way; what it cannot rebuild from a committed
+    /// chain alone is the state these blocks left.
+    #[must_use]
+    pub fn vote_position(&self, voted: Option<BlockHash>) -> VotePosition {
+        let tip = voted.or_else(|| self.latest_qc.as_deref().map(QuorumCertificate::block_hash));
+        VotePosition {
+            registers: self.safe_vote_registers(),
+            justification: tip
+                .map(|tip| self.uncommitted_suffix(tip))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The assembled uncommitted blocks from the committed tip up to
+    /// `tip` inclusive, oldest first.
+    ///
+    /// `tip` is the block a signature is about to name — the one this
+    /// vote extends the chain to, or the one the high QC certifies when
+    /// no vote is being cast. The vote itself is what turns the voted
+    /// block into the next certificate, so keeping it is what lets the
+    /// committee that produced that certificate still build on it.
+    ///
+    /// Empty when `tip` is the committed tip, and empty when any ancestor
+    /// above the committed tip is missing or unassembled — a suffix with
+    /// a hole in it is no use to a proposer, so it is not written down.
+    fn uncommitted_suffix(&self, tip: BlockHash) -> Vec<Arc<Block>> {
+        let mut suffix = Vec::new();
+        let mut hash = tip;
+        while let Some(pending) = self.pending_blocks.get(hash) {
+            if pending.header().height() <= self.committed_height {
+                break;
+            }
+            let Some(block) = pending.block() else {
+                return Vec::new();
+            };
+            suffix.push(Arc::clone(block));
+            hash = pending.header().parent_block_hash();
+        }
+        suffix.reverse();
+        suffix
     }
 
     /// Check if we have a COMPLETE block at the given height that can be committed.
@@ -6703,16 +6691,18 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge};
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeaderParts,
-        CommittedTxsRoot, ConsensusSignature, Epoch, Hash, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
-        NetworkDefinition, NetworkParams, SettledTxsRoot, ShardAnchor, ShardId, Signer,
-        SignerBitfield, TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot,
-        Transaction, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
-        WeightedTimestamp, WitnessSources, terminal_verdict_root_from_records, test_utils,
+        AbandonmentRoot, AggregateSignature, BeaconWitnessLeafCount, BlockHeaderParts,
+        CommittedTxsRoot, ConsensusSignature, Deadline, Epoch, Hash, Heard, LeafRoot,
+        MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, Probed,
+        Question, SettledSetVerdict, SettledTxSet, SettledTxsRoot, ShardAnchor, ShardId, Signer,
+        SignerBitfield, StateClaimsRoot, TerminalRoots, TimestampRange, TopologySchedule,
+        TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxOutcome, UnsettledTx,
+        ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources,
+        Word, settled_set_verdict, test_utils,
     };
 
     use super::*;
-    use crate::validation::validate_no_duplicate_transactions;
+    use crate::admission::{RecordsSection, TransactionsSection, admit_all, unwrapped};
 
     fn install_complete_block(state: &mut ShardCoordinator, block: &Block) {
         let mut pending =
@@ -7161,7 +7151,8 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -7623,6 +7614,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -7703,7 +7695,8 @@ mod tests {
                 transactions: Arc::new(Vec::new()),
                 certificates: Arc::new(Vec::new()),
                 provisions: Arc::new(Vec::new()),
-                terminal_verdicts: Arc::new(Vec::new()),
+                abandonment_records: Arc::new(Vec::new()),
+                state_claims: Arc::new(Vec::new()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             }
         };
@@ -7907,7 +7900,8 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -8348,7 +8342,8 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let parent_block_hash = parent_block.hash();
@@ -8417,11 +8412,12 @@ mod tests {
         );
 
         // State root completes — beacon witness root still pending.
-        let state_root_ok = Ok(Verified::<StateRoot>::new_unchecked_for_test(
-            StateRoot::ZERO,
-        ));
-        let after_state =
-            state.on_state_root_verified(&topology_schedule, block_hash, state_root_ok, 0);
+        let after_state = state.on_block_check_completed(
+            &topology_schedule,
+            block_hash,
+            VerificationKind::StateRoot,
+            CheckOutcome::Checked { bytes_delta: 0 },
+        );
         assert!(
             !after_state
                 .iter()
@@ -8429,18 +8425,11 @@ mod tests {
         );
 
         // Beacon witness root completes — now we vote.
-        let beacon_root = state
-            .pending_blocks
-            .get_block(block_hash)
-            .expect("pending block")
-            .header()
-            .beacon_witness_root();
-        let after_roots = state.on_beacon_witness_root_verified(
+        let after_roots = state.on_block_check_completed(
             &topology_schedule,
             block_hash,
-            Ok(Verified::<BeaconWitnessRoot>::new_unchecked_for_test(
-                beacon_root,
-            )),
+            VerificationKind::BeaconWitnessRoot,
+            CheckOutcome::Checked { bytes_delta: 0 },
         );
         assert!(
             after_roots
@@ -9198,6 +9187,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
         );
 
         // Should emit BuildProposal for height 4 even with empty content.
@@ -9254,6 +9244,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
         );
         assert!(
             actions.is_empty(),
@@ -9268,6 +9259,7 @@ mod tests {
             block_3_hash,
             &honest,
             &[],
+            vec![],
             vec![],
             vec![],
             vec![],
@@ -9336,7 +9328,7 @@ mod tests {
         // Intentionally do NOT call on_block_persisted — parent tree
         // unavailable forces the defer branch.
 
-        let first = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let first = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(
             first
                 .iter()
@@ -9348,7 +9340,7 @@ mod tests {
             "defer slot should be recorded"
         );
 
-        let second = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let second = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(
             second.is_empty(),
             "second try_propose for same (height, round) must be suppressed"
@@ -9366,7 +9358,7 @@ mod tests {
             "deferred slot should be cleared"
         );
 
-        let third = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let third = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(
             third.iter().any(
                 |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
@@ -9410,7 +9402,7 @@ mod tests {
         // the sync-commit shape, whose commits carry no byte delta.
         assert_ne!(state.substate_bytes_frontier.0, state.committed_height);
 
-        let first = state.try_propose(&snapshot, &[], vec![], vec![], vec![]);
+        let first = state.try_propose(&snapshot, &[], vec![], vec![], vec![], vec![]);
         assert!(
             first
                 .iter()
@@ -9429,7 +9421,7 @@ mod tests {
             "the reconcile must latch a proposal retry"
         );
 
-        let second = state.try_propose(&snapshot, &[], vec![], vec![], vec![]);
+        let second = state.try_propose(&snapshot, &[], vec![], vec![], vec![], vec![]);
         assert!(
             second.iter().any(
                 |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
@@ -9711,7 +9703,14 @@ mod tests {
 
         // Ready txs must be dropped — sync blocks are always empty.
         let ready_txs = vec![Arc::new(test_utils::verified_test_transaction(1))];
-        let actions = state.try_propose(&topology_schedule, &ready_txs, vec![], vec![], vec![]);
+        let actions = state.try_propose(
+            &topology_schedule,
+            &ready_txs,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
 
         let proposal = actions
             .iter()
@@ -9766,7 +9765,7 @@ mod tests {
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
 
-        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         let Some(Action::BuildProposal { timestamp, .. }) = actions
             .iter()
             .find(|a| matches!(a, Action::BuildProposal { .. }))
@@ -9799,7 +9798,7 @@ mod tests {
 
         let height = BlockHeight::new(4);
         let round = Round::new(4);
-        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(
             actions
                 .iter()
@@ -9822,7 +9821,7 @@ mod tests {
         assert_eq!(state.last_voted_round(), round);
 
         // The retry at the same view must be a no-op, not a sibling build.
-        let retry = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let retry = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(retry.is_empty(), "retry built a sibling: {retry:?}");
     }
 
@@ -9883,7 +9882,7 @@ mod tests {
         sched.insert(Epoch::new(1), Arc::clone(&post_split));
         sched.set_head(post_split);
 
-        let actions = state.try_propose(&sched, &[], vec![], vec![], vec![]);
+        let actions = state.try_propose(&sched, &[], vec![], vec![], vec![], vec![]);
         let classification = actions
             .iter()
             .find_map(|a| match a {
@@ -10392,6 +10391,55 @@ mod tests {
         );
     }
 
+    /// A block the vote fence withheld does not buy the progress
+    /// window.
+    ///
+    /// The window is for work this replica finishes on its own. A block
+    /// held at the fence waits on a counterpart to answer for a claim
+    /// its proposer made, and a silent counterpart never answers — so
+    /// the wait is bounded by the round timer, as every other wait on
+    /// somebody else is. Priced the other way, one claim nobody can
+    /// check stalls every transaction beside it for three rounds.
+    #[test]
+    fn a_block_held_at_the_fence_times_out_on_the_round_and_not_the_window() {
+        let (mut state, _) = make_test_state();
+        let round = state.view_change.view;
+        let height = BlockHeight::new(state.committed_height.inner() + 1);
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: state.local_shard,
+            height,
+            round,
+            ..Default::default()
+        });
+        let hash = header.hash();
+        state.pending_blocks.insert(PendingBlock::from_manifest(
+            header,
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        ));
+
+        // Past the round timeout, inside the progress window.
+        state.view_change.last_leader_activity = Some(LocalTimestamp::ZERO);
+        state.set_time(
+            LocalTimestamp::ZERO
+                .plus(hyperscale_types::VIEW_CHANGE_TIMEOUT + Duration::from_millis(1)),
+        );
+        assert!(
+            !state.should_advance_round(),
+            "content still landing here is worth the window",
+        );
+
+        state
+            .pending_blocks
+            .get_mut(hash)
+            .expect("the block was just inserted")
+            .set_awaiting_counterpart(true);
+        assert!(
+            state.should_advance_round(),
+            "a block waiting on a counterpart is not, and the round timer bounds it",
+        );
+    }
+
     #[test]
     fn test_start_sync_sets_syncing_flag() {
         // check_sync_health triggers StartBlockSync when the gap to latest_qc is
@@ -10462,7 +10510,8 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
         let mut sub_quorum_signers = SignerBitfield::new(4);
         sub_quorum_signers.set(0); // single signer — far below 2f+1 = 3
@@ -10531,7 +10580,8 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
         let block_hash = block.hash();
         // The linkage assert fires before the committee resolves, so a
@@ -10579,7 +10629,8 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
         let qc = {
             let __qc = make_test_qc(block.hash(), BlockHeight::new(1));
@@ -10632,7 +10683,7 @@ mod tests {
         // Height 4 proposes at round 4 (rounds increase per block).
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
-        let _ = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let _ = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
 
         assert_eq!(
             state.view_change.last_leader_activity,
@@ -10743,7 +10794,7 @@ mod tests {
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
 
-        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
+        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![], vec![]);
         assert!(
             actions
                 .iter()
@@ -10753,7 +10804,7 @@ mod tests {
 
     #[test]
     fn test_validate_no_duplicate_transactions_rejects_cross_block_dup() {
-        let (mut state, _topology) = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.committed_height = BlockHeight::new(3);
 
         let tx1 = make_test_tx_with_seed(10);
@@ -10785,7 +10836,8 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
         let ancestor_hash = ancestor_block.hash();
         install_complete_block(&mut state, &ancestor_block);
@@ -10819,20 +10871,18 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
 
-        let result = {
-            let (qc_chain, _) = state.collect_qc_chain_hashes(block.header().parent_block_hash());
-            validate_no_duplicate_transactions(&block, &qc_chain, &state.dedup_index)
-        };
+        let result = state.admit_transactions(&topology, &block);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in QC chain ancestor"));
     }
 
     #[test]
     fn test_validate_no_duplicate_transactions_ignores_committed_ancestors() {
-        let (mut state, _topology) = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.committed_height = BlockHeight::new(5);
 
         let tx1 = make_test_tx_with_seed(10);
@@ -10864,7 +10914,8 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
         let ancestor_hash = ancestor_block.hash();
 
@@ -10896,18 +10947,12 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
 
         // Ancestor is at committed height, so walk stops before checking it
-        assert!(
-            {
-                let (qc_chain, _) =
-                    state.collect_qc_chain_hashes(block.header().parent_block_hash());
-                validate_no_duplicate_transactions(&block, &qc_chain, &state.dedup_index)
-            }
-            .is_ok()
-        );
+        assert!(state.admit_transactions(&topology, &block).is_ok());
     }
 
     /// Schedule whose window 0 carries `ROOT` (the coordinator's shard,
@@ -11062,6 +11107,58 @@ mod tests {
 
     /// A live child coordinator (`leaf(1,0)`) of a `ROOT` that terminated
     /// at wt 1000 — so `ROOT` is past-terminal at any later anchor.
+    impl ShardCoordinator {
+        /// Admit `block`'s transactions against the chain behind its
+        /// parent, the way the vote does.
+        fn admit_transactions(
+            &self,
+            topology_schedule: &TopologySchedule,
+            block: &Block,
+        ) -> Result<(), String> {
+            let parent = block.header().parent_block_hash();
+            let chain = QcChainSets::behind(&self.chain_view(), parent);
+            let ctx = self.admission(
+                topology_schedule.head(),
+                topology_schedule,
+                &chain,
+                parent,
+                block.header().parent_qc().weighted_timestamp(),
+                block.header().parent_qc().is_genesis(),
+            );
+            let provisions = ProvisionsFold::default();
+            admit_all::<TransactionsSection<'_>>(
+                &ctx,
+                &mut TransactionsFold::beside(&provisions),
+                block.transactions().iter().map(unwrapped),
+            )
+        }
+
+        /// Admit `block`'s records against the schedule, the way the
+        /// vote does, with no finalization beside them.
+        fn admit_records(
+            &self,
+            topology_schedule: &TopologySchedule,
+            block: &Block,
+        ) -> Result<(), String> {
+            let parent = block.header().parent_block_hash();
+            let chain = QcChainSets::behind(&self.chain_view(), parent);
+            let ctx = self.admission(
+                topology_schedule.head(),
+                topology_schedule,
+                &chain,
+                parent,
+                block.header().parent_qc().weighted_timestamp(),
+                block.header().parent_qc().is_genesis(),
+            );
+            let finalizations = FinalizationsFold::from(&ctx);
+            admit_all::<RecordsSection<'_>>(
+                &ctx,
+                &mut RecordsFold::after(&finalizations),
+                block.abandonment_records(),
+            )
+        }
+    }
+
     fn fence_coordinator() -> ShardCoordinator {
         ShardCoordinator::new(
             Arc::new(BlsVerifier),
@@ -11113,7 +11210,7 @@ mod tests {
 
     /// A block carrying boundary records, anchored at `anchor_ms` — the
     /// clock the fence reads each named departure against.
-    fn block_with_records(anchor_ms: u64, records: Vec<TerminalVerdict>) -> Block {
+    fn block_with_records(anchor_ms: u64, records: Vec<AbandonmentRecord>) -> Block {
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
         Block::Live {
             header: BlockHeader::new(BlockHeaderParts {
@@ -11130,30 +11227,153 @@ mod tests {
                     WeightedTimestamp::from_millis(anchor_ms),
                 )
                 .into(),
-                terminal_verdict_root: terminal_verdict_root_from_records(&records),
+                abandonment_root: AbandonmentRoot::over(&records),
                 ..Default::default()
             }),
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(records),
+            abandonment_records: Arc::new(records),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
 
+    /// A block carrying `bundles`, committed under their root.
+    fn block_with_state_claims(bundles: Vec<StateClaim>) -> Block {
+        Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(1),
+                state_claims_root: StateClaimsRoot::over(&bundles),
+                ..Default::default()
+            }),
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(Vec::new()),
+            provisions: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(bundles),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        }
+    }
+
+    /// A claim against `shard` at height 5 under the root `root` names,
+    /// claiming the anchor's clock is `ts_ms`.
+    fn bundle_against(shard: ShardId, root: &[u8], ts_ms: u64) -> StateClaim {
+        use hyperscale_types::Inclusion;
+        StateClaim::new(
+            Anchor {
+                shard,
+                height: BlockHeight::new(5),
+                state_root: StateRoot::from_raw(Hash::from_bytes(root)),
+                ts: WeightedTimestamp::from_millis(ts_ms),
+            },
+            [(stub_abort_charge(1).vault, Inclusion::Absent)],
+        )
+    }
+
+    /// A bundle names a counterpart's height this voter has not
+    /// commit-proven: the vote defers and asks for the commit proof,
+    /// as a provision on an unproven source block does.
+    #[test]
+    fn a_state_proof_against_an_unproven_height_defers_and_asks_for_its_proof() {
+        let coord = fence_coordinator();
+        let peer = ShardId::leaf(1, 1);
+        let block = block_with_state_claims(vec![bundle_against(peer, b"root", 5_000)]);
+        let Err(Withheld::Deferred { wanted, .. }) = coord.vote_fence().state_claims(&block) else {
+            panic!("the vote is withheld");
+        };
+        assert!(
+            matches!(
+                wanted.as_slice(),
+                [Action::Continuation(ProtocolEvent::CommitProofNeeded {
+                    source_shard,
+                    block_height,
+                })] if *source_shard == peer && *block_height == BlockHeight::new(5)
+            ),
+            "{wanted:?}"
+        );
+    }
+
+    /// A claim whose root or clock disagrees with the commit-proven
+    /// header this voter holds is refused outright: its reading would
+    /// have been taken against a root the chain never committed, or
+    /// dated to a clock the chain never carried. An anchor that agrees
+    /// leaves the reading itself to answer for.
+    #[test]
+    fn a_state_claim_disagreeing_with_the_held_header_is_refused() {
+        let mut coord = fence_coordinator();
+        let peer = ShardId::leaf(1, 1);
+        coord.record_proven_anchor(Anchor {
+            shard: peer,
+            height: BlockHeight::new(5),
+            state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
+            ts: WeightedTimestamp::from_millis(5_000),
+        });
+
+        let other_root = block_with_state_claims(vec![bundle_against(peer, b"other", 5_000)]);
+        assert!(
+            matches!(
+                coord.vote_fence().state_claims(&other_root),
+                Err(Withheld::Refused(_))
+            ),
+            "refused, with nothing to wait for"
+        );
+        let other_clock = block_with_state_claims(vec![bundle_against(peer, b"root", 5_001)]);
+        assert!(matches!(
+            coord.vote_fence().state_claims(&other_clock),
+            Err(Withheld::Refused(_))
+        ),);
+
+        let agreeing = block_with_state_claims(vec![bundle_against(peer, b"root", 5_000)]);
+        let claim = &agreeing.state_claims()[0];
+        assert!(
+            matches!(
+                coord.vote_fence().state_claims(&agreeing),
+                Err(Withheld::Deferred { .. })
+            ),
+            "the anchor the chain committed stands, and the reading is still owed"
+        );
+        coord
+            .proven_cells()
+            .proven(claim.anchor, claim.cells.clone());
+        assert!(
+            coord.vote_fence().state_claims(&agreeing).is_ok(),
+            "and passes once this validator has proven the cell for itself"
+        );
+    }
+
+    /// What abandoning `tx` takes, as the transaction fixes it.
+    fn figures_of(tx: &[u8]) -> UnsettledTx {
+        UnsettledTx {
+            tx_hash: TxHash::from(Hash::from_bytes(tx)),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(60_000)),
+            declared_work: 5,
+            charge: stub_abort_charge(5),
+            reach: Vec::new(),
+        }
+    }
+
+    /// The departed shard's business here, as the ledger would mirror it.
+    fn parties_of(tx: &[u8]) -> BTreeSet<TxHash> {
+        BTreeSet::from([TxHash::from(Hash::from_bytes(tx))])
+    }
+
     /// A record claiming `shard` left `tx` unsettled when it terminated at
-    /// `terminal_wt`.
-    fn record_naming(shard: ShardId, terminal_wt: u64, tx: &[u8]) -> TerminalVerdict {
-        TerminalVerdict::new(
+    /// `terminal_wt`, restating the figures [`figures_of`] fixes.
+    fn record_naming(shard: ShardId, terminal_wt: u64, tx: &[u8]) -> AbandonmentRecord {
+        AbandonmentRecord::departed(
             shard,
             WeightedTimestamp::from_millis(terminal_wt),
-            [UnsettledTx {
-                tx_hash: TxHash::from(Hash::from_bytes(tx)),
-                deadline: WeightedTimestamp::from_millis(1_200),
-                declared_work: 5,
-                charge: stub_abort_charge(5),
-            }],
+            [figures_of(tx)],
         )
+    }
+
+    /// The settled set `ROOT` left, naming `settled` and nothing else.
+    fn root_settled(settled: &[u8]) -> SettledTxSet {
+        SettledTxSet {
+            txs: std::iter::once(TxHash::from(Hash::from_bytes(settled))).collect(),
+            terminal_wt: WeightedTimestamp::from_millis(ROOT_CUT_MS),
+        }
     }
 
     /// `ROOT` terminates at the close of window 0, so a record against it
@@ -11182,7 +11402,7 @@ mod tests {
 
         assert_eq!(
             settled_set_verdict(
-                &coord.settled_sets,
+                &coord.evidence().with_settled(Clone::clone),
                 &sched,
                 coord.local_shard,
                 WeightedTimestamp::from_millis(AFTER_CUT_MS),
@@ -11195,11 +11415,12 @@ mod tests {
             SettledSetVerdict::Pass,
             "the delegate passes over a live shard, so the fence must ask first",
         );
-        assert!(coord.fence_terminal_verdicts(
-            &sched,
-            &block_with_records(AFTER_CUT_MS, records),
-            BlockHash::ZERO,
-        ));
+        assert!(
+            coord
+                .vote_fence()
+                .records(&block_with_records(AFTER_CUT_MS, records))
+                .is_err()
+        );
     }
 
     /// And one against this shard itself, which the delegate skips for the
@@ -11209,11 +11430,10 @@ mod tests {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         let records = vec![record_naming(coord.local_shard, ROOT_CUT_MS, b"tx")];
-        assert!(coord.fence_terminal_verdicts(
-            &sched,
-            &block_with_records(AFTER_CUT_MS, records),
-            BlockHash::ZERO,
-        ));
+        let err = coord
+            .admit_records(&sched, &block_with_records(AFTER_CUT_MS, records))
+            .unwrap_err();
+        assert!(err.contains("schedule does not attest"), "{err}");
     }
 
     /// The stated cut is held to the schedule's own. It dates the record
@@ -11224,11 +11444,16 @@ mod tests {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS + 1, b"tx")];
-        assert!(coord.fence_terminal_verdicts(
-            &sched,
-            &block_with_records(AFTER_CUT_MS, records),
-            BlockHash::ZERO,
-        ));
+        let err = coord
+            .admit_records(&sched, &block_with_records(AFTER_CUT_MS, records))
+            .unwrap_err();
+        assert!(err.contains("schedule does not attest"), "{err}");
+        let honest = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
+        assert!(
+            coord
+                .admit_records(&sched, &block_with_records(AFTER_CUT_MS, honest))
+                .is_ok()
+        );
     }
 
     /// The honest record still passes: a departure the schedule attests,
@@ -11236,21 +11461,397 @@ mod tests {
     /// own settled set does not.
     #[test]
     fn a_record_the_schedule_attests_is_voted_on() {
-        let mut coord = fence_coordinator();
-        let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
-            ShardId::ROOT,
-            SettledTxSet {
-                txs: std::iter::once(TxHash::from(Hash::from_bytes(b"other"))).collect(),
-                terminal_wt: WeightedTimestamp::from_millis(ROOT_CUT_MS),
-            },
-        );
+        let coord = fence_coordinator();
+        coord
+            .evidence()
+            .record_settled(ShardId::ROOT, root_settled(b"other"), parties_of(b"tx"));
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
-        assert!(!coord.fence_terminal_verdicts(
+        assert!(
+            coord
+                .vote_fence()
+                .records(&block_with_records(AFTER_CUT_MS, records))
+                .is_ok()
+        );
+    }
+
+    /// A record naming a transaction the departed shard was not party to
+    /// is refused: its absence from the settled set is trivial, and
+    /// abandoning it would charge a payer for a transaction a live
+    /// counterpart can still settle. A voter holding no mirror of the
+    /// departure at all cannot say either way, and defers.
+    #[test]
+    fn a_record_naming_a_stranger_to_the_departed_shard_is_refused() {
+        let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
+        let block = block_with_records(AFTER_CUT_MS, records);
+
+        let stranger = fence_coordinator();
+        stranger.evidence().record_settled(
+            ShardId::ROOT,
+            root_settled(b"other"),
+            parties_of(b"other"),
+        );
+        assert!(
+            stranger.vote_fence().records(&block).is_err(),
+            "a name the departed shard was not party to is not voted"
+        );
+
+        let unmirrored = fence_coordinator();
+        assert!(
+            unmirrored.vote_fence().records(&block).is_err(),
+            "and a voter that has mirrored no departure defers"
+        );
+    }
+
+    /// The figures each name restates are checked off the committed body
+    /// by a delegated verification, whose three answers fold in
+    /// A block whose anchor no retained window carries defers the check
+    /// rather than answering it.
+    ///
+    /// The trie is what a delivery is classified against, and a stand-in
+    /// is not neutral: under one shard nothing classifies as delivering
+    /// here, so no delivery reads as lapsed and the block passes the arm
+    /// that keeps a crossing from being claimed after its issuer may
+    /// have taken it back. The mark is not taken either, so the next
+    /// re-drive asks again once the beacon has caught up.
+    #[test]
+    fn a_block_anchored_outside_every_window_defers_its_resolutions_check() {
+        let sched = make_terminating_schedule(4);
+        let block = block_with_records(
+            50_000,
+            vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")],
+        );
+        let block_hash = block.hash();
+
+        let mut coord = fence_coordinator();
+        install_complete_block(&mut coord, &block);
+        let actions = coord
+            .verification
+            .initiate_resolutions_verification(block_hash, &block, &sched);
+
+        assert!(
+            actions.is_empty(),
+            "nothing is checked against a window nobody holds: {actions:?}",
+        );
+        assert!(
+            !coord
+                .verification
+                .is_root_in_flight(block_hash, VerificationKind::Resolutions),
+            "and the mark is left for the re-drive to take",
+        );
+    }
+
+    /// differently: exact verifies the check, wrong refuses the block, and
+    /// unknown clears the check's in-flight mark — the block pending, the
+    /// vote deferred, and the check dispatched again on the next re-drive.
+    #[test]
+    fn a_records_figures_are_checked_off_the_body_and_folded_three_ways() {
+        let sched = make_terminating_schedule(4);
+        let block = block_with_records(
+            AFTER_CUT_MS,
+            vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")],
+        );
+        let block_hash = block.hash();
+        let tx_hash = figures_of(b"tx").tx_hash;
+        let kind = VerificationKind::Resolutions;
+
+        let mut coord = fence_coordinator();
+        install_complete_block(&mut coord, &block);
+        let actions = coord
+            .verification
+            .initiate_resolutions_verification(block_hash, &block, &sched);
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::VerifyResolutions { entries, .. }] if *entries == vec![figures_of(b"tx")]
+            ),
+            "the names go to the store: {actions:?}"
+        );
+        assert!(coord.verification.is_root_in_flight(block_hash, kind));
+
+        coord.on_block_check_completed(
             &sched,
-            &block_with_records(AFTER_CUT_MS, records),
-            BlockHash::ZERO,
-        ));
+            block_hash,
+            kind,
+            CheckOutcome::Deferred(DeferOn::Bodies(vec![tx_hash])),
+        );
+        assert!(
+            !coord.verification.is_root_in_flight(block_hash, kind)
+                && !coord.verification.is_root_verified(block_hash, kind),
+            "an unknown name clears the in-flight mark, so a re-drive asks again"
+        );
+        assert!(
+            coord.pending_blocks.get(block_hash).is_some(),
+            "and the block pending"
+        );
+
+        coord.on_block_check_completed(&sched, block_hash, kind, CheckOutcome::Refused);
+        assert!(
+            coord.pending_blocks.get(block_hash).is_none(),
+            "a wrong figure refuses the block"
+        );
+
+        let mut coord = fence_coordinator();
+        install_complete_block(&mut coord, &block);
+        coord
+            .verification
+            .initiate_resolutions_verification(block_hash, &block, &sched);
+        coord.on_block_check_completed(&sched, block_hash, kind, CheckOutcome::Refused);
+        assert!(
+            coord.pending_blocks.get(block_hash).is_none(),
+            "a delivery past its lapse refuses the block"
+        );
+
+        let mut coord = fence_coordinator();
+        install_complete_block(&mut coord, &block);
+        coord
+            .verification
+            .initiate_resolutions_verification(block_hash, &block, &sched);
+        coord.on_block_check_completed(&sched, block_hash, kind, CheckOutcome::Refused);
+        assert!(
+            coord.pending_blocks.get(block_hash).is_none(),
+            "a success past its deadline refuses the block"
+        );
+
+        let mut coord = fence_coordinator();
+        install_complete_block(&mut coord, &block);
+        coord
+            .verification
+            .initiate_resolutions_verification(block_hash, &block, &sched);
+        coord.on_block_check_completed(
+            &sched,
+            block_hash,
+            kind,
+            CheckOutcome::Checked { bytes_delta: 0 },
+        );
+        assert!(
+            coord.verification.is_root_verified(block_hash, kind),
+            "an exact restatement verifies the root"
+        );
+    }
+
+    /// `probed` proved absent at `at`.
+    fn absent(probed: Probed, at: WeightedTimestamp) -> Heard {
+        Heard {
+            question: Question::Cell(probed),
+            word: Word::Absent,
+            at,
+        }
+    }
+
+    /// A verdict at `at`, which a record may only ever carry as a
+    /// refusal.
+    fn verdict(at: WeightedTimestamp) -> Heard {
+        Heard {
+            question: Question::Verdict,
+            word: Word::Refused {
+                decision: TransactionDecision::Reject,
+                digest: Hash::from_bytes(b"digest"),
+            },
+            at,
+        }
+    }
+
+    /// A block carrying one record of what `ROOT` said, naming `tx`.
+    fn record_of(heard: Heard) -> Block {
+        block_with_records(
+            AFTER_CUT_MS,
+            vec![AbandonmentRecord::heard(
+                ShardId::ROOT,
+                heard,
+                [figures_of(b"tx")],
+            )],
+        )
+    }
+
+    /// A refusal record is checked against this validator's own mirror
+    /// of the core's certificate, and against nothing else: a matching
+    /// mirror passes it outside any terminal window; a mirror at another
+    /// anchor, of another decision or of another certificate refuses it;
+    /// and no mirror defers it.
+    #[test]
+    fn a_refusal_record_stands_or_falls_on_the_mirror() {
+        let refused_wt = WeightedTimestamp::from_millis(5_000);
+        let block = record_of(verdict(refused_wt));
+        let tx_hash = figures_of(b"tx").tx_hash;
+
+        let matching = fence_coordinator();
+        matching
+            .evidence()
+            .record(tx_hash, ShardId::ROOT, verdict(refused_wt));
+        assert!(
+            matching.vote_fence().records(&block).is_ok(),
+            "a matching mirror passes it"
+        );
+
+        let mut aborted = verdict(refused_wt);
+        aborted.word = Word::Refused {
+            decision: TransactionDecision::Aborted,
+            digest: Hash::from_bytes(b"digest"),
+        };
+        let mut other_bytes = verdict(refused_wt);
+        other_bytes.word = Word::Refused {
+            decision: TransactionDecision::Reject,
+            digest: Hash::from_bytes(b"other"),
+        };
+        for (held, why) in [
+            (
+                verdict(WeightedTimestamp::from_millis(6_000)),
+                "another anchor",
+            ),
+            (aborted, "another decision"),
+            (other_bytes, "another certificate"),
+        ] {
+            let mismatched = fence_coordinator();
+            mismatched.evidence().record(tx_hash, ShardId::ROOT, held);
+            assert!(
+                mismatched.vote_fence().records(&block).is_err(),
+                "a mirror of {why} refuses it"
+            );
+        }
+
+        let absent = fence_coordinator();
+        assert!(
+            absent.vote_fence().records(&block).is_err(),
+            "no mirror defers it"
+        );
+    }
+
+    /// An absence record is checked against the proof this validator
+    /// folded off the chain: the record's anchor has to sit inside the
+    /// name's absence window and be the one folded. A proof at the
+    /// deadline passes a record at the deadline, a record at an anchor
+    /// this validator has not folded defers, a record probed short of
+    /// the deadline is refused whatever the mirror holds, and so is one
+    /// probed where the cell may be swept.
+    #[test]
+    fn an_absence_record_stands_or_falls_on_the_mirror() {
+        let deadline = figures_of(b"tx").deadline.at();
+        let tx_hash = figures_of(b"tx").tx_hash;
+        let record = |at| record_of(absent(Probed::Core, at));
+
+        let matching = fence_coordinator();
+        matching
+            .evidence()
+            .record(tx_hash, ShardId::ROOT, absent(Probed::Core, deadline));
+        assert!(
+            matching.vote_fence().records(&record(deadline)).is_ok(),
+            "a proof at the deadline passes a record at the deadline"
+        );
+        assert!(
+            matching
+                .vote_fence()
+                .records(&record(deadline.plus(Duration::from_secs(5))))
+                .is_err(),
+            "a record at an anchor this validator has not folded defers"
+        );
+        assert!(
+            matching
+                .vote_fence()
+                .records(&record(deadline.minus(Duration::from_millis(1))))
+                .is_err(),
+            "a record probed before the deadline is refused whatever the mirror holds"
+        );
+        let sweep = deadline.plus(MAX_VALIDITY_RANGE);
+        assert!(
+            matching.vote_fence().records(&record(sweep)).is_err(),
+            "a record probed where the committed cell may be swept is refused"
+        );
+        let late = fence_coordinator();
+        late.evidence()
+            .record(tx_hash, ShardId::ROOT, absent(Probed::Core, sweep));
+        assert!(
+            late.vote_fence().records(&record(deadline)).is_err(),
+            "a mirror taken past the sweep proves nothing and defers"
+        );
+
+        let absent_mirror = fence_coordinator();
+        assert!(
+            absent_mirror
+                .vote_fence()
+                .records(&record(deadline))
+                .is_err(),
+            "no proof defers it"
+        );
+    }
+
+    /// An untaken record — a one-shard core's claim absent — stands on
+    /// the claim's own mirror: a folded claim absence at the record's
+    /// anchor passes it, and a committed-cell absence at the same anchor
+    /// does not, since the questions are different proofs.
+    #[test]
+    fn an_untaken_record_stands_on_the_claims_own_mirror() {
+        let deadline = figures_of(b"tx").deadline.at();
+        let tx_hash = figures_of(b"tx").tx_hash;
+        let record = record_of(absent(Probed::Claim, deadline));
+
+        let claim = fence_coordinator();
+        claim
+            .evidence()
+            .record(tx_hash, ShardId::ROOT, absent(Probed::Claim, deadline));
+        assert!(
+            claim.vote_fence().records(&record).is_ok(),
+            "a folded claim absence at the anchor passes it"
+        );
+
+        let cell = fence_coordinator();
+        cell.evidence()
+            .record(tx_hash, ShardId::ROOT, absent(Probed::Core, deadline));
+        assert!(
+            cell.vote_fence().records(&record).is_err(),
+            "a committed-cell absence is another question's proof, and defers"
+        );
+    }
+
+    /// A lapse record is the same check against a later window: the
+    /// name's deadline plus one validity range. A proof at the lapse
+    /// passes a record at the lapse, a record anchored at the deadline
+    /// is refused whatever the mirror holds, and a mirror short of the
+    /// lapse defers — the proof it holds is a core's answer, not a
+    /// delivery's.
+    #[test]
+    fn a_lapse_record_is_held_to_the_deadline_plus_a_validity_range() {
+        let deadline = figures_of(b"tx").deadline.at();
+        let lapse = deadline.plus(MAX_VALIDITY_RANGE);
+        let tx_hash = figures_of(b"tx").tx_hash;
+        let record = |at| record_of(absent(Probed::Delivery, at));
+
+        let matching = fence_coordinator();
+        matching
+            .evidence()
+            .record(tx_hash, ShardId::ROOT, absent(Probed::Delivery, lapse));
+        assert!(
+            matching.vote_fence().records(&record(lapse)).is_ok(),
+            "a proof at the lapse passes a record at the lapse"
+        );
+        assert!(
+            matching.vote_fence().records(&record(deadline)).is_err(),
+            "a lapse record anchored at the deadline is refused whatever the mirror holds"
+        );
+        assert!(
+            matching
+                .vote_fence()
+                .records(&record(lapse.plus(MAX_VALIDITY_RANGE)))
+                .is_err(),
+            "a lapse record anchored where the claim cell may be swept is refused"
+        );
+
+        let short = fence_coordinator();
+        short
+            .evidence()
+            .record(tx_hash, ShardId::ROOT, absent(Probed::Delivery, deadline));
+        assert!(
+            short.vote_fence().records(&record(lapse)).is_err(),
+            "a proof short of the lapse defers it"
+        );
+
+        let cores = fence_coordinator();
+        cores
+            .evidence()
+            .record(tx_hash, ShardId::ROOT, absent(Probed::Core, lapse));
+        assert!(
+            cores.vote_fence().records(&record(lapse)).is_err(),
+            "a core's cell proved absent at the lapse is not the claim proved absent: it defers"
+        );
     }
 
     /// Past the departure the record's own claim still stands or falls on
@@ -11259,21 +11860,22 @@ mod tests {
     /// exists to let run.
     #[test]
     fn a_record_naming_what_the_departed_shard_settled_is_refused() {
-        let mut coord = fence_coordinator();
-        let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
+        let coord = fence_coordinator();
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(ROOT_CUT_MS),
             },
+            parties_of(b"tx"),
         );
         let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
-        assert!(coord.fence_terminal_verdicts(
-            &sched,
-            &block_with_records(AFTER_CUT_MS, records),
-            BlockHash::ZERO,
-        ));
+        assert!(
+            coord
+                .vote_fence()
+                .records(&block_with_records(AFTER_CUT_MS, records))
+                .is_err()
+        );
     }
 
     fn block_with_certs(certs: Vec<Arc<Verifiable<Finalization>>>) -> Block {
@@ -11283,16 +11885,45 @@ mod tests {
             certificates: Arc::new(certs),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         }
     }
 
     /// An abandonment: this shard's certificate alone, attesting the
-    /// transaction aborted, with no counterpart certificate beside it.
+    /// transaction aborted after awaiting `ShardId::ROOT`, with no
+    /// counterpart certificate beside it.
     fn abandonment_tick(local: ShardId, height: u64) -> Arc<Verifiable<Finalization>> {
+        use hyperscale_types::ExecutionOutcome;
+        lone_tick(
+            local,
+            height,
+            TxOutcome::new(
+                TxHash::from(Hash::from_bytes(b"tx")),
+                ExecutionOutcome::Aborted,
+            )
+            .awaiting([ShardId::ROOT]),
+        )
+    }
+
+    /// A verdict that awaited nobody: this shard's certificate alone,
+    /// attesting the transaction refused by a member with no counterpart
+    /// to hear from — a leg's own verdict.
+    fn lone_verdict_tick(local: ShardId, height: u64) -> Arc<Verifiable<Finalization>> {
+        use hyperscale_types::ExecutionOutcome;
+        lone_tick(
+            local,
+            height,
+            TxOutcome::new(
+                TxHash::from(Hash::from_bytes(b"tx")),
+                ExecutionOutcome::Failed,
+            ),
+        )
+    }
+
+    fn lone_tick(local: ShardId, height: u64, outcome: TxOutcome) -> Arc<Verifiable<Finalization>> {
         use hyperscale_types::{
-            ExecutionCertificate, ExecutionOutcome, GlobalReceiptRoot, SignerBitfield, TickHalf,
-            TickId, TxOutcome,
+            ExecutionCertificate, GlobalReceiptRoot, SignerBitfield, TickHalf, TickId,
         };
         let tick = TickId::new(local, BlockHeight::new(height));
         Arc::new(Verifiable::from(Finalization::new(
@@ -11302,10 +11933,7 @@ mod tests {
                 tick,
                 WeightedTimestamp::from_millis(height),
                 GlobalReceiptRoot::ZERO,
-                vec![TxOutcome::new(
-                    TxHash::from(Hash::from_bytes(b"tx")),
-                    ExecutionOutcome::Aborted,
-                )],
+                vec![outcome],
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ))],
@@ -11319,42 +11947,99 @@ mod tests {
     /// transaction or knowing which shards were party to it.
     #[test]
     fn fence_rejects_an_abandonment_a_terminated_shard_settled() {
-        let mut coord = fence_coordinator();
+        let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
+            parties_of(b"tx"),
         );
         let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Reject,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Err(Withheld::Refused(_))
+        ));
     }
 
-    /// The same abandonment passes when no set names the transaction. A
-    /// miss is not proof — an unacquired set could still name it — so this
-    /// is the vote landing on the evidence the node has, which is why the
-    /// composing side defers rather than relying on this scan.
+    /// The same abandonment passes when the awaited shard's set is held
+    /// and does not name the transaction: absence from a set is proof,
+    /// so the partner never settled its half and the abort tears nothing.
     #[test]
-    fn fence_admits_an_abandonment_no_settled_set_names() {
-        let mut coord = fence_coordinator();
+    fn fence_admits_an_abandonment_the_settled_set_does_not_name() {
+        let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"other"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
+            parties_of(b"tx"),
         );
         let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Pass,
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Ok(())
+        ));
+    }
+
+    /// An abandonment whose awaited shard's set is not yet held defers,
+    /// as the proposer's gate held it: a set nobody has read could still
+    /// name the transaction, and the voter asks the same question the
+    /// gate did rather than landing on what it happens to hold.
+    #[test]
+    fn fence_defers_an_abandonment_until_the_awaited_set_is_held() {
+        let coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Err(Withheld::Deferred { .. })
+        ));
+    }
+
+    /// An abandonment a committed record covers claims nothing of any
+    /// set: the record established that no counterpart can settle the
+    /// transaction, in a form that outlives the set, so the vote passes
+    /// with the set unknown — and would pass with the set naming it,
+    /// since the record is the chain's own answer.
+    #[test]
+    fn fence_admits_an_abandonment_a_committed_record_covers() {
+        let coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        coord
+            .evidence()
+            .cover(TxHash::from(Hash::from_bytes(b"tx")));
+        let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Ok(())
+        ));
+        coord.evidence().record_settled(
+            ShardId::ROOT,
+            SettledTxSet {
+                txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
+                terminal_wt: WeightedTimestamp::from_millis(1000),
+            },
+            parties_of(b"tx"),
         );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Ok(())
+        ));
     }
 
     /// A settlement is judged on the certificates it carries, not by this
@@ -11363,24 +12048,53 @@ mod tests {
     /// would refuse the outcome the fence exists to admit.
     #[test]
     fn the_abandonment_scan_leaves_a_settlement_alone() {
-        let mut coord = fence_coordinator();
+        let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
+            parties_of(b"tx"),
         );
         let block = block_with_certs(vec![cross_shard_tick(
             ShardId::leaf(1, 0),
             ShardId::ROOT,
             1,
         )]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Pass,
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Ok(())
+        ));
+    }
+
+    /// A verdict that awaited nobody is left alone too: a leg's own
+    /// finalization carries only this shard's certificate, as an
+    /// abandonment does, but it makes no claim about any counterpart's
+    /// set — the core settles its half on the record cell — so the set
+    /// naming the transaction refuses nothing.
+    #[test]
+    fn the_abandonment_scan_leaves_a_verdict_that_awaited_nobody_alone() {
+        let coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        coord.evidence().record_settled(
+            ShardId::ROOT,
+            SettledTxSet {
+                txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
+                terminal_wt: WeightedTimestamp::from_millis(1000),
+            },
+            parties_of(b"tx"),
         );
+        let block = block_with_certs(vec![lone_verdict_tick(ShardId::leaf(1, 0), 1)]);
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Ok(())
+        ));
     }
 
     /// A finalization naming a past-terminal shard whose settled set is
@@ -11394,57 +12108,65 @@ mod tests {
             ShardId::ROOT,
             1,
         )]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Defer,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Err(Withheld::Deferred { .. })
+        ));
     }
 
     /// Once the past-terminal shard's settled set is known and contains
     /// the tick, the vote passes.
     #[test]
     fn fence_passes_when_tick_settled() {
-        let mut coord = fence_coordinator();
+        let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
+            parties_of(b"tx"),
         );
         let block = block_with_certs(vec![cross_shard_tick(
             ShardId::leaf(1, 0),
             ShardId::ROOT,
             1,
         )]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Pass,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Ok(())
+        ));
     }
 
     /// A tick the past-terminal shard did not settle is rejected.
     #[test]
     fn fence_rejects_unsettled_tick() {
-        let mut coord = fence_coordinator();
+        let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: BTreeSet::new(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
+            parties_of(b"tx"),
         );
         let block = block_with_certs(vec![cross_shard_tick(
             ShardId::leaf(1, 0),
             ShardId::ROOT,
             1,
         )]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Reject,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Err(Withheld::Refused(_))
+        ));
     }
 
     /// Past its evidence window, a tick naming the terminated shard is
@@ -11452,14 +12174,15 @@ mod tests {
     /// set happens to contain it.
     #[test]
     fn fence_rejects_past_the_evidence_window() {
-        let mut coord = fence_coordinator();
+        let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
+            parties_of(b"tx"),
         );
         let block = block_with_certs(vec![cross_shard_tick(
             ShardId::leaf(1, 0),
@@ -11467,10 +12190,10 @@ mod tests {
             1,
         )]);
         let beyond = WeightedTimestamp::from_millis(6_001);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, beyond),
-            SettledSetVerdict::Reject,
-        );
+        assert!(matches!(
+            coord.vote_fence().finalizations(&sched, &block, beyond),
+            Err(Withheld::Refused(_))
+        ));
     }
 
     /// A tick with no past-terminal-shard certificate passes regardless of
@@ -11486,10 +12209,12 @@ mod tests {
             ShardId::leaf(1, 1),
             1,
         )]);
-        assert_eq!(
-            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
-            SettledSetVerdict::Pass,
-        );
+        assert!(matches!(
+            coord
+                .vote_fence()
+                .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            Ok(())
+        ));
     }
 
     /// A height-1 block on `leaf(1,0)` anchored in epoch 1 (`parent_qc`
@@ -11527,7 +12252,8 @@ mod tests {
             )]),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         }
     }
 
@@ -11579,12 +12305,13 @@ mod tests {
         // Record ROOT's settled set including the straddler's tick, then
         // re-drive: the fence now passes, so the block proceeds to
         // verification.
-        coord.record_settled_txs(
+        coord.evidence().record_settled(
             ShardId::ROOT,
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
+            parties_of(b"tx"),
         );
         let released = coord.redrive_pending_votes(&sched);
         assert!(
@@ -11620,7 +12347,8 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         }
     }
 
@@ -11641,7 +12369,8 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         }
     }
 

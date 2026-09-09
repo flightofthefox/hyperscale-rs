@@ -1,11 +1,11 @@
 //! Garbage collection for `RocksDB` storage.
 //!
 //! Two independent GC passes:
-//! - **JMT GC**: deletes stale tree nodes older than `jmt_history_length`.
-//! - **State-history GC**: prunes state-history entries older than
-//!   `jmt_history_length`. `StateCf` is always authoritative for current
-//!   values, so deleting old history entries only costs the ability to
-//!   serve historical reads beyond the retention window.
+//! - **JMT GC**: deletes stale tree nodes below the retention floor.
+//! - **State-history GC**: prunes state-history entries below the same
+//!   floor. `StateCf` is always authoritative for current values, so
+//!   deleting old history entries only costs the ability to serve
+//!   historical reads past the retention horizon.
 
 use rocksdb::{ColumnFamily, WriteBatch};
 
@@ -20,10 +20,9 @@ use crate::typed_cf::{self, DbCodec, TypedCf};
 impl RocksDbShardStorage {
     /// Run garbage collection for stale JMT nodes.
     ///
-    /// Deletes JMT nodes that became stale at heights older than
-    /// `current_height - jmt_history_length`, freeing disk space while
-    /// preserving the ability to generate historical proofs within the
-    /// retention window.
+    /// Deletes JMT nodes that became stale below the retention floor,
+    /// freeing disk space while preserving the ability to generate
+    /// historical proofs at every version a consumer may still name.
     ///
     /// # When to Call
     ///
@@ -38,10 +37,9 @@ impl RocksDbShardStorage {
     pub fn run_jmt_gc(&self) -> usize {
         let start = std::time::Instant::now();
 
-        let (current_version, _) = self.read_jmt_metadata();
-
-        // Calculate the cutoff version — delete stale parts older than this.
-        let cutoff_version = current_version.saturating_sub(self.jmt_history_length);
+        // Below the retention floor no reader may ask, so nothing needs
+        // the tree at those versions.
+        let cutoff_version = self.retention_floor();
 
         if cutoff_version == 0 {
             return 0;
@@ -114,7 +112,6 @@ impl RocksDbShardStorage {
                 processed_count,
                 deleted_nodes,
                 cutoff_version,
-                current_version,
                 elapsed_ms = elapsed.as_millis(),
                 "JMT GC completed"
             );
@@ -135,13 +132,11 @@ impl RocksDbShardStorage {
     ///
     /// # Boundary invariant
     ///
-    /// `cutoff` here MUST equal `floor` in `snapshot_at`: readers at
-    /// `V = floor` need history entries with `v' > V = floor`, i.e. the
-    /// smallest surviving `v'` must be `floor + 1 = cutoff + 1`. GC
-    /// deletes `v' ≤ cutoff`, so the first preserved entry is exactly
-    /// `cutoff + 1` — zero-margin. Any refactor that makes `floor <
-    /// cutoff` (e.g. rounding, off-by-one in saturating math) silently
-    /// breaks historical reads at the boundary without a panic.
+    /// A reader at `V = floor` needs history entries with `v' > floor`,
+    /// so the smallest surviving one must be `floor + 1`. This deletes
+    /// `v' ≤ floor` — zero-margin, and the margin holds because the
+    /// cutoff and the readers' floor are one stored value rather than two
+    /// expressions that have to agree.
     ///
     /// # Concurrency
     ///
@@ -154,11 +149,9 @@ impl RocksDbShardStorage {
     /// # Returns
     ///
     /// The number of entries deleted.
+    #[allow(clippy::must_use_candidate)] // run for its effect; the count is a log line
     pub fn run_state_history_gc(&self) -> usize {
-        let (current_version, _) = self.read_jmt_metadata();
-        // Must match `snapshot_at`'s floor calculation exactly — see
-        // boundary invariant above.
-        let cutoff = current_version.saturating_sub(self.jmt_history_length);
+        let cutoff = self.retention_floor();
 
         if cutoff == 0 {
             return 0;
@@ -268,12 +261,18 @@ mod tests {
 
     use hyperscale_jmt::NibblePath;
     use hyperscale_storage::Substates;
-    use hyperscale_storage::test_helpers::state_key;
-    use hyperscale_types::SettledWrites;
+    use hyperscale_storage::test_helpers::{commit_writes_at, state_key};
+    use hyperscale_types::{RETENTION_HORIZON, SettledWrites, WeightedTimestamp};
     use tempfile::TempDir;
 
     use super::super::core::RocksDbShardStorage;
-    use crate::config::RocksDbConfig;
+
+    /// Commits a whole retention horizon apart, so each one leaves the
+    /// last outside the window.
+    fn past(step: u64) -> WeightedTimestamp {
+        let horizon = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX);
+        WeightedTimestamp::from_millis(step * (horizon + 1))
+    }
 
     /// Aggressive state-history GC must not affect current-tip reads.
     /// `StateCf` holds the authoritative current value per key; deleting
@@ -282,13 +281,7 @@ mod tests {
     #[test]
     fn state_history_gc_preserves_current_state() {
         let temp_dir = TempDir::new().unwrap();
-        let config = RocksDbConfig {
-            jmt_history_length: 2, // tiny retention for test
-            ..Default::default()
-        };
-        let storage =
-            RocksDbShardStorage::open_with_config(temp_dir.path(), &config, NibblePath::empty())
-                .unwrap();
+        let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
         let key_a = state_key(1, 10);
         let key_b = state_key(2, 20);
@@ -297,12 +290,12 @@ mod tests {
             (key_a, Some(vec![0xAA])),
             (key_b, Some(vec![0xBB])),
         ]));
-        storage.commit(&writes).unwrap();
+        commit_writes_at(&storage, &writes, past(0));
 
-        // Advance JMT version past the retention window with empty
-        // commits so the history cutoff is above version 1.
-        for _ in 0..4 {
-            storage.commit(&SettledWrites::default()).unwrap();
+        // Carry the tip a horizon past the first commit with empty ones,
+        // so the floor leaves version 1 behind.
+        for step in 1..=4 {
+            commit_writes_at(&storage, &SettledWrites::default(), past(step));
         }
 
         storage.run_state_history_gc();

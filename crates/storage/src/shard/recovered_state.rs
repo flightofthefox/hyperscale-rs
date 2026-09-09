@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, CommittedTip, Hash,
-    PredecessorTerminal, Provisions, QuorumCertificate, SafeVoteRegisters, ShardAnchor, StateRoot,
-    ValidatorId, Verified, WeightedTimestamp,
+    BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, CommittedTip,
+    Hash, PredecessorTerminal, Provisions, QuorumCertificate, SafeVoteRegisters, ShardAnchor,
+    StateRoot, SubstateKey, ValidatorId, Verified, WeightedTimestamp,
 };
 
 use super::dedup_window::DedupWindow;
@@ -157,6 +157,37 @@ pub struct RecoveredState {
     /// already consumed. Empty on a fresh start — including after
     /// snap-sync, where the imported store carries no signing history.
     pub safe_vote_registers: BTreeMap<ValidatorId, SafeVoteRegisters>,
+
+    /// The escrow records this store inherited with a prefix it adopted
+    /// whole, and their committed bytes, for the cells that are still
+    /// live.
+    ///
+    /// A successor's ledger is a fold over its own chain, which begins
+    /// empty, while the value its predecessors escrowed rides the prefix
+    /// into it. Nothing else names those records: the entry that would
+    /// is the predecessor's ledger's, a fold over a chain the successor
+    /// never replays, and the cell is outside every sweep's reach. So
+    /// the adoption writes down what it imported, from the leaves it
+    /// wrote — the same argument the sweep index's rebuild makes, and
+    /// the same authority.
+    ///
+    /// Empty everywhere but a reshape successor's adoption. An ordinary
+    /// snap-sync joins a chain whose members hold the ledger, and a
+    /// joiner deriving obligations they do not would compose a tick they
+    /// cannot sign.
+    pub inherited_records: Vec<(SubstateKey, Vec<u8>)>,
+
+    /// The uncommitted blocks the store kept beside the safe-vote
+    /// registers, above the committed tip and in height order.
+    ///
+    /// The certificate a restored record carries names one of these, and
+    /// a proposer extends the block its high QC certifies — so without
+    /// them a committee that restarted together holds a lock no proposal
+    /// it can build satisfies. Seeded into the coordinator's pending
+    /// blocks, where verification re-derives the state each one left.
+    /// Empty on a fresh start and after snap-sync, where the store
+    /// carries no signing history.
+    pub voted_blocks: Vec<Arc<Block>>,
 }
 
 impl RecoveredState {
@@ -224,6 +255,8 @@ impl RecoveredState {
                 ChainOrigin::ROOT
             },
             safe_vote_registers: BTreeMap::new(),
+            inherited_records: Vec::new(),
+            voted_blocks: Vec::new(),
         }
     }
 

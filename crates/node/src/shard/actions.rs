@@ -1,11 +1,11 @@
 //! Action processing and dispatch.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_beacon::action_handlers::handle_action as handle_beacon_action;
 use hyperscale_core::{
-    Action, ActionContext, ActionOwner, CommitSource, FetchAbandon, FetchRequest, ProtocolEvent,
+    Action, ActionContext, ActionOwner, CommitSource, FetchRequest, ProtocolEvent,
 };
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_execution::action_handlers::handle_action as handle_execution_action;
@@ -15,8 +15,8 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    BeaconProposal, BeaconWitnessCommit, BlockHeight, CertifiedBlock, Epoch, PredecessorTerminal,
-    RoutingCommittees, StateRoot, SweepFrontier, TopologySnapshot, TransactionStatus, TxHash,
+    Anchor, BeaconProposal, BeaconWitnessCommit, CertifiedBlock, Epoch, PredecessorTerminal,
+    ShardId, SubstateKey, TerminalEvidence, TopologySchedule, TransactionStatus, TxHash,
     ValidatorId, Verified,
 };
 use tracing::{debug, error, trace, warn};
@@ -24,15 +24,15 @@ use tracing::{debug, error, trace, warn};
 use super::{ShardLoop, ShardScopedInput, TimerOp, push_protocol_event, push_shard_input};
 use crate::beacon;
 use crate::beacon::{BeaconProposalBinding, ShardWitnessBinding};
-use crate::fetch::{FetchBinding, FetchInput};
+use crate::fetch::{FetchInput, Release};
 use crate::shard::commit::{
-    AccumulateDecision, PendingCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind, QcOnlyPending,
-    make_commit_prepared, run_qc_only_prep,
+    AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind,
+    QcOnlyPending, make_commit_prepared, run_qc_only_prep,
 };
 use crate::shard::consensus::BlockSyncInput;
 use crate::shard::cross_shard::{
     CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
-    ProvisionBinding,
+    ProvisionBinding, SettledTxsBinding, StateProofBinding, StateProofRelayBinding,
 };
 use crate::shard::mempool::TransactionBinding;
 
@@ -79,6 +79,7 @@ where
             | Action::VerifyCertificateRoot { .. }
             | Action::VerifyProvisionTxRoots { .. }
             | Action::VerifyReservations { .. }
+            | Action::VerifyResolutions { .. }
             | Action::VerifyProvisions { .. }
             | Action::ExecuteTransactions { .. }
             | Action::FetchAndBroadcastProvisions { .. }
@@ -142,11 +143,6 @@ where
                 from_height,
                 count,
             } => self.process_fetch_commit_proof(source_shard, from_height, count),
-            Action::StartSettledTxsAcquisition {
-                shard,
-                evidence,
-                peers,
-            } => self.process_start_settled_txs_acquisition(shard, evidence, peers),
             Action::ReofferTransactions { txs } => {
                 // Through the client submit rail, not this shard's gossip
                 // topic: the fan-out resolves each transaction against
@@ -158,7 +154,7 @@ where
                 }
             }
             Action::Fetch(req) => self.process_fetch_request(req),
-            Action::AbandonFetch(req) => self.process_fetch_abandon(req),
+            Action::AbandonFetch(ids) => self.release_fetch(ids, Release::Abandoned),
 
             // ─── ShardLoop-internal effects ────────────────────────────────
             Action::SetTimer { id, duration } => {
@@ -218,17 +214,19 @@ where
                 parent_state_root,
                 parent_block_height,
                 parent_sweep_frontier,
+                creations,
                 source,
                 witness,
             } => {
-                self.accept_qc_only_commit(
+                self.accept_qc_only_commit(QcOnlyCommit {
                     certified,
                     parent_state_root,
                     parent_block_height,
                     parent_sweep_frontier,
+                    creations,
                     source,
                     witness,
-                );
+                });
             }
             Action::AttachCertifiedUncommitted { certified } => {
                 let block_hash = certified.block().hash();
@@ -262,12 +260,8 @@ where
                 let now = self.now;
                 self.io.tx_phase_times.record_ec_created(&tx_hashes, now);
             }
-            Action::TopologyChanged {
-                epoch,
-                topology_snapshot,
-                routing_committees,
-            } => {
-                self.handle_topology_changed(epoch, &topology_snapshot, routing_committees);
+            Action::TopologyChanged { epoch, schedule } => {
+                self.handle_topology_changed(epoch, schedule);
             }
             Action::ReconfigureParticipation(change) => {
                 self.pending_participation_changes.push(change);
@@ -389,15 +383,16 @@ where
     /// commit order instead of holding the pipeline open across a
     /// reordered burst. `try_apply_verified_synced_blocks` can emit a
     /// burst of these for consecutive heights in a single shard step.
-    fn accept_qc_only_commit(
-        &mut self,
-        certified: Arc<Verified<CertifiedBlock>>,
-        parent_state_root: StateRoot,
-        parent_block_height: BlockHeight,
-        parent_sweep_frontier: SweepFrontier,
-        source: CommitSource,
-        witness: BeaconWitnessCommit,
-    ) {
+    fn accept_qc_only_commit(&mut self, commit: QcOnlyCommit) {
+        let QcOnlyCommit {
+            certified,
+            parent_state_root,
+            parent_block_height,
+            parent_sweep_frontier,
+            creations,
+            source,
+            witness,
+        } = commit;
         let block_hash = certified.block().hash();
         let height = certified.block().height();
 
@@ -419,6 +414,7 @@ where
             parent_state_root,
             parent_block_height,
             parent_sweep_frontier,
+            creations,
             source,
             kind,
             witness,
@@ -663,23 +659,82 @@ where
                     .map(|tx_hash| (predecessor, tx_hash))
                     .collect();
                 // The scan re-derives the whole wanted set for this
-                // predecessor each pass, so anything the FSM still holds
-                // and the scan no longer names is an answer nobody is
-                // waiting for — a transaction that expired out of the
-                // pool, or the rule retiring as the chain outlives its
-                // origin. Nothing else retires these ids: a terminated
-                // committee that never answers would pin them for good.
-                let stale: Vec<_> = CommittedTxBinding::fetch_mut(&mut self.io)
-                    .pending_ids()
-                    .filter(|id| id.0.shard == predecessor.shard && !wanted.contains(id))
-                    .copied()
-                    .collect();
-                if !stale.is_empty() {
-                    self.drive_fetch::<CommittedTxBinding>(FetchInput::Abandoned { ids: stale });
-                }
+                // predecessor each pass, so anything the fetch still
+                // holds under it and the scan no longer names is an
+                // answer nobody is waiting for — a transaction that
+                // expired out of the pool, or the rule retiring as the
+                // chain outlives its origin. Nothing else retires these
+                // ids: a terminated committee that never answers would
+                // pin them for good.
+                self.abandon_unwanted::<CommittedTxBinding>(&wanted, |id| {
+                    id.0.shard == predecessor.shard
+                });
                 self.drive_fetch::<CommittedTxBinding>(FetchInput::Request {
                     ids: wanted.into_iter().collect(),
                     shard: predecessor.shard,
+                    preferred,
+                    class,
+                });
+            }
+            FetchRequest::SettledTxs {
+                wanted,
+                preferred,
+                class,
+            } => {
+                // The whole wanted set arrives on every beacon fold, so
+                // a terminal the fetch still holds and the set no longer
+                // names — acquired, its window closed, its shard evicted
+                // — is released here; nothing else retires it, and a
+                // committee that never answers would pin it for good.
+                let wanted: BTreeSet<TerminalEvidence> = wanted.into_iter().collect();
+                self.abandon_unwanted::<SettledTxsBinding>(&wanted, |_| true);
+                let mut by_shard: BTreeMap<ShardId, Vec<TerminalEvidence>> = BTreeMap::new();
+                for evidence in wanted {
+                    by_shard.entry(evidence.shard).or_default().push(evidence);
+                }
+                for (shard, ids) in by_shard {
+                    self.drive_fetch::<SettledTxsBinding>(FetchInput::Request {
+                        ids,
+                        shard,
+                        preferred,
+                        class,
+                    });
+                }
+            }
+            FetchRequest::StateProof {
+                anchor,
+                keys,
+                preferred,
+                class,
+            } => {
+                self.drive_fetch::<StateProofBinding>(FetchInput::Request {
+                    ids: keys.into_iter().map(|key| (anchor, key)).collect(),
+                    shard: anchor.shard,
+                    preferred,
+                    class,
+                });
+            }
+            FetchRequest::RelayedStateProof {
+                anchor,
+                keys,
+                shard,
+                preferred,
+                class,
+            } => {
+                let wanted: BTreeSet<(Anchor, SubstateKey)> =
+                    keys.into_iter().map(|key| (anchor, key)).collect();
+                // The fence re-derives what it wants relayed at this
+                // anchor on every deferral, so a cell the fetch still
+                // holds under it and the fence no longer names is one
+                // nobody is waiting on — the block that claimed it was
+                // discarded, or this validator's own probe proved the
+                // cell first. Nothing else retires these ids: a
+                // committee that never holds the proof would pin them
+                // for good.
+                self.abandon_unwanted::<StateProofRelayBinding>(&wanted, |id| id.0 == anchor);
+                self.drive_fetch::<StateProofRelayBinding>(FetchInput::Request {
+                    ids: wanted.into_iter().collect(),
+                    shard,
                     preferred,
                     class,
                 });
@@ -713,51 +768,6 @@ where
                     preferred,
                     class,
                 });
-            }
-        }
-    }
-
-    /// Dispatch a typed fetch-abandon to the corresponding binding.
-    ///
-    /// The fetch instance in this shard's `ShardIo` is notified — keyed by
-    /// the abandoning vnode's shard, not the routing target of the original
-    /// request. Symmetric to [`Self::process_fetch_request`] — translates the
-    /// variant payload into ids and feeds them through `FetchInput::Abandoned`,
-    /// which removes them from the binding's pending set and increments
-    /// `record_fetch_abandoned` so the cancellation is observable separately
-    /// from genuine admissions.
-    #[allow(clippy::needless_pass_by_value)] // mirrors process_fetch_request; future variants carry Vec ids
-    fn process_fetch_abandon(&mut self, req: FetchAbandon) {
-        match req {
-            FetchAbandon::Transactions { ids } => {
-                self.drive_fetch::<TransactionBinding>(FetchInput::Abandoned { ids });
-            }
-            FetchAbandon::RemoteProvisions {
-                source_shard,
-                block_height,
-            } => {
-                let local_shard = self.shard;
-                self.drive_fetch::<ProvisionBinding>(FetchInput::Abandoned {
-                    ids: vec![(source_shard, local_shard, block_height)],
-                });
-            }
-            FetchAbandon::LocalProvisions { hashes } => {
-                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Abandoned { ids: hashes });
-            }
-            FetchAbandon::Finalizations { ids } => {
-                self.drive_fetch::<FinalizationBinding>(FetchInput::Abandoned { ids });
-            }
-            FetchAbandon::ExecutionCerts { ids } => {
-                self.drive_fetch::<ExecCertBinding>(FetchInput::Abandoned { ids });
-            }
-            FetchAbandon::CommittedTxs { ids } => {
-                self.drive_fetch::<CommittedTxBinding>(FetchInput::Abandoned { ids });
-            }
-            FetchAbandon::BeaconProposal { ids } => {
-                self.drive_fetch::<BeaconProposalBinding>(FetchInput::Abandoned { ids });
-            }
-            FetchAbandon::ShardWitnesses { ids } => {
-                self.drive_fetch::<ShardWitnessBinding>(FetchInput::Abandoned { ids });
             }
         }
     }
@@ -889,25 +899,25 @@ where
         });
     }
 
-    /// Adopt a fresh topology snapshot: publish it through the lock-free
-    /// `ArcSwap` so off-thread closures pick it up on their next `.load()`,
-    /// and push it to the network adapter (which keys validator pubkeys
-    /// and shard committees off the snapshot). Every hosted shard's
-    /// `Action::TopologyChanged` lands here as it folds the beacon at `epoch`;
-    /// `apply_topology` gates the store monotonically so a slower shard thread
-    /// cannot regress the shared snapshot to an older epoch's view.
+    /// Adopt a freshly folded schedule: publish its head through the
+    /// lock-free `ArcSwap` so off-thread closures pick it up on their
+    /// next `.load()`, and push it to the network adapter (which keys
+    /// validator pubkeys and shard committees off the snapshot). Every
+    /// hosted shard's `Action::TopologyChanged` lands here as it folds
+    /// the beacon at `epoch`; `apply_topology` gates the store
+    /// monotonically so a slower shard thread cannot regress the shared
+    /// schedule to an older epoch's view.
     pub(in crate::shard) fn handle_topology_changed(
         &self,
         epoch: Epoch,
-        topology_snapshot: &Arc<TopologySnapshot>,
-        routing_committees: Arc<RoutingCommittees>,
+        schedule: Arc<TopologySchedule>,
     ) {
-        self.process
-            .apply_topology(epoch, topology_snapshot, routing_committees);
+        let committee_size = schedule.head().committee_for_shard(self.shard).len();
+        self.process.apply_topology(epoch, schedule);
 
         tracing::info!(
             local_shard = self.shard.inner(),
-            committee_size = topology_snapshot.committee_for_shard(self.shard).len(),
+            committee_size,
             "Network topology updated"
         );
     }

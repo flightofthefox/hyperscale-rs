@@ -1,19 +1,23 @@
 //! Generic fetch dispatch + tick-timer plumbing.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
-use hyperscale_core::{ProtocolEvent, TimerId};
+use hyperscale_core::{FetchIds, ProtocolEvent, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 
 use super::{ShardLoop, TimerOp};
-use crate::beacon;
-use crate::fetch::{FetchBinding, FetchInput, FetchOutput};
+use crate::beacon::{self, BeaconProposalBinding, ShardWitnessBinding};
+use crate::fetch::{FetchBinding, FetchInput, FetchOutput, Release};
 use crate::shard::cross_shard::{
-    ExecCertBinding, FinalizationBinding, LocalProvisionBinding, ProvisionBinding,
+    CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
+    ProvisionBinding, SettledTxsBinding, StateProofBinding, StateProofRelayBinding,
 };
+use crate::shard::instances::InstanceRecordBinding;
 use crate::shard::mempool::TransactionBinding;
+use crate::shard::packages::PackageArtifactBinding;
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -90,6 +94,61 @@ where
         }
         let outputs = B::fetch_mut(&mut self.io).handle(input);
         self.process_fetch_outputs::<B>(outputs);
+    }
+
+    /// Release a batch of ids from the binding that fetches them. The
+    /// one place a [`FetchIds`] arm is matched back to its binding: a
+    /// response boundary's failure or fulfilment and a coordinator's
+    /// `Action::AbandonFetch` all arrive here.
+    pub(in crate::shard) fn release_fetch(&mut self, ids: FetchIds, how: Release) {
+        match ids {
+            FetchIds::Transactions(ids) => self.drive_fetch::<TransactionBinding>(how.input(ids)),
+            FetchIds::LocalProvisions(ids) => {
+                self.drive_fetch::<LocalProvisionBinding>(how.input(ids));
+            }
+            FetchIds::Finalizations(ids) => {
+                self.drive_fetch::<FinalizationBinding>(how.input(ids));
+            }
+            FetchIds::RemoteProvisions(ids) => self.drive_fetch::<ProvisionBinding>(how.input(ids)),
+            FetchIds::ExecutionCerts(ids) => self.drive_fetch::<ExecCertBinding>(how.input(ids)),
+            FetchIds::CommittedTxs(ids) => self.drive_fetch::<CommittedTxBinding>(how.input(ids)),
+            FetchIds::StateProofs(ids) => self.drive_fetch::<StateProofBinding>(how.input(ids)),
+            FetchIds::RelayedStateProofs(ids) => {
+                self.drive_fetch::<StateProofRelayBinding>(how.input(ids));
+            }
+            FetchIds::SettledTxs(ids) => self.drive_fetch::<SettledTxsBinding>(how.input(ids)),
+            FetchIds::BeaconProposals(ids) => {
+                self.drive_fetch::<BeaconProposalBinding>(how.input(ids));
+            }
+            FetchIds::ShardWitnesses(ids) => {
+                self.drive_fetch::<ShardWitnessBinding>(how.input(ids));
+            }
+            FetchIds::PackageArtifacts(ids) => {
+                self.drive_fetch::<PackageArtifactBinding>(how.input(ids));
+            }
+            FetchIds::InstanceRecords(ids) => {
+                self.drive_fetch::<InstanceRecordBinding>(how.input(ids));
+            }
+        }
+    }
+
+    /// Release what `B`'s fetch still holds `within` a scope that
+    /// `wanted` no longer names. For a fetch whose consumer re-derives
+    /// its whole wanted set each pass, this is the only retirement:
+    /// nothing answers for an id the consumer stopped asking about.
+    pub(in crate::shard) fn abandon_unwanted<B: FetchBinding>(
+        &mut self,
+        wanted: &BTreeSet<B::Id>,
+        within: impl Fn(&B::Id) -> bool,
+    ) {
+        let stale: Vec<B::Id> = B::fetch_mut(&mut self.io)
+            .pending_ids()
+            .filter(|id| within(id) && !wanted.contains(id))
+            .cloned()
+            .collect();
+        if !stale.is_empty() {
+            self.drive_fetch::<B>(FetchInput::Abandoned { ids: stale });
+        }
     }
 
     /// Route an admission `ProtocolEvent` to whichever fetch bindings

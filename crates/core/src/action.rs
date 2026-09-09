@@ -1,39 +1,49 @@
 //! Action types for the deterministic state machine.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_engine::TickEnvironment;
+use hyperscale_engine::legs::{Member, Runs};
 use hyperscale_storage::TickResolution;
 use hyperscale_types::{
-    BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
-    BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
-    CertificateRoot, CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader,
-    ConsensusPublicKey, DeclaredRange, Epoch, ExecutionCertificate, ExecutionVote, Finalization,
-    GlobalReceiptRoot, Hash, HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1,
-    PcVote2, PcVote3, PcVoteEquivocation, PrincipalAddr, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
-    RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain,
-    Round, RoutingCommittees, SafeVoteRegisters, ShardForkProof, ShardId, ShardLoad,
-    ShardVoteEquivocation, SharedCertificates, SharedTransactions, SharedWitnessSources,
-    SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
-    StateRoot, SubstateEntry, SubstateKey, SweepFrontier, TerminalEvidence, TerminalRoots,
-    TerminalVerdict, TickId, Timeout, TopologySnapshot, Transaction, TransactionRoot,
-    TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount,
-    WeightedTimestamp, WorkInFlight,
+    AbandonmentRecord, BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount,
+    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote,
+    CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
+    CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, EscrowedValue,
+    ExecutionCertificate, ExecutionVote, Finalization, GlobalReceiptRoot, Hash, HeaderFetchCount,
+    LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
+    PrincipalAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
+    ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadySignal,
+    ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round, ShardForkProof,
+    ShardId, ShardLoad, ShardTrie, ShardVoteEquivocation, SharedCertificates, SharedTransactions,
+    SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
+    SpcView, SplitChildRoots, StateClaim, StateRoot, SubstateEntry, SubstateKey, SweepFrontier,
+    TerminalRoots, TickId, Timeout, TopologySchedule, TopologySnapshot, Transaction,
+    TransactionRoot, TransactionStatus, TxHash, TxOutcome, UnsettledTx, ValidatorId, Verifiable,
+    Verified, VoteCount, VotePosition, WeightedTimestamp, WorkInFlight,
 };
 
-use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
+use crate::{CommitSource, FetchIds, FetchRequest, ProtocolEvent, TimerId};
 
 /// A request to execute a cross-shard transaction with its provisions.
 #[derive(Debug, Clone)]
 pub struct CrossShardExecutionRequest {
     /// Transaction hash (for correlation).
     pub tx_hash: TxHash,
-    /// The transaction to execute.
-    pub transaction: Arc<Verified<Transaction>>,
+    /// The transaction to execute, or `None` where this shard holds no
+    /// body for it.
+    ///
+    /// A member running a shape always holds one. The two housekeeping
+    /// members read none — every cell they touch is named by the record
+    /// leaves `runs` carries — but they keep it where it is there,
+    /// because the price still follows the payer's vault and the vault
+    /// is the body's to name. `None` is a reshape successor's
+    /// housekeeping: its store arrives as a prefix of leaves, no body
+    /// arrives with it, and its predecessor's chain settled the price.
+    pub transaction: Option<Arc<Verified<Transaction>>>,
     /// State entries provisioned by other shards (one `Arc` per source shard
     /// contribution). Engine layers them on top of the local snapshot.
     pub provisions: Vec<Arc<Vec<SubstateEntry>>>,
@@ -43,15 +53,36 @@ pub struct CrossShardExecutionRequest {
     /// bundle carried, so every participant executes the transaction
     /// under one clock.
     pub clock: WeightedTimestamp,
-    /// Whether this transaction reaches beyond the executing shard.
+    /// What this member runs: the transaction as classified when its
+    /// block committed — carried, never re-derived — or a settlement of
+    /// what a leg here issued. What it says of the member is what the
+    /// batch reads: whether the transaction reaches beyond this shard,
+    /// which makes a member's provisions and arrivals necessary and its
+    /// writes filtered to the subtree this shard owns; and whether a
+    /// counterpart's verdict can still discard its effects, which makes
+    /// its contributions provisional, readable by no later tick until
+    /// the verdict resolves them, and its declared cells a claim a later
+    /// member must compose with.
+    pub runs: Runs,
+    /// What committed bundles attested for the edges this shard's legs
+    /// consume, read off the record cells they proved. Empty for a
+    /// member that runs the whole shape.
+    pub arrivals: Vec<EscrowedValue>,
+}
+
+impl CrossShardExecutionRequest {
+    /// The shape this member runs and the body it runs over, or `None`
+    /// for a housekeeping member.
     ///
-    /// A batch is not homogeneous in this: it carries whatever the tick
-    /// admitted, single-shard and cross-shard alike. Reaching beyond is
-    /// what makes a transaction's contributions provisional — readable by
-    /// no later tick until a counterpart's outcome resolves them — and
-    /// what makes it abortable on a counterpart's verdict, so both are
-    /// decided per transaction rather than per batch.
-    pub reaches_beyond: bool,
+    /// The pair travels together or not at all: `Runs::Shape` is the one
+    /// arm a body belongs to, and a reclaim or a retirement has neither.
+    #[must_use]
+    pub const fn shape(&self) -> Option<(&Member, &Arc<Verified<Transaction>>)> {
+        match (&self.runs, self.transaction.as_ref()) {
+            (Runs::Shape(member), Some(body)) => Some((member, body)),
+            _ => None,
+        }
+    }
 }
 
 /// A change to the local vnode's reshape-observer duty, carried on
@@ -229,10 +260,12 @@ pub enum Action {
         /// Local-shard validators eligible to propose the next block; they
         /// need this vote to assemble the QC.
         next_proposers: Vec<ValidatorId>,
-        /// The safe-vote registers as ratcheted by this vote. The runner
-        /// persists them durably before the signature leaves the process,
-        /// so a crash-restarted validator can never re-vote this round.
-        registers: SafeVoteRegisters,
+        /// The signing position this vote ratchets — the registers and
+        /// the uncommitted chain justifying them. The runner persists it
+        /// durably before the signature leaves the process, so a
+        /// crash-restarted validator can never re-vote this round, and
+        /// comes back able to extend the certificate it locked on.
+        position: VotePosition,
     },
 
     /// Sign and broadcast a timeout to the local-shard committee.
@@ -250,11 +283,11 @@ pub enum Action {
         high_qc: QuorumCertificate,
         /// Local-shard committee members who tally timeouts for this round.
         recipients: Vec<ValidatorId>,
-        /// The safe-vote registers as ratcheted by this timeout. The runner
-        /// persists them durably before the signature leaves the process,
+        /// The signing position this timeout ratchets. The runner
+        /// persists it durably before the signature leaves the process,
         /// so a crash-restarted validator can never vote a round it
         /// already abandoned.
-        registers: SafeVoteRegisters,
+        position: VotePosition,
     },
 
     /// Sign and broadcast a "ready on shard" signal to the local committee.
@@ -643,10 +676,10 @@ pub enum Action {
     /// shard-local state changes to the JMT and compares the resulting
     /// root against the header's `state_root`.
     ///
-    /// Always emits `ProtocolEvent::LocalReceiptRootVerified`. Emits
-    /// `ProtocolEvent::StateRootVerified` only on receipt-root pass; on
-    /// receipt-root failure the handler short-circuits and the pipeline
-    /// rejects the block from the receipt-root event alone.
+    /// Always completes the local-receipt-root check. Completes the
+    /// state-root check only on receipt-root pass; on receipt-root
+    /// failure the handler short-circuits and the pipeline rejects the
+    /// block from the receipt-root refusal alone.
     ///
     /// The action handler walks the snapshot chain from `parent_block_hash`
     /// to build an overlay of uncommitted tree nodes, then calls
@@ -673,6 +706,10 @@ pub enum Action {
         /// the committed-transaction window a terminating boundary header
         /// roots. Carried as hashes because that is all the root needs.
         block_tx_hashes: Vec<TxHash>,
+        /// The committed cells the block writes, derived by the
+        /// coordinator under the block's own window. They fold with the
+        /// receipts' writes under the root being verified.
+        creations: Vec<(SubstateKey, Vec<u8>)>,
         /// Block height being verified.
         block_height: BlockHeight,
         /// The header's `split_child_roots` claim, verified beside the
@@ -793,9 +830,8 @@ pub enum Action {
     /// against the header's `transaction_root`. Also checks that every tx's
     /// `validity_range` is well-formed and contains `validity_anchor` — the
     /// parent QC's `weighted_timestamp` carried on the block. Returns
-    /// `ProtocolEvent::TransactionRootVerified` carrying
-    /// `Result<Verified<TransactionRoot>, TxRootVerifyError>`; the `Err`
-    /// variant distinguishes a merkle-root mismatch from an out-of-window
+    /// `ProtocolEvent::BlockCheckCompleted` for the transaction root; the
+    /// verifier's error distinguishes a merkle-root mismatch from an out-of-window
     /// transaction.
     ///
     /// Pure CPU; no JMT dependency.
@@ -812,6 +848,9 @@ pub enum Action {
         /// one-block lag (this block's own QC may carry a slightly later
         /// timestamp) is bounded by `MAX_VALIDITY_RANGE`.
         validity_anchor: WeightedTimestamp,
+        /// Transactions this shard only delivers for, admissible past
+        /// their validity end to the delivery window's close.
+        late_deliveries: HashSet<TxHash>,
     },
 
     /// Verify a block's provisions root.
@@ -831,7 +870,7 @@ pub enum Action {
     ///
     /// Computes the merkle root from the certificates' `receipt_hash` values
     /// and compares against the block header's claimed `certificate_root`.
-    /// Returns `ProtocolEvent::CertificateRootVerified`.
+    /// Returns `ProtocolEvent::BlockCheckCompleted`.
     ///
     /// Pure CPU operation — verified in parallel with state root and transaction root.
     VerifyCertificateRoot {
@@ -858,6 +897,9 @@ pub enum Action {
         expected: ProvisionTxRootsMap,
         /// Transactions in the block.
         transactions: SharedTransactions,
+        /// Certificates in the block, whose committed outcomes promise
+        /// crossing bundles.
+        certificates: SharedCertificates,
         /// Topology snapshot used to route txs to target shards.
         topology_snapshot: TopologySnapshot,
     },
@@ -871,7 +913,7 @@ pub enum Action {
     /// reads the same vault version regardless of local commit progress;
     /// the coordinator holds the dispatch until its own commit pipeline
     /// has materialized that height.
-    /// Returns `ProtocolEvent::ReservationsVerified`.
+    /// Returns `ProtocolEvent::BlockCheckCompleted`.
     VerifyReservations {
         /// Block whose reservations are being verified.
         block_hash: BlockHash,
@@ -883,6 +925,41 @@ pub enum Action {
         /// transaction clock its members execute under if it commits
         /// them.
         clock: WeightedTimestamp,
+    },
+
+    /// Check the figures a block's abandonment records restate against
+    /// the committed transactions they name.
+    ///
+    /// A record restates each name's deadline, reservation and charge so
+    /// a replica whose replay never reached the transaction composes the
+    /// same abort as one that held it; unchecked, that would let a
+    /// proposer choose the vault and the amount an abort burns. Every
+    /// figure is a function of the body, and the body is read off the
+    /// store — where a validator that committed the transaction holds it
+    /// at any distance — so the check needs no window of its own. A body
+    /// the store never held answers `Unknown`, and the vote defers on it
+    /// rather than accepting.
+    /// Returns `ProtocolEvent::BlockCheckCompleted`.
+    VerifyResolutions {
+        /// Block whose resolutions are being checked.
+        block_hash: BlockHash,
+        /// Every name the block's records carry.
+        entries: Vec<UnsettledTx>,
+        /// Every transaction the block's finalizations resolve without
+        /// deciding — a delivery or a leg — checked against the lapse
+        /// where the body says this shard delivers for it.
+        deliveries: Vec<TxHash>,
+        /// Every transaction the block's finalizations decide with
+        /// success by its own execution, for a member that awaits
+        /// nobody, checked against the deadline: past it a leg may
+        /// already have taken its crossing back.
+        successes: Vec<TxHash>,
+        /// The block's own anchor, which the lapse and the deadline are
+        /// read against.
+        anchor: WeightedTimestamp,
+        /// The trie of the anchor's window, which the body is classified
+        /// against.
+        trie: ShardTrie,
     },
 
     /// Build a complete block proposal.
@@ -924,7 +1001,10 @@ pub enum Action {
         /// What departed shards left unresolved of this chain's business
         /// — written down here while the settled sets they were read
         /// from can still be checked against.
-        terminal_verdicts: Vec<TerminalVerdict>,
+        abandonment_records: Vec<AbandonmentRecord>,
+        /// Proofs of counterparts' cells this proposer's fetches
+        /// answered, for every replica to fold at commit.
+        state_claims: Vec<StateClaim>,
         /// Prior fee-reservation demand per local payer among the
         /// candidate transactions — in-flight holds plus the uncommitted
         /// window, excluding the candidates themselves. The builder
@@ -1074,8 +1154,9 @@ pub enum Action {
     },
 
     /// Commit a block trusted via QC only — no cached `PreparedCommit` exists
-    /// because we didn't run state root verification ourselves (sync path,
-    /// or consensus path when we didn't participate in voting).
+    /// because this node's own state root verification has not landed: an
+    /// aggregator that formed the QC without voting, or a sync-admitted
+    /// block whose verification is still in flight at its commit.
     ///
     /// The `io_loop` computes the `PreparedCommit` inline and asserts the
     /// computed root matches the block's declared root (same Byzantine
@@ -1095,6 +1176,11 @@ pub enum Action {
         /// Where the parent's sweep stopped — the lower end of the
         /// interval this block's removals fill.
         parent_sweep_frontier: SweepFrontier,
+        /// The committed cells the block writes, derived by the
+        /// coordinator under the block's own window — the one placement
+        /// fact the recomputation reads beyond the block, resolved where
+        /// the schedule is.
+        creations: Vec<(SubstateKey, Vec<u8>)>,
         /// How this node learned the certifying QC (aggregator vs header).
         source: CommitSource,
         /// Beacon-witness leaves to persist alongside the block in the
@@ -1160,26 +1246,21 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Topology
     // ═══════════════════════════════════════════════════════════════════════
-    /// Propagate updated topology to the `io_loop` / network layer.
+    /// Propagate the folded topology to the `io_loop` / network layer.
     ///
-    /// Emitted by the state machine after any topology mutation. The
-    /// `io_loop` stores the snapshot into its shared topology snapshot
-    /// (`ArcSwap`), rebuilds `cached_local_peers`, and updates
-    /// `local_shard` / `num_shards`.
+    /// Emitted by the state machine on every beacon commit. The io side
+    /// publishes the schedule's head as its shared topology snapshot,
+    /// keys fetch routing on the schedule's terminal-clamped committees,
+    /// and resolves a followed block's window through the schedule.
     TopologyChanged {
-        /// Beacon epoch this snapshot was derived at — the monotonic key the
-        /// `io_loop` gates the shared `ArcSwap` on, so a slower co-hosted shard
-        /// thread folding an older epoch cannot overwrite a newer snapshot a
-        /// sibling thread already published.
+        /// Beacon epoch the schedule was folded at — the monotonic key the
+        /// `io_loop` gates its publish on, so a slower co-hosted shard
+        /// thread folding an older epoch cannot overwrite a newer schedule
+        /// a sibling thread already published.
         epoch: Epoch,
-        /// New topology snapshot to propagate.
-        topology_snapshot: Arc<TopologySnapshot>,
-        /// Terminal-clamped per-shard routing committees, covering every
-        /// shard the schedule still retains — including a split parent
-        /// draining out of the head, whose committee the head snapshot no
-        /// longer carries. The network keys fetch routing on this so a
-        /// request to a dissolved shard still reaches its draining members.
-        routing_committees: Arc<RoutingCommittees>,
+        /// The beacon's window schedule as of this fold: the head, the
+        /// retained windows and the lookahead, one clone per epoch.
+        schedule: Arc<TopologySchedule>,
     },
 
     /// The lookahead committees move this vnode's validator onto or off
@@ -1266,26 +1347,6 @@ pub enum Action {
         count: HeaderFetchCount,
     },
 
-    /// Acquire a terminated shard's settled-transaction set `S_P` for the
-    /// split-boundary fence in one beacon-attested shot.
-    ///
-    /// Emitted when the node's own beacon fold attests a terminated
-    /// shard's `settled_txs_root` it doesn't yet hold `S_P` for. The
-    /// I/O loop fetches the shard's complete settled-transaction window list
-    /// from its terminal committee (`peers`), accepts it only when the
-    /// recomputed root equals `attested_root`, and feeds the verified
-    /// set back as [`crate::ProtocolEvent::SettledTxsReconstructed`].
-    StartSettledTxsAcquisition {
-        /// The terminated shard whose settled set to acquire.
-        shard: ShardId,
-        /// The terminal to fetch against, the root to check the list
-        /// against, and how long the answer stays good — all read off the
-        /// emitting node's own beacon fold.
-        evidence: TerminalEvidence,
-        /// The terminated shard's terminal committee, asked in rotation.
-        peers: Vec<ValidatorId>,
-    },
-
     /// Issue a network fetch via one of the unified fetch protocols.
     ///
     /// Replaces the family of flat `Fetch*` / `RequestMissing*` variants —
@@ -1296,14 +1357,13 @@ pub enum Action {
     /// key without it ever being admitted.
     Fetch(FetchRequest),
 
-    /// Cancel an in-flight fetch the originating coordinator no longer wants.
+    /// Cancel in-flight fetches the originating coordinator no longer wants.
     ///
-    /// Symmetric to [`Self::Fetch`] — `io_loop`'s dispatcher matches the
-    /// inner [`FetchAbandon`] and feeds the ids through
-    /// `FetchInput::Abandoned` on the corresponding binding. Emitted by
+    /// Symmetric to [`Self::Fetch`]: the node feeds the ids through
+    /// `FetchInput::Abandoned` on the binding that fetches them. Emitted by
     /// coordinators at every expected-set drop site (verification
     /// succeeded, retention-horizon orphan cleanup, deadline eviction).
-    AbandonFetch(FetchAbandon),
+    AbandonFetch(FetchIds),
 
     /// Offer transactions this chain never included to whatever holds
     /// their keys now.
@@ -1675,6 +1735,7 @@ impl Action {
             | Self::VerifyCertificateRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyReservations { .. }
+            | Self::VerifyResolutions { .. }
             | Self::VerifyStateRoot { .. }
             | Self::VerifyBeaconWitnessRoot { .. }
             | Self::BuildProposal { .. }
@@ -1781,6 +1842,7 @@ impl Action {
             | Self::VerifyCertificateRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyReservations { .. }
+            | Self::VerifyResolutions { .. }
             | Self::BuildProposal { .. }
             | Self::ExecuteTransactions { .. }
             | Self::ResolveTicks { .. }
@@ -1795,7 +1857,6 @@ impl Action {
             | Self::StartBeaconBlockSync { .. }
             | Self::StartRemoteHeaderSync { .. }
             | Self::FetchCommitProof { .. }
-            | Self::StartSettledTxsAcquisition { .. }
             | Self::RestoreCommittedState { .. }
             | Self::Fetch(_)
             | Self::AbandonFetch(_)
@@ -1866,6 +1927,7 @@ impl Action {
             | Self::VerifyCertificateRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyReservations { .. }
+            | Self::VerifyResolutions { .. }
             | Self::VerifyStateRoot { .. }
             | Self::VerifyBeaconWitnessRoot { .. }
             | Self::BuildProposal { .. }

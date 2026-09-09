@@ -166,16 +166,29 @@ hash_newtype!(
 );
 
 hash_newtype!(
-    /// Merkle root over the [`TerminalVerdict`](crate::TerminalVerdict)
+    /// Merkle root over the [`AbandonmentRecord`](crate::AbandonmentRecord)
     /// records a block carries.
     ///
     /// Carried in
-    /// [`BlockHeader::terminal_verdict_root`](crate::BlockHeader), so what
+    /// [`BlockHeader::abandonment_root`](crate::BlockHeader), so what
     /// a departed shard left unresolved of this chain's business is
     /// committed content rather than a reading that expires with the
     /// terminal it came from.
-    pub TerminalVerdictRoot,
-    "TerminalVerdictRoot"
+    pub AbandonmentRoot,
+    "AbandonmentRoot"
+);
+
+hash_newtype!(
+    /// Merkle root over the [`StateClaim`](crate::StateClaim)
+    /// bundles a block carries.
+    ///
+    /// Carried in
+    /// [`BlockHeader::state_claims_root`](crate::BlockHeader), so a
+    /// proof of a counterpart's cell is committed content every replica
+    /// folds at the same height rather than a reading one validator
+    /// fetched.
+    pub StateClaimsRoot,
+    "StateClaimsRoot"
 );
 
 hash_newtype!(

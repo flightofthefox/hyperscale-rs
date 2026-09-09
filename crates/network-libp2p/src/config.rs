@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use hyperscale_types::MAX_WIRE_MESSAGE_BYTES;
 use libp2p::Multiaddr;
 
 /// Configuration for the libp2p network adapter.
@@ -133,7 +134,7 @@ impl Default for Libp2pConfig {
             // Use QUIC by default with random port
             listen_addresses: vec!["/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap()],
             bootstrap_peers: vec![],
-            max_message_size: 1024 * 1024 * 10, // 10MB
+            max_message_size: MAX_WIRE_MESSAGE_BYTES,
             gossipsub_heartbeat: Duration::from_millis(300),
             gossipsub_history_length: 12,
             idle_connection_timeout: Duration::from_secs(30),
@@ -212,7 +213,7 @@ impl Libp2pConfig {
             // Matches the production default: a maximal transaction is
             // exactly the transaction cap, so a message budget equal to
             // it cannot carry one once the gossip envelope is added.
-            max_message_size: 1024 * 1024 * 10, // 10MB
+            max_message_size: MAX_WIRE_MESSAGE_BYTES,
             gossipsub_heartbeat: Duration::from_millis(500),
             gossipsub_history_length: 12,
             idle_connection_timeout: Duration::from_secs(30),
@@ -244,7 +245,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Libp2pConfig::default();
-        assert_eq!(config.max_message_size, 1024 * 1024 * 10); // 10MB
+        assert_eq!(config.max_message_size, MAX_WIRE_MESSAGE_BYTES);
         assert_eq!(config.gossipsub_heartbeat, Duration::from_millis(300));
         assert_eq!(config.gossipsub_history_length, 12);
         assert!(!config.listen_addresses.is_empty());

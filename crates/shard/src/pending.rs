@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchAbandon, FetchRequest};
+use hyperscale_core::{Action, FetchIds, FetchRequest};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, Finalization, FinalizationHash,
     LocalTimestamp, ProvisionHash, Provisions, Round, ShardId, Transaction, TxHash, ValidatorId,
@@ -34,19 +34,17 @@ impl OrphanedFetches {
     pub fn into_abandon_actions(self) -> Vec<Action> {
         let mut actions = Vec::new();
         if !self.txs.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::Transactions {
-                ids: self.txs,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::Transactions(self.txs)));
         }
         if !self.finalizations.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::Finalizations {
-                ids: self.finalizations,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::Finalizations(
+                self.finalizations,
+            )));
         }
         if !self.provisions.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::LocalProvisions {
-                hashes: self.provisions,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::LocalProvisions(
+                self.provisions,
+            )));
         }
         actions
     }
@@ -243,6 +241,23 @@ impl PendingBlocks {
         self.0
             .values()
             .any(|pending| pending.header().height() == height && pending.header().round() == round)
+    }
+
+    /// True when a block at `(height, round)` is one this replica still
+    /// owes work to itself — content to gather, roots to check — rather
+    /// than one waiting on another chain to answer for a claim.
+    ///
+    /// The round timer suppresses on the first and not the second. A
+    /// replica gathering a block's own content finishes on its own and
+    /// is worth waiting the long window for; one held at the fence is
+    /// waiting on a counterpart it cannot make answer, which is the
+    /// case the ordinary round timeout is there to bound.
+    pub fn has_own_work_at_round(&self, height: BlockHeight, round: Round) -> bool {
+        self.0.values().any(|pending| {
+            pending.header().height() == height
+                && pending.header().round() == round
+                && !pending.awaiting_counterpart()
+        })
     }
 
     /// Total transaction count across all pending blocks (manifest counts,
@@ -517,6 +532,18 @@ pub struct PendingBlock {
     /// The fully constructed block (None until all transactions/ticks received).
     constructed_block: Option<Arc<Block>>,
 
+    /// Whether the vote fence withheld this block for want of evidence
+    /// from another chain.
+    ///
+    /// Held apart from the missing-content sets above because it is a
+    /// different kind of waiting. Those name content this replica is
+    /// still gathering for a block the chain has committed to; this
+    /// names a claim the proposer made about a counterpart that only
+    /// that counterpart can settle. The round timer prices the two
+    /// differently, which is the whole reason the flag exists — see
+    /// [`PendingBlocks::has_own_work_at_round`].
+    awaiting_counterpart: bool,
+
     /// Time at which this pending block was first observed. Used to schedule
     /// fetch requests for missing data after a gossip grace period.
     created_at: LocalTimestamp,
@@ -547,6 +574,7 @@ impl PendingBlock {
             missing_provision_hashes,
             manifest,
             constructed_block: None,
+            awaiting_counterpart: false,
             created_at,
         }
     }
@@ -581,7 +609,8 @@ impl PendingBlock {
             tx_hashes,
             cert_ids,
             provision_hashes,
-            block.terminal_verdicts().to_vec(),
+            block.abandonment_records().to_vec(),
+            block.state_claims().to_vec(),
             block.witness_sources().as_ref().clone(),
         );
         let mut received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>> =
@@ -599,6 +628,7 @@ impl PendingBlock {
             missing_provision_hashes: HashSet::new(),
             manifest,
             constructed_block: None,
+            awaiting_counterpart: false,
             created_at,
         };
         // Fill in all transactions
@@ -639,6 +669,19 @@ impl PendingBlock {
         } else {
             false
         }
+    }
+
+    /// Whether the vote fence withheld this block for want of another
+    /// chain's evidence, rather than for content still landing here.
+    pub const fn awaiting_counterpart(&self) -> bool {
+        self.awaiting_counterpart
+    }
+
+    /// Record what the vote fence said of this block: `true` where it
+    /// withheld the vote for want of a counterpart's evidence, `false`
+    /// once the evidence stands and the block is judged on its own.
+    pub const fn set_awaiting_counterpart(&mut self, awaiting: bool) {
+        self.awaiting_counterpart = awaiting;
     }
 
     /// Check if all transactions, finalizations, and provisions have been received.
@@ -763,7 +806,8 @@ impl PendingBlock {
             transactions: Arc::new(transactions),
             certificates: Arc::new(certificates),
             provisions: Arc::new(provisions),
-            terminal_verdicts: Arc::new(self.manifest.terminal_verdicts().clone()),
+            abandonment_records: Arc::new(self.manifest.abandonment_records().clone()),
+            state_claims: Arc::new(self.manifest.state_claims().clone()),
             witness_sources: Arc::new(self.manifest.witness_sources().clone()),
         });
 
@@ -853,6 +897,42 @@ mod tests {
         hash
     }
 
+    /// A block held at the fence is not work this replica owes: the
+    /// round timer prices it at the ordinary timeout, so the query the
+    /// timer reads must not see it, while the one the pacemaker reads
+    /// for a live proposal at the round still does.
+    #[test]
+    fn a_block_held_at_the_fence_is_not_this_replicas_own_work() {
+        let mut pending = PendingBlocks::new();
+        let height = BlockHeight::new(5);
+        let round = Round::new(1);
+        let hash = insert_at(&mut pending, height, round);
+
+        assert!(pending.has_own_work_at_round(height, round));
+
+        pending
+            .get_mut(hash)
+            .expect("the block was just inserted")
+            .set_awaiting_counterpart(true);
+        assert!(
+            !pending.has_own_work_at_round(height, round),
+            "a block waiting on a counterpart is not work that finishes here",
+        );
+        assert!(
+            pending.has_any_at_round(height, round),
+            "and it is still a proposal standing at the round",
+        );
+
+        pending
+            .get_mut(hash)
+            .expect("the block is still pending")
+            .set_awaiting_counterpart(false);
+        assert!(
+            pending.has_own_work_at_round(height, round),
+            "evidence that lands puts the block back in this replica's hands",
+        );
+    }
+
     #[test]
     fn count_at_height_counts_every_round() {
         let mut pending = PendingBlocks::new();
@@ -900,6 +980,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -935,6 +1016,7 @@ mod tests {
                 vec![one, two],
                 vec![],
                 vec![],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -966,6 +1048,7 @@ mod tests {
             BlockManifest::new(
                 vec![],
                 vec![fw.receipt_hash()],
+                vec![],
                 vec![],
                 vec![],
                 WitnessSources::empty(),
@@ -1005,6 +1088,7 @@ mod tests {
                 vec![fw.receipt_hash()],
                 vec![],
                 vec![],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1039,7 +1123,8 @@ mod tests {
             certificates: Arc::new(vec![wire_fw]),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
 
         let pending = PendingBlock::from_complete_block(
@@ -1067,6 +1152,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![prov_a, prov_b],
+                vec![],
                 vec![],
                 WitnessSources::empty(),
             ),
@@ -1117,6 +1203,7 @@ mod tests {
                 vec![],
                 vec![shared, only_stale],
                 vec![],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1127,6 +1214,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![shared],
+                vec![],
                 vec![],
                 WitnessSources::empty(),
             ),
@@ -1156,6 +1244,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1165,6 +1254,7 @@ mod tests {
             make_header(BlockHeight::new(8)),
             BlockManifest::new(
                 vec![shared],
+                vec![],
                 vec![],
                 vec![],
                 vec![],

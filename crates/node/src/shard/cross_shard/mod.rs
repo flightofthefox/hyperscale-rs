@@ -3,7 +3,7 @@
 //! Owns the per-shard state and code for everything a shard does *across*
 //! shard boundaries: tracking other shards' certified headers, fetching and
 //! serving cross-shard data (provisions, execution certificates, finalized
-//! ticks), and reconstructing the settled-transaction fence at a split boundary.
+//! ticks, a departed shard's settled set).
 //!
 //! [`CrossShardState`] is the per-shard state struct `ShardIo` composes;
 //! subsystem-specific FSM instances, bindings, serves, and glue live here
@@ -18,16 +18,16 @@ mod provision_serve;
 mod remote_header;
 mod remote_header_serve;
 mod remote_header_sync;
-mod settled_set;
-mod settled_set_sync;
 mod settled_txs_serve;
+mod state_proof_serve;
 
 pub use committed_txs_serve::{CommittedTxsCache, serve_committed_txs_request};
 pub use exec_cert_serve::serve_execution_certs_request;
 pub use fetch::{
     CommittedTxBinding, CommittedTxFetch, ExecCertBinding, ExecCertFetch, FinalizationBinding,
     FinalizationFetch, LocalProvisionBinding, LocalProvisionFetch, ProvisionBinding,
-    ProvisionFetch,
+    ProvisionFetch, SettledTxsBinding, SettledTxsFetch, StateProofBinding, StateProofFetch,
+    StateProofRelayBinding,
 };
 pub use finalization_serve::serve_finalizations_request;
 use hyperscale_types::{BlockHeight, LocalTimestamp, ShardId};
@@ -35,8 +35,8 @@ pub use local_provision_serve::serve_local_provisions_request;
 pub use provision_serve::serve_provision_request;
 use remote_header::{RemoteHeaderSync, RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 pub use remote_header_serve::{serve_local_certified_headers, serve_remote_headers_request};
-pub use settled_set::SettledTxsAcquisition;
 pub use settled_txs_serve::serve_settled_txs_request;
+pub use state_proof_serve::{serve_relayed_state_proof_request, serve_state_proof_request};
 
 use crate::config::NodeConfig;
 use crate::fetch::FetchConfig;
@@ -60,10 +60,17 @@ pub struct CrossShardState {
     /// Committed-transaction membership fetch against the chains this
     /// one succeeds (rotates through the predecessor's committee).
     pub committed_tx: CommittedTxFetch,
-
-    /// Settled-ticks acquisition drivers — one per past-terminal remote
-    /// shard whose `S_P` this node is acquiring for the split-boundary fence.
-    pub settled_set_sync: SettledTxsAcquisition,
+    /// State-proof fetch against other shards' commit-proven headers
+    /// (rotates through the anchor's committee).
+    pub state_proof: StateProofFetch,
+    /// State-proof relay for a claim this validator has not proven,
+    /// asked of its own committee (rotates through it). Its own slot
+    /// rather than the one above, so a relay is not suppressed by a
+    /// counterpart-addressed fetch of the same cell that is failing.
+    pub relayed_state_proof: StateProofFetch,
+    /// Settled-set fetch against departed shards' terminals (rotates
+    /// through the terminal committee).
+    pub settled_txs: SettledTxsFetch,
 }
 
 impl CrossShardState {
@@ -98,13 +105,36 @@ impl CrossShardState {
                     parallel_chunks_per_tick: 2,
                 },
             ),
-            settled_set_sync: SettledTxsAcquisition::new(),
+            state_proof: StateProofFetch::new(
+                "state_proof",
+                FetchConfig {
+                    max_in_flight: 256,
+                    max_ids_per_request: 64,
+                    parallel_chunks_per_tick: 2,
+                },
+            ),
+            relayed_state_proof: StateProofFetch::new(
+                "relayed_state_proof",
+                FetchConfig {
+                    max_in_flight: 256,
+                    max_ids_per_request: 64,
+                    parallel_chunks_per_tick: 2,
+                },
+            ),
+            settled_txs: SettledTxsFetch::new(
+                "settled_txs",
+                FetchConfig {
+                    max_in_flight: 8,
+                    max_ids_per_request: 8,
+                    parallel_chunks_per_tick: 2,
+                },
+            ),
         }
     }
 
-    /// True if any cross-shard FSM (remote-header sync, the cross-shard
-    /// fetches, or settled-transaction acquisition) has pending work — keeps this
-    /// shard's `FetchTick` alive so deferred work retries.
+    /// True if any cross-shard FSM (remote-header sync or the cross-shard
+    /// fetches) has pending work — keeps this shard's `FetchTick` alive so
+    /// deferred work retries.
     #[must_use]
     pub fn has_pending(&self) -> bool {
         self.remote_header_sync.has_deferred()
@@ -114,7 +144,9 @@ impl CrossShardState {
             || self.finalization.has_pending()
             || self.local_provision.has_pending()
             || self.committed_tx.has_pending()
-            || self.settled_set_sync.has_pending()
+            || self.state_proof.has_pending()
+            || self.relayed_state_proof.has_pending()
+            || self.settled_txs.has_pending()
     }
 
     /// Drive the remote-header-sync FSM's periodic tick. Returns range

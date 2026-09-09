@@ -15,19 +15,25 @@
 //! build-and-dispatch helper can drive them uniformly.
 
 use std::collections::HashSet;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
+use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash, LocalTimestamp,
-    ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round,
-    ShardId, TerminalVerdict, TopologySchedule, TopologySnapshot, Transaction, TxHash, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp, sweep_admits_block,
+    AbandonmentRecord, BeaconWitnessLeafCount, BlockHash, BlockHeight, Deadline, Epoch,
+    Finalization, Hash, LocalTimestamp, ProposerTimestamp, Provisions, ReadySignal, ReshapeTrigger,
+    RevealChain, Round, ScheduleLookup, ShardId, StateClaim, TopologySchedule, TopologySnapshot,
+    Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, Window,
 };
 use tracing::debug;
 
+use crate::admission::{
+    Admission, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
+    RecordsFold, RecordsSection, StateClaimsFold, StateClaimsSection, TransactionsFold,
+    TransactionsSection, admit_each, unwrapped,
+};
 use crate::chain_view::ChainView;
-use crate::commit_dedup::CommitDedupIndex;
 use crate::precut::Precut;
 use crate::verification::VerificationPipeline;
 
@@ -39,12 +45,7 @@ use crate::verification::VerificationPipeline;
 #[derive(Debug)]
 pub enum ProposalKind {
     /// Normal proposal with a filtered payload and a real-clock timestamp.
-    Normal {
-        transactions: Vec<Arc<Verified<Transaction>>>,
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
-        provisions: Vec<Arc<Verifiable<Provisions>>>,
-        terminal_verdicts: Vec<TerminalVerdict>,
-    },
+    Normal(ProposalPayload),
     /// View-change fallback: empty payload, parent's weighted timestamp
     /// (prevents Byzantine proposers from manipulating consensus time on
     /// timeout), `is_fallback = true`.
@@ -52,6 +53,17 @@ pub enum ProposalKind {
     /// Syncing proposer: empty payload, normal timestamp. Proposer is
     /// online with an accurate clock but can't execute transactions.
     Sync,
+}
+
+/// What a normal proposal carries, each list already selected against
+/// the chain. Empty for a block that exists only to advance the chain.
+#[derive(Debug, Default)]
+pub struct ProposalPayload {
+    pub transactions: Vec<Arc<Verified<Transaction>>>,
+    pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
+    pub provisions: Vec<Arc<Verifiable<Provisions>>>,
+    pub abandonment_records: Vec<AbandonmentRecord>,
+    pub state_claims: Vec<StateClaim>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,55 +160,55 @@ impl ProposalTracker {
 // Payload selection
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Filter ready transactions for proposal inclusion. Drops, in this order:
+/// What a proposer answers for itself that its voters answer by
+/// delegation or at the fence: the validity window each transaction is
+/// held to, with the late deliveries the anchor admits past their
+/// validity end, and the predecessors' answers for transactions opening
+/// before the chain's origin.
+#[derive(Clone, Copy)]
+pub struct Prefilter<'a> {
+    /// The predecessors' answers for transactions opening before the
+    /// origin.
+    pub precut: &'a Precut,
+    /// Transactions this shard only delivers for, admissible past their
+    /// validity end to the delivery window's close.
+    pub late_deliveries: &'a HashSet<TxHash>,
+}
+
+/// Filter ready transactions for proposal inclusion. Drops what the
+/// voters' delegated root check refuses — a `validity_range` malformed
+/// against the anchor or not containing it, unless the anchor admits
+/// the transaction as a late delivery — and what their fence defers on
+/// — a transaction opening before the chain's origin that no
+/// predecessor has proven absent; then keeps what
+/// [`TransactionsSection`] admits, folding into `fold`. A transaction
+/// that does not fit the sweep cap is skipped rather than ending the
+/// selection, so a large composition never starves the small ones
+/// behind it.
 ///
-/// 1. Txs already in the QC chain (ancestors in the two-chain window) or the
-///    retention-backed committed-tx cache (historically-committed hashes that
-///    survive past mempool eviction — critical after sync).
-/// 2. Txs whose `validity_range` is malformed against `validity_anchor`, or
-///    whose half-open range does not contain `validity_anchor`.
-/// 3. Txs whose window opened before `chain_origin_wt` — the
-///    predecessor's, on a reshape successor — unless `precut` holds an
-///    absence proof for it against every predecessor's committed set.
-///    This is the same question voters ask during block verification, so
-///    filtering here keeps a proposer from offering what its own voters
-///    would defer on or refuse.
-/// 4. Txs naming a package this window cannot run — the same question
-///    `validate_packages_usable` asks, for the same reason.
-/// 5. Txs that would carry the block past the cap on sweepable cells
-///    one block may create — the question `validate_sweepable_creation`
-///    asks. A transaction that does not fit is skipped rather than
-///    ending the selection, so a large composition never starves the
-///    small ones behind it.
-///
-/// Logs the dedup and expiry counts when non-zero.
+/// Logs the refusals when non-zero.
 pub fn select_transactions(
+    ctx: &Admission<'_>,
+    prefilter: &Prefilter<'_>,
+    fold: &mut TransactionsFold<'_>,
     ready_txs: &[Arc<Verified<Transaction>>],
-    qc_chain_tx_hashes: &HashSet<TxHash>,
-    dedup_index: &CommitDedupIndex,
-    validity_anchor: WeightedTimestamp,
-    chain_origin_wt: WeightedTimestamp,
-    precut: &Precut,
-    topology_snapshot: &TopologySnapshot,
 ) -> Vec<Arc<Verified<Transaction>>> {
     let before = ready_txs.len();
-    let mut deduped = 0;
     let mut expired = 0;
     let mut predates = 0;
-    let mut unrunnable = 0;
-    let mut oversweeping = 0;
-    let mut sweepable = 0usize;
-    let filtered: Vec<_> = ready_txs
+    let candidates: Vec<Arc<Verified<Transaction>>> = ready_txs
         .iter()
         .filter(|tx| {
             let h = tx.hash();
-            if qc_chain_tx_hashes.contains(&h) || dedup_index.contains_tx(&h) {
-                deduped += 1;
-                return false;
-            }
-            if !tx.validity_range().is_well_formed(validity_anchor)
-                || !tx.validity_range().contains(validity_anchor)
-            {
+            // A delivery is admissible to its record's window, not the
+            // transaction's — the same rule the voters' root check reads.
+            let range = tx.validity_range();
+            let admitted = range.contains(ctx.anchor)
+                || (prefilter.late_deliveries.contains(&h)
+                    && Window::Delivery
+                        .of(Deadline::of(range.end_timestamp_exclusive))
+                        .contains(&ctx.anchor));
+            if !range.is_well_formed(ctx.anchor) || !admitted {
                 expired += 1;
                 return false;
             }
@@ -205,53 +217,60 @@ pub fn select_transactions(
             // every predecessor proved it absent from its committed set;
             // anything else a voter defers on or refuses. Zero for a
             // chain born at network genesis.
-            if tx.validity_range().start_timestamp_inclusive < chain_origin_wt
-                && !precut.admissible(&h)
+            if range.start_timestamp_inclusive < ctx.chain_origin
+                && !prefilter.precut.admissible(&h)
             {
                 predates += 1;
                 return false;
             }
-            // Not published, or not for long enough that every voter is
-            // sure to hold its code yet.
-            if topology_snapshot.unusable_package_of(tx).is_some() {
-                unrunnable += 1;
-                return false;
-            }
-            let with_this = sweepable.saturating_add(tx.sweepable_writes() as usize);
-            if !sweep_admits_block(with_this) {
-                oversweeping += 1;
-                return false;
-            }
-            sweepable = with_this;
             true
         })
         .cloned()
         .collect();
-    if deduped > 0 || expired > 0 || predates > 0 || unrunnable > 0 || oversweeping > 0 {
+    let (selected, refused) =
+        admit_each::<TransactionsSection<'_>, _>(ctx, fold, candidates, |tx| tx.as_ref());
+    if expired > 0 || predates > 0 || refused > 0 {
         debug!(
-            deduped,
             expired,
             predates,
-            unrunnable,
-            oversweeping,
+            refused,
             before,
-            after = filtered.len(),
+            after = selected.len(),
             "Filtered proposal candidates"
         );
     }
-    filtered
+    selected
 }
 
-/// Select finalizations for inclusion: drop those whose tick or whose
-/// transactions the QC chain or the retention window has already
-/// resolved, and cap the total finalized-tx count at the
-/// `max_finalized_txs` limit. Returns `(ticks, total_tx_count)`.
+/// The transactions among `txs`, past their validity end at `anchor`,
+/// that `local_shard` only delivers for: frozen divided against the trie
+/// of `anchor`'s window with this shard outside the core and every leg
+/// here a delivery.
 ///
-/// The per-transaction half mirrors `validate_no_duplicate_resolutions`,
-/// so a proposer never offers a second verdict its own voters refuse —
-/// which is reachable without any misbehaviour: a settlement and an
-/// abandonment for one transaction are different ticks, and only the
-/// transaction they name says they are the same verdict twice.
+/// Computed against the block's own anchor by the proposer selecting
+/// and by every voter checking, so the set is one set. Empty when the
+/// anchor's window is not retained — a block there is refused on other
+/// grounds.
+#[must_use]
+pub fn late_deliveries<T: Deref<Target = Transaction>>(
+    txs: &[Arc<T>],
+    topology_schedule: &TopologySchedule,
+    anchor: WeightedTimestamp,
+    local_shard: ShardId,
+) -> HashSet<TxHash> {
+    let ScheduleLookup::Committee(snapshot) = topology_schedule.lookup(anchor) else {
+        return HashSet::new();
+    };
+    let trie = snapshot.shard_trie();
+    txs.iter()
+        .filter(|tx| anchor >= tx.validity_range().end_timestamp_exclusive)
+        .filter(|tx| Classified::freeze(tx.legs(), tx.owners(), trie).only_delivers_at(local_shard))
+        .map(|tx| tx.hash())
+        .collect()
+}
+
+/// Select finalizations for inclusion: what [`FinalizationsSection`]
+/// admits, in the caller's order, folding into `fold`.
 ///
 /// Order is the caller's and is preserved. It arrives in the order the
 /// ticks executed, which is the order their receipts have to settle in —
@@ -260,160 +279,82 @@ pub fn select_transactions(
 /// execution must land last. Re-sorting here by kickoff height would
 /// invert exactly the pairs that matter: a tick held back from its own
 /// block's tick executes after a later-numbered one it shares a cell
-/// with. Order stays deterministic because the caller's is, which is what
-/// verifiers flattening receipts into JMT `work_items` in manifest order
-/// need.
-///
-/// Truncation is a suffix for the same reason: dropping the tail cannot
-/// leave a tick ahead of a predecessor it should follow.
+/// with. The store hands them over in tick order, so the order rule
+/// drops only what a gap in that order would have made unofferable
+/// anyway, and the cap drops a suffix.
 pub fn select_finalizations(
+    ctx: &Admission<'_>,
+    fold: &mut FinalizationsFold,
     finalizations: Vec<Arc<Verifiable<Finalization>>>,
-    qc_chain_resolved_txs: &HashSet<TxHash>,
-    dedup_index: &CommitDedupIndex,
-    parent_settled_frontier: BlockHeight,
-    max_finalized_txs: usize,
-    chain_origin_wt: WeightedTimestamp,
-) -> (Vec<Arc<Verifiable<Finalization>>>, usize) {
-    let mut finalized_tx_count = 0usize;
-    let mut resolved_here: HashSet<TxHash> = HashSet::new();
-    let mut frontier = parent_settled_frontier;
-    let ticks_to_propose: Vec<_> = finalizations
+) -> Vec<Arc<Verifiable<Finalization>>> {
+    admit_each::<FinalizationsSection, _>(ctx, fold, finalizations, unwrapped).0
+}
+
+/// Select the boundary records for inclusion: each trimmed to the names
+/// [`RecordsSection::name_stands`] admits — a name a finalization in
+/// the block resolves, or one the chain already resolved, is refused by
+/// every voter — with an emptied record dropped rather than offered,
+/// then what [`RecordsSection`] admits in canonical order.
+///
+/// A departure's evidence stops answering at the departed shard's
+/// terminal-evidence expiry, read at the block's anchor. The composing
+/// side holds the set against the *committed* frontier while the vote
+/// reads the block's own anchor, which runs ahead of it, so the two can
+/// disagree by up to the pipeline's depth: without this the proposer
+/// offers a record every voter refuses, and because a chain that
+/// commits nothing never advances the frontier that would retire the
+/// set, the next proposal carries it again.
+pub fn select_abandonment_records(
+    ctx: &Admission<'_>,
+    fold: &mut RecordsFold<'_>,
+    verdicts: Vec<AbandonmentRecord>,
+) -> Vec<AbandonmentRecord> {
+    let mut trimmed: Vec<AbandonmentRecord> = verdicts
         .into_iter()
-        .filter(|fw| {
-            // Anchored before this chain began, so it resolves
-            // transactions this chain never committed and every voter
-            // refuses it. Zero for a chain born at network genesis.
-            if fw.local_ec().vote_anchor_ts() < chain_origin_wt {
-                return false;
-            }
-            // The settlement frontier, proposer-side: a determined half
-            // at or below it would be refused by every voter, and one
-            // offered out of order would settle an older absolute over a
-            // newer one. The store hands them over in tick order, so this
-            // drops only what a gap in that order would have made
-            // unofferable anyway.
-            let fw_ref = fw.as_unverified();
-            if fw_ref.is_determined() {
-                let tick = fw_ref.tick_id().block_height();
-                if tick <= frontier {
-                    return false;
-                }
-                frontier = tick;
-            }
-            true
-        })
-        .filter(|fw| {
-            let unresolved = fw.tx_hashes().all(|tx_hash| {
-                !resolved_here.contains(&tx_hash)
-                    && !qc_chain_resolved_txs.contains(&tx_hash)
-                    && !dedup_index.contains_resolved_tx(&tx_hash)
-            });
-            if unresolved {
-                resolved_here.extend(fw.tx_hashes());
-            }
-            unresolved
-        })
-        .take_while(|fw| {
-            let new_total = finalized_tx_count.saturating_add(fw.tx_count());
-            if new_total <= max_finalized_txs {
-                finalized_tx_count = new_total;
-                true
-            } else {
-                false
-            }
+        .filter_map(|verdict| {
+            let kept: Vec<UnsettledTx> = verdict
+                .unsettled()
+                .iter()
+                .filter(|entry| {
+                    RecordsSection::name_stands(ctx, fold, verdict.evidence(), entry.tx_hash)
+                        .is_ok()
+                })
+                .cloned()
+                .collect();
+            (!kept.is_empty())
+                .then(|| AbandonmentRecord::new(verdict.shard(), verdict.evidence(), kept))
         })
         .collect();
-    (ticks_to_propose, finalized_tx_count)
+    trimmed.sort_by_key(|verdict| (verdict.shard(), verdict.evidence()));
+    admit_each::<RecordsSection<'_>, _>(ctx, fold, trimmed, |verdict| verdict).0
 }
 
-/// Drop boundary records whose evidence has stopped answering at the
-/// clock the vote will read.
-///
-/// A record claims a departed shard left transactions unsettled, and the
-/// vote checks that against the shard's settled set — which stops being
-/// readable at its terminal-evidence expiry, past which the fence refuses
-/// the claim outright. The composing side holds the set against the
-/// *committed* frontier while the vote reads the block's own `anchor_wt`,
-/// which runs ahead of it, so the two can disagree by up to the pipeline's
-/// depth: without this the proposer offers a record every voter refuses,
-/// and because a chain that commits nothing never advances the frontier
-/// that would retire the set, the next proposal carries it again.
-pub fn select_terminal_verdicts(
-    verdicts: Vec<TerminalVerdict>,
-    topology_schedule: &TopologySchedule,
-    anchor_wt: WeightedTimestamp,
-) -> Vec<TerminalVerdict> {
-    verdicts
-        .into_iter()
-        .filter(|verdict| topology_schedule.terminal_evidence_readable(verdict.shard(), anchor_wt))
-        .collect()
+/// The proofs a block may carry of counterparts' cells: what
+/// [`StateClaimsSection`] admits, in the one order it carries them —
+/// ascending, without repeats, and no more than the block's cap, with
+/// the rest waiting a block.
+#[must_use]
+pub fn select_state_claims(
+    ctx: &Admission<'_>,
+    fold: &mut StateClaimsFold,
+    state_claims: Vec<StateClaim>,
+) -> Vec<StateClaim> {
+    let mut sorted = state_claims;
+    sorted.sort_unstable();
+    sorted.dedup();
+    admit_each::<StateClaimsSection, _>(ctx, fold, sorted, |bundle| bundle).0
 }
 
-/// Drop cross-shard transactions whose payer bundle is neither among
-/// the block's selected provisions nor committed within the retention
-/// window — the proposer-side form of `validate_engagement`, applied
-/// after provision selection so a capped-out bundle can never strand its
-/// transaction in a self-rejecting proposal.
-pub fn filter_engaged_transactions(
-    topology_snapshot: &TopologySnapshot,
-    local_shard: ShardId,
-    transactions: Vec<Arc<Verified<Transaction>>>,
-    provisions: &[Arc<Verifiable<Provisions>>],
-    dedup_index: &CommitDedupIndex,
-) -> Vec<Arc<Verified<Transaction>>> {
-    transactions
-        .into_iter()
-        .filter(|tx| {
-            if topology_snapshot.is_single_shard_transaction(tx.as_ref()) {
-                return true;
-            }
-            let payer_shard = topology_snapshot
-                .shard_trie()
-                .shard_for_prefix(tx.body().fee_payer);
-            if payer_shard == local_shard {
-                return true;
-            }
-            let tx_hash = tx.hash();
-            dedup_index.contains_provision_tx(payer_shard, tx_hash)
-                || provisions.iter().any(|batch| {
-                    batch.source_shard() == payer_shard
-                        && batch
-                            .transactions()
-                            .iter()
-                            .any(|entry| entry.tx_hash == tx_hash)
-                })
-        })
-        .collect()
-}
-
-/// Select provisions for inclusion: drop those already in the QC
-/// chain or committed within the retention window, then take from the FIFO
-/// queue until the running tx-count total would exceed `max_provision_txs`.
-/// Oldest batches go first so the queue drains monotonically; unselected
-/// batches remain queued for the next proposal.
+/// Select provisions for inclusion: what [`ProvisionsSection`] admits
+/// from the FIFO queue, folding into `fold`. Oldest batches go first so
+/// the queue drains monotonically; unselected batches remain queued for
+/// the next proposal.
 pub fn select_provisions(
+    ctx: &Admission<'_>,
+    fold: &mut ProvisionsFold,
     provisions: Vec<Arc<Verifiable<Provisions>>>,
-    qc_chain_provision_hashes: &HashSet<ProvisionHash>,
-    dedup_index: &CommitDedupIndex,
-    max_provision_txs: usize,
 ) -> Vec<Arc<Verifiable<Provisions>>> {
-    let mut running_tx_count = 0usize;
-    provisions
-        .into_iter()
-        .filter(|b| {
-            let h = b.hash();
-            !qc_chain_provision_hashes.contains(&h) && !dedup_index.contains_provision(&h)
-        })
-        .take_while(|b| {
-            let new_total = running_tx_count.saturating_add(b.transactions().len());
-            if new_total <= max_provision_txs {
-                running_tx_count = new_total;
-                true
-            } else {
-                false
-            }
-        })
-        .collect()
+    admit_each::<ProvisionsSection, _>(ctx, fold, provisions, unwrapped).0
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -483,52 +424,36 @@ pub fn assemble_build_action(
     let parent_sweep_frontier = chain.parent_sweep_frontier(parent_block_hash);
     let parent_load = chain.parent_load_checked(parent_block_hash);
 
-    let (
-        timestamp,
-        is_fallback,
-        transactions,
-        finalizations,
-        provisions,
-        terminal_verdicts,
-        log_label,
-        record_leader_activity,
-    ) = match kind {
-        ProposalKind::Normal {
-            transactions,
-            finalizations,
-            provisions,
-            terminal_verdicts,
-        } => (
+    let (timestamp, is_fallback, payload, log_label, record_leader_activity) = match kind {
+        ProposalKind::Normal(payload) => (
             ProposerTimestamp::from_local(now),
             false,
-            transactions,
-            finalizations,
-            provisions,
-            terminal_verdicts,
+            payload,
             "Requesting block build for proposal",
             false,
         ),
         ProposalKind::Fallback => (
             ProposerTimestamp::from_millis(parent_qc.weighted_timestamp().as_millis()),
             true,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            ProposalPayload::default(),
             "Building fallback block (leader timeout)",
             true,
         ),
         ProposalKind::Sync => (
             ProposerTimestamp::from_local(now),
             false,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            ProposalPayload::default(),
             "Building sync block (syncing, empty payload)",
             true,
         ),
     };
+    let ProposalPayload {
+        transactions,
+        finalizations,
+        provisions,
+        abandonment_records,
+        state_claims,
+    } = payload;
 
     // The proposer's new BlockHeader will carry parent_qc in its wire
     // form; HBOR encoding is byte-identical between the raw and
@@ -548,7 +473,8 @@ pub fn assemble_build_action(
         transactions,
         finalizations,
         provisions,
-        terminal_verdicts,
+        abandonment_records,
+        state_claims,
         fee_checks,
         fee_read_height,
         parent_in_flight,
@@ -583,20 +509,10 @@ pub fn assemble_build_action(
 ///
 /// Even empty blocks need the parent root node: `noop_jmt_snapshot` copies
 /// it to the new version so the overlay chain stays intact. Without that, a
-/// child block's `VerifyStateRoot` hits `ParentVersionMissing`.
-///
-/// The one exception is `bridge_over_attested_parent` — the build-side
-/// mirror of the verifier's recovery-bridge escape (see
-/// `initiate_state_root_verification`): a tick-less block in the bridge
-/// band whose parent is a sync-admitted, QC-attested certified block
-/// dispatches without the parent tree. Its prepare applies no updates and
-/// inherits the attested parent root; the commit pipeline releases store
-/// persists strictly height contiguous, so by the time this block
-/// persists its parent's tree is durable and the no-op root carry
-/// completes. Without the escape a fully redrawn recovery committee
-/// deadlocks: no member ever verified the halted tip through the live
-/// pipeline, the tip's tree materializes only at commit, and that commit
-/// needs the successor QC this very build produces.
+/// child block's `VerifyStateRoot` hits `ParentVersionMissing`. A
+/// sync-admitted parent is verified at admission like any other, so a
+/// fully redrawn recovery committee builds over the halted tip once that
+/// verification lands.
 ///
 /// When deferred, the verification pipeline unblocks and re-enters
 /// `try_propose` via the proposal-retry latch when the parent tree lands.
@@ -606,11 +522,8 @@ pub fn dispatch_or_defer(
     plan: BuildActionPlan,
     block_height: BlockHeight,
     round: Round,
-    bridge_over_attested_parent: bool,
 ) -> Vec<Action> {
-    if bridge_over_attested_parent
-        || verification.parent_tree_available(plan.parent_block_height, plan.parent_block_hash)
-    {
+    if verification.parent_tree_available(plan.parent_block_height, plan.parent_block_hash) {
         tracker.start(block_height, round);
         vec![plan.action]
     } else {
@@ -625,16 +538,68 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_types::test_utils::{
-        install_stub_protocol_statics, make_finalization, stub_abort_charge, stub_transaction,
-        stub_transaction_binding, test_prefix, test_principal, test_transaction_running,
+        install_stub_protocol_statics, make_finalization, make_undecided_finalization,
+        stub_abort_charge, stub_transaction, stub_transaction_binding, test_prefix, test_principal,
+        test_transaction_running,
     };
     use hyperscale_types::{
-        CommittedTxsRoot, Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_SUBINTENTS,
-        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
-        PredecessorTerminal, TimestampRange, TransactionDecision, UnsettledTx, ValidatorSet,
+        CommittedTxsRoot, Hash, Heard, MAX_SUBINTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK,
+        MAX_VALIDITY_RANGE, NetworkDefinition, PredecessorTerminal, Question, TimestampRange,
+        TransactionDecision, UnsettledTx, ValidatorSet, Word,
     };
 
     use super::*;
+    use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures};
+    use crate::commit_dedup::CommitDedupIndex;
+
+    /// Admission under `snapshot` at `anchor` for a chain that began at
+    /// `origin`, with `txs` behind the parent and `dedup` committed.
+    fn against(
+        snapshot: TopologySnapshot,
+        anchor: WeightedTimestamp,
+        origin: WeightedTimestamp,
+        txs: HashSet<TxHash>,
+        dedup: CommitDedupIndex,
+    ) -> Against {
+        let mut against = Against::window(snapshot);
+        against.anchor = anchor;
+        against.chain_origin = origin;
+        against.chain.txs = txs;
+        against.dedup = dedup;
+        against
+    }
+
+    /// Admission for a finalization offer: a chain born at genesis with
+    /// `dedup` committed.
+    fn finalizations_against(dedup: CommitDedupIndex) -> Against {
+        let mut against = Against::window(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            ValidatorSet::new(Vec::new()),
+        ));
+        against.dedup = dedup;
+        against
+    }
+
+    const DEPARTED: ShardId = ShardId::leaf(1, 0);
+    const SURVIVOR: ShardId = ShardId::leaf(1, 1);
+
+    /// A schedule in which `DEPARTED` left at the fixtures' cut, with its
+    /// handoff stamped complete at `handoff_complete` or still open.
+    fn departed_schedule(handoff_complete: Option<Epoch>) -> TopologySchedule {
+        departures(&[DEPARTED], &[SURVIVOR], handoff_complete)
+    }
+
+    /// The one name the record fixtures carry.
+    fn stranded() -> UnsettledTx {
+        UnsettledTx {
+            tx_hash: TxHash::from(Hash::from_bytes(b"stranded")),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(5_000)),
+            declared_work: 3,
+            charge: stub_abort_charge(3),
+            reach: Vec::new(),
+        }
+    }
 
     /// A boundary record is offered only while the vote can still accept
     /// it. The vote reads the block's own anchor, which runs ahead of the
@@ -642,65 +607,28 @@ mod tests {
     /// so the anchor is what decides here too — against the same
     /// handoff-anchored evidence window the fence itself derives.
     #[test]
-    fn select_terminal_verdicts_stops_at_the_evidence_expiry() {
-        use std::collections::{BTreeMap, BTreeSet, HashMap};
-
-        use hyperscale_types::{
-            NetworkDefinition, ShardAnchor, StateRoot, TopologySchedule, ValidatorSet,
-        };
-
-        let departed = ShardId::leaf(1, 0);
-        let survivor = ShardId::leaf(1, 1);
-        let schedule = |handoff_complete: Option<Epoch>| {
-            let mut boundaries = HashMap::new();
-            boundaries.insert(
-                departed,
-                ShardAnchor {
-                    state_root: StateRoot::ZERO,
-                    block_hash: BlockHash::from_raw(Hash::from_bytes(b"terminal")),
-                    height: BlockHeight::new(9),
-                    weighted_timestamp: WeightedTimestamp::from_millis(2_000),
-                    witness_base: BeaconWitnessLeafCount::ZERO,
-                    terminal_roots: None,
-                    handoff_complete,
-                },
-            );
-            let snapshot = Arc::new(TopologySnapshot::from_explicit_committees(
-                NetworkDefinition::simulator(),
-                &ValidatorSet::new(Vec::new()),
-                std::iter::once((survivor, Vec::new())).collect(),
-                HashMap::new(),
-                boundaries,
-                HashMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeSet::new(),
-            ));
-            let mut sched = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&snapshot));
-            for epoch in 1..=20u64 {
-                sched.insert(Epoch::new(epoch), Arc::clone(&snapshot));
-            }
-            sched.set_head(snapshot);
-            sched
-        };
-
-        let record = TerminalVerdict::new(
-            departed,
-            WeightedTimestamp::from_millis(2_000),
-            [UnsettledTx {
-                tx_hash: TxHash::from(Hash::from_bytes(b"stranded")),
-                deadline: WeightedTimestamp::from_millis(5_000),
-                declared_work: 3,
-                charge: stub_abort_charge(3),
-            }],
+    fn select_abandonment_records_stops_at_the_evidence_expiry() {
+        let record = AbandonmentRecord::departed(
+            DEPARTED,
+            WeightedTimestamp::from_millis(DEPARTURE_CUT_MS),
+            [stranded()],
         );
         let offered = |sched: &TopologySchedule, anchor: WeightedTimestamp| {
-            select_terminal_verdicts(vec![record.clone()], sched, anchor).len()
+            let mut against =
+                Against::schedule(TopologySnapshot::clone(sched.head()), sched.clone());
+            against.anchor = anchor;
+            let ctx = against.ctx();
+            let finalizations = FinalizationsFold::from(&ctx);
+            select_abandonment_records(
+                &ctx,
+                &mut RecordsFold::after(&finalizations),
+                vec![record.clone()],
+            )
+            .len()
         };
 
         let handoff = Epoch::new(4);
-        let stamped = schedule(Some(handoff));
+        let stamped = departed_schedule(Some(handoff));
         let expiry = stamped.windows().handoff_evidence_expiry(handoff);
         assert_eq!(offered(&stamped, expiry), 1, "to the last instant of it");
         assert_eq!(
@@ -709,11 +637,67 @@ mod tests {
             "past it every voter refuses the claim, so it must not be offered",
         );
 
-        let open = schedule(None);
+        let open = departed_schedule(None);
         assert_eq!(
             offered(&open, expiry.plus(Duration::from_millis(1))),
             1,
             "an unstamped handoff holds the window open however late the anchor",
+        );
+    }
+
+    /// A refusal names a live shard and is held to no evidence window;
+    /// and any record loses the names a finalization in the same block
+    /// resolves, an emptied one being dropped rather than offered.
+    #[test]
+    fn a_refusal_is_offered_past_the_window_and_stripped_of_what_the_block_resolves() {
+        let handoff = Epoch::new(4);
+        let stamped = departed_schedule(Some(handoff));
+        let past = stamped
+            .windows()
+            .handoff_evidence_expiry(handoff)
+            .plus(Duration::from_millis(1));
+        let refused = AbandonmentRecord::heard(
+            DEPARTED,
+            Heard {
+                question: Question::Verdict,
+                word: Word::Refused {
+                    decision: TransactionDecision::Reject,
+                    digest: Hash::from_bytes(b"digest"),
+                },
+                at: WeightedTimestamp::from_millis(2_000),
+            },
+            [stranded()],
+        );
+        let mut against =
+            Against::schedule(TopologySnapshot::clone(stamped.head()), stamped.clone());
+        against.anchor = past;
+        let ctx = against.ctx();
+        let none = FinalizationsFold::from(&ctx);
+        assert_eq!(
+            select_abandonment_records(
+                &ctx,
+                &mut RecordsFold::after(&none),
+                vec![refused.clone()],
+            )
+            .len(),
+            1,
+            "a refusal names a live shard and is held to no window",
+        );
+
+        let resolving = Arc::new(Verifiable::from(make_finalization(
+            BlockHeight::new(1),
+            stranded().tx_hash,
+            TransactionDecision::Accept,
+        )));
+        let mut resolved = FinalizationsFold::from(&ctx);
+        assert_eq!(
+            select_finalizations(&ctx, &mut resolved, vec![resolving]).len(),
+            1
+        );
+        assert!(
+            select_abandonment_records(&ctx, &mut RecordsFold::after(&resolved), vec![refused])
+                .is_empty(),
+            "a name this block resolves is stripped, and an emptied record is dropped",
         );
     }
 
@@ -733,17 +717,49 @@ mod tests {
         );
         assert_ne!(settled.tick_id(), abandoned.tick_id());
 
-        let (selected, count) = select_finalizations(
-            vec![Arc::clone(&settled), abandoned],
-            &HashSet::new(),
-            &CommitDedupIndex::new(),
-            BlockHeight::GENESIS,
-            MAX_FINALIZED_TX_PER_BLOCK,
-            WeightedTimestamp::ZERO,
-        );
+        let against = finalizations_against(CommitDedupIndex::new());
+        let ctx = against.ctx();
+        let mut fold = FinalizationsFold::from(&ctx);
+        let selected = select_finalizations(&ctx, &mut fold, vec![Arc::clone(&settled), abandoned]);
         assert_eq!(selected.len(), 1, "the second verdict is dropped");
         assert_eq!(selected[0].tick_id(), settled.tick_id());
-        assert_eq!(count, 1);
+        assert_eq!(fold.tx_count, 1);
+    }
+
+    /// A finalization whose members decide nothing is offered once, and
+    /// the block that commits it keeps it out of the next proposal.
+    ///
+    /// The offer's dedup asks whether the chain already resolved the
+    /// names a finalization carries a verdict on. A member that reaches
+    /// no verdict — a retirement, whose `Membership::housekeeping`
+    /// decides nothing — contributes no such name, so a certificate
+    /// carrying only those asks the question of an empty set. `all()` over
+    /// an empty iterator is true, and the proposer re-offers the same
+    /// certificate on every block while the settlement frontier stands
+    /// still.
+    #[test]
+    fn select_finalizations_drops_a_committed_offer_that_decided_nothing() {
+        let tx_hash = TxHash::from(Hash::from_bytes(b"retired"));
+        let committed: Arc<Verifiable<Finalization>> = Arc::new(
+            make_undecided_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept)
+                .into(),
+        );
+        assert_eq!(
+            committed.deciding_tx_hashes().count(),
+            0,
+            "the fixture has to decide nothing, or it tests the ordinary path",
+        );
+        let mut dedup_index = CommitDedupIndex::new();
+        dedup_index.register_committed_certs(&[Arc::clone(&committed)]);
+
+        let against = finalizations_against(dedup_index);
+        let ctx = against.ctx();
+        let mut fold = FinalizationsFold::from(&ctx);
+        let selected = select_finalizations(&ctx, &mut fold, vec![committed]);
+        assert!(
+            selected.is_empty(),
+            "a certificate the chain already carries was offered again",
+        );
     }
 
     /// A transaction a committed block already resolved keeps its
@@ -761,16 +777,12 @@ mod tests {
         let abandoned: Arc<Verifiable<Finalization>> = Arc::new(
             make_finalization(BlockHeight::new(9), tx_hash, TransactionDecision::Aborted).into(),
         );
-        let (selected, count) = select_finalizations(
-            vec![abandoned],
-            &HashSet::new(),
-            &dedup_index,
-            BlockHeight::GENESIS,
-            MAX_FINALIZED_TX_PER_BLOCK,
-            WeightedTimestamp::ZERO,
-        );
+        let against = finalizations_against(dedup_index);
+        let ctx = against.ctx();
+        let mut fold = FinalizationsFold::from(&ctx);
+        let selected = select_finalizations(&ctx, &mut fold, vec![abandoned]);
         assert!(selected.is_empty());
-        assert_eq!(count, 0);
+        assert_eq!(fold.tx_count, 0);
     }
 
     #[test]
@@ -946,13 +958,20 @@ mod tests {
         let txs = vec![candidate];
 
         let refused = select_transactions(
+            &against(
+                window_listing_no_packages(),
+                anchor,
+                cut,
+                HashSet::new(),
+                empty_dedup_index(),
+            )
+            .ctx(),
+            &Prefilter {
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
-            &HashSet::new(),
-            &empty_dedup_index(),
-            anchor,
-            cut,
-            &refuses_precut(),
-            &window_listing_no_packages(),
         );
         assert!(
             refused.is_empty(),
@@ -960,13 +979,20 @@ mod tests {
         );
 
         let admitted = select_transactions(
+            &against(
+                window_listing_no_packages(),
+                anchor,
+                cut,
+                HashSet::new(),
+                empty_dedup_index(),
+            )
+            .ctx(),
+            &Prefilter {
+                precut: &admits_precut(hash),
+                late_deliveries: &HashSet::new(),
+            },
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
-            &HashSet::new(),
-            &empty_dedup_index(),
-            anchor,
-            cut,
-            &admits_precut(hash),
-            &window_listing_no_packages(),
         );
         assert_eq!(
             admitted.len(),
@@ -988,13 +1014,20 @@ mod tests {
         ];
 
         let selected = select_transactions(
+            &against(
+                window_listing_no_packages(),
+                anchor,
+                WeightedTimestamp::ZERO,
+                HashSet::new(),
+                empty_dedup_index(),
+            )
+            .ctx(),
+            &Prefilter {
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
-            &HashSet::new(),
-            &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
-            &window_listing_no_packages(),
         );
 
         assert_eq!(selected.len(), 1, "only the in-range tx should survive");
@@ -1009,13 +1042,20 @@ mod tests {
         let txs = vec![tx_with_range(3, future_range)];
 
         let selected = select_transactions(
+            &against(
+                window_listing_no_packages(),
+                anchor,
+                WeightedTimestamp::ZERO,
+                HashSet::new(),
+                empty_dedup_index(),
+            )
+            .ctx(),
+            &Prefilter {
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
-            &HashSet::new(),
-            &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
-            &window_listing_no_packages(),
         );
 
         assert!(
@@ -1035,13 +1075,20 @@ mod tests {
         let txs = vec![tx_with_range(4, too_wide)];
 
         let selected = select_transactions(
+            &against(
+                window_listing_no_packages(),
+                anchor,
+                WeightedTimestamp::ZERO,
+                HashSet::new(),
+                empty_dedup_index(),
+            )
+            .ctx(),
+            &Prefilter {
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
-            &HashSet::new(),
-            &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
-            &window_listing_no_packages(),
         );
 
         assert!(selected.is_empty(), "malformed range should be filtered");
@@ -1052,31 +1099,46 @@ mod tests {
         install_stub_protocol_statics();
         let anchor = ts(1_000);
         let range = TimestampRange::new(ts(500), anchor.plus(Duration::from_mins(1)));
-        let binding = |seed: u8, bound: usize| -> Arc<Verified<Transaction>> {
+        let binding = |seed: u32, bound: usize| -> Arc<Verified<Transaction>> {
             Arc::new(Verified::<Transaction>::from_persisted(
                 stub_transaction_binding(seed, bound, range),
             ))
         };
-        // Fill the cap exactly, then offer one that cannot fit followed
-        // by one that can. Skipping rather than stopping is what keeps a
-        // large composition from starving the small ones behind it.
-        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / MAX_SUBINTENTS;
+        // Fill the cap, then offer one that cannot fit followed by one
+        // that can. Skipping rather than stopping is what keeps a large
+        // composition from starving the small ones behind it. Each fully
+        // composed transaction creates its subintents' nullifiers, all
+        // on this one shard, and its committed cell beside them — which
+        // every transaction writes, so the smallest one still costs one.
+        let full = MAX_SWEEPABLE_CREATED_PER_BLOCK / (MAX_SUBINTENTS + 1);
         let mut txs: Vec<Arc<Verified<Transaction>>> = (0..full)
-            .map(|i| binding(u8::try_from(i).expect("fewer than 256"), MAX_SUBINTENTS))
+            .map(|i| {
+                binding(
+                    u32::try_from(i).expect("fewer than u32 transactions"),
+                    MAX_SUBINTENTS,
+                )
+            })
             .collect();
-        let overflows = binding(u8::MAX, MAX_SUBINTENTS);
-        let fits = binding(u8::MAX - 1, 0);
+        let overflows = binding(u32::MAX, MAX_SUBINTENTS);
+        let fits = binding(u32::MAX - 1, 0);
         txs.push(overflows.clone());
         txs.push(fits.clone());
 
         let selected = select_transactions(
+            &against(
+                window_listing_no_packages(),
+                anchor,
+                WeightedTimestamp::ZERO,
+                HashSet::new(),
+                empty_dedup_index(),
+            )
+            .ctx(),
+            &Prefilter {
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
-            &HashSet::new(),
-            &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
-            &window_listing_no_packages(),
         );
 
         assert_eq!(
@@ -1096,18 +1158,79 @@ mod tests {
         let txs = vec![tx_with_range(5, range)];
 
         let selected = select_transactions(
+            &against(
+                window_listing_no_packages(),
+                anchor,
+                WeightedTimestamp::ZERO,
+                HashSet::new(),
+                empty_dedup_index(),
+            )
+            .ctx(),
+            &Prefilter {
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
-            &HashSet::new(),
-            &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
-            &window_listing_no_packages(),
         );
 
         assert!(
             selected.is_empty(),
             "anchor == end_exclusive must be excluded (half-open)"
+        );
+    }
+
+    /// A transaction named a late delivery is offered past its validity
+    /// end while the delivery window is open, and dropped at the close;
+    /// one not named is dropped at the validity end as before.
+    #[test]
+    fn select_transactions_offers_a_late_delivery_to_the_windows_close() {
+        let end = ts(1_000);
+        let range = TimestampRange::new(ts(500), end);
+        let delivery = tx_with_range(7, range);
+        let other = tx_with_range(8, range);
+        let late: HashSet<TxHash> = std::iter::once(delivery.hash()).collect();
+        let txs = vec![delivery.clone(), other];
+
+        let select = |anchor: WeightedTimestamp| -> Vec<TxHash> {
+            select_transactions(
+                &against(
+                    window_listing_no_packages(),
+                    anchor,
+                    WeightedTimestamp::ZERO,
+                    HashSet::new(),
+                    empty_dedup_index(),
+                )
+                .ctx(),
+                &Prefilter {
+                    precut: &refuses_precut(),
+                    late_deliveries: &late,
+                },
+                &mut TransactionsFold::beside(&ProvisionsFold::default()),
+                &txs,
+            )
+            .iter()
+            .map(|tx| tx.hash())
+            .collect()
+        };
+        assert_eq!(
+            select(end),
+            vec![delivery.hash()],
+            "at the end only the delivery"
+        );
+        assert_eq!(
+            select(
+                Window::Delivery
+                    .of(Deadline::of(end))
+                    .end
+                    .minus(Duration::from_millis(1))
+            ),
+            vec![delivery.hash()],
+            "and to the last moment of its window"
+        );
+        assert!(
+            select(Window::Delivery.of(Deadline::of(end)).end).is_empty(),
+            "the close drops it"
         );
     }
 
@@ -1119,13 +1242,20 @@ mod tests {
         let txs = vec![tx_with_range(6, range)];
 
         let selected = select_transactions(
+            &against(
+                window_listing_no_packages(),
+                anchor,
+                WeightedTimestamp::ZERO,
+                HashSet::new(),
+                empty_dedup_index(),
+            )
+            .ctx(),
+            &Prefilter {
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &txs,
-            &HashSet::new(),
-            &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
-            &window_listing_no_packages(),
         );
 
         assert_eq!(selected.len(), 1, "anchor == start_inclusive must be kept");
@@ -1142,13 +1272,20 @@ mod tests {
         chain.insert(tx.hash());
 
         let selected = select_transactions(
+            &against(
+                window_listing_no_packages(),
+                anchor,
+                WeightedTimestamp::ZERO,
+                chain,
+                empty_dedup_index(),
+            )
+            .ctx(),
+            &Prefilter {
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &[tx],
-            &chain,
-            &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
-            &window_listing_no_packages(),
         );
         assert!(selected.is_empty());
     }
@@ -1170,13 +1307,20 @@ mod tests {
         let runnable = tx_running(1, &[listed]);
         let held = tx_running(2, &[unlisted]);
         let selected = select_transactions(
+            &against(
+                window_listing(&[listed]),
+                anchor,
+                WeightedTimestamp::ZERO,
+                HashSet::new(),
+                empty_dedup_index(),
+            )
+            .ctx(),
+            &Prefilter {
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &[Arc::clone(&runnable), held],
-            &HashSet::new(),
-            &empty_dedup_index(),
-            anchor,
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
-            &window_listing(&[listed]),
         );
 
         assert_eq!(
@@ -1192,13 +1336,20 @@ mod tests {
         let listed = Hash::from_bytes(b"code the window lists");
         let unlisted = Hash::from_bytes(b"code it does not");
         let selected = select_transactions(
+            &against(
+                window_listing(&[listed]),
+                ts(1_000),
+                WeightedTimestamp::ZERO,
+                HashSet::new(),
+                empty_dedup_index(),
+            )
+            .ctx(),
+            &Prefilter {
+                precut: &refuses_precut(),
+                late_deliveries: &HashSet::new(),
+            },
+            &mut TransactionsFold::beside(&ProvisionsFold::default()),
             &[tx_running(3, &[listed, unlisted])],
-            &HashSet::new(),
-            &empty_dedup_index(),
-            ts(1_000),
-            WeightedTimestamp::ZERO,
-            &refuses_precut(),
-            &window_listing(&[listed]),
         );
         assert!(
             selected.is_empty(),

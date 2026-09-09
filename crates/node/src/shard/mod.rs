@@ -63,23 +63,14 @@ pub use io::ShardIo;
 pub use metrics::{MetricsSnapshot, ShardMetrics, VnodeMetrics, record_metrics};
 
 use crate::batch_accumulator::BatchAccumulator;
-use crate::beacon::{
-    BeaconBlockSync, BeaconProposalBinding, BeaconProposalCache, ShardWitnessBinding,
-};
+use crate::beacon::{BeaconBlockSync, BeaconProposalCache};
 pub use crate::event::{
     EventPriority, FetchFailureKind, HostEvent, PoolScopedInput, ProcessScopedInput,
     ShardScopedInput,
 };
-use crate::fetch::FetchInput;
+use crate::fetch::Release;
 use crate::process::ProcessIo;
 use crate::shard::commit::PreparedCommitMap;
-use crate::shard::cross_shard::{
-    CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
-    ProvisionBinding,
-};
-use crate::shard::instances::InstanceRecordBinding;
-use crate::shard::mempool::TransactionBinding;
-use crate::shard::packages::PackageArtifactBinding;
 use crate::vnode::Vnode;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
@@ -428,9 +419,6 @@ where
             ShardScopedInput::TransactionGossipReceived { tx } => {
                 self.handle_gossip_received_tx_for_validation(tx);
             }
-            ShardScopedInput::TransactionsFetched { batch } => {
-                self.handle_fetched_txs_for_validation(batch);
-            }
             ShardScopedInput::AdmitTransaction { tx } => {
                 self.handle_admit_transaction(tx);
             }
@@ -504,16 +492,13 @@ where
                     headers,
                 );
             }
-            ShardScopedInput::SettledTxsResponseReceived { source_shard, txs } => {
-                self.handle_settled_txs_response_received(source_shard, txs);
-            }
-            ShardScopedInput::SettledTxsFetchFailed { source_shard } => {
-                self.handle_settled_txs_fetch_failed(source_shard);
-            }
 
             // ── Fetch protocol ─────────────────────────────────────────
-            ShardScopedInput::TransactionsFetchFailed { hashes } => {
-                self.drive_fetch::<TransactionBinding>(FetchInput::Failed { ids: hashes });
+            ShardScopedInput::FetchFailed(ids) => self.release_fetch(ids, Release::Failed),
+            ShardScopedInput::FetchUnroutable(ids) => self.release_fetch(ids, Release::Unroutable),
+            ShardScopedInput::FetchFulfilled(ids) => self.release_fetch(ids, Release::Admitted),
+            ShardScopedInput::TransactionsFetched { batch } => {
+                self.handle_fetched_txs_for_validation(batch);
             }
             ShardScopedInput::PackageArtifactsFetched { artifacts } => {
                 self.handle_package_artifacts_fetched(artifacts);
@@ -523,48 +508,6 @@ where
             }
             ShardScopedInput::InstanceRecordsFetched { records } => {
                 self.handle_instance_records_fetched(records);
-            }
-            ShardScopedInput::InstanceRecordsFetchFailed { ids } => {
-                self.drive_fetch::<InstanceRecordBinding>(FetchInput::Failed { ids });
-            }
-            ShardScopedInput::PackageArtifactsFetchFailed { ids } => {
-                self.drive_fetch::<PackageArtifactBinding>(FetchInput::Failed { ids });
-            }
-            ShardScopedInput::ProvisionsFetchFailed {
-                source_shard,
-                block_height,
-            } => {
-                let local_shard = self.shard;
-                self.drive_fetch::<ProvisionBinding>(FetchInput::Failed {
-                    ids: vec![(source_shard, local_shard, block_height)],
-                });
-            }
-            ShardScopedInput::ExecCertFetchFailed { hashes } => {
-                self.drive_fetch::<ExecCertBinding>(FetchInput::Failed { ids: hashes });
-            }
-            ShardScopedInput::LocalProvisionsFetchFailed { hashes } => {
-                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Failed { ids: hashes });
-            }
-            ShardScopedInput::FinalizationsFetchFailed { ids } => {
-                self.drive_fetch::<FinalizationBinding>(FetchInput::Failed { ids });
-            }
-            ShardScopedInput::CommittedTxsFetchFailed { ids } => {
-                self.drive_fetch::<CommittedTxBinding>(FetchInput::Failed { ids });
-            }
-            ShardScopedInput::CommittedTxsFetchFulfilled { ids } => {
-                self.drive_fetch::<CommittedTxBinding>(FetchInput::Admitted { ids });
-            }
-            ShardScopedInput::ShardWitnessesFetchFailed { ids } => {
-                self.drive_fetch::<ShardWitnessBinding>(FetchInput::Failed { ids });
-            }
-            ShardScopedInput::ShardWitnessesFetchFulfilled { ids } => {
-                self.drive_fetch::<ShardWitnessBinding>(FetchInput::Admitted { ids });
-            }
-            ShardScopedInput::BeaconProposalFetchFailed { ids } => {
-                self.drive_fetch::<BeaconProposalBinding>(FetchInput::Failed { ids });
-            }
-            ShardScopedInput::BeaconProposalFetchFulfilled { ids } => {
-                self.drive_fetch::<BeaconProposalBinding>(FetchInput::Admitted { ids });
             }
 
             // ── Certified header (gossip → signature verify → state machine) ──

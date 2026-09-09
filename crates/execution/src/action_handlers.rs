@@ -95,18 +95,18 @@ pub fn accumulate_tick_output(
     ordered.sort_by_key(|tx| tx.tx_hash);
 
     // A batch carries whatever the tick admitted, so it splits here rather
-    // than as a whole: a transaction that reaches beyond this shard leaves
-    // a provisional contribution no later tick may read until a
-    // counterpart resolves it, and one that does not is determined the
+    // than as a whole: a member a counterpart's verdict can still discard
+    // leaves a provisional contribution no later tick may read until that
+    // verdict resolves it, and one nothing can retract is determined the
     // moment it executes.
-    let reaches_beyond: HashSet<TxHash> = requests
+    let abortable: HashSet<TxHash> = requests
         .iter()
-        .filter(|r| r.reaches_beyond)
+        .filter(|r| r.runs.abortable())
         .map(|r| r.tx_hash)
         .collect();
     let (beyond, local): (Vec<&ExecutedTx>, Vec<&ExecutedTx>) = ordered
         .into_iter()
-        .partition(|tx| reaches_beyond.contains(&tx.tx_hash));
+        .partition(|tx| abortable.contains(&tx.tx_hash));
 
     let mut members: Vec<(TxHash, StateWrites)> = Vec::new();
     for tx in local {
@@ -168,10 +168,14 @@ fn granted_reservations(
     if executed.consensus.writes().is_none() {
         return reserved;
     }
-    let Some(request) = requests.iter().find(|r| r.tx_hash == executed.tx_hash) else {
+    let Some((_, body)) = requests
+        .iter()
+        .find(|r| r.tx_hash == executed.tx_hash)
+        .and_then(CrossShardExecutionRequest::shape)
+    else {
         return reserved;
     };
-    for (key, mode) in &request.transaction.routing().declared_modes {
+    for (key, mode) in &body.routing().declared_modes {
         if let (DeclaredKey::Cell(cell), Mode::Reserve { amount }) = (key, mode) {
             *reserved.entry(*cell).or_default() += *amount;
         }
@@ -286,10 +290,12 @@ where
             let inputs: Vec<TickTxInput<'_>> = requests
                 .iter()
                 .map(|r| TickTxInput {
-                    transaction: &r.transaction,
+                    tx_hash: r.tx_hash,
+                    transaction: r.transaction.as_ref(),
                     provisions: &r.provisions,
                     clock: r.clock,
-                    abortable: r.reaches_beyond,
+                    runs: r.runs.clone(),
+                    arrivals: &r.arrivals,
                 })
                 .collect();
             let executed = ctx

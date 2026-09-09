@@ -24,7 +24,7 @@ use hyperscale_production::rpc::{NodeStatusState, TxSubmissionSender};
 use hyperscale_production::{
     LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, StorageFactory,
 };
-use hyperscale_scenarios::query::chain_fate;
+use hyperscale_scenarios::query::{RanAs, chain_fate, chain_membership};
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
@@ -371,6 +371,14 @@ impl Harness {
         store
             .get_certified_header(store.committed_height())
             .map(|header| header.header().work_in_flight())
+    }
+
+    /// [`chain_membership`] over the live store — what `shard`'s own
+    /// certificates said it ran of `hash`. Empty if no host serves
+    /// `shard` or no committed finalization names it.
+    pub fn ran(&self, shard: ShardId, hash: TxHash) -> Vec<RanAs> {
+        self.store_for(shard)
+            .map_or_else(Vec::new, |store| chain_membership(store.as_ref(), hash))
     }
 
     /// [`chain_fate`] over the live store the runner writes to — the shared

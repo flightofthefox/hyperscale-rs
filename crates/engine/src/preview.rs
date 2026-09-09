@@ -25,14 +25,14 @@ use hyperscale_effects_bridge::admit_package;
 use hyperscale_storage::Substates;
 use hyperscale_types::{Event, Transaction, WeightedTimestamp};
 use hyperscale_vm_kernel::{
-    Baseline, BatchTx, EnvInputs, Locality, ManifestWalk, Receipt, decode_amount, execute_batch,
+    Baseline, BatchTx, EnvInputs, ManifestWalk, OwnerSet, Receipt, decode_amount, execute_batch,
 };
-use hyperscale_vm_types::{Outcome, SubstateKey};
+use hyperscale_vm_types::{Outcome, SubstateKey, price_attos};
 
 use crate::batch::TickEnvironment;
 use crate::executor::{
-    PayerFee, TargetAuthority, TickBaseline, abort_reason, charge_for, materialize_declared,
-    protocol_hash, publish_work,
+    PayerFee, TargetAuthority, TickBaseline, abort_reason, materialize_declared, protocol_hash,
+    publish_work,
 };
 use crate::genesis::vault_key;
 use crate::{Executor, XRD};
@@ -172,7 +172,7 @@ fn amount_at(base: &TickBaseline, key: SubstateKey) -> u128 {
 /// Fold a run's movements and settles into the wallet's report, landing
 /// the fee on the payer's vault unless the run was credited.
 ///
-/// The walk is `Locality::All` deliberately: the report answers what the
+/// The walk is `OwnerSet::whole()` deliberately: the report answers what the
 /// transaction does, and which shard applies which part of it is a
 /// question about commitment, not about resources.
 fn resource_changes(
@@ -184,7 +184,8 @@ fn resource_changes(
 ) -> Vec<ResourceChange> {
     let mut changes: BTreeMap<SubstateKey, ResourceChange> = BTreeMap::new();
     if let Some(receipt) = receipt {
-        let moved = receipt.delta.owned(&Locality::All);
+        let whole = OwnerSet::whole();
+        let moved = receipt.delta.owned(&whole);
         for (key, movement) in moved.movements() {
             let change = changes
                 .entry(key)
@@ -224,18 +225,6 @@ fn resource_changes(
         .collect()
 }
 
-/// What the payer burns for a run that reached execution.
-///
-/// [`charge_for`] answers for an attempt that applied no effects; a
-/// completed run instead burns the attested actual capped at its
-/// ceiling, which is the figure the fee burn writes into the receipt.
-fn fee_for(outcome: &Outcome, fuel: u64, payer: PayerFee) -> u128 {
-    match outcome {
-        Outcome::Completed { .. } => u128::from(fuel).min(payer.max_fee),
-        aborted => charge_for(aborted, payer).unwrap_or(0),
-    }
-}
-
 impl Executor {
     /// Run `tx` against `snapshot` and report what it would move and what
     /// it would cost, committing nothing.
@@ -251,19 +240,17 @@ impl Executor {
         inputs: &PreviewInputs,
     ) -> PreviewReport {
         let vm = tx.body();
-        let payer = PayerFee {
-            // Derived rather than read off `fee_vault`, which panics
-            // on an envelope derivation refuses — the exact envelope a
-            // preview exists to give an answer about.
-            vault: vault_key(vm.fee_payer, *XRD),
-            max_fee: vm.max_fee,
-            floor: vm.abort_floor(),
-            // A preview is one envelope against one snapshot: no tick can
-            // discard effects it completed, so the reserve-receipt shape
-            // does not arise.
-            abortable: false,
-        };
+        // Derived rather than read off `fee_vault`, which panics on an
+        // envelope derivation refuses — the exact envelope a preview
+        // exists to give an answer about.
+        let vault = vault_key(vm.fee_payer, *XRD);
         if let Some(artifact) = vm.artifact() {
+            let payer = PayerFee {
+                vault,
+                max_fee: vm.max_fee,
+                price: u128::from(publish_work(artifact)),
+                abortable: false,
+            };
             return preview_publish(snapshot, artifact, payer, inputs.grants);
         }
 
@@ -281,6 +268,22 @@ impl Executor {
             Ok(derived) => derived,
             Err(reason) => return PreviewReport::refused(reason),
         };
+        // The price is the declaration's; an envelope that prepared
+        // derives, so a refusal here is answered as one rather than
+        // reached.
+        let price = match tx.try_derived(self.derivation().as_ref()) {
+            Ok(derived) => price_attos(derived.work),
+            Err(error) => return PreviewReport::refused(error.to_string()),
+        };
+        let payer = PayerFee {
+            vault,
+            max_fee: vm.max_fee,
+            price,
+            // A preview is one envelope against one snapshot: no tick can
+            // discard effects it completed, so the reserve-receipt shape
+            // does not arise.
+            abortable: false,
+        };
         // A preview judges against committed state alone: it is not in
         // a tick, so no tick's reservation is in flight over the
         // baseline it reads, and total locality covers every cell the
@@ -289,7 +292,7 @@ impl Executor {
         materialize_declared(
             snapshot,
             &prepared.declaration.set,
-            &Locality::All,
+            &OwnerSet::whole(),
             &mut base,
         );
         // The fee vault is not a declared effect, and the report needs
@@ -309,7 +312,7 @@ impl Executor {
                 seeds: inputs.env.seeds.clone(),
             },
         )
-        .with_calls(prepared.calls)
+        .with_job(prepared.job)
         .with_nullifiers(prepared.nullifiers)];
         let walk = ManifestWalk {
             backend: &self.backend,
@@ -323,7 +326,6 @@ impl Executor {
             &walk,
             protocol_hash,
             self.mode,
-            &Locality::All,
         ) {
             Ok(outcome) => outcome,
             // The screen is a property of one derivation's own output, so
@@ -334,7 +336,8 @@ impl Executor {
         let Some(receipt) = outcome.receipts.get(&vm_tx) else {
             return PreviewReport::refused("the batch produced no receipt");
         };
-        let fee = fee_for(&receipt.outcome, receipt.fuel, payer);
+        // One price whatever the outcome, held to the ceiling like the burn.
+        let fee = payer.price.min(payer.max_fee);
         PreviewReport {
             outcome: preview_outcome(&receipt.outcome),
             changes: resource_changes(&base, Some(receipt), fee, payer.vault, inputs.grants),

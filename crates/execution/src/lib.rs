@@ -21,12 +21,17 @@ pub mod candidates;
 pub mod tick_state;
 
 mod coordinator;
+mod counterparts;
 mod early_arrivals;
 mod exec_cert_store;
 mod expected_certs;
 mod finalizations;
+#[cfg(test)]
+mod fixtures;
+mod gate;
 mod lookups;
 mod outbound_certs;
+mod parked;
 mod provisional;
 mod provisioning;
 mod ticks;
@@ -34,8 +39,9 @@ mod unresolved;
 mod vote_tracker;
 
 pub use coordinator::{CompletionData, ExecutionCoordinator, ExecutionMemoryStats};
+pub use counterparts::Offers;
 pub use exec_cert_store::ExecCertStore;
 pub use finalizations::FinalizationStore;
-pub use lookups::provision_request;
+pub use lookups::{crossing_requests, provision_request};
 pub use tick_state::TickState;
 pub use vote_tracker::VoteTracker;

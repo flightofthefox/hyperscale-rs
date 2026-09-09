@@ -1,147 +1,182 @@
-use std::collections::BTreeMap;
+use std::cell::Cell;
 use std::sync::Arc;
 
 use hyperscale_jmt::NibblePath;
 use hyperscale_storage::test_helpers::{
-    PendingBaseline, entry_key, make_settled_writes, make_test_block,
-    make_test_block_with_anchor_wt, make_test_certified, make_test_execution_certificate,
-    make_test_finalization, make_test_qc, make_test_receipt, state_key,
-    test_committed_bundle_outlives_sealing, test_ec_storage_batch as helpers_test_ec_storage_batch,
+    PendingBaseline, commit_settled_at, commit_writes, commit_writes_at, entry_key,
+    make_settled_writes, make_test_block, make_test_block_with_anchor_wt, make_test_certified,
+    make_test_execution_certificate, make_test_finalization, make_test_qc, make_test_receipt,
+    paced, placeholder_local_ec, position, registers, state_key, test_a_committed_block_reads_back,
+    test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
+    test_a_fresh_store_holds_nothing, test_a_leg_entry_holds_the_floor_to_its_horizon,
+    test_a_legs_own_finalization_keeps_the_floor, test_a_package_cell_lands_in_the_artifact_index,
+    test_commits_advance_the_version_and_writes_move_the_root,
+    test_committed_bundle_outlives_sealing, test_committed_receipts_reach_state,
+    test_ec_storage_batch as helpers_test_ec_storage_batch,
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
-    test_entries_commit_serve_and_history, test_recovery_carries_the_tip_drain_total,
+    test_entries_commit_serve_and_history, test_historical_reads_resolve_per_version,
+    test_historical_reads_respect_retention, test_history_reads_through_create_delete_create,
+    test_prepared_commit_for_a_committed_block_applies_nothing,
+    test_prepared_commit_refuses_a_different_block_at_one_height,
+    test_prepared_commit_writes_committed_cells, test_recovery_carries_the_tip_drain_total,
+    test_registers_are_monotone_and_recoverable, test_registers_ignore_a_stale_chain_incarnation,
     test_registers_recover_their_justification, test_retained_bundle_drops_below_the_history_floor,
-    test_sweep_index_tracks_the_leaves, test_sweep_stops_at_the_ceiling_or_the_cap,
+    test_snapshot_at_below_the_floor_panics, test_substate_bytes_track_commits,
+    test_sweep_index_counts_a_pending_ancestors_move, test_sweep_index_tracks_the_leaves,
+    test_sweep_stops_at_the_ceiling_or_the_cap, test_the_replay_floor_stops_at_the_chain_origin,
+    test_the_root_is_a_function_of_the_writes,
+    test_the_tx_index_answers_with_every_certificate_of_this_shards,
     test_tx_index_answers_with_the_local_shards_certificate,
     test_undischarged_record_holds_the_floor, test_unresolved_fold,
     test_widest_tick_copy_holds_the_slot,
-    test_witness_payload_range_reads as helpers_test_witness_payload_range_reads, with_provisions,
+    test_witness_payload_range_reads as helpers_test_witness_payload_range_reads,
+    test_witness_window_retention_and_recovery, with_provisions,
 };
 use hyperscale_storage::{
     PackageArtifactStore, ParentAnchor, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
     SubstateStore, Substates, VersionedStore,
 };
-use hyperscale_types::test_utils::{STUB_PACKAGE_MARKER, install_stub_protocol_statics};
 use hyperscale_types::{
-    Address, AddressClass, AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block,
-    BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
-    Finalization, FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey,
-    ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId,
-    SignerBitfield, StateRoot, StateWrites, StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId,
-    TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
+    ConsensusReceipt, Finalization, FinalizationHash, GlobalReceiptHash, Hash, QuorumCertificate,
+    Round, ShardId, StateWrites, StoredReceipt, SyncHint, TickHalf, TickId, TxHash, ValidatorId,
+    Verifiable, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
     BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO)
 }
 
-/// Build a placeholder EC whose `tick_id` matches the WC the caller is about
-/// to construct, so the WC satisfies the local-EC invariant enforced at
-/// HBOR decode time. The EC carries no signers / outcomes — these tests
-/// exercise the storage codec, not consensus.
-fn placeholder_local_ec(shard: ShardId, height: BlockHeight) -> Arc<ExecutionCertificate> {
-    Arc::new(ExecutionCertificate::new(
-        TickId::new(shard, height),
-        WeightedTimestamp::from_millis(0),
-        GlobalReceiptRoot::ZERO,
-        Vec::new(),
-        AggregateSignature::new([0u8; 96]),
-        SignerBitfield::empty(),
-    ))
-}
 use rocksdb::WriteBatch;
 use tempfile::TempDir;
 
 use super::column_families::STATE_HISTORY_CF;
 use super::core::RocksDbShardStorage;
 use super::metadata::write_chain_origin;
-use crate::config::RocksDbConfig;
 
-/// Helper: wrap writes into a single `StoredReceipt` for test commit calls.
-/// The union of already-settled fixtures — values, so nothing to fold.
-fn union_of(parts: &[SettledWrites]) -> SettledWrites {
-    SettledWrites::from_absolutes(
-        parts
-            .iter()
-            .flat_map(SettledWrites::cells)
-            .map(|(key, change)| (*key, change.clone()))
-            .collect(),
-    )
+/// Commit `block` with no writes and no witness.
+fn commit_empty(storage: &RocksDbShardStorage, block: &Block) {
+    commit_settled_at(
+        storage,
+        &make_test_certified(block.clone()),
+        &[],
+        &[],
+        &no_witness(),
+    );
 }
 
-fn updates_to_receipts(writes: &SettledWrites) -> Vec<StoredReceipt> {
-    if writes.is_empty() {
-        return vec![];
-    }
-    vec![StoredReceipt {
-        tx_hash: TxHash::ZERO,
-        consensus: Arc::new(ConsensusReceipt::Succeeded {
-            receipt_hash: GlobalReceiptHash::ZERO,
-            writes: writes.clone().into(),
-            beacon_witness_events: Vec::new(),
-            events: Vec::new(),
-        }),
-        metadata: None,
-    }]
-}
-
-/// Helper: commit a block with empty updates and no ECs/receipts.
-fn commit_empty(storage: &RocksDbShardStorage, block: &Block, qc: &Verified<QuorumCertificate>) {
-    // SAFETY: synthetic test fixture; round-trip tests don't exercise
-    // the `Verified<CertifiedBlock>` predicate.
-    let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
-        CertifiedBlock::new_unchecked(block.clone(), <Verified<_>>::clone(qc)),
-    ));
-    storage.commit_block(&certified, &[], &no_witness());
-}
-
-/// Writes holding a single removal.
-fn make_state_delete(owner_seed: u8, local_seed: u8) -> SettledWrites {
-    SettledWrites::from_absolutes(BTreeMap::from([(state_key(owner_seed, local_seed), None)]))
-}
-
-/// The full entry pipeline over `RocksDB`: commit moves the root, the
-/// index serves current and historical ranges, the leaf self-describes,
-/// and the history GC prunes superseded rows without touching the tip.
-#[test]
-fn a_blocks_sweep_stops_at_the_ceiling_or_the_cap() {
+/// A fresh store in a temporary directory; the directory rides with it.
+fn open_fresh() -> (TempDir, RocksDbShardStorage) {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    test_sweep_stops_at_the_ceiling_or_the_cap(&storage, |writes| {
-        storage.commit(writes).unwrap();
+    (temp_dir, storage)
+}
+
+#[test]
+fn a_fresh_store_holds_nothing() {
+    let (_dir, storage) = open_fresh();
+    test_a_fresh_store_holds_nothing(&storage);
+}
+
+#[test]
+fn a_committed_cell_reads_back_and_a_snapshot_keeps_its_version() {
+    let (_dir, storage) = open_fresh();
+    test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version(&storage);
+}
+
+#[test]
+fn commits_advance_the_version_and_writes_move_the_root() {
+    let (_dir, storage) = open_fresh();
+    test_commits_advance_the_version_and_writes_move_the_root(&storage);
+}
+
+#[test]
+fn the_root_is_a_function_of_the_writes() {
+    let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+    let next = Cell::new(0usize);
+    test_the_root_is_a_function_of_the_writes(|| {
+        let dir = &dirs[next.get()];
+        next.set(next.get() + 1);
+        RocksDbShardStorage::open(dir.path(), NibblePath::empty()).unwrap()
     });
+}
+
+#[test]
+fn a_committed_block_reads_back() {
+    let (_dir, storage) = open_fresh();
+    test_a_committed_block_reads_back(&storage);
+}
+
+#[test]
+fn committed_receipts_reach_state() {
+    let (_dir, storage) = open_fresh();
+    test_committed_receipts_reach_state(&storage);
+}
+
+#[test]
+fn history_reads_through_create_delete_create() {
+    let (_dir, storage) = open_fresh();
+    test_history_reads_through_create_delete_create(&storage);
+}
+
+#[test]
+fn historical_reads_resolve_per_version() {
+    let (_dir, storage) = open_fresh();
+    test_historical_reads_resolve_per_version(&storage);
+}
+
+#[test]
+#[should_panic(expected = "below retention floor")]
+fn snapshot_at_below_the_floor_panics() {
+    let (_dir, storage) = open_fresh();
+    test_snapshot_at_below_the_floor_panics(&storage);
+}
+
+#[test]
+fn historical_reads_respect_retention() {
+    let (_dir, storage) = open_fresh();
+    test_historical_reads_respect_retention(&storage);
+}
+
+#[test]
+fn witness_window_retention_and_recovery() {
+    let (_dir, storage) = open_fresh();
+    test_witness_window_retention_and_recovery(&storage, || storage.load_recovered_state());
+}
+
+#[test]
+fn a_blocks_sweep_stops_at_the_ceiling_or_the_cap() {
+    let (_dir, storage) = open_fresh();
+    test_sweep_stops_at_the_ceiling_or_the_cap(&storage);
 }
 
 #[test]
 fn the_sweep_index_tracks_the_leaves() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    test_sweep_index_tracks_the_leaves(&storage, |writes| {
-        storage.commit(writes).unwrap();
-    });
+    let (_dir, storage) = open_fresh();
+    test_sweep_index_tracks_the_leaves(&storage);
 }
 
 #[test]
+fn the_sweep_index_counts_a_pending_ancestors_move() {
+    let (_dir, storage) = open_fresh();
+    test_sweep_index_counts_a_pending_ancestors_move(&storage);
+}
+
+/// The shared entry pipeline, then the `RocksDB` tail: carry the tip
+/// past the horizon and GC — the superseded history rows go, the
+/// current index and a scan at the floor survive.
+#[test]
 fn entries_commit_serve_ranges_and_gc_history() {
-    let temp_dir = TempDir::new().unwrap();
-    let config = RocksDbConfig {
-        jmt_history_length: 2,
-        ..RocksDbConfig::default()
-    };
-    let storage =
-        RocksDbShardStorage::open_with_config(temp_dir.path(), &config, NibblePath::empty())
-            .unwrap();
+    let (_dir, storage) = open_fresh();
+    test_entries_commit_serve_and_history(&storage);
 
-    test_entries_commit_serve_and_history(&storage, |writes| {
-        storage.commit(writes).unwrap();
-    });
-
-    // Push the tip past retention and GC: the superseded history rows
-    // go, the current index and a scan at the floor survive.
     let key = entry_key(7, 5);
-    for version in 3..=6u8 {
-        storage
-            .commit(&make_settled_writes(9, version, vec![version]))
-            .unwrap();
+    for seed in 3..=6u8 {
+        commit_writes_at(
+            &storage,
+            &make_settled_writes(9, seed, vec![seed]),
+            paced(u64::from(seed), 2),
+        );
     }
     assert!(storage.run_state_history_gc() > 0);
     assert_eq!(
@@ -160,30 +195,13 @@ fn entries_commit_serve_ranges_and_gc_history() {
     );
 }
 
-/// The per-version substate byte total tracks inserts, value updates and
-/// deletes; historical entries stay readable and survive a reopen.
+/// The shared byte-total test, then a reopen: every version's total
+/// survives it.
 #[test]
 fn substate_bytes_tracks_commits_and_survives_reopen() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    // v1: two inserts.
-    let v1 = union_of(&[
-        make_settled_writes(3, 7, vec![1]),
-        make_settled_writes(4, 8, vec![2]),
-    ]);
-    storage.commit(&v1).unwrap();
-    assert_eq!(storage.substate_bytes_at(BlockHeight::new(1)), Some(2));
-
-    // v2: value update only — count unchanged.
-    storage.commit(&make_settled_writes(3, 7, vec![9])).unwrap();
-    assert_eq!(storage.substate_bytes_at(BlockHeight::new(2)), Some(2));
-
-    // v3: delete one — count drops; the historical entry is untouched.
-    storage.commit(&make_state_delete(3, 7)).unwrap();
-    assert_eq!(storage.substate_bytes_at(BlockHeight::new(3)), Some(1));
-    assert_eq!(storage.substate_bytes_at(BlockHeight::new(1)), Some(2));
-
+    test_substate_bytes_track_commits(&storage);
     drop(storage);
     let reopened = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     assert_eq!(reopened.substate_bytes_at(BlockHeight::new(3)), Some(1));
@@ -198,52 +216,11 @@ fn recovered_state_carries_substate_bytes() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
-    for h in 1..=3u64 {
-        let block = make_test_block(BlockHeight::new(h));
-        let qc = make_test_qc(&block);
-        let updates = make_settled_writes(u8::try_from(h).unwrap_or(u8::MAX), 1, vec![1]);
-        rocks_commit_with(&storage, &updates, &block, &qc);
+    for h in 1..=3u8 {
+        commit_writes(&storage, &make_settled_writes(h, 1, vec![1]));
     }
 
     assert_eq!(storage.load_recovered_state().substate_bytes, 3);
-}
-
-#[test]
-fn test_basic_substate_operations() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    let key = state_key(3, 10);
-
-    // Initially empty
-    assert!(storage.cell(key).is_none());
-
-    // Commit a value
-    storage
-        .commit(&make_settled_writes(3, 10, vec![99, 88, 77]))
-        .unwrap();
-
-    // Now we can read it
-    assert_eq!(storage.cell(key), Some(vec![99, 88, 77]));
-}
-
-#[test]
-fn test_snapshot() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    let key = state_key(7, 10);
-
-    // Write initial value
-    storage
-        .commit(&make_settled_writes(7, 10, vec![1]))
-        .unwrap();
-
-    // Take snapshot
-    let snapshot = storage.snapshot();
-
-    // Snapshot can read data
-    assert_eq!(snapshot.cell(key), Some(vec![1]));
 }
 
 #[test]
@@ -270,58 +247,13 @@ fn test_recovery_resumes_at_correct_height() {
 }
 
 #[test]
-fn test_commit_certificate_with_writes_persists_both() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    let writes = make_settled_writes(1, 10, vec![99, 88, 77]);
-    let cert = make_test_finalization(BlockHeight::new(42), ShardId::ROOT);
-    let tick_id = *cert.tick_id();
-
-    storage.commit_certificate_with_writes(&cert, &writes);
-
-    let stored_cert = storage.get_certificate(&cert.receipt_hash());
-    assert!(stored_cert.is_some());
-    assert_eq!(stored_cert.unwrap().tick_id(), &tick_id);
-
-    // Verify the substate was written to the state CF via direct key lookup.
-    assert_eq!(
-        storage.cell(state_key(1, 10)),
-        Some(vec![99, 88, 77]),
-        "value should match what was written"
-    );
-}
-
-#[test]
-fn test_block_storage_and_retrieval() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    let block = make_test_block(BlockHeight::new(1));
-    let qc = make_test_qc(&block);
-
-    assert!(storage.get_block(BlockHeight::new(1)).is_none());
-
-    commit_empty(&storage, &block, &qc);
-
-    let stored = storage.get_block(BlockHeight::new(1)).unwrap();
-    assert_eq!(stored.block().height(), BlockHeight::new(1));
-    assert_eq!(
-        stored.block().header().timestamp(),
-        ProposerTimestamp::from_millis(1_000)
-    );
-    assert_eq!(stored.qc().block_hash(), block.hash());
-}
-
-#[test]
 fn test_block_range_retrieval() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
     for h in 1..=5u64 {
         let block = make_test_block(BlockHeight::new(h));
-        let qc = make_test_qc(&block);
-        commit_empty(&storage, &block, &qc);
+        commit_empty(&storage, &block);
     }
 
     let blocks = storage.get_blocks_range(BlockHeight::new(2), BlockHeight::new(5));
@@ -378,7 +310,7 @@ fn test_recovery_seeds_committed_anchor_from_parent_qc() {
 
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-        commit_empty(&storage, &block, &tip_qc);
+        commit_empty(&storage, &block);
         storage.set_chain_metadata(
             height,
             Some(Hash::from_hash_bytes(&[42; 32])),
@@ -417,8 +349,8 @@ fn test_recovery_seeds_committee_anchor_from_the_header_below_the_tip() {
 
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-        commit_empty(&storage, &parent, &make_test_qc(&parent));
-        commit_empty(&storage, &tip, &tip_qc);
+        commit_empty(&storage, &parent);
+        commit_empty(&storage, &tip);
         storage.set_chain_metadata(
             BlockHeight::new(2),
             Some(*tip.hash().as_raw()),
@@ -444,23 +376,6 @@ fn test_recovery_seeds_committee_anchor_from_the_header_below_the_tip() {
 }
 
 #[test]
-fn test_certificate_idempotency() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    let updates = make_settled_writes(1, 10, vec![99, 88, 77]);
-    let cert = make_test_finalization(BlockHeight::new(42), ShardId::ROOT);
-    let tick_id = *cert.tick_id();
-
-    storage.commit_certificate_with_writes(&cert, &updates);
-    storage.commit_certificate_with_writes(&cert, &updates);
-
-    let stored = storage.get_certificate(&cert.receipt_hash());
-    assert!(stored.is_some());
-    assert_eq!(stored.unwrap().tick_id(), &tick_id);
-}
-
-#[test]
 fn test_empty_state_on_fresh_database() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
@@ -476,44 +391,6 @@ fn test_empty_state_on_fresh_database() {
 // JMT state tracking
 // ═══════════════════════════════════════════════════════════════════════
 
-#[test]
-fn test_block_height_increments_on_commit() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    assert_eq!(storage.jmt_height(), BlockHeight::new(0));
-
-    storage
-        .commit(&make_settled_writes(1, 10, vec![1]))
-        .unwrap();
-    assert_eq!(storage.jmt_height(), BlockHeight::new(1));
-
-    storage
-        .commit(&make_settled_writes(4, 20, vec![2]))
-        .unwrap();
-    assert_eq!(storage.jmt_height(), BlockHeight::new(2));
-}
-
-#[test]
-fn test_state_root_changes_on_commit() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    let root0 = storage.state_root();
-
-    storage
-        .commit(&make_settled_writes(1, 10, vec![1]))
-        .unwrap();
-    let root1 = storage.state_root();
-    assert_ne!(root0, root1, "root should change after first commit");
-
-    storage
-        .commit(&make_settled_writes(4, 20, vec![2]))
-        .unwrap();
-    let root2 = storage.state_root();
-    assert_ne!(root1, root2, "root should change after second commit");
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 // ShardChainWriter
 // ═══════════════════════════════════════════════════════════════════════
@@ -528,7 +405,8 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provision_hashes: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     );
@@ -538,7 +416,8 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             transactions,
             certificates,
             provisions,
-            terminal_verdicts,
+            abandonment_records,
+            state_claims,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -548,7 +427,8 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
                 transactions,
                 certificates: Arc::new(certificates),
                 provisions,
-                terminal_verdicts,
+                abandonment_records,
+                state_claims,
                 witness_sources,
             }
         }
@@ -557,7 +437,8 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             transactions,
             certificates,
             provision_hashes,
-            terminal_verdicts,
+            abandonment_records,
+            state_claims,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -567,150 +448,41 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
                 transactions,
                 certificates: Arc::new(certificates),
                 provision_hashes,
-                terminal_verdicts,
+                abandonment_records,
+                state_claims,
                 witness_sources,
             }
         }
     };
 }
 
-/// Wrap receipts into a single `Finalization` attached to `block.certificates`,
-/// so the new `commit_block` (which derives receipts from `block.certificates`)
-/// can apply them.
-fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
-    let new_fw: Arc<Verifiable<Finalization>> = Arc::new(
-        Finalization::new(
-            TickId::new(ShardId::ROOT, block.height()),
-            TickHalf::Determined,
-            vec![placeholder_local_ec(ShardId::ROOT, block.height())],
-            receipts,
-        )
-        .into(),
-    );
-    // Take block out, mutate, and put back.
-    let taken = std::mem::replace(
-        block,
-        Block::Sealed {
-            header: block.header().clone(),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provision_hashes: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
-            witness_sources: Arc::new(WitnessSources::empty()),
-        },
-    );
-    *block = match taken {
-        Block::Live {
-            header,
-            transactions,
-            certificates,
-            provisions,
-            terminal_verdicts,
-            witness_sources,
-        } => {
-            let mut certificates = (*certificates).clone();
-            certificates.push(new_fw);
-            Block::Live {
-                header,
-                transactions,
-                certificates: Arc::new(certificates),
-                provisions,
-                terminal_verdicts,
-                witness_sources,
-            }
-        }
-        Block::Sealed {
-            header,
-            transactions,
-            certificates,
-            provision_hashes,
-            terminal_verdicts,
-            witness_sources,
-        } => {
-            let mut certificates = (*certificates).clone();
-            certificates.push(new_fw);
-            Block::Sealed {
-                header,
-                transactions,
-                certificates: Arc::new(certificates),
-                provision_hashes,
-                terminal_verdicts,
-                witness_sources,
-            }
-        }
-    };
-}
-
+/// A prepared commit for a block the store already holds — landed by a
+/// sync commit between prepare and flush, or by a second vnode on the
+/// store — applies nothing: the block is in, and its batch would
+/// otherwise be replayed onto a version already written.
 #[test]
-fn test_commit_block_applies_writes() {
+fn a_prepared_commit_for_a_committed_block_applies_nothing() {
     let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    let updates = make_settled_writes(1, 10, vec![42]);
-    let mut block = make_test_block(BlockHeight::new(1));
-    let receipts = updates_to_receipts(&updates);
-    attach_receipts(&mut block, receipts);
-    let result = storage.commit_block(&make_test_certified(block), &[], &no_witness());
-    assert_ne!(result, StateRoot::ZERO);
+    let storage =
+        Arc::new(RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap());
+    test_prepared_commit_for_a_committed_block_applies_nothing(&storage);
 }
 
 #[test]
-fn test_commit_block_multiple_certs() {
+#[should_panic(expected = "meets a different block already there")]
+fn a_prepared_commit_refuses_a_different_block_at_one_height() {
     let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    let updates1 = make_settled_writes(1, 10, vec![1]);
-    let updates2 = make_settled_writes(2, 20, vec![2]);
-    let merged = union_of(&[updates1, updates2]);
-    let mut block = make_test_block(BlockHeight::new(1));
-    let receipts = updates_to_receipts(&merged);
-    attach_receipts(&mut block, receipts);
-    let result = storage.commit_block(&make_test_certified(block), &[], &no_witness());
-    assert_ne!(result, StateRoot::ZERO);
+    let storage =
+        Arc::new(RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap());
+    test_prepared_commit_refuses_a_different_block_at_one_height(&storage);
 }
 
 #[test]
-fn test_commit_block_empty_certs() {
+fn a_prepared_commit_writes_its_committed_cells() {
     let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    let block = make_test_block(BlockHeight::new(1));
-    storage.commit_block(&make_test_certified(block), &[], &no_witness());
-    assert_eq!(storage.jmt_height(), BlockHeight::new(1));
-}
-
-#[test]
-fn test_prepare_then_commit_matches_direct() {
-    let temp_dir1 = TempDir::new().unwrap();
-    let s_prepared =
-        Arc::new(RocksDbShardStorage::open(temp_dir1.path(), NibblePath::empty()).unwrap());
-    let parent_root = s_prepared.state_root();
-    let (spec_root, _jmt_snapshot, prepared) = s_prepared.prepare_block_commit(
-        ParentAnchor {
-            state_root: parent_root,
-            height: BlockHeight::GENESIS,
-            state: &s_prepared.snapshot(),
-            pending: &[],
-            base_reads: None,
-        },
-        &[],
-        &[],
-        BlockHeight::new(1),
-    );
-    let block = make_test_block(BlockHeight::new(1));
-    let result_prepared = prepared(
-        SyncHint::FlushNow,
-        &make_test_certified(block),
-        &no_witness(),
-    );
-
-    let temp_dir2 = TempDir::new().unwrap();
-    let s_direct = RocksDbShardStorage::open(temp_dir2.path(), NibblePath::empty()).unwrap();
-    let block2 = make_test_block(BlockHeight::new(1));
-    let result_direct = s_direct.commit_block(&make_test_certified(block2), &[], &no_witness());
-
-    assert_eq!(result_prepared, result_direct);
-    assert_eq!(spec_root, result_prepared);
+    let storage =
+        Arc::new(RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap());
+    test_prepared_commit_writes_committed_cells(&storage);
 }
 
 /// A finalization whose single receipt carries `writes`. Its placeholder
@@ -769,6 +541,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
             writes.clone(),
         )],
         &[],
+        &[],
         BlockHeight::new(1),
     );
     prepared1(
@@ -792,6 +565,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
         },
         &[finalization_with_writes(BlockHeight::new(2), tombstones)],
         &[],
+        &[],
         BlockHeight::new(2),
     );
     let (_root3, _snap3, prepared3) = storage.prepare_block_commit(
@@ -811,6 +585,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
             base_reads: None,
         },
         &[finalization_with_writes(BlockHeight::new(3), writes)],
+        &[],
         &[],
         BlockHeight::new(3),
     );
@@ -870,7 +645,8 @@ fn test_commit_block_stores_certificates() {
             transactions,
             certificates: fw_certificates,
             provisions,
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
         Block::Sealed {
@@ -883,11 +659,18 @@ fn test_commit_block_stores_certificates() {
             transactions,
             certificates: fw_certificates,
             provision_hashes,
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     };
-    let _ = storage.commit_block(&make_test_certified(block), &[], &no_witness());
+    let _ = commit_settled_at(
+        &storage,
+        &make_test_certified(block),
+        &[],
+        &[],
+        &no_witness(),
+    );
 
     assert!(storage.get_certificate(&cert_hash).is_some());
 }
@@ -895,15 +678,6 @@ fn test_commit_block_stores_certificates() {
 // ═══════════════════════════════════════════════════════════════════════
 // Batch operations
 // ═══════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_transactions_batch_missing() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    let result = storage.get_transactions_batch(&[TxHash::from(Hash::from_bytes(&[1; 32]))]);
-    assert!(result.is_empty());
-}
 
 #[test]
 fn test_certificates_batch() {
@@ -932,49 +706,6 @@ fn test_certificates_batch() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_initial_block_height_is_zero() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    assert_eq!(storage.jmt_height(), BlockHeight::new(0));
-}
-
-#[test]
-fn test_initial_state_root_is_zero() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    assert_eq!(storage.state_root(), StateRoot::ZERO);
-}
-
-#[test]
-fn test_state_root_deterministic() {
-    let updates = make_settled_writes(1, 10, vec![42]);
-
-    let td1 = TempDir::new().unwrap();
-    let s1 = RocksDbShardStorage::open(td1.path(), NibblePath::empty()).unwrap();
-    s1.commit(&updates).unwrap();
-
-    let td2 = TempDir::new().unwrap();
-    let s2 = RocksDbShardStorage::open(td2.path(), NibblePath::empty()).unwrap();
-    s2.commit(&updates).unwrap();
-
-    assert_eq!(s1.state_root(), s2.state_root());
-    assert_eq!(s1.jmt_height(), s2.jmt_height());
-}
-
-#[test]
-fn test_state_root_differs_for_different_data() {
-    let td1 = TempDir::new().unwrap();
-    let s1 = RocksDbShardStorage::open(td1.path(), NibblePath::empty()).unwrap();
-    s1.commit(&make_settled_writes(1, 10, vec![1])).unwrap();
-
-    let td2 = TempDir::new().unwrap();
-    let s2 = RocksDbShardStorage::open(td2.path(), NibblePath::empty()).unwrap();
-    s2.commit(&make_settled_writes(1, 10, vec![2])).unwrap();
-
-    assert_ne!(s1.state_root(), s2.state_root());
-}
-
-#[test]
 fn test_certificate_store_and_retrieve() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
@@ -996,47 +727,6 @@ fn test_certificate_get_missing() {
     assert!(storage.get_certificate(&missing).is_none());
 }
 
-#[test]
-fn test_get_block_for_sync() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    let block = make_test_block(BlockHeight::new(1));
-    let qc = make_test_qc(&block);
-    commit_empty(&storage, &block, &qc);
-
-    let result = storage.get_block_for_sync(BlockHeight::new(1));
-    assert!(result.is_some());
-    assert_eq!(result.unwrap().0.height(), BlockHeight::new(1));
-
-    assert!(storage.get_block_for_sync(BlockHeight::new(999)).is_none());
-}
-
-#[test]
-fn test_commit_certificate_via_commit_store() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    let updates = make_settled_writes(1, 10, vec![42]);
-    let cert = make_test_finalization(BlockHeight::new(1), ShardId::ROOT);
-
-    storage.commit_certificate_with_writes(&cert, &updates);
-
-    assert_eq!(storage.jmt_height(), BlockHeight::new(0));
-    assert_eq!(storage.state_root(), StateRoot::ZERO);
-    assert!(storage.get_certificate(&cert.receipt_hash()).is_some());
-}
-
-#[test]
-fn test_empty_commit_still_advances_version() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    let updates = SettledWrites::default();
-    storage.commit(&updates).unwrap();
-    assert_eq!(storage.jmt_height(), BlockHeight::new(1));
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 // Persistence across reopen
 // ═══════════════════════════════════════════════════════════════════════
@@ -1047,30 +737,22 @@ fn test_substates_survive_reopen() {
 
     let root_after_write;
     let version_after_write;
-    let cert_id;
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-        let updates = make_settled_writes(1, 10, vec![42]);
-        let cert = make_test_finalization(BlockHeight::new(1), ShardId::ROOT);
-        cert_id = cert.receipt_hash();
-        storage.commit_certificate_with_writes(&cert, &updates);
+        commit_writes(&storage, &make_settled_writes(1, 10, vec![42]));
         root_after_write = storage.state_root();
         version_after_write = storage.jmt_height();
     }
 
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
         assert_eq!(storage.jmt_height(), version_after_write);
         assert_eq!(storage.state_root(), root_after_write);
-
-        let cert = storage.get_certificate(&cert_id);
-        assert!(cert.is_some(), "certificate should survive reopen");
-        assert_eq!(cert.unwrap().receipt_hash(), cert_id);
-
-        // Verify the substate was written via direct key lookup.
-        let value = storage.cell(state_key(1, 10));
-        assert_eq!(value, Some(vec![42]), "substate should survive reopen");
+        assert_eq!(
+            storage.cell(state_key(1, 10)),
+            Some(vec![42]),
+            "substate should survive reopen"
+        );
     }
 }
 
@@ -1081,8 +763,7 @@ fn test_blocks_survive_reopen() {
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
         let block = make_test_block(BlockHeight::new(1));
-        let qc = make_test_qc(&block);
-        commit_empty(&storage, &block, &qc);
+        commit_empty(&storage, &block);
     }
 
     {
@@ -1140,6 +821,27 @@ fn a_replay_reaches_a_record_no_verdict_has_discharged() {
 }
 
 #[test]
+fn a_replay_stops_at_the_chain_origin() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_the_replay_floor_stops_at_the_chain_origin(&storage);
+}
+
+#[test]
+fn a_replay_keeps_a_leg_its_own_finalization_settled() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_a_legs_own_finalization_keeps_the_floor(&storage);
+}
+
+#[test]
+fn a_leg_entry_holds_the_floor_to_its_horizon() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_a_leg_entry_holds_the_floor_to_its_horizon(&storage);
+}
+
+#[test]
 fn test_ec_storage_roundtrip() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
@@ -1168,8 +870,6 @@ fn test_ec_survives_reopen() {
 
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-        let block = make_test_block(BlockHeight::new(0));
-        storage.commit_block(&make_test_certified(block), &[], &no_witness());
         let mut block = make_test_block(BlockHeight::new(1));
         push_finalization(
             &mut block,
@@ -1177,7 +877,13 @@ fn test_ec_survives_reopen() {
                 Finalization::new(tick_id, TickHalf::Determined, vec![Arc::new(ec)], vec![]).into(),
             ),
         );
-        storage.commit_block(&make_test_certified(block), &[], &no_witness());
+        commit_settled_at(
+            &storage,
+            &make_test_certified(block),
+            &[],
+            &[],
+            &no_witness(),
+        );
     }
 
     {
@@ -1204,7 +910,13 @@ fn test_ec_atomic_with_block_commit() {
         ),
     );
     // Commit block with EC atomically
-    storage.commit_block(&make_test_certified(block), &[], &no_witness());
+    commit_settled_at(
+        &storage,
+        &make_test_certified(block),
+        &[],
+        &[],
+        &no_witness(),
+    );
 
     let cert = storage
         .get_execution_certificate(&tick_id)
@@ -1224,187 +936,24 @@ fn test_ec_atomic_with_block_commit() {
 // RocksDB encodes the history log differently (wire codec, prefix extractor,
 // snapshot isolation, column family) so backend parity is not free.
 
-/// Helper: port of `commit_with` from the memory tests. Injects the updates
-/// as a single-tx `Finalization` receipt inside a block and commits it.
-fn rocks_commit_with(
-    storage: &RocksDbShardStorage,
-    writes: &SettledWrites,
-    block: &Block,
-    qc: &Verified<QuorumCertificate>,
-) {
-    let mut block = block.clone();
-    if !writes.is_empty() {
-        let receipt = StoredReceipt {
-            tx_hash: TxHash::ZERO,
-            consensus: Arc::new(ConsensusReceipt::Succeeded {
-                receipt_hash: GlobalReceiptHash::ZERO,
-                writes: writes.clone().into(),
-                beacon_witness_events: Vec::new(),
-                events: Vec::new(),
-            }),
-            metadata: None,
-        };
-        let tick = Arc::new(
-            Finalization::new(
-                TickId::new(ShardId::ROOT, block.height()),
-                TickHalf::Determined,
-                vec![placeholder_local_ec(ShardId::ROOT, block.height())],
-                vec![receipt],
-            )
-            .into(),
-        );
-        push_finalization(&mut block, tick);
-    }
-    // SAFETY: synthetic test fixture; round-trip tests don't exercise
-    // the `Verified<CertifiedBlock>` predicate.
-    let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
-        CertifiedBlock::new_unchecked(block, <Verified<_>>::clone(qc)),
-    ));
-    storage.commit_block(&certified, &[], &no_witness());
-}
-
-/// State-history walkthrough: key K created at V1 with value A, deleted
-/// at V2, recreated at V3 with value B. Every historical version must
-/// read back the correct value — that's the "smallest history entry
-/// after V" invariant end-to-end.
-#[test]
-fn test_state_history_create_delete_create() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    let key = state_key(7, 42);
-
-    // Keep an anchor key alive throughout so the JMT never empties out —
-    // deleting K alone at V2 would otherwise break the parent-version
-    // chain. The state-history behavior under test is independent of this.
-    let anchor = make_settled_writes(99, 0xFF, vec![0xFF]);
-
-    // V1: create K=A, plus anchor.
-    let v1 = union_of(&[make_settled_writes(7, 42, vec![0xAA]), anchor]);
-    storage.commit(&v1).unwrap();
-
-    // V2: delete K.
-    storage.commit(&make_state_delete(7, 42)).unwrap();
-
-    // V3: recreate K=B.
-    storage
-        .commit(&make_settled_writes(7, 42, vec![0xBB]))
-        .unwrap();
-
-    // See memory test for derivation:
-    let expected: &[(u64, Option<Vec<u8>>)] = &[
-        (0, None),
-        (1, Some(vec![0xAA])),
-        (2, None),
-        (3, Some(vec![0xBB])),
-    ];
-    for (v, want) in expected {
-        let snap =
-            <RocksDbShardStorage as VersionedStore>::snapshot_at(&storage, BlockHeight::new(*v));
-        let got = snap.cell(key);
-        assert_eq!(
-            &got, want,
-            "state-history read at V={v}: want={want:?}, got={got:?}"
-        );
-    }
-}
-
 /// JMT GC prunes per-version substate byte totals below the retention
 /// cutoff and retains everything at or above it.
 #[test]
 fn substate_bytes_pruned_by_jmt_gc() {
     let temp_dir = TempDir::new().unwrap();
-    let config = RocksDbConfig {
-        jmt_history_length: 2,
-        ..Default::default()
-    };
-    let storage =
-        RocksDbShardStorage::open_with_config(temp_dir.path(), &config, NibblePath::empty())
-            .unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
     for h in 1..=10u64 {
         let writes = make_settled_writes(u8::try_from(h).unwrap_or(u8::MAX), 1, vec![1]);
-        storage.commit(&writes).unwrap();
+        commit_writes_at(&storage, &writes, paced(h, 2));
     }
     storage.run_jmt_gc();
 
-    // current=10, cutoff=8: below-cutoff entries pruned, the rest intact.
+    // Two blocks fit the horizon, so a tip at 10 floors at 8: below it
+    // the entries are pruned, the rest intact.
     assert_eq!(storage.substate_bytes_at(BlockHeight::new(7)), None);
     assert_eq!(storage.substate_bytes_at(BlockHeight::new(8)), Some(8));
     assert_eq!(storage.substate_bytes_at(BlockHeight::new(10)), Some(10));
-}
-
-/// `snapshot_at(V)` must panic when V is below the retention floor.
-#[test]
-#[should_panic(expected = "below retention floor")]
-fn test_snapshot_at_below_retention_panics() {
-    let temp_dir = TempDir::new().unwrap();
-    let config = RocksDbConfig {
-        jmt_history_length: 2,
-        ..Default::default()
-    };
-    let storage =
-        RocksDbShardStorage::open_with_config(temp_dir.path(), &config, NibblePath::empty())
-            .unwrap();
-
-    for h in 1..=10u64 {
-        let block = make_test_block(BlockHeight::new(h));
-        let qc = make_test_qc(&block);
-        commit_empty(&storage, &block, &qc);
-    }
-    // current=10, floor=8. V=1 is well below floor.
-    let _snap = <RocksDbShardStorage as VersionedStore>::snapshot_at(&storage, BlockHeight::new(1));
-}
-
-/// `get_substate_at_height` is an external-facing API — it must
-/// return `None` for out-of-retention heights rather than panicking.
-#[test]
-fn test_historical_substate_read_respects_retention() {
-    let temp_dir = TempDir::new().unwrap();
-    let config = RocksDbConfig {
-        jmt_history_length: 2,
-        ..Default::default()
-    };
-    let storage =
-        RocksDbShardStorage::open_with_config(temp_dir.path(), &config, NibblePath::empty())
-            .unwrap();
-
-    let key = SubstateKey {
-        owner: Address::new([9u8; 31], AddressClass::Component),
-        local: LocalKey([1u8; 16]),
-    };
-
-    for h in 1..=10u64 {
-        let block = make_test_block(BlockHeight::new(h));
-        let qc = make_test_qc(&block);
-        let writes = SettledWrites::from_absolutes(BTreeMap::from([(
-            key,
-            Some(vec![u8::try_from(h).unwrap_or(u8::MAX)]),
-        )]));
-        rocks_commit_with(&storage, &writes, &block, &qc);
-    }
-    // current=10, floor=8.
-
-    // Within retention: returns Some.
-    assert_eq!(
-        storage.get_substate_at_height(key, BlockHeight::new(9)),
-        Some(Some(vec![9])),
-        "height within retention must succeed"
-    );
-    // Below retention: returns None.
-    assert!(
-        storage
-            .get_substate_at_height(key, BlockHeight::new(1))
-            .is_none(),
-        "height below retention must return None"
-    );
-    // Above current: returns None.
-    assert!(
-        storage
-            .get_substate_at_height(key, BlockHeight::new(99))
-            .is_none(),
-        "future height returns None"
-    );
 }
 
 /// Genesis-style writes via `commit_substates_only` must NOT populate the
@@ -1441,85 +990,33 @@ fn test_genesis_skips_history_entries() {
     assert_eq!(storage.cell(state_key(1, 1)), Some(vec![0xAA]));
 }
 
-/// Witness retention follows the commit-carried floor (a `WriteBatch`
-/// range delete) with one window of hysteresis, and recovery rebuilds
-/// the accumulator window from the tip header's base — entries below it
-/// are serving stock only.
-#[test]
-fn witness_window_retention_and_recovery() {
-    use hyperscale_storage::test_helpers::{commit_block_with_witness_window, stake_deposit};
-    use hyperscale_types::ShardWitnessPayload;
-
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    let deposits: Vec<_> = (0u64..6).map(stake_deposit).collect();
-
-    // Window [0, 4): all four leaves appended, nothing pruned.
-    commit_block_with_witness_window(
-        &storage,
-        BlockHeight::new(1),
-        0,
-        &deposits[0..4],
-        &deposits[0..4],
-        None,
-    );
-    // Window [2, 6): the tail appends, persisted floor untouched.
-    commit_block_with_witness_window(
-        &storage,
-        BlockHeight::new(2),
-        2,
-        &deposits[2..6],
-        &deposits[4..6],
-        None,
-    );
-    // Window [4, 6): the base advance carries the previous window's
-    // base as the persisted floor — leaves below 2 drop, [2, 4) stays
-    // as hysteresis stock.
-    commit_block_with_witness_window(
-        &storage,
-        BlockHeight::new(3),
-        4,
-        &deposits[4..6],
-        &[],
-        Some(BeaconWitnessLeafCount::new(2)),
-    );
-
-    // A read spanning the dropped range comes back short; the retained
-    // hysteresis range answers in full.
-    assert_eq!(storage.get_beacon_witness_payload_range(0, 6).len(), 4);
-    assert_eq!(
-        storage.get_beacon_witness_payload_range(2, 6),
-        deposits[2..6].to_vec(),
-    );
-
-    // Recovery starts the accumulator window at the tip's base.
-    let recovered = storage.load_recovered_state();
-    assert_eq!(
-        recovered.beacon_witness_start,
-        BeaconWitnessLeafCount::new(4)
-    );
-    let expected: Vec<_> = deposits[4..6]
-        .iter()
-        .map(ShardWitnessPayload::leaf_hash)
-        .collect();
-    assert_eq!(recovered.beacon_witness_leaf_hashes, expected);
-}
-
 // ─── Safe-vote registers ─────────────────────────────────────────────────────
-
-fn registers(locked: u64, last_voted: u64) -> SafeVoteRegisters {
-    SafeVoteRegisters {
-        locked_round: Round::new(locked),
-        last_voted_round: Round::new(last_voted),
-        high_qc: None,
-    }
-}
 
 #[test]
 fn safe_vote_registers_recover_their_justification() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     test_registers_recover_their_justification(&storage, || storage.load_recovered_state());
+}
+
+#[test]
+fn safe_vote_registers_are_monotone_and_recoverable() {
+    let (_dir, storage) = open_fresh();
+    test_registers_are_monotone_and_recoverable(&storage, || storage.load_recovered_state());
+}
+
+#[test]
+fn safe_vote_registers_ignore_a_stale_chain_incarnation() {
+    let (_dir, storage) = open_fresh();
+    test_registers_ignore_a_stale_chain_incarnation(
+        &storage,
+        |origin| {
+            let mut batch = WriteBatch::default();
+            write_chain_origin(&mut batch, origin);
+            storage.db.write(batch).unwrap();
+        },
+        || storage.load_recovered_state(),
+    );
 }
 
 /// Persisted registers read back, survive a reopen, and land in
@@ -1531,8 +1028,8 @@ fn safe_vote_registers_survive_reopen() {
     let v2 = ValidatorId::new(2);
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-        storage.persist_safe_vote_registers(v1, registers(3, 5));
-        storage.persist_safe_vote_registers(v2, registers(2, 2));
+        storage.persist_vote_position(v1, &position(registers(3, 5)));
+        storage.persist_vote_position(v2, &position(registers(2, 2)));
         assert_eq!(storage.safe_vote_registers(v1), Some(registers(3, 5)));
     }
 
@@ -1549,57 +1046,22 @@ fn safe_vote_registers_survive_reopen() {
     );
 }
 
-/// Writes merge field-wise max, so a lower or mixed write can never
-/// regress either register — including on a cold write-path cache after
-/// a reopen, where the merge must consult the stored record.
+/// The register merge holds on a cold write-path cache after a reopen,
+/// where it must consult the stored record.
 #[test]
-fn safe_vote_registers_writes_are_monotone() {
+fn safe_vote_registers_writes_are_monotone_across_a_reopen() {
     let temp_dir = TempDir::new().unwrap();
     let v = ValidatorId::new(7);
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-        storage.persist_safe_vote_registers(v, registers(4, 6));
-        storage.persist_safe_vote_registers(v, registers(2, 9));
+        storage.persist_vote_position(v, &position(registers(4, 6)));
+        storage.persist_vote_position(v, &position(registers(2, 9)));
         assert_eq!(storage.safe_vote_registers(v), Some(registers(4, 9)));
     }
 
     let reopened = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    reopened.persist_safe_vote_registers(v, registers(3, 3));
+    reopened.persist_vote_position(v, &position(registers(3, 3)));
     assert_eq!(reopened.safe_vote_registers(v), Some(registers(4, 9)));
-}
-
-/// A record written under a different chain origin is invisible to
-/// reads and recovery — a checkpoint-seeded child store inherits the
-/// parent's records but must not apply them to the child chain's
-/// unrelated round numbering. The next write starts a fresh record
-/// under the new origin.
-#[test]
-fn safe_vote_registers_ignore_stale_chain_incarnation() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    let v = ValidatorId::new(1);
-    storage.persist_safe_vote_registers(v, registers(8, 8));
-
-    let mut batch = WriteBatch::default();
-    write_chain_origin(
-        &mut batch,
-        ChainOrigin {
-            genesis_height: BlockHeight::new(11),
-            anchor_wt: WeightedTimestamp::from_millis(999),
-        },
-    );
-    storage.db.write(batch).unwrap();
-
-    assert_eq!(storage.safe_vote_registers(v), None);
-    assert!(
-        storage
-            .load_recovered_state()
-            .safe_vote_registers
-            .is_empty()
-    );
-
-    storage.persist_safe_vote_registers(v, registers(1, 2));
-    assert_eq!(storage.safe_vote_registers(v), Some(registers(1, 2)));
 }
 
 #[test]
@@ -1610,7 +1072,7 @@ fn recovery_carries_the_tip_drain_total() {
 }
 
 #[test]
-fn a_committed_bundle_outlives_its_block_s_sealing() {
+fn a_committed_bundle_outlives_the_sealing_of_its_block() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     test_committed_bundle_outlives_sealing(&storage, || storage.load_recovered_state());
@@ -1629,7 +1091,13 @@ fn a_committed_bundle_survives_a_reopen() {
             TxHash::ZERO,
         );
         let hash = block.provisions()[0].hash();
-        storage.commit_block(&make_test_certified(block), &[], &no_witness());
+        commit_settled_at(
+            &storage,
+            &make_test_certified(block),
+            &[],
+            &[],
+            &no_witness(),
+        );
         hash
     };
 
@@ -1648,13 +1116,7 @@ fn a_committed_bundle_survives_a_reopen() {
 #[test]
 fn a_retained_bundle_drops_below_the_history_floor() {
     let temp_dir = TempDir::new().unwrap();
-    let config = RocksDbConfig {
-        jmt_history_length: 3,
-        ..RocksDbConfig::default()
-    };
-    let storage =
-        RocksDbShardStorage::open_with_config(temp_dir.path(), &config, NibblePath::empty())
-            .unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     test_retained_bundle_drops_below_the_history_floor(&storage, 3, || {
         storage.load_recovered_state()
     });
@@ -1675,31 +1137,20 @@ fn the_tx_index_answers_with_the_local_shards_certificate() {
 }
 
 #[test]
-fn a_package_cell_lands_in_the_artifact_index_with_its_commit() {
-    // The judgement of what a package cell is belongs to the installed
-    // statics; the stub judges by local-key marker so the index write is
-    // under test without the VM stack.
-    install_stub_protocol_statics();
-
+fn the_tx_index_answers_with_every_certificate_of_this_shards() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_the_tx_index_answers_with_every_certificate_of_this_shards(&storage);
+}
 
-    let artifact = vec![7u8; 64];
-    let mut cells = BTreeMap::from([(state_key(1, STUB_PACKAGE_MARKER), Some(artifact.clone()))]);
-    cells.insert(state_key(1, 10), Some(vec![9, 9, 9]));
-    let writes = SettledWrites::from_absolutes(cells);
-    let cert = make_test_finalization(BlockHeight::new(1), ShardId::ROOT);
-    storage.commit_certificate_with_writes(&cert, &writes);
-
-    assert_eq!(
-        storage.package_artifacts(),
-        vec![artifact],
-        "the package-marked cell is indexed; the ordinary cell is not"
-    );
-
-    // The index survives a reopen — it is what a restarting host reseeds
-    // its caches from.
+/// The shared package-index test, then a reopen: the index is what a
+/// restarting host reseeds its caches from.
+#[test]
+fn a_package_cell_lands_in_the_artifact_index_and_survives_a_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    let artifact = test_a_package_cell_lands_in_the_artifact_index(&storage);
     drop(storage);
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    assert_eq!(storage.package_artifacts().len(), 1);
+    assert_eq!(storage.package_artifacts(), vec![artifact]);
 }

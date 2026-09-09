@@ -61,8 +61,8 @@ fn four_party_cluster_converges_on_per_epoch_state() {
         );
         let mut ref_proposals: Vec<_> = reference.block.block().committed_proposals().to_vec();
         ref_proposals.sort_by_key(|(id, _)| id.inner());
-        for r in 1..sim.n() {
-            let cmp = &sim.commits[r][e];
+        for (r, commits) in sim.commits.iter().enumerate().skip(1) {
+            let cmp = &commits[e];
             assert_eq!(
                 cmp.epoch, reference.epoch,
                 "replica {r} committed epoch {:?} at slot {e}, expected {:?}",
@@ -109,9 +109,9 @@ fn cluster_commits_non_empty_proposal_set_per_epoch() {
     // Tripwire: every dispatched verify must resolve. A non-zero
     // in-flight count after the cluster quiesces means the result
     // path didn't clear a pipeline slot somewhere.
-    for r in 0..sim.n() {
+    for (r, coordinator) in sim.coordinators.iter().enumerate() {
         assert_eq!(
-            sim.coordinators[r].verifications_in_flight(),
+            coordinator.verifications_in_flight(),
             0,
             "replica {r} leaked verify slots",
         );
@@ -239,8 +239,8 @@ fn observed_crossing_records_shard_boundary_through_full_commit() {
     }
 
     // Every replica folds to the same boundary record.
-    for r in 1..sim.n() {
-        let other = sim.commits[r][0]
+    for (r, commits) in sim.commits.iter().enumerate().skip(1) {
+        let other = commits[0]
             .state
             .boundaries
             .get(&ShardId::ROOT)
@@ -291,8 +291,8 @@ fn forged_boundary_qc_records_no_shard_boundary() {
             .contains_key(&ShardId::ROOT),
         "no contribution should seat for a rejected boundary QC",
     );
-    for r in 1..sim.n() {
-        let other = sim.commits[r][0]
+    for (r, commits) in sim.commits.iter().enumerate().skip(1) {
+        let other = commits[0]
             .state
             .boundaries
             .get(&ShardId::ROOT)
@@ -436,10 +436,9 @@ fn equivocating_proposer_does_not_block_consensus() {
         "byzantine transform must have fired exactly once",
     );
     let reference = &sim.commits[0][0];
-    for r in 1..sim.n() {
-        let cmp = &sim.commits[r][0];
+    for (r, commits) in sim.commits.iter().enumerate().skip(1) {
         assert_eq!(
-            cmp.state, reference.state,
+            commits[0].state, reference.state,
             "replica {r} diverged from replica 0 under proposal equivocation",
         );
     }
@@ -472,9 +471,9 @@ fn silenced_replica_recovers_via_view_2_timeout() {
     sim.fire_spc_view_timer_all();
     sim.run_for_at_most(MAX_STEPS);
 
-    for r in 0..3 {
+    for (r, commits) in sim.commits.iter().enumerate().take(3) {
         assert!(
-            !sim.commits[r].is_empty(),
+            !commits.is_empty(),
             "honest replica {r} failed to commit after view-2 timeout recovery",
         );
     }
@@ -483,9 +482,9 @@ fn silenced_replica_recovers_via_view_2_timeout() {
         "silenced replica unexpectedly committed",
     );
     let reference = &sim.commits[0][0];
-    for r in 1..3 {
+    for (r, commits) in sim.commits.iter().enumerate().take(3).skip(1) {
         assert_eq!(
-            sim.commits[r][0].state, reference.state,
+            commits[0].state, reference.state,
             "honest replica {r} diverged from replica 0",
         );
     }
@@ -516,8 +515,8 @@ fn forged_equivocation_witness_cannot_jail_or_fork() {
     sim.run_until_committed(1, MAX_STEPS);
 
     let reference = &sim.commits[0][0].state;
-    for r in 0..sim.n() {
-        let state = &sim.commits[r][0].state;
+    for (r, commits) in sim.commits.iter().enumerate() {
+        let state = &commits[0].state;
         let record = state
             .validators
             .get(&victim)
@@ -596,8 +595,8 @@ fn gossiped_vote_equivocation_convicts_through_a_committed_proposal() {
     sim.run_until_committed(1, MAX_STEPS);
 
     let reference = &sim.commits[0][0].state;
-    for r in 0..sim.n() {
-        let state = &sim.commits[r][0].state;
+    for (r, commits) in sim.commits.iter().enumerate() {
+        let state = &commits[0].state;
         let record = state
             .validators
             .get(&accused)
@@ -639,8 +638,8 @@ fn forged_vote_equivocation_cannot_convict() {
     sim.run_until_committed(1, MAX_STEPS);
 
     let reference = &sim.commits[0][0].state;
-    for r in 0..sim.n() {
-        let state = &sim.commits[r][0].state;
+    for (r, commits) in sim.commits.iter().enumerate() {
+        let state = &commits[0].state;
         let record = state.validators.get(&victim).expect("still registered");
         assert!(
             !matches!(
@@ -697,8 +696,7 @@ fn skip_quorum_drives_chain_past_abandoned_epoch() {
 
     // Every replica has committed exactly one Skip block at the
     // expected epoch, anchored at the prior tip.
-    for r in 0..n {
-        let commits = &sim.commits[r];
+    for (r, commits) in sim.commits.iter().enumerate() {
         assert_eq!(
             commits.len(),
             1,
@@ -717,9 +715,9 @@ fn skip_quorum_drives_chain_past_abandoned_epoch() {
     // may have assembled certs with different signer subsets — the
     // cert lives outside the block hash.
     let canonical_hash = sim.commits[0][0].block.block_hash();
-    for r in 1..n {
+    for (r, commits) in sim.commits.iter().enumerate().skip(1) {
         assert_eq!(
-            sim.commits[r][0].block.block_hash(),
+            commits[0].block.block_hash(),
             canonical_hash,
             "replica {r} block hash diverged from replica 0",
         );
@@ -752,17 +750,10 @@ fn consecutive_skips_advance_chain() {
         sim.fire_ratify_timer(idx);
     }
     let _ = sim.run_until_committed(1, MAX_STEPS);
-    for r in 0..n {
-        assert_eq!(
-            sim.commits[r].len(),
-            1,
-            "replica {r} commit count post-skip-1"
-        );
-        assert_eq!(sim.commits[r][0].epoch, Epoch::new(1));
-        assert!(matches!(
-            sim.commits[r][0].block.cert(),
-            BeaconCert::Skip(_)
-        ));
+    for (r, commits) in sim.commits.iter().enumerate() {
+        assert_eq!(commits.len(), 1, "replica {r} commit count post-skip-1");
+        assert_eq!(commits[0].epoch, Epoch::new(1));
+        assert!(matches!(commits[0].block.cert(), BeaconCert::Skip(_)));
     }
     let post_skip_1_randomness = sim.commits[0][0].state.randomness;
 
@@ -778,17 +769,10 @@ fn consecutive_skips_advance_chain() {
         sim.fire_ratify_timer(idx);
     }
     let _ = sim.run_until_committed(2, MAX_STEPS);
-    for r in 0..n {
-        assert_eq!(
-            sim.commits[r].len(),
-            2,
-            "replica {r} commit count post-skip-2"
-        );
-        assert_eq!(sim.commits[r][1].epoch, Epoch::new(2));
-        assert!(matches!(
-            sim.commits[r][1].block.cert(),
-            BeaconCert::Skip(_)
-        ));
+    for (r, commits) in sim.commits.iter().enumerate() {
+        assert_eq!(commits.len(), 2, "replica {r} commit count post-skip-2");
+        assert_eq!(commits[1].epoch, Epoch::new(2));
+        assert!(matches!(commits[1].block.cert(), BeaconCert::Skip(_)));
     }
     // Randomness rolled between consecutive skips — pinning the
     // "each skip advances randomness" property.
@@ -798,9 +782,9 @@ fn consecutive_skips_advance_chain() {
         "consecutive skips must roll randomness; chain wouldn't converge otherwise",
     );
     // Tripwire: verify pipeline drains after consecutive skips.
-    for r in 0..n {
+    for (r, coordinator) in sim.coordinators.iter().enumerate() {
         assert_eq!(
-            sim.coordinators[r].verifications_in_flight(),
+            coordinator.verifications_in_flight(),
             0,
             "replica {r} leaked verify slots across two skips",
         );
@@ -829,9 +813,9 @@ fn missed_proposal_gossip_recovers_via_fetch_protocol() {
 
     // Every replica must commit the epoch-1 block; replica 1's commit
     // came through the fetch-recovery path.
-    for r in 0..sim.n() {
+    for (r, commits) in sim.commits.iter().enumerate() {
         assert!(
-            !sim.commits[r].is_empty(),
+            !commits.is_empty(),
             "replica {r} failed to commit epoch 1 (fetch path may have stalled)",
         );
     }
@@ -844,12 +828,8 @@ fn missed_proposal_gossip_recovers_via_fetch_protocol() {
         .committed_proposals()
         .to_vec();
     reference.sort_by_key(|(id, _)| id.inner());
-    for r in 1..sim.n() {
-        let mut cmp: Vec<_> = sim.commits[r][0]
-            .block
-            .block()
-            .committed_proposals()
-            .to_vec();
+    for (r, commits) in sim.commits.iter().enumerate().skip(1) {
+        let mut cmp: Vec<_> = commits[0].block.block().committed_proposals().to_vec();
         cmp.sort_by_key(|(id, _)| id.inner());
         assert_eq!(
             cmp, reference,
@@ -947,10 +927,10 @@ fn partition_stalls_committee_side_then_skip_settles() {
         cert.signer_count() >= 9,
         "commit quorum is 9 of the 13-member active pool",
     );
-    for i in 3..POOL {
+    for (i, commits) in sim.commits.iter().enumerate().skip(3) {
         assert!(
             matches!(
-                sim.commits[i].last().map(|c| c.block.cert()),
+                commits.last().map(|c| c.block.cert()),
                 Some(BeaconCert::Skip(_)),
             ),
             "replica {i} did not adopt the skip block",
@@ -958,8 +938,8 @@ fn partition_stalls_committee_side_then_skip_settles() {
     }
     // The committee side is still stalled — consistency chosen over
     // availability for the partition minority.
-    for i in 0..3 {
-        assert!(sim.commits[i].is_empty(), "replica {i} forked");
+    for (i, commits) in sim.commits.iter().enumerate().take(3) {
+        assert!(commits.is_empty(), "replica {i} forked");
     }
 
     // Heal: the certified skip block reaches a committee replica, which
@@ -1045,8 +1025,8 @@ fn split_round_one_converges_on_the_candidate_in_round_two() {
 
     // Round 1 split 2–2 below the quorum of 3: no polka, no lock, no
     // commit anywhere.
-    for i in 0..4 {
-        assert!(sim.commits[i].is_empty(), "replica {i} committed early");
+    for (i, commits) in sim.commits.iter().enumerate().take(4) {
+        assert!(commits.is_empty(), "replica {i} committed early");
     }
 
     // The candidate reaches the late half (its round-1 register is
@@ -1067,8 +1047,8 @@ fn split_round_one_converges_on_the_candidate_in_round_two() {
     }
     sim.run_for_at_most(10_000);
 
-    for i in 0..4 {
-        let commit = sim.commits[i]
+    for (i, commits) in sim.commits.iter().enumerate().take(4) {
+        let commit = commits
             .last()
             .unwrap_or_else(|| panic!("replica {i} never committed"));
         assert_eq!(commit.epoch, Epoch::new(1));

@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
+use hyperscale_core::FetchIds;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::instance_of_record;
 use hyperscale_network::{Network, ResponseVerdict};
@@ -65,6 +66,10 @@ impl FetchBinding for InstanceRecordBinding {
     type Id = Address;
 
     const NAME: &'static str = "instance_record";
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::InstanceRecords(ids)
+    }
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Address> {
         &mut shard.instances.fetch
@@ -116,9 +121,7 @@ impl FetchBinding for InstanceRecordBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::InstanceRecordsFetchFailed {
-                                ids: split.missing.clone(),
-                            },
+                            ShardScopedInput::FetchFailed(Self::ids(split.missing.clone())),
                         );
                     }
                     if split.unsolicited > 0 || !split.missing.is_empty() {
@@ -130,7 +133,7 @@ impl FetchBinding for InstanceRecordBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::InstanceRecordsFetchFailed { ids: requested },
+                        ShardScopedInput::FetchFailed(Self::ids(requested)),
                     );
                     ResponseVerdict::Accept
                 }

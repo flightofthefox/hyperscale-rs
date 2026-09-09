@@ -14,29 +14,34 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    EpochWindows, NetworkDefinition, ReshapeSeat, ResolvedCommittee, ShardAnchor, ShardId,
+    NetworkDefinition, ReshapeSeat, ResolvedCommittee, ShardAnchor, ShardId, TopologySchedule,
     TopologySnapshot, ValidatorId, WeightedTimestamp,
 };
 
-/// Reshape gate predicates over one host's [`TopologySnapshot`] — the
-/// identity-agnostic projection of the committed `BeaconState`.
+/// Reshape gate predicates over one host's [`TopologySchedule`].
+///
+/// Its head, the identity-agnostic projection of the committed
+/// `BeaconState`, is what the gates read, and its retained windows are
+/// what a followed block is classified under.
 pub struct ReshapeView<'a> {
-    topology_snapshot: &'a TopologySnapshot,
-    /// Window length, so a scheduled terminal epoch resolves to the
-    /// instant a chain cuts over. Chain-constant; the snapshot projects
-    /// placement, not the clock the windows are cut on.
-    epoch_duration_ms: u64,
+    schedule: &'a TopologySchedule,
 }
 
 impl<'a> ReshapeView<'a> {
-    /// View the reshape gate through `topology`, whose epoch windows are
-    /// `epoch_duration_ms` long.
+    /// View the reshape gate through `schedule`.
     #[must_use]
-    pub const fn new(topology_snapshot: &'a TopologySnapshot, epoch_duration_ms: u64) -> Self {
-        Self {
-            topology_snapshot,
-            epoch_duration_ms,
-        }
+    pub const fn new(schedule: &'a TopologySchedule) -> Self {
+        Self { schedule }
+    }
+
+    /// The schedule the view reads.
+    #[must_use]
+    pub const fn schedule(&self) -> &'a TopologySchedule {
+        self.schedule
+    }
+
+    fn topology_snapshot(&self) -> &'a TopologySnapshot {
+        self.schedule.head()
     }
 
     /// The weighted timestamp `shard`'s chain terminates at — the end of
@@ -50,22 +55,19 @@ impl<'a> ReshapeView<'a> {
     /// crossing was terminal an epoch later from the beacon's anchor.
     #[must_use]
     pub fn terminal_cut(&self, shard: ShardId) -> Option<WeightedTimestamp> {
-        if self.epoch_duration_ms == 0 {
+        let windows = self.schedule.windows();
+        if windows.epoch_duration_ms() == 0 {
             return None;
         }
-        let terminal = self.topology_snapshot.scheduled_terminal(shard)?;
-        Some(
-            EpochWindows::new(self.epoch_duration_ms)
-                .window_of(terminal)
-                .end,
-        )
+        let terminal = self.topology_snapshot().scheduled_terminal(shard)?;
+        Some(windows.window_of(terminal).end)
     }
 
     /// The chain's network definition — the domain every signature and QC
     /// verification binds to.
     #[must_use]
-    pub const fn network(&self) -> &NetworkDefinition {
-        self.topology_snapshot.network()
+    pub fn network(&self) -> &NetworkDefinition {
+        self.topology_snapshot().network()
     }
 
     /// Whether the beacon has folded a boundary crossing of `shard`'s own —
@@ -79,13 +81,13 @@ impl<'a> ReshapeView<'a> {
     /// is `false`.
     #[must_use]
     pub fn advanced_past_genesis(&self, shard: ShardId) -> bool {
-        self.topology_snapshot.advanced_past_genesis(shard)
+        self.topology_snapshot().advanced_past_genesis(shard)
     }
 
     /// The shard's beacon-attested boundary anchor, or `None` until it seeds.
     #[must_use]
     pub fn boundary(&self, shard: ShardId) -> Option<ShardAnchor> {
-        self.topology_snapshot.boundary(shard)
+        self.topology_snapshot().boundary(shard)
     }
 
     /// `shard`'s consensus committee resolved for QC verification — its
@@ -101,30 +103,32 @@ impl<'a> ReshapeView<'a> {
     /// window is exactly the set that signed that window's QCs.
     #[must_use]
     pub fn resolved_committee(&self, shard: ShardId) -> Option<ResolvedCommittee> {
-        let members = self.topology_snapshot.consensus_committee_for_shard(shard);
+        let members = self
+            .topology_snapshot()
+            .consensus_committee_for_shard(shard);
         if members.is_empty() {
             return None;
         }
         Some(ResolvedCommittee {
             public_keys: members
                 .iter()
-                .map(|v| self.topology_snapshot.public_key(*v))
+                .map(|v| self.topology_snapshot().public_key(*v))
                 .collect::<Option<Vec<_>>>()?,
-            quorum_threshold: self.topology_snapshot.quorum_threshold_for_shard(shard),
+            quorum_threshold: self.topology_snapshot().quorum_threshold_for_shard(shard),
         })
     }
 
     /// The shard's full committee — the ready-signal broadcast recipients.
     #[must_use]
     pub fn committee(&self, shard: ShardId) -> &[ValidatorId] {
-        self.topology_snapshot.committee_for_shard(shard)
+        self.topology_snapshot().committee_for_shard(shard)
     }
 
     /// The split child `validator` syncs as an observer of `parent`'s pending
     /// split, or `None` when it holds no observer seat there.
     #[must_use]
     pub fn observer_child(&self, parent: ShardId, validator: ValidatorId) -> Option<ShardId> {
-        self.topology_snapshot
+        self.topology_snapshot()
             .reshape_observer_child(parent, validator)
     }
 
@@ -132,23 +136,23 @@ impl<'a> ReshapeView<'a> {
     /// merge, or `None` when it holds no keeper seat there.
     #[must_use]
     pub fn keeper_parent(&self, child: ShardId, validator: ValidatorId) -> Option<ShardId> {
-        self.topology_snapshot
+        self.topology_snapshot()
             .reshape_keeper_parent(child, validator)
     }
 
     /// The pending-split observer cohorts, keyed by splitting parent — the
     /// orchestrator scans these for its host's observer seats.
     #[must_use]
-    pub const fn observer_cohorts(&self) -> &BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>> {
-        self.topology_snapshot.reshape_observer_cohorts()
+    pub fn observer_cohorts(&self) -> &BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>> {
+        self.topology_snapshot().reshape_observer_cohorts()
     }
 
     /// The pending-merge keeper cohorts, keyed by the child each keeper runs —
     /// each maps a keeper to its seat on the parent it reforms. The
     /// orchestrator scans these for its host's keeper seats.
     #[must_use]
-    pub const fn keeper_cohorts(&self) -> &BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>> {
-        self.topology_snapshot.reshape_keeper_cohorts()
+    pub fn keeper_cohorts(&self) -> &BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>> {
+        self.topology_snapshot().reshape_keeper_cohorts()
     }
 
     /// Whether the beacon has credited `validator`'s observer seat in
@@ -156,7 +160,7 @@ impl<'a> ReshapeView<'a> {
     /// a cohort that has lapsed has nothing left to assert either.
     #[must_use]
     pub fn observer_ready(&self, parent: ShardId, validator: ValidatorId) -> bool {
-        self.topology_snapshot
+        self.topology_snapshot()
             .reshape_observer_seat(parent, validator)
             .is_some_and(|seat| seat.ready)
     }
@@ -164,7 +168,7 @@ impl<'a> ReshapeView<'a> {
     /// Whether the beacon has credited `validator`'s keeper seat on `child`.
     #[must_use]
     pub fn keeper_ready(&self, child: ShardId, validator: ValidatorId) -> bool {
-        self.topology_snapshot
+        self.topology_snapshot()
             .reshape_keeper_seat(child, validator)
             .is_some_and(|seat| seat.ready)
     }
@@ -173,8 +177,8 @@ impl<'a> ReshapeView<'a> {
     /// seats on — each maps a member to the parent it re-roots its local store
     /// from. The orchestrator scans these for its host's parent-half seats.
     #[must_use]
-    pub const fn parent_half_cohorts(&self) -> &BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>> {
-        self.topology_snapshot.reshape_parent_half_cohorts()
+    pub fn parent_half_cohorts(&self) -> &BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>> {
+        self.topology_snapshot().reshape_parent_half_cohorts()
     }
 
     /// Whether `shard` has seeded a beacon-attested boundary anchor. The
@@ -182,7 +186,7 @@ impl<'a> ReshapeView<'a> {
     /// means the shard's boundary crossing committed.
     #[must_use]
     pub fn seeded(&self, shard: ShardId) -> bool {
-        self.topology_snapshot.boundary(shard).is_some()
+        self.topology_snapshot().boundary(shard).is_some()
     }
 
     /// Whether both of `parent`'s split children have seeded — the gate a
@@ -211,7 +215,7 @@ impl<'a> ReshapeView<'a> {
     /// splitting parent's committee may dissolve only once this holds.
     #[must_use]
     pub fn children_live(&self, parent: ShardId) -> bool {
-        self.topology_snapshot.children_live(parent)
+        self.topology_snapshot().children_live(parent)
     }
 
     /// Whether `shard`'s reshape successor(s) are live — both split children, or
@@ -219,7 +223,7 @@ impl<'a> ReshapeView<'a> {
     /// terminating committee waits on before it stops finalizing and serving.
     #[must_use]
     pub fn successors_live(&self, shard: ShardId) -> bool {
-        self.topology_snapshot.successors_live(shard)
+        self.topology_snapshot().successors_live(shard)
     }
 }
 
@@ -230,11 +234,21 @@ mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Hash, NetworkDefinition,
-        ShardAnchor, ShardId, Signer, StateRoot, TopologySnapshot, ValidatorId, ValidatorInfo,
-        ValidatorSet, WeightedTimestamp,
+        ShardAnchor, ShardId, Signer, StateRoot, TopologySchedule, TopologySnapshot, ValidatorId,
+        ValidatorInfo, ValidatorSet, WeightedTimestamp,
     };
 
     use super::ReshapeView;
+
+    /// A schedule headed by `snapshot`, cut into windows `epoch_duration_ms`
+    /// long.
+    fn windowed(snapshot: TopologySnapshot, epoch_duration_ms: u64) -> TopologySchedule {
+        TopologySchedule::new(
+            epoch_duration_ms,
+            Epoch::GENESIS,
+            std::sync::Arc::new(snapshot),
+        )
+    }
 
     /// A non-zero anchor — the projection only carries seeded boundaries.
     fn seeded_anchor() -> ShardAnchor {
@@ -273,25 +287,29 @@ mod tests {
     #[test]
     fn terminal_cut_resolves_the_scheduled_window_end() {
         let parent = ShardId::ROOT;
-        let unscheduled = snapshot_with_seeded(&[]);
-        assert_eq!(
-            ReshapeView::new(&unscheduled, 1_000).terminal_cut(parent),
-            None,
-        );
+        let unscheduled = windowed(snapshot_with_seeded(&[]), 1_000);
+        assert_eq!(ReshapeView::new(&unscheduled).terminal_cut(parent), None);
 
-        let scheduled = snapshot_with_seeded(&[])
-            .with_scheduled_terminals(BTreeMap::from([(parent, Epoch::new(6))]));
+        let terminals = BTreeMap::from([(parent, Epoch::new(6))]);
+        let scheduled = windowed(
+            snapshot_with_seeded(&[]).with_scheduled_terminals(terminals.clone()),
+            1_000,
+        );
         assert_eq!(
-            ReshapeView::new(&scheduled, 1_000).terminal_cut(parent),
+            ReshapeView::new(&scheduled).terminal_cut(parent),
             Some(WeightedTimestamp::from_millis(7_000)),
         );
         // A shard with no cut of its own is unaffected by another's.
         assert_eq!(
-            ReshapeView::new(&scheduled, 1_000).terminal_cut(ShardId::leaf(1, 0)),
+            ReshapeView::new(&scheduled).terminal_cut(ShardId::leaf(1, 0)),
             None,
         );
         // No epoch boundaries exist to cut on.
-        assert_eq!(ReshapeView::new(&scheduled, 0).terminal_cut(parent), None);
+        let unwindowed = windowed(
+            snapshot_with_seeded(&[]).with_scheduled_terminals(terminals),
+            0,
+        );
+        assert_eq!(ReshapeView::new(&unwindowed).terminal_cut(parent), None);
     }
 
     #[test]
@@ -299,11 +317,10 @@ mod tests {
         let parent = ShardId::ROOT;
         let (left, right) = parent.children();
 
-        assert!(!ReshapeView::new(&snapshot_with_seeded(&[]), 1_000).children_seeded(parent));
-        assert!(!ReshapeView::new(&snapshot_with_seeded(&[left]), 1_000).children_seeded(parent));
-        assert!(
-            ReshapeView::new(&snapshot_with_seeded(&[left, right]), 1_000).children_seeded(parent)
-        );
+        let seeded = |shards: &[ShardId]| windowed(snapshot_with_seeded(shards), 1_000);
+        assert!(!ReshapeView::new(&seeded(&[])).children_seeded(parent));
+        assert!(!ReshapeView::new(&seeded(&[left])).children_seeded(parent));
+        assert!(ReshapeView::new(&seeded(&[left, right])).children_seeded(parent));
     }
 
     #[test]
@@ -311,8 +328,9 @@ mod tests {
         let parent = ShardId::ROOT;
         // Seeded but no live committee — the parent's pre-merge terminal record,
         // not a reformed parent.
-        assert!(!ReshapeView::new(&snapshot_with_seeded(&[]), 1_000).merge_composed(parent));
-        assert!(!ReshapeView::new(&snapshot_with_seeded(&[parent]), 1_000).merge_composed(parent));
+        let seeded = |shards: &[ShardId]| windowed(snapshot_with_seeded(shards), 1_000);
+        assert!(!ReshapeView::new(&seeded(&[])).merge_composed(parent));
+        assert!(!ReshapeView::new(&seeded(&[parent])).merge_composed(parent));
         // Seeded with a live committee — the merge reformed it.
         let validator = ValidatorId::new(1);
         let validators = ValidatorSet::new(vec![ValidatorInfo {
@@ -331,6 +349,6 @@ mod tests {
             BTreeMap::new(),
             BTreeSet::new(),
         );
-        assert!(ReshapeView::new(&composed, 1_000).merge_composed(parent));
+        assert!(ReshapeView::new(&windowed(composed, 1_000)).merge_composed(parent));
     }
 }

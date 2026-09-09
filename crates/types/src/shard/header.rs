@@ -10,12 +10,12 @@ use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
 use thiserror::Error;
 
 use crate::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
-    ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot, MAX_PROVISION_TARGET_SHARDS,
-    PredecessorTerminal, ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate,
-    RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot,
-    SweepFrontier, TerminalRoots, TerminalVerdictRoot, TransactionRoot, ValidatorId, Verifiable,
-    Verified, Verify, WeightedTimestamp, WorkInFlight,
+    AbandonmentRoot, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
+    CertificateRoot, ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot,
+    MAX_PROVISION_TARGET_SHARDS, PredecessorTerminal, ProposerTimestamp, ProvisionTxRoot,
+    ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad,
+    SplitChildRoots, StateClaimsRoot, StateRoot, SweepFrontier, TerminalRoots, TransactionRoot,
+    ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, WorkInFlight,
 };
 
 /// The running values a block extending the committed tip is checked
@@ -79,11 +79,12 @@ pub struct BlockHeader {
     provision_root: ProvisionsRoot,
     #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
     provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
-    /// Commits the block's [`TerminalVerdict`](crate::TerminalVerdict)
+    /// Commits the block's [`AbandonmentRecord`](crate::AbandonmentRecord)
     /// records — what departed shards left unresolved of this chain's
     /// business, written down while the evidence for it could still be
     /// read.
-    terminal_verdict_root: TerminalVerdictRoot,
+    abandonment_root: AbandonmentRoot,
+    state_claims_root: StateClaimsRoot,
     work_in_flight: WorkInFlight,
     /// The highest tick whose determined half has settled at or below
     /// this block: the parent's, raised to the last determined half this
@@ -187,7 +188,8 @@ pub struct BlockHeaderParts {
     pub local_receipt_root: LocalReceiptRoot,
     pub provision_root: ProvisionsRoot,
     pub provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
-    pub terminal_verdict_root: TerminalVerdictRoot,
+    pub abandonment_root: AbandonmentRoot,
+    pub state_claims_root: StateClaimsRoot,
     pub work_in_flight: WorkInFlight,
     pub settled_tick_frontier: BlockHeight,
     pub sweep_frontier: SweepFrontier,
@@ -218,7 +220,8 @@ impl Default for BlockHeaderParts {
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
             provision_tx_roots: BTreeMap::new(),
-            terminal_verdict_root: TerminalVerdictRoot::ZERO,
+            abandonment_root: AbandonmentRoot::ZERO,
+            state_claims_root: StateClaimsRoot::ZERO,
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
             sweep_frontier: SweepFrontier::ZERO,
@@ -239,7 +242,7 @@ impl BlockHeader {
     /// # Panics
     ///
     /// Panics if `provision_tx_roots.len() > MAX_PROVISION_TARGET_SHARDS`.
-    #[allow(clippy::too_many_arguments)] // mirrors the 23 stored fields
+    #[allow(clippy::too_many_arguments)] // mirrors the stored fields one to one
     #[must_use]
     pub fn new(parts: BlockHeaderParts) -> Self {
         let BlockHeaderParts {
@@ -257,7 +260,8 @@ impl BlockHeader {
             local_receipt_root,
             provision_root,
             provision_tx_roots,
-            terminal_verdict_root,
+            abandonment_root,
+            state_claims_root,
             work_in_flight,
             settled_tick_frontier,
             sweep_frontier,
@@ -284,7 +288,8 @@ impl BlockHeader {
             local_receipt_root,
             provision_root,
             provision_tx_roots,
-            terminal_verdict_root,
+            abandonment_root,
+            state_claims_root,
             work_in_flight,
             settled_tick_frontier,
             sweep_frontier,
@@ -311,37 +316,43 @@ impl BlockHeader {
         state_root: StateRoot,
         origin: ChainOrigin,
     ) -> Self {
-        Self {
+        // Genesis QC carries no signature and is valid by definition;
+        // `Verified::<QuorumCertificate>::genesis` is the only path to a
+        // verified genesis value (the predicate's signer check would
+        // reject the zero-signers genesis bitfield).
+        Self::empty(
+            shard_id,
+            BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
+            proposer,
+            state_root,
+            origin,
+        )
+    }
+
+    /// A genesis header of any provenance: no content, every root at
+    /// zero, and the five terms that differ between one chain's birth
+    /// and another's.
+    ///
+    /// The empty half comes from [`BlockHeaderParts::default`], which is
+    /// the one place a header's zero is written down — so a root added to
+    /// the header is a field every genesis gets without a line here, and
+    /// three constructors cannot drift into three different empties.
+    fn empty(
+        shard_id: ShardId,
+        parent_block_hash: BlockHash,
+        proposer: ValidatorId,
+        state_root: StateRoot,
+        origin: ChainOrigin,
+    ) -> Self {
+        Self::new(BlockHeaderParts {
             shard_id,
             height: origin.genesis_height,
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
-            // Genesis QC carries no signature and is valid by definition;
-            // `Verified::<QuorumCertificate>::genesis` is the only path to a
-            // verified genesis value (the predicate's signer check would
-            // reject the zero-signers genesis bitfield).
+            parent_block_hash,
             parent_qc: Verified::<QuorumCertificate>::genesis(shard_id, origin).into(),
             proposer,
-            timestamp: ProposerTimestamp::ZERO,
-            round: Round::INITIAL,
-            is_fallback: false,
             state_root,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            provision_tx_roots: BTreeMap::new(),
-            terminal_verdict_root: TerminalVerdictRoot::ZERO,
-            work_in_flight: WorkInFlight::ZERO,
-            settled_tick_frontier: BlockHeight::GENESIS,
-            sweep_frontier: SweepFrontier::ZERO,
-            beacon_witness_root: BeaconWitnessRoot::ZERO,
-            beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
-            beacon_witness_base: BeaconWitnessLeafCount::ZERO,
-            reveal_chain: RevealChain::ZERO,
-            split_child_roots: None,
-            terminal_roots: None,
-            load: ShardLoad::ZERO,
-        }
+            ..BlockHeaderParts::default()
+        })
     }
 
     /// The deterministic genesis header of a split child adopting
@@ -369,33 +380,13 @@ impl BlockHeader {
             genesis_height: parent_terminal.height().next(),
             anchor_wt: parent_canonical_wt,
         };
-        Self {
-            shard_id: child,
-            height: origin.genesis_height,
-            parent_block_hash: parent_terminal.hash(),
-            parent_qc: Verified::<QuorumCertificate>::genesis(child, origin).into(),
-            proposer: parent_terminal.proposer(),
-            timestamp: ProposerTimestamp::ZERO,
-            round: Round::INITIAL,
-            is_fallback: false,
+        Self::empty(
+            child,
+            parent_terminal.hash(),
+            parent_terminal.proposer(),
             state_root,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            provision_tx_roots: BTreeMap::new(),
-            terminal_verdict_root: TerminalVerdictRoot::ZERO,
-            work_in_flight: WorkInFlight::ZERO,
-            settled_tick_frontier: BlockHeight::GENESIS,
-            sweep_frontier: SweepFrontier::ZERO,
-            beacon_witness_root: BeaconWitnessRoot::ZERO,
-            beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
-            beacon_witness_base: BeaconWitnessLeafCount::ZERO,
-            reveal_chain: RevealChain::ZERO,
-            split_child_roots: None,
-            terminal_roots: None,
-            load: ShardLoad::ZERO,
-        }
+            origin,
+        )
     }
 
     /// The deterministic genesis header of a merged parent adopting
@@ -437,33 +428,13 @@ impl BlockHeader {
             genesis_height,
             anchor_wt: cut_wt,
         };
-        Self {
-            shard_id: parent,
-            height: genesis_height,
+        Self::empty(
+            parent,
             parent_block_hash,
-            parent_qc: Verified::<QuorumCertificate>::genesis(parent, origin).into(),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::ZERO,
-            round: Round::INITIAL,
-            is_fallback: false,
+            ValidatorId::new(0),
             state_root,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            provision_tx_roots: BTreeMap::new(),
-            terminal_verdict_root: TerminalVerdictRoot::ZERO,
-            work_in_flight: WorkInFlight::ZERO,
-            settled_tick_frontier: BlockHeight::GENESIS,
-            sweep_frontier: SweepFrontier::ZERO,
-            beacon_witness_root: BeaconWitnessRoot::ZERO,
-            beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
-            beacon_witness_base: BeaconWitnessLeafCount::ZERO,
-            reveal_chain: RevealChain::ZERO,
-            split_child_roots: None,
-            terminal_roots: None,
-            load: ShardLoad::ZERO,
-        }
+            origin,
+        )
     }
 
     /// Shard group this block belongs to.
@@ -596,10 +567,18 @@ impl BlockHeader {
         &self.provision_tx_roots
     }
 
-    /// Commitment to the block's terminal-verdict records.
+    /// Commitment to the block's abandonment records.
     #[must_use]
-    pub const fn terminal_verdict_root(&self) -> TerminalVerdictRoot {
-        self.terminal_verdict_root
+    pub const fn abandonment_root(&self) -> AbandonmentRoot {
+        self.abandonment_root
+    }
+
+    /// Merkle root over the state claims the block carries — what its
+    /// proposer read of counterparts' cells, which every replica folds
+    /// at commit.
+    #[must_use]
+    pub const fn state_claims_root(&self) -> StateClaimsRoot {
+        self.state_claims_root
     }
 
     /// Approximate number of in-flight transactions on this shard at proposal time.
@@ -769,7 +748,8 @@ impl BlockHeader {
             local_receipt_root: self.local_receipt_root,
             provision_root: self.provision_root,
             provision_tx_roots: self.provision_tx_roots,
-            terminal_verdict_root: self.terminal_verdict_root,
+            abandonment_root: self.abandonment_root,
+            state_claims_root: self.state_claims_root,
             work_in_flight: self.work_in_flight,
             settled_tick_frontier: self.settled_tick_frontier,
             sweep_frontier: self.sweep_frontier,

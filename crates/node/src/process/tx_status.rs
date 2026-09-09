@@ -20,14 +20,15 @@ pub struct TxStatusCache {
     cache: QuickCache<TxHash, (TransactionStatus, ShardId)>,
 }
 
-/// Merge rank: statuses only advance `Pending → Committed → Completed`.
-/// Committed heights from different shards are incomparable, so equal
-/// ranks resolve by last write.
+/// Merge rank: statuses only advance `Pending → Committed →
+/// LegFinalized → Completed`. Committed heights from different shards
+/// are incomparable, so equal ranks resolve by last write.
 const fn rank(status: &TransactionStatus) -> u8 {
     match status {
         TransactionStatus::Pending => 0,
         TransactionStatus::Committed(_) => 1,
-        TransactionStatus::Completed(_) => 2,
+        TransactionStatus::LegFinalized => 2,
+        TransactionStatus::Completed(_) => 3,
     }
 }
 
@@ -139,6 +140,36 @@ mod tests {
             TransactionStatus::Completed(TransactionDecision::Accept)
         ));
         assert_eq!(shard, SHARD_A);
+    }
+
+    /// A leg finalizing ranks past its commit and short of the verdict:
+    /// the issuer's leg neither regresses a core's decision nor is
+    /// regressed by a lagging shard's commit.
+    #[test]
+    fn a_finalized_leg_sits_between_committed_and_completed() {
+        let cache = TxStatusCache::new();
+        let tx_hash = tx(&[4u8; 32]);
+
+        cache.record(tx_hash, TransactionStatus::LegFinalized, SHARD_A);
+        cache.record(
+            tx_hash,
+            TransactionStatus::Committed(BlockHeight::new(3)),
+            SHARD_B,
+        );
+        let (status, _) = cache.get(&tx_hash).unwrap();
+        assert_eq!(status, TransactionStatus::LegFinalized);
+
+        cache.record(
+            tx_hash,
+            TransactionStatus::Completed(TransactionDecision::Accept),
+            SHARD_B,
+        );
+        cache.record(tx_hash, TransactionStatus::LegFinalized, SHARD_A);
+        let (status, _) = cache.get(&tx_hash).unwrap();
+        assert_eq!(
+            status,
+            TransactionStatus::Completed(TransactionDecision::Accept)
+        );
     }
 
     #[test]

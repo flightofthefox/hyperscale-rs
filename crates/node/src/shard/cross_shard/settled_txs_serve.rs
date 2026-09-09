@@ -93,8 +93,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    use hyperscale_storage::ShardChainWriter;
-    use hyperscale_storage::test_helpers::make_test_certified;
+    use hyperscale_storage::test_helpers::{commit_settled_at, make_test_certified};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
@@ -188,12 +187,15 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(certs.to_vec()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let hash = block.hash();
-        storage.commit_block(
+        commit_settled_at(
+            storage,
             &make_test_certified(block),
+            &[],
             &[],
             &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
         );

@@ -6,12 +6,14 @@ use std::sync::Arc;
 use hyperscale_hbor::{from_slice, to_vec};
 use hyperscale_jmt::{Key as JmtKey, NibblePath};
 use hyperscale_types::{
-    Address, CollectionId, EntryKey, EntryLeaf, Movement, ProtocolHasher, SettledEntries,
-    SettledWrites, StateWrites, StoredReceipt, SubstateKey, entry_leaf_key,
+    Address, AddressClass, BlockHeight, CollectionId, Compose, EntryKey, EntryLeaf, LocalKey,
+    Movement, ProtocolHasher, SettledEntries, SettledWrites, StateWrites, StoredReceipt,
+    SubstateKey, entry_leaf_key,
 };
 use hyperscale_vm_kernel::Substates;
 
 use crate::shard::store::Anchored;
+use crate::shard::sweep::with_sweep;
 use crate::tree::JmtSnapshot;
 
 /// Extract and merge the writes from stored receipts, resolving what
@@ -41,18 +43,94 @@ use crate::tree::JmtSnapshot;
 /// caller that needs a *particular* height still checks `anchor()`,
 /// because a snapshot of the wrong block is as wrong as a live read and
 /// looks the same from here.
+///
+/// # Panics
+///
+/// If a certified debit runs past what its cell holds. The kernel judged
+/// every movement against committed balance less outstanding holds
+/// before recording it, so this is a receipt disagreeing with the state
+/// it lands on, and the chain halts on it rather than settle a balance
+/// nothing produced.
 #[must_use]
 pub fn merge_writes_from_receipts(
     receipts: &[StoredReceipt],
     prior: &dyn Anchored,
 ) -> SettledWrites {
+    settle_writes(&merge_receipts(receipts), prior)
+}
+
+/// Everything a prepared commit lands: the settling receipts resolved
+/// against the parent's baseline, plus the sweep's own creations and
+/// removals.
+///
+/// One resolution, feeding both the tree and the substate store — they
+/// commit the same values or they disagree about state. It happens once
+/// per block rather than per receipt because a receipt says what it
+/// moved, and two receipts moving one cell compose only once something
+/// has said what they moved from.
+///
+/// The one place either backend computes it, so a rule about how a
+/// block's writes settle cannot hold on one store and not the other.
+///
+/// # Panics
+///
+/// If `baseline` is not anchored at `parent_height`. The type says the
+/// baseline was fixed when it was made; which block it was fixed at is
+/// the caller's to have got right, and a movement resolved against any
+/// other is as wrong as one resolved live.
+#[must_use]
+pub fn settled_writes_at(
+    settling: &[StoredReceipt],
+    baseline: &dyn Anchored,
+    parent_height: BlockHeight,
+    creations: &[(SubstateKey, Vec<u8>)],
+    removals: &[SubstateKey],
+) -> SettledWrites {
+    assert_eq!(
+        baseline.anchor(),
+        parent_height,
+        "a movement's baseline is anchored at the wrong height",
+    );
+    with_sweep(
+        merge_writes_from_receipts(settling, baseline),
+        creations,
+        removals,
+    )
+}
+
+/// The receipts' writes folded in commit order, unresolved.
+///
+/// What a caller settling only part of them — a follower holding one
+/// prefix of the chain's tree — restricts before resolving, since a
+/// movement on a cell it does not hold reads an empty prior and is
+/// nobody's debit to judge.
+#[must_use]
+pub fn merge_receipts(receipts: &[StoredReceipt]) -> StateWrites {
     let mut merged = StateWrites::default();
     for receipt in receipts {
         if let Some(writes) = receipt.consensus.writes() {
             fold_state_writes(&mut merged, writes);
         }
     }
-    merged.resolve(&mut |key| prior.cell(key))
+    merged
+}
+
+/// Resolve `writes` against the state they settle into.
+///
+/// # Panics
+///
+/// If a certified debit runs past what its cell holds — see
+/// [`merge_writes_from_receipts`].
+#[must_use]
+pub fn settle_writes(writes: &StateWrites, prior: &dyn Anchored) -> SettledWrites {
+    writes
+        .resolve(&mut |key| prior.cell(key))
+        .unwrap_or_else(|over| {
+            panic!(
+                "BFT CRITICAL: a certified debit runs past what {:?} holds: held {}, debit {}",
+                over.key, over.held, over.debit
+            )
+        })
 }
 
 /// Fold `writes` onto `merged`, in that order.
@@ -75,7 +153,7 @@ pub fn fold_state_writes(merged: &mut StateWrites, writes: &StateWrites) {
         merged
             .movements
             .entry(*key)
-            .and_modify(|standing| *standing = compose_movements(*standing, *movement))
+            .and_modify(|standing| *standing = compose_movements(*key, *standing, *movement))
             .or_insert(*movement);
     }
     for (key, change) in &writes.entries {
@@ -101,23 +179,38 @@ pub fn fold_state_writes(merged: &mut StateWrites, writes: &StateWrites) {
 /// own posture: a net past `u128` is no difference of balances this
 /// chain held, and settlement saturates rather than raising an error no
 /// caller could act on.
-pub(crate) fn compose_movements(standing: Movement, next: Movement) -> Movement {
-    standing.then(next).unwrap_or_else(|| {
-        let (standing_gains, standing_net) = net(standing);
-        let (next_gains, next_net) = net(next);
-        let (gains, magnitude) = if standing_gains == next_gains {
-            (standing_gains, standing_net.saturating_add(next_net))
-        } else if standing_net >= next_net {
-            (standing_gains, standing_net - next_net)
-        } else {
-            (next_gains, next_net - standing_net)
-        };
-        Movement {
-            resource: standing.resource,
-            credit: if gains { magnitude } else { 0 },
-            debit: if gains { 0 } else { magnitude },
+///
+/// # Panics
+///
+/// If the two name different resources. One cell holds one resource,
+/// so a second denomination reaching it is a certified receipt
+/// disagreeing with the state it lands on — netting across the two
+/// would spend one resource out of the other's balance, and dropping
+/// either would settle a movement nobody recorded.
+pub(crate) fn compose_movements(key: SubstateKey, standing: Movement, next: Movement) -> Movement {
+    match standing.then(next) {
+        Ok(composed) => composed,
+        Err(Compose::Denomination) => panic!(
+            "BFT CRITICAL: movements of two resources on one cell {key:?}: {:?} then {:?}",
+            standing.resource, next.resource
+        ),
+        Err(Compose::Overflow) => {
+            let (standing_gains, standing_net) = net(standing);
+            let (next_gains, next_net) = net(next);
+            let (gains, magnitude) = if standing_gains == next_gains {
+                (standing_gains, standing_net.saturating_add(next_net))
+            } else if standing_net >= next_net {
+                (standing_gains, standing_net - next_net)
+            } else {
+                (next_gains, next_net - standing_net)
+            };
+            Movement {
+                resource: standing.resource,
+                credit: if gains { magnitude } else { 0 },
+                debit: if gains { 0 } else { magnitude },
+            }
         }
-    })
+    }
 }
 
 /// A movement as the direction and magnitude it nets to.
@@ -165,6 +258,39 @@ pub fn filter_writes_to_prefix(writes: &SettledWrites, prefix: &NibblePath) -> S
             .map(|(key, change)| (*key, change.clone()))
             .collect(),
     )
+}
+
+/// Restrict unresolved `writes` to the cells, movements and entries
+/// whose JMT leaves fall under `prefix`.
+///
+/// The rule [`filter_writes_to_prefix`] applies to settled writes, for a
+/// follower to apply before it resolves, so a movement on a cell outside
+/// its prefix is never judged against a prior it does not hold.
+#[must_use]
+pub fn filter_state_writes_to_prefix(writes: &StateWrites, prefix: &NibblePath) -> StateWrites {
+    let under = |key: &SubstateKey| key_under_prefix(&key.to_bytes(), prefix);
+    StateWrites {
+        cells: writes
+            .cells
+            .iter()
+            .filter(|(key, _)| under(key))
+            .map(|(key, change)| (*key, change.clone()))
+            .collect(),
+        movements: writes
+            .movements
+            .iter()
+            .filter(|(key, _)| under(key))
+            .map(|(key, movement)| (*key, *movement))
+            .collect(),
+        entries: writes
+            .entries
+            .iter()
+            .filter(|(key, _)| {
+                key_under_prefix(&entry_leaf_key(&ProtocolHasher, **key).to_bytes(), prefix)
+            })
+            .map(|(key, change)| (*key, change.clone()))
+            .collect(),
+    }
 }
 
 /// Decode a leaf back to the entry it commits, if it is one.
@@ -350,6 +476,26 @@ pub fn merge_entry_overlay(
     .unwrap_or_default()
 }
 
+/// The lowest leaf key under `prefix`: its bits, then zeros.
+///
+/// The keyspace is owner-major and an owner is wholly one prefix's, so a
+/// prefix names a contiguous run of keys and this is where it starts —
+/// the seek point a scan of one shard's slice begins at, with
+/// [`key_under_prefix`] ending it.
+#[must_use]
+pub fn prefix_low_key(prefix: &NibblePath) -> SubstateKey {
+    let mut body = [0u8; 31];
+    let bits = prefix.as_bytes();
+    let taken = bits.len().min(body.len());
+    body[..taken].copy_from_slice(&bits[..taken]);
+    SubstateKey {
+        // The lowest assigned class tag, so the key sorts at or below
+        // every address sharing these leading bits.
+        owner: Address::new(body, AddressClass::Principal),
+        local: LocalKey([0; 16]),
+    }
+}
+
 /// Whether `key`'s leading bits equal `prefix` — the subtree-membership
 /// test shard prefixes partition the keyspace by.
 #[must_use]
@@ -378,6 +524,23 @@ mod tests {
             },
             Some(vec![value]),
         )]))
+    }
+
+    fn key(local: u8) -> SubstateKey {
+        SubstateKey {
+            owner: test_prefix(1),
+            local: LocalKey([local; 16]),
+        }
+    }
+
+    /// Two movements naming different resources on one cell are a
+    /// receipt disagreeing with the state it lands on, and the merge
+    /// halts on them rather than net one resource out of the other.
+    #[test]
+    #[should_panic(expected = "BFT CRITICAL")]
+    fn movements_of_two_resources_on_one_cell_halt_the_merge() {
+        let (xrd, other) = (ResourceAddr::new([7; 31]), ResourceAddr::new([8; 31]));
+        let _ = compose_movements(key(1), Movement::debit(xrd, 1), Movement::debit(other, 1));
     }
 
     fn relative(owner: Address, value: u8) -> StateWrites {
@@ -423,17 +586,18 @@ mod tests {
             credit: 3,
             debit: 1,
         };
-        assert_eq!(compose_movements(small, small).credit, 6);
-        assert_eq!(compose_movements(small, small).debit, 2);
+        assert_eq!(compose_movements(key(1), small, small).credit, 6);
+        assert_eq!(compose_movements(key(1), small, small).debit, 2);
         // Past the width, the net survives: everything paid in came
         // back out but five, and the composed movement says exactly
         // that on the crediting side.
-        let folded = compose_movements(paid_in, cycled);
+        let folded = compose_movements(key(1), paid_in, cycled);
         assert_eq!((folded.credit, folded.debit), (5, 0));
         // The other way round nets to a debit.
-        let folded = compose_movements(cycled, paid_in);
+        let folded = compose_movements(key(1), cycled, paid_in);
         assert_eq!((folded.credit, folded.debit), (5, 0));
         let drained = compose_movements(
+            key(1),
             Movement {
                 resource,
                 credit: 0,
@@ -488,7 +652,7 @@ mod tests {
         assert_eq!(merged.entries[&key(9)], Some(vec![9]));
 
         // The prefix filter follows the collection owner's leaf prefix.
-        let settled = merged.resolve(&mut |_| None);
+        let settled = merged.resolve(&mut |_| None).expect("the debit fits");
         let mut left = NibblePath::empty();
         left.push_bits(0, 1);
         let mut right = NibblePath::empty();

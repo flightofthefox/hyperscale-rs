@@ -12,12 +12,12 @@
 //!   writes the executor already projected.
 
 use hyperscale_types::{
-    Address, BeaconWitnessEvent, ConsensusReceipt, Event, ExecutionMetadata, GlobalReceiptHash,
-    ShardId, ShardTrie, StateWrites, TxHash,
+    Address, BeaconWitnessEvent, ConsensusReceipt, EscrowedValue, Event, ExecutionMetadata,
+    GlobalReceiptHash, ShardId, ShardTrie, StateWrites, TxHash,
 };
 
 use crate::output::ExecutedTx;
-use crate::sharding::filter_writes_for_shard;
+use crate::sharding::{filter_writes_for_shard, owned_by};
 
 /// Cached projection of an execution receipt.
 ///
@@ -60,6 +60,8 @@ enum CachedOutputBody {
         /// consumed the same amount, and locality scoping shows up as a
         /// different batch rather than a different number.
         gas_consumed: u64,
+        /// What the execution escrowed out, per departing edge.
+        escrowed: Vec<EscrowedValue>,
     },
 }
 
@@ -76,6 +78,7 @@ impl CachedOutput {
         gas_consumed: u64,
         events: Vec<Event>,
         witnesses: Vec<(Address, BeaconWitnessEvent)>,
+        escrowed: Vec<EscrowedValue>,
     ) -> Self {
         Self {
             metadata,
@@ -85,6 +88,7 @@ impl CachedOutput {
                 receipt_hash,
                 witnesses,
                 gas_consumed,
+                escrowed,
             },
         }
     }
@@ -124,8 +128,10 @@ pub fn project_to_shard(
             receipt_hash,
             witnesses,
             gas_consumed,
+            escrowed,
         } => {
-            let writes = filter_writes_for_shard(raw_writes, local_shard, shard_trie);
+            let owned = owned_by(local_shard, shard_trie);
+            let writes = filter_writes_for_shard(raw_writes, owned);
             // A fact's emitter is a substate prefix, so the shard that
             // keeps the fact is the one that keeps the event it was read
             // from — the same rule applied a few lines below, and the
@@ -134,16 +140,16 @@ pub fn project_to_shard(
             // shard owns its emitter.
             let beacon_witness_events: Vec<BeaconWitnessEvent> = witnesses
                 .iter()
-                .filter(|(emitter, _)| shard_trie.shard_for_prefix(*emitter) == local_shard)
+                .filter(|(emitter, _)| owned(*emitter))
                 .map(|(_, event)| event.clone())
                 .collect();
             // An event is stored where its emitter lives, so each shard
             // keeps its own and the rest are another shard's to hold. The
-            // receipt hash covers the whole union, so dropping them here
-            // costs no agreement.
+            // receipt hash's event root covers exactly these, so what is
+            // stored is what was signed over.
             let events: Vec<Event> = events
                 .iter()
-                .filter(|event| shard_trie.shard_for_prefix(event.emitter) == local_shard)
+                .filter(|event| owned(event.emitter))
                 .cloned()
                 .collect();
             let consensus = ConsensusReceipt::Succeeded {
@@ -154,6 +160,7 @@ pub fn project_to_shard(
             };
             let mut executed = ExecutedTx::new(tx_hash, consensus, cached.metadata.clone());
             executed.attested_work = *gas_consumed;
+            executed.escrowed.clone_from(escrowed);
             executed
         }
     }

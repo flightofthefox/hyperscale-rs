@@ -1,58 +1,35 @@
 //! Receipt tree leaves and `global_receipt_root` computation/proof helpers.
 
+use hyperscale_hbor::to_vec as hbor_to_vec;
+
 use crate::{
-    ExecutionOutcome, GlobalReceiptRoot, Hash, TxOutcome, compute_merkle_root,
-    compute_merkle_root_with_proof,
+    GlobalReceiptRoot, Hash, TxOutcome, compute_merkle_root, compute_merkle_root_with_proof,
 };
 
-/// Compute the leaf hash for a transaction outcome in the receipt tree.
+/// Domain tag separating a transaction outcome's receipt-tree leaf from
+/// every other leaf preimage the codebase hashes.
+const TX_OUTCOME_LEAF_TAG: &[u8] = b"hyperscale.tx_outcome_leaf.v1";
+
+/// The leaf hash of a transaction outcome in the receipt tree: the tag
+/// and the outcome's canonical encoding.
 ///
-/// - `Succeeded`: `H(tx_hash || receipt_hash)`
-/// - `Failed`:    `H(tx_hash || b"FAILED:")` (domain-tagged; canonical hash is implicit)
-/// - `Aborted`:   `H(tx_hash || b"ABORTED:")`
+/// The vote signature covers only the receipt root, and decoding
+/// recomputes that root from the outcomes, so every field of the
+/// outcome has to sit under the leaf or it is an aggregator's to forge:
+/// the verdict, the attested and reserved work, any settled fee receipt,
+/// the shards the settlement waits on, what the execution escrowed and
+/// where those crossings land, and what the outcome says of its own
+/// role. The encoding admits one reading of all of them, so nothing is
+/// packed by hand.
 ///
-/// The domain tags ensure the three variants can never collide.
+/// # Panics
 ///
-/// The attested `work` scalar, any settled fee receipt, and the shards
-/// the transaction's settlement waits on extend the leaf under their own
-/// domain tags. The vote signature covers only the receipt root, and
-/// decoding recomputes that root from the outcomes — so a field outside
-/// the leaf would be an aggregator's to forge. Work in particular feeds
-/// emission weighting and the reshape load predicate, and the awaited
-/// shards decide how many certificates it takes to settle the
-/// transaction at all, so both must sit under the signed root.
+/// If the outcome does not encode, which one built under its caps
+/// always does.
 #[must_use]
 pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
-    let base = match outcome.outcome() {
-        ExecutionOutcome::Succeeded { receipt_hash } => {
-            Hash::from_parts(&[outcome.tx_hash().as_bytes(), receipt_hash.as_bytes()])
-        }
-        ExecutionOutcome::Failed => Hash::from_parts(&[outcome.tx_hash().as_bytes(), b"FAILED:"]),
-        ExecutionOutcome::Aborted => Hash::from_parts(&[outcome.tx_hash().as_bytes(), b"ABORTED:"]),
-    };
-    let with_work = Hash::from_parts(&[
-        base.as_bytes(),
-        b"WORK:",
-        &outcome.attested_work().to_le_bytes(),
-        b"RESERVED:",
-        &outcome.declared_work().to_le_bytes(),
-    ]);
-    let with_fee = outcome.fee_receipt().map_or(with_work, |fee_receipt| {
-        Hash::from_parts(&[with_work.as_bytes(), b"FEE:", fee_receipt.as_bytes()])
-    });
-    // Fixed-width per shard, so the concatenation admits one reading — a
-    // variable encoding would let two different sets agree on their bytes.
-    let awaited: Vec<u8> = outcome
-        .counterparts()
-        .iter()
-        .flat_map(|shard| {
-            let mut bytes = [0u8; 12];
-            bytes[..4].copy_from_slice(&shard.depth().to_le_bytes());
-            bytes[4..].copy_from_slice(&shard.path().to_le_bytes());
-            bytes
-        })
-        .collect();
-    Hash::from_parts(&[with_fee.as_bytes(), b"AWAITS:", &awaited])
+    let bytes = hbor_to_vec(outcome).expect("a transaction outcome encodes");
+    Hash::from_parts(&[TX_OUTCOME_LEAF_TAG, &bytes])
 }
 
 /// Compute the receipt root from a list of transaction outcomes.
@@ -136,11 +113,109 @@ mod reservation_tests {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_vm_types::{Address, AddressClass, LocalKey, SubstateKey};
+
     use super::*;
-    use crate::{GlobalReceiptHash, TxHash};
+    use crate::{ExecutionOutcome, GlobalReceiptHash, Role, ShardId, TxHash};
+
+    /// Whether an outcome decides its transaction is under the signed
+    /// leaf: a leg's success and a core's are otherwise identical bytes.
+    #[test]
+    fn a_leg_that_decides_nothing_leafs_differently() {
+        let outcome = TxOutcome::new(
+            TxHash::from(Hash::from_bytes(b"leg")),
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        );
+        assert!(
+            outcome.decides(),
+            "an outcome decides unless told otherwise"
+        );
+        assert_ne!(
+            tx_outcome_leaf(&outcome),
+            tx_outcome_leaf(&outcome.clone().as_role(Role::Leg)),
+        );
+    }
+
+    /// Whether an outcome is the transaction's own execution is under
+    /// the signed leaf: a reclaim's success and a single-shard core's
+    /// are otherwise identical bytes.
+    #[test]
+    fn a_member_that_settles_leafs_differently() {
+        let outcome = TxOutcome::new(
+            TxHash::from(Hash::from_bytes(b"reclaim")),
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        );
+        assert!(
+            outcome.executes(),
+            "an outcome executes unless told otherwise"
+        );
+        assert_ne!(
+            tx_outcome_leaf(&outcome),
+            tx_outcome_leaf(&outcome.clone().as_role(Role::Settling)),
+        );
+    }
 
     fn tx_hash() -> TxHash {
         TxHash::from(Hash::from_bytes(b"leaf-tx"))
+    }
+
+    fn escrowed(node: u32) -> SubstateKey {
+        SubstateKey {
+            owner: Address::new([0xC1; 31], AddressClass::Component),
+            local: LocalKey([u8::try_from(node).expect("a test node fits a byte"); 16]),
+        }
+    }
+
+    fn base() -> TxOutcome {
+        TxOutcome::attesting(tx_hash(), ExecutionOutcome::Aborted, 7)
+    }
+
+    /// The list region is one byte string whatever the split between
+    /// its three lists, so the counts have to be what fixes the reading:
+    /// three escrowed entries and twenty-six shards are the same 312
+    /// bytes of region, and the leaves differ.
+    #[test]
+    fn two_list_splits_of_equal_length_give_different_leaves() {
+        let escrowing = base().escrowing((0..3).map(escrowed));
+        let crossing = base().crossing_to((0..12).map(|path| ShardId::leaf(4, path)));
+        assert_eq!(
+            escrowing.escrowed().len() * 48,
+            crossing.crossing_targets().len() * 12,
+            "the two regions have to be the same length, or this proves nothing"
+        );
+        assert_ne!(tx_outcome_leaf(&escrowing), tx_outcome_leaf(&crossing));
+
+        // And the same shards awaited rather than crossed to is a third
+        // reading of the same bytes.
+        let awaiting = base().awaiting((0..12).map(|path| ShardId::leaf(4, path)));
+        assert_ne!(tx_outcome_leaf(&awaiting), tx_outcome_leaf(&crossing));
+    }
+
+    /// The cells an execution escrowed are under the leaf: an aggregator
+    /// restating which of them left fails the root recompute.
+    #[test]
+    fn leaf_covers_which_cells_were_escrowed() {
+        let one = base().escrowing([escrowed(1)]);
+        let moved = base().escrowing([escrowed(2)]);
+        let both = base().escrowing([escrowed(1), escrowed(2)]);
+        assert_ne!(tx_outcome_leaf(&one), tx_outcome_leaf(&moved));
+        assert_ne!(tx_outcome_leaf(&one), tx_outcome_leaf(&both));
+        assert_ne!(tx_outcome_leaf(&one), tx_outcome_leaf(&base()));
+    }
+
+    /// One form: the builder sorts on the whole entry and keeps one per
+    /// edge, so two callers offering the same set in different orders
+    /// build the same outcome.
+    #[test]
+    fn escrowed_entries_take_one_form() {
+        let forward = base().escrowing([escrowed(1), escrowed(2)]);
+        let backward = base().escrowing([escrowed(2), escrowed(1), escrowed(2)]);
+        assert_eq!(forward, backward);
+        assert_eq!(forward.escrowed().len(), 2);
     }
 
     /// `work` is folded into the leaf: outcomes identical but for their

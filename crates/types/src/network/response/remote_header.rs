@@ -2,7 +2,19 @@
 
 use hyperscale_hbor::Hbor;
 
+use crate::network::request::MAX_REMOTE_HEADERS_PER_REQUEST;
 use crate::{CertifiedBlockHeader, MessageClass, NetworkMessage};
+
+/// [`MAX_REMOTE_HEADERS_PER_REQUEST`] as a length, for the decode cap.
+///
+/// The count is a `u64` on the wire and a length here; the assert is
+/// what keeps the two spellings from drifting.
+const MAX_REMOTE_HEADERS_PER_REQUEST_LEN: usize = 64;
+
+const _: () = assert!(
+    MAX_REMOTE_HEADERS_PER_REQUEST_LEN as u64 == MAX_REMOTE_HEADERS_PER_REQUEST.inner(),
+    "the decode cap is the request's own ceiling",
+);
 
 /// Response to a [`crate::network::request::GetRemoteHeadersRequest`].
 ///
@@ -15,6 +27,10 @@ use crate::{CertifiedBlockHeader, MessageClass, NetworkMessage};
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetRemoteHeadersResponse {
     /// Consecutive certified headers in ascending height order.
+    ///
+    /// Capped at what one request may ask for, which is the most a
+    /// responder can honestly have been asked to serve.
+    #[hbor(max = MAX_REMOTE_HEADERS_PER_REQUEST_LEN)]
     pub headers: Vec<CertifiedBlockHeader>,
 }
 

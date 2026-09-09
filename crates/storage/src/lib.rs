@@ -40,20 +40,25 @@ use hyperscale_jmt::TreeReader;
 /// kernel's, so the executor and the chain read one vocabulary.
 pub use hyperscale_vm_kernel::Substates;
 pub use shard::boundary::{
-    AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, WitnessSeed,
+    AdoptSource, Adoption, BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, Subtree,
+    Vintage, WitnessSeed, adopt_plan, holds_state,
 };
-pub use shard::chain_reader::{BlockForSync, ShardChainReader};
+pub use shard::chain_reader::{BlockForSync, ShardChainReader, holds_this_block_at};
 pub use shard::chain_writer::{ParentAnchor, ShardChainWriter};
 pub use shard::dedup_window::DedupWindow;
+pub use shard::derived::{LeafRows, index_leaf};
 pub use shard::genesis::GenesisCommit;
 pub use shard::packages::{PackageArtifactStore, package_of_cell};
 pub use shard::pending_chain::{
     BaseReadCache, ChainEntry, PendingChain, SubstateView, TerminalWindow,
 };
 pub use shard::recovered_state::RecoveredState;
+pub use shard::retention::{Retired, retire_dated};
 pub use shard::store::{Anchored, SubstateStore, VersionedStore};
 pub use shard::sweep::{
-    SweepIndex, merge_sweep_overlay, sweep_for_block, sweepable_expiry, with_removals,
+    SweepIndex, SweepRow, SweepRows, committed_tx_cell_key, committed_tx_cells,
+    followed_block_writes, is_record_cell, merge_sweep_overlay, sweep_for_block, sweep_through,
+    sweepable_expiry, with_sweep,
 };
 pub use shard::tick_certs::{covers_strictly_more, widest_tick_copies};
 pub use shard::tick_chain::{
@@ -63,8 +68,9 @@ pub use shard::unresolved::{ReplayWindow, replay_window, unresolved_replay_floor
 pub use shard::vote_registers::SafeVoteRegisterStore;
 pub use shard::writes::{
     entry_from_leaf, entry_leaf_rows, entry_leaf_value, entry_overlay_range,
-    filter_writes_to_prefix, fold_state_writes, key_under_prefix, merge_entry_overlay,
-    merge_entry_overlay_with, merge_state_writes, merge_writes_from_receipts, pending_write,
+    filter_state_writes_to_prefix, filter_writes_to_prefix, fold_state_writes, key_under_prefix,
+    merge_entry_overlay, merge_entry_overlay_with, merge_receipts, merge_state_writes,
+    merge_writes_from_receipts, pending_write, prefix_low_key, settle_writes, settled_writes_at,
 };
 pub use tree::{CollectedWrites, JmtSnapshot};
 

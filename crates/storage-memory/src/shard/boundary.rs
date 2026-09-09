@@ -12,14 +12,15 @@ use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
-    AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, SubstateStore, Substates,
-    WitnessSeed, entry_from_leaf, filter_writes_to_prefix, merge_writes_from_receipts,
-    package_of_cell, sweepable_expiry,
+    AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, LeafRows, SubstateStore,
+    Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state, is_record_cell,
+    key_under_prefix, prefix_low_key,
 };
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, EntryKey, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf,
+    Block, BlockHeight, ChainOrigin, EntryKey, ShardId, StateRoot, SubstateKey, SubstateLeaf,
+    shard_prefix_path,
 };
-use hyperscale_vm_types::{Address, CollectionId, SweepBucket};
+use hyperscale_vm_types::{Address, CollectionId};
 
 use super::core::SimShardStorage;
 use super::snapshot::{entries_in_range_at, value_at_version};
@@ -95,6 +96,17 @@ impl Substates for SimBoundary {
 impl BoundaryStore for SimShardStorage {
     type Boundary = SimBoundary;
 
+    fn escrow_records(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)> {
+        let prefix = shard_prefix_path(shard);
+        read_or_recover(&self.state)
+            .current_state
+            .range(prefix_low_key(&prefix)..)
+            .take_while(|(key, _)| key_under_prefix(&key.to_bytes(), &prefix))
+            .filter(|(key, value)| is_record_cell(**key, value))
+            .map(|(key, value)| (*key, value.clone()))
+            .collect()
+    }
+
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
         let mut pins = write_or_recover(&self.boundary_pins);
         pins.insert(height);
@@ -120,9 +132,7 @@ impl BoundaryStore for SimShardStorage {
         leaves: &[SubstateLeaf],
     ) -> Result<(), String> {
         let state = read_or_recover(&self.state);
-        if state.current_block_height != BlockHeight::GENESIS
-            || state.current_root_hash != StateRoot::ZERO
-        {
+        if holds_state(state.current_block_height, state.current_root_hash) {
             return Err("snap-sync staging requires an empty store".to_string());
         }
         drop(state);
@@ -154,9 +164,7 @@ impl BoundaryStore for SimShardStorage {
         witnesses: WitnessSeed,
     ) -> Result<StateRoot, String> {
         let mut state = write_or_recover(&self.state);
-        if state.current_block_height != BlockHeight::GENESIS
-            || state.current_root_hash != StateRoot::ZERO
-        {
+        if holds_state(state.current_block_height, state.current_root_hash) {
             return Err("snap-sync import requires an empty store".to_string());
         }
 
@@ -188,30 +196,30 @@ impl BoundaryStore for SimShardStorage {
         for (key, node) in result.batch.new_nodes {
             state.tree_store.insert(key, Arc::new(node));
         }
+        let mut sweep_rows = SweepRows::default();
         for leaf in leaves {
-            // The ordered entry index is derived state: rebuild it from
-            // the leaves themselves — the row exists exactly where the
-            // leaf re-derives.
-            if let Some((entry_key, value)) = entry_from_leaf(leaf.key, &leaf.value) {
+            // Every index is derived state, rebuilt from the leaves
+            // themselves: a row exists exactly where a leaf re-derives
+            // it. A successor holds the prefix and no history, so the
+            // leaves it just imported are the only honest source for
+            // what it owes a sweep, and for the artifacts a foreign
+            // shard can still fetch from it once its committee turns
+            // over.
+            let LeafRows {
+                entry,
+                package,
+                sweep,
+            } = LeafRows::of(leaf.key, &leaf.value);
+            if let Some((entry_key, value)) = entry {
                 state.current_entries.insert(entry_key, value);
             }
-            // So is the package index, and for a sharper reason: an
-            // imported store whose committee turns over is the only place
-            // a foreign shard can still fetch this artifact from.
-            if let Some(package) = package_of_cell(leaf.key, &leaf.value) {
+            if let Some(package) = package {
                 state.package_artifacts.insert(package, leaf.value.clone());
             }
-            // And so is the sweep index. A successor holds the prefix
-            // and no history, so the leaves it just imported are the
-            // only honest source for what it owes a sweep.
-            if let Some(expiry) = sweepable_expiry(leaf.key, &leaf.value) {
-                *state
-                    .sweep_index
-                    .entry((SweepBucket::of(expiry), leaf.key.owner))
-                    .or_default() += 1;
-            }
+            sweep_rows.delta(leaf.key.owner, None, sweep);
             state.current_state.insert(leaf.key, leaf.value);
         }
+        state.sweep_index.fold(&sweep_rows);
 
         // Seed the substate byte total: a fresh-tree import's byte delta IS
         // the imported leaves' value bytes.
@@ -238,15 +246,17 @@ impl BoundaryStore for SimShardStorage {
 
     fn follow_block_writes(
         &self,
-        height: BlockHeight,
-        receipts: &[StoredReceipt],
+        block: &Block,
+        creations: &[(SubstateKey, Vec<u8>)],
     ) -> Result<StateRoot, String> {
+        let height = block.height();
+        let prefix = read_or_recover(&self.state).tree_store.root_path();
         // Anchored at this store's own tip, which the check above holds
         // only to being behind the followed block rather than one short
         // of it. A follow that skips a height resolves its movements
         // against a baseline missing what the gap left, and fails against
         // the child roots rather than committing quietly.
-        let merged = merge_writes_from_receipts(receipts, &self.snapshot());
+        let filtered = followed_block_writes(self, &self.snapshot(), block, creations, &prefix);
         let mut state = write_or_recover(&self.state);
         if height <= state.current_block_height {
             return Err(format!(
@@ -254,7 +264,6 @@ impl BoundaryStore for SimShardStorage {
                 state.current_block_height,
             ));
         }
-        let filtered = filter_writes_to_prefix(&merged, &state.tree_store.root_path());
         if filtered.is_empty() {
             return Ok(state.current_root_hash);
         }
@@ -280,24 +289,26 @@ impl BoundaryStore for SimShardStorage {
 #[cfg(test)]
 mod tests {
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
-    use hyperscale_storage::SubstateStore;
     use hyperscale_storage::test_helpers::{
-        make_settled_writes, make_state_writes, test_boundary_import_roundtrip,
-        test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
+        block_settling, commit_one, commit_writes, make_settled_writes, make_state_writes,
+        test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
+        test_boundary_unpinned_height_not_served, test_escrow_records_are_read_off_the_state,
+        test_import_gate_reads_the_trie,
     };
-    use hyperscale_types::test_utils::test_key;
+    use hyperscale_storage::{SubstateStore, Substates, committed_tx_cell_key, committed_tx_cells};
+    use hyperscale_types::test_utils::{
+        install_stub_protocol_statics, stub_sweepable_cell, test_key, test_transaction,
+    };
     use hyperscale_types::{
-        ConsensusReceipt, GlobalReceiptHash, Hash, SettledWrites, ShardId, SplitChildRoots,
-        SubstateKey, TxHash, shard_prefix_path,
+        AddressClass, Block, BlockHeader, BlockHeaderParts, BlockHeight, ConsensusReceipt,
+        GlobalReceiptHash, Hash, SettledWrites, ShardId, SplitChildRoots, StateWrites,
+        StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, Transaction, TxHash, Verifiable,
+        WitnessSources, shard_prefix_path,
     };
 
     use super::*;
 
     type Jmt = Tree<Blake3Hasher, 1>;
-
-    fn commit_one(storage: &SimShardStorage, seed: u8) {
-        storage.commit_shared(&make_settled_writes(seed, seed, vec![seed, seed, seed]));
-    }
 
     #[test]
     fn finalize_refuses_an_incomplete_assembly_bound_to_the_height() {
@@ -355,12 +366,12 @@ mod tests {
     fn boundary_leaf_reads_resolve_at_pinned_version() {
         let storage = SimShardStorage::default();
         let old = make_settled_writes(7, 7, vec![1]);
-        storage.commit_shared(&old);
+        commit_writes(&storage, &old);
         storage.pin_boundary(BlockHeight::new(1)).unwrap();
 
         // Overwrite the same substate at height 2.
         let new = make_settled_writes(7, 7, vec![2]);
-        storage.commit_shared(&new);
+        commit_writes(&storage, &new);
 
         let boundary = storage.open_boundary(BlockHeight::new(1)).expect("pinned");
         let root_key = boundary.get_root_key(1).expect("pinned root resolves");
@@ -382,13 +393,13 @@ mod tests {
     #[test]
     fn retention_evicts_oldest_pin() {
         let storage = SimShardStorage::default();
-        test_boundary_retention_evicts_oldest(&storage, |seed| commit_one(&storage, seed));
+        test_boundary_retention_evicts_oldest(&storage);
     }
 
     #[test]
     fn unpinned_height_is_not_served() {
         let storage = SimShardStorage::default();
-        test_boundary_unpinned_height_not_served(&storage, |seed| commit_one(&storage, seed));
+        test_boundary_unpinned_height_not_served(&storage);
     }
 
     /// Full serve → import round trip: leaves enumerated and resolved
@@ -398,7 +409,20 @@ mod tests {
     fn imported_boundary_state_reproduces_the_root() {
         let storage = SimShardStorage::default();
         let fresh = SimShardStorage::default();
-        test_boundary_import_roundtrip(&storage, &fresh, |writes| storage.commit_shared(writes));
+        test_boundary_import_roundtrip(&storage, &fresh);
+    }
+
+    /// A store answers for the escrow records its state holds, which is
+    /// what a merge successor's adoption reads its obligations off.
+    #[test]
+    fn escrow_records_are_read_off_the_state() {
+        let storage = SimShardStorage::default();
+        test_escrow_records_are_read_off_the_state(&storage);
+    }
+
+    #[test]
+    fn the_import_gate_reads_the_trie_not_the_chain() {
+        test_import_gate_reads_the_trie(&SimShardStorage::default(), &SimShardStorage::default());
     }
 
     /// One write under the owner prefix `[seed; 16]` wrapped as a synced
@@ -449,14 +473,15 @@ mod tests {
         let mut counts = [0u64, 0];
         for (height, seed) in straddling_seeds() {
             let (writes, receipt) = follow_receipt(seed);
-            parent.commit_shared(&writes);
+            commit_writes(&parent, &writes);
             let height = BlockHeight::new(height);
             let receipts = [receipt];
 
             let left_before = left_store.state_root();
             let right_before = right_store.state_root();
-            let left_after = left_store.follow_block_writes(height, &receipts).unwrap();
-            let right_after = right_store.follow_block_writes(height, &receipts).unwrap();
+            let block = block_settling(height, receipts.to_vec());
+            let left_after = left_store.follow_block_writes(&block, &[]).unwrap();
+            let right_after = right_store.follow_block_writes(&block, &[]).unwrap();
 
             // Exactly the routed side's root moves; the other side's
             // follow is a no-op.
@@ -497,20 +522,133 @@ mod tests {
         }
     }
 
+    /// A live block at `height` whose header names `frontier` as its
+    /// sweep, carrying `txs` and one tick settling `receipts`.
+    fn followed_block(
+        height: u64,
+        frontier: SweepFrontier,
+        txs: Vec<Transaction>,
+        receipts: Vec<StoredReceipt>,
+    ) -> Block {
+        let Block::Live { certificates, .. } = block_settling(BlockHeight::new(height), receipts)
+        else {
+            unreachable!("the fixture builds a live block");
+        };
+        Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(height),
+                sweep_frontier: frontier,
+                ..Default::default()
+            }),
+            transactions: Arc::new(
+                txs.into_iter()
+                    .map(|tx| Arc::new(Verifiable::from(tx)))
+                    .collect(),
+            ),
+            certificates,
+            provisions: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        }
+    }
+
+    /// A followed block is applied as the chain applied it, not as its
+    /// receipts alone say: the committed cell of a transaction it carries
+    /// lands on the child whose half holds it, and nowhere else.
+    #[test]
+    fn a_followed_block_writes_its_committed_cells_on_their_half() {
+        let (left, right) = ShardId::ROOT.children();
+        let left_store = SimShardStorage::new(shard_prefix_path(left));
+        let right_store = SimShardStorage::new(shard_prefix_path(right));
+
+        let tx = test_transaction(1);
+        let cell = committed_tx_cell_key(
+            ShardId::ROOT,
+            tx.hash(),
+            tx.validity_range().end_timestamp_exclusive,
+        );
+        let (routed, other) = if cell.to_bytes()[0] >> 7 == 0 {
+            (&left_store, &right_store)
+        } else {
+            (&right_store, &left_store)
+        };
+        let creations = committed_tx_cells(ShardId::ROOT, std::iter::once(&tx));
+        let carrying = followed_block(1, SweepFrontier::ZERO, vec![tx], Vec::new());
+        let other_before = other.state_root();
+        routed.follow_block_writes(&carrying, &creations).unwrap();
+        other.follow_block_writes(&carrying, &creations).unwrap();
+        assert!(
+            routed.cell(cell).is_some(),
+            "the committed cell lands on its half"
+        );
+        assert_eq!(
+            other.state_root(),
+            other_before,
+            "the other half is untouched"
+        );
+    }
+
+    /// A followed block sweeps what its header names: a frontier past an
+    /// expired cell's bucket retires it, one short of it leaves it.
+    #[test]
+    fn a_followed_block_applies_the_sweep_its_header_names() {
+        install_stub_protocol_statics();
+        let (left, _) = ShardId::ROOT.children();
+        let store = SimShardStorage::new(shard_prefix_path(left));
+
+        let (local, value) = stub_sweepable_cell(5_000, 0x11);
+        let sweepable = SubstateKey {
+            owner: Address::new([0x01; 31], AddressClass::Component),
+            local,
+        };
+        let mut writes = StateWrites::default();
+        writes.cells.insert(sweepable, Some(value));
+        let receipt = StoredReceipt::synced(
+            TxHash::from(Hash::from_bytes(b"sweepable")),
+            Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                writes,
+                beacon_witness_events: Vec::new(),
+                events: Vec::new(),
+            }),
+        );
+        store
+            .follow_block_writes(
+                &followed_block(1, SweepFrontier::ZERO, Vec::new(), vec![receipt]),
+                &[],
+            )
+            .unwrap();
+        assert!(store.cell(sweepable).is_some());
+
+        let bucket = SweepFrontier::of_leaf(sweepable).bucket();
+        let short = SweepFrontier::start_of(bucket);
+        store
+            .follow_block_writes(&followed_block(2, short, Vec::new(), Vec::new()), &[])
+            .unwrap();
+        assert!(
+            store.cell(sweepable).is_some(),
+            "a frontier short of the cell leaves it"
+        );
+
+        let past = SweepFrontier::start_of(SweepBucket(bucket.0 + 1));
+        store
+            .follow_block_writes(&followed_block(3, past, Vec::new(), Vec::new()), &[])
+            .unwrap();
+        assert!(
+            store.cell(sweepable).is_none(),
+            "the sweep the header names retires it"
+        );
+    }
+
     /// A follow must advance the store's version; replaying a height the
     /// store already applied is rejected.
     #[test]
     fn follow_rejects_a_non_advancing_height() {
         let store = SimShardStorage::new(shard_prefix_path(child_of(1)));
         let (_, receipt) = follow_receipt(1);
-        let receipts = [receipt];
-        store
-            .follow_block_writes(BlockHeight::new(5), &receipts)
-            .unwrap();
-        assert!(
-            store
-                .follow_block_writes(BlockHeight::new(5), &receipts)
-                .is_err(),
-        );
+        let block = block_settling(BlockHeight::new(5), vec![receipt]);
+        store.follow_block_writes(&block, &[]).unwrap();
+        assert!(store.follow_block_writes(&block, &[]).is_err());
     }
 }

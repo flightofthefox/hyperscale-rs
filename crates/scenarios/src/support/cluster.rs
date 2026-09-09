@@ -11,6 +11,7 @@ use hyperscale_types::{
 };
 
 use super::Budget;
+use super::query::RanAs;
 
 /// A running cluster of assembled nodes, observed and driven by a scenario.
 ///
@@ -147,6 +148,17 @@ pub trait Cluster {
 
     /// The status of `tx`, if any hosted mempool or execution still tracks it.
     fn tx_status(&self, tx: TxHash) -> Option<TransactionStatus>;
+
+    /// What `shard`'s own certificates said it ran of `tx`, in commit
+    /// order — the memberships it froze, not what the end state implies.
+    ///
+    /// An observation seam, like [`Self::chain_origin_anchor`]: a whole
+    /// shape replicated on every participant and a shape divided into a
+    /// core and its legs settle to the same balances, and a scenario
+    /// asserting the divided path has to read which one ran. A shard
+    /// that ran a member and later composed a reclaim for the same
+    /// transaction reports both.
+    fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs>;
 
     /// Where `tx` landed on `shard`: the height it committed at (if any), and
     /// the height plus decision of its execution outcome (if any).

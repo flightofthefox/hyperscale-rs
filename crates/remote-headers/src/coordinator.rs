@@ -17,13 +17,15 @@ use std::time::Duration;
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::network::request::MAX_REMOTE_HEADERS_PER_REQUEST;
 use hyperscale_types::{
-    AwaitingTopologyBuffer, BlockHash, BlockHeader, BlockHeight, CertifiedBlock,
-    CertifiedBlockHeader, CertifiedHeaderVerifyError, CommitProof, CompletedRecovery,
-    ConsensusPublicKey, Epoch, ForkFence, HeaderFetchCount, REMOTE_HEADER_RETENTION,
-    RETENTION_HORIZON, ScheduleLookup, ShardForkProof, ShardId, TopologySchedule, TopologySnapshot,
-    ValidatorId, Verified, WeightedTimestamp, WorkInFlight,
+    BlockHash, BlockHeader, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
+    CertifiedHeaderVerifyError, CommitProof, CompletedRecovery, ConsensusPublicKey, Epoch,
+    ForkFence, HeaderFetchCount, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, ScheduleLookup,
+    ShardForkProof, ShardId, TopologySchedule, TopologySnapshot, ValidatorId, Verified,
+    WeightedTimestamp, WorkInFlight,
 };
 use tracing::{debug, info, trace, warn};
+
+use crate::awaiting::AwaitingTopologyBuffer;
 
 /// How long to wait before raising the per-shard sync target for a remote
 /// shard. Measured against the shard consensus-authenticated `weighted_timestamp_ms`

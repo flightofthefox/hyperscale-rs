@@ -8,11 +8,50 @@
 
 use std::collections::BTreeSet;
 
+use hyperscale_hbor::Hbor;
+use hyperscale_vm_types::AddressClass;
+
 use crate::{Address, ShardId};
+
+/// The leading bits of an owner prefix: everything placement reads of it.
+///
+/// A shard's path is a bit prefix of its members' keys, so routing a key
+/// consults only its first eight bytes and never the rest. Naming that
+/// much on its own keeps a routing fact from being written down as a
+/// whole address, which costs four times the bytes and invites a reader
+/// to think the remainder means something.
+///
+/// Ordered, so a set of routes sorts as the addresses they came from do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
+#[hbor(transparent)]
+pub struct RoutePrefix(u64);
+
+impl RoutePrefix {
+    /// The route `prefix` takes.
+    #[must_use]
+    pub const fn of(prefix: Address) -> Self {
+        let b = prefix.to_bytes();
+        Self(u64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    /// The bits themselves, most significant first.
+    #[must_use]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<Address> for RoutePrefix {
+    fn from(prefix: Address) -> Self {
+        Self::of(prefix)
+    }
+}
 
 /// The set of live shards, forming a complete partition of the keyspace: every
 /// infinite bit path from the root passes through exactly one leaf.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct ShardTrie {
     leaves: BTreeSet<ShardId>,
 }
@@ -66,10 +105,31 @@ impl ShardTrie {
     /// As [`Self::shard_for`].
     #[must_use]
     pub fn shard_for_prefix(&self, prefix: impl Into<Address>) -> ShardId {
-        let bytes = prefix.into().to_bytes();
-        self.walk(u64::from_be_bytes(
-            bytes[..8].try_into().expect("an address is 32 bytes"),
-        ))
+        self.shard_for_route(RoutePrefix::of(prefix.into()))
+    }
+
+    /// The leaf owning `route`.
+    #[must_use]
+    pub fn shard_for_route(&self, route: RoutePrefix) -> ShardId {
+        self.walk(route.bits())
+    }
+
+    /// The owner a shard writes its own cells under: an address whose
+    /// leading bits are the shard's path, so it routes to the shard at
+    /// any depth up to the shard's own, and whose body is fixed, so every
+    /// replica and every prober derives the same one from the shard id
+    /// alone. What the chain writes of its own accord — the committed
+    /// transaction family — lives here, under the `Native` class, which
+    /// no package or principal can occupy.
+    #[must_use]
+    pub fn shard_owner(shard: ShardId) -> Address {
+        let mut body = [0u8; 31];
+        let depth = shard.depth();
+        if depth > 0 {
+            body[..8].copy_from_slice(&(shard.path() << (64 - depth)).to_be_bytes());
+        }
+        body[8..21].copy_from_slice(b"committed-txs");
+        Address::new(body, AddressClass::Native)
     }
 
     /// Whether `shard` owns `prefix`'s key space, asked without a trie.
@@ -88,13 +148,16 @@ impl ShardTrie {
     /// # Panics
     /// As [`Self::shard_for_prefix`].
     #[must_use]
-    pub fn shard_owns_prefix(shard: ShardId, prefix: Address) -> bool {
+    pub const fn shard_owns_prefix(shard: ShardId, prefix: Address) -> bool {
+        Self::shard_owns_route(shard, RoutePrefix::of(prefix))
+    }
+
+    /// Whether `shard` owns `route`, with no trie to walk: the leading
+    /// `depth` bits of the route are the shard's path.
+    #[must_use]
+    pub const fn shard_owns_route(shard: ShardId, route: RoutePrefix) -> bool {
         let depth = shard.depth();
-        let bytes = prefix.to_bytes();
-        depth == 0
-            || (u64::from_be_bytes(bytes[..8].try_into().expect("an address is 32 bytes"))
-                >> (64 - depth))
-                == shard.path()
+        depth == 0 || (route.bits() >> (64 - depth)) == shard.path()
     }
 
     fn walk(&self, bits: u64) -> ShardId {
@@ -312,5 +375,32 @@ mod tests {
         // Merging the two depth-2 leaves restores the 2-shard partition.
         assert_eq!(trie.merge(left0, left1), ShardId::leaf(1, 0));
         assert_eq!(trie.len(), 2);
+    }
+
+    /// A shard's own owner routes to the shard at its own depth and at
+    /// every shallower one, and two shards derive two owners.
+    #[test]
+    fn a_shards_owner_routes_to_it() {
+        for shard in [
+            ShardId::ROOT,
+            ShardId::leaf(1, 0),
+            ShardId::leaf(1, 1),
+            ShardId::leaf(3, 5),
+        ] {
+            let owner = ShardTrie::shard_owner(shard);
+            assert!(ShardTrie::shard_owns_prefix(shard, owner), "{shard:?}");
+        }
+        assert!(ShardTrie::shard_owns_prefix(
+            ShardId::leaf(1, 1),
+            ShardTrie::shard_owner(ShardId::leaf(3, 5))
+        ));
+        assert!(!ShardTrie::shard_owns_prefix(
+            ShardId::leaf(1, 0),
+            ShardTrie::shard_owner(ShardId::leaf(3, 5))
+        ));
+        assert_ne!(
+            ShardTrie::shard_owner(ShardId::leaf(1, 0)),
+            ShardTrie::shard_owner(ShardId::leaf(1, 1))
+        );
     }
 }

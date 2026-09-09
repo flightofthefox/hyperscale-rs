@@ -7,6 +7,7 @@
 //! [`crate::fetch`].
 
 use crossbeam::channel::Sender;
+use hyperscale_core::FetchIds;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::GetTransactionsRequest;
@@ -25,6 +26,10 @@ impl FetchBinding for TransactionBinding {
     type Id = TxHash;
 
     const NAME: &'static str = "transaction";
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::Transactions(ids)
+    }
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<TxHash> {
         &mut shard.mempool.transaction
@@ -61,9 +66,7 @@ impl FetchBinding for TransactionBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::TransactionsFetchFailed {
-                                hashes: split.missing.clone(),
-                            },
+                            ShardScopedInput::FetchFailed(Self::ids(split.missing.clone())),
                         );
                     }
                     // Reject the response if the peer shipped unsolicited
@@ -78,7 +81,7 @@ impl FetchBinding for TransactionBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::TransactionsFetchFailed { hashes: hs },
+                        ShardScopedInput::FetchFailed(Self::ids(hs)),
                     );
                     ResponseVerdict::Accept
                 }

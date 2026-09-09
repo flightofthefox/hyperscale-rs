@@ -75,7 +75,7 @@ impl TestNodeBuilder {
             Arc::new(StubVmStatics),
             local_shard,
             &ShardConsensusConfig::default(),
-            RecoveredState::default(),
+            &RecoveredState::default(),
             beacon_coordinator,
             MempoolConfig::default(),
             ProvisionConfig::default(),

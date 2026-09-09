@@ -21,7 +21,8 @@
 //! one here, so the gap is reported instead of erasing the window.
 
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, ProvisionHash, RETENTION_HORIZON, TxHash, WeightedTimestamp,
+    Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, Deadline, FinalizationHash, ProvisionHash,
+    RETENTION_HORIZON, TxHash, WeightedTimestamp, Window,
 };
 
 use super::chain_reader::ShardChainReader;
@@ -30,13 +31,14 @@ use super::chain_reader::ShardChainReader;
 /// whole of it.
 ///
 /// The three maps carry their own deadlines because the tiers differ: a
-/// transaction's is its signed `end_timestamp_exclusive`, a resolution's
-/// comes off the resolving certificate, and a provision batch's is keyed
-/// to the block that committed it.
+/// transaction's is the close of the delivery window its signed
+/// `end_timestamp_exclusive` opens, a resolution's comes off the
+/// resolving certificate, and a provision batch's is keyed to the block
+/// that committed it.
 #[derive(Debug, Clone, Default)]
 pub struct DedupWindow {
-    /// `(tx_hash, end_timestamp_exclusive)` for every transaction the
-    /// window's blocks committed.
+    /// `(tx_hash, close of the delivery window)` for every transaction
+    /// the window's blocks committed.
     pub committed: Vec<(TxHash, WeightedTimestamp)>,
     /// `(tx_hash, deadline)` for every transaction a committed
     /// finalization in the window reached a verdict for.
@@ -44,6 +46,15 @@ pub struct DedupWindow {
     /// `(provision_hash, deadline)` for every batch the window's blocks
     /// committed.
     pub provisions: Vec<(ProvisionHash, WeightedTimestamp)>,
+    /// `(receipt_hash, deadline)` for every finalization the window's
+    /// blocks committed.
+    ///
+    /// Separate from [`Self::resolved`] because the two answer different
+    /// questions. That tier says a transaction has a verdict, which is
+    /// what refuses a second one; this says the chain already carries
+    /// *this certificate*, which is the only thing that refuses one whose
+    /// members reach no verdict at all.
+    pub finalizations: Vec<(FinalizationHash, WeightedTimestamp)>,
     /// The oldest block anchor the walk folded, or `None` when it folded
     /// nothing.
     ///
@@ -65,7 +76,7 @@ pub struct DedupWindow {
 impl DedupWindow {
     /// Rebuild the window from a reader's own committed chain, walking back
     /// from `committed_height` until a block's anchor falls below
-    /// `committed_ts − RETENTION_HORIZON`.
+    /// `committed_ts − DEDUP_WINDOW`.
     ///
     /// The walk reads each block's own `parent_qc` weighted timestamp — the
     /// hash-pinned value every replica sees identically — so two nodes
@@ -93,7 +104,7 @@ impl DedupWindow {
         committed_ts: WeightedTimestamp,
         origin: ChainOrigin,
     ) -> Self {
-        let floor = committed_ts.minus(RETENTION_HORIZON);
+        let floor = committed_ts.minus(DEDUP_WINDOW);
         let mut window = Self::default();
         let mut height = committed_height;
 
@@ -140,12 +151,18 @@ impl DedupWindow {
     fn fold_block(&mut self, block: &Block, anchor: WeightedTimestamp) {
         self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
         for tx in block.transactions().iter() {
-            self.committed
-                .push((tx.hash(), tx.validity_range().end_timestamp_exclusive));
+            let deadline = Window::Delivery.of(Deadline::of_transaction(tx)).end;
+            self.committed.push((tx.hash(), deadline));
         }
         for finalization in block.certificates().iter() {
             let deadline = finalization.local_ec().deadline();
-            for tx_hash in finalization.tx_hashes() {
+            self.finalizations
+                .push((finalization.receipt_hash(), deadline));
+            // The names it *decided*, which is what the live index
+            // records. A leg's finalization names its transaction
+            // without resolving it, and the reclaim's finalization
+            // naming the hash later is the one neither may refuse.
+            for tx_hash in finalization.deciding_tx_hashes() {
                 self.resolved.push((tx_hash, deadline));
             }
         }

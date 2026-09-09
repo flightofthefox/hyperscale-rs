@@ -3,7 +3,7 @@
 use hyperscale_hbor::Hbor;
 
 use crate::network::response::GetLocalProvisionsResponse;
-use crate::{MessageClass, NetworkMessage, ProvisionHash, Request};
+use crate::{MAX_PROVISIONS_PER_BLOCK, MessageClass, NetworkMessage, ProvisionHash, Request};
 
 /// Request to fetch provision batches by hash.
 ///
@@ -13,6 +13,10 @@ use crate::{MessageClass, NetworkMessage, ProvisionHash, Request};
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetLocalProvisionsRequest {
     /// Hashes of the provisions being requested.
+    ///
+    /// Capped as the response is: a request asks for the batches a block
+    /// names, and a block carries at most this many.
+    #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
     pub batch_hashes: Vec<ProvisionHash>,
 }
 
@@ -60,5 +64,28 @@ mod tests {
         let encoded = hbor_to_vec(&request).unwrap();
         let decoded: GetLocalProvisionsRequest = hbor_from_slice(&encoded).unwrap();
         assert_eq!(request, decoded);
+    }
+
+    /// A claimed length past the cap is refused before any element is
+    /// decoded, so a peer cannot make the decoder allocate for a batch
+    /// no honest block could name.
+    #[test]
+    fn decode_rejects_an_oversized_request() {
+        use hyperscale_hbor::{DecodeError, varint};
+
+        let mut buf = Vec::new();
+        varint::write(&mut buf, MAX_PROVISIONS_PER_BLOCK + 1).unwrap();
+        // Filler so the claimed length clears the input-capacity check
+        // and the bound is what refuses it.
+        buf.extend(std::iter::repeat_n(
+            0u8,
+            (MAX_PROVISIONS_PER_BLOCK + 1) * 64,
+        ));
+        let err = hbor_from_slice::<GetLocalProvisionsRequest>(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::BoundExceeded { max, actual }
+                if max == MAX_PROVISIONS_PER_BLOCK && actual == MAX_PROVISIONS_PER_BLOCK + 1
+        ));
     }
 }

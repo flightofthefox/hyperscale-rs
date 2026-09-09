@@ -20,8 +20,8 @@ use hyperscale_storage::Substates;
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId,
-    PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie, Stake, StateWrites,
-    SubstateKey, TimestampRange, Transaction, Verified, WeightedTimestamp,
+    PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateWrites, SubstateKey,
+    TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::{Address, CollectionId, amount_cell, encode_amount};
 
@@ -130,12 +130,14 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
 /// A receipt says what it moved, not what the cell ends at, so a balance
 /// assertion has to name the state the movement lands on.
 fn settled(writes: &StateWrites, accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
-    writes.resolve(&mut |key| {
-        accounts
-            .iter()
-            .find(|(owner, _)| vault_key(*owner, *XRD) == key)
-            .and_then(|(_, amount)| amount_cell(*amount).map(|cell| cell.to_vec()))
-    })
+    writes
+        .resolve(&mut |key| {
+            accounts
+                .iter()
+                .find(|(owner, _)| vault_key(*owner, *XRD) == key)
+                .and_then(|(_, amount)| amount_cell(*amount).map(|cell| cell.to_vec()))
+        })
+        .expect("the debit fits")
 }
 
 /// An account's native vault as the batch left it.
@@ -206,8 +208,7 @@ fn the_gated_node_is_the_one_that_moves_the_balance() {
         .metadata
         .fee_summary
         .total_execution_cost
-        .expect("an executed receipt reports its cost")
-        / Stake::ATTOS_PER_WHOLE;
+        .expect("an executed receipt reports its cost");
     assert!(
         charged > 0 && charged < 2_000,
         "the burn is real and inside the signed ceiling, so the balance equation below \

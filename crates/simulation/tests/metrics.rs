@@ -7,6 +7,7 @@ use std::time::Duration;
 use hyperscale_metrics::set_global_recorder;
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_simulation::{SimConfig, SimulationRunner};
+use hyperscale_types::ShardId;
 
 #[test]
 fn metrics_recorder_collects_values_from_running_sim() {
@@ -46,5 +47,33 @@ fn metrics_recorder_collects_values_from_running_sim() {
     assert_eq!(
         commit_observations, blocks_committed,
         "histogram observation count should match blocks_committed counter"
+    );
+}
+
+/// A host resolves a fetch against routing from the moment it is built,
+/// not from its first topology fold.
+///
+/// The fold runs on a beacon commit, up to an epoch after a restart.
+/// Inside that window a fetch to a shard the head does not name resolves
+/// no committee and fails at the transport before it reaches a peer,
+/// where the caller re-dispatches it — so the gap is a spin, not a
+/// delay. The sim resolves peers by hosting registry and cannot show
+/// that; what it can show is the seed being there.
+#[test]
+fn a_host_boots_with_its_schedules_routing() {
+    let config = SimConfig {
+        shard_size: 4,
+        ..Default::default()
+    };
+    // Built, not run: no beacon block has committed, so nothing has
+    // folded a topology into the network.
+    let runner = SimulationRunner::new(&config, 42);
+
+    let routing = runner
+        .host_routing_committees(0)
+        .expect("the sim seats host 0");
+    assert!(
+        routing.contains_key(&ShardId::ROOT),
+        "the boot schedule's routing reached the network, {routing:?}"
     );
 }

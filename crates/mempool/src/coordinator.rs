@@ -38,12 +38,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
+use hyperscale_engine::legs::Classified;
 use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, CompletedRecovery, ForkFence, LocalTimestamp, MAX_DRAIN_WORK,
-    MAX_GAS_LIMIT, MessageClass, RETENTION_HORIZON, ShardId, TopologySnapshot, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, Verified, WeightedTimestamp,
+    BlockHeight, CertifiedBlock, CompletedRecovery, Deadline, ForkFence, LocalTimestamp,
+    MAX_DRAIN_WORK, MAX_GAS_LIMIT, MessageClass, RETENTION_HORIZON, ShardId, TopologySnapshot,
+    Transaction, TransactionDecision, TransactionStatus, TxHash, TxResolution, Verified,
+    WeightedTimestamp, Window,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -131,6 +133,15 @@ struct PoolEntry {
     /// for the slow-tx finalization log lives in the `io_loop`'s
     /// `tx_phase_times` side cache.
     admitted_at: LocalTimestamp,
+    /// The last instant this shard could still include the transaction:
+    /// its validity end, or the delivery window's close where this shard
+    /// may only be delivering for it. What the pool, the tombstone and
+    /// the body are retained to.
+    admissible_until: WeightedTimestamp,
+    /// The core's verdict on a divided transaction, heard off its
+    /// certificates before this shard's own leg finalized here. The
+    /// terminal lands when it does.
+    verdict: Option<TransactionDecision>,
 }
 
 /// Mempool state machine.
@@ -293,13 +304,16 @@ impl MempoolCoordinator {
             return None;
         }
 
-        // Reject if past `validity_range.end_timestamp_exclusive`. Same
-        // expression the proposer/validator apply, enforced at the admission
-        // boundary so expired txs never enter the pool.
-        if tx.validity_range().end_timestamp_exclusive <= self.current_ts {
+        // Reject once nothing here could include it: past its validity
+        // end, or past the delivery window where this shard may only be
+        // delivering. The proposer applies the exact rule; this is the
+        // admission boundary that keeps dead entries out of the pool.
+        let cross_shard = topology_snapshot.is_cross_shard_transaction(tx);
+        let admissible_until = self.admissible_until(topology_snapshot, tx, cross_shard);
+        if admissible_until <= self.current_ts {
             tracing::debug!(
                 tx_hash = ?hash,
-                end_ms = tx.validity_range().end_timestamp_exclusive.as_millis(),
+                until_ms = admissible_until.as_millis(),
                 now_ms = self.current_ts.as_millis(),
                 "Rejecting expired transaction"
             );
@@ -337,7 +351,6 @@ impl MempoolCoordinator {
             return None;
         }
 
-        let cross_shard = topology_snapshot.is_cross_shard_transaction(tx);
         // A cross-shard transaction at a non-payer shard enters
         // contention only once its engagement evidence exists.
         if let Some(payer_shard) = self.engagement_park_target(topology_snapshot, tx, cross_shard) {
@@ -352,6 +365,8 @@ impl MempoolCoordinator {
                 cross_shard,
                 submitted_locally,
                 admitted_at: now,
+                admissible_until,
+                verdict: None,
             },
         );
         // Tx is in the pool — any pending cross-shard expectation is satisfied,
@@ -458,9 +473,7 @@ impl MempoolCoordinator {
         }
         let mut actions = Vec::new();
         if !moot.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::Transactions {
-                ids: moot,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::Transactions(moot)));
         }
         if !admitted.is_empty() {
             actions.push(Action::Continuation(ProtocolEvent::TransactionsAdmitted {
@@ -528,9 +541,8 @@ impl MempoolCoordinator {
 
         // Tombstone the hash so it can't be re-admitted. Body stays in
         // `tx_store` so peers can still fetch by hash; both expire on the
-        // same `end_timestamp_exclusive` via `prune_tombstones`.
-        self.tombstones
-            .tombstone(tx_hash, entry.tx.validity_range().end_timestamp_exclusive);
+        // same instant via `prune_tombstones`.
+        self.tombstones.tombstone(tx_hash, entry.admissible_until);
     }
 
     /// Check if a transaction hash is tombstoned (reached terminal state).
@@ -550,8 +562,7 @@ impl MempoolCoordinator {
     /// chain locked; skipping them is sound because a terminated chain's
     fn abort_one(&mut self, tx_hash: TxHash) -> Option<Action> {
         let entry = self.pool.remove(&tx_hash)?;
-        self.tombstones
-            .tombstone(tx_hash, entry.tx.validity_range().end_timestamp_exclusive);
+        self.tombstones.tombstone(tx_hash, entry.admissible_until);
         record_transaction_aborted();
         Some(Action::EmitTransactionStatus {
             tx_hash,
@@ -595,17 +606,19 @@ impl MempoolCoordinator {
         self.fork_fence.engage(shard, fork_height, completed);
     }
 
-    /// Process a committed block - update statuses and finalize transactions.
+    /// Process a committed block: admit what it includes, mark it
+    /// committed, and sweep the cross-shard expectations it satisfies or
+    /// outlives.
     ///
-    /// This handles:
-    /// 1. Mark committed transactions
-    /// 2. Process certificates → mark completed
-    /// 3. Process aborts → update status to terminal
+    /// What the block's finalizations settle about the transactions
+    /// they name arrives separately, through [`Self::on_resolutions`]:
+    /// a finalization's name means different things on different
+    /// entries, and the execution ledger is what knows which.
     #[instrument(skip(self, certified), fields(
         height = certified.block().height().inner(),
         tx_count = certified.block().transaction_count()
     ))]
-    #[allow(clippy::too_many_lines)] // sequential orchestration: block-include, expected-tx sweep, certificate processing
+    #[allow(clippy::too_many_lines)] // sequential orchestration: block-include, status marking, expected-tx sweep
     pub fn on_block_committed(
         &mut self,
         topology_snapshot: &TopologySnapshot,
@@ -641,6 +654,8 @@ impl MempoolCoordinator {
                 Ok(v) => Arc::new(v),
                 Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
             };
+            let cross_shard = topology_snapshot.is_cross_shard_transaction(tx);
+            let admissible_until = self.admissible_until(topology_snapshot, tx, cross_shard);
             self.pool.entry(hash).or_insert_with(|| {
                 tracing::debug!(
                     tx_hash = ?hash,
@@ -649,14 +664,16 @@ impl MempoolCoordinator {
                 );
                 self.tx_store.insert(Arc::clone(&verified));
                 PoolEntry {
+                    admissible_until,
                     tx: verified,
                     status: TransactionStatus::Pending, // Will be updated by execution
-                    cross_shard: topology_snapshot.is_cross_shard_transaction(tx),
+                    cross_shard,
                     submitted_locally: false, // Fetched for block processing
                     // Block-committed entries skip the dwell path entirely
                     // (next loop transitions them straight to Committed +
                     // takes locks), so the anchor is never read.
                     admitted_at: LocalTimestamp::ZERO,
+                    verdict: None,
                 }
             });
             // Block inclusion is the strongest possible signal that the tx
@@ -668,9 +685,9 @@ impl MempoolCoordinator {
             }
         }
         if !abandoned_tx_fetches.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::Transactions {
-                ids: abandoned_tx_fetches,
-            }));
+            actions.push(Action::AbandonFetch(FetchIds::Transactions(
+                abandoned_tx_fetches,
+            )));
         }
 
         // Update transaction status to Committed and add locks.
@@ -762,21 +779,7 @@ impl MempoolCoordinator {
                 record_expected_tx_dropped();
                 abandoned.push(tx_hash);
             }
-            actions.push(Action::AbandonFetch(FetchAbandon::Transactions {
-                ids: abandoned,
-            }));
-        }
-
-        // Per-tx terminal state from committed finalizations. Decisions are
-        // derived from each Finalization directly, so this works identically
-        // for consensus and sync commit paths.
-        for fw in block.certificates().iter() {
-            for (tx_hash, decision) in fw.tx_decisions() {
-                if matches!(decision, TransactionDecision::Aborted) {
-                    record_transaction_aborted();
-                }
-                actions.extend(self.process_certificate_committed(tx_hash, decision));
-            }
+            actions.push(Action::AbandonFetch(FetchIds::Transactions(abandoned)));
         }
 
         self.prune_engagement_state();
@@ -784,26 +787,72 @@ impl MempoolCoordinator {
         actions
     }
 
-    /// Mark a transaction as terminal in response to a committed finalization.
+    /// Apply what the execution coordinator settled about each
+    /// transaction — off a committed block's finalizations, or off a
+    /// core's certificates.
     ///
-    /// Called from `on_block_committed` once per tx in `block.certificates`.
-    /// Emits the terminal status update and evicts/tombstones the entry.
-    fn process_certificate_committed(
-        &mut self,
-        tx_hash: TxHash,
-        decision: TransactionDecision,
-    ) -> Vec<Action> {
+    /// A decision of this shard's chain is terminal wherever the entry
+    /// stands. A leg finalizing here is its own state, and the
+    /// transaction stays pending its core's verdict; that verdict is
+    /// terminal once the leg has finalized, and is held for it
+    /// otherwise, since a replica behind on its own chain can hear the
+    /// core before it commits the leg. Nothing is said of a transaction
+    /// the pool no longer holds.
+    pub fn on_resolutions(&mut self, resolutions: &[(TxHash, TxResolution)]) -> Vec<Action> {
+        let mut actions = Vec::new();
+        for &(tx_hash, resolution) in resolutions {
+            match resolution {
+                TxResolution::Decided(decision) => actions.extend(self.complete(tx_hash, decision)),
+                TxResolution::LegFinalized => {
+                    let Some(entry) = self.pool.get_mut(&tx_hash) else {
+                        continue;
+                    };
+                    // A shard with legs on both sides of the core runs
+                    // them as two members, and the second finalizes
+                    // into the state the first already reported.
+                    if matches!(entry.status, TransactionStatus::LegFinalized) {
+                        continue;
+                    }
+                    entry.status = TransactionStatus::LegFinalized;
+                    actions.push(Action::EmitTransactionStatus {
+                        tx_hash,
+                        status: TransactionStatus::LegFinalized,
+                        cross_shard: entry.cross_shard,
+                        submitted_locally: entry.submitted_locally,
+                    });
+                    if let Some(verdict) = entry.verdict {
+                        actions.extend(self.complete(tx_hash, verdict));
+                    }
+                }
+                TxResolution::CoreDecided(decision) => {
+                    let Some(entry) = self.pool.get_mut(&tx_hash) else {
+                        continue;
+                    };
+                    if matches!(entry.status, TransactionStatus::LegFinalized) {
+                        actions.extend(self.complete(tx_hash, decision));
+                    } else {
+                        entry.verdict = Some(decision);
+                    }
+                }
+            }
+        }
+        actions
+    }
+
+    /// Drive a transaction to `Completed(decision)`: emit the terminal
+    /// status and evict and tombstone the entry.
+    fn complete(&mut self, tx_hash: TxHash, decision: TransactionDecision) -> Vec<Action> {
         let mut actions = Vec::new();
 
         if let Some(entry) = self.pool.get(&tx_hash) {
-            let cross_shard = entry.cross_shard;
-            let submitted_locally = entry.submitted_locally;
-
+            if matches!(decision, TransactionDecision::Aborted) {
+                record_transaction_aborted();
+            }
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
                 status: TransactionStatus::Completed(decision),
-                cross_shard,
-                submitted_locally,
+                cross_shard: entry.cross_shard,
+                submitted_locally: entry.submitted_locally,
             });
 
             self.evict_terminal(tx_hash);
@@ -833,6 +882,32 @@ impl MempoolCoordinator {
     /// currently-locked and already-claimed nodes.
     /// The payer shard a cross-shard transaction must show engagement
     /// evidence from before entering contention, or `None` when the
+    /// The last instant this shard could still include `tx`.
+    ///
+    /// Its validity end, except where this shard only delivers for it —
+    /// frozen divided against the head trie with this shard outside the
+    /// core and every leg here a delivery — which is admissible to the
+    /// delivery window's close. The proposer reads the same predicate
+    /// against its block's own anchor, so what this widens is
+    /// retention: the body and the tombstone are held while a delivery
+    /// could still be composed from them, and for nothing else.
+    fn admissible_until(
+        &self,
+        topology_snapshot: &TopologySnapshot,
+        tx: &Transaction,
+        cross_shard: bool,
+    ) -> WeightedTimestamp {
+        let validity_end = tx.validity_range().end_timestamp_exclusive;
+        let delivers = cross_shard
+            && Classified::freeze(tx.legs(), tx.owners(), topology_snapshot.shard_trie())
+                .only_delivers_at(self.local_shard);
+        if delivers {
+            Window::Delivery.of(Deadline::of(validity_end)).end
+        } else {
+            validity_end
+        }
+    }
+
     /// transaction is immediately ready: not VM, not cross-shard, this
     /// shard is the payer's, or the evidence already arrived.
     fn engagement_park_target(
@@ -1084,27 +1159,34 @@ impl MempoolCoordinator {
         count
     }
 
-    /// Drop `Pending` pool entries whose `end_timestamp_exclusive <= current_ts`.
+    /// Drop the pool entries nothing here can still include or decide:
+    /// `Pending` ones past what this shard could include them by, and
+    /// `LegFinalized` ones past the horizon at which the execution
+    /// ledger gives up the reclaim that would have decided them.
     ///
-    /// Pending txs hold no state locks (locks are taken on `Committed` /
-    /// `Executed`), so removal is safe without going through the
-    /// terminal-eviction path. Re-submission past expiry is rejected at
-    /// admission, so no tombstone is needed either; we also drop the body
-    /// from [`Self::tx_store`] since nothing else needs it.
+    /// Neither holds a state lock, so removal is safe without going
+    /// through the terminal-eviction path. Re-submission past expiry is
+    /// rejected at admission, so no tombstone is needed either; the body
+    /// goes from [`Self::tx_store`] since nothing else needs it.
     ///
     /// The proposer-side filter already skips expired txs at selection
     /// time; this sweep is what keeps the pool from accumulating dead
-    /// pending entries when expiry outpaces selection (e.g. a transient
-    /// stall in cross-shard EC delivery delays inclusion past the window).
+    /// entries when expiry outpaces selection (e.g. a transient stall in
+    /// cross-shard EC delivery delays inclusion past the window).
     ///
-    /// Returns the number of pending entries dropped.
+    /// Returns the number of entries dropped.
     pub fn cleanup_expired_pending(&mut self) -> usize {
         let now = self.current_ts;
         let expired: Vec<TxHash> = self
             .pool
             .iter()
-            .filter(|(_, entry)| matches!(entry.status, TransactionStatus::Pending))
-            .filter(|(_, entry)| entry.tx.validity_range().end_timestamp_exclusive <= now)
+            .filter(|(_, entry)| match entry.status {
+                TransactionStatus::Pending => entry.admissible_until <= now,
+                TransactionStatus::LegFinalized => {
+                    Window::LegEntry.of(Deadline::of_transaction(&entry.tx)).end <= now
+                }
+                TransactionStatus::Committed(_) | TransactionStatus::Completed(_) => false,
+            })
             .map(|(hash, _)| *hash)
             .collect();
         for hash in &expired {
@@ -1137,7 +1219,7 @@ impl MempoolCoordinator {
         self.pool
             .values()
             .filter(|entry| matches!(entry.status, TransactionStatus::Pending))
-            .filter(|entry| entry.tx.validity_range().end_timestamp_exclusive > now)
+            .filter(|entry| entry.admissible_until > now)
             .map(|entry| Arc::new((**entry.tx).clone()))
             .collect()
     }
@@ -1237,7 +1319,8 @@ mod tests {
                 transactions,
                 certificates,
                 provisions: Arc::new(vec![Arc::new(provision.into())]),
-                terminal_verdicts: Arc::new(Vec::new()),
+                abandonment_records: Arc::new(Vec::new()),
+                state_claims: Arc::new(Vec::new()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             },
             sealed @ Block::Sealed { .. } => sealed,
@@ -1577,7 +1660,7 @@ mod tests {
         let abandoned: Vec<TxHash> = actions
             .iter()
             .filter_map(|a| match a {
-                Action::AbandonFetch(FetchAbandon::Transactions { ids }) => Some(ids.clone()),
+                Action::AbandonFetch(FetchIds::Transactions(ids)) => Some(ids.clone()),
                 _ => None,
             })
             .flatten()
@@ -1619,7 +1702,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::Transactions { ids }) if ids == &[tx_hash]
+                Action::AbandonFetch(FetchIds::Transactions(ids)) if ids == &[tx_hash]
             )),
             "Expected AbandonFetch for block-included expected tx, got: {actions:?}"
         );
@@ -1673,7 +1756,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::Transactions { ids }) if ids == &[tx_hash]
+                Action::AbandonFetch(FetchIds::Transactions(ids)) if ids == &[tx_hash]
             )),
             "rejected tx must emit AbandonFetch so any in-flight retry \
              is cancelled, got: {actions:?}"
@@ -1730,7 +1813,9 @@ mod tests {
             tx,
             make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Aborted),
         );
-        let actions = mempool.on_block_committed(&topology_snapshot, &certified);
+        mempool.on_block_committed(&topology_snapshot, &certified);
+        let actions = mempool
+            .on_resolutions(&[(tx_hash, TxResolution::Decided(TransactionDecision::Aborted))]);
 
         // Should have emitted Completed(Aborted) status
         let aborted_action = actions.iter().find(|a| {
@@ -1786,6 +1871,144 @@ mod tests {
         );
         assert!(mempool.status(&tx_hash).is_none());
         assert!(mempool.is_tombstoned(&tx_hash));
+    }
+
+    /// The status emitted for `tx_hash` by `actions`, if any.
+    fn emitted(actions: &[Action], tx_hash: TxHash) -> Vec<TransactionStatus> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::EmitTransactionStatus {
+                    tx_hash: h, status, ..
+                } if *h == tx_hash => Some(status.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A leg's own finalization is the leg's state and not the
+    /// transaction's terminal: the entry stays, untombstoned, until the
+    /// core's verdict ends it.
+    #[test]
+    fn a_legs_finalization_is_its_own_state_and_the_cores_verdict_ends_it() {
+        let topology_snapshot = make_test_topology();
+        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+        mempool.on_submit_transaction(
+            &topology_snapshot,
+            Arc::new(verified(tx.clone())),
+            LocalTimestamp::ZERO,
+        );
+        let block = make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            1_000,
+            ValidatorId::new(0),
+            vec![Arc::new(tx)],
+            vec![],
+        );
+        mempool.on_block_committed(&topology_snapshot, &certify(block, 1_000));
+
+        let actions = mempool.on_resolutions(&[(tx_hash, TxResolution::LegFinalized)]);
+        assert_eq!(
+            emitted(&actions, tx_hash),
+            vec![TransactionStatus::LegFinalized]
+        );
+        assert_eq!(
+            mempool.status(&tx_hash),
+            Some(TransactionStatus::LegFinalized),
+            "the entry stays for the verdict"
+        );
+        assert!(!mempool.is_tombstoned(&tx_hash));
+        assert!(
+            mempool
+                .ready_transactions(10, 0, LocalTimestamp::ZERO)
+                .is_empty(),
+            "and is never offered again"
+        );
+
+        let actions = mempool.on_resolutions(&[(
+            tx_hash,
+            TxResolution::CoreDecided(TransactionDecision::Accept),
+        )]);
+        assert_eq!(
+            emitted(&actions, tx_hash),
+            vec![TransactionStatus::Completed(TransactionDecision::Accept)]
+        );
+        assert!(mempool.status(&tx_hash).is_none());
+        assert!(mempool.is_tombstoned(&tx_hash));
+    }
+
+    /// A core's verdict can reach a replica before that replica commits
+    /// its own leg's finalization: it is held, and lands the moment the
+    /// leg finalizes.
+    #[test]
+    fn a_cores_verdict_heard_before_the_leg_finalized_waits_for_it() {
+        let topology_snapshot = make_test_topology();
+        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
+        let tx = test_transaction(2);
+        let tx_hash = tx.hash();
+        let block = make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            1_000,
+            ValidatorId::new(0),
+            vec![Arc::new(tx)],
+            vec![],
+        );
+        mempool.on_block_committed(&topology_snapshot, &certify(block, 1_000));
+
+        let actions = mempool.on_resolutions(&[(
+            tx_hash,
+            TxResolution::CoreDecided(TransactionDecision::Reject),
+        )]);
+        assert!(emitted(&actions, tx_hash).is_empty(), "held for the leg");
+        assert_eq!(
+            mempool.status(&tx_hash),
+            Some(TransactionStatus::Committed(BlockHeight::new(1)))
+        );
+
+        let actions = mempool.on_resolutions(&[(tx_hash, TxResolution::LegFinalized)]);
+        assert_eq!(
+            emitted(&actions, tx_hash),
+            vec![
+                TransactionStatus::LegFinalized,
+                TransactionStatus::Completed(TransactionDecision::Reject)
+            ]
+        );
+        assert!(mempool.is_tombstoned(&tx_hash));
+    }
+
+    /// A leg nothing ever decides goes at the horizon the execution
+    /// ledger gives its reclaim up at, and not before.
+    #[test]
+    fn a_finalized_leg_nobody_decides_goes_at_its_horizon() {
+        let topology_snapshot = make_test_topology();
+        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
+        let end_ms = 60_000;
+        let tx = tx_with_end(3, end_ms);
+        let tx_hash = tx.hash();
+        let block = make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            1_000,
+            ValidatorId::new(0),
+            vec![Arc::new((**tx).clone())],
+            vec![],
+        );
+        mempool.on_block_committed(&topology_snapshot, &certify(block, 1_000));
+        mempool.on_resolutions(&[(tx_hash, TxResolution::LegFinalized)]);
+
+        let horizon = Window::LegEntry
+            .of(Deadline::of(WeightedTimestamp::from_millis(end_ms)))
+            .end;
+        set_current_ts(&mut mempool, horizon.minus(Duration::from_millis(1)));
+        assert_eq!(mempool.cleanup_expired_pending(), 0);
+        assert!(mempool.has_transaction(&tx_hash));
+        set_current_ts(&mut mempool, horizon);
+        assert_eq!(mempool.cleanup_expired_pending(), 1);
+        assert!(!mempool.has_transaction(&tx_hash));
     }
 
     #[test]
@@ -1854,6 +2077,7 @@ mod tests {
             make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept),
         );
         mempool.on_block_committed(&topology_snapshot, &certified);
+        mempool.on_resolutions(&[(tx_hash, TxResolution::Decided(TransactionDecision::Accept))]);
 
         // Verify it's tombstoned
         assert!(mempool.is_tombstoned(&tx_hash));
@@ -1891,6 +2115,7 @@ mod tests {
             make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept),
         );
         mempool.on_block_committed(&topology_snapshot, &certified);
+        mempool.on_resolutions(&[(tx_hash, TxResolution::Decided(TransactionDecision::Accept))]);
 
         // Try to re-submit - should be rejected (no status emitted)
         let actions = mempool.on_submit_transaction(
@@ -2520,6 +2745,84 @@ mod tests {
             2,
             "the fixed charge is what makes the budget count them"
         );
+    }
+
+    /// A transaction this shard only delivers for — frozen divided
+    /// with this shard outside the core and every leg here a delivery
+    /// — is held to the delivery window's close; one this shard issues
+    /// for, or runs whole, is held to its validity end whoever pays.
+    #[test]
+    fn a_delivery_is_held_to_the_windows_close_and_nothing_else_is() {
+        use hyperscale_types::TimestampRange;
+        use hyperscale_types::test_utils::{StubVmStatics, leg_shape};
+        use hyperscale_vm_types::LegRole;
+
+        let topology = TestCommittee::new(4, 42).topology_snapshot(2);
+        let local = ShardId::leaf(1, 0);
+        let mut mempool = MempoolCoordinator::new(local);
+        let end = WeightedTimestamp::from_millis(60_000);
+        let range = TimestampRange::new(WeightedTimestamp::ZERO, end);
+        // A clear top bit routes to leaf(1, 0); a set one to leaf(1, 1).
+        let local_owner = test_principal(0x02);
+        let remote_owner = test_principal(0x82);
+        install_stub_protocol_statics();
+        // The legs are derived facts and not body, so each shape gets a
+        // fee ceiling of its own to keep the three hashes apart.
+        let stub = |payer: PrincipalAddr, max_fee: u128, legs: Vec<_>| {
+            Arc::new(verified(
+                stub_transaction(
+                    payer,
+                    &[local_owner.address(), remote_owner.address()],
+                    max_fee,
+                    range,
+                )
+                .with_legs(&StubVmStatics, legs),
+            ))
+        };
+        // A swap whose output lands here: the withdraw and the venue
+        // away, the deposit here consuming what the venue issued.
+        let delivery = stub(
+            remote_owner,
+            1_000,
+            vec![
+                leg_shape(remote_owner.address(), LegRole::Inbound, &[]),
+                leg_shape(remote_owner.address(), LegRole::Core, &[(0, 0)]),
+                leg_shape(local_owner.address(), LegRole::Outbound, &[(1, 0)]),
+            ],
+        );
+        // The same swap the other way round: this shard issues for it.
+        let issuer = stub(
+            local_owner,
+            2_000,
+            vec![
+                leg_shape(local_owner.address(), LegRole::Inbound, &[]),
+                leg_shape(remote_owner.address(), LegRole::Core, &[(0, 0)]),
+                leg_shape(remote_owner.address(), LegRole::Outbound, &[(1, 0)]),
+            ],
+        );
+        // A shape with no legs, paid for elsewhere: whole, and no delivery.
+        let whole = stub(remote_owner, 3_000, Vec::new());
+
+        set_current_ts(&mut mempool, end);
+        for tx in [&delivery, &issuer, &whole] {
+            mempool.on_transaction_gossip(&topology, Arc::clone(tx), false, LocalTimestamp::ZERO);
+        }
+        assert!(
+            mempool.status(&delivery.hash()).is_some(),
+            "a delivery is admitted past its validity end"
+        );
+        assert!(
+            mempool.status(&issuer.hash()).is_none(),
+            "an issuer's window is the transaction's"
+        );
+        assert!(
+            mempool.status(&whole.hash()).is_none(),
+            "and so is a whole shape's, wherever its payer sits"
+        );
+
+        set_current_ts(&mut mempool, Window::Delivery.of(Deadline::of(end)).end);
+        assert_eq!(mempool.cleanup_expired_pending(), 1, "the close sweeps it");
+        assert!(mempool.status(&delivery.hash()).is_none());
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //! - [`certified`]: [`CertifiedBlock`] pairing of a block with its certifying QC.
 //! - [`certified_header`]: [`CertifiedBlockHeader`] cross-shard trust attestation.
 //! - [`evidence`]: [`ShardVoteEquivocation`] self-proving double-vote evidence.
+//! - [`demands`]: what a block [`Demands`](demands::Demands) be checked
+//!   before a vote, and how one [`CheckOutcome`](demands::CheckOutcome) ends.
 //! - [`fork_fence`]: [`ForkFence`](fork_fence::ForkFence) — the gossip-timed
 //!   quiesce every cross-shard consumer engages against a proven fork.
 //! - [`header`]: [`BlockHeader`] (shard-voted metadata).
@@ -25,12 +27,16 @@
 //! - [`witness_sources`]: [`WitnessSources`] — the proposer-supplied
 //!   beacon-witness inputs a block carries.
 
+pub mod abandonment;
+pub mod anchor;
 #[allow(clippy::module_inception)]
 mod block;
 pub mod certified;
 pub mod certified_header;
 pub mod chain_origin;
 pub mod commit_proof;
+pub mod counterpart_mirror;
+pub mod demands;
 pub mod evidence;
 pub mod fork_fence;
 pub mod header;
@@ -38,12 +44,14 @@ pub mod inventory;
 pub mod limits;
 pub mod load;
 pub mod manifest;
+pub mod proven_anchors;
+pub mod proven_cells;
 pub mod quorum_certificate;
 pub mod reshape;
 pub mod roots;
+pub mod state_claim;
 pub mod storage_commit;
 pub mod sweep;
-pub mod terminal_verdict;
 pub mod timeout;
 pub mod vote;
 pub mod vote_registers;

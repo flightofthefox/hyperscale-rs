@@ -790,9 +790,9 @@ pub fn register_shard_request_handlers<S, N, D>(
     use hyperscale_engine::Executor;
     use hyperscale_types::network::request::{
         GetBlockRequest, GetCommittedTxsRequest, GetInstanceRecordsRequest,
-        GetPackageArtifactsRequest, GetProvisionsRequest, GetRemoteHeadersRequest,
-        GetSettledTxsRequest, GetStateRangeRequest, GetTransactionsRequest,
-        GetWitnessHistoryRequest,
+        GetPackageArtifactsRequest, GetProvisionsRequest, GetRelayedStateProofRequest,
+        GetRemoteHeadersRequest, GetSettledTxsRequest, GetStateProofRequest, GetStateRangeRequest,
+        GetTransactionsRequest, GetWitnessHistoryRequest,
     };
     use hyperscale_types::network::response::{
         GetInstanceRecordsResponse, GetPackageArtifactsResponse,
@@ -806,7 +806,8 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::shard::cross_shard::{
         CommittedTxsCache, serve_committed_txs_request, serve_execution_certs_request,
         serve_finalizations_request, serve_local_provisions_request, serve_provision_request,
-        serve_remote_headers_request, serve_settled_txs_request,
+        serve_relayed_state_proof_request, serve_remote_headers_request, serve_settled_txs_request,
+        serve_state_proof_request,
     };
     use crate::shard::mempool::serve_transaction_request;
 
@@ -1182,6 +1183,36 @@ pub fn register_shard_request_handlers<S, N, D>(
         .network
         .register_request_handler::<GetCommittedTxsRequest>(shard, move |req| {
             serve_committed_txs_request(&pending_chain, &committed_txs_cache, &req)
+        });
+
+    // ── state_proof.request → proof of keys at a committed height ──
+    //
+    // A shard holding an escrow a core here never claimed asks whether
+    // this shard committed the transaction, against one of our headers
+    // it has commit-proved. The proof is checked against that header's
+    // root on the requester's side, so nothing here is trusted; a
+    // height outside the JMT's history answers `not_found` and the
+    // requester rotates.
+    let pending_chain = Arc::clone(&io.pending_chain);
+    process
+        .network
+        .register_request_handler::<GetStateProofRequest>(shard, move |req| {
+            serve_state_proof_request(&pending_chain, &req)
+        });
+
+    // ── relayed_state_proof.request → a peer's copy of a proof ────
+    //
+    // A committee member fencing a vote on a block's state claim needs a
+    // proof of the counterpart's cell and could not obtain one from the
+    // counterpart itself. Anything this node fetched for its own probes
+    // is passed on; nothing is constructed, since this node holds no
+    // copy of that shard's tree. The requester checks the bytes against
+    // the root it commit-proved, so relaying grants no trust.
+    let proven_cells = Arc::clone(&io.caches.proven_cells);
+    process
+        .network
+        .register_request_handler::<GetRelayedStateProofRequest>(shard, move |req| {
+            serve_relayed_state_proof_request(&proven_cells, &req)
         });
 
     // ── beacon.proposal.request → process-level serve cache ──────

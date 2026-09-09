@@ -6,26 +6,25 @@ use std::sync::Arc;
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
-    resolve_materialized_root,
 };
 use hyperscale_storage::{
     JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, covers_strictly_more,
-    merge_writes_from_receipts, widest_tick_copies, with_removals,
+    holds_this_block_at, settled_writes_at, widest_tick_copies,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, Finalization, PreparedCommit,
-    QuorumCertificate, SettledWrites, StateRoot, StoredReceipt, SubstateKey, SyncHint, Verifiable,
-    Verified,
+    SettledWrites, StateRoot, StoredReceipt, SubstateKey, SyncHint, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
-use super::state::{ConsensusState, apply_state_writes, apply_writes};
+use super::state::{ConsensusState, apply_writes};
 
 impl ShardChainWriter for SimShardStorage {
     fn prepare_block_commit(
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
         finalizations: &[Arc<Verifiable<Finalization>>],
+        creations: &[(SubstateKey, Vec<u8>)],
         removals: &[SubstateKey],
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
@@ -43,9 +42,10 @@ impl ShardChainWriter for SimShardStorage {
         // Nothing to write → state root is unchanged. Build a no-op
         // JmtSnapshot directly, avoiding put_at_version which would fail
         // if the parent's tree nodes aren't in the store yet. A block's
-        // sweep is a write like any other, so a block that removes
-        // something is not one of these however few receipts it carries.
-        if receipts.is_empty() && removals.is_empty() {
+        // sweep and its committed cells are writes like any other, so a
+        // block that removes or creates something is not one of these
+        // however few receipts it carries.
+        if receipts.is_empty() && creations.is_empty() && removals.is_empty() {
             let s = read_or_recover(&self.state);
             let snapshot = Arc::new(noop_jmt_snapshot(
                 &s.tree_store,
@@ -67,15 +67,8 @@ impl ShardChainWriter for SimShardStorage {
         // Read lock: compute speculative JMT root.
         let s = read_or_recover(&self.state);
 
-        // Anchor on the nearest materialized version: a node-less no-op
-        // ancestor (a block prepared before its parent's tree existed,
-        // across a recovery bridge) carries this same root without
-        // holding its node, and the JMT applier needs a version that does.
-        let parent_version = jmt_parent_height(parent.height, parent.state_root)
-            .map(BlockHeight::inner)
-            .map(|pv| {
-                resolve_materialized_root(&s.tree_store, parent.pending, pv).map_or(pv, |(v, _)| v)
-            });
+        let parent_version =
+            jmt_parent_height(parent.height, parent.state_root).map(BlockHeight::inner);
 
         // One resolution, feeding both the tree and the substate store —
         // they commit the same values or they disagree about state. It
@@ -85,15 +78,8 @@ impl ShardChainWriter for SimShardStorage {
         // The type says the baseline was fixed when it was made; which
         // block it was fixed at is this caller's to check, and a movement
         // resolved against any other is as wrong as one resolved live.
-        assert_eq!(
-            parent.state.anchor(),
-            parent.height,
-            "a movement's baseline is anchored at the wrong height",
-        );
-        let settled = with_removals(
-            merge_writes_from_receipts(&settling, parent.state),
-            removals,
-        );
+        let settled =
+            settled_writes_at(&settling, parent.state, parent.height, creations, removals);
 
         let (result_root, collected) = if parent.pending.is_empty() {
             put_at_version(
@@ -123,34 +109,6 @@ impl ShardChainWriter for SimShardStorage {
 
         (result_root, snapshot, prepared)
     }
-
-    fn commit_block(
-        &self,
-        certified: &Arc<Verified<CertifiedBlock>>,
-        removals: &[SubstateKey],
-        witness: &BeaconWitnessCommit,
-    ) -> StateRoot {
-        let block = certified.block();
-        let qc = certified.qc_verified();
-        let receipts: Vec<StoredReceipt> = block
-            .certificates()
-            .iter()
-            .flat_map(|fw| fw.receipts().iter().cloned())
-            .collect();
-        let merged_writes = with_removals(
-            merge_writes_from_receipts(
-                &block
-                    .certificates()
-                    .iter()
-                    .flat_map(|fw| fw.settling_receipts())
-                    .collect::<Vec<_>>(),
-                &self.snapshot(),
-            ),
-            removals,
-        );
-        self.append_beacon_witnesses(witness);
-        self.commit_block_inner(&merged_writes, block, qc, &receipts)
-    }
 }
 
 /// Build the closure that performs the in-memory atomic block commit.
@@ -171,12 +129,34 @@ fn build_prepared_commit(
               certified: &Arc<Verified<CertifiedBlock>>,
               witness: &BeaconWitnessCommit|
               -> StateRoot {
+            let result_root = snapshot.result_root;
+            // A block already committed — by a sync commit that landed
+            // it between prepare and flush, or by a second vnode on this
+            // store — is in, and applying it again would write its
+            // history twice at one version. The tree's own version says
+            // so, as it does on the persistent backend: a chain adopted
+            // from a checkpoint carries a committed height above its
+            // first blocks, and the tree starts where the chain does.
+            if storage.jmt_height() >= snapshot.new_height {
+                assert!(
+                    holds_this_block_at(
+                        storage.as_ref(),
+                        certified.block().height(),
+                        certified.block().hash(),
+                    ),
+                    "BFT CRITICAL: prepared commit for height {} meets a different block already there",
+                    certified.block().height().inner(),
+                );
+                return result_root;
+            }
             storage.append_beacon_witnesses(witness);
 
             let block_height_u64 = snapshot.new_height.inner();
-            let result_root = snapshot.result_root;
 
-            {
+            let block = certified.block();
+            let qc = certified.qc_verified();
+
+            let floor = {
                 let mut s = write_or_recover(&storage.state);
                 s.apply_jmt_snapshot(&snapshot);
                 apply_writes(
@@ -185,10 +165,8 @@ fn build_prepared_commit(
                     block_height_u64,
                     /* write_history */ true,
                 );
-            }
-
-            let block = certified.block();
-            let qc = certified.qc_verified();
+                s.advance_retention_floor(block_height_u64, qc.weighted_timestamp())
+            };
 
             // SAFETY: synthetic in-memory commit wrapper; the certified
             // value is already verified upstream and we're just copying
@@ -208,13 +186,14 @@ fn build_prepared_commit(
                     .or_default()
                     .push(tick_id);
             }
-            c.record_provisions(block, storage.jmt_history_length);
+            c.record_provisions(block, floor);
             c.insert_receipts(&receipts);
             record_execution_certs(&mut c, block);
             c.committed_height = block.height();
             c.committed_hash = Some(block.hash());
             c.committed_qc = Some(qc.as_ref().clone());
             c.prune_receipts(block.height());
+            c.drop_voted_blocks_through(block.height());
 
             result_root
         },
@@ -224,8 +203,7 @@ fn build_prepared_commit(
 impl SimShardStorage {
     /// Fold a block's beacon-witness commit into the in-memory map:
     /// append `witness.leaves` and drop entries below a carried
-    /// retention floor. Lives next to the commit paths so both
-    /// prepared-commit and from-scratch commits share one entry point.
+    /// retention floor.
     fn append_beacon_witnesses(&self, witness: &BeaconWitnessCommit) {
         if witness.leaves.is_empty() && witness.prune_persisted_below.is_none() {
             return;
@@ -242,67 +220,6 @@ impl SimShardStorage {
     }
 }
 
-impl SimShardStorage {
-    /// Internal commit path used by `commit_block` (sync blocks without a `PreparedCommit`).
-    fn commit_block_inner(
-        &self,
-        merged_writes: &SettledWrites,
-        block: &Block,
-        qc: &Verified<QuorumCertificate>,
-        receipts: &[StoredReceipt],
-    ) -> StateRoot {
-        let block_height = block.height();
-        let mut s = write_or_recover(&self.state);
-
-        // A genesis commit re-records the height the install already wrote
-        // (the chain's genesis height — 0 only for chains born at network
-        // genesis); every other block advances the version by exactly one.
-        assert!(
-            block_height == s.current_block_height + 1
-                || (block.is_genesis() && block_height == s.current_block_height),
-            "commit_block: block_height ({block_height}) must be exactly current_version + 1 ({})",
-            s.current_block_height
-        );
-
-        let new_root = apply_state_writes(&mut s, merged_writes, block_height);
-
-        drop(s);
-
-        // Store block + certificate + consensus state atomically.
-        {
-            let mut c = write_or_recover(&self.consensus);
-            for tx in block.transactions().iter() {
-                c.transactions.insert(tx.hash(), (***tx).clone());
-            }
-            // SAFETY: sync-path commit; certified value is already
-            // verified upstream.
-            c.blocks.insert(
-                block.height(),
-                CertifiedBlock::new_unchecked(block.clone().into_sealed(), qc.clone()),
-            );
-            for fw in block.certificates().iter() {
-                let tick_id = *fw.tick_id();
-                c.certificates.insert(fw.receipt_hash(), fw.attestation());
-                c.finalizations_by_height
-                    .entry(tick_id.block_height())
-                    .or_default()
-                    .push(tick_id);
-            }
-            c.record_provisions(block, self.jmt_history_length);
-            // Store receipts atomically with block commit.
-            c.insert_receipts(receipts);
-            // Store execution certificates (extracted from finalizations) atomically.
-            record_execution_certs(&mut c, block);
-            c.committed_height = block.height();
-            c.committed_hash = Some(block.hash());
-            c.committed_qc = Some(qc.as_ref().clone());
-            c.prune_receipts(block.height());
-        }
-
-        new_root
-    }
-}
-
 /// Fold a block's execution certificates into the consensus map, keeping
 /// the widest copy of each tick and indexing the transactions that copy
 /// attests.
@@ -311,9 +228,13 @@ impl SimShardStorage {
 /// settled cross-shard transaction lands here under both sides'
 /// certificates, and the index answers "what did THIS shard attest for
 /// the transaction" — the question a counterpart's fallback fetch asks
-/// this shard. Letting a remote copy win the single slot serves the
-/// requester its own certificate back, which it rightly refuses as
-/// unsolicited, and the fetch loops forever.
+/// this shard. A remote copy in there serves the requester its own
+/// certificate back, which it rightly refuses as unsolicited, and the
+/// fetch loops forever.
+///
+/// Every one of this shard's is indexed, not the newest: the verdict and
+/// whatever settles what it left both name the transaction, and only the
+/// asker can tell which answers the question its tick waits on.
 fn record_execution_certs(consensus: &mut ConsensusState, block: &Block) {
     let local_shard = block
         .certificates()
@@ -337,7 +258,9 @@ fn record_execution_certs(consensus: &mut ConsensusState, block: &Block) {
         for outcome in cert.tx_outcomes() {
             consensus
                 .tx_cert_index
-                .insert(outcome.tx_hash(), *cert.tick_id());
+                .entry(outcome.tx_hash())
+                .or_default()
+                .insert(*cert.tick_id());
         }
     }
 }

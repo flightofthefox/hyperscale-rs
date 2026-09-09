@@ -3,8 +3,12 @@
 //! This is the single source of truth for what column families exist,
 //! what they store, and how their keys/values are encoded.
 
+use std::collections::BTreeSet;
+use std::marker::PhantomData;
+
+use hyperscale_hbor::{HborDecode, HborEncode};
 use hyperscale_types::{
-    Address, BlockHeight, BlockMetadata, ChainOrigin, ConsensusReceipt, EntryKey,
+    Address, Block, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, ConsensusReceipt, EntryKey,
     ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash,
     Provisions, SafeVoteRegisters, ShardWitnessPayload, SubstateKey, SweepBucket, TickId,
     Transaction, ValidatorId,
@@ -70,7 +74,7 @@ pub const JMT_NODES_CF: &str = "jmt_nodes";
 /// Column family for stale JMT nodes pending garbage collection.
 /// Key: `version_BE_8B` (the version at which nodes became stale).
 /// Value: HBOR-encoded `Vec<StaleTreePart>`.
-/// GC deletes entries older than `current_version - jmt_history_length`.
+/// GC deletes entries below the retention floor.
 pub const STALE_JMT_NODES_CF: &str = "stale_jmt_nodes";
 
 /// Column family indexing `state_history` entries by their write version so
@@ -129,8 +133,21 @@ pub const BEACON_WITNESSES_CF: &str = "beacon_witnesses";
 /// entry per committed version. Consensus-critical: shard-witness
 /// derivation reads the byte total behind a block's parent state, so it
 /// must be identical on every replica. GC prunes entries below the same
-/// `jmt_history_length` cutoff as historical tree data.
+/// retention floor as historical tree data.
 pub const SUBSTATE_BYTES_CF: &str = "substate_bytes";
+
+/// Column family for each version's weighted timestamp.
+///
+/// Key: `version_BE_8B`; value: HBOR-encoded `u64` — the milliseconds of
+/// the weighted timestamp on the QC that certified the block at that
+/// version. Written in the same batch as the commit, one entry per
+/// committed version, and it is what makes retention a span of time
+/// rather than a count of blocks: the floor is the oldest version still
+/// inside `RETENTION_HORIZON` of the tip, which is a question only these
+/// rows can answer. Kept here rather than read back off the block store
+/// so retention answers for itself — a version this shard holds tree
+/// data for is one it can date, whatever else has been pruned.
+pub const VERSION_TIME_CF: &str = "version_time";
 
 /// Column family for durable safe-vote registers, keyed by validator.
 ///
@@ -143,6 +160,17 @@ pub const SUBSTATE_BYTES_CF: &str = "substate_bytes";
 /// (fsynced) write before the corresponding vote or timeout signature
 /// leaves the process.
 pub const SAFE_VOTE_REGISTERS_CF: &str = "safe_vote_registers";
+
+/// Column family holding the uncommitted blocks that justify a
+/// validator's safe-vote registers, keyed by height then block hash.
+///
+/// A certificate is only usable while the block it names still exists,
+/// so these are written in the same synchronous batch as the registers
+/// and dropped by one range delete once the chain commits past them.
+/// The hash follows the height because two blocks can sit at one height
+/// across a fork, and the committed chain's view of that height belongs
+/// to [`BLOCKS_CF`].
+pub const VOTED_BLOCKS_CF: &str = "voted_blocks";
 
 /// Column family staging verified snap-sync chunks before finalize.
 ///
@@ -221,7 +249,9 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     TX_CERT_INDEX_CF,
     BEACON_WITNESSES_CF,
     SUBSTATE_BYTES_CF,
+    VERSION_TIME_CF,
     SAFE_VOTE_REGISTERS_CF,
+    VOTED_BLOCKS_CF,
     IMPORT_STAGING_CF,
     PROVISIONS_CF,
     PACKAGE_ARTIFACTS_CF,
@@ -254,7 +284,9 @@ pub struct CfHandles<'a> {
     tx_cert_index: &'a ColumnFamily,
     beacon_witnesses: &'a ColumnFamily,
     substate_bytes: &'a ColumnFamily,
+    version_time: &'a ColumnFamily,
     safe_vote_registers: &'a ColumnFamily,
+    voted_blocks: &'a ColumnFamily,
     import_staging: &'a ColumnFamily,
     provisions: &'a ColumnFamily,
     package_artifacts: &'a ColumnFamily,
@@ -289,7 +321,9 @@ impl<'a> CfHandles<'a> {
             tx_cert_index: resolve(TX_CERT_INDEX_CF),
             beacon_witnesses: resolve(BEACON_WITNESSES_CF),
             substate_bytes: resolve(SUBSTATE_BYTES_CF),
+            version_time: resolve(VERSION_TIME_CF),
             safe_vote_registers: resolve(SAFE_VOTE_REGISTERS_CF),
+            voted_blocks: resolve(VOTED_BLOCKS_CF),
             import_staging: resolve(IMPORT_STAGING_CF),
             package_artifacts: resolve(PACKAGE_ARTIFACTS_CF),
             sweep_index: resolve(SWEEP_INDEX_CF),
@@ -380,6 +414,20 @@ impl TypedCf for SubstateBytesCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.substate_bytes
+    }
+}
+
+/// Each version's weighted timestamp; see [`VERSION_TIME_CF`].
+pub struct VersionTimeCf;
+impl TypedCf for VersionTimeCf {
+    const NAME: &'static str = VERSION_TIME_CF;
+    type Key = u64; // version
+    type Value = u64; // weighted timestamp of the QC certifying it, in ms
+    type KeyCodec = BeU64Codec;
+    type ValueCodec = HborCodec<u64>;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.version_time
     }
 }
 
@@ -646,9 +694,14 @@ pub struct TxCertIndexCf;
 impl TypedCf for TxCertIndexCf {
     const NAME: &'static str = TX_CERT_INDEX_CF;
     type Key = Hash;
-    type Value = TickId;
+    /// Every tick of this shard's that carried an outcome for the
+    /// transaction, not the newest: a shard certifies one transaction
+    /// its verdict and then again whatever settles what the verdict left
+    /// — a retirement, a reclaim, an abandonment — and a counterpart
+    /// fetching by transaction cannot name which of them it wants.
+    type Value = BTreeSet<TickId>;
     type KeyCodec = HashCodec;
-    type ValueCodec = HborCodec<TickId>;
+    type ValueCodec = HborCodec<BTreeSet<TickId>>;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.tx_cert_index
@@ -710,35 +763,40 @@ impl DbCodec<ValidatorId> for ValidatorIdCodec {
     }
 }
 
-/// Value codec for [`SafeVoteRegistersCf`]: a 16-byte chain origin
-/// followed by the HBOR-encoded registers.
+/// Value codec for a record bound to a chain incarnation: a 16-byte
+/// chain origin followed by the HBOR-encoded value.
 ///
 /// The origin stays a raw prefix so a record's incarnation reads without
-/// decoding the rest; the registers carry a certificate, so their half is
-/// variable width.
-#[derive(Default)]
-pub struct SafeVoteRegisterRecordCodec;
+/// decoding the rest, which is what lets a store adopted from a parent
+/// shard ignore the parent's records rather than act on rounds and blocks
+/// belonging to an unrelated chain.
+pub struct OriginTaggedCodec<T>(PhantomData<T>);
 
-/// Bytes the [`ChainOrigin`] prefix occupies in a safe-vote record.
-const CHAIN_ORIGIN_BYTES: usize = 16;
-
-impl DbEncode<(ChainOrigin, SafeVoteRegisters)> for SafeVoteRegisterRecordCodec {
-    fn encode_to(&self, value: &(ChainOrigin, SafeVoteRegisters), buf: &mut Vec<u8>) {
-        ChainOriginCodec.encode_to(&value.0, buf);
-        HborCodec::<SafeVoteRegisters>::default().encode_to(&value.1, buf);
+impl<T> Default for OriginTaggedCodec<T> {
+    fn default() -> Self {
+        Self(PhantomData)
     }
 }
 
-impl DbCodec<(ChainOrigin, SafeVoteRegisters)> for SafeVoteRegisterRecordCodec {
-    fn decode(&self, bytes: &[u8]) -> (ChainOrigin, SafeVoteRegisters) {
+/// Bytes the [`ChainOrigin`] prefix occupies in an origin-tagged record.
+const CHAIN_ORIGIN_BYTES: usize = 16;
+
+impl<T: HborEncode> DbEncode<(ChainOrigin, T)> for OriginTaggedCodec<T> {
+    fn encode_to(&self, value: &(ChainOrigin, T), buf: &mut Vec<u8>) {
+        ChainOriginCodec.encode_to(&value.0, buf);
+        HborCodec::<T>::default().encode_to(&value.1, buf);
+    }
+}
+
+impl<T: HborEncode + HborDecode> DbCodec<(ChainOrigin, T)> for OriginTaggedCodec<T> {
+    fn decode(&self, bytes: &[u8]) -> (ChainOrigin, T) {
         assert!(
             bytes.len() > CHAIN_ORIGIN_BYTES,
-            "safe-vote register record must carry an origin and registers"
+            "an origin-tagged record must carry an origin and a value"
         );
         let origin = ChainOriginCodec.decode(&bytes[..CHAIN_ORIGIN_BYTES]);
-        let registers =
-            HborCodec::<SafeVoteRegisters>::default().decode(&bytes[CHAIN_ORIGIN_BYTES..]);
-        (origin, registers)
+        let value = HborCodec::<T>::default().decode(&bytes[CHAIN_ORIGIN_BYTES..]);
+        (origin, value)
     }
 }
 
@@ -749,10 +807,52 @@ impl TypedCf for SafeVoteRegistersCf {
     type Key = ValidatorId;
     type Value = (ChainOrigin, SafeVoteRegisters);
     type KeyCodec = ValidatorIdCodec;
-    type ValueCodec = SafeVoteRegisterRecordCodec;
+    type ValueCodec = OriginTaggedCodec<SafeVoteRegisters>;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.safe_vote_registers
+    }
+}
+
+/// Key codec for [`VotedBlocksCf`]: big-endian height then the block
+/// hash, so the commit sweep is one range delete and a fork sibling
+/// keeps its own key.
+#[derive(Default)]
+pub struct VotedBlockKeyCodec;
+
+impl DbEncode<(BlockHeight, BlockHash)> for VotedBlockKeyCodec {
+    fn encode_to(&self, value: &(BlockHeight, BlockHash), buf: &mut Vec<u8>) {
+        let (height, hash) = value;
+        buf.extend_from_slice(&height.inner().to_be_bytes());
+        buf.extend_from_slice(Hash::from(*hash).as_bytes());
+    }
+}
+
+impl DbCodec<(BlockHeight, BlockHash)> for VotedBlockKeyCodec {
+    fn decode(&self, bytes: &[u8]) -> (BlockHeight, BlockHash) {
+        assert_eq!(bytes.len(), 40, "voted-block key must be 8 + 32 bytes");
+        let (height, hash) = bytes.split_at(8);
+        (
+            BlockHeight::new(u64::from_be_bytes(
+                height.try_into().expect("length checked above"),
+            )),
+            BlockHash::from_raw(Hash::from_hash_bytes(hash)),
+        )
+    }
+}
+
+/// Uncommitted blocks justifying the safe-vote registers; see
+/// [`VOTED_BLOCKS_CF`].
+pub struct VotedBlocksCf;
+impl TypedCf for VotedBlocksCf {
+    const NAME: &'static str = VOTED_BLOCKS_CF;
+    type Key = (BlockHeight, BlockHash);
+    type Value = (ChainOrigin, Block);
+    type KeyCodec = VotedBlockKeyCodec;
+    type ValueCodec = OriginTaggedCodec<Block>;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.voted_blocks
     }
 }
 

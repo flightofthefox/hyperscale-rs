@@ -14,8 +14,8 @@
 use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
 
 use crate::{
-    Address, BlockHeight, ConsensusPublicKey, ConsensusSignature, Hash, ParamVote, Round, ShardId,
-    Stake, StakePoolId, ValidatorId,
+    Address, BlockHeight, ConsensusPublicKey, ConsensusSignature, Epoch, Hash, ParamVote, Round,
+    ShardId, Stake, StakePoolId, ValidatorId,
 };
 
 /// Domain tag for accumulator leaf hashing.
@@ -144,6 +144,16 @@ pub enum ShardWitnessPayload {
         /// shard today; explicit so the payload stays valid if
         /// emission ever moves off-shard.
         shard: ShardId,
+        /// The epoch the asserting block's committee is anchored in.
+        ///
+        /// What separates one assertion from the next. The shard's
+        /// window dedup suppresses a leaf the window already carries,
+        /// so a payload naming only its subject is one leaf for the
+        /// life of the shard: the shard states its load once ever, and
+        /// an assertion the beacon happened not to fold silences every
+        /// one after it. The window is trimmed at a base resolved from
+        /// this same anchor, so the two move together.
+        epoch: Epoch,
     },
     /// The shard's committed substate byte total fell below the merge
     /// threshold. The beacon parks the assertion until the sibling's
@@ -153,6 +163,9 @@ pub enum ShardWitnessPayload {
         /// shard's own parent today; explicit for the same reason as
         /// [`Self::ScheduleSplit::shard`].
         parent: ShardId,
+        /// The epoch the assertion was made in, for the reason
+        /// [`Self::ScheduleSplit::epoch`] carries it.
+        epoch: Epoch,
     },
     /// A cohort observer finished syncing its assigned pending child
     /// of the source shard and is ready for the reshape to execute.
@@ -365,9 +378,11 @@ mod tests {
             },
             ShardWitnessPayload::ScheduleSplit {
                 shard: ShardId::leaf(2, 0b01),
+                epoch: Epoch::new(9),
             },
             ShardWitnessPayload::ScheduleMerge {
                 parent: ShardId::leaf(1, 0b1),
+                epoch: Epoch::new(9),
             },
             ShardWitnessPayload::ReshapeReady {
                 validator: ValidatorId::new(13),

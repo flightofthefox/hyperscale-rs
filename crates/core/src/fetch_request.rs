@@ -18,8 +18,9 @@
 //! the fetch key (no id-set to enumerate).
 
 use hyperscale_types::{
-    BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, MessageClass, PredecessorTerminal,
-    ProvisionHash, ShardId, TxHash, ValidatorId,
+    Anchor, BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, MessageClass,
+    PredecessorTerminal, ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash,
+    ValidatorId,
 };
 
 /// Fetch family — one variant per payload type.
@@ -138,6 +139,74 @@ pub enum FetchRequest {
         /// Transactions whose membership in that chain's committed set
         /// is outstanding.
         tx_hashes: Vec<TxHash>,
+        /// Always `None` for this variant; see variant-level doc.
+        preferred: Option<ValidatorId>,
+        /// Optional class override; see enum-level doc.
+        class: Option<MessageClass>,
+    },
+    /// State proof of `keys` against a commit-proven remote header.
+    /// Routing shard is `anchor.shard`, whose committee holds the JMT
+    /// version the anchor's height names. `preferred` is `None`: every
+    /// member serves the same tree, so health-weighted rotation is what
+    /// moves off a peer that has pruned the height or serves a proof
+    /// against another root.
+    ///
+    /// The anchor rides whole rather than as a shard and height: its
+    /// root is what the proof is checked against before any answer
+    /// reaches the coordinator, and the answer is keyed by it so a
+    /// proof taken at one height never answers a probe at another.
+    StateProof {
+        /// The commit-proven state the proof reconstructs.
+        anchor: Anchor,
+        /// The keys whose presence or absence under it is wanted.
+        keys: Vec<SubstateKey>,
+        /// Always `None` for this variant; see variant-level doc.
+        preferred: Option<ValidatorId>,
+        /// Optional class override; see enum-level doc.
+        class: Option<MessageClass>,
+    },
+    /// A state proof this shard's own committee relays, for a cell a
+    /// block claims that this validator has not proven for itself.
+    ///
+    /// Routing shard is the local one: what is wanted is not a
+    /// counterpart's state but a peer's copy of a proof of it. Every
+    /// member probes, so most hold the bytes already, and the proposer
+    /// of the block making the claim certainly does. `preferred` is
+    /// `None` for that reason — any member that probed the anchor
+    /// answers, and health-weighted rotation is what moves off one that
+    /// did not.
+    ///
+    /// Distinct from [`Self::StateProof`] rather than a routing flag on
+    /// it, because a fetch is keyed by its ids: the two ask different
+    /// committees the same `(anchor, key)`, and one slot would hold
+    /// whichever asked first and never rotate to the other.
+    RelayedStateProof {
+        /// The commit-proven state the proof reconstructs.
+        anchor: Anchor,
+        /// The keys whose presence or absence under it is wanted.
+        keys: Vec<SubstateKey>,
+        /// Always the local shard for this variant.
+        shard: ShardId,
+        /// Always `None` for this variant; see variant-level doc.
+        preferred: Option<ValidatorId>,
+        /// Optional class override; see enum-level doc.
+        class: Option<MessageClass>,
+    },
+    /// A departed shard's settled-transaction set, checked against the
+    /// root this node's own beacon fold attests. Routing shard is
+    /// `evidence.shard`, whose terminal committee keeps serving while
+    /// any retained window carries it. `preferred` is `None`: every
+    /// member holds the same window.
+    ///
+    /// Carries the whole wanted set, re-derived on every beacon fold.
+    /// The node diffs it against what the fetch already holds, so a
+    /// terminal that drops out of the set here — the set acquired, the
+    /// evidence window closed, the shard evicted from every retained
+    /// window — is what releases its slot. An empty set is how the last
+    /// one retires.
+    SettledTxs {
+        /// Every terminal whose settled set is still wanted.
+        wanted: Vec<TerminalEvidence>,
         /// Always `None` for this variant; see variant-level doc.
         preferred: Option<ValidatorId>,
         /// Optional class override; see enum-level doc.

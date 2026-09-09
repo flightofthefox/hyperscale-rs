@@ -17,7 +17,7 @@ use crate::{
     ConsensusPublicKey, ConsensusReceipt, ExecutionCertificate, ExecutionCertificateContext,
     ExecutionCertificateVerifyError, ExecutionOutcome, FinalizationHash, GlobalReceiptHash, Hash,
     MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, StoredReceipt, TickId, TransactionDecision,
-    TxHash, TxOutcome, Verifiable, Verified, Verify,
+    TxClaim, TxHash, TxOutcome, Verifiable, Verified, Verify,
 };
 
 /// Cap on execution certificates accepted in a single [`Finalization`] at
@@ -383,6 +383,70 @@ impl Finalization {
     /// Iterator over the tick's tx hashes in canonical block order.
     pub fn tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
         self.local_ec().tx_outcomes().iter().map(TxOutcome::tx_hash)
+    }
+
+    /// The transactions this finalization resolves: those whose local
+    /// outcome bears the verdict. A leg that succeeded is named here and
+    /// resolved elsewhere, so it is among [`Self::tx_hashes`] and not
+    /// among these.
+    pub fn deciding_tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
+        self.local_ec()
+            .tx_outcomes()
+            .iter()
+            .filter(|outcome| outcome.decides())
+            .map(TxOutcome::tx_hash)
+    }
+
+    /// What this finalization claims of each counterpart's settled set,
+    /// per transaction — the question the split-boundary fence puts to
+    /// the sets, derived once for the proposer's gate and the voter's
+    /// fence so the two cannot judge one tick differently.
+    ///
+    /// A certificate a counterpart signed is a settlement claim on it:
+    /// `local` applies its half on coverage the counterpart attested, so
+    /// the counterpart must have settled its own. A local outcome no
+    /// counterpart attested, for a member that awaited some, is an
+    /// abandonment claim on each one it awaited: the abort is dominant
+    /// and needs no verdict of theirs, but it needs them not to have
+    /// settled. A member that awaited nobody — a leg, a core answering
+    /// alone, a reclaim — claims nothing: its verdict is its own, and no
+    /// counterpart's set can contradict it.
+    ///
+    /// Nor does a name `covered` claims anything: a committed record has
+    /// already established that no counterpart can settle it, in a form
+    /// that does not expire with the set it was read from, and putting
+    /// the question again would let the set's own horizon refuse a
+    /// verdict the chain already licensed.
+    pub fn claims(
+        &self,
+        local: ShardId,
+        covered: impl Fn(TxHash) -> bool,
+    ) -> Vec<(ShardId, TxHash, TxClaim)> {
+        let mut claims: Vec<(ShardId, TxHash, TxClaim)> = Vec::new();
+        let mut attested_remotely: HashSet<TxHash> = HashSet::new();
+        for ec in &self.execution_certificates {
+            let shard = ec.shard_id();
+            if shard == local {
+                continue;
+            }
+            for outcome in ec.tx_outcomes() {
+                attested_remotely.insert(outcome.tx_hash());
+                claims.push((shard, outcome.tx_hash(), TxClaim::Settled));
+            }
+        }
+        for outcome in self.local_ec().tx_outcomes() {
+            let tx_hash = outcome.tx_hash();
+            if attested_remotely.contains(&tx_hash) || covered(tx_hash) {
+                continue;
+            }
+            claims.extend(
+                outcome
+                    .counterparts()
+                    .iter()
+                    .map(|&shard| (shard, tx_hash, TxClaim::Abandoned)),
+            );
+        }
+        claims
     }
 
     /// Whether the tick contains a given tx.

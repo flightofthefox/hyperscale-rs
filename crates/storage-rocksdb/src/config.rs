@@ -59,15 +59,6 @@ pub struct RocksDbConfig {
     pub bytes_per_sync: usize,
     /// Number of log files to keep
     pub keep_log_file_num: usize,
-    /// Number of block heights of JMT history to retain before garbage collection.
-    ///
-    /// Stale JMT nodes are kept for this many heights before being
-    /// eligible for deletion. This enables historical queries within
-    /// this window.
-    ///
-    /// Set to 0 for immediate deletion (no history retention).
-    /// Defaults to 256.
-    pub jmt_history_length: u64,
     /// How many snap-sync boundary checkpoints the ring retains before
     /// evicting the oldest.
     ///
@@ -94,7 +85,6 @@ impl Default for RocksDbConfig {
             bloom_filter_bits: 10.0,
             bytes_per_sync: 1024 * 1024, // 1MB
             keep_log_file_num: 10,
-            jmt_history_length: 256,
             boundary_retain: BOUNDARY_RETAIN,
         }
     }

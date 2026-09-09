@@ -96,12 +96,10 @@ pub struct MemoryMetrics {
     pub exec_early_votes: usize,
     /// Expected execution certificates from remote shards.
     pub exec_expected_exec_certs: usize,
-    /// Verified state provisions per transaction.
-    pub exec_verified_provisions: usize,
-    /// Required provision shards per transaction.
+    /// Transactions with a provision bundle absorbed.
+    pub exec_absorbed_provisions: usize,
+    /// Candidates with a requirement set filed.
     pub exec_required_provision_shards: usize,
-    /// Received provision shards per transaction.
-    pub exec_received_provision_shards: usize,
     /// Ticks that have produced an execution certificate.
     pub exec_ticks_with_ec: usize,
     /// Ticks with pending vote retries.
@@ -356,6 +354,35 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// rebuild did not reach the transaction's own block, and the record
     /// is what puts it back in step with them.
     fn record_rebuilt_verdict_entry(&self) {}
+
+    /// Record a counterpart cell a committed proof answered for, as
+    /// `present` or absent — the fold every replica of a shard reaches
+    /// at the same height.
+    ///
+    /// Absences are what license a reclaim, so an absent rate rising
+    /// against a flat present one is counterparts going silent, not
+    /// proofs going missing.
+    fn record_reclaim_probe_answered(&self, present: bool) {}
+
+    /// Record a reclaim admitted into a tick — one transaction whose
+    /// escrowed value this shard is taking back on the evidence its
+    /// chain committed.
+    fn record_reclaim_admitted(&self) {}
+
+    /// A vote withheld because a block's verdict claim names a
+    /// certificate this validator does not hold.
+    fn record_verdict_claim_deferred(&self) {}
+
+    /// A fetch response the requester's own check refused, by fetch kind
+    /// and the check that refused it.
+    ///
+    /// Every evidence seam is a payload held against something the
+    /// checker already has, and the refusal is the only place the check
+    /// is observable: what the caller sees afterwards is the value
+    /// arriving from an honest peer instead, which an unattacked run
+    /// produces too. A rate above zero here is a responder answering
+    /// wrongly.
+    fn record_fetch_response_refused(&self, kind: &str, reason: &str) {}
 
     /// Set the in-flight request slot count for a `MessageClass`.
     ///
@@ -810,6 +837,35 @@ pub fn record_unresolvable_tx(cause: &str) {
 #[inline]
 pub fn record_rebuilt_verdict_entry() {
     recorder().record_rebuilt_verdict_entry();
+}
+
+/// Record a counterpart cell a committed proof answered for.
+#[inline]
+pub fn record_reclaim_probe_answered(present: bool) {
+    recorder().record_reclaim_probe_answered(present);
+}
+
+/// Record a reclaim admitted into a tick.
+#[inline]
+pub fn record_reclaim_admitted() {
+    recorder().record_reclaim_admitted();
+}
+
+/// Record a fetch response refused by the requester's own check.
+#[inline]
+pub fn record_fetch_response_refused(kind: &str, reason: &str) {
+    recorder().record_fetch_response_refused(kind, reason);
+}
+
+/// Record a vote withheld for want of the certificate a block's verdict
+/// claim names.
+///
+/// A refusal that never reached this validator is invisible once the
+/// chain carries the commitment rather than the bytes, so the frequency
+/// of the deferral is what says the push is working.
+#[inline]
+pub fn record_verdict_claim_deferred() {
+    recorder().record_verdict_claim_deferred();
 }
 
 /// Set the in-flight request slot count for a class.

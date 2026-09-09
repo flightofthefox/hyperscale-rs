@@ -19,15 +19,15 @@ use std::time::Instant;
 
 use hyperscale_metrics::{record_storage_operation, record_storage_read};
 use hyperscale_types::{
-    BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, BlockMetadata, CertifiedBlock,
-    Finalization, FinalizationHash, Hash, ProvisionHash, QuorumCertificate, Transaction, TxHash,
-    Verifiable, Verified,
+    BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata,
+    CertifiedBlock, Finalization, FinalizationHash, Hash, ProvisionHash, QuorumCertificate,
+    Transaction, TxHash, Verifiable, Verified,
 };
 use rocksdb::{ColumnFamily, WriteBatch};
 
 use super::column_families::{
     BeaconWitnessesCf, BlocksCf, CertificatesCf, ConsensusReceiptsCf, ProvisionKeyCodec,
-    ProvisionsCf, TransactionsCf,
+    ProvisionsCf, TransactionsCf, VotedBlockKeyCodec, VotedBlocksCf,
 };
 use super::core::RocksDbShardStorage;
 use super::metadata::{read_committed_hash, read_committed_height, read_committed_qc};
@@ -39,6 +39,7 @@ impl RocksDbShardStorage {
     /// Returns blocks in ascending height order. Uses `get_block_denormalized`
     /// for each height to properly reconstruct blocks from metadata + individual
     /// transaction/certificate entries.
+    #[must_use]
     pub fn get_blocks_range(&self, from: BlockHeight, to: BlockHeight) -> Vec<CertifiedBlock> {
         let mut result = Vec::new();
         let mut h = from.inner();
@@ -64,6 +65,7 @@ impl RocksDbShardStorage {
     }
 
     /// Get a transaction by hash.
+    #[must_use]
     pub fn get_transaction(&self, hash: &TxHash) -> Option<Transaction> {
         let start = Instant::now();
         let result = self.cf_get::<TransactionsCf>(&Hash::from(*hash));
@@ -75,6 +77,7 @@ impl RocksDbShardStorage {
     ///
     /// Uses `RocksDB`'s `multi_get_cf` for efficient batch retrieval.
     /// Returns only transactions that were found (missing hashes are skipped).
+    #[must_use]
     pub fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<Transaction> {
         if hashes.is_empty() {
             return vec![];
@@ -123,6 +126,7 @@ impl RocksDbShardStorage {
         block: &Block,
         qc: &Verified<QuorumCertificate>,
         beacon_witness_leaf_count_at_block_end: BeaconWitnessLeafCount,
+        retention_floor: u64,
     ) {
         // Resolve column-family handles once for the whole append loop.
         // Per-call `cf_put`/`cf_put_raw` would each invoke `self.cf()`,
@@ -139,6 +143,14 @@ impl RocksDbShardStorage {
             beacon_witness_leaf_count_at_block_end,
         );
         batch_put::<BlocksCf>(batch, blocks_cf, &block.height().inner(), &metadata);
+        // The chain now holds this height, so the vote justifications at
+        // or below it — this block and any fork sibling — have nothing
+        // left to justify. One range delete, in the commit's own batch.
+        batch.delete_range_cf(
+            VotedBlocksCf::handle(&cf),
+            VotedBlockKeyCodec.encode(&(BlockHeight::GENESIS, BlockHash::ZERO)),
+            VotedBlockKeyCodec.encode(&(block.height().next(), BlockHash::ZERO)),
+        );
         for tx in block.transactions().iter() {
             batch_put_raw::<TransactionsCf>(
                 batch,
@@ -156,7 +168,7 @@ impl RocksDbShardStorage {
                 &fw.attestation(),
             );
         }
-        self.append_provisions_to_batch(batch, block);
+        self.append_provisions_to_batch(batch, block, retention_floor);
     }
 
     /// Fold a block's provision bodies into the same batch, and drop
@@ -168,22 +180,20 @@ impl RocksDbShardStorage {
     ///
     /// The floor is the history retention floor rather than the
     /// unresolved set's: a replay reads state as of the block below the
-    /// one it starts at, and `snapshot_at` cannot serve that below
-    /// `height - jmt_history_length`. Nothing kept under that line could
-    /// be replayed against, so nothing under it is worth keeping.
+    /// one it starts at, and `snapshot_at` cannot serve below the floor.
+    /// Nothing kept under that line could be replayed against, so nothing
+    /// under it is worth keeping.
     ///
-    /// Cut at the floor rather than one above it, which is where the
-    /// lowest startable replay actually sits. The extra block costs one
-    /// commit's bundles and keeps the boundary from depending on the
-    /// commit's version matching its height, which a genesis commit
-    /// re-recording its own height does not.
-    fn append_provisions_to_batch(&self, batch: &mut WriteBatch, block: &Block) {
+    /// The floor is the one this commit's own advance established, passed
+    /// in rather than read back: the store still holds the previous one
+    /// until the batch lands, and cutting at that would keep a block of
+    /// bundles nothing can replay against.
+    fn append_provisions_to_batch(&self, batch: &mut WriteBatch, block: &Block, floor: u64) {
         let provisions = block.provisions();
         let height = block.height();
         let cf = self.cf();
         let provisions_cf = ProvisionsCf::handle(&cf);
 
-        let floor = height.inner().saturating_sub(self.jmt_history_length);
         if floor > 0 {
             let codec = ProvisionKeyCodec;
             batch.delete_range_cf(
@@ -209,8 +219,8 @@ impl RocksDbShardStorage {
     /// [`BeaconWitnessesCf`](crate::column_families::BeaconWitnessesCf),
     /// and a carried retention floor range-deletes the leaves below it.
     ///
-    /// Called from `commit_prepared_blocks` and `commit_block` so the
-    /// witness writes commit in the same atomic batch as the block + JMT.
+    /// Called from the prepared commit so the witness writes commit in
+    /// the same atomic batch as the block + JMT.
     pub(crate) fn append_beacon_witnesses_to_batch(
         &self,
         batch: &mut WriteBatch,
@@ -335,7 +345,8 @@ impl RocksDbShardStorage {
             transactions: Arc::new(transactions),
             certificates: Arc::new(certificates),
             provision_hashes: Arc::new(manifest.provision_hashes().clone()),
-            terminal_verdicts: Arc::new(manifest.terminal_verdicts().clone()),
+            abandonment_records: Arc::new(manifest.abandonment_records().clone()),
+            state_claims: Arc::new(manifest.state_claims().clone()),
             witness_sources: Arc::new(manifest.witness_sources().clone()),
         };
 
@@ -365,6 +376,7 @@ impl RocksDbShardStorage {
     ///
     /// Used for partial sync responses when the full block cannot be
     /// reconstructed (e.g., missing transactions or certificates).
+    #[must_use]
     pub fn get_block_metadata(&self, height: BlockHeight) -> Option<BlockMetadata> {
         let start = Instant::now();
         let metadata = self.cf_get::<BlocksCf>(&height.inner())?;
@@ -482,7 +494,8 @@ impl RocksDbShardStorage {
             transactions: Arc::new(transactions),
             certificates: Arc::new(certificates),
             provision_hashes: Arc::new(provision_hashes_bounded.clone()),
-            terminal_verdicts: Arc::new(manifest.terminal_verdicts().clone()),
+            abandonment_records: Arc::new(manifest.abandonment_records().clone()),
+            state_claims: Arc::new(manifest.state_claims().clone()),
             witness_sources: Arc::new(manifest.witness_sources().clone()),
         };
         let provision_hashes = provision_hashes_bounded;
@@ -561,6 +574,7 @@ impl RocksDbShardStorage {
     /// Reads all three chain metadata keys in one call. Use the individual
     /// `read_committed_height`, `read_committed_hash`, `read_latest_qc`
     /// methods when only one value is needed.
+    #[must_use]
     pub fn get_chain_metadata(
         &self,
     ) -> (
@@ -606,6 +620,7 @@ impl RocksDbShardStorage {
     }
 
     /// Get a finalization's attestation by identity.
+    #[must_use]
     pub fn get_certificate(&self, id: &FinalizationHash) -> Option<Finalization> {
         self.cf_get::<CertificatesCf>(id)
     }
@@ -614,6 +629,7 @@ impl RocksDbShardStorage {
     ///
     /// Uses `RocksDB`'s `multi_get_cf` for efficient batch retrieval.
     /// Returns only certificates that were found (missing ids are skipped).
+    #[must_use]
     pub fn get_certificates_batch(&self, ids: &[FinalizationHash]) -> Vec<Finalization> {
         if ids.is_empty() {
             return vec![];
@@ -640,21 +656,13 @@ impl RocksDbShardStorage {
 // code can't accidentally call them.
 #[cfg(test)]
 mod test_helpers {
-    use hyperscale_metrics::{
-        record_certificate_persisted, record_storage_batch_size, record_storage_operation,
-        record_storage_write,
-    };
-    use hyperscale_types::{BlockHeight, Finalization, Hash, QuorumCertificate, SettledWrites};
+    use hyperscale_types::{BlockHeight, Hash, QuorumCertificate};
     use rocksdb::{WriteBatch, WriteOptions};
-    use tracing::field::Empty;
-    use tracing::{Level, Span, instrument};
 
-    use super::super::column_families::CertificatesCf;
     use super::super::core::RocksDbShardStorage;
     use super::super::metadata::{
         write_committed_hash, write_committed_height, write_committed_qc,
     };
-    use super::Instant;
 
     impl RocksDbShardStorage {
         /// Test-only seed for `committed_height` / `committed_hash` /
@@ -683,69 +691,6 @@ mod test_helpers {
             self.db
                 .write_opt(batch, &opts)
                 .expect("set_chain_metadata: synced write failed");
-        }
-
-        /// Test-only deferred-commit shim for a single finalization
-        /// plus its state writes. Production goes through `commit_block`,
-        /// which folds the cert and state writes into the atomic
-        /// JMT-update batch under `commit_lock`.
-        ///
-        /// # Panics
-        /// Panics if the synced commit fails.
-        #[instrument(level = Level::DEBUG, skip_all, fields(
-            tick_id = ?certificate.tick_id(),
-            latency_us = Empty,
-            otel.kind = "INTERNAL",
-        ))]
-        pub fn commit_certificate_with_writes(
-            &self,
-            certificate: &Finalization,
-            writes: &SettledWrites,
-        ) {
-            let start = Instant::now();
-            let mut batch = WriteBatch::default();
-            let mut write_count = 0usize;
-
-            self.cf_put::<CertificatesCf>(&mut batch, &certificate.receipt_hash(), certificate);
-            write_count += 1;
-
-            // Append substate writes to the cert batch at the current JMT
-            // version. Delegates to `append_substate_writes_to_batch` so
-            // the state-history capture stays single-sourced with the
-            // production commit path.
-            let version = self.read_jmt_metadata().0;
-            self.append_substate_writes_to_batch(
-                &mut batch,
-                writes,
-                version,
-                /* write_history */ true,
-                /* base_reads */ None,
-                /* pending */ &[],
-            );
-            write_count += writes.cells().len();
-
-            let mut write_opts = WriteOptions::default();
-            write_opts.set_sync(true);
-            self.db
-                .write_opt(batch, &write_opts)
-                .expect("commit_certificate_with_writes: synced commit failed");
-
-            tracing::debug!(
-                tick_id = ?certificate.tick_id(),
-                write_count,
-                "Certificate state writes committed (JMT deferred to block commit)"
-            );
-
-            let elapsed = start.elapsed();
-            record_storage_write(elapsed.as_secs_f64());
-            record_storage_operation("commit_cert_writes", elapsed.as_secs_f64());
-            record_storage_batch_size(write_count);
-            record_certificate_persisted();
-
-            Span::current().record(
-                "latency_us",
-                u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
-            );
         }
     }
 }

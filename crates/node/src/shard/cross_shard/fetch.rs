@@ -1,30 +1,37 @@
 //! Cross-shard fetch bindings.
 //!
 //! The [`FetchBinding`] impls for the cross-shard data-availability payloads —
-//! provisions, execution certificates, finalizations, and local provisions.
+//! provisions, execution certificates, finalizations, local provisions, and
+//! the answers checked against a remote chain's committed state.
 //! Each `fetch_mut` resolves the binding's `Fetch` instance out of this shard's
 //! [`CrossShardState`](super::CrossShardState). The generic engine, the
 //! `FetchBinding` trait, and the shared `partition_solicited` helper live in
 //! [`crate::fetch`].
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
-use hyperscale_core::ProtocolEvent;
-use hyperscale_network::{Network, ResponseVerdict};
+use hyperscale_core::{FetchIds, ProtocolEvent};
+use hyperscale_metrics::record_fetch_response_refused;
+use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
     GetCommittedTxsRequest, GetExecutionCertsRequest, GetFinalizationsRequest,
-    GetLocalProvisionsRequest, GetProvisionsRequest,
+    GetLocalProvisionsRequest, GetProvisionsRequest, GetRelayedStateProofRequest,
+    GetSettledTxsRequest, GetStateProofRequest,
 };
-use hyperscale_types::network::response::CommittedTxVerdict;
+use hyperscale_types::network::response::{
+    CommittedTxVerdict, GetCommittedTxsResponse, GetSettledTxsResponse, GetStateProofResponse,
+};
 use hyperscale_types::{
-    BlockHeight, ExecutionCertificate, Finalization, FinalizationHash, MessageClass,
-    PredecessorTerminal, ProvisionHash, ShardId, TxHash, ValidatorId, Verifiable,
+    Anchor, BlockHeight, ExecutionCertificate, Finalization, FinalizationHash, MessageClass,
+    PredecessorTerminal, ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash,
+    ValidatorId, Verifiable, settled_txs_root_from_hashes,
 };
 
-use crate::fetch::{Fetch, FetchBinding, partition_solicited};
+use crate::fetch::{
+    Fetch, FetchBinding, Refusal, ScopedAnswer, dispatch_scoped, partition_solicited,
+};
 use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, push_shard_input};
 
 // ─── Type aliases ──────────────────────────────────────────────────────
@@ -45,6 +52,11 @@ pub type ProvisionFetch = Fetch<(ShardId, ShardId, BlockHeight)>;
 /// reconstruct, and its `committed_txs_root` is the key each absence
 /// proof is checked against.
 pub type CommittedTxFetch = Fetch<(PredecessorTerminal, TxHash)>;
+pub type StateProofFetch = Fetch<(Anchor, SubstateKey)>;
+/// Settled-set fetch keyed by the departed shard's terminal evidence:
+/// the terminal the window is reconstructed from and the root the list
+/// must recompute to.
+pub type SettledTxsFetch = Fetch<TerminalEvidence>;
 
 // ─── Bindings ──────────────────────────────────────────────────────────
 
@@ -55,6 +67,10 @@ impl FetchBinding for LocalProvisionBinding {
     type Id = ProvisionHash;
 
     const NAME: &'static str = "local_provision";
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::LocalProvisions(ids)
+    }
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<ProvisionHash> {
         &mut shard.cross_shard.local_provision
@@ -108,9 +124,7 @@ impl FetchBinding for LocalProvisionBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::LocalProvisionsFetchFailed {
-                                hashes: split.missing,
-                            },
+                            ShardScopedInput::FetchFailed(Self::ids(split.missing)),
                         );
                     }
                     // Reject the response if the peer shipped unsolicited
@@ -124,7 +138,7 @@ impl FetchBinding for LocalProvisionBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::LocalProvisionsFetchFailed { hashes: hs },
+                        ShardScopedInput::FetchFailed(Self::ids(hs)),
                     );
                     ResponseVerdict::Accept
                 }
@@ -140,6 +154,10 @@ impl FetchBinding for FinalizationBinding {
     type Id = FinalizationHash;
 
     const NAME: &'static str = "finalization";
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::Finalizations(ids)
+    }
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<FinalizationHash> {
         &mut shard.cross_shard.finalization
@@ -184,7 +202,7 @@ impl FetchBinding for FinalizationBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::FinalizationsFetchFailed { ids: split.missing },
+                            ShardScopedInput::FetchFailed(Self::ids(split.missing)),
                         );
                     }
                     // Reject responses with unsolicited ticks (peer scoring;
@@ -199,7 +217,7 @@ impl FetchBinding for FinalizationBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::FinalizationsFetchFailed { ids: requested_ids },
+                        ShardScopedInput::FetchFailed(Self::ids(requested_ids)),
                     );
                     ResponseVerdict::Accept
                 }
@@ -219,6 +237,10 @@ impl FetchBinding for ExecCertBinding {
     type Id = (ShardId, TxHash);
 
     const NAME: &'static str = "exec_cert";
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::ExecutionCerts(ids)
+    }
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<(ShardId, TxHash)> {
         &mut shard.cross_shard.exec_cert
@@ -272,9 +294,7 @@ impl FetchBinding for ExecCertBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::ExecCertFetchFailed {
-                                hashes: split.missing,
-                            },
+                            ShardScopedInput::FetchFailed(Self::ids(split.missing)),
                         );
                     }
                     // Reject the response if the peer shipped unsolicited
@@ -289,7 +309,7 @@ impl FetchBinding for ExecCertBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::ExecCertFetchFailed { hashes: failed_ids },
+                        ShardScopedInput::FetchFailed(Self::ids(failed_ids)),
                     );
                     ResponseVerdict::Accept
                 }
@@ -345,6 +365,10 @@ impl FetchBinding for CommittedTxBinding {
 
     const NAME: &'static str = "committed_tx";
 
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::CommittedTxs(ids)
+    }
+
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
         &mut shard.cross_shard.committed_tx
     }
@@ -358,82 +382,263 @@ impl FetchBinding for CommittedTxBinding {
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
-        // A chunk is grouped by `(shard, preferred, class)`, which does
-        // not separate two terminals of the same shard, and one request
-        // resolves against exactly one terminal. Split by terminal here
-        // rather than assume the chunk is uniform.
-        let mut by_terminal: BTreeMap<PredecessorTerminal, Vec<TxHash>> = BTreeMap::new();
-        for (predecessor, tx_hash) in ids {
-            by_terminal.entry(predecessor).or_default().push(tx_hash);
+        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
+    }
+}
+
+impl ScopedAnswer for CommittedTxBinding {
+    type Scope = PredecessorTerminal;
+    type Key = TxHash;
+    type Request = GetCommittedTxsRequest;
+
+    fn split(id: Self::Id) -> (Self::Scope, Self::Key) {
+        id
+    }
+
+    fn join(scope: Self::Scope, key: Self::Key) -> Self::Id {
+        (scope, key)
+    }
+
+    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
+        GetCommittedTxsRequest::new(scope.height, scope.block_hash, keys.to_vec())
+    }
+
+    /// Absence is the answer that relaxes the successor's standing
+    /// refusal, so it is the one that has to lift to the terminal's
+    /// `committed_txs_root`; `Committed` is what the successor already
+    /// assumes and carries no proof.
+    fn answer(
+        scope: Self::Scope,
+        keys: Vec<Self::Key>,
+        response: GetCommittedTxsResponse,
+    ) -> Result<ProtocolEvent, Refusal> {
+        let verdicts = response.verdicts.ok_or(Refusal::NotHeld)?;
+        let answers = verified_answers(&verdicts, scope, &keys)
+            .ok_or(Refusal::Unusable("unusable_verdicts"))?;
+        Ok(ProtocolEvent::PrecutResolutionsReceived {
+            predecessor: scope.shard,
+            answers,
+        })
+    }
+}
+
+/// Marker type for the state-proof fetch against a commit-proven remote
+/// header.
+pub struct StateProofBinding;
+
+impl FetchBinding for StateProofBinding {
+    /// `(anchor, key)` — the commit-proven state the proof reconstructs
+    /// and one key whose presence under it is asked. The anchor rides
+    /// whole because its root is what the answer is checked against
+    /// before it reaches the coordinator.
+    type Id = (Anchor, SubstateKey);
+
+    const NAME: &'static str = "state_proof";
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::StateProofs(ids)
+    }
+
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+        &mut shard.cross_shard.state_proof
+    }
+
+    fn dispatch_chunk<N: Network>(
+        ids: Vec<Self::Id>,
+        local_shard: ShardId,
+        shard: ShardId,
+        preferred: Option<ValidatorId>,
+        class: Option<MessageClass>,
+        network: &N,
+        sender: &Sender<HostEvent>,
+    ) {
+        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
+    }
+}
+
+impl ScopedAnswer for StateProofBinding {
+    type Scope = Anchor;
+    type Key = SubstateKey;
+    type Request = GetStateProofRequest;
+
+    fn split(id: Self::Id) -> (Self::Scope, Self::Key) {
+        id
+    }
+
+    fn join(scope: Self::Scope, key: Self::Key) -> Self::Id {
+        (scope, key)
+    }
+
+    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
+        GetStateProofRequest::new(scope.height, keys.to_vec())
+    }
+
+    /// Checked here so an unusable proof rotates the peer rather than
+    /// reaching a block. What it says is read off the block that carries
+    /// it, by every replica.
+    fn answer(
+        scope: Self::Scope,
+        keys: Vec<Self::Key>,
+        response: GetStateProofResponse,
+    ) -> Result<ProtocolEvent, Refusal> {
+        let proof = response.proof.ok_or(Refusal::NotHeld)?;
+        proof
+            .inclusions(scope.state_root, scope.shard, &keys)
+            .map_err(|_| Refusal::Unusable("unusable_proof"))?;
+        Ok(ProtocolEvent::FetchedStateProofVerified {
+            anchor: scope,
+            keys,
+            proof,
+        })
+    }
+}
+
+/// Marker type for the state-proof relay: the same question as
+/// [`StateProofBinding`], put to this shard's own committee.
+///
+/// A separate binding rather than a routing argument on that one,
+/// because a fetch is keyed by its ids: the two ask different committees
+/// about the same `(anchor, key)`, and one slot would hold whichever
+/// asked first. The answer is the same event, since a proof is checked
+/// against the anchor's root whoever served it.
+pub struct StateProofRelayBinding;
+
+impl FetchBinding for StateProofRelayBinding {
+    /// `(anchor, key)`, as [`StateProofBinding`].
+    type Id = (Anchor, SubstateKey);
+
+    const NAME: &'static str = "relayed_state_proof";
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::RelayedStateProofs(ids)
+    }
+
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+        &mut shard.cross_shard.relayed_state_proof
+    }
+
+    fn dispatch_chunk<N: Network>(
+        ids: Vec<Self::Id>,
+        local_shard: ShardId,
+        shard: ShardId,
+        preferred: Option<ValidatorId>,
+        class: Option<MessageClass>,
+        network: &N,
+        sender: &Sender<HostEvent>,
+    ) {
+        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
+    }
+}
+
+impl ScopedAnswer for StateProofRelayBinding {
+    type Scope = Anchor;
+    type Key = SubstateKey;
+    type Request = GetRelayedStateProofRequest;
+
+    fn split(id: Self::Id) -> (Self::Scope, Self::Key) {
+        id
+    }
+
+    fn join(scope: Self::Scope, key: Self::Key) -> Self::Id {
+        (scope, key)
+    }
+
+    /// The anchor's shard rides in the body: the request goes to this
+    /// shard's committee, and what it asks about is another shard's
+    /// state.
+    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
+        GetRelayedStateProofRequest::new(scope.shard, scope.height, keys.to_vec())
+    }
+
+    /// Checked here, against the anchor the requester commit-proved, so
+    /// a peer passing on a proof of any other tree rotates rather than
+    /// being believed.
+    fn answer(
+        scope: Self::Scope,
+        keys: Vec<Self::Key>,
+        response: GetStateProofResponse,
+    ) -> Result<ProtocolEvent, Refusal> {
+        let proof = response.proof.ok_or(Refusal::NotHeld)?;
+        proof
+            .inclusions(scope.state_root, scope.shard, &keys)
+            .map_err(|_| Refusal::Unusable("unusable_proof"))?;
+        Ok(ProtocolEvent::FetchedStateProofVerified {
+            anchor: scope,
+            keys,
+            proof,
+        })
+    }
+}
+
+/// Marker type for the settled-set fetch against a departed shard's
+/// terminal.
+pub struct SettledTxsBinding;
+
+impl FetchBinding for SettledTxsBinding {
+    /// The terminal to ask for and the root the answer must recompute
+    /// to, read off this node's own beacon fold. A revised terminal is a
+    /// different id.
+    type Id = TerminalEvidence;
+
+    const NAME: &'static str = "settled_txs";
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::SettledTxs(ids)
+    }
+
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+        &mut shard.cross_shard.settled_txs
+    }
+
+    fn dispatch_chunk<N: Network>(
+        ids: Vec<Self::Id>,
+        local_shard: ShardId,
+        shard: ShardId,
+        preferred: Option<ValidatorId>,
+        class: Option<MessageClass>,
+        network: &N,
+        sender: &Sender<HostEvent>,
+    ) {
+        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
+    }
+}
+
+/// One request reconstructs one terminal's whole window, so the evidence
+/// is the scope and the question under it is the window itself.
+impl ScopedAnswer for SettledTxsBinding {
+    type Scope = TerminalEvidence;
+    type Key = ();
+    type Request = GetSettledTxsRequest;
+
+    fn split(id: Self::Id) -> (Self::Scope, Self::Key) {
+        (id, ())
+    }
+
+    fn join(scope: Self::Scope, (): Self::Key) -> Self::Id {
+        scope
+    }
+
+    fn request(scope: Self::Scope, _keys: &[Self::Key]) -> Self::Request {
+        GetSettledTxsRequest::new(scope.height, scope.block_hash)
+    }
+
+    /// The list is complete or it is nothing: a root over the whole
+    /// window means a peer can neither hide a settled transaction nor
+    /// add one, which is what makes every absence from the set sound.
+    fn answer(
+        scope: Self::Scope,
+        _keys: Vec<Self::Key>,
+        response: GetSettledTxsResponse,
+    ) -> Result<ProtocolEvent, Refusal> {
+        let txs = response.txs.ok_or(Refusal::NotHeld)?;
+        if settled_txs_root_from_hashes(txs.iter()) != scope.attested_root {
+            return Err(Refusal::Unusable("root_mismatch"));
         }
-        for (predecessor, tx_hashes) in by_terminal {
-            debug_assert_eq!(
-                shard, predecessor.shard,
-                "CommittedTxBinding routes to the predecessor; the scan sets it from the id",
-            );
-            let requested: Vec<Self::Id> =
-                tx_hashes.iter().map(|hash| (predecessor, *hash)).collect();
-            let request =
-                GetCommittedTxsRequest::new(predecessor.height, predecessor.block_hash, tx_hashes);
-            let es = sender.clone();
-            network.request(
-                shard,
-                preferred,
-                request,
-                class,
-                Box::new(move |result| {
-                    let asked: Vec<TxHash> = requested.iter().map(|(_, hash)| *hash).collect();
-                    let Ok(response) = result else {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::CommittedTxsFetchFailed { ids: requested },
-                        );
-                        return ResponseVerdict::Accept;
-                    };
-                    // This peer doesn't hold the named terminal — rotate.
-                    let Some(verdicts) = response.verdicts else {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::CommittedTxsFetchFailed { ids: requested },
-                        );
-                        return ResponseVerdict::Reject;
-                    };
-                    let Some(answers) = verified_answers(&verdicts, predecessor, &asked) else {
-                        tracing::warn!(
-                            predecessor = ?predecessor.shard,
-                            asked = asked.len(),
-                            answered = verdicts.len(),
-                            "Dropping committed-transaction response: unusable verdicts"
-                        );
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::CommittedTxsFetchFailed { ids: requested },
-                        );
-                        return ResponseVerdict::Reject;
-                    };
-                    // Release the slots before delivering the answers, so
-                    // the freed capacity is available if handling the
-                    // delivery re-drives this fetch.
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::CommittedTxsFetchFulfilled { ids: requested },
-                    );
-                    push_protocol_event(
-                        &es,
-                        local_shard,
-                        ProtocolEvent::PrecutResolutionsReceived {
-                            predecessor: predecessor.shard,
-                            answers,
-                        },
-                    );
-                    ResponseVerdict::Accept
-                }),
-            );
-        }
+        Ok(ProtocolEvent::SettledTxsReconstructed {
+            shard: scope.shard,
+            txs: txs.into_iter().collect(),
+            terminal_wt: scope.terminal_wt,
+        })
     }
 }
 
@@ -448,6 +653,10 @@ impl FetchBinding for ProvisionBinding {
     /// Cross-shard provisions are addressed by a single `(shard, height)` —
     /// each request targets exactly one scope.
     const PER_ID: bool = true;
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::RemoteProvisions(ids)
+    }
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
         &mut shard.cross_shard.provision
@@ -487,15 +696,22 @@ impl FetchBinding for ProvisionBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::ProvisionsFetchFailed {
+                        ShardScopedInput::FetchFailed(Self::ids(vec![(
                             source_shard,
+                            target_shard,
                             block_height,
-                        },
+                        )])),
                     );
                 };
-                let Ok(response) = result else {
-                    push_fetch_failed();
-                    return ResponseVerdict::Accept;
+                let response = match result {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if matches!(error, RequestError::PeerError(_)) {
+                            record_fetch_response_refused("provision", "unusable_answer");
+                        }
+                        push_fetch_failed();
+                        return ResponseVerdict::Accept;
+                    }
                 };
                 let Some(provisions) = response.provisions else {
                     push_fetch_failed();
@@ -514,6 +730,7 @@ impl FetchBinding for ProvisionBinding {
                         got_height = provisions.block_height().inner(),
                         "Dropping provision fetch response: scope mismatch"
                     );
+                    record_fetch_response_refused("provision", "scope_mismatch");
                     push_fetch_failed();
                     return ResponseVerdict::Reject;
                 }
@@ -645,5 +862,182 @@ mod committed_tx_tests {
         let answers = verified_answers(&[absence(&[], probe)], terminal, &[probe])
             .expect("absence over an empty set verifies");
         assert_eq!(answers, vec![(probe, true)]);
+    }
+}
+
+#[cfg(test)]
+mod settled_txs_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+
+    use hyperscale_storage::PendingChain;
+    use hyperscale_storage::test_helpers::{commit_settled_at, make_test_certified};
+    use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_types::{
+        AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ExecutionCertificate,
+        ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash,
+        ProposerTimestamp, QuorumCertificate, Round, SettledTxsRoot, SignerBitfield, TickHalf,
+        TickId, TxOutcome, Verified, WeightedTimestamp, WitnessSources,
+    };
+
+    use super::*;
+    use crate::shard::cross_shard::serve_settled_txs_request;
+
+    const SHARD: ShardId = ShardId::ROOT;
+
+    /// The transaction the tick at `height` settles — distinct per tick,
+    /// so a window over several ticks has one entry each.
+    fn settled_tx(height: u64) -> TxHash {
+        TxHash::from(Hash::from_bytes(&height.to_le_bytes()))
+    }
+
+    fn certificate(tick: TickId, height: u64) -> Arc<ExecutionCertificate> {
+        Arc::new(ExecutionCertificate::new(
+            tick,
+            WeightedTimestamp::from_millis(1),
+            GlobalReceiptRoot::ZERO,
+            vec![TxOutcome::new(
+                settled_tx(height),
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            )],
+            AggregateSignature::new([0u8; 96]),
+            SignerBitfield::new(4),
+        ))
+    }
+
+    /// A finalization settling one transaction beside a counterpart's
+    /// certificate for it: what makes it reach beyond this shard, and so
+    /// what puts it in the settled set.
+    fn finalization(height: u64) -> Arc<Verifiable<Finalization>> {
+        let tick = TickId::new(SHARD, BlockHeight::new(height));
+        let remote = TickId::new(ShardId::from_heap_index(2), BlockHeight::new(height));
+        Arc::new(Verifiable::from(Finalization::new(
+            tick,
+            TickHalf::Determined,
+            vec![certificate(tick, height), certificate(remote, height)],
+            vec![],
+        )))
+    }
+
+    /// Commit `count` blocks (1..=count), each carrying its own settled
+    /// tick, and return the storage, the terminal hash, and the attested
+    /// settled root over the whole window.
+    fn served_chain(count: u64) -> (Arc<SimShardStorage>, BlockHash, SettledTxsRoot) {
+        let storage = Arc::new(SimShardStorage::default());
+        let mut parent = BlockHash::ZERO;
+        for h in 1..=count {
+            let certs = [finalization(h)];
+            let parent_qc = QuorumCertificate::new(
+                parent,
+                SHARD,
+                BlockHeight::new(h.saturating_sub(1)),
+                BlockHash::ZERO,
+                Round::INITIAL,
+                SignerBitfield::new(4),
+                AggregateSignature::new([0u8; 96]),
+                WeightedTimestamp::from_millis(1_000 * h),
+            );
+            let header = BlockHeader::new(BlockHeaderParts {
+                shard_id: SHARD,
+                height: BlockHeight::new(h),
+                parent_block_hash: parent,
+                parent_qc: parent_qc.into(),
+                timestamp: ProposerTimestamp::from_millis(1_000 * h),
+                certificate_root: *Verified::<CertificateRoot>::compute(&certs).as_ref(),
+                provision_tx_roots: BTreeMap::new(),
+                ..Default::default()
+            });
+            let block = Block::Live {
+                header,
+                transactions: Arc::new(Vec::new()),
+                certificates: Arc::new(certs.to_vec()),
+                provisions: Arc::new(Vec::new()),
+                abandonment_records: Arc::new(Vec::new()),
+                state_claims: Arc::new(Vec::new()),
+                witness_sources: Arc::new(WitnessSources::empty()),
+            };
+            parent = block.hash();
+            commit_settled_at(
+                storage.as_ref(),
+                &make_test_certified(block),
+                &[],
+                &[],
+                &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+            );
+        }
+        let root =
+            settled_txs_root_from_hashes((1..=count).map(settled_tx).collect::<Vec<_>>().iter());
+        (storage, parent, root)
+    }
+
+    fn evidence(terminal: BlockHash, attested_root: SettledTxsRoot) -> TerminalEvidence {
+        TerminalEvidence {
+            shard: SHARD,
+            height: BlockHeight::new(3),
+            block_hash: terminal,
+            terminal_wt: WeightedTimestamp::from_millis(9_000),
+            attested_root,
+        }
+    }
+
+    /// The served window recomputes to the attested root and reaches the
+    /// coordinator whole, stamped with the terminal's clock.
+    #[test]
+    fn a_served_window_lifts_to_the_attested_root() {
+        let (storage, terminal, root) = served_chain(3);
+        let pending_chain = PendingChain::new(storage);
+        let scope = evidence(terminal, root);
+        let response = serve_settled_txs_request(
+            &pending_chain,
+            None,
+            &SettledTxsBinding::request(scope, &[]),
+        );
+        match SettledTxsBinding::answer(scope, vec![()], response) {
+            Ok(ProtocolEvent::SettledTxsReconstructed {
+                shard,
+                txs,
+                terminal_wt,
+            }) => {
+                assert_eq!(shard, SHARD);
+                assert_eq!(terminal_wt, WeightedTimestamp::from_millis(9_000));
+                assert_eq!(
+                    txs,
+                    BTreeSet::from([settled_tx(1), settled_tx(2), settled_tx(3)])
+                );
+            }
+            other => panic!("expected the reconstructed set, got {other:?}"),
+        }
+    }
+
+    /// A list that does not recompute to the attested root is refused
+    /// as unusable rather than recorded: the peer rotates.
+    #[test]
+    fn a_window_off_the_attested_root_is_unusable() {
+        let (storage, terminal, _) = served_chain(3);
+        let pending_chain = PendingChain::new(storage);
+        let scope = evidence(terminal, settled_txs_root_from_hashes([&settled_tx(99)]));
+        let response = serve_settled_txs_request(
+            &pending_chain,
+            None,
+            &SettledTxsBinding::request(scope, &[]),
+        );
+        assert_eq!(
+            SettledTxsBinding::answer(scope, vec![()], response).err(),
+            Some(Refusal::Unusable("root_mismatch"))
+        );
+    }
+
+    /// A peer that does not hold the terminal is not held against; the
+    /// ids release for the next peer.
+    #[test]
+    fn a_peer_without_the_terminal_is_not_held() {
+        let scope = evidence(BlockHash::ZERO, SettledTxsRoot::ZERO);
+        assert_eq!(
+            SettledTxsBinding::answer(scope, vec![()], GetSettledTxsResponse::not_found()).err(),
+            Some(Refusal::NotHeld)
+        );
     }
 }

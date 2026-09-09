@@ -15,8 +15,8 @@ use hyperscale_jmt::NibblePath;
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::put_at_version;
 use hyperscale_storage::{
-    DedupWindow, GenesisCommit, ImportProgress, RecoveredState, SubstateStore, Substates,
-    replay_window,
+    DedupWindow, GenesisCommit, ImportProgress, RecoveredState, SafeVoteRegisterStore,
+    SubstateStore, Substates, replay_window,
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHeight, Hash, QuorumCertificate, SettledWrites, StateRoot,
@@ -47,10 +47,9 @@ use super::state::{ConsensusState, SharedState, apply_writes};
 ///   Separate because consensus metadata is independent of substate/JMT state.
 ///
 /// Every field is behind a shared handle, so a [`Clone`] is another
-/// handle onto the *same* store — the in-memory analogue of
-/// production's `SharedStorage` wrapper over one `RocksDB` instance. A
-/// shard's storage can therefore be retained across a runtime
-/// leave/rejoin cycle.
+/// handle onto the *same* store, as a `RocksDbShardStorage` clone is
+/// onto one database. A shard's storage can therefore be retained
+/// across a runtime leave/rejoin cycle.
 #[derive(Clone)]
 pub struct SimShardStorage {
     /// Substate data + JMT state (single `RwLock`).
@@ -58,13 +57,6 @@ pub struct SimShardStorage {
 
     /// Consensus metadata (single `RwLock`).
     pub(crate) consensus: Arc<RwLock<ConsensusState>>,
-
-    /// Retention window for historical substate reads. `snapshot_at(V)`
-    /// panics if `V < current_version - jmt_history_length` (saturating).
-    /// Defaults to `u64::MAX` so tests keep working — deliberately set
-    /// a smaller value in tests that want to exercise retention
-    /// behaviour.
-    pub(crate) jmt_history_length: u64,
 
     /// Boundary heights pinned for snap-sync serving. The in-memory
     /// store retains every JMT version, so a pin is pure bookkeeping —
@@ -105,23 +97,19 @@ impl SimShardStorage {
         Self {
             state: Arc::new(RwLock::new(shared)),
             consensus: Arc::new(RwLock::new(ConsensusState::new())),
-            jmt_history_length: u64::MAX,
             boundary_pins: Arc::new(RwLock::new(BTreeSet::new())),
             import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
         }
     }
 
-    /// Create storage with a specific retention window. Used by tests
-    /// that exercise the retention panic.
+    /// The oldest version this store answers historical reads at.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state lock is poisoned.
     #[must_use]
-    pub fn with_jmt_history_length(jmt_history_length: u64) -> Self {
-        Self {
-            state: Arc::new(RwLock::new(SharedState::new())),
-            consensus: Arc::new(RwLock::new(ConsensusState::new())),
-            jmt_history_length,
-            boundary_pins: Arc::new(RwLock::new(BTreeSet::new())),
-            import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
-        }
+    pub fn retention_floor(&self) -> u64 {
+        read_or_recover(&self.state).retention_floor
     }
 
     /// Clear all data (useful for testing).
@@ -204,6 +192,8 @@ impl SimShardStorage {
                 self,
                 committed_height,
                 committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),
+                BlockHeight::new(self.retention_floor()),
+                chain_origin,
             ),
             dedup: DedupWindow::from_reader(
                 self,
@@ -228,6 +218,10 @@ impl SimShardStorage {
                 .unwrap_or(0),
             chain_origin,
             safe_vote_registers,
+            // Filled only by a reshape adoption, where a store inherits a
+            // prefix whole; an ordinary resume folds its own chain.
+            inherited_records: Vec::new(),
+            voted_blocks: self.voted_blocks_above(committed_height),
         }
     }
 

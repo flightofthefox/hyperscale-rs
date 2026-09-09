@@ -30,7 +30,7 @@ use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{GetRemoteHeadersRequest, GetStateRangeRequest};
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, PredecessorTerminal, ReshapeSeat, ShardAnchor, ShardId,
-    StateRoot, StoredReceipt, SubstateLeaf, ValidatorId,
+    StateRoot, SubstateKey, SubstateLeaf, ValidatorId,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -127,8 +127,8 @@ impl ShardSupervisor {
     /// populates its own duty maps — the window in which an ordinary join would
     /// otherwise race the reshape duty for the shard's store directory.
     pub(super) fn reshape_owns(&self, shard: ShardId) -> bool {
-        let topology_snapshot = self.process.topology_snapshot().load_full();
-        let view = ReshapeView::new(&topology_snapshot, self.epoch_duration_ms);
+        let schedule = self.process.topology_schedule();
+        let view = ReshapeView::new(&schedule);
         host_reshape_owns(
             view.parent_half_cohorts(),
             view.observer_cohorts(),
@@ -145,8 +145,8 @@ impl ShardSupervisor {
     pub(crate) fn reshape_step(&mut self, events: Vec<ReshapeEvent>) {
         self.resume_pending_reshape_prep();
         let requests = {
-            let topology_snapshot = self.process.topology_snapshot().load_full();
-            let view = ReshapeView::new(&topology_snapshot, self.epoch_duration_ms);
+            let schedule = self.process.topology_schedule();
+            let view = ReshapeView::new(&schedule);
             self.reshape
                 .step(&view, self.verifier.as_ref(), events, wall_clock_local())
         };
@@ -219,9 +219,9 @@ impl ShardSupervisor {
             }
             ReshapeRequest::ApplyFollow {
                 shard,
-                height,
-                receipts,
-            } => self.reshape_apply(shard, height, receipts),
+                block,
+                creations,
+            } => self.reshape_apply(shard, block, creations),
             ReshapeRequest::BroadcastReady {
                 validator,
                 child,
@@ -576,7 +576,12 @@ impl ShardSupervisor {
 
     /// Apply a followed parent block's writes into a reshape duty's store
     /// off the loop, answering with [`ReshapeIo::Applied`].
-    fn reshape_apply(&self, shard: ShardId, height: BlockHeight, receipts: Vec<StoredReceipt>) {
+    fn reshape_apply(
+        &self,
+        shard: ShardId,
+        block: Arc<Block>,
+        creations: Vec<(SubstateKey, Vec<u8>)>,
+    ) {
         let Some(storage) = self
             .reshape_stores
             .get(&shard)
@@ -587,7 +592,7 @@ impl ShardSupervisor {
         };
         let events = self.events_tx.clone();
         self.tokio_handle.spawn_blocking(move || {
-            match storage.follow_block_writes(height, &receipts) {
+            match storage.follow_block_writes(&block, &creations) {
                 Ok(root) => {
                     let _ =
                         events.send(SupervisorEvent::Reshape(ReshapeIo::Applied { shard, root }));
@@ -654,7 +659,14 @@ impl ShardSupervisor {
         };
         let events = self.events_tx.clone();
         self.tokio_handle.spawn_blocking(move || {
-            match adopt_prepared_store(storage.as_ref(), kind, origin, &genesis, predecessors) {
+            match adopt_prepared_store(
+                storage.as_ref(),
+                shard,
+                kind,
+                origin,
+                &genesis,
+                predecessors,
+            ) {
                 Ok(recovered) => {
                     let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Adopted {
                         shard,

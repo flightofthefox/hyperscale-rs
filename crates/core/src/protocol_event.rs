@@ -9,21 +9,19 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconBlockHash, BeaconProposal, BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block,
-    BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
-    CandidateBeaconBlockVerifyError, CertRootVerifyError, CertificateRoot, CertifiedBeaconBlock,
-    CertifiedBeaconBlockVerifyError, CertifiedBlock, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, Epoch, ExecutionCertificate, ExecutionCertificateVerifyError,
-    ExecutionVote, Finalization, FinalizationVerifyError, Hash, LeafIndex, LocalReceiptRoot,
-    LocalReceiptRootVerifyError, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
-    PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
-    Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate,
-    RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal, Round,
-    ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg,
+    Anchor, BeaconBlockHash, BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight,
+    BlockManifest, BlockVote, CandidateBeaconBlock, CandidateBeaconBlockVerifyError,
+    CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, CertifiedBlock, CertifiedBlockHeader,
+    CertifiedHeaderVerifyError, CheckOutcome, Epoch, ExecutionCertificate,
+    ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationVerifyError, Hash,
+    LeafIndex, MerkleInclusionProof, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError,
+    PcVote3, PcVote3VerifyError, Provisions, ProvisionsVerifyError, QcVerifyError,
+    QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal,
+    Round, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg,
     SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
-    SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError, StoredReceipt, TickId,
-    Timeout, Transaction, TransactionRoot, TxHash, TxOutcome, TxRootVerifyError, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp,
+    SpcProposalObjectVerifyError, SpcView, StoredReceipt, SubstateKey, TickId, Timeout,
+    Transaction, TxHash, TxOutcome, TxResolution, ValidatorId, Verifiable, VerificationKind,
+    Verified, WeightedTimestamp,
 };
 
 /// What one tick's batch produced.
@@ -360,89 +358,22 @@ pub enum ProtocolEvent {
         evidence: Box<ShardVoteEquivocation>,
     },
 
-    /// Transaction-root verification completed for a pending block.
-    /// On success the payload carries the verified root (predicate
-    /// includes per-tx validity-window checks against the parent QC's
-    /// weighted timestamp).
-    TransactionRootVerified {
-        /// Block whose root was verified.
-        block_hash: BlockHash,
-        /// Typed verification result.
-        result: Result<Verified<TransactionRoot>, TxRootVerifyError>,
-    },
-
-    /// Certificate-root verification completed for a pending block.
-    CertificateRootVerified {
-        /// Block whose root was verified.
-        block_hash: BlockHash,
-        /// Typed verification result.
-        result: Result<Verified<CertificateRoot>, CertRootVerifyError>,
-    },
-
-    /// Local-receipt-root verification completed for a pending block.
+    /// One check on a pending block completed: a root over one of its
+    /// sections, its state root, its payers' reservations, the
+    /// resolutions it names, or the state proofs it carries.
     ///
-    /// Emitted as a pre-flight by the `VerifyStateRoot` handler: when
-    /// the computed receipt root diverges from the header's claim,
-    /// state-root recomputation can't match either, so the handler
-    /// short-circuits without emitting a separate `StateRootVerified`
-    /// — the pipeline rejects the block on this failure alone.
-    LocalReceiptRootVerified {
-        /// Block whose root was verified.
+    /// The state root's replay also side-channels its `PreparedCommit`
+    /// byproduct to the commit pipeline via `ActionContext::commit_prepared`
+    /// — vnode-private `IoLoop` data that doesn't belong on this fan-out
+    /// channel — and reports the net substate byte change it measured
+    /// in the outcome.
+    BlockCheckCompleted {
+        /// Block the check ran on.
         block_hash: BlockHash,
-        /// Typed verification result.
-        result: Result<Verified<LocalReceiptRoot>, LocalReceiptRootVerifyError>,
-    },
-
-    /// Provisions-root verification completed for a pending block.
-    ProvisionsRootVerified {
-        /// Block whose root was verified.
-        block_hash: BlockHash,
-        /// Typed verification result.
-        result: Result<Verified<ProvisionsRoot>, ProvisionRootVerifyError>,
-    },
-
-    /// Provision-tx-roots map verification completed for a pending block.
-    ProvisionTxRootsVerified {
-        /// Block whose root was verified.
-        block_hash: BlockHash,
-        /// Typed verification result.
-        result: Result<Verified<ProvisionTxRootsMap>, ProvisionTxRootsVerifyError>,
-    },
-
-    /// Payer-shard fee-reservation verification completed for a pending
-    /// block.
-    ReservationsVerified {
-        /// Block whose reservations were verified.
-        block_hash: BlockHash,
-        /// `Ok` when every payer's balance covers its demand; the
-        /// failing diagnostic otherwise.
-        result: Result<(), String>,
-    },
-
-    /// Beacon-witness-root verification completed for a pending block.
-    BeaconWitnessRootVerified {
-        /// Block whose root was verified.
-        block_hash: BlockHash,
-        /// Typed verification result.
-        result: Result<Verified<BeaconWitnessRoot>, BeaconWitnessRootVerifyError>,
-    },
-
-    /// State-root verification completed for a pending block.
-    ///
-    /// On success the action handler also routes the JMT replay's
-    /// `PreparedCommit` byproduct to the commit pipeline via
-    /// `ActionContext::commit_prepared`. That closure is vnode-private
-    /// `IoLoop` pipeline data — it doesn't belong on the fan-out
-    /// `ProtocolEvent` channel.
-    StateRootVerified {
-        /// Block whose root was verified.
-        block_hash: BlockHash,
-        /// Typed verification result.
-        result: Result<Verified<StateRoot>, StateRootVerifyError>,
-        /// Net substate byte total change the block's JMT replay
-        /// produced. Feeds the coordinator's count frontier for
-        /// reshape-trigger derivation; meaningful only on success.
-        bytes_delta: i64,
+        /// Which check.
+        kind: VerificationKind,
+        /// How it ended.
+        outcome: CheckOutcome,
     },
 
     /// Proposal block built by the runner.
@@ -720,6 +651,15 @@ pub enum ProtocolEvent {
         txs: Vec<Arc<Verified<Transaction>>>,
     },
 
+    /// The execution coordinator settled what a core's certificates
+    /// mean for transactions legs here issued for — refused, or accepted
+    /// by every core shard — which its ledger alone can say. The mempool
+    /// applies each to its entry's status.
+    TransactionsResolved {
+        /// Each transaction with what was settled about it.
+        resolutions: Vec<(TxHash, TxResolution)>,
+    },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Storage Callbacks
     // ═══════════════════════════════════════════════════════════════════════
@@ -790,10 +730,24 @@ pub enum ProtocolEvent {
         block_height: BlockHeight,
     },
 
-    /// The `io_loop`'s settled-set acquisition verified a past-terminal
-    /// shard's complete settled-transaction set against its beacon-attested root.
-    /// `ShardCoordinator` records it for the split-boundary fence and
-    /// re-drives any votes that deferred for want of it.
+    /// A state proof fetched against a commit-proven remote header
+    /// verified: it reconstructs the anchor's root and claims every key
+    /// asked. The execution coordinator keeps the bytes to offer in a
+    /// block it proposes; nothing reads an answer off a fetch, since
+    /// the answer is the chain's once a block carries the proof.
+    FetchedStateProofVerified {
+        /// The state the proof was checked against.
+        anchor: Anchor,
+        /// The keys the proof was asked about.
+        keys: Vec<SubstateKey>,
+        /// The proof as fetched.
+        proof: MerkleInclusionProof,
+    },
+
+    /// A settled-set fetch verified a past-terminal shard's complete
+    /// settled-transaction set against its beacon-attested root. The
+    /// execution coordinator records it for the split-boundary fence and
+    /// releases what waited on it.
     SettledTxsReconstructed {
         /// The terminated shard whose settled set this is.
         shard: ShardId,

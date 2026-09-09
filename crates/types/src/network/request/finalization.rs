@@ -3,7 +3,7 @@
 use hyperscale_hbor::Hbor;
 
 use crate::network::response::GetFinalizationsResponse;
-use crate::{FinalizationHash, MessageClass, NetworkMessage, Request};
+use crate::{FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MessageClass, NetworkMessage, Request};
 
 /// Request to fetch finalizations by identity.
 ///
@@ -15,6 +15,10 @@ use crate::{FinalizationHash, MessageClass, NetworkMessage, Request};
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetFinalizationsRequest {
     /// Finalization identities being requested.
+    ///
+    /// A block names at most this many, and a request asks for the ones
+    /// a block names.
+    #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
     pub finalization_hashes: Vec<FinalizationHash>,
 }
 
@@ -65,5 +69,28 @@ mod tests {
         let encoded = hbor_to_vec(&request).unwrap();
         let decoded: GetFinalizationsRequest = hbor_from_slice(&encoded).unwrap();
         assert_eq!(request, decoded);
+    }
+
+    /// A claimed length past the cap is refused before any element is
+    /// decoded, so a peer cannot make the decoder allocate for a batch
+    /// no honest block could name.
+    #[test]
+    fn decode_rejects_an_oversized_request() {
+        use hyperscale_hbor::{DecodeError, varint};
+
+        let mut buf = Vec::new();
+        varint::write(&mut buf, MAX_FINALIZED_TX_PER_BLOCK + 1).unwrap();
+        // Filler so the claimed length clears the input-capacity check
+        // and the bound is what refuses it.
+        buf.extend(std::iter::repeat_n(
+            0u8,
+            (MAX_FINALIZED_TX_PER_BLOCK + 1) * 64,
+        ));
+        let err = hbor_from_slice::<GetFinalizationsRequest>(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::BoundExceeded { max, actual }
+                if max == MAX_FINALIZED_TX_PER_BLOCK && actual == MAX_FINALIZED_TX_PER_BLOCK + 1
+        ));
     }
 }

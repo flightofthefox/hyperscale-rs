@@ -160,22 +160,6 @@ impl Precut {
     }
 }
 
-/// What a block's pre-cut content means for the vote on it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PrecutVerdict {
-    /// Nothing in the block predates this chain, or everything that does
-    /// is proven absent from every predecessor's committed set.
-    Pass,
-    /// The block carries content this chain must never commit. Naming
-    /// what, for the log.
-    Reject(String),
-    /// The block carries a transaction that predates this chain and whose
-    /// status is still outstanding. The vote waits: refusing would make a
-    /// slow answer look like a bad block, and every honest validator
-    /// reaches the same verdict once the answer lands.
-    Defer(TxHash),
-}
-
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{BlockHash, BlockHeight, CommittedTxsRoot, Hash};

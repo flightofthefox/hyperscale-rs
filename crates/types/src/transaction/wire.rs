@@ -15,13 +15,14 @@ use std::sync::OnceLock;
 
 use blake3::Hasher;
 use hyperscale_hbor::{Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+use hyperscale_vm_types::{LegShape, price_attos};
 use thiserror::Error;
 
 use crate::transaction::vm::{Derivation, ProtocolVerifier, SchemeVerifier};
 use crate::{
-    DeclaredKey, DerivationError, Derived, EnvelopeExt, Hash, LocalKey, MAX_TX_BYTES_LEN,
-    NetworkId, PrincipalAddr, Routing, ShardTrie, SubstateKey, TimestampRange, TransactionEnvelope,
-    TxHash, Verified, Verify, protocol_statics,
+    Address, DeclaredKey, DerivationError, Derived, EnvelopeExt, Hash, LocalKey, MAX_TX_BYTES_LEN,
+    NetworkId, PrincipalAddr, Routing, ShardId, ShardTrie, SubstateKey, TimestampRange,
+    TransactionEnvelope, TxHash, Verified, Verify, protocol_statics,
 };
 
 /// What a transaction is verified against: the network its envelope has
@@ -167,16 +168,122 @@ impl Transaction {
         self.derived().work
     }
 
-    /// How many cells this transaction creates that a sweep will later
-    /// have to retire — what a block sums to stay under
+    /// What the declaration claims it will touch, in footprint units.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn footprint(&self) -> u64 {
+        self.derived().footprint
+    }
+
+    /// What this transaction is charged, in attos: its declared work at
+    /// the protocol's rate. One figure whatever the outcome and wherever
+    /// it runs — a participant measuring only its own legs bills the
+    /// same as one that ran the whole — and never more than the signed
+    /// ceiling, which admission holds it to.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn price(&self) -> u128 {
+        price_attos(self.work())
+    }
+
+    /// [`Self::price`] for an envelope that may not have been derived
+    /// yet — what a composer quotes before submitting, deriving under
+    /// `derivation` where nothing has.
+    ///
+    /// # Errors
+    ///
+    /// [`DerivationError`], where the envelope derives to nothing.
+    pub fn price_under(&self, derivation: &dyn Derivation) -> Result<u128, DerivationError> {
+        Ok(price_attos(self.try_derived(derivation)?.work))
+    }
+
+    /// Each manifest node's placement-free shape, in node order.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn legs(&self) -> &[LegShape] {
+        &self.derived().legs
+    }
+
+    /// The parties the routing declares beyond any node's frame: the
+    /// fee payer and every signer.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn owners(&self) -> &[Address] {
+        &self.derived().owners
+    }
+
+    /// The cells the kernel writes of its own accord.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn nullifiers(&self) -> &[SubstateKey] {
+        &self.derived().nullifiers
+    }
+
+    /// How many cells this transaction's execution on `shard` creates
+    /// that a sweep will later have to retire, under `trie`'s placement:
+    /// its nullifiers under signers the shard holds, and, for every
+    /// value edge whose ends the trie places on different shards, the
+    /// record where the shard holds the producer and the claim where it
+    /// holds the consumer.
+    ///
+    /// An edge inside one shard passes its value directly and writes
+    /// neither. So does one inside a core spanning two shards, and that
+    /// one is counted anyway: the count reads placement alone and never
+    /// the classification, so it over-flags a core's internal edge
+    /// rather than depending on a window's answer. What a block sums,
+    /// beside the committed cell it writes for the transaction itself,
+    /// to stay under
     /// [`MAX_SWEEPABLE_CREATED_PER_BLOCK`](crate::MAX_SWEEPABLE_CREATED_PER_BLOCK).
     ///
     /// # Panics
     ///
     /// As [`Self::work`], on a transaction that was never derived.
     #[must_use]
-    pub fn sweepable_writes(&self) -> u32 {
-        self.derived().sweepable_writes
+    pub fn sweepable_writes_on(&self, trie: &ShardTrie, shard: ShardId) -> usize {
+        let derived = self.derived();
+        let placed = |target| trie.shard_for_prefix(target);
+        let nullifiers = derived
+            .nullifiers
+            .iter()
+            .filter(|cell| placed(cell.owner) == shard)
+            .count();
+        let escrow: usize = derived
+            .legs
+            .iter()
+            .flat_map(|consumer| {
+                consumer
+                    .edges
+                    .iter()
+                    .map(move |edge| (edge.source, consumer.target))
+            })
+            .map(|(source, consumer)| {
+                let Some(producer) = derived.legs.get(source as usize) else {
+                    return 0;
+                };
+                let (from, to) = (placed(producer.target), placed(consumer));
+                if from == to {
+                    0
+                } else {
+                    usize::from(from == shard) + usize::from(to == shard)
+                }
+            })
+            .sum();
+        nullifiers + escrow
     }
 
     /// Half-open `WeightedTimestamp` range during which this tx may be
@@ -381,6 +488,25 @@ impl Transaction {
         )
     }
 
+    /// This transaction with its derived legs replaced by `legs`, for a
+    /// test that needs a shape the stub derivation cannot produce.
+    /// Derives under `derivation` first where nothing has yet.
+    ///
+    /// # Panics
+    ///
+    /// If `derivation` refuses the body.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn with_legs(self, derivation: &dyn Derivation, legs: Vec<LegShape>) -> Self {
+        let base = self
+            .try_derived(derivation)
+            .expect("a stub transaction derives")
+            .clone();
+        let tx = Self::new(self.body().clone());
+        let _ = tx.derived.set(Derived { legs, ..base });
+        tx
+    }
+
     /// Derive (or fetch the cached) envelope derivation under this
     /// node's `derivation`.
     ///
@@ -461,6 +587,17 @@ pub enum TransactionVerifyError {
     /// Static derivation refused the envelope.
     #[error(transparent)]
     Derivation(#[from] DerivationError),
+    /// The signed ceiling is below the declared price. The drain reserves
+    /// the whole declaration either way, so a ceiling short of it would
+    /// charge least for exactly the transactions that cost most; the
+    /// ceiling is a hold size the price must fit.
+    #[error("fee ceiling {max_fee} is below the declared price {price}")]
+    CeilingBelowPrice {
+        /// The ceiling the sender signed.
+        max_fee: u128,
+        /// The price the declaration derives to.
+        price: u128,
+    },
 }
 
 /// Construction asserts: the body decodes, the envelope names this
@@ -502,6 +639,17 @@ impl Verify<TransactionContext<'_>> for Transaction {
         // signer-address binding; the signatures themselves verify here,
         // over the derived declaration hashes.
         let derived = self.try_derived(ctx.derivation)?;
+        // A publish is priced by its artifact and capped at the ceiling;
+        // only a call declares a price the ceiling has to cover.
+        if vm.artifact().is_none() {
+            let price = price_attos(derived.work);
+            if price > vm.max_fee {
+                return Err(TransactionVerifyError::CeilingBelowPrice {
+                    max_fee: vm.max_fee,
+                    price,
+                });
+            }
+        }
         for (index, (sig, subintent)) in vm
             .subintent_sigs
             .iter()
@@ -546,9 +694,11 @@ impl Verified<Transaction> {
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::{
-        DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
+        DecodeError, Hash32, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
-    use hyperscale_vm_types::{Address, AddressClass, Mode, Moves};
+    use hyperscale_vm_types::{
+        Address, AddressClass, LegRole, Mode, Moves, SubintentHash, ValueEdge,
+    };
 
     use super::*;
     use crate::test_utils::{test_prefix, test_validity_range};
@@ -574,7 +724,6 @@ mod tests {
                 Vec::new()
             };
             Ok(Derived {
-                sweepable_writes: 0,
                 // A stub derives no tree, so the envelope's own window
                 // is the whole of it.
                 effective_window: vm.validity_window(),
@@ -582,6 +731,7 @@ mod tests {
                 // binds the signer to the payer field — every stubbed
                 // transaction's payer admits its signer.
                 signer: vm.fee_payer,
+                owners: vec![vm.fee_payer.address()],
                 fee_vault_local: [0xEE; 16],
                 auth_cell_local: [0xAE; 16],
                 routing: Routing {
@@ -604,6 +754,9 @@ mod tests {
                 },
                 subintent_hashes,
                 work: declared_work(0, 0, 0),
+                footprint: 0,
+                legs: Vec::new(),
+                nullifiers: Vec::new(),
                 packages: Vec::new(),
             })
         }
@@ -645,6 +798,64 @@ mod tests {
             network,
             derivation: &StubStatics,
         }
+    }
+
+    /// A transaction's share of the sweep budget is read at a placement:
+    /// a nullifier follows its signer, an edge across two shards costs
+    /// the producer's shard its record and the consumer's its claim, and
+    /// the same edge inside one shard costs nothing, since the value
+    /// passes directly.
+    #[test]
+    fn sweepable_writes_are_counted_where_the_placement_puts_them() {
+        let tx = fixture(b"tree");
+        let base = StubStatics.derive(tx.body()).expect("the stub derives");
+        let sender = Address::new([0x00; 31], AddressClass::Component);
+        let recipient = Address::new([0xFF; 31], AddressClass::Component);
+        let leg = |target, edges| LegShape {
+            target,
+            role: LegRole::Inbound,
+            edges,
+            presents: Vec::new(),
+            declares: Vec::new(),
+            intent: SubintentHash(Hash32([0x5A; 32])),
+            local: 0,
+            expiry_ms: 0,
+        };
+        let edge = ValueEdge {
+            source: 0,
+            output: 0,
+            non_fungible: false,
+        };
+        let _ = tx.derived.set(Derived {
+            legs: vec![leg(sender, Vec::new()), leg(recipient, vec![edge])],
+            nullifiers: vec![SubstateKey {
+                owner: sender,
+                local: LocalKey([1; 16]),
+            }],
+            ..base
+        });
+
+        let split = ShardTrie::from_leaves([ShardId::leaf(1, 0), ShardId::leaf(1, 1)]);
+        let (from, to) = (
+            split.shard_for_prefix(sender),
+            split.shard_for_prefix(recipient),
+        );
+        assert_ne!(from, to, "the ends must sit apart for the edge to cross");
+        assert_eq!(
+            tx.sweepable_writes_on(&split, from),
+            2,
+            "the nullifier and the record"
+        );
+        assert_eq!(tx.sweepable_writes_on(&split, to), 1, "the claim");
+
+        let whole = ShardTrie::uniform_from_count(1);
+        let only = whole.shard_for_prefix(sender);
+        assert_eq!(whole.shard_for_prefix(recipient), only);
+        assert_eq!(
+            tx.sweepable_writes_on(&whole, only),
+            1,
+            "the nullifier alone: an edge inside one shard writes no escrow"
+        );
     }
 
     #[test]

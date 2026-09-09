@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
 use hyperscale_shard::SettledTxSet;
 use hyperscale_types::{
-    PredecessorTerminal, TerminalEvidence, TopologySchedule, TxHash, derive_block_transactions,
+    PredecessorTerminal, ShardId, TopologySchedule, TxHash, derive_block_transactions,
 };
 
 use super::ShardParticipation;
@@ -69,28 +69,28 @@ impl ShardParticipation {
                 shard,
                 txs,
                 terminal_wt,
+            } => self.on_settled_txs_reconstructed(
+                topology_schedule,
+                shard,
+                SettledTxSet { txs, terminal_wt },
+            ),
+
+            // A state proof against a core's commit-proven header
+            // verified: the execution coordinator reads its probes off
+            // it and hands each absence on.
+            ProtocolEvent::FetchedStateProofVerified {
+                anchor,
+                keys,
+                proof,
             } => {
-                let set = SettledTxSet { txs, terminal_wt };
-                let mut actions = self.execution_coordinator.record_settled_txs(
-                    topology_schedule,
-                    shard,
-                    set.clone(),
-                );
-                self.shard_coordinator.record_settled_txs(shard, set);
-                actions.extend(
-                    self.shard_coordinator
-                        .redrive_pending_votes(topology_schedule),
-                );
-                actions.extend(
-                    self.execution_coordinator
-                        .redrive_gated_finalizations(topology_schedule),
-                );
-                actions
+                self.execution_coordinator
+                    .on_proof_fetched(anchor, keys, proof);
+                Vec::new()
             }
             // A predecessor answered which of the queried transactions it
-            // committed. Record the answers, then re-drive the votes that
-            // deferred for want of them and the proposal that was
-            // filtering them out.
+            // committed. Record the answers and re-drive the proposal
+            // that was filtering them out; the votes that deferred for
+            // want of them re-drive off the fence's evidence.
             ProtocolEvent::PrecutResolutionsReceived {
                 predecessor,
                 answers,
@@ -99,11 +99,8 @@ impl ShardParticipation {
                     self.shard_coordinator
                         .record_precut_resolution(predecessor, tx_hash, absent);
                 }
-                let actions = self
-                    .shard_coordinator
-                    .redrive_pending_votes(topology_schedule);
                 self.shard_coordinator.queue_ready_proposal();
-                actions
+                Vec::new()
             }
             _ => unreachable!("non-sync event routed to handle_sync"),
         }
@@ -111,8 +108,8 @@ impl ShardParticipation {
 
     /// Beacon advanced an epoch — replay any cross-shard artifacts buffered
     /// because their committee epoch wasn't yet in the schedule (remote headers,
-    /// ECs, finalized txs), then acquire any newly-attested settled set
-    /// the fence needs. Dispatched from `handle_beacon`'s `BeaconBlockPersisted`
+    /// ECs, finalized txs), and re-derive the settled sets the fence still
+    /// wants. Dispatched from `handle_beacon`'s `BeaconBlockPersisted`
     /// arm via the option guard, so a vnode that only follows the beacon no-ops.
     pub(in crate::state) fn on_beacon_block_persisted(
         &mut self,
@@ -129,51 +126,6 @@ impl ShardParticipation {
         // round-contiguous commit rule never sees the consecutive rounds it
         // needs. The post-dispatch hook turns the latch into one `try_propose`.
         self.shard_coordinator.queue_ready_proposal();
-        actions.extend(self.scan_settled_txs_acquisitions(sched));
-        actions
-    }
-
-    /// Start a one-shot settled-set acquisition for every past-terminal shard
-    /// whose beacon-attested `settled_txs_root` this node's own fold now
-    /// carries and whose `S_P` the fence doesn't yet hold.
-    ///
-    /// Everything the acquisition needs comes from the node's beacon projection:
-    /// the terminal block and attested root from the boundary anchor, the
-    /// terminal weighted timestamp from the schedule's terminal cut, and the
-    /// peers from the terminal-clamped routing committees. A shard already
-    /// recorded (or live) is skipped, so the scan re-runs harmlessly each commit
-    /// until the set is acquired.
-    fn scan_settled_txs_acquisitions(&self, sched: &TopologySchedule) -> Vec<Action> {
-        let head = sched.head();
-        let mut actions = Vec::new();
-        for (shard, peers) in sched.routing_committees() {
-            if shard == self.local_shard {
-                continue;
-            }
-            let Some(anchor) = head.boundary(shard) else {
-                continue;
-            };
-            let Some(attested_root) = anchor.terminal_roots.map(|roots| roots.settled_txs) else {
-                continue;
-            };
-            if self.shard_coordinator.settled_set(shard).is_some() {
-                continue;
-            }
-            let Some(terminal_wt) = sched.terminal_cut_wt(shard) else {
-                continue;
-            };
-            actions.push(Action::StartSettledTxsAcquisition {
-                shard,
-                evidence: TerminalEvidence {
-                    height: anchor.height,
-                    block_hash: anchor.block_hash,
-                    terminal_wt,
-                    attested_root,
-                    expires: sched.handoff_evidence_expiry(shard),
-                },
-                peers,
-            });
-        }
         actions
     }
 
@@ -228,6 +180,19 @@ impl ShardParticipation {
             self.shard_coordinator.retire_precut();
         }
         actions
+    }
+
+    /// Record a past-terminal shard's settled set, which releases what
+    /// the execution coordinator held for want of it; the votes that
+    /// deferred re-drive off the fence's evidence.
+    fn on_settled_txs_reconstructed(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+        set: SettledTxSet,
+    ) -> Vec<Action> {
+        self.execution_coordinator
+            .record_settled_txs(topology_schedule, shard, set)
     }
 }
 

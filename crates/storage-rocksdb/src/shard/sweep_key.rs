@@ -7,8 +7,8 @@
 //! walked that way.
 //!
 //! Which *cells* an owner holds in a bucket is a question the leaves
-//! answer for themselves: the bucket leads a sweepable cell's local
-//! half, so one owner's bucket is a contiguous leaf-key range.
+//! answer for themselves, and the walk over both is
+//! [`SweepRows::walk`](hyperscale_storage::SweepRows::walk).
 
 use hyperscale_types::{Address, SWEEP_BUCKET_BYTES, SweepBucket};
 
@@ -42,26 +42,6 @@ impl DbCodec<(SweepBucket, Address)> for SweepRowCodec {
     }
 }
 
-/// The leaf-key range covering one owner's cells in one bucket: the
-/// half-open interval every sweepable leaf of that pair falls in, and
-/// nothing else does.
-///
-/// The bucket leads a sweepable cell's local half, so the pair is a
-/// 36-byte prefix of the leaf key and the end is that prefix with the
-/// remaining local bytes maxed out.
-#[must_use]
-pub fn leaf_bucket_bounds(owner: Address, bucket: SweepBucket) -> (Vec<u8>, Vec<u8>) {
-    const BODY_LEN: usize = 16 - SWEEP_BUCKET_BYTES;
-    let mut start = Vec::with_capacity(SWEEP_ROW_LEN + BODY_LEN);
-    start.extend_from_slice(&owner.to_bytes());
-    start.extend_from_slice(&bucket.to_bytes());
-    let mut end = start.clone();
-    start.extend_from_slice(&[0x00; BODY_LEN]);
-    end.extend_from_slice(&[0xFF; BODY_LEN]);
-    end.push(0x00);
-    (start, end)
-}
-
 /// The raw sweep-index key a walk seeks to when it resumes at `bucket`.
 #[must_use]
 pub fn row_seek(bucket: SweepBucket) -> Vec<u8> {
@@ -73,7 +53,7 @@ pub fn row_seek(bucket: SweepBucket) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{AddressClass, LocalKey, SubstateKey};
+    use hyperscale_types::AddressClass;
 
     use super::*;
 
@@ -89,36 +69,6 @@ mod tests {
             SweepRowCodec.encode(&(SweepBucket(8), owner(0xFF)))
                 < SweepRowCodec.encode(&(SweepBucket(9), owner(0)))
         );
-    }
-
-    #[test]
-    fn bounds_cover_a_buckets_leaves_and_no_others() {
-        let (start, end) = leaf_bucket_bounds(owner(3), SweepBucket(9));
-        let leaf = |bucket: u32, body: u8| {
-            let mut local = [body; 16];
-            local[..SWEEP_BUCKET_BYTES].copy_from_slice(&bucket.to_be_bytes());
-            SubstateKey {
-                owner: owner(3),
-                local: LocalKey(local),
-            }
-            .to_bytes()
-            .to_vec()
-        };
-        for body in [0x00, 0x7F, 0xFF] {
-            let inside = leaf(9, body);
-            assert!(start <= inside && inside < end, "body {body:02x}");
-        }
-        assert!(leaf(8, 0xFF) < start);
-        assert!(leaf(10, 0x00) >= end);
-        // Another owner's cells in the same bucket sit outside entirely,
-        // which is what makes the pair the unit the index rows count.
-        let elsewhere = SubstateKey {
-            owner: owner(4),
-            local: LocalKey([0; 16]),
-        }
-        .to_bytes()
-        .to_vec();
-        assert!(elsewhere >= end);
     }
 
     #[test]

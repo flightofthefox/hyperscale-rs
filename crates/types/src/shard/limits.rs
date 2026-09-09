@@ -9,9 +9,22 @@
 //! limits down on a single node only degrades that node's responsiveness
 //! without reducing the protocol-wide load it has to keep up with.
 
-use hyperscale_vm_types::TX_UNITS;
+use hyperscale_vm_types::{MAX_TX_BYTES_LEN, TX_UNITS};
 
-use crate::WorkInFlight;
+use crate::{Address, LocalKey, Question, RoutePrefix, WorkInFlight};
+
+/// The largest message any transport carries, compressed.
+///
+/// One figure for both paths a block travels: the framed request streams
+/// and the gossip topics. A message past it is not truncated, it is
+/// dropped — the sender warns and the round it carried is lost — so a
+/// section a proposer fills has to be budgeted against this rather than
+/// discovered at it.
+///
+/// Stated here rather than in the transport because the caps that have
+/// to fit inside it are stated here, and a bound nothing can be checked
+/// against is not a bound.
+pub const MAX_WIRE_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Hard cap on the number of live transactions any single block can carry.
 ///
@@ -35,13 +48,53 @@ pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 /// the removal side would leave a sweep that bounds ordinary operation
 /// and not the peak, which is not a bound.
 ///
-/// Set at [`MAX_TXS_PER_BLOCK`] — an average of one per transaction,
-/// which a block may distribute unevenly. Nothing else in the block
-/// budget reaches this: a nullifier costs its transaction a footprint
-/// unit and a signature, so the work budget admits thirty-two of them
-/// per transaction and the creation ceiling would otherwise sit two
-/// orders of magnitude above any removal count a block can carry.
-pub const MAX_SWEEPABLE_CREATED_PER_BLOCK: usize = MAX_TXS_PER_BLOCK;
+/// The rates bound the backlog; what sets the resident *level* is how
+/// long each family's cells live, and the two are independent. A cell
+/// created here is retired one grace past the window it was derived
+/// from, so the population a family contributes is this cap times its
+/// grace measured in transaction windows — about one for the nullifier
+/// and the committed cell, which take the default artifact grace, and
+/// about twelve for the crossing family, whose claim cell has to stay
+/// readable for the whole terminal evidence span or an inherited record
+/// becomes one nobody can dispose of. So the crossing family dominates
+/// the resident set by roughly an order of magnitude over the other two,
+/// even though the committed cell is the one every transaction writes,
+/// by choice, and none of that reaches the rates: the cap rationed here
+/// is family-blind and per block, so a longer grace moves the level and
+/// leaves what a block may create and remove exactly where it was.
+///
+/// Three families are sweepable and share that capacity — the nullifier,
+/// the escrow claim (a reclaim's included) and the committed-transaction
+/// cell a shard writes for every transaction it commits — because the
+/// removal capacity they draw on is one capacity. A budget per family would cost throughput as well as
+/// counters: a block could be invalid on one family's peak while the
+/// shared walk had room.
+///
+/// The count has a fourth term that is not one of them. An escrow record
+/// is a balance, retired by whoever consumes it and reachable by no
+/// clock, so no sweep removes it and it draws on none of the capacity
+/// this cap rations. It is counted anyway, and counting it only tightens
+/// the ceiling on the three: the alternative is a figure whose slack
+/// depends on how many of a block's edges cross.
+///
+/// Counted per shard, since that is where a cell lands and where the
+/// sweep that retires it runs: a transaction's kernel cells whose owner
+/// the shard holds, plus its committed cell, which every shard writes
+/// for every transaction it commits. Sized at four times
+/// [`MAX_TXS_PER_BLOCK`] so a full block of any shape the corpus
+/// produces stays admissible on its busiest shard — every transaction
+/// carries its committed cell, so a transfer's payer writes that and the
+/// record, two; a swap's caller adds the claim of what the venue issued,
+/// three; a liquidity provider paying two resources writes two records
+/// and one claim beside it, four. A bound subintent adds its
+/// nullifier on its signer's shard, so a subintent-heavy block packs
+/// fewer transactions, which is the trade the figure already made when
+/// nullifiers were the only family. Nothing else in the block budget
+/// reaches this: a nullifier costs its transaction a footprint unit and
+/// a signature, so the work budget admits thirty-two of them per
+/// transaction and the creation ceiling would otherwise sit two orders
+/// of magnitude above any removal count a block can carry.
+pub const MAX_SWEEPABLE_CREATED_PER_BLOCK: usize = 4 * MAX_TXS_PER_BLOCK;
 
 /// Hard cap on the cells one block's sweep may remove.
 ///
@@ -52,10 +105,19 @@ pub const MAX_SWEEPABLE_CREATED_PER_BLOCK: usize = MAX_TXS_PER_BLOCK;
 /// advance makes, and it is why a proposer cannot decline to sweep in
 /// order to keep block space for what does pay.
 ///
+/// One walk over the three sweepable families, in key order: the bucket
+/// leads every sweepable cell's local key, so a block's removals are one
+/// contiguous range whatever families they mix, and the cap is on the
+/// range rather than on any family's share of it.
+///
 /// Twice the creation cap, so a backlog drains rather than holding
 /// station: a shard that fell behind under peak load catches up in
 /// bounded time once the load stops, and one running at the creation cap
-/// still removes what it creates with room to spare.
+/// still removes what it creates with room to spare. The margin is also
+/// what carries the one family member no block budgets at creation — a
+/// reclaim's claim is written where the reclaim runs, one per record and
+/// never beside the record's own claim, so it adds at most the record's
+/// own rate to what the sweep must retire.
 pub const MAX_SWEEP_PER_BLOCK: usize = 2 * MAX_SWEEPABLE_CREATED_PER_BLOCK;
 
 /// The removal cap must outrun the creation cap, or the resident
@@ -76,30 +138,55 @@ pub const fn sweep_admits_block(sweepable: usize) -> bool {
 }
 
 /// Hard cap on the transactions a block's
-/// [`TerminalVerdict`](crate::TerminalVerdict) records may name between
+/// [`AbandonmentRecord`](crate::AbandonmentRecord) records may name between
 /// them.
 ///
 /// A record answers for the transactions this chain still owes an outcome
-/// for that a departed shard did not settle, and how many that can be is
+/// for that a counterpart can never settle, and how many that can be is
 /// what [`MAX_DRAIN_WORK`] already bounds — a transaction is only owed
 /// while its reservation stands. So the ceiling is the drain's own count
-/// bound rather than a figure of its own, and a departure with more
+/// bound rather than a figure of its own, and a counterpart with more
 /// outstanding than one block will carry is answered over several, each
 /// record standing alone.
 ///
 /// The bound is on the block rather than on any one record, because the
-/// drain is one budget shared across every departure the block answers
+/// drain is one budget shared across every counterpart the block answers
 /// for. It doubles as each record's own decode cap, since a single
-/// departure can hold the whole of it — but that cap alone would let a
+/// counterpart can hold the whole of it — but that cap alone would let a
 /// block carry the budget once per record, which is why the sum is
 /// checked as well.
 pub const MAX_UNSETTLED_PER_BLOCK: usize = (MAX_DRAIN_WORK / TX_UNITS) as usize;
 
-/// Hard cap on the departed shards one block may answer for.
+/// Hard cap on the owner prefixes one transaction's routing names.
 ///
-/// A shard leaves at a reshape cut, so a block carrying more of these
-/// than the trie has leaves is describing a topology that never existed.
-pub const MAX_TERMINAL_VERDICTS_PER_BLOCK: usize = MAX_PROVISION_TARGET_SHARDS;
+/// A wire bound on the reach a record restates, and the only structural
+/// one there is: a prefix enters a transaction's routing through a
+/// declared key, and a declared key costs its owner and its local half
+/// inside the envelope, so the envelope's own cap divides. Every real
+/// transaction sits orders below it — a transfer names two, a route
+/// half a dozen — and what the bound is for is that a decoder allocates
+/// against an envelope a sender actually paid for rather than against a
+/// length it claims.
+pub const MAX_PREFIXES_PER_TX: usize =
+    MAX_TX_BYTES_LEN / (size_of::<Address>() + size_of::<LocalKey>());
+
+/// Hard cap on the abandonment records one block may carry.
+///
+/// What a composer offers is one departure per counterpart shard plus
+/// one per question it heard an answer to, and a record may name a live
+/// shard — a refusing core, a consumer that claimed — as readily as one
+/// that left. So the bound is the shard count times a departure and one
+/// per question. A shard with evidence at several anchors under one
+/// question drains one anchor per block, which costs settlement rate
+/// rather than this bound.
+///
+/// This is a decode cap and is what makes it a bound: a block claiming
+/// more never decodes. The admitted ordering is finer than the count —
+/// strictly ascending `(shard, evidence)`, and evidence carries the
+/// anchor it was taken at — so the ordering alone would admit several
+/// records per shard and question, and does not imply this figure.
+pub const MAX_ABANDONMENT_RECORDS_PER_BLOCK: usize =
+    MAX_PROVISION_TARGET_SHARDS * (1 + Question::ALL.len());
 
 /// Cap on the number of shards a block can name as provision targets, at
 /// decode time.
@@ -122,16 +209,21 @@ pub const MAX_PROVISION_TARGET_SHARDS: usize = 1_024;
 /// same cap.
 pub const MAX_FINALIZED_TX_PER_BLOCK: usize = 8_192;
 
-/// Cap on the transactions a successor asks about in one
-/// committed-transaction query.
+/// Cap on the things one query asks a counterpart to prove.
 ///
-/// Bounds the response, whose per-entry cost is an absence proof rather
-/// than a hash. The population it draws from is small by construction:
-/// only transactions submitted to the successor whose validity window
-/// opened before its origin, and only until the chain outlives that
-/// origin by `MAX_VALIDITY_RANGE`. A successor with more than this
+/// Bounds the response, whose per-entry cost is a merkle path rather
+/// than a hash. Two questions share it, because a proof costs the same
+/// whichever of them asked: the transactions a successor asks a
+/// predecessor about, and the substate keys a leg's probe asks a
+/// counterpart to prove present or absent — one probe asks about one
+/// transaction's cell, so the two are the same size of question.
+///
+/// Each population is small by construction. A successor asks only about
+/// transactions whose validity window opened before its origin, and only
+/// until the chain outlives that origin by `MAX_VALIDITY_RANGE`; a leg
+/// asks only about the crossings it issued. Anything with more than this
 /// outstanding asks across several requests.
-pub const MAX_COMMITTED_TX_QUERY: usize = 256;
+pub const MAX_PROOFS_PER_QUERY: usize = 256;
 
 /// Hard cap on the number of provision batches any single block can carry.
 ///
@@ -142,6 +234,90 @@ pub const MAX_COMMITTED_TX_QUERY: usize = 256;
 /// for small-to-mid-shard topologies; widening the topology may require
 /// revisiting.
 pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
+
+/// Hard cap on the state claims a block can carry.
+///
+/// One claim answers one fetch against one counterpart height; the
+/// proposer offers what its own fetches read and the rest waits a
+/// block. This bounds the section's bytes, and nothing else: the vote
+/// fence withholds the vote on the whole block, so a single claim no
+/// voter can check already couples every transaction beside it to a
+/// counterpart's silence, and no cap above one changes that. What
+/// bounds the coupling is the round timer, which prices a block held
+/// at the fence at the ordinary timeout rather than the progress
+/// window — see `has_own_work_at_round` in `hyperscale-shard`.
+pub const MAX_STATE_CLAIMS_PER_BLOCK: usize = 256;
+
+/// Byte budget the abandonment records of one block share.
+///
+/// The one section a block carries verbatim whose per-item cost varies:
+/// a name is 128 bytes plus its reach, and a record's reach runs from a
+/// transfer's two routes to a route's dozens. So a count cannot bound
+/// it — [`MAX_UNSETTLED_PER_BLOCK`] names at their widest run past the
+/// whole frame — and a proposer spends this instead, leaving the
+/// remainder to the next block. Nothing is lost by stopping: a name a
+/// record does not carry stays uncovered and is offered again.
+///
+/// Sized as the share of [`MAX_WIRE_MESSAGE_BYTES`] the assertion below
+/// leaves for it. At the narrowest reach it still carries some eight
+/// thousand names a block, several times the rate any drain can open
+/// them at.
+pub const MAX_PROPOSAL_EVIDENCE_BYTES: usize = 1024 * 1024;
+
+/// Whether a block may still carry records weighing `weight` between
+/// them.
+///
+/// The one reading of the budget, so the composer that fills the section
+/// and the admission that checks it stop at the same place.
+#[must_use]
+pub const fn evidence_admits_block(weight: usize) -> bool {
+    weight <= MAX_PROPOSAL_EVIDENCE_BYTES
+}
+
+/// Bytes one [`AbandonmentRecord`](crate::AbandonmentRecord) costs
+/// before the names it carries.
+pub const ABANDONMENT_RECORD_BYTES: usize = 32;
+
+/// Bytes one [`UnsettledTx`](crate::UnsettledTx) costs before its reach.
+pub const UNSETTLED_TX_BYTES: usize = 128;
+
+/// Bytes one [`RoutePrefix`](crate::RoutePrefix) of a name's reach
+/// costs.
+pub const ROUTE_PREFIX_BYTES: usize = size_of::<RoutePrefix>();
+
+/// Bytes one [`StateClaim`](crate::StateClaim) costs before its cells.
+const STATE_CLAIM_BYTES: usize = 64;
+
+/// Bytes one cell of a claim costs: the key and the reading of it.
+const STATE_CLAIM_CELL_BYTES: usize = 82;
+
+/// Bytes a hash-only entry of a manifest costs.
+const HASH_BYTES: usize = 32;
+
+/// Bytes the parts of a proposal that carry no capped list cost between
+/// them: the header, the QC, the witness sources and the framing.
+const PROPOSAL_FIXED_BYTES: usize = 64 * 1024;
+
+/// The widest a proposal can encode: every section at its own cap, and
+/// the record section at its byte budget.
+///
+/// The per-item figures above are upper bounds on the real encoding,
+/// which `wire_budget.rs` holds them to by encoding a maximal value of
+/// each and measuring it. Without that this assertion would only be
+/// arithmetic over guesses.
+const MAX_PROPOSAL_BYTES: usize = PROPOSAL_FIXED_BYTES
+    + MAX_TXS_PER_BLOCK * HASH_BYTES
+    + MAX_FINALIZED_TX_PER_BLOCK * HASH_BYTES
+    + MAX_PROVISIONS_PER_BLOCK * HASH_BYTES
+    + MAX_PROPOSAL_EVIDENCE_BYTES
+    + MAX_STATE_CLAIMS_PER_BLOCK
+        * (STATE_CLAIM_BYTES + MAX_PROOFS_PER_QUERY * STATE_CLAIM_CELL_BYTES);
+
+/// INV-WIRE-1: a proposal every section of which is at its cap still
+/// fits the frame that carries it. The transports drop an oversize
+/// message rather than truncating it, so a proposer that could build one
+/// would lose the round and lose it again on every block of that shape.
+const _: () = assert!(MAX_PROPOSAL_BYTES < MAX_WIRE_MESSAGE_BYTES);
 
 /// How far the drain's transaction *count* may run past the depth its
 /// work budget is sized for, when every transaction is as cheap as one

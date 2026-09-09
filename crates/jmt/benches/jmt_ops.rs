@@ -7,7 +7,7 @@ use std::hint::black_box;
 use blake3::hash as blake3_hash;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hyperscale_jmt::{
-    Blake3Hasher, KEY_BYTES, Key, LeafValue, MemoryStore, MultiProof, Tree, ValueHash,
+    Blake3Hasher, KEY_BYTES, Key, LeafValue, MemoryStore, MultiProof, NibblePath, Tree, ValueHash,
 };
 
 type Jmt = Tree<Blake3Hasher>;
@@ -133,7 +133,7 @@ fn bench_verify(c: &mut Criterion) {
                 &batch_n,
                 |b, _| {
                     b.iter(|| {
-                        Jmt::verify(&proof, root_hash, &expected).unwrap();
+                        Jmt::verify(&proof, root_hash, &NibblePath::empty(), &expected).unwrap();
                     });
                 },
             );

@@ -172,7 +172,7 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
                 Arc::clone(&args.derivation),
                 args.shard,
                 args.shard_config,
-                args.recovered.clone(),
+                args.recovered,
                 beacon_coordinator,
                 args.mempool_config.clone(),
                 args.provision_config,

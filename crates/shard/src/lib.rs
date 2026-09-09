@@ -66,6 +66,7 @@
 //!   nudges its view toward a higher round observed on a header or vote.
 
 pub mod action_handlers;
+pub mod admission;
 pub mod beacon_witnesses;
 pub mod ready_signal_pool;
 
@@ -77,6 +78,7 @@ mod config;
 mod coordinator;
 mod deferred_qc;
 mod fee_ledger;
+mod fence;
 mod lookups;
 mod pending;
 mod precut;
@@ -91,4 +93,4 @@ mod vote_set;
 pub use config::ShardConsensusConfig;
 pub use coordinator::{ShardCoordinator, ShardMemoryStats, ShardStats};
 pub use hyperscale_types::SettledTxSet;
-pub use verification::ReadyStateRootVerification;
+pub use verification::{ReadyStateRootVerification, committed_cells_for};

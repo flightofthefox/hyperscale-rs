@@ -22,7 +22,7 @@ use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::host::{attach_shard, detach_shard};
 use hyperscale_node::{SeatVnodeGroup, VnodeInit, seat_vnode_group};
 use hyperscale_storage::RecoveredState;
-use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
+use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
     Block, BlockHeight, RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
 };
@@ -259,7 +259,7 @@ impl ShardSupervisor {
             &self.process,
             &self.node_config,
             inits,
-            SharedStorage::new(Arc::clone(&storage)),
+            (*storage).clone(),
             callback_tx,
         );
         shard_loop.set_time(consensus_clock(self.genesis_offset_ms));

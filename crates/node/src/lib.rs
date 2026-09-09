@@ -25,7 +25,8 @@
 //! Cross-shard provisions are gossiped optimistically; if a target shard
 //! misses the broadcast, the cross-shard `provision_serve` path answers
 //! `provision.request` from `RocksDB` and the historical JMT. Reads are
-//! bounded by `jmt_history_length` (256 blocks by default).
+//! bounded by the retention floor — `RETENTION_HORIZON` of weighted
+//! time behind the tip.
 //!
 //! [`ProcessIo`]: crate::process::ProcessIo
 
@@ -52,6 +53,7 @@ pub use process::TxStatusCache;
 pub use shard::consensus::{BlockSyncStateKind, serve_block_request};
 pub use shard::cross_shard::{
     serve_committed_txs_request, serve_local_certified_headers, serve_settled_txs_request,
+    serve_state_proof_request,
 };
 pub use shard::{SharedTopologySnapshot, TimerOp, timer_event};
 pub use state::NodeStateMachine;

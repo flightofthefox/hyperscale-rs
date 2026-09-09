@@ -802,7 +802,10 @@ mod tests {
             &mut state,
             &net(),
             p,
-            &ShardWitnessPayload::ScheduleSplit { shard: p },
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
         );
         let parent_members: BTreeSet<ValidatorId> = (0..4).map(ValidatorId::new).collect();
         let cohort: BTreeMap<ValidatorId, CohortSeat> = cohort_of(&state, p).clone();
@@ -884,6 +887,69 @@ mod tests {
     /// floor projection carries the parent across the whole lifecycle:
     /// from the pending record at admission, then from the boundary stamp
     /// once the record is consumed (the coast).
+    /// A gate met inside a window schedules the terminal for the next
+    /// one, after that window's projection was published, so the
+    /// projection carries no terminal where the fold carries one — a
+    /// reader keyed on `scheduled_terminal` answers differently from the
+    /// two copies. The trie has no such gap: the cut lands a whole window
+    /// after the gate, and every projection of the children's window is
+    /// published after the gate has seated them.
+    #[test]
+    fn a_terminal_scheduled_inside_a_window_is_absent_from_that_windows_projection() {
+        let p = ShardId::leaf(1, 0);
+        let (left, right) = p.children();
+        let mut state = grow_state(4);
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
+        );
+        let gate_epoch = state.current_epoch;
+        // The next window's projection as the fold before the gate
+        // published it.
+        let published_before_the_gate = state.derive_next_topology_snapshot(net());
+        let left_observer = observer_for(&state, p, left);
+        mark_ready(&mut state, p, left_observer);
+        let right_observer = observer_for(&state, p, right);
+        mark_ready(&mut state, p, right_observer);
+        schedule_ready_splits(&mut state);
+        let terminal = state
+            .pending_reshapes
+            .get(&p)
+            .and_then(PendingReshape::scheduled_terminal)
+            .expect("the gate schedules the cut");
+        assert_eq!(
+            terminal,
+            gate_epoch.next(),
+            "the parent's final window is the next one"
+        );
+        // What the fold into that window freezes: the live window as the
+        // gate left it.
+        let frozen_at_the_fold = state.derive_next_topology_snapshot(net());
+        assert_eq!(published_before_the_gate.scheduled_terminal(p), None);
+        assert_eq!(frozen_at_the_fold.scheduled_terminal(p), Some(terminal));
+        assert_eq!(
+            published_before_the_gate
+                .shard_trie()
+                .leaves()
+                .collect::<Vec<_>>(),
+            frozen_at_the_fold.shard_trie().leaves().collect::<Vec<_>>(),
+            "the final window's trie still carries the parent in both copies",
+        );
+        // The children's window: projected at the final window's fold,
+        // after the gate, so the children are already in its trie.
+        assert!(advance_to_scheduled_cut(&mut state));
+        apply_scheduled_splits(&mut state);
+        let children = state.derive_next_topology_snapshot(net());
+        assert!(children.shard_trie().contains(left) && children.shard_trie().contains(right));
+        assert!(!children.shard_trie().contains(p));
+    }
+
     #[test]
     fn execution_stamps_the_admission_epoch_on_the_terminal_boundary() {
         use hyperscale_types::RETENTION_HORIZON;
@@ -917,7 +983,10 @@ mod tests {
             &mut state,
             &net(),
             p,
-            &ShardWitnessPayload::ScheduleSplit { shard: p },
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
         );
         let admitted = state.current_epoch;
         let floor = WeightedTimestamp::from_millis(
@@ -963,7 +1032,10 @@ mod tests {
             &mut state,
             &net(),
             p,
-            &ShardWitnessPayload::ScheduleSplit { shard: p },
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
         );
         let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
         for observer in observers {
@@ -999,7 +1071,10 @@ mod tests {
                 state,
                 &net(),
                 p,
-                &ShardWitnessPayload::ScheduleSplit { shard: p },
+                &ShardWitnessPayload::ScheduleSplit {
+                    shard: p,
+                    epoch: Epoch::GENESIS,
+                },
             );
             let observers: Vec<ValidatorId> = cohort_of(state, p).keys().copied().collect();
             for observer in observers {
@@ -1021,7 +1096,10 @@ mod tests {
         use hyperscale_types::RESHAPE_TRIGGER_TTL_EPOCHS;
 
         let p = ShardId::leaf(1, 0);
-        let split = ShardWitnessPayload::ScheduleSplit { shard: p };
+        let split = ShardWitnessPayload::ScheduleSplit {
+            shard: p,
+            epoch: Epoch::GENESIS,
+        };
 
         // Admission: the draw surfaces with assignments.
         let mut state = grow_state(4);
@@ -1138,7 +1216,10 @@ mod tests {
         apply_witness_chunk(
             &mut state,
             0,
-            vec![ShardWitnessPayload::ScheduleSplit { shard: p }],
+            vec![ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            }],
         );
         assert!(state.pending_reshapes.contains_key(&p));
         let consensus_during_grow = state.shard_consensus_members.clone();
@@ -1308,7 +1389,7 @@ mod tests {
         let parent = ShardId::leaf(1, 0);
         let (left, right) = parent.children();
         let mut state = merge_grow_state(0);
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let merge = merge_assertion(parent);
 
         // The first half waits: no keepers, no readiness clock.
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
@@ -1371,7 +1452,7 @@ mod tests {
             }
         }
 
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let merge = merge_assertion(parent);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
 
@@ -1396,7 +1477,7 @@ mod tests {
         let parent = ShardId::leaf(1, 0);
         let (left, right) = parent.children();
         let mut state = merge_grow_state(0);
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let merge = merge_assertion(parent);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         let keepers = keepers_of(&state, parent);
@@ -1424,7 +1505,7 @@ mod tests {
         let parent = ShardId::leaf(1, 0);
         let (left, right) = parent.children();
         let mut state = merge_grow_state(0);
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let merge = merge_assertion(parent);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
 
@@ -1458,7 +1539,7 @@ mod tests {
         let (left, right) = parent.children();
         let mut state = merge_grow_state(4);
         state.current_epoch = Epoch::new(state.chain_config.shuffle_interval_epochs());
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let merge = merge_assertion(parent);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         let keepers = keepers_of(&state, parent);
@@ -1514,7 +1595,7 @@ mod tests {
             .collect();
         assert_eq!(parties.len(), 2, "both children rotate");
 
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let merge = merge_assertion(parent);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
 
@@ -1562,7 +1643,7 @@ mod tests {
         let (left, right) = parent.children();
         let mut state = merge_grow_state(4);
 
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let merge = merge_assertion(parent);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
 
@@ -1625,7 +1706,10 @@ mod tests {
             state.current_epoch = Epoch::new(state.chain_config.shuffle_interval_epochs());
             run_shuffle_step(&mut state);
 
-            let merge = ShardWitnessPayload::ScheduleMerge { parent };
+            let merge = ShardWitnessPayload::ScheduleMerge {
+                parent,
+                epoch: Epoch::GENESIS,
+            };
             apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
             apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
 
@@ -1686,7 +1770,7 @@ mod tests {
         let parent = ShardId::leaf(1, 0);
         let (left, right) = parent.children();
         let mut state = merge_grow_state(0);
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let merge = merge_assertion(parent);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         assert!(state.pending_reshapes.contains_key(&parent));
@@ -1731,7 +1815,10 @@ mod tests {
             &mut state,
             &net(),
             p,
-            &ShardWitnessPayload::ScheduleSplit { shard: p },
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
         );
         // Collected first: marking readiness borrows the state mutably.
         let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
@@ -1776,7 +1863,7 @@ mod tests {
         let parent = ShardId::leaf(1, 0);
         let (left, right) = parent.children();
         let mut state = merge_grow_state(0);
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let merge = merge_assertion(parent);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         let keepers = keepers_of(&state, parent);
@@ -1862,7 +1949,10 @@ mod tests {
             &mut state,
             &net(),
             p,
-            &ShardWitnessPayload::ScheduleSplit { shard: p },
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
         );
         let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
         for observer in observers {
@@ -1887,7 +1977,10 @@ mod tests {
             &mut state,
             &net(),
             p,
-            &ShardWitnessPayload::ScheduleSplit { shard: p },
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
         );
 
         assert!(
@@ -1908,7 +2001,7 @@ mod tests {
         let parent = ShardId::leaf(1, 0);
         let (left, right) = parent.children();
         let mut state = merge_grow_state(0);
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let merge = merge_assertion(parent);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         for (id, seat) in keepers_of(&state, parent) {
@@ -1956,7 +2049,10 @@ mod tests {
             &mut state,
             &net(),
             p,
-            &ShardWitnessPayload::ScheduleSplit { shard: p },
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
         );
         let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
         for observer in &observers {
@@ -1979,7 +2075,10 @@ mod tests {
             &mut state,
             &net(),
             p,
-            &ShardWitnessPayload::ScheduleSplit { shard: p },
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
         );
 
         assert!(
@@ -2032,7 +2131,10 @@ mod tests {
             &mut state,
             &net(),
             p,
-            &ShardWitnessPayload::ScheduleSplit { shard: p },
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
         );
         for child in [left, right] {
             let observer = observer_for(&state, p, child);
@@ -2071,7 +2173,7 @@ mod tests {
         let parent = ShardId::leaf(1, 0);
         let (left, right) = parent.children();
         let mut state = merge_grow_state(0);
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let merge = merge_assertion(parent);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         let keepers = keepers_of(&state, parent);
@@ -2172,7 +2274,10 @@ mod tests {
             &mut state,
             &net(),
             p,
-            &ShardWitnessPayload::ScheduleSplit { shard: p },
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
         );
         assert_eq!(state.pooled_validators().len(), 2);
 
@@ -2225,7 +2330,7 @@ mod tests {
         let parent = ShardId::leaf(1, 0);
         let (left, right) = parent.children();
         let mut state = merge_grow_state(0);
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let merge = merge_assertion(parent);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         let keepers = keepers_of(&state, parent);
@@ -2286,7 +2391,7 @@ mod tests {
     fn merge_execution_is_deterministic_across_replicas() {
         let parent = ShardId::leaf(1, 0);
         let (left, right) = parent.children();
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let merge = merge_assertion(parent);
         let mut a = merge_grow_state(0);
         let mut b = merge_grow_state(0);
         for state in [&mut a, &mut b] {
@@ -2352,7 +2457,7 @@ mod tests {
             },
         );
 
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let merge = merge_assertion(parent);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         for (id, seat) in keepers_of(&state, parent) {
@@ -2391,6 +2496,15 @@ mod tests {
         assert_eq!(ready[&parent].len(), 4);
         // The pending placeholder never projects as a snap-sync anchor.
         assert!(lookahead.boundary(parent).is_none());
+    }
+
+    /// A merge assertion under `parent`, in the epoch these tests date
+    /// every assertion to.
+    fn merge_assertion(parent: ShardId) -> ShardWitnessPayload {
+        ShardWitnessPayload::ScheduleMerge {
+            parent,
+            epoch: Epoch::GENESIS,
+        }
     }
 
     /// `routing_committees()` resolves a dissolved merging child to the
@@ -2457,7 +2571,7 @@ mod tests {
         let right_serving = serving(&state, right);
 
         // Drive the merge to execution.
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        let merge = merge_assertion(parent);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         for (id, seat) in keepers_of(&state, parent) {
@@ -2490,7 +2604,7 @@ mod tests {
         let active = Arc::new(state.derive_topology_snapshot(net()));
         let lookahead = Arc::new(state.derive_next_topology_snapshot(net()));
         let mut schedule = TopologySchedule::new(1000, Epoch::new(5), active);
-        schedule.insert(Epoch::new(6), lookahead);
+        schedule.insert_lookahead(Epoch::new(6), lookahead);
         let routing = schedule.routing_committees();
 
         let route = |shard| -> BTreeSet<ValidatorId> {

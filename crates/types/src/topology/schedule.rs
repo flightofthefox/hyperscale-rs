@@ -36,10 +36,19 @@ pub type RoutingCommittees = BTreeMap<ShardId, Vec<ValidatorId>>;
 /// and trims via [`evict_below`](Self::evict_below); the lookahead entry is
 /// finalized an epoch before its window opens.
 ///
+/// A window is written twice: the fold of `N` publishes its projection of
+/// `N+1`, and the fold of `N+1` replaces it with the frozen window. A
+/// question about the window ahead — whether a shard is leaving, where a
+/// settled window floors — must not move between those two writes, or a
+/// replica replaying a block classifies it against a different future
+/// than the replicas that committed it did. So the projection is also
+/// kept as it was first written, in [`lookahead`](Self::lookahead), and
+/// every forward question reads that copy.
+///
 /// A schedule built with [`single`](Self::single) carries one committee for
 /// all time (`epoch_duration_ms == 0` folds every timestamp to genesis) — the
 /// pre-rotation / single-epoch case used by tests and within-epoch callers.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TopologySchedule {
     /// Window length in milliseconds; `epoch = floor(wt / epoch_duration_ms)`.
     /// Zero means a single fixed committee (every timestamp maps to genesis).
@@ -48,6 +57,9 @@ pub struct TopologySchedule {
     head: Arc<TopologySnapshot>,
     /// Committee snapshots keyed by the epoch each governs.
     by_epoch: BTreeMap<Epoch, Arc<TopologySnapshot>>,
+    /// Each window's projection as the fold before it first published it,
+    /// never rewritten by the fold that freezes the window.
+    lookahead: BTreeMap<Epoch, Arc<TopologySnapshot>>,
 }
 
 /// Answer of [`TopologySchedule::split_at_next_boundary`].
@@ -92,10 +104,12 @@ impl TopologySchedule {
     pub fn new(epoch_duration_ms: u64, head_epoch: Epoch, head: Arc<TopologySnapshot>) -> Self {
         let mut by_epoch = BTreeMap::new();
         by_epoch.insert(head_epoch, Arc::clone(&head));
+        let lookahead = BTreeMap::new();
         Self {
             epoch_duration_ms,
             head,
             by_epoch,
+            lookahead,
         }
     }
 
@@ -139,10 +153,12 @@ impl TopologySchedule {
         // genesis, where the sole entry lives — so `at` always answers.
         let mut by_epoch = BTreeMap::new();
         by_epoch.insert(Epoch::GENESIS, Arc::clone(&snapshot));
+        let lookahead = BTreeMap::new();
         Self {
             epoch_duration_ms: 0,
             head: snapshot,
             by_epoch,
+            lookahead,
         }
     }
 
@@ -396,8 +412,8 @@ impl TopologySchedule {
     ///
     /// The local-bookkeeping companion of the fence's own inline
     /// derivation in [`settled_set_verdict`](crate::settled_set_verdict):
-    /// caches, prunes, and acquisition drivers retain on this, so none of
-    /// them stops reading while the fence still expects an answer.
+    /// caches, prunes, and the settled sets still wanted all read this, so
+    /// none of them stops asking while the fence still expects an answer.
     #[must_use]
     pub fn terminal_evidence_readable(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
         match self.lookup(wt) {
@@ -898,13 +914,25 @@ impl TopologySchedule {
     /// [`terminates_at_next_boundary`]: Self::terminates_at_next_boundary
     #[must_use]
     pub fn termination_scheduled(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
-        let epoch = self.epoch_for(wt);
-        let pending = [epoch, epoch.next()].iter().any(|e| {
-            self.by_epoch
-                .get(e)
-                .is_some_and(|s| s.split_pending(shard) || s.merge_pending(shard))
-        });
+        let pending = self
+            .forward_windows(wt)
+            .into_iter()
+            .flatten()
+            .any(|s| s.split_pending(shard) || s.merge_pending(shard));
         pending || self.terminates_at_next_boundary(shard, wt) == Some(true)
+    }
+
+    /// The window `wt` falls in and the projection of the one after it,
+    /// as first published: what every forward question reads.
+    ///
+    /// The first is the frozen window. The second is the lookahead copy
+    /// rather than the by-epoch entry, which the next fold rewrites: two
+    /// replicas at one committed frontier hold the same copy whether or
+    /// not either has folded past it, which is what lets a classification
+    /// taken at commit be re-derived identically on replay.
+    fn forward_windows(&self, wt: WeightedTimestamp) -> [Option<&Arc<TopologySnapshot>>; 2] {
+        let epoch = self.epoch_for(wt);
+        [self.by_epoch.get(&epoch), self.lookahead.get(&epoch.next())]
     }
 
     /// The floor of `shard`'s attested settled-transaction window at `wt`: the
@@ -935,19 +963,28 @@ impl TopologySchedule {
         if self.epoch_duration_ms == 0 {
             return None;
         }
-        let epoch = self.epoch_for(wt);
-        [epoch, epoch.next()].iter().find_map(|e| {
-            self.by_epoch
-                .get(e)
-                .and_then(|s| s.settled_window_floor(shard))
-        })
+        self.forward_windows(wt)
+            .into_iter()
+            .flatten()
+            .find_map(|s| s.settled_window_floor(shard))
     }
 
-    /// Record the committee governing `epoch`. The beacon coordinator inserts
-    /// the just-applied epoch's active committee and the next epoch's
-    /// lookahead on every commit.
+    /// Record the committee governing `epoch`: the frozen window the
+    /// beacon coordinator inserts for the epoch it has just applied.
     pub fn insert(&mut self, epoch: Epoch, snapshot: Arc<TopologySnapshot>) {
         self.by_epoch.insert(epoch, snapshot);
+    }
+
+    /// Record the projection of `epoch` the fold before it publishes.
+    ///
+    /// Written to the by-epoch map, where the committee lookup wants it
+    /// and where the fold of `epoch` will replace it, and kept as first
+    /// written for the forward questions: a projection published once is
+    /// never rewritten, so a later insert for the same epoch leaves the
+    /// kept copy alone.
+    pub fn insert_lookahead(&mut self, epoch: Epoch, snapshot: Arc<TopologySnapshot>) {
+        self.by_epoch.insert(epoch, Arc::clone(&snapshot));
+        self.lookahead.entry(epoch).or_insert(snapshot);
     }
 
     /// Replace the active head committee (routing view).
@@ -960,6 +997,7 @@ impl TopologySchedule {
     /// is unreachable by honest artifacts.
     pub fn evict_below(&mut self, floor: Epoch) {
         self.by_epoch.retain(|epoch, _| *epoch >= floor);
+        self.lookahead.retain(|epoch, _| *epoch >= floor);
     }
 }
 
@@ -1227,7 +1265,7 @@ mod tests {
             .with_settled_window_floors(BTreeMap::from([(ShardId::ROOT, floor)])),
         );
         let mut sched = TopologySchedule::new(1000, Epoch::new(3), snapshot());
-        sched.insert(Epoch::new(5), terminating);
+        sched.insert_lookahead(Epoch::new(5), terminating);
 
         // The floor answers from the governing window and from the epoch
         // before it (the lookahead consult), and nowhere else.
@@ -1254,6 +1292,54 @@ mod tests {
                 .settled_window_floor(ShardId::ROOT, WeightedTimestamp::from_millis(5_500)),
             None,
         );
+    }
+
+    /// A forward question does not move with the fold: a replica that has
+    /// folded epoch `e + 1` and one that has not answer alike for a
+    /// timestamp in `e`, though the fold rewrote what the by-epoch map
+    /// holds for `e + 1`.
+    #[test]
+    fn a_forward_question_does_not_move_with_the_fold() {
+        let projecting_a_split = |pending: &[ShardId]| {
+            Arc::new(TopologySnapshot::from_explicit_committees(
+                NetworkDefinition::simulator(),
+                &ValidatorSet::new(Vec::new()),
+                HashMap::from([(ShardId::ROOT, Vec::new())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                pending.iter().copied().collect(),
+            ))
+        };
+        let in_window_four = WeightedTimestamp::from_millis(4_500);
+
+        // The fold of 4 publishes its projection of 5, with the root's
+        // split pending.
+        let mut behind = TopologySchedule::new(1000, Epoch::new(4), snapshot());
+        behind.insert_lookahead(Epoch::new(5), projecting_a_split(&[ShardId::ROOT]));
+        assert!(behind.termination_scheduled(ShardId::ROOT, in_window_four));
+
+        // The fold of 5 freezes window 5 with the split already cleared.
+        // The replica that folded it answers for window 4 exactly as the
+        // one that has not.
+        let mut ahead = behind.clone();
+        ahead.insert(Epoch::new(5), projecting_a_split(&[]));
+        assert_eq!(
+            ahead.termination_scheduled(ShardId::ROOT, in_window_four),
+            behind.termination_scheduled(ShardId::ROOT, in_window_four),
+        );
+
+        // A projection is kept as first published: publishing window 5
+        // again leaves the copy the forward question reads alone.
+        ahead.insert_lookahead(Epoch::new(5), projecting_a_split(&[]));
+        assert!(ahead.termination_scheduled(ShardId::ROOT, in_window_four));
+
+        // Eviction takes the kept copy with the window.
+        ahead.evict_below(Epoch::new(6));
+        assert!(!ahead.termination_scheduled(ShardId::ROOT, in_window_four));
     }
 
     #[test]

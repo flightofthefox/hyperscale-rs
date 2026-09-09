@@ -14,14 +14,15 @@ use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
     cross_shard_genesis_accounts, genesis_accounts, halt_straddler_setup,
     livelock_genesis_accounts, merge_straddler_setup, participant_sweep_genesis_accounts,
-    reshape_lifecycle_accounts, split_straddler_setup,
+    remote_delegator, reshape_lifecycle_accounts, split_straddler_setup,
 };
 use hyperscale_scenarios::{
-    ScenarioConfig, abort_converges, abort_floor_settles_on_deadline,
+    ScenarioConfig, a_delivery_cut_off_past_its_window_is_reclaimed,
+    a_delivery_is_reclaimed_when_its_deliverer_splits,
+    a_leg_whose_core_never_answers_refuses_at_the_deadline, abort_converges,
     beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
-    cross_shard_exec_cert_drop_fetch_fallback, cross_shard_fraction,
-    cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
-    cross_shard_provisions_fetch_with_request_loss,
+    cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
+    cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, delegation_folds_into_beacon_state,
     gossip_drop_engages_fetch_fallback, grow_reaches_four_shard_topology,
@@ -35,10 +36,7 @@ use hyperscale_scenarios::{
     re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
     register_without_capacity_is_rejected, registered_validator_activates_onto_a_shard,
     single_transfer, split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
-    split_surviving_counterpart_releases_its_reservation,
-    split_survivor_recovers_a_settlement_it_never_received,
-    split_terminating_payer_releases_its_reservation, stake_withdraw_drops_effective_stake,
-    surviving_sibling_split_seats_full_committees,
+    stake_withdraw_drops_effective_stake, surviving_sibling_split_seats_full_committees,
     withdrawal_ejects_a_validator_that_a_deposit_reactivates, zipf_payments,
 };
 use hyperscale_types::PrincipalAddr;
@@ -244,14 +242,27 @@ const fn cross_shard_config() -> ScenarioConfig {
 #[test]
 #[serial]
 #[ignore = "real-QUIC production scenario; run with -- --ignored"]
-fn abort_floor_settles_on_deadline_prod() {
+fn a_delivery_cut_off_past_its_window_is_reclaimed_prod() {
     let mut cluster = ProdCluster::start_with_grown_accounts(
         &cross_shard_config(),
         42,
         EPOCH_MS,
         cross_shard_genesis_accounts(),
     );
-    cluster.run_faultable(abort_floor_settles_on_deadline);
+    cluster.run_faultable(a_delivery_cut_off_past_its_window_is_reclaimed);
+}
+
+#[test]
+#[serial]
+#[ignore = "real-QUIC production scenario; run with -- --ignored"]
+fn a_leg_whose_core_never_answers_refuses_at_the_deadline_prod() {
+    let mut cluster = ProdCluster::start_with_grown_accounts(
+        &cross_shard_config(),
+        42,
+        EPOCH_MS,
+        vec![(remote_delegator().1, 1_000_000)],
+    );
+    cluster.run_faultable(a_leg_whose_core_never_answers_refuses_at_the_deadline);
 }
 
 #[test]
@@ -284,14 +295,14 @@ fn cross_shard_provisions_drop_fetch_fallback_prod() {
 #[test]
 #[serial]
 #[ignore = "real-QUIC production scenario; run with -- --ignored"]
-fn cross_shard_exec_cert_drop_fetch_fallback_prod() {
+fn cross_shard_exec_cert_drop_is_inert_prod() {
     let mut cluster = ProdCluster::start_with_accounts(
         &split_config(),
         11,
         EPOCH_MS,
         cross_shard_fault_genesis_accounts(),
     );
-    cluster.run_faultable(cross_shard_exec_cert_drop_fetch_fallback);
+    cluster.run_faultable(cross_shard_exec_cert_drop_is_inert);
 }
 
 #[test]
@@ -404,16 +415,21 @@ fn merge_lifecycle_prod() {
     merge_lifecycle(&mut cluster);
 }
 
-/// Two cohorts of pool surplus and a grow trigger above each child of the
-/// ballasted root (~29.2 KB and ~8.1 KB) but below the root itself
-/// (~37.2 KB): one cohort grows ROOT to the two siblings, the other splits
-/// the heavier one after the vote. One validator per host (each reshape
-/// seat its own store).
+/// Two cohorts of pool surplus plus the shuffle's headroom, and a grow
+/// trigger above each child of the ballasted root (~29.2 KB and ~8.1 KB)
+/// but below the root itself (~37.2 KB): one cohort grows ROOT to the two
+/// siblings, the other splits the heavier one after the vote. One
+/// validator per host (each reshape seat its own store).
+///
+/// The headroom is what makes the second split reachable at all. A split
+/// is admitted only while the pool holds a whole committee, and the
+/// shuffle draws its entrants from that same pool with no such gate —
+/// one per live shard, so two here.
 const fn straddler_config() -> ScenarioConfig {
     ScenarioConfig {
         shard_size: 4,
         vnodes_per_host: 1,
-        pool_surplus: 8,
+        pool_surplus: 10,
         num_shards: 1,
         split_bytes: 33_000,
         latency: Duration::from_millis(60),
@@ -433,31 +449,11 @@ fn split_straddler_atomic_prod() {
 #[test]
 #[serial]
 #[ignore = "real-QUIC production scenario; run with -- --ignored"]
-fn split_terminating_payer_releases_its_reservation_prod() {
+fn a_delivery_is_reclaimed_when_its_deliverer_splits_prod() {
     let setup = split_straddler_setup();
     let mut cluster =
         ProdCluster::start_with_accounts(&straddler_config(), 11, EPOCH_MS, setup.accounts);
-    cluster.run_faultable(split_terminating_payer_releases_its_reservation);
-}
-
-#[test]
-#[serial]
-#[ignore = "real-QUIC production scenario; run with -- --ignored"]
-fn split_survivor_recovers_a_settlement_it_never_received_prod() {
-    let setup = split_straddler_setup();
-    let mut cluster =
-        ProdCluster::start_with_accounts(&straddler_config(), 11, EPOCH_MS, setup.accounts);
-    cluster.run_faultable(split_survivor_recovers_a_settlement_it_never_received);
-}
-
-#[test]
-#[serial]
-#[ignore = "real-QUIC production scenario; run with -- --ignored"]
-fn split_surviving_counterpart_releases_its_reservation_prod() {
-    let setup = split_straddler_setup();
-    let mut cluster =
-        ProdCluster::start_with_accounts(&straddler_config(), 11, EPOCH_MS, setup.accounts);
-    cluster.run_faultable(split_surviving_counterpart_releases_its_reservation);
+    cluster.run_faultable(a_delivery_is_reclaimed_when_its_deliverer_splits);
 }
 
 #[test]

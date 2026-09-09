@@ -18,9 +18,9 @@
 
 use std::time::Duration;
 
-use hyperscale_vm_types::NULLIFIER_GRACE_MS;
+use hyperscale_vm_types::{ARTIFACT_GRACE_MS, CROSSING_GRACE_MS};
 
-use crate::MAX_VALIDITY_RANGE;
+use crate::{CLAIM_WINDOW, MAX_VALIDITY_RANGE, TERMINAL_EVIDENCE_EPOCHS};
 
 /// The longest a cross-shard transaction may take to finalize, past the
 /// last block that could have included it.
@@ -66,16 +66,52 @@ pub const REMOTE_HEADER_RETENTION: Duration = Duration::from_secs(30);
 pub const RETENTION_HORIZON: Duration =
     Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() + MAX_FINALIZATION_DELAY.as_secs());
 
-/// A nullifier's life and every other tx-derived artifact's are the same
-/// bound, asserted rather than assumed: the VM keys and values a
-/// nullifier by an expiry it computes from its own constant, and this is
-/// where the two spellings are held together. If the horizon moves, that
-/// constant moves with it — a nullifier swept while some chain can still
-/// be deciding a spend of it is a replay, and one retained past it is
-/// state nobody can retire.
+/// How far back a chain is folded to rebuild the committed-artifact
+/// dedup window.
+///
+/// The widest of the index's tiers. A transaction is held to the close of
+/// its delivery window — one [`MAX_VALIDITY_RANGE`] past a validity end
+/// that may itself sit a whole range past the block that committed it —
+/// so an entry still live can come from a block two ranges back. The
+/// resolution and provision tiers are keyed at most
+/// [`RETENTION_HORIZON`] past their own block, which this covers.
+pub const DEDUP_WINDOW: Duration = Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() * 2);
+
 const _: () = assert!(
-    RETENTION_HORIZON.as_secs() * 1_000 == NULLIFIER_GRACE_MS,
-    "a nullifier's grace is the protocol's retention horizon",
+    DEDUP_WINDOW.as_secs() >= RETENTION_HORIZON.as_secs(),
+    "the dedup walk covers every tier of the index it rebuilds",
+);
+
+/// The VM keys and values each sweepable family by an expiry it derives
+/// from the family alone, and this is where the two spellings are held
+/// together. Two graces, so two asserts: the default, and the one
+/// exception.
+///
+/// The default is the bound every transaction-derived artifact already
+/// answers to. A nullifier's floor is the last transaction that could
+/// have bound the subintent, admitted before the intent's window ends
+/// and terminated one [`MAX_FINALIZATION_DELAY`] later; a committed
+/// cell's is `Window::Core`, which opens at the deadline and runs one
+/// [`MAX_VALIDITY_RANGE`] on, and the cell is swept exactly where that
+/// window closes — earlier and an absence inside it would be a swept
+/// cell read as a shard that never committed. `RETENTION_HORIZON` is
+/// both.
+const _: () = assert!(
+    RETENTION_HORIZON.as_secs() * 1_000 == ARTIFACT_GRACE_MS,
+    "an artifact lives its signed window plus the retention horizon",
+);
+
+/// The exception is the crossing, whose cells are swept where the claim
+/// window closes: swept earlier and the proof would license a reclaim of
+/// state already gone, retained later and it is state nobody can retire.
+/// And the claim window is the terminal evidence span, so a record a
+/// successor inherits across a cut stays decidable for as long as any
+/// other reshape evidence is readable — which is the whole reason this
+/// family is not on the default.
+const _: () = assert!(
+    (MAX_FINALIZATION_DELAY.as_secs() + CLAIM_WINDOW.as_secs()) * 1_000 == CROSSING_GRACE_MS
+        && EPOCH_DURATION.as_secs() * TERMINAL_EVIDENCE_EPOCHS * 1_000 == CROSSING_GRACE_MS,
+    "a crossing's grace is the deadline plus the claim window, sized at the reshape span",
 );
 
 /// The horizon must not outlive the epoch that produced what it retains.
@@ -126,6 +162,30 @@ pub const VIEW_CHANGE_TIMEOUT_MAX: Duration = Duration::from_secs(30);
 /// the chain. Once this elapses since the last leader-activity reset,
 /// the timer fires regardless of pending work.
 pub const MAX_PROGRESS_WAIT: Duration = Duration::from_secs(9);
+
+/// How long past a counterpart's claiming vote its claim cell becomes
+/// readable in that counterpart's committed state.
+///
+/// The vote anchor a certificate speaks at is where the counterpart's
+/// execution ran, and the cell it writes lands where the tick casting
+/// that vote commits — a few of that shard's blocks later. A probe
+/// before then is certain to miss, and costs more than the fetch it
+/// wastes: a claim is held to each voter's own reading, so members
+/// polling on their own fetch latencies hold readings at different
+/// heights and a block claiming one sends the rest to fetch it again.
+/// Measured from the anchor the certificate names, which every member
+/// reads the same, so they ask one question at one height.
+///
+/// Sized well above a handful of block intervals and far under the
+/// windows a reading answers in, which run to minutes. A counterpart
+/// slower than this is asked again at a newer header, as before; one
+/// faster is retired a moment later than it might have been.
+pub const CLAIM_VISIBILITY_LAG: Duration = Duration::from_secs(1);
+
+const _: () = assert!(
+    CLAIM_VISIBILITY_LAG.as_secs() * 20 < MAX_VALIDITY_RANGE.as_secs(),
+    "the wait before a claim is asked about is a rounding error against the window it answers in",
+);
 
 /// Beacon-chain epoch length, measured against committed beacon-slot
 /// `weighted_timestamp`.

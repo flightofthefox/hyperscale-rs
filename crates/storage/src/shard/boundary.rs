@@ -9,10 +9,10 @@
 //! layer's boundary trigger and range-serving code stay generic and run
 //! identically in simulation and production.
 
-use hyperscale_jmt::{Key, TreeReader};
+use hyperscale_jmt::{Key, NibblePath, TreeReader};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHeight, ChainOrigin, ShardWitnessPayload, StateRoot,
-    StoredReceipt, SubstateLeaf,
+    BeaconWitnessLeafCount, Block, BlockHeight, ChainOrigin, ShardId, ShardWitnessPayload,
+    StateRoot, SubstateKey, SubstateLeaf,
 };
 
 use crate::Substates;
@@ -83,7 +83,8 @@ pub struct ImportProgress {
 }
 
 /// How a reshape successor's store reaches the version its genesis sits at
-/// — the only thing that differs between the three adoptions.
+/// — the only thing that differs between the three adoptions, decided by
+/// [`adopt_plan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdoptSource {
     /// A split child seeded by checkpoint-cloning its parent: the child
@@ -100,6 +101,169 @@ pub enum AdoptSource {
     /// the boundary import. Nothing to re-point; unlike a split child the
     /// prefix may be the trie root.
     InPlace,
+}
+
+/// What a store reads under its lock before deciding an adoption: the
+/// tree's tip, the prefix it is rooted at, and the origin its chain
+/// recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Vintage {
+    /// The tree's version.
+    pub version: u64,
+    /// The root the tree carries at that version.
+    pub root: StateRoot,
+    /// The prefix the tree is rooted at — a split child's, or the trie
+    /// root for a merged parent.
+    pub prefix: NibblePath,
+    /// The origin the chain recorded.
+    pub origin: ChainOrigin,
+}
+
+/// A subtree the tree holds at this store's prefix: the version its
+/// root node sits at, and the root it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Subtree {
+    /// The version the root node is keyed at.
+    pub version: u64,
+    /// The subtree's root.
+    pub root: StateRoot,
+}
+
+/// What an adoption does to the store, decided by [`adopt_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Adoption {
+    /// A re-run over an already-adopted store: the recorded root, and
+    /// nothing to write.
+    Recorded(StateRoot),
+    /// The tip already sits at the genesis version — a merged union the
+    /// boundary import built there. Record the origin and the genesis
+    /// tip over it.
+    InPlace(StateRoot),
+    /// Re-root the tree at the genesis version: copy the subtree's root
+    /// node there, or install the empty root when the side is empty;
+    /// then drop the sweep rows the prefix no longer owns, and record
+    /// the origin and the genesis tip.
+    Repoint(Option<Subtree>),
+}
+
+impl Adoption {
+    /// The root the adoption installs, or answers with.
+    #[must_use]
+    pub fn root(self) -> StateRoot {
+        match self {
+            Self::Recorded(root) | Self::InPlace(root) => root,
+            Self::Repoint(subtree) => subtree.map_or(StateRoot::ZERO, |subtree| subtree.root),
+        }
+    }
+}
+
+/// Decide a reshape successor's adoption of `genesis` from what the
+/// store holds.
+///
+/// One decision for every backend and all three sources, so the two
+/// stores cannot diverge on what an adoption admits. The store reads its
+/// `vintage` under its commit lock and applies what comes back;
+/// `parent_slot(version)` is the one read the decision needs mid-way —
+/// the child-side slot of the parent root node at `version`, for a
+/// clone of a parent checkpoint.
+///
+/// The rules, in order. The genesis must sit at the origin's height. A
+/// store whose tip already sits at that height under this origin is
+/// adopted: the answer is the recorded root, and the parent slot the
+/// first run consumed is not read again. Then the source's vintage: an
+/// in-place union must already sit at the genesis version; a followed
+/// store must sit below it — it only ever advanced on the child half's
+/// writes, which the parent's coast cannot produce; a parent checkpoint
+/// may sit at the crossing or anywhere the coast carried it, since the
+/// frozen root makes the extracted subtree identical at every one. A
+/// split child needs a prefix off the trie root; a merged parent may sit
+/// at it. Last, the root gate, which is the guarantee: a successor's
+/// genesis derives from frozen chain content its duty commit-proved, so
+/// it cannot name a subtree no terminal committed, and a store that does
+/// not hold what the genesis names must not seat.
+///
+/// # Errors
+///
+/// A description of what refused the adoption: the genesis block off
+/// the origin's height, a vintage `source` does not admit, an
+/// unresolvable subtree, or an adopted root the genesis does not name.
+pub fn adopt_plan(
+    vintage: &Vintage,
+    origin: ChainOrigin,
+    genesis: &Block,
+    source: AdoptSource,
+    parent_slot: impl FnOnce(u64) -> Result<Option<Subtree>, String>,
+) -> Result<Adoption, String> {
+    if genesis.height() != origin.genesis_height {
+        return Err(format!(
+            "genesis block at height {} does not sit at the origin's {}",
+            genesis.height(),
+            origin.genesis_height,
+        ));
+    }
+    let genesis_version = origin.genesis_height.inner();
+    if vintage.version == genesis_version && vintage.origin == origin {
+        return Ok(Adoption::Recorded(vintage.root));
+    }
+    let adoption = match source {
+        AdoptSource::InPlace => {
+            if vintage.version != genesis_version {
+                return Err(format!(
+                    "in-place adoption vintage mismatch: store at version {}, genesis height \
+                     {genesis_version}",
+                    vintage.version,
+                ));
+            }
+            Adoption::InPlace(vintage.root)
+        }
+        AdoptSource::ParentSubtree | AdoptSource::FollowedTip => {
+            if vintage.prefix.is_empty() {
+                return Err("split adoption requires a non-root child prefix".to_string());
+            }
+            if source == AdoptSource::FollowedTip {
+                if vintage.version >= genesis_version {
+                    return Err(format!(
+                        "followed adoption vintage mismatch: store at version {}, genesis \
+                         height {genesis_version}",
+                        vintage.version,
+                    ));
+                }
+                Adoption::Repoint((vintage.root != StateRoot::ZERO).then_some(Subtree {
+                    version: vintage.version,
+                    root: vintage.root,
+                }))
+            } else {
+                Adoption::Repoint(parent_slot(vintage.version)?)
+            }
+        }
+    };
+    let adopted = adoption.root();
+    if adopted != genesis.header().state_root() {
+        return Err(format!(
+            "adopted root {adopted:?} does not match the genesis state root {:?}",
+            genesis.header().state_root(),
+        ));
+    }
+    Ok(adoption)
+}
+
+/// Whether a JMT at `height` carrying `root` already holds authenticated
+/// state — anything a snap-sync import would overwrite.
+///
+/// The gate every import call owes the [`BoundaryStore`] contract, stated
+/// once rather than spelled at each of them. Neither term implies the
+/// other: a store past `BlockHeight::GENESIS` always holds state, and one
+/// at `GENESIS` holds it as soon as a genesis build or a reshape clone has
+/// filled its trie. Callers pass the pair they read under whatever lock
+/// makes the two atomic for their backend.
+///
+/// Not "has a chain to resume from". A reshape seat boots with its
+/// coordinator at `GENESIS` over a trie its adoption already filled, so a
+/// caller choosing between resuming a chain and snap-syncing one asks the
+/// chain, not this.
+#[must_use]
+pub fn holds_state(height: BlockHeight, root: StateRoot) -> bool {
+    height != BlockHeight::GENESIS || root != StateRoot::ZERO
 }
 
 /// Pin and serve committed state at epoch boundary heights.
@@ -183,9 +347,9 @@ pub trait BoundaryStore {
         witnesses: WitnessSeed,
     ) -> Result<StateRoot, String>;
 
-    /// Apply the subset of a followed chain's block writes that falls
-    /// under this store's prefix, at the block's height — substate
-    /// values, the JMT, and the count, advancing the store's version.
+    /// Apply the subset of a followed chain's block that falls under
+    /// this store's prefix, at the block's height — substate values, the
+    /// JMT, and the count, advancing the store's version.
     ///
     /// This is how a reshape observer's child-rooted store stays current
     /// with the splitting parent between its snap-synced anchor and the
@@ -193,9 +357,14 @@ pub trait BoundaryStore {
     /// chain's (QC-trusted by the driver — the observer cannot verify
     /// the parent's full roots from a half store), and partition
     /// independence keeps the resulting root exactly the parent tree's
-    /// subtree node at the prefix. A block whose writes carry nothing
-    /// under the prefix is a no-op: the version does not advance, so the
-    /// store's version line stays sparse on the parent's heights.
+    /// subtree node at the prefix. The block is applied as the chain
+    /// applied it — the receipts its ticks settled, the committed cells
+    /// its committer derived under the block's own window, `creations`,
+    /// and the sweep its header names — so the follower's half reads
+    /// exactly as the parent's. A block that
+    /// touches nothing under the prefix is a no-op: the version does not
+    /// advance, so the store's version line stays sparse on the parent's
+    /// heights.
     ///
     /// Returns the store's state root after the application.
     ///
@@ -205,28 +374,20 @@ pub trait BoundaryStore {
     /// store's current version, or a backend write failure.
     fn follow_block_writes(
         &self,
-        height: BlockHeight,
-        receipts: &[StoredReceipt],
+        block: &Block,
+        creations: &[(SubstateKey, Vec<u8>)],
     ) -> Result<StateRoot, String>;
 
     /// Install a reshape successor's derived `genesis` as this store's
-    /// chain origin and committed tip, returning the adopted state root.
-    ///
-    /// `source` names only how the tree reaches the genesis version; the
-    /// adopted root is then checked against the root the `genesis` names,
-    /// which is what gates the seat. A successor's genesis derives from
-    /// frozen chain content its duty commit-proved, so it cannot name a
-    /// subtree no terminal committed — and a store that does not hold what
-    /// the genesis names must not seat.
+    /// chain origin and committed tip, returning the adopted state root:
+    /// [`adopt_plan`] decided over this store's vintage, then applied.
     ///
     /// Idempotent: a re-run over an already-adopted store returns the
     /// recorded adoption.
     ///
     /// # Errors
     ///
-    /// Returns a description of the failure — a genesis block off the
-    /// origin's height, a store vintage `source` does not admit, an
-    /// unresolvable subtree, or an adopted root the genesis does not name.
+    /// What [`adopt_plan`] refused.
     fn adopt_genesis(
         &self,
         origin: ChainOrigin,
@@ -237,4 +398,187 @@ pub trait BoundaryStore {
     /// The committed substate byte total at `version`, or `None` when the
     /// store's version line doesn't carry it.
     fn substate_bytes_at_version(&self, version: u64) -> Option<u64>;
+
+    /// Every escrow record `shard`'s slice of the committed state holds,
+    /// with its bytes.
+    ///
+    /// Derived on demand rather than indexed, because the state is the
+    /// authority and the one caller asks once: a reshape successor whose
+    /// adoption just filled its trie, and whose ledger begins empty
+    /// while the value its predecessors escrowed rides the prefix in.
+    /// Nothing else names those records — the entry that would is the
+    /// predecessor's ledger's, a fold over a chain the successor never
+    /// replays, and the cell is outside every sweep's reach.
+    ///
+    /// Bounded by the shard's own prefix rather than run over the store:
+    /// a split child's store is a clone of its parent's and holds the
+    /// sibling's leaves too, and an obligation the sibling owns is not
+    /// this seat's to take. The keyspace is owner-major, so the prefix is
+    /// a contiguous run and the scan is that run and nothing else.
+    fn escrow_records(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)>;
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_types::{Hash, ValidatorId, WeightedTimestamp};
+
+    use super::*;
+
+    fn origin_at(height: u64) -> ChainOrigin {
+        ChainOrigin {
+            genesis_height: BlockHeight::new(height),
+            anchor_wt: WeightedTimestamp::from_millis(42_000),
+        }
+    }
+
+    fn genesis_naming(root: StateRoot, origin: ChainOrigin) -> Block {
+        Block::genesis(ShardId::ROOT, ValidatorId::new(0), root, origin)
+    }
+
+    fn root(tag: &[u8]) -> StateRoot {
+        StateRoot::from_raw(Hash::from_bytes(tag))
+    }
+
+    fn child_prefix() -> NibblePath {
+        let mut path = NibblePath::empty();
+        path.push_bits(1, 1);
+        path
+    }
+
+    fn vintage(version: u64, root: StateRoot, prefix: NibblePath, origin: ChainOrigin) -> Vintage {
+        Vintage {
+            version,
+            root,
+            prefix,
+            origin,
+        }
+    }
+
+    fn no_slot(_: u64) -> Result<Option<Subtree>, String> {
+        panic!("the parent slot is not read")
+    }
+
+    /// A store already sitting at the genesis under this origin answers
+    /// its recorded root without reading the parent slot again.
+    #[test]
+    fn an_adopted_store_answers_its_recorded_root() {
+        let origin = origin_at(10);
+        let held = root(b"held");
+        let genesis = genesis_naming(root(b"anything"), origin);
+        let vintage = vintage(10, held, child_prefix(), origin);
+        for source in [
+            AdoptSource::ParentSubtree,
+            AdoptSource::FollowedTip,
+            AdoptSource::InPlace,
+        ] {
+            assert_eq!(
+                adopt_plan(&vintage, origin, &genesis, source, no_slot),
+                Ok(Adoption::Recorded(held)),
+            );
+        }
+    }
+
+    /// A followed store sits below the genesis height or it is not a
+    /// followed store: its tip is the adopted subtree, and an empty tip is
+    /// the empty side.
+    #[test]
+    fn a_followed_tip_must_sit_below_the_genesis_and_adopts_its_own_root() {
+        let origin = origin_at(10);
+        let followed = root(b"followed");
+        let genesis = genesis_naming(followed, origin);
+        let below = vintage(8, followed, child_prefix(), ChainOrigin::ROOT);
+        assert_eq!(
+            adopt_plan(&below, origin, &genesis, AdoptSource::FollowedTip, no_slot),
+            Ok(Adoption::Repoint(Some(Subtree {
+                version: 8,
+                root: followed
+            }))),
+        );
+        let at = vintage(10, followed, child_prefix(), ChainOrigin::ROOT);
+        assert!(
+            adopt_plan(&at, origin, &genesis, AdoptSource::FollowedTip, no_slot)
+                .unwrap_err()
+                .contains("followed adoption vintage mismatch")
+        );
+        let empty = vintage(3, StateRoot::ZERO, child_prefix(), ChainOrigin::ROOT);
+        let empty_genesis = genesis_naming(StateRoot::ZERO, origin);
+        assert_eq!(
+            adopt_plan(
+                &empty,
+                origin,
+                &empty_genesis,
+                AdoptSource::FollowedTip,
+                no_slot
+            ),
+            Ok(Adoption::Repoint(None)),
+        );
+    }
+
+    /// A parent checkpoint adopts whatever the child slot holds at its
+    /// version — at the crossing or past a coast — and the root gate is
+    /// what refuses a slot the genesis does not name.
+    #[test]
+    fn a_parent_checkpoint_adopts_its_child_slot_behind_the_root_gate() {
+        let origin = origin_at(10);
+        let slot = root(b"child slot");
+        let genesis = genesis_naming(slot, origin);
+        let coasted = vintage(13, root(b"parent"), child_prefix(), ChainOrigin::ROOT);
+        let read = |version: u64| {
+            assert_eq!(version, 13, "the slot is read at the checkpoint's version");
+            Ok(Some(Subtree {
+                version: 9,
+                root: slot,
+            }))
+        };
+        assert_eq!(
+            adopt_plan(&coasted, origin, &genesis, AdoptSource::ParentSubtree, read),
+            Ok(Adoption::Repoint(Some(Subtree {
+                version: 9,
+                root: slot
+            }))),
+        );
+        let forged = genesis_naming(root(b"forged"), origin);
+        assert!(
+            adopt_plan(&coasted, origin, &forged, AdoptSource::ParentSubtree, read)
+                .unwrap_err()
+                .contains("does not match the genesis state root")
+        );
+        let at_root = vintage(13, root(b"parent"), NibblePath::empty(), ChainOrigin::ROOT);
+        assert!(
+            adopt_plan(
+                &at_root,
+                origin,
+                &genesis,
+                AdoptSource::ParentSubtree,
+                no_slot
+            )
+            .unwrap_err()
+            .contains("non-root child prefix")
+        );
+    }
+
+    /// A merged union is adopted where it stands, and only there.
+    #[test]
+    fn an_in_place_union_must_already_sit_at_the_genesis() {
+        let origin = origin_at(10);
+        let union = root(b"union");
+        let genesis = genesis_naming(union, origin);
+        let built = vintage(10, union, NibblePath::empty(), ChainOrigin::ROOT);
+        assert_eq!(
+            adopt_plan(&built, origin, &genesis, AdoptSource::InPlace, no_slot),
+            Ok(Adoption::InPlace(union)),
+        );
+        let short = vintage(9, union, NibblePath::empty(), ChainOrigin::ROOT);
+        assert!(
+            adopt_plan(&short, origin, &genesis, AdoptSource::InPlace, no_slot)
+                .unwrap_err()
+                .contains("in-place adoption vintage mismatch")
+        );
+        let elsewhere = genesis_naming(union, origin_at(11));
+        assert!(
+            adopt_plan(&built, origin, &elsewhere, AdoptSource::InPlace, no_slot)
+                .unwrap_err()
+                .contains("does not sit at the origin's")
+        );
+    }
 }

@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::sharding::filter_genesis_writes_for_shard;
+use hyperscale_engine::sharding::{filter_genesis_writes_for_shard, owned_by};
 use hyperscale_engine::{GenesisConfig, genesis_writes};
 use hyperscale_network::Network;
 use hyperscale_storage::{GenesisCommit, RecoveredState, ShardStorage};
@@ -140,8 +140,10 @@ where
         // for read availability, but the prefix-rooted JMT must hold only
         // this shard's subtree, so the committed state root is the global
         // tree's node at the shard prefix.
-        let jmt_writes =
-            filter_genesis_writes_for_shard(&merged, shard, topology_snapshot.shard_trie());
+        let jmt_writes = filter_genesis_writes_for_shard(
+            &merged,
+            owned_by(shard, topology_snapshot.shard_trie()),
+        );
         self.shard_io(shard)
             .storage
             .install_genesis(&merged, &jmt_writes)

@@ -17,12 +17,39 @@ use hyperscale_hbor::{
 use thiserror::Error;
 
 use crate::{
-    AggregateSignature, BlockHeight, ConsensusPublicKey, ExecutionVote, ExecutionVoteMessage,
-    GlobalReceiptRoot, Hash, MAX_TXS_PER_BLOCK, NetworkDefinition, RETENTION_HORIZON, ShardId,
-    SignerBitfield, TickId, TxHash, TxOutcome, ValidatorId, Verified, Verify, WeightedTimestamp,
-    compute_global_receipt_root, compute_sparse_proof, signed_bytes, tx_outcome_leaf,
-    verify_sparse_inclusion,
+    AggregateSignature, BlockHeight, ConsensusPublicKey, ExecutionOutcome, ExecutionVote,
+    ExecutionVoteMessage, GlobalReceiptRoot, Hash, Heard, MAX_TXS_PER_BLOCK, NetworkDefinition,
+    Question, RETENTION_HORIZON, ShardId, SignerBitfield, TickId, TransactionDecision, TxHash,
+    TxOutcome, ValidatorId, Verified, Verify, WeightedTimestamp, Word, compute_global_receipt_root,
+    compute_sparse_proof, signed_bytes, tx_outcome_leaf, verify_sparse_inclusion,
 };
+
+/// Domain tag separating a certificate's attested digest from every
+/// other preimage the codebase hashes.
+const CERTIFICATE_DIGEST_TAG: &[u8] = b"hyperscale.execution_certificate.attested.v1";
+
+/// What a certificate says of one transaction, as a counterpart hears
+/// it.
+///
+/// Two shapes because they are two different things, and the record
+/// vocabulary holds only one of them. A refusal is evidence: the
+/// counterpart ended the transaction on its shard, and a record may
+/// carry that word. A claiming success is a cue: it says the
+/// counterpart's execution went through, not that it wrote the claim
+/// the success promises — its own finalization can still be refused
+/// afterwards — so what a record stands on is the claim cell proved
+/// present, and the certificate only opens the question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spoken {
+    /// The counterpart refused it, at the vote anchor, named by the
+    /// attested digest.
+    Refused(Heard),
+    /// The counterpart's execution claimed, in a role that claims.
+    Claimed {
+        /// The vote anchor the certificate speaks at.
+        at: WeightedTimestamp,
+    },
+}
 
 /// Aggregated certificate for an execution tick.
 ///
@@ -402,6 +429,45 @@ impl ExecutionCertificate {
         &self.tx_outcomes
     }
 
+    /// What this certificate says of each transaction, as a counterpart
+    /// hears it.
+    ///
+    /// A success speaks only in a role that claims. A leg's success is
+    /// its own side going through, which says nothing about the crossings
+    /// it consumed — and an issuer that heard it as an acceptance would
+    /// take it for the claim its record is held for. A refusal speaks
+    /// whatever the role, since a member that could not do its part ends
+    /// the transaction on its shard.
+    pub fn verdicts(&self) -> impl Iterator<Item = (TxHash, Spoken)> + '_ {
+        let digest = self.attested_digest();
+        let at = self.vote_anchor_ts;
+        self.tx_outcomes.iter().filter_map(move |outcome| {
+            let spoken = match outcome.outcome() {
+                ExecutionOutcome::Succeeded { .. } => outcome
+                    .role()
+                    .success_claims()
+                    .then_some(Spoken::Claimed { at })?,
+                ExecutionOutcome::Failed => Spoken::Refused(Heard {
+                    question: Question::Verdict,
+                    word: Word::Refused {
+                        decision: TransactionDecision::Reject,
+                        digest,
+                    },
+                    at,
+                }),
+                ExecutionOutcome::Aborted => Spoken::Refused(Heard {
+                    question: Question::Verdict,
+                    word: Word::Refused {
+                        decision: TransactionDecision::Aborted,
+                        digest,
+                    },
+                    at,
+                }),
+            };
+            Some((outcome.tx_hash(), spoken))
+        })
+    }
+
     /// signature aggregated signature from 2f+1 validators.
     #[must_use]
     pub const fn aggregated_signature(&self) -> AggregateSignature {
@@ -461,6 +527,28 @@ impl ExecutionCertificate {
             },
             |bytes| Hash::from_parts(&[bytes]),
         )
+    }
+
+    /// Digest over what the committee signed, and nothing a copy varies.
+    ///
+    /// [`Self::wire_hash`] deliberately separates different aggregations
+    /// and different projections of one logical certificate, which makes
+    /// it the wrong name for a fact two shards have to agree on: a copy
+    /// carries only the outcomes naming its receiver, and two assemblers
+    /// may aggregate different quorums of the same votes. What survives
+    /// both is the signed identity — the tick, the anchor the votes were
+    /// cast at, the receipt root they attest and the leaf count that root
+    /// covers — so that is what a claim to a counterpart's verdict names.
+    #[must_use]
+    pub fn attested_digest(&self) -> Hash {
+        Hash::from_parts(&[
+            CERTIFICATE_DIGEST_TAG,
+            &self.tick_id.shard_id().to_le_bytes(),
+            &self.tick_id.block_height().inner().to_le_bytes(),
+            &self.vote_anchor_ts.as_millis().to_le_bytes(),
+            self.global_receipt_root.as_raw().as_bytes(),
+            &self.tx_count.to_le_bytes(),
+        ])
     }
 
     fn populate_cached_bytes(&mut self) {
@@ -683,8 +771,8 @@ impl Verified<ExecutionCertificate> {
 
     /// Re-wrap a certificate that satisfied the predicate at write
     /// time. ECs ride into storage embedded inside `Verified<Finalization>`
-    /// values inside the `Verified<CertifiedBlock>` argument to
-    /// `commit_block`, so unverified ECs can't reach the write path.
+    /// values inside the `Verified<CertifiedBlock>` argument to the
+    /// prepared commit, so unverified ECs can't reach the write path.
     /// Storage rehydration paths use this gate to avoid re-running
     /// aggregation on every load.
     #[must_use]
@@ -704,7 +792,7 @@ mod tests {
     use hyperscale_hbor::from_slice as hbor_from_slice;
 
     use super::*;
-    use crate::{BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, TxHash};
+    use crate::{BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, Role, TxHash};
 
     fn outcome(seed: u8) -> TxOutcome {
         TxOutcome::new(
@@ -1081,6 +1169,57 @@ mod tests {
         );
         let keep: HashSet<TxHash> = outcomes.iter().map(TxOutcome::tx_hash).collect();
         assert_eq!(cert.project_to(&keep).expect("all kept"), cert);
+    }
+
+    /// A success speaks an acceptance only in a role that claims what
+    /// crossed to it. A leg's success is its own side going through, and
+    /// an issuer that heard it as an acceptance would take it for the
+    /// claim its record is held for — which on a shard that is both a
+    /// caller and a recipient of one swap is every swap.
+    #[test]
+    fn only_a_claiming_success_speaks_an_acceptance() {
+        let outcomes = vec![
+            outcome(1).as_role(Role::Delivery),
+            outcome(2).as_role(Role::Leg),
+            outcome(3).as_role(Role::Core),
+            TxOutcome::new(
+                TxHash::from(Hash::from_bytes(&[4u8; 4])),
+                ExecutionOutcome::Failed,
+            )
+            .as_role(Role::Leg),
+        ];
+        let spoken: Vec<(TxHash, Spoken)> = ExecutionCertificate::new(
+            tick_id(),
+            WeightedTimestamp::from_millis(11),
+            compute_global_receipt_root(&outcomes),
+            outcomes.clone(),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        )
+        .verdicts()
+        .collect();
+
+        assert_eq!(
+            spoken
+                .iter()
+                .map(|(tx_hash, _)| *tx_hash)
+                .collect::<Vec<_>>(),
+            vec![
+                outcomes[0].tx_hash(),
+                outcomes[2].tx_hash(),
+                outcomes[3].tx_hash()
+            ],
+            "the leg's success says nothing; its refusal still ends the transaction here",
+        );
+        assert!(matches!(spoken[0].1, Spoken::Claimed { .. }));
+        assert!(matches!(spoken[1].1, Spoken::Claimed { .. }));
+        assert!(matches!(
+            spoken[2].1,
+            Spoken::Refused(Heard {
+                word: Word::Refused { .. },
+                ..
+            })
+        ));
     }
 
     /// A recipient party to nothing in the tick gets no certificate: an

@@ -5,14 +5,17 @@ use hyperscale_hbor::Hbor;
 use crate::{BeaconWitnessRoot, EventRoot, GlobalReceiptHash, Hash, WritesRoot};
 
 /// The receipt an executing shard signs over: one shard's attestation of
-/// what a transaction did.
+/// what it ran of a transaction.
 ///
-/// Contains `writes_root` — a commitment over the writes this shard
-/// attests. For a batch with cross-shard members the delta is projected
-/// to the executing shard before the root is taken, and the fee burn
-/// lands only on the payer's side, so the participants in one
-/// transaction produce per-shard hashes; agreement across shards is
-/// outcome-level in the certificates, never hash equality.
+/// Every term is this shard's. `writes_root` commits to the writes this
+/// shard attests — for a batch with cross-shard members the delta is
+/// projected to the executing shard before the root is taken, and the
+/// fee burn lands only on the payer's side — `event_root` to the events
+/// its own emitters produced, and `success` to whether what it ran
+/// committed. So the participants in one transaction produce per-shard
+/// hashes; agreement across shards is outcome-level in the
+/// certificates, never hash equality. A shard running only its own legs
+/// of a transaction could attest nothing wider.
 ///
 /// This hash is what validators sign over in execution votes.
 /// Ephemeral — never written to storage, only lives for EC aggregation.
@@ -41,13 +44,19 @@ impl GlobalReceipt {
         }
     }
 
-    /// Whether the engine committed (`true`) or rejected (`false`) the transaction.
+    /// Whether the legs this shard ran committed (`true`) or were
+    /// rejected (`false`).
+    ///
+    /// One shard's fact, never the transaction's verdict: a shard
+    /// reporting `true` for a transaction its core refused is stating
+    /// what it ran, not disagreeing. The transaction-level answer is the
+    /// tick's verdict over every participant's outcome.
     #[must_use]
     pub const fn success(&self) -> bool {
         self.success
     }
 
-    /// Merkle root of application event hashes.
+    /// Merkle root of the events this shard's own emitters produced.
     #[must_use]
     pub const fn event_root(&self) -> EventRoot {
         self.event_root

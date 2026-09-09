@@ -33,12 +33,13 @@ mod records;
 
 /// Genesis seeding: the stdlib world and funded-account cells.
 pub mod genesis;
+pub mod legs;
 /// Shard assignment and write filtering for `StateWrites`.
 pub mod sharding;
 
 pub use batch::{TickBatchContext, TickEnvironment, TickTxInput};
 pub use executor::{
-    Executor, artifact_package, build_fee_receipt, instance_of_record, protocol_hash,
+    Executor, artifact_package, build_fee_receipt, instance_of_record, protocol_hash, publish_work,
 };
 pub use genesis::{
     GenesisConfig, World, XRD, genesis_package_facts, genesis_world, genesis_writes,

@@ -144,7 +144,8 @@ mod tests {
 
     use std::sync::Arc;
 
-    use hyperscale_storage::{PendingChain, ShardChainWriter};
+    use hyperscale_storage::PendingChain;
+    use hyperscale_storage::test_helpers::commit_settled_at;
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::beacon::GetShardWitnessesRequest;
     use hyperscale_types::{
@@ -215,7 +216,8 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = make_qc_for(&block);
@@ -233,7 +235,7 @@ mod tests {
         let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
             CertifiedBlock::new_unchecked(block, qc),
         ));
-        storage.commit_block(&certified, &[], &witness);
+        commit_settled_at(storage, &certified, &[], &[], &witness);
         (block_hash, root, leaf_count_at_block_end)
     }
 

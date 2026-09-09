@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_metrics::record_storage_operation;
-use hyperscale_storage::{DedupWindow, RecoveredState, SubstateStore, replay_window};
+use hyperscale_storage::{
+    DedupWindow, RecoveredState, SafeVoteRegisterStore, SubstateStore, replay_window,
+};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, CommittedTip, Hash,
     Provisions, SafeVoteRegisters, ShardWitnessPayload, ValidatorId, WeightedTimestamp,
@@ -80,6 +82,8 @@ impl RocksDbShardStorage {
                 self,
                 committed_height,
                 committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),
+                BlockHeight::new(self.retention_floor()),
+                chain_origin,
             ),
             dedup: DedupWindow::from_reader(
                 self,
@@ -104,6 +108,10 @@ impl RocksDbShardStorage {
                 .unwrap_or(0),
             chain_origin,
             safe_vote_registers: self.load_safe_vote_registers(chain_origin),
+            // Filled only by a reshape adoption, where a store inherits a
+            // prefix whole; an ordinary resume folds its own chain.
+            inherited_records: Vec::new(),
+            voted_blocks: self.voted_blocks_above(committed_height),
         }
     }
 

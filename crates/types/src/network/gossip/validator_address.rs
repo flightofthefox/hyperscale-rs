@@ -38,8 +38,10 @@ pub struct ValidatorAddressGossip {
     /// are only ever self-announced.
     pub validator: ValidatorId,
     /// libp2p peer id bytes the validator currently binds as.
+    #[hbor(max = MAX_ANNOUNCED_PEER_ID_BYTES)]
     pub peer_id: Vec<u8>,
     /// Encoded multiaddrs the peer can be dialed at.
+    #[hbor(max = MAX_ANNOUNCED_ADDRESSES)]
     pub addresses: Vec<Vec<u8>>,
     /// Announce ordering: consumers keep the record with the highest
     /// sequence per validator, so a re-announce after a peer-id or address

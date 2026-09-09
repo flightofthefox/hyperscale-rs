@@ -16,7 +16,7 @@
 mod engine;
 
 #[cfg(feature = "test-utils")]
-pub use engine::{DropSpec, Engine, FaultBuilder, RuleBuilder, RuleHandle};
+pub use engine::{DropSpec, Engine, FaultBuilder, Rewrite, RuleBuilder, RuleHandle};
 
 /// A cluster host — the granularity at which faults apply.
 ///

@@ -14,6 +14,7 @@ pub use hyperscale_vm_types::{
     AccountSigner, MAX_MESSAGE_LEN, MAX_SUBINTENTS, Mode, SchemeId, SchemeVerifier, SubintentSig,
     TransactionBody, TransactionEnvelope,
 };
+use hyperscale_vm_types::{LegShape, SubstateKey};
 use thiserror::Error;
 
 use crate::crypto::{
@@ -21,7 +22,8 @@ use crate::crypto::{
     verify_ml_dsa_65, verify_secp256k1,
 };
 use crate::{
-    Address, DeclaredKey, Hash, PrincipalAddr, ProtocolHasher, TimestampRange, WeightedTimestamp,
+    Address, DeclaredKey, Hash, PrincipalAddr, ProtocolHasher, RoutePrefix, TimestampRange,
+    WeightedTimestamp,
 };
 
 /// The arithmetic behind the VM's scheme registry.
@@ -192,6 +194,25 @@ pub struct Routing {
 }
 
 impl Routing {
+    /// The route every owner prefix the transaction touches takes,
+    /// ascending, deduplicated.
+    ///
+    /// Deduplicated on the route and not on the address, so two prefixes
+    /// that place together are one entry: what reads this asks only
+    /// where a prefix sits.
+    #[must_use]
+    pub fn all_routes(&self) -> Vec<RoutePrefix> {
+        let mut routes: Vec<RoutePrefix> = self
+            .read_prefixes
+            .iter()
+            .chain(self.write_prefixes.iter())
+            .map(|prefix| RoutePrefix::of(*prefix))
+            .collect();
+        routes.sort_unstable();
+        routes.dedup();
+        routes
+    }
+
     /// Every owner prefix the transaction touches, ascending, deduplicated.
     #[must_use]
     pub fn all_prefixes(&self) -> Vec<Address> {
@@ -239,17 +260,6 @@ pub struct Derived {
     pub signer: PrincipalAddr,
     /// One declaration hash per bound subintent, in tree order.
     pub subintent_hashes: Vec<[u8; 32]>,
-    /// How many cells this transaction creates that a sweep will later
-    /// have to retire.
-    ///
-    /// Counted rather than inferred from the routed sets, because what
-    /// makes a write sweepable is the family it belongs to and only the
-    /// derivation knows that. A block sums this over its transactions
-    /// and is refused past
-    /// [`MAX_SWEEPABLE_CREATED_PER_BLOCK`](crate::MAX_SWEEPABLE_CREATED_PER_BLOCK),
-    /// which is what keeps the sweep's own cap a bound on the resident
-    /// population rather than only on a block's work.
-    pub sweepable_writes: u32,
     /// The local half of the fee payer's native-resource vault cell —
     /// the substate the payer shard's reservation check reads and the
     /// fee settlement debits. The owner half is the envelope's
@@ -287,6 +297,29 @@ pub struct Derived {
     /// every other routing quantity — nothing about it travels on the
     /// wire, so a sender cannot understate it.
     pub work: u64,
+    /// What the declaration claims it will touch, priced on the effects
+    /// crate's schedule — the one term of `work` a burn reads whole.
+    /// Carried beside the sum because the sum is not invertible.
+    pub footprint: u64,
+    /// Each manifest node's placement-free shape, in node order. Empty
+    /// for a publish, which has no manifest to divide.
+    pub legs: Vec<LegShape>,
+    /// The parties the routing declares beyond any node's frame — the
+    /// fee payer and every signer — which the classifier holds to some
+    /// member's scope before it divides the shape. Sorted and unique.
+    pub owners: Vec<Address>,
+    /// The nullifier cell of every bound subintent, in tree order, each
+    /// under its own signer.
+    ///
+    /// One of the cells the kernel writes of its own accord; the others
+    /// — the record and claim of every value edge that crosses — are
+    /// read off `legs` at a placement, since which edges cross is a fact
+    /// of the anchor while this list is fixed when the envelope is
+    /// composed. Together they are what
+    /// [`Transaction::sweepable_writes_on`](crate::Transaction::sweepable_writes_on)
+    /// counts for a shard against
+    /// [`MAX_SWEEPABLE_CREATED_PER_BLOCK`](crate::MAX_SWEEPABLE_CREATED_PER_BLOCK).
+    pub nullifiers: Vec<SubstateKey>,
 }
 
 /// Why a derivation did not answer.
@@ -433,6 +466,22 @@ pub trait ProtocolStatics: Send + Sync {
     fn sweepable_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> Option<u64> {
         let _ = (owner, local, value);
         None
+    }
+
+    /// Whether this committed cell is an escrow record — value a shard
+    /// holds for a crossing it issued, until a consumer claims it or the
+    /// issuer takes it back.
+    ///
+    /// Judged from the bytes as [`Self::sweepable_cell`] is, and asked
+    /// for the opposite reason: a record is deliberately outside every
+    /// sweep's reach, so nothing else tells a successor that the leaf it
+    /// just imported is an obligation. A store answers this only where
+    /// it inherits a prefix whole — a reshape successor's adoption — and
+    /// what it writes down is the key, the state being the value's
+    /// authority.
+    fn record_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> bool {
+        let _ = (owner, local, value);
+        false
     }
 }
 

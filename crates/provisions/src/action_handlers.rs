@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, ProtocolEvent, ProvisionsRequest};
 use hyperscale_jmt::TreeReader as JmtTreeReader;
-use hyperscale_metrics::record_signature_verification_latency;
+use hyperscale_metrics::{record_fetch_response_refused, record_signature_verification_latency};
 use hyperscale_network::Network;
 use hyperscale_storage::{ShardStorage, SubstateStore, SubstateView, VersionedStore};
 use hyperscale_types::network::notification::ProvisionsNotification;
@@ -100,6 +100,11 @@ where
                         error = ?err,
                         "Provision merkle proof verification failed"
                     );
+                    // The inclusion proof is what holds a bundle's entries
+                    // to the state root its source header committed, so a
+                    // failure here is a responder that answered with values
+                    // its own chain never held.
+                    record_fetch_response_refused("provision", "unproven_entries");
                     Err((Arc::new(provisions), err))
                 }
             };

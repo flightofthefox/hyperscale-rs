@@ -24,23 +24,87 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT};
 use hyperscale_vm_effects::{
-    ChainRecords, Claim, EnvelopeTree, IntentHeader, ManifestHash, PackageHash,
-    PrefixShardResolver, Routing as RoutedTransaction, RuleBytes, Value, admit_tree, child_key,
-    footprint, package_hash, package_key as canonical_package_key, principal_address, route_tree,
-    xrd,
+    AdmittedTree, ChainRecords, Claim, CrossingSite, EnvelopeTree, IntentHeader, ManifestHash,
+    PackageHash, PrefixShardResolver, Routing as RoutedTransaction, RuleBytes, Value, admit_tree,
+    child_key, effect_units, footprint, legs_of, package_hash,
+    package_key as canonical_package_key, principal_address, route_tree, xrd,
 };
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
-    Address, EffectSet, EffectTarget, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId,
-    SubstateKey,
+    Address, Effect, EffectSet, EffectTarget, LegShape, Mode, Moves, PrincipalAddr, ResourceAddr,
+    SchemeId, SubstateKey,
 };
 
 use crate::ProtocolHasher;
 use crate::artifact::admit_package;
 use crate::records::{
-    InstanceCache, LocalCells, NodeRecords, PackageCache, committed_package, sweepable_cell,
+    InstanceCache, LocalCells, NodeRecords, PackageCache, committed_package, record_cell,
+    sweepable_cell,
 };
+
+/// The parties a transaction's routing declares beyond any node's
+/// frame: the payer, whose vault the reservation and the burn reach,
+/// and every signer, whose nullifier a bound subintent writes. Sorted
+/// and unique, so two derivations of one envelope agree byte for byte.
+fn route_owners(
+    vm: &TransactionEnvelope,
+    signer: PrincipalAddr,
+    admitted: &AdmittedTree,
+) -> Vec<Address> {
+    [vm.fee_payer.address(), signer.address()]
+        .into_iter()
+        .chain(
+            admitted
+                .subintents
+                .iter()
+                .map(|record| record.signer.address()),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The record cell of every value edge among `legs`, in `(producer,
+/// output)` order.
+///
+/// Every edge, not only the ones that turn out to cross: which cross is
+/// a placement fact read at an anchor, while the cells are fixed by what
+/// each producing node's own signer signed — the intent, the node's index
+/// within it, and that intent's expiry — so two compositions of one
+/// subintent derive the same record for its nodes.
+#[must_use]
+pub fn crossing_records(legs: &[LegShape]) -> Vec<SubstateKey> {
+    let mut records: Vec<((u32, u32), SubstateKey)> = legs
+        .iter()
+        .flat_map(|consumer| &consumer.edges)
+        .filter_map(|edge| {
+            let producer = legs.get(edge.source as usize)?;
+            let record = CrossingSite::record_of(&ProtocolHasher, producer, edge.output).key();
+            Some(((edge.source, edge.output), record))
+        })
+        .collect();
+    records.sort_unstable_by_key(|(edge, _)| *edge);
+    records.into_iter().map(|(_, record)| record).collect()
+}
+
+/// The footprint of the cells a transaction's value edges write.
+///
+/// The record under the producer and the claim under the consumer, each
+/// a point write on the effects schedule, for every edge whether or not
+/// it crosses at any placement.
+#[must_use]
+pub fn crossing_cells_footprint(legs: &[LegShape]) -> u64 {
+    crossing_records(legs)
+        .into_iter()
+        .fold(0u64, |total, record| {
+            let cell = effect_units(Effect {
+                target: EffectTarget::Point(record),
+                mode: Mode::Write { moves: Moves::Both },
+            });
+            total.saturating_add(cell.saturating_mul(2))
+        })
+}
 
 /// The protocol fee and transfer resource: the genesis publisher's
 /// primary issue.
@@ -261,7 +325,18 @@ struct DeclaredAccess {
 /// exclusive class by the time they are built — and which of the three a
 /// key holds is exactly what decides whether two transactions may be in
 /// flight on it together.
-fn classify_declared_access(routing: &RoutedTransaction) -> DeclaredAccess {
+///
+/// The price is a debit on `fee_payer`'s vault, and the declaration
+/// names it like every other debit: the payer's shard is then a
+/// participant by the rule every written shard is one by, whether or
+/// not the payer touches a node — a sponsored transaction reaches the
+/// shard that charges it — and the charge contends with whatever else
+/// reaches the vault on the mode a debit has, commutative with another
+/// debit and exclusive with a write.
+fn classify_declared_access(
+    routing: &RoutedTransaction,
+    fee_payer: PrincipalAddr,
+) -> DeclaredAccess {
     let mut access = DeclaredAccess {
         read_keys: BTreeSet::new(),
         write_keys: BTreeSet::new(),
@@ -284,6 +359,12 @@ fn classify_declared_access(routing: &RoutedTransaction) -> DeclaredAccess {
             }
         }
         access.declared_modes.push((key, effect.mode));
+    }
+    let fee_vault = DeclaredKey::Cell(vault_key(fee_payer, *XRD));
+    let fee_mode = (fee_vault, Mode::Delta { moves: Moves::Out });
+    access.write_keys.insert(fee_vault);
+    if !access.declared_modes.contains(&fee_mode) {
+        access.declared_modes.push(fee_mode);
     }
     access.declared_modes.sort_unstable();
     access
@@ -468,8 +549,17 @@ impl BridgeStatics {
             // A publish carries no tree, so nothing narrows the window
             // its composer signed and nothing binds a subintent.
             effective_window: vm.validity_window(),
-            sweepable_writes: 0,
             work,
+            footprint,
+            // No manifest, so nothing to divide, nothing crossing, and no
+            // subintent bound; the publisher pays and signs.
+            legs: Vec::new(),
+            owners: [publisher.address(), signer.address()]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            nullifiers: Vec::new(),
             signer,
             routing: Routing {
                 read_prefixes: Vec::new(),
@@ -572,7 +662,7 @@ impl Derivation for BridgeStatics {
             write_keys,
             provision_keys,
             declared_modes,
-        } = classify_declared_access(&routing);
+        } = classify_declared_access(&routing, vm.fee_payer);
         check_provision_weight(&provision_keys)?;
         let prefixes = |keys: &BTreeSet<DeclaredKey>| -> Vec<Address> {
             keys.iter()
@@ -590,22 +680,33 @@ impl Derivation for BridgeStatics {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        let legs = legs_of(&admitted.admitted);
         // What this transaction costs a block, on the engine's own
         // schedule: the fixed charge for carrying it, what it declared it
         // would touch, and the ceiling it signed for its own execution.
         // The declaration spans every shard it routes to, because the
-        // reservation is taken once against the whole of it.
-        let work = declared_work(
-            routing
-                .per_shard
-                .values()
-                .fold(0u64, |total, set| total.saturating_add(footprint(set))),
-            vm.gas_limit,
-            vm.signature_work(),
-        );
+        // reservation is taken once against the whole of it — and every
+        // value edge's record and claim beside it, which the engine
+        // declares at prepare wherever the edge turns out to cross:
+        // placement is a fact of the anchor, and the price is fixed when
+        // the envelope is composed.
+        let declared_footprint = routing
+            .per_shard
+            .values()
+            .fold(0u64, |total, set| total.saturating_add(footprint(set)))
+            .saturating_add(crossing_cells_footprint(&legs));
+        let work = declared_work(declared_footprint, vm.gas_limit, vm.signature_work());
         Ok(Derived {
             effective_window,
             work,
+            footprint: declared_footprint,
+            legs,
+            nullifiers: admitted
+                .subintents
+                .iter()
+                .map(|record| record.nullifier)
+                .collect(),
+            owners: route_owners(vm, signer, &admitted),
             signer,
             routing: Routing {
                 read_prefixes: prefixes(&read_keys),
@@ -621,10 +722,6 @@ impl Derivation for BridgeStatics {
                 .iter()
                 .map(|record| record.subintent.0.0)
                 .collect(),
-            // One nullifier per bound subintent, and nothing else this
-            // derivation produces is a family a sweep retires.
-            sweepable_writes: u32::try_from(admitted.subintents.len())
-                .expect("bounded by MAX_SUBINTENTS"),
             fee_vault_local: vault_key(vm.fee_payer, *XRD).local.0,
             auth_cell_local: auth_key(vm.fee_payer).local.0,
             packages,
@@ -640,6 +737,10 @@ impl ProtocolStatics for BridgeStatics {
 
     fn sweepable_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> Option<u64> {
         sweepable_cell(Address::from_bytes(owner).ok()?, local, value)
+    }
+
+    fn record_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> bool {
+        Address::from_bytes(owner).is_ok_and(|owner| record_cell(owner, local, value))
     }
 
     fn rule_admits(
@@ -683,7 +784,7 @@ mod tests {
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
     use hyperscale_vm_stdlib::account;
-    use hyperscale_vm_types::{AddressClass, CollectionId, ResourceAddr};
+    use hyperscale_vm_types::{AddressClass, CollectionId, LegRole, ResourceAddr};
 
     use super::*;
     use crate::records::record_address;
@@ -879,6 +980,102 @@ mod tests {
             signature: Vec::new(),
         }
         .sign(&key(7))
+    }
+
+    /// A transfer divides into a sign-in, a withdraw and a deposit. Its
+    /// one value edge is one crossing, whose record sits under the
+    /// sender and names the vault the withdraw reserved; and it binds
+    /// nothing, so it files no nullifier.
+    #[test]
+    fn a_transfer_derives_one_crossing_per_value_edge() {
+        let tree = single_intent_tree(vec![
+            sign_in(composer_addr()),
+            withdraw(composer_addr(), RES_X, 100),
+            deposit_edge(bob_addr(), 1, RES_X),
+        ]);
+        let vm = envelope(&tree, &[]);
+        let derived = statics().derive(&vm).expect("derives");
+
+        let roles: Vec<LegRole> = derived.legs.iter().map(|leg| leg.role).collect();
+        assert_eq!(
+            roles,
+            vec![LegRole::Attesting, LegRole::Inbound, LegRole::Outbound]
+        );
+        let records = crossing_records(&derived.legs);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].owner,
+            composer_addr().address(),
+            "the record sits under the producing node's target"
+        );
+
+        assert!(
+            derived.nullifiers.is_empty(),
+            "nothing bound, nothing spent"
+        );
+
+        // The footprint is the term of the price the declaration fixes,
+        // carried whole beside the sum it feeds — and it prices the
+        // crossing's record and claim beside what the routing declares.
+        let cells = crossing_cells_footprint(&derived.legs);
+        assert_eq!(
+            cells,
+            2 * effect_units(Effect {
+                target: EffectTarget::Point(records[0]),
+                mode: Mode::Write { moves: Moves::Both },
+            }),
+            "one record and one claim, each a point write"
+        );
+        assert!(
+            derived.footprint > cells,
+            "the routing's own declaration is priced beside them"
+        );
+        assert_eq!(
+            derived.work,
+            declared_work(derived.footprint, vm.gas_limit, vm.signature_work())
+        );
+    }
+
+    /// An escrow cell is keyed by what its node's own signer signed. Two
+    /// compositions of one subintent derive the same cells for that
+    /// subintent's nodes, and the composer moving the root's own window
+    /// moves the root's cells and nobody else's.
+    #[test]
+    fn escrow_cells_follow_the_signing_intent() {
+        let first = composed_tree();
+        let mut second = composed_tree();
+        second.root.header.validity_end_ms -= 1_000;
+        let derive = |tree: &EnvelopeTree| {
+            statics()
+                .derive(&envelope(tree, &[&key(9)]))
+                .expect("derives")
+        };
+        let (one, other) = (derive(&first), derive(&second));
+        let bob = first.subintents[0].decl.hash(&ProtocolHasher);
+
+        // The interleave puts Bob's withdraw at manifest node 3, second
+        // in his own intent — and the leg says which of those it is.
+        assert_eq!(one.legs[3].intent, bob);
+        assert_eq!(one.legs[3].local, 1);
+        assert_eq!(one.legs[1].intent, first.root.hash(&ProtocolHasher));
+
+        let record_of = |derived: &Derived, node: usize| {
+            CrossingSite::record_of(&ProtocolHasher, &derived.legs[node], 0).key()
+        };
+        assert_eq!(
+            record_of(&one, 3),
+            record_of(&other, 3),
+            "Bob's record is fixed by Bob's signature"
+        );
+        assert_ne!(
+            record_of(&one, 1),
+            record_of(&other, 1),
+            "the root's record moves with the root's window"
+        );
+        assert_eq!(
+            one.nullifiers[0], other.nullifiers[0],
+            "and so is his nullifier"
+        );
     }
 
     /// Work is what a block pays to carry a transaction: a fixed charge

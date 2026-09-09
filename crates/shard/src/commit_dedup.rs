@@ -8,8 +8,11 @@
 //! Per-artifact deadline maps bound the index by artifact-specific
 //! BFT-attested horizons:
 //!
-//! - **txs**: each tx's own `end_timestamp_exclusive` (capped by
-//!   `MAX_VALIDITY_RANGE` at admission).
+//! - **txs**: the delivery window's close on each tx's own
+//!   `end_timestamp_exclusive` — the last anchor a block may carry the
+//!   transaction at, since a delivery-only member is admissible past the
+//!   validity end and a shorter window would leave room to commit one
+//!   twice.
 //! - **certs**: `vote_anchor_ts + RETENTION_HORIZON` from the tick's local
 //!   EC.
 //! - **provisions**: `local_committed_ts + RETENTION_HORIZON`, a
@@ -31,14 +34,14 @@ use std::sync::Arc;
 
 use hyperscale_storage::DedupWindow;
 use hyperscale_types::{
-    Finalization, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId, Transaction, TxHash,
-    Verifiable, WeightedTimestamp,
+    DEDUP_WINDOW, Deadline, Finalization, FinalizationHash, ProvisionHash, Provisions,
+    RETENTION_HORIZON, ShardId, Transaction, TxHash, Verifiable, WeightedTimestamp, Window,
 };
 
 #[allow(clippy::struct_field_names)] // shared `_retention` postfix is the artifact-tier convention
 pub struct CommitDedupIndex {
-    /// `tx_hash → end_timestamp_exclusive`. Pruned when
-    /// `end_timestamp_exclusive <= current_committed_ts`.
+    /// `tx_hash → the close of its delivery window`. Pruned
+    /// when the deadline is at or below `current_committed_ts`.
     tx_retention: HashMap<TxHash, WeightedTimestamp>,
     /// `tx_hash → vote_anchor_ts + RETENTION_HORIZON` of the finalization
     /// that resolved it. Every transaction a committed finalization
@@ -47,6 +50,10 @@ pub struct CommitDedupIndex {
     /// that have to agree, and what a tick key could never express, since
     /// a tick can settle in more than one part.
     resolved_tx_retention: HashMap<TxHash, WeightedTimestamp>,
+    /// `receipt_hash → deadline` of every finalization a committed block
+    /// carried. The question `resolved_tx_retention` cannot answer for a
+    /// certificate that resolves nothing.
+    finalization_retention: HashMap<FinalizationHash, WeightedTimestamp>,
     /// `provision_hash → local_committed_ts + RETENTION_HORIZON`. Pruned
     /// when `deadline <= current_committed_ts`. Past the horizon, every tx
     /// the batch carried has expired its `validity_range` and terminated
@@ -85,6 +92,7 @@ impl CommitDedupIndex {
         Self {
             tx_retention: HashMap::new(),
             resolved_tx_retention: HashMap::new(),
+            finalization_retention: HashMap::new(),
             provision_retention: HashMap::new(),
             provision_tx_retention: HashMap::new(),
             covered_from: None,
@@ -108,6 +116,9 @@ impl CommitDedupIndex {
             .resolved_tx_retention
             .extend(window.resolved.iter().copied());
         index
+            .finalization_retention
+            .extend(window.finalizations.iter().copied());
+        index
             .provision_retention
             .extend(window.provisions.iter().copied());
         index.covered_from = window.covered_from;
@@ -118,9 +129,9 @@ impl CommitDedupIndex {
     /// Whether the index covers the whole window a chain at `now` has to
     /// refuse duplicates across.
     ///
-    /// True once the coverage runs a full [`RETENTION_HORIZON`] behind
-    /// `now`, or bottoms out at the chain's own origin — below which
-    /// nothing was ever committed to be missed.
+    /// True once the coverage runs a full [`DEDUP_WINDOW`] behind `now`,
+    /// or bottoms out at the chain's own origin — below which nothing was
+    /// ever committed to be missed.
     ///
     /// Diagnostic, not a gate. A false answer means the index under-refuses
     /// by an unknown amount, and nothing here holds a vote back over it: the
@@ -133,7 +144,7 @@ impl CommitDedupIndex {
         self.reached_origin
             || self
                 .covered_from
-                .is_some_and(|from| now.elapsed_since(from) >= RETENTION_HORIZON)
+                .is_some_and(|from| now.elapsed_since(from) >= DEDUP_WINDOW)
     }
 
     /// Record that the coverage bottoms out at the chain's origin.
@@ -156,22 +167,37 @@ impl CommitDedupIndex {
     }
 
     /// Record a block's transactions in the retention lookup. Each entry's
-    /// stored value is the tx's `validity_range.end_timestamp_exclusive`.
+    /// stored value is the close of the tx's delivery window — the last
+    /// anchor a block may carry the transaction at.
     pub fn register_committed_txs(&mut self, transactions: &[Arc<Verifiable<Transaction>>]) {
         for tx in transactions {
             let tx_hash = tx.hash();
-            let end = tx.validity_range().end_timestamp_exclusive;
-            self.tx_retention.entry(tx_hash).or_insert(end);
+            let deadline = Window::Delivery.of(Deadline::of_transaction(tx)).end;
+            self.tx_retention.entry(tx_hash).or_insert(deadline);
         }
     }
 
     /// Record every transaction a block's finalizations resolved. Each
     /// entry's deadline is the resolving tick's local EC
     /// `vote_anchor_ts + RETENTION_HORIZON`.
+    ///
+    /// The deciding outcomes only: a leg's finalization names its hash
+    /// without resolving it, and the reclaim's finalization naming the
+    /// hash later is the one this index must not refuse.
+    ///
+    /// The certificate's own identity is recorded beside them, because
+    /// the deciding set is empty for a tick whose every member reaches no
+    /// verdict — a retirement's, which settles records under a
+    /// transaction whose verdict belongs to another chain. Keyed on the
+    /// deciding names alone, such a certificate is never seen as already
+    /// carried, and the proposer offers it again on every block.
     pub fn register_committed_certs(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
         for fw in finalizations {
             let deadline = fw.local_ec().deadline();
-            for tx_hash in fw.tx_hashes() {
+            self.finalization_retention
+                .entry(fw.receipt_hash())
+                .or_insert(deadline);
+            for tx_hash in fw.deciding_tx_hashes() {
                 self.resolved_tx_retention
                     .entry(tx_hash)
                     .or_insert(deadline);
@@ -223,6 +249,8 @@ impl CommitDedupIndex {
         self.tx_retention.retain(|_, end| *end > now);
         self.resolved_tx_retention
             .retain(|_, deadline| *deadline > now);
+        self.finalization_retention
+            .retain(|_, deadline| *deadline > now);
         self.provision_retention
             .retain(|_, deadline| *deadline > now);
         self.provision_tx_retention
@@ -237,6 +265,12 @@ impl CommitDedupIndex {
     /// `tx_hash`, within the retention window.
     pub fn contains_resolved_tx(&self, tx_hash: &TxHash) -> bool {
         self.resolved_tx_retention.contains_key(tx_hash)
+    }
+
+    /// Whether the chain already carries this exact finalization, within
+    /// the retention window.
+    pub fn contains_finalization(&self, receipt_hash: &FinalizationHash) -> bool {
+        self.finalization_retention.contains_key(receipt_hash)
     }
 
     pub fn contains_provision(&self, provision_hash: &ProvisionHash) -> bool {
@@ -327,8 +361,38 @@ mod tests {
         assert_eq!(idx.tx_retention_len(), 1);
     }
 
+    /// A transaction is refusable to the close of its delivery window,
+    /// not to its validity end: a delivery-only member is admissible past
+    /// the end, so an index that forgot the hash there would let a
+    /// proposer commit the same delivery twice.
     #[test]
-    fn prune_drops_txs_past_their_end_exclusive() {
+    fn a_tx_stays_refusable_across_its_delivery_window() {
+        let mut idx = CommitDedupIndex::new();
+        let tx = tx_with_end(1, 100);
+        let tx_hash = tx.hash();
+        let close = Window::Delivery
+            .of(Deadline::of(WeightedTimestamp::from_millis(100)))
+            .end;
+        idx.register_committed_txs(std::slice::from_ref(&tx));
+
+        idx.prune(WeightedTimestamp::from_millis(101));
+        assert!(
+            idx.contains_tx(&tx_hash),
+            "past the validity end a delivery may still be admitted",
+        );
+
+        idx.prune(close.minus(std::time::Duration::from_millis(1)));
+        assert!(idx.contains_tx(&tx_hash), "short of the window's close");
+
+        idx.prune(close);
+        assert!(
+            !idx.contains_tx(&tx_hash),
+            "at the close nothing may carry it"
+        );
+    }
+
+    #[test]
+    fn prune_drops_txs_past_their_window() {
         let mut idx = CommitDedupIndex::new();
         let early = tx_with_end(1, 100);
         let later = tx_with_end(2, 900);
@@ -336,7 +400,11 @@ mod tests {
         let later_hash = later.hash();
         idx.register_committed_txs(&[early, later]);
 
-        idx.prune(WeightedTimestamp::from_millis(500));
+        idx.prune(
+            Window::Delivery
+                .of(Deadline::of(WeightedTimestamp::from_millis(500)))
+                .end,
+        );
 
         assert!(!idx.contains_tx(&early_hash));
         assert!(idx.contains_tx(&later_hash));
@@ -399,5 +467,34 @@ mod tests {
             .plus(std::time::Duration::from_millis(1));
         idx.prune(past);
         assert!(!idx.contains_provision(&p.hash()));
+    }
+
+    /// A leg's finalization names its hash without resolving it, so the
+    /// reclaim's finalization naming the hash later is not a duplicate.
+    #[test]
+    fn a_leg_finalization_does_not_resolve_its_transaction() {
+        use hyperscale_types::test_utils::{make_finalization, make_leg_finalization};
+        use hyperscale_types::{BlockHeight, TransactionDecision};
+
+        let tx_hash = tx_with_end(7, 60_000).hash();
+        let mut index = CommitDedupIndex::new();
+        index.register_committed_certs(&[Arc::new(Verifiable::from(make_leg_finalization(
+            BlockHeight::new(1),
+            tx_hash,
+        )))]);
+        assert!(
+            !index.contains_resolved_tx(&tx_hash),
+            "the leg decided nothing"
+        );
+
+        index.register_committed_certs(&[Arc::new(Verifiable::from(make_finalization(
+            BlockHeight::new(5),
+            tx_hash,
+            TransactionDecision::Accept,
+        )))]);
+        assert!(
+            index.contains_resolved_tx(&tx_hash),
+            "the reclaim's finalization does"
+        );
     }
 }

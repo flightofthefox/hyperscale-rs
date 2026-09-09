@@ -3,8 +3,9 @@
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    ConsensusSignature, ExecutionVote, ExecutionVotesSenderMessage, MessageClass,
-    NetworkDefinition, NetworkMessage, ShardId, Signed, ValidatorId, Verifiable, signed_bytes,
+    ConsensusSignature, ExecutionVote, ExecutionVotesSenderMessage, MAX_TXS_PER_BLOCK,
+    MessageClass, NetworkDefinition, NetworkMessage, ShardId, Signed, ValidatorId, Verifiable,
+    signed_bytes,
 };
 
 /// Batched execution votes within a shard.
@@ -16,6 +17,10 @@ pub struct ExecutionVotesNotification {
     /// The execution votes being sent. Wire bytes always land in
     /// [`Verifiable::Unverified`]; local-dispatched sends from a
     /// colocated voter preserve [`Verifiable::Verified`].
+    ///
+    /// Bounded like the certificates they aggregate into: one per tick,
+    /// and a tick partitions the block's transactions.
+    #[hbor(max = MAX_TXS_PER_BLOCK)]
     pub votes: Vec<Verifiable<ExecutionVote>>,
     /// The validator who sent this batch.
     pub sender: ValidatorId,

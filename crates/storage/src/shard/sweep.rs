@@ -10,12 +10,19 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use hyperscale_jmt::NibblePath;
 use hyperscale_types::{
-    MAX_SWEEP_PER_BLOCK, SettledWrites, SubstateKey, SweepFrontier, WeightedTimestamp,
-    protocol_statics, protocol_statics_installed,
+    Address, Block, LocalKey, MAX_SWEEP_PER_BLOCK, SWEEP_BUCKET_BYTES, SettledWrites, ShardId,
+    ShardTrie, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, Transaction, TxHash,
+    WeightedTimestamp, protocol_statics, protocol_statics_installed,
 };
+use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
 
 use crate::tree::JmtSnapshot;
+use crate::{
+    Anchored, filter_state_writes_to_prefix, filter_writes_to_prefix, key_under_prefix,
+    merge_receipts, settle_writes,
+};
 
 /// When a committed cell stops being needed, or `None` for every cell a
 /// sweep does not reach.
@@ -38,38 +45,256 @@ pub fn sweepable_expiry(key: SubstateKey, value: &[u8]) -> Option<u64> {
     protocol_statics().sweepable_cell(key.owner.to_bytes(), key.local.0, value)
 }
 
+/// Whether a committed cell is an escrow record — value the shard holds
+/// for a crossing it issued.
+///
+/// The same seam as [`sweepable_expiry`] and its complement: a record is
+/// outside every sweep's reach by construction, so a store that inherits
+/// a prefix whole has nothing else to tell it that the leaf it just
+/// imported is an obligation. Lives here because both questions are the
+/// same question about a leaf — which family wrote it — asked of the one
+/// authority that can answer from the bytes.
+#[must_use]
+pub fn is_record_cell(key: SubstateKey, value: &[u8]) -> bool {
+    protocol_statics_installed()
+        && protocol_statics().record_cell(key.owner.to_bytes(), key.local.0, value)
+}
+
+/// One row of the sweep index: an owner holding sweepable cells in a
+/// bucket.
+pub type SweepRow = (SweepBucket, Address);
+
+/// The sweep index's rows: how many live sweepable cells each owner
+/// holds in each expiry bucket, bucket-major so a sweep walks by expiry
+/// over a keyspace that is owner-major.
+///
+/// Derived state — the leaves are the authority — kept because nothing
+/// about a leaf key lets a walk find the next cell to expire. What a
+/// row answers is which owners hold cells in which bucket; which cells
+/// is the leaves' own answer, since the bucket leads a sweepable cell's
+/// local half and one row's cells are a contiguous leaf-key range.
+///
+/// Signed, because one shape carries both what a batch moves and what a
+/// store holds: the movement folds into the total through
+/// [`SweepRows::fold`], which is where a row that would go negative —
+/// an index disagreeing with the leaves it derives from — is caught.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepRows(BTreeMap<SweepRow, i64>);
+
+impl SweepRows {
+    /// Move one cell's write across the rows: `was` is the expiry the
+    /// prior value carried, `now` the one the written value carries. A
+    /// value sweepable in the same row as its prior moves nothing, which
+    /// is why the no-op writes a backend skips need no entry here either.
+    pub fn delta(&mut self, owner: Address, was: Option<u64>, now: Option<u64>) {
+        if was == now {
+            return;
+        }
+        if let Some(expiry) = was {
+            self.add((SweepBucket::of(expiry), owner), -1);
+        }
+        if let Some(expiry) = now {
+            self.add((SweepBucket::of(expiry), owner), 1);
+        }
+    }
+
+    fn add(&mut self, row: SweepRow, by: i64) {
+        let count = self.0.entry(row).or_default();
+        *count += by;
+        if *count == 0 {
+            self.0.remove(&row);
+        }
+    }
+
+    /// Whether no row moved, or none is held.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The rows in walk order, each with its count.
+    pub fn iter(&self) -> impl Iterator<Item = (SweepRow, i64)> + '_ {
+        self.0.iter().map(|(row, count)| (*row, *count))
+    }
+
+    /// The rows from `bucket` on, in walk order.
+    pub fn from_bucket(&self, bucket: SweepBucket) -> impl Iterator<Item = SweepRow> + '_ {
+        self.0.range((bucket, Address::MIN)..).map(|(row, _)| *row)
+    }
+
+    /// Fold what a batch `moved` into this total. A row that empties is
+    /// dropped, so the index holds exactly the pairs that have something
+    /// in them and a walk visits nothing empty.
+    ///
+    /// # Panics
+    ///
+    /// If a row would go negative; see [`SweepRows::fold_row`].
+    pub fn fold(&mut self, moved: &Self) {
+        for (row, delta) in moved.iter() {
+            let held = self.0.get(&row).copied().unwrap_or(0);
+            match Self::fold_row(row, held, delta) {
+                0 => {
+                    self.0.remove(&row);
+                }
+                count => {
+                    self.0.insert(row, count);
+                }
+            }
+        }
+    }
+
+    /// The count `row` holds once `delta` moves `held`; zero means the
+    /// row empties.
+    ///
+    /// # Panics
+    ///
+    /// If the count would go negative, which means the index disagrees
+    /// with the leaves it is derived from — the same class of fault as
+    /// the byte total's checked add, and caught here rather than allowed
+    /// to under-report a sweep's candidates.
+    #[must_use]
+    pub fn fold_row(row: SweepRow, held: i64, delta: i64) -> i64 {
+        let count = held
+            .checked_add(delta)
+            .expect("a sweep-index count stays inside i64");
+        assert!(
+            count >= 0,
+            "sweep index for {row:?} went to {count}, so it disagrees with the leaves"
+        );
+        count
+    }
+
+    /// Keep the rows of owners under `prefix`, returning the rows
+    /// dropped.
+    ///
+    /// A reshape adoption re-roots the tree at a subtree but leaves the
+    /// cell column whole, so a split child's cells are a superset of its
+    /// own leaves — the sibling's are still sitting in it. Every other
+    /// index survives that because every other index is read
+    /// owner-scoped, and a transaction on a child names only owners the
+    /// child holds. A sweep is the one walk that enumerates the whole
+    /// shard, so it is the one to meet them.
+    ///
+    /// Rows are keyed by owner, which makes the drop exact: an owner is
+    /// wholly one child's or the other's, so dropping its row drops the
+    /// sibling's cells from the walk and leaves the counts of what
+    /// remains untouched. A replica that snap-syncs the same child
+    /// instead of cloning it rebuilds the index from the leaves it
+    /// imported and so holds these rows and no others; that the two
+    /// agree is what makes a removal set a function of committed state
+    /// rather than of how a node got there.
+    pub fn retain_under(&mut self, prefix: &NibblePath) -> Vec<SweepRow> {
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+        let (kept, dropped): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut self.0)
+            .into_iter()
+            .partition(|((_, owner), _)| owner_under(*owner, prefix));
+        self.0 = kept;
+        dropped.into_keys().collect()
+    }
+
+    /// The sweep walk, over rows and leaves read however a backend reads
+    /// them: the sweepable cells strictly after `after` and in buckets
+    /// strictly below `below`, in sweep order, at most `limit` of them,
+    /// each with the expiry its value carries.
+    ///
+    /// Index rows from `after`'s bucket in `(bucket, owner)` order, then
+    /// that pair's leaves in local order. The two walks composed are
+    /// already sweep order, so nothing sorts and stopping at `limit` is
+    /// stopping rather than discarding — what makes the cap a bound on
+    /// work and not only on output. `rows_from(bucket)` reads the rows
+    /// from `bucket` on; `leaves_between(lo, hi, each)` visits one row's
+    /// leaves in `lo..=hi` until `each` answers `false`.
+    pub fn walk<Rows>(
+        after: SweepFrontier,
+        below: SweepBucket,
+        limit: usize,
+        rows_from: impl FnOnce(SweepBucket) -> Rows,
+        mut leaves_between: impl FnMut(
+            SubstateKey,
+            SubstateKey,
+            &mut dyn FnMut(SubstateKey, &[u8]) -> bool,
+        ),
+    ) -> Vec<(SubstateKey, u64)>
+    where
+        Rows: IntoIterator<Item = SweepRow>,
+    {
+        if limit == 0 || after.bucket() >= below {
+            return Vec::new();
+        }
+        let mut found = Vec::new();
+        for (bucket, owner) in rows_from(after.bucket()) {
+            if bucket >= below || found.len() >= limit {
+                break;
+            }
+            let (lo, hi) = leaf_span(owner, bucket);
+            leaves_between(lo, hi, &mut |key, value| {
+                if SweepFrontier::of_leaf(key) > after
+                    && let Some(expiry) = sweepable_expiry(key, value)
+                {
+                    found.push((key, expiry));
+                }
+                found.len() < limit
+            });
+        }
+        found
+    }
+}
+
+impl FromIterator<(SweepRow, i64)> for SweepRows {
+    fn from_iter<I: IntoIterator<Item = (SweepRow, i64)>>(rows: I) -> Self {
+        Self(rows.into_iter().filter(|(_, count)| *count != 0).collect())
+    }
+}
+
+/// Whether every cell of `owner` sits under `prefix`: a leaf key leads
+/// with its owner, so an owner is wholly one prefix's.
+fn owner_under(owner: Address, prefix: &NibblePath) -> bool {
+    let leaf = SubstateKey {
+        owner,
+        local: LocalKey([0; 16]),
+    };
+    key_under_prefix(&leaf.to_bytes(), prefix)
+}
+
+/// The lowest and highest keys one owner's cells in one bucket can
+/// take: the bucket leads a sweepable cell's local half, so the pair is
+/// a prefix of the leaf key and the span is that prefix with the rest of
+/// the local half at its two extremes.
+fn leaf_span(owner: Address, bucket: SweepBucket) -> (SubstateKey, SubstateKey) {
+    let bounded = |fill: u8| {
+        let mut local = [fill; 16];
+        local[..SWEEP_BUCKET_BYTES].copy_from_slice(&bucket.to_bytes());
+        SubstateKey {
+            owner,
+            local: LocalKey(local),
+        }
+    };
+    (bounded(0x00), bounded(0xFF))
+}
+
 /// Read access to the sweepable cells this store's committed state
 /// holds, in sweep order.
-///
-/// Derived state — the leaves are the authority — kept because the
-/// keyspace is owner-major and always will be, so nothing about a leaf
-/// key lets a walk find the next cell to expire. What the index answers
-/// is which owners hold cells in which bucket; which cells is a question
-/// the leaves answer for themselves, since the bucket leads a sweepable
-/// cell's local half and one owner's bucket is a contiguous range.
 ///
 /// The default is the empty index, for stores that never commit one
 /// (test doubles, ephemeral views).
 pub trait SweepIndex {
-    /// The sweepable cells strictly after `frontier` and strictly below
-    /// `ceiling`, in sweep order, at most `limit` of them, each with the
-    /// expiry its value carries.
+    /// The sweepable cells strictly after `after` and in buckets
+    /// strictly below `below`, in sweep order, at most `limit` of them,
+    /// each with the expiry its value carries — [`SweepRows::walk`] over
+    /// this store's rows and leaves.
     ///
-    /// Ascending in [`SweepFrontier`] order, which is the order the
-    /// index and the leaves are already stored in, so the walk sorts
-    /// nothing and stopping at `limit` is stopping rather than
-    /// discarding. That is what makes the cap a bound on work and not
-    /// only on output.
-    ///
-    /// `ceiling` is exclusive and is a bucket boundary, so every cell
-    /// this returns is in a bucket wholly in the past.
+    /// `below` is a bucket rather than a position because a block's
+    /// ceiling is always a bucket boundary: every cell this returns is
+    /// in a bucket wholly in the past.
     fn sweep_candidates(
         &self,
-        frontier: SweepFrontier,
-        ceiling: SweepFrontier,
+        after: SweepFrontier,
+        below: SweepBucket,
         limit: usize,
     ) -> Vec<(SubstateKey, u64)> {
-        let _ = (frontier, ceiling, limit);
+        let _ = (after, below, limit);
         Vec::new()
     }
 }
@@ -109,7 +334,7 @@ pub fn sweep_for_block(
     if parent_frontier >= ceiling {
         return (Vec::new(), parent_frontier);
     }
-    let found = store.sweep_candidates(parent_frontier, ceiling, MAX_SWEEP_PER_BLOCK);
+    let found = store.sweep_candidates(parent_frontier, ceiling.bucket(), MAX_SWEEP_PER_BLOCK);
     let capped = found.len() >= MAX_SWEEP_PER_BLOCK;
     let frontier = match found.last() {
         Some((key, _)) if capped => SweepFrontier::of_leaf(*key),
@@ -136,11 +361,11 @@ pub fn sweep_for_block(
 pub fn merge_sweep_overlay(
     base: impl FnOnce(usize) -> Vec<(SubstateKey, u64)>,
     overlay: &[Arc<JmtSnapshot>],
-    frontier: SweepFrontier,
-    ceiling: SweepFrontier,
+    after: SweepFrontier,
+    below: SweepBucket,
     limit: usize,
 ) -> Vec<(SubstateKey, u64)> {
-    if limit == 0 || frontier >= ceiling {
+    if limit == 0 || after.bucket() >= below {
         return Vec::new();
     }
     // What the unpersisted chain says about cells in the interval, latest
@@ -149,7 +374,7 @@ pub fn merge_sweep_overlay(
     for snapshot in overlay {
         for (key, change) in snapshot.settled.cells() {
             let position = SweepFrontier::of_leaf(*key);
-            if position <= frontier || position >= ceiling {
+            if position <= after || position.bucket() >= below {
                 continue;
             }
             touched.insert(
@@ -180,27 +405,40 @@ pub fn merge_sweep_overlay(
     merged.into_values().take(limit).collect()
 }
 
-/// Fold a block's removals into the settled set its receipts produced.
+/// Fold what the block itself writes — the committed-transaction cells
+/// it creates and the sweep's removals — into the settled set its
+/// receipts produced.
 ///
-/// A removal is an ordinary write — `None` at the key — so a sweep needs
-/// no commit path of its own: the tombstones fold with everything else
-/// and land under `state_root` like any other change. That is the fact
-/// that makes this tractable rather than novel.
+/// Both are ordinary writes, a value at the key or `None` at it, so
+/// neither needs a commit path of its own: they fold with everything
+/// else and land under `state_root` like any other change. That is the
+/// fact that makes this tractable rather than novel.
 ///
 /// # Panics
 ///
-/// If a removal names a cell the block's own receipts also write. The
-/// two would be one entry in the settled map, so one of them would
-/// silently not happen — and which one is decided by insertion order,
-/// which is not something a validator can check. Validation refuses such
-/// a block before anything reaches here; this is the assertion that it
-/// did.
+/// If a creation or a removal names a cell the block's own receipts
+/// also write. The two would be one entry in the settled map, so one of
+/// them would silently not happen — and which one is decided by
+/// insertion order, which is not something a validator can check. A
+/// creation sits under the shard's own owner, which no receipt writes,
+/// and validation refuses a block sweeping what it writes before
+/// anything reaches here; this is the assertion that both hold.
 #[must_use]
-pub fn with_removals(settled: SettledWrites, removals: &[SubstateKey]) -> SettledWrites {
-    if removals.is_empty() {
+pub fn with_sweep(
+    settled: SettledWrites,
+    creations: &[(SubstateKey, Vec<u8>)],
+    removals: &[SubstateKey],
+) -> SettledWrites {
+    if creations.is_empty() && removals.is_empty() {
         return settled;
     }
     let (mut cells, entries) = settled.into_parts();
+    for (key, value) in creations {
+        assert!(
+            cells.insert(*key, Some(value.clone())).is_none(),
+            "the chain created {key:?}, which this block's receipts also write",
+        );
+    }
     for key in removals {
         assert!(
             cells.insert(*key, None).is_none(),
@@ -210,12 +448,123 @@ pub fn with_removals(settled: SettledWrites, removals: &[SubstateKey]) -> Settle
     SettledWrites::from_parts(cells, entries)
 }
 
+/// The cells a followed block removed: everything sweepable strictly
+/// after `parent_frontier` and at or below `frontier`, the position the
+/// block's header claims its sweep landed on.
+///
+/// A follower holds a prefix of the chain's tree and no cap of its own:
+/// it removes exactly what the header's interval names, whether that
+/// interval ended at a ceiling or on the last cell a capped walk took.
+#[must_use]
+pub fn sweep_through(
+    store: &(impl SweepIndex + ?Sized),
+    parent_frontier: SweepFrontier,
+    frontier: SweepFrontier,
+) -> Vec<SubstateKey> {
+    if parent_frontier >= frontier {
+        return Vec::new();
+    }
+    let past = SweepBucket(frontier.bucket().0.saturating_add(1));
+    store
+        .sweep_candidates(parent_frontier, past, usize::MAX)
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| SweepFrontier::of_leaf(*key) <= frontier)
+        .collect()
+}
+
+/// What a followed block writes under `prefix`, composed as the chain
+/// composed it: the receipts its ticks settled, the committed cells its
+/// committer derived, and the sweep its header names.
+///
+/// The removals read `store` as it stands before the block, from the
+/// bottom of the sweep order: a follower mirrors the chain's state, so
+/// every live cell at or below the header's frontier is one the block
+/// removed, and one the block created sits far above it. The creations
+/// are the caller's, derived under the block's own window as the
+/// committer derived them.
+#[must_use]
+pub fn followed_block_writes(
+    store: &(impl SweepIndex + ?Sized),
+    prior: &dyn Anchored,
+    block: &Block,
+    creations: &[(SubstateKey, Vec<u8>)],
+    prefix: &NibblePath,
+) -> SettledWrites {
+    let settling: Vec<StoredReceipt> = block
+        .certificates()
+        .iter()
+        .flat_map(|fw| fw.settling_receipts())
+        .collect();
+    // Restricted before resolving: a follower holds its prefix of the
+    // tree and nothing else, so a movement on any other cell reads an
+    // empty prior here and is the owning store's to judge, not this one's.
+    let merged = settle_writes(
+        &filter_state_writes_to_prefix(&merge_receipts(&settling), prefix),
+        prior,
+    );
+    let removals = sweep_through(store, SweepFrontier::ZERO, block.header().sweep_frontier());
+    filter_writes_to_prefix(&with_sweep(merged, creations, &removals), prefix)
+}
+
+/// The committed-transaction cells `local_shard` writes for
+/// `transactions`: one each, under the shard's own owner, expiring at
+/// the transaction's validity end plus the grace.
+///
+/// What makes a shard's committed set provable and refutable against the
+/// state root every header carries. Derived from the transactions and
+/// the shard's identity, so every replica folds the same cells and a
+/// prober holding the transaction derives the same key from nothing
+/// else.
+///
+/// Every transaction a block carries, and no reading of placement. A
+/// rule that gave only some of them would make a block's creations a
+/// function of the trie the reader classified under, and a split child
+/// following its parent's block classifies under the cut — so the halves
+/// would not recompose the parent's root. Which absences *answer* is a
+/// separate rule, and lives where the probe is composed.
+#[must_use]
+pub fn committed_tx_cells<'a>(
+    local_shard: ShardId,
+    transactions: impl IntoIterator<Item = &'a Transaction>,
+) -> Vec<(SubstateKey, Vec<u8>)> {
+    transactions
+        .into_iter()
+        .map(|tx| {
+            let validity_end = tx.validity_range().end_timestamp_exclusive;
+            let cell = Marker::of(tx.hash(), validity_end.as_millis(), Marked::Committed);
+            (
+                committed_tx_cell_key(local_shard, cell.tx, validity_end),
+                cell.to_bytes(),
+            )
+        })
+        .collect()
+}
+
+/// The key `shard` writes its committed cell for `tx` under.
+///
+/// Derived from signed content and the shard alone, so a prober asking
+/// whether a shard committed a transaction names the same cell the
+/// shard's own commit wrote, from nothing but the transaction and the
+/// shard.
+#[must_use]
+pub fn committed_tx_cell_key(
+    shard: ShardId,
+    tx: TxHash,
+    validity_end: WeightedTimestamp,
+) -> SubstateKey {
+    committed_tx_key(
+        &ProtocolHasher,
+        ShardTrie::shard_owner(shard),
+        tx,
+        Marked::Committed.expiry_ms(validity_end.as_millis()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
-    use hyperscale_types::{
-        Address, AddressClass, BlockHeight, SWEEP_BUCKET_MS, StateRoot, SweepBucket,
-    };
+    use hyperscale_types::{AddressClass, BlockHeight, SWEEP_BUCKET_MS, StateRoot};
 
     use super::*;
     use crate::CollectedWrites;
@@ -250,8 +599,106 @@ mod tests {
         ))
     }
 
-    fn all() -> SweepFrontier {
-        SweepFrontier::start_of(SweepBucket(u32::MAX))
+    fn all() -> SweepBucket {
+        SweepBucket(u32::MAX)
+    }
+
+    /// The span covers exactly the bucket's leaves of one owner: every
+    /// body inside, neither neighbouring bucket, and no other owner —
+    /// which is what makes the pair the unit the index rows count.
+    #[test]
+    fn a_leaf_span_covers_a_buckets_leaves_and_no_others() {
+        let (lo, hi) = leaf_span(owner(3), SweepBucket(9));
+        let leaf = |bucket: u32, body: u8| {
+            let mut local = [body; 16];
+            local[..SWEEP_BUCKET_BYTES].copy_from_slice(&bucket.to_be_bytes());
+            SubstateKey {
+                owner: owner(3),
+                local: LocalKey(local),
+            }
+        };
+        for body in [0x00, 0x7F, 0xFF] {
+            let inside = leaf(9, body);
+            assert!(lo <= inside && inside <= hi, "body {body:02x}");
+        }
+        assert!(leaf(8, 0xFF) < lo);
+        assert!(leaf(10, 0x00) > hi);
+        let elsewhere = SubstateKey {
+            owner: owner(4),
+            local: LocalKey([0; 16]),
+        };
+        assert!(elsewhere > hi);
+    }
+
+    /// One shape carries a batch's movement and a store's total: a
+    /// cell's write moves a row by one, a rewrite in the same row moves
+    /// nothing, and folding the movement empties the row it drains.
+    #[test]
+    fn rows_move_by_what_a_write_changes_and_fold_into_the_total() {
+        let mut total = SweepRows::default();
+        let mut moved = SweepRows::default();
+        moved.delta(owner(1), None, Some(3 * SWEEP_BUCKET_MS));
+        moved.delta(owner(1), None, Some(3 * SWEEP_BUCKET_MS + 1));
+        moved.delta(
+            owner(2),
+            Some(5 * SWEEP_BUCKET_MS),
+            Some(5 * SWEEP_BUCKET_MS + 9),
+        );
+        assert_eq!(
+            moved.iter().collect::<Vec<_>>(),
+            vec![((SweepBucket(3), owner(1)), 2)],
+            "a rewrite inside one bucket moves nothing",
+        );
+        total.fold(&moved);
+
+        let mut retired = SweepRows::default();
+        retired.delta(owner(1), Some(3 * SWEEP_BUCKET_MS), None);
+        total.fold(&retired);
+        assert_eq!(
+            total.from_bucket(SweepBucket(0)).collect::<Vec<_>>(),
+            vec![(SweepBucket(3), owner(1))],
+        );
+        total.fold(&retired);
+        assert!(total.is_empty(), "the row that drained is gone");
+    }
+
+    #[test]
+    #[should_panic(expected = "disagrees with the leaves")]
+    fn a_row_folding_below_zero_is_a_fault() {
+        let mut retired = SweepRows::default();
+        retired.delta(owner(1), Some(3 * SWEEP_BUCKET_MS), None);
+        SweepRows::default().fold(&retired);
+    }
+
+    /// Rows keep or go by their owner's prefix alone, and the rows that
+    /// went are handed back for a store whose index lives elsewhere.
+    #[test]
+    fn rows_outside_the_prefix_are_dropped_and_named() {
+        let mut left = NibblePath::empty();
+        left.push_bits(0, 1);
+        let under = Address::new([0x00; 31], AddressClass::Principal);
+        let outside = Address::new([0x80; 31], AddressClass::Principal);
+        let mut rows: SweepRows = [
+            ((SweepBucket(1), under), 1),
+            ((SweepBucket(1), outside), 1),
+            ((SweepBucket(2), outside), 3),
+        ]
+        .into_iter()
+        .collect();
+        let dropped = rows.retain_under(&left);
+        assert_eq!(
+            dropped,
+            vec![(SweepBucket(1), outside), (SweepBucket(2), outside)]
+        );
+        assert_eq!(
+            rows.iter().collect::<Vec<_>>(),
+            vec![((SweepBucket(1), under), 1)]
+        );
+        assert!(
+            SweepRows::default()
+                .retain_under(&NibblePath::empty())
+                .is_empty()
+        );
     }
 
     /// A cell an unpersisted ancestor created is one this block owes a
@@ -323,9 +770,56 @@ mod tests {
                 (above, Some(above_value)),
             ])],
             SweepFrontier::start_of(SweepBucket(3)),
-            SweepFrontier::start_of(SweepBucket(9)),
+            SweepBucket(9),
             10,
         );
         assert!(merged.is_empty());
+    }
+
+    /// The chain's own creations fold in beside the sweep's removals, as
+    /// ordinary writes under the same root.
+    #[test]
+    fn creations_fold_in_beside_removals() {
+        let (created, _, value) = cell(1, 3, 0xC1);
+        let (removed, _, _) = cell(2, 1, 0xD1);
+        let settled = with_sweep(
+            SettledWrites::default(),
+            &[(created, value.clone())],
+            &[removed],
+        );
+        assert_eq!(settled.cells().get(&created), Some(&Some(value)));
+        assert_eq!(settled.cells().get(&removed), Some(&None));
+    }
+
+    /// One committed cell per transaction given, under the shard's own
+    /// owner, self-describing as sweepable at the transaction's validity
+    /// end plus the grace — the same cells whether a proposer or a
+    /// verifier derives them.
+    #[test]
+    fn a_block_creates_one_committed_cell_per_transaction() {
+        use hyperscale_hbor::from_slice;
+        use hyperscale_types::test_utils::{install_stub_protocol_statics, test_transaction};
+        use hyperscale_vm_effects::Marker;
+        use hyperscale_vm_types::ARTIFACT_GRACE_MS;
+
+        install_stub_protocol_statics();
+        let shard = ShardId::leaf(1, 1);
+        let txs = [test_transaction(1), test_transaction(2)];
+        let cells = committed_tx_cells(shard, txs.iter());
+        assert_eq!(cells.len(), 2);
+        for ((key, value), tx) in cells.iter().zip(&txs) {
+            assert!(ShardTrie::shard_owns_prefix(shard, key.owner));
+            let decoded: Marker = from_slice(value).expect("decodes");
+            assert_eq!(decoded.tx, tx.hash());
+            assert_eq!(
+                decoded.expiry_ms,
+                tx.validity_range().end_timestamp_exclusive.as_millis() + ARTIFACT_GRACE_MS
+            );
+        }
+        assert_eq!(
+            cells,
+            committed_tx_cells(shard, txs.iter()),
+            "derived the same way on every replica"
+        );
     }
 }

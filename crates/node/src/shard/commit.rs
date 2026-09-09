@@ -28,8 +28,8 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, Derivation,
-    EpochWindows, Finalization, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SweepFrontier,
-    SyncHint, Verifiable, Verified, WeightedTimestamp, absorb_committed_cells,
+    EpochWindows, Finalization, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SubstateKey,
+    SweepFrontier, SyncHint, Verifiable, Verified, WeightedTimestamp, absorb_committed_cells,
     local_settled_tx_hashes,
 };
 use tracing::debug;
@@ -62,6 +62,26 @@ pub enum QcOnlyKind {
     NeedsPrep,
 }
 
+/// What `Action::CommitBlockByQcOnly` carries: the certified block and
+/// every input its JMT recomputation reads, as the coordinator that
+/// admitted the block derived them.
+pub struct QcOnlyCommit {
+    /// Block + certifying QC; see [`QcOnlyPending::certified`].
+    pub certified: Arc<Verified<CertifiedBlock>>,
+    /// Parent's state root, the base for the recomputation.
+    pub parent_state_root: StateRoot,
+    /// Parent's height, the JMT parent version.
+    pub parent_block_height: BlockHeight,
+    /// Where the parent's sweep stopped.
+    pub parent_sweep_frontier: SweepFrontier,
+    /// The committed cells the block writes, derived under its window.
+    pub creations: Vec<(SubstateKey, Vec<u8>)>,
+    /// How this node learned the certifying QC.
+    pub source: CommitSource,
+    /// Beacon-witness leaves to fold into the commit.
+    pub witness: BeaconWitnessCommit,
+}
+
 /// A QC-only commit waiting on the single in-flight slot. Every
 /// `Action::CommitBlockByQcOnly` other than the already-persisted skip
 /// path enters the FIFO so preps run one at a time in commit order —
@@ -82,6 +102,10 @@ pub struct QcOnlyPending {
     /// this block's removals fill. Unused when
     /// `kind == AlreadyPrepared`.
     pub parent_sweep_frontier: SweepFrontier,
+    /// The committed cells the block writes, derived by the coordinator
+    /// under the block's own window. Unused when
+    /// `kind == AlreadyPrepared`.
+    pub creations: Vec<(SubstateKey, Vec<u8>)>,
     /// How this node learned the certifying QC.
     pub source: CommitSource,
     /// Whether this entry needs the pool to run JMT prep or can
@@ -186,6 +210,7 @@ where
         pending.parent_sweep_frontier,
         block.header().parent_qc().weighted_timestamp(),
     );
+    let creations = &pending.creations;
     let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
         ParentAnchor {
             state_root: pending.parent_state_root,
@@ -195,6 +220,7 @@ where
             base_reads: None,
         },
         &finalizations,
+        creations,
         &removals,
         height,
     );
@@ -564,8 +590,8 @@ impl BlockCommitCoordinator {
         // whose child arrived via sync rather than consensus, so the
         // 2-chain commit rule never triggered. Dropping the block here
         // leaves its prepared commit orphaned in the cache, and the
-        // next block to reach flush trips the strict ordering assert
-        // in `commit_block_inner` because its parent was never applied.
+        // next block to reach flush is refused because its parent was
+        // never applied.
         if height <= self.persisted_height {
             return QcOnlyDecision::Skip;
         }
@@ -604,8 +630,13 @@ impl BlockCommitCoordinator {
         let block_hash = commit.certified.block().hash();
         let height = commit.certified.block().height();
 
-        // Skip blocks already persisted by the sync path.
-        if height <= self.persisted_height {
+        // Skip blocks at or below the store's write frontier: persisted by
+        // the sync path, or handed to the store by an earlier flush whose
+        // `BlockPersisted` has not come back yet. Every hosted vnode in
+        // the shard commits the same block, and the first one's flush
+        // empties `pending` before the next one's `CommitBlock` arrives,
+        // so `pending` alone cannot dedup them.
+        if height <= self.flushed_height.max(self.persisted_height) {
             return AccumulateDecision::Skip;
         }
 
@@ -713,9 +744,9 @@ impl BlockCommitCoordinator {
         // different latencies — a `CommitBlock` lands inline while a
         // `CommitBlockByQcOnly` round-trips the prep pool — so arrival
         // order at this queue can invert around a sync/live junction (a
-        // recovery bridge committing over a sync-admitted suffix). An
-        // out-of-order persist writes a no-op block's root carry over an
-        // unmaterialized parent version, holing the JMT version chain.
+        // recovery committee committing over a sync-admitted suffix). An
+        // out-of-order persist would write a block's tree over a parent
+        // version the store does not hold yet, holing the version chain.
         // Deferral also covers a block still awaiting the PreparedCommit
         // that `VerifyStateRoot` produces asynchronously.
         let mut ready_commits: Vec<PendingCommit> = Vec::with_capacity(commits.len());
@@ -1048,6 +1079,40 @@ mod tests {
                 AccumulateDecision::Skip
             ));
         }
+        assert_eq!(coord.pending_len(), 0);
+    }
+
+    #[test]
+    fn accumulate_skips_block_already_flushed_but_not_yet_persisted() {
+        let committee = TestCommittee::new(4, 1);
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
+        let sink = empty_sink();
+        let (tx, _rx) = unbounded();
+        let dispatch = SyncDispatch::new();
+
+        enqueue(
+            &mut coord,
+            &committee,
+            BlockHeight::new(1),
+            CommitSource::Aggregator,
+            Arc::clone(&sink),
+        );
+        coord.flush(&tx, &dispatch);
+        assert_eq!(committed_heights(&sink), vec![1]);
+        assert_eq!(coord.persisted_height().inner(), 0);
+
+        // A second hosted vnode commits the same block after the first
+        // one's flush emptied `pending` and before `BlockPersisted` lands.
+        let (dup, _) = make_commit(
+            &committee,
+            BlockHeight::new(1),
+            CommitSource::Aggregator,
+            Arc::clone(&sink),
+        );
+        assert!(matches!(
+            coord.accumulate(dup, now()),
+            AccumulateDecision::Skip
+        ));
         assert_eq!(coord.pending_len(), 0);
     }
 
@@ -1620,7 +1685,8 @@ mod tests {
             transactions: Arc::new(vec![]),
             certificates: Arc::new(vec![]),
             provisions: Arc::new(Vec::new()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let hash = block.hash();

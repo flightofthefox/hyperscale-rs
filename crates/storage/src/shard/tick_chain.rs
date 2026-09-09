@@ -116,6 +116,22 @@ pub enum TickResolution {
         /// The members that will never reach a verdict.
         members: BTreeSet<TxHash>,
     },
+    /// A settled tick this replica never ran, taken from the receipts
+    /// that committed it.
+    ///
+    /// A replay reaches further back than the store answers a historical
+    /// read at, so the ticks below that reach compose and none of them
+    /// runs. What such a tick left is still owed to every tick the replay
+    /// *does* run below the height it settled at —
+    /// the base does not carry it yet, and a baseline missing it is a
+    /// baseline no other replica computed. The receipts state it exactly,
+    /// so the entry is seated from them and stamped where they committed.
+    Restored {
+        /// Height of the block that committed the receipts.
+        height: BlockHeight,
+        /// What each member left, as its receipt states it.
+        writes: Vec<(TxHash, StateWrites)>,
+    },
 }
 
 /// One transaction's readable contribution to a tick.
@@ -192,6 +208,34 @@ struct TickEntry {
 }
 
 impl TickEntry {
+    /// An entry holding nothing, for a tick whose contributions arrive
+    /// from the chain rather than from a run.
+    const fn empty() -> Self {
+        Self {
+            readable: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            folded: None,
+        }
+    }
+
+    /// Seat what the receipts committed at `height` say each member left,
+    /// already stamped: the base gains them there, so a read anchored
+    /// below it folds them and one at or above it does not.
+    ///
+    /// A member the entry already holds is left alone — a run of this
+    /// replica's produced it, and the receipts restate the same writes.
+    fn restore(&mut self, height: BlockHeight, writes: &[(TxHash, StateWrites)]) {
+        for (tx_hash, writes) in writes {
+            self.readable
+                .entry(*tx_hash)
+                .or_insert_with(|| Contribution {
+                    writes: writes.clone(),
+                    in_base_from: Some(height),
+                });
+        }
+        self.folded = None;
+    }
+
     /// The entry one tick's output produces.
     fn from_output(output: TickOutput) -> Self {
         Self {
@@ -305,6 +349,10 @@ impl TickEntry {
                     }
                 }
             }
+            // Seated by the chain rather than applied here: an entry
+            // exists only where a tick ran, and the whole point of a
+            // restore is that none did.
+            TickResolution::Restored { .. } => {}
             // Nothing settles, so nothing enters the base and no height
             // is recorded. Only a provisional contribution can take this
             // path: it was never readable, so dropping it changes no
@@ -426,8 +474,22 @@ where
     /// Idempotent and tolerant of unknown ticks: the entry may already be
     /// evicted (resolved and persisted) or torn down at a reshape
     /// boundary.
+    ///
+    /// A [`TickResolution::Restored`] is the one that seats an entry
+    /// rather than resolving one, because the tick it speaks for is one
+    /// no run of this replica's produced. It never overwrites an entry a
+    /// run did produce: where both exist the run is the same function of
+    /// the same chain prefix, and the receipts add nothing to it.
     pub fn resolve(&self, tick_id: &TickId, resolution: &TickResolution) {
-        if let Some(entry) = write_or_recover(&self.entries).get_mut(&tick_id.block_height()) {
+        let mut entries = write_or_recover(&self.entries);
+        if let TickResolution::Restored { height, writes } = resolution {
+            let entry = entries
+                .entry(tick_id.block_height())
+                .or_insert_with(TickEntry::empty);
+            entry.restore(*height, writes);
+            return;
+        }
+        if let Some(entry) = entries.get_mut(&tick_id.block_height()) {
             entry.resolve(tick_id, resolution);
         }
     }
@@ -588,7 +650,8 @@ impl<Snap: Substates> Substates for TickViewSnapshot<Snap> {
         let mut written: Option<&Option<Vec<u8>>> = None;
         for overlay in self.overlays.iter().rev() {
             if let Some(movement) = overlay.movements.get(&key) {
-                moved = Some(moved.map_or(*movement, |above| compose_movements(*movement, above)));
+                moved =
+                    Some(moved.map_or(*movement, |above| compose_movements(key, *movement, above)));
             }
             if let Some(change) = overlay.cells.get(&key) {
                 written = Some(change);
@@ -607,7 +670,13 @@ impl<Snap: Substates> Substates for TickViewSnapshot<Snap> {
             .as_deref()
             .and_then(read_amount)
             .unwrap_or(0);
-        amount_cell(moved.apply(before).unwrap_or(0)).map(|cell| cell.to_vec())
+        let after = moved.apply(before).unwrap_or_else(|| {
+            panic!(
+                "BFT CRITICAL: a certified debit runs past what {key:?} holds: held {before}, \
+                 moved {moved:?}"
+            )
+        });
+        amount_cell(after).map(|cell| cell.to_vec())
     }
 
     fn entries_in_range(
@@ -746,6 +815,14 @@ mod tests {
     }
 
     impl VersionedStore for StubStore {
+        fn retention_floor(&self) -> u64 {
+            0
+        }
+
+        fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+            (height <= self.tip).then(|| self.snapshot_at(height))
+        }
+
         fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
             lock_or_recover(&self.anchors).push(height);
             StubSnapshot(self.cells_at(height))
@@ -1023,6 +1100,77 @@ mod tests {
                 "anchored at {anchor}"
             );
         }
+    }
+
+    /// A tick the chain never ran folds from the receipts that settled
+    /// it, and only below the height they committed at.
+    ///
+    /// The case is a replay reaching further back than the store answers
+    /// a historical read at: those ticks compose and none of them runs,
+    /// so a tick the replay does run below the height one of them settled
+    /// at reads a baseline the base has not caught up to. The receipts
+    /// state what it is missing.
+    #[test]
+    fn a_restored_tick_folds_until_the_base_carries_it() {
+        let store = Arc::new(StubStore {
+            history: [
+                (BlockHeight::GENESIS, 1_000u128),
+                (BlockHeight::new(9), 700),
+            ]
+            .into_iter()
+            .map(|(height, held)| {
+                (
+                    height,
+                    HashMap::from([(key(1), encode_amount(held).as_ref().to_vec())]),
+                )
+            })
+            .collect(),
+            tip: BlockHeight::new(9),
+            anchors: Mutex::new(Vec::new()),
+        });
+        let chain = TickChain::new(store);
+        chain.resolve(
+            &tick(3),
+            &TickResolution::Restored {
+                height: BlockHeight::new(9),
+                writes: vec![(tx(7), debit(key(1), 300))],
+            },
+        );
+        chain.prune_persisted(BlockHeight::new(9));
+
+        // Below the settlement and at it, in both directions: one answer.
+        for anchor in [4u64, 8, 9, 8, 4] {
+            let view = chain.view_at(BlockHeight::new(anchor));
+            assert_eq!(
+                amount(&view.snapshot().cell(key(1)).unwrap()),
+                700,
+                "anchored at {anchor}"
+            );
+        }
+    }
+
+    /// A restore never displaces what a run of this replica's produced:
+    /// both are the same function of the same chain prefix, so the first
+    /// one seated is the whole of it.
+    #[test]
+    fn a_restore_leaves_a_tick_this_replica_ran_alone() {
+        let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
+        chain.append(
+            BlockHeight::new(3),
+            TickOutput {
+                determined: vec![(tx(7), writes(&[(key(1), Some(b"ran"))]))],
+                provisional: Vec::new(),
+            },
+        );
+        chain.resolve(
+            &tick(3),
+            &TickResolution::Restored {
+                height: BlockHeight::new(9),
+                writes: vec![(tx(7), writes(&[(key(1), Some(b"restored"))]))],
+            },
+        );
+        let view = chain.view_at(BlockHeight::new(3));
+        assert_eq!(view.snapshot().cell(key(1)).unwrap(), b"ran".to_vec());
     }
 
     /// An ordered-collection entry is an exclusive write like any other,

@@ -13,7 +13,7 @@
 //! On each commit, the JMT is updated and a new state root hash is
 //! computed.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -22,8 +22,8 @@ use hyperscale_hbor::from_slice;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_metrics::record_storage_read;
 use hyperscale_storage::{
-    BaseReadCache, GenesisCommit, JmtSnapshot, SubstateStore, Substates, entry_leaf_value,
-    package_of_cell, pending_write, sweepable_expiry, tree,
+    BaseReadCache, GenesisCommit, JmtSnapshot, SubstateStore, Substates, SweepRows,
+    entry_leaf_value, index_leaf, pending_write, tree,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryLeaf, ProtocolHasher, QuorumCertificate,
@@ -71,15 +71,18 @@ use crate::typed_cf::{DbEncode, TypedCf, batch_delete, batch_put, get, multi_get
 /// (version and root hash) is in the default CF under `jmt:metadata` and read
 /// directly from `RocksDB` on demand — always hot in the memtable since they're
 /// written on every commit.
+///
+/// Every field is behind a shared handle, so a [`Clone`] is another
+/// handle onto the *same* database: the pinned shard thread and the
+/// async tasks beside it each hold one, and the commit lock they
+/// serialize on is the one lock.
+#[derive(Clone)]
 pub struct RocksDbShardStorage {
     pub(crate) db: Arc<DB>,
 
     /// Serializes JMT-mutating commits to prevent interleaved read-modify-write
     /// sequences (e.g., `read_jmt_metadata` + `WriteBatch` write).
-    pub(crate) commit_lock: Mutex<()>,
-
-    /// Number of block heights of JMT history to retain before garbage collection.
-    pub(crate) jmt_history_length: u64,
+    pub(crate) commit_lock: Arc<Mutex<()>>,
 
     /// Path this store's JMT is rooted at — its shard's prefix, so the root is
     /// the global tree's subtree at that prefix. Empty for a single-shard /
@@ -92,39 +95,41 @@ pub struct RocksDbShardStorage {
 
     /// Write-path cache of the last-persisted safe-vote register record
     /// per validator. One guard spans the read-merge-write in
-    /// `persist_safe_vote_registers`, keeping concurrent writes monotone
+    /// `persist_vote_position`, keeping concurrent writes monotone
     /// and letting a write that raises nothing (e.g. a timeout
     /// retransmit) skip the fsync entirely.
-    pub(crate) vote_registers: Mutex<HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>>,
+    pub(crate) vote_registers: Arc<Mutex<HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>>>,
 }
 
-/// Move one cell's write across the sweep index's rows.
+/// Fold what a batch `moved` in the sweep index into the rows it holds.
 ///
-/// The index counts live sweepable cells per owner and bucket, so what
-/// matters is whether the cell was sweepable before and whether it is
-/// after — both judged from bytes alone. A value equal to its prior is
-/// sweepable in exactly the same row, which is why the no-op writes the
-/// caller skips need no entry here either.
-fn record_sweep_delta(
-    deltas: &mut BTreeMap<(SweepBucket, Address), i64>,
-    key: SubstateKey,
-    prior: Option<&[u8]>,
-    change: Option<&[u8]>,
-) {
-    let was = prior.and_then(|bytes| sweepable_expiry(key, bytes));
-    let now = change.and_then(|bytes| sweepable_expiry(key, bytes));
-    if was == now {
+/// One read-modify-write per touched row, which is at most one per
+/// distinct owner a batch writes a sweepable cell for — never one per
+/// cell. A row that reaches zero is deleted, so the index holds exactly
+/// the pairs that have something in them and a sweep's walk skips
+/// nothing and visits nothing empty.
+///
+/// A row is a total over what has *committed*, and the read that carries
+/// it forward is against the persisted store. So this belongs where
+/// commits serialize — under `commit_lock`, with `batch` the next thing
+/// written. Folded while an ancestor is still unpersisted it would
+/// overwrite that ancestor's move to the same row with a count taken
+/// before it.
+pub fn fold_sweep_rows(db: &DB, batch: &mut WriteBatch, cf: &CfHandles<'_>, moved: &SweepRows) {
+    if moved.is_empty() {
         return;
     }
-    if let Some(expiry) = was {
-        *deltas
-            .entry((SweepBucket::of(expiry), key.owner))
-            .or_default() -= 1;
-    }
-    if let Some(expiry) = now {
-        *deltas
-            .entry((SweepBucket::of(expiry), key.owner))
-            .or_default() += 1;
+    let sweep_cf = SweepIndexCf::handle(cf);
+    let rows: Vec<(SweepBucket, Address)> = moved.iter().map(|(row, _)| row).collect();
+    let held: Vec<Option<u32>> = multi_get::<SweepIndexCf>(db, sweep_cf, &rows);
+    for ((row, delta), held) in moved.iter().zip(held) {
+        let count = SweepRows::fold_row(row, i64::from(held.unwrap_or(0)), delta);
+        if count == 0 {
+            batch_delete::<SweepIndexCf>(batch, sweep_cf, &row);
+        } else {
+            let count = u32::try_from(count).expect("a sweep-index count fits its column");
+            batch_put::<SweepIndexCf>(batch, sweep_cf, &row, &count);
+        }
     }
 }
 
@@ -278,17 +283,11 @@ impl RocksDbShardStorage {
 
         Ok(Self {
             db,
-            commit_lock: Mutex::new(()),
-            jmt_history_length: config.jmt_history_length,
+            commit_lock: Arc::new(Mutex::new(())),
             root_path,
             checkpoints,
-            vote_registers: Mutex::new(HashMap::new()),
+            vote_registers: Arc::new(Mutex::new(HashMap::new())),
         })
-    }
-
-    /// Get the configured JMT history retention length (in block heights).
-    pub const fn jmt_history_length(&self) -> u64 {
-        self.jmt_history_length
     }
 
     /// Resolve all column family handles from the database.
@@ -368,23 +367,6 @@ impl RocksDbShardStorage {
         read_jmt_metadata(&*self.db)
     }
 
-    /// Append a single JMT node to a `WriteBatch` — the persist-time root
-    /// carry for a node-less no-op snapshot.
-    pub(crate) fn append_jmt_node_to_batch(
-        &self,
-        batch: &mut WriteBatch,
-        key: &JmtNodeKey,
-        node: &JmtNode,
-    ) {
-        let cf = self.cf();
-        batch_put::<JmtNodesCf>(
-            batch,
-            JmtNodesCf::handle(&cf),
-            &StoredNodeKey::from_jmt(key),
-            &VersionedStoredNode::from_latest(StoredNode::from_jmt(node)),
-        );
-    }
-
     /// Append JMT data from a snapshot to a `WriteBatch`.
     ///
     /// Writes JMT nodes, stale tree parts (for deferred GC), and JMT
@@ -446,6 +428,7 @@ impl RocksDbShardStorage {
     /// Committed substate byte total after the commit at `version`,
     /// or `None` if no commit at that version recorded one (never
     /// committed, or pruned past the retention horizon).
+    #[must_use]
     pub fn substate_bytes_at_version(&self, version: u64) -> Option<u64> {
         let cf = self.cf();
         get::<SubstateBytesCf>(&*self.db, SubstateBytesCf::handle(&cf), &version)
@@ -476,6 +459,10 @@ impl RocksDbShardStorage {
     /// a prior read past them would judge the no-op skip — and record
     /// history — against state older than the parent's. A caller building
     /// at the committed tip passes `&[]`.
+    ///
+    /// Returns the sweep-index delta beside the batch rather than folding
+    /// it, for the reason [`fold_sweep_rows`] gives: the fold reads the
+    /// persisted index, so it belongs where the batch is written.
     pub(crate) fn build_substate_write_batch(
         &self,
         writes: &SettledWrites,
@@ -483,9 +470,9 @@ impl RocksDbShardStorage {
         write_history: bool,
         base_reads: Option<&BaseReadCache>,
         pending: &[Arc<JmtSnapshot>],
-    ) -> WriteBatch {
+    ) -> (WriteBatch, SweepRows) {
         let mut batch = WriteBatch::default();
-        self.append_substate_writes_to_batch(
+        let sweep_rows = self.append_substate_writes_to_batch(
             &mut batch,
             writes,
             version,
@@ -493,13 +480,11 @@ impl RocksDbShardStorage {
             base_reads,
             pending,
         );
-        batch
+        (batch, sweep_rows)
     }
 
     /// Same as `build_substate_write_batch` but appends to an existing
-    /// `WriteBatch`. Used by callers that want to fold substate writes
-    /// into a larger atomic batch (e.g. the test-only
-    /// `commit_certificate_with_writes`).
+    /// `WriteBatch`.
     ///
     /// `base_reads`, when provided, is the read cache accumulated by the
     /// originating `SubstateView` during execution. Priors for keys
@@ -514,7 +499,7 @@ impl RocksDbShardStorage {
         write_history: bool,
         base_reads: Option<&BaseReadCache>,
         pending: &[Arc<JmtSnapshot>],
-    ) {
+    ) -> SweepRows {
         let cf = self.cf();
         let state_cf = StateCf::handle(&cf);
         let history_cf = StateHistoryCf::handle(&cf);
@@ -563,11 +548,18 @@ impl RocksDbShardStorage {
         // stale-set entry for this version in one shot.
         let history_key_codec = VersionedSubstateKeyCodec;
         let mut stale_history_keys: Vec<Vec<u8>> = Vec::new();
-        let mut sweep_deltas: BTreeMap<(SweepBucket, Address), i64> = BTreeMap::new();
+        let mut sweep_rows = SweepRows::default();
+        let artifacts_cf = PackageArtifactsCf::handle(&cf);
         for ((key, change), prior_slot) in writes.cells().iter().zip(priors) {
             let prior =
                 prior_slot.expect("every write must have a resolved prior (cache hit or fetched)");
-            record_sweep_delta(&mut sweep_deltas, *key, prior.as_deref(), change.as_deref());
+            let package = index_leaf(*key, prior.as_deref(), change.as_deref(), &mut sweep_rows);
+            // A cell that self-identifies as a package lands its artifact
+            // in the content-addressed index, in the same atomic batch as
+            // the state that carries it.
+            if let (Some(package), Some(value)) = (package, change) {
+                batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, value);
+            }
             if let Some(new_value) = change {
                 // No-op short-circuit: setting a key to the value it
                 // already holds changes nothing. Skip both the history
@@ -608,20 +600,6 @@ impl RocksDbShardStorage {
             pending,
         );
 
-        // A committed cell that self-identifies as a package lands its
-        // artifact in the content-addressed index, in the same atomic
-        // batch as the state that carries it.
-        let artifacts_cf = PackageArtifactsCf::handle(&cf);
-        for (key, change) in writes.cells() {
-            if let Some(value) = change
-                && let Some(package) = package_of_cell(*key, value)
-            {
-                batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, value);
-            }
-        }
-
-        self.append_sweep_rows_to_batch(batch, &cf, &sweep_deltas);
-
         // Index the history keys by version so GC can delete them without
         // scanning StateHistoryCf. Skipped when write_history is false
         // (genesis) — nothing was written.
@@ -633,52 +611,8 @@ impl RocksDbShardStorage {
                 &stale_history_keys,
             );
         }
-    }
 
-    /// Fold this batch's sweep-index deltas into the rows they touch.
-    ///
-    /// One read-modify-write per touched `(bucket, owner)` pair, which
-    /// is at most one per distinct owner a block writes a sweepable cell
-    /// for — never one per cell. A row that reaches zero is deleted, so
-    /// the index holds exactly the pairs that have something in them and
-    /// a sweep's walk skips nothing and visits nothing empty.
-    ///
-    /// The read is against the persisted store rather than the pending
-    /// overlay because the rows are a total over what has *committed*,
-    /// and every batch that moved one has already been applied by the
-    /// time this one is built.
-    ///
-    /// # Panics
-    ///
-    /// If a row would go negative, which means the index disagrees with
-    /// the leaves it is derived from — the same class of fault as the
-    /// byte total's checked add, and caught here rather than allowed to
-    /// under-report a sweep's candidates.
-    fn append_sweep_rows_to_batch(
-        &self,
-        batch: &mut WriteBatch,
-        cf: &CfHandles<'_>,
-        deltas: &BTreeMap<(SweepBucket, Address), i64>,
-    ) {
-        if deltas.is_empty() {
-            return;
-        }
-        let sweep_cf = SweepIndexCf::handle(cf);
-        let rows: Vec<(SweepBucket, Address)> = deltas.keys().copied().collect();
-        let current: Vec<Option<u32>> = multi_get::<SweepIndexCf>(&*self.db, sweep_cf, &rows);
-        for ((row, delta), held) in deltas.iter().zip(current) {
-            let count = i64::from(held.unwrap_or(0))
-                .checked_add(*delta)
-                .expect("a sweep-index count stays inside i64");
-            let count = u32::try_from(count).unwrap_or_else(|_| {
-                panic!("sweep index for {row:?} went to {count}, so it disagrees with the leaves")
-            });
-            if count == 0 {
-                batch_delete::<SweepIndexCf>(batch, sweep_cf, row);
-            } else {
-                batch_put::<SweepIndexCf>(batch, sweep_cf, row, &count);
-            }
-        }
+        sweep_rows
     }
 
     /// The entries half of a substate write batch: each entry's leaf row
@@ -799,13 +733,16 @@ impl RocksDbShardStorage {
         // Genesis writes at version 0. Repeat Sets to the same key
         // overwrite — idempotent by RocksDB write semantics. No history
         // entries: genesis has no pre-state to preserve.
-        let batch = self.build_substate_write_batch(
+        let (mut batch, sweep_rows) = self.build_substate_write_batch(
             writes,
             0,
             /* write_history */ false,
             /* base_reads */ None,
             /* pending */ &[],
         );
+        // Genesis builds and writes in one step over an empty store, so
+        // the fold's read is of what this batch is about to extend.
+        fold_sweep_rows(&self.db, &mut batch, &self.cf(), &sweep_rows);
 
         // Substates only — no JMT, no sync (genesis isn't durability-critical).
         self.db
@@ -825,6 +762,7 @@ impl RocksDbShardStorage {
     ///
     /// Panics if called after the JMT has already been initialized, or
     /// if the underlying `RocksDB` write fails.
+    #[must_use]
     pub fn finalize_genesis_jmt(&self, merged: &SettledWrites) -> StateRoot {
         let _commit_guard = self.commit_lock.lock().unwrap();
 
@@ -926,82 +864,5 @@ impl TreeReader for RocksDbShardStorage {
 
     fn root_path(&self) -> NibblePath {
         self.root_path.clone()
-    }
-}
-
-#[cfg(test)]
-mod test_helpers {
-    use hyperscale_metrics::record_storage_write;
-
-    use super::*;
-
-    impl RocksDbShardStorage {
-        /// Test helper: commits database updates with auto-incrementing JMT version.
-        /// Production uses `commit_block` / `commit_prepared_block` instead.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`StorageError`] if the underlying `RocksDB` write fails.
-        ///
-        /// # Panics
-        ///
-        /// Panics if the commit lock is poisoned.
-        #[instrument(level = Level::DEBUG, skip_all, fields(
-            cell_count = writes.cells().len(),
-            latency_us = Empty,
-        ))]
-        pub fn commit(&self, writes: &SettledWrites) -> Result<(), StorageError> {
-            let _commit_guard = self.commit_lock.lock().unwrap();
-
-            let start = Instant::now();
-
-            // Compute JMT updates using a snapshot-based store for isolation
-            let snapshot_store = SnapshotTreeStore::new(&self.db, self.root_path.clone());
-            let (base_version, base_root) = snapshot_store.read_jmt_metadata();
-
-            // Version 0 with a non-zero root means genesis has been computed at version 0.
-            // Only treat as "no parent" when the JMT is truly empty.
-            let parent_version = tree::jmt_parent_height(BlockHeight::new(base_version), base_root)
-                .map(BlockHeight::inner);
-            let new_version = base_version + 1;
-
-            let mut batch = self.build_substate_write_batch(
-                writes,
-                new_version,
-                /* write_history */ true,
-                /* base_reads */ None,
-                /* pending */ &[],
-            );
-
-            let (new_root, collected) =
-                tree::put_at_version(&snapshot_store, parent_version, new_version, writes);
-            let jmt_snapshot = JmtSnapshot::from_collected_writes(
-                collected,
-                writes.clone(),
-                base_root,
-                BlockHeight::new(base_version),
-                new_root,
-                BlockHeight::new(new_version),
-            );
-
-            self.append_jmt_to_batch(&mut batch, &jmt_snapshot, new_version);
-
-            self.db
-                .write(batch)
-                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-
-            let elapsed = start.elapsed();
-            record_storage_write(elapsed.as_secs_f64());
-
-            // Record span fields
-            let span = Span::current();
-            span.record(
-                "latency_us",
-                u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
-            );
-            tracing::debug!(new_version, "commit complete");
-
-            Ok(())
-        }
     }
 }

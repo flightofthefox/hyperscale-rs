@@ -14,6 +14,7 @@ use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, TickBatchContext, TickEnvironment, genesis_writes,
 };
 use hyperscale_hbor::{from_slice, to_vec};
+use hyperscale_storage::test_helpers::block_settling;
 use hyperscale_storage::{BoundaryStore, GenesisCommit, SubstateStore, Substates};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_transactions::{Client, Terms};
@@ -164,7 +165,7 @@ fn run_tick(
         receipts.push(StoredReceipt::from(tx));
     }
     let after = storage
-        .follow_block_writes(BlockHeight::new(height), &receipts)
+        .follow_block_writes(&block_settling(BlockHeight::new(height), receipts), &[])
         .expect("committed receipts apply");
     assert_ne!(before, after, "a settling tick moves the state root");
     executed
@@ -231,7 +232,7 @@ fn custody_opens_for_the_holder_and_refuses_the_rest() {
     );
 
     // Withdrawing an instance the holdings do not contain traps in the
-    // guest — the sender's own defect, priced as one.
+    // guest — the sender's own defect, and priced like every attempt.
     let executed = run_tick(&executor, &storage, 3, signed_nf_transfer(BOB, ALICE, &[9]));
     assert!(
         matches!(&executed[0].consensus, ConsensusReceipt::Failed),

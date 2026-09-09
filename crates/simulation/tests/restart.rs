@@ -15,12 +15,18 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_engine::XRD;
+use hyperscale_engine::genesis::GenesisPackages;
+use hyperscale_scenarios::query::{declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
-    HALT_STRADDLER_BATCH, build_transfer_tx, genesis_accounts, halt_straddler_setup, recipient,
-    sender, validity_around,
+    HALT_STRADDLER_BATCH, build_swap_tx, build_transfer_tx, genesis_accounts, halt_straddler_setup,
+    recipient, sender, validity_around,
 };
 use hyperscale_scenarios::wait::await_tx_terminal;
-use hyperscale_scenarios::{Cluster, FaultableCluster, ScenarioConfig, epochs, split_lifecycle};
+use hyperscale_scenarios::{
+    Cluster, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, ScenarioConfig, VENUE_SHARD, epochs,
+    grind_onto, split_lifecycle, stand_up_venue, venue_genesis_accounts,
+};
 use hyperscale_types::{HALT_THRESHOLD_EPOCHS, ShardId, TransactionStatus, TxHash};
 use support::SimCluster;
 
@@ -34,6 +40,20 @@ const fn halt_recovery_config() -> ScenarioConfig {
         pool_surplus: 14,
         num_shards: 1,
         split_bytes: 36_000,
+        latency: Duration::from_millis(150),
+    }
+}
+
+/// A venue on one shard and its callers on the other, resharding
+/// disarmed so the committees a restart bounces are the ones that were
+/// seated.
+const fn venue_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 4,
+        num_shards: 2,
+        split_bytes: u64::MAX,
         latency: Duration::from_millis(150),
     }
 }
@@ -216,22 +236,20 @@ fn a_restarted_committee_resumes_beside_a_live_sibling() {
 
 /// Every replica restarting at once, on a shard with no counterpart.
 ///
-/// The committee comes back holding its committed tip, and the certified
-/// block above it is gone from every replica at once. Each recovers a lock
-/// it cannot satisfy: the QC that justifies it certifies a block none of
-/// them holds, so every proposal they can build extends a lower QC and the
-/// safe-vote rule refuses it. They propose and vote and no quorum forms.
+/// The committee comes back holding its committed tip; the certified
+/// block above it goes down with every replica at once, and the lock each
+/// one recovers is on the QC certifying that block.
 ///
 /// The single shard is the whole of the condition — with a live sibling
-/// the shard resumes ([`a_restarted_committee_resumes_beside_a_live_sibling`]),
-/// so what is missing here is any counterpart holding what the committee
-/// dropped. Closing it means making certified-but-uncommitted blocks
-/// durable, since the lock cannot be lowered: nothing in a shard's own
-/// state distinguishes "nothing was committed above me" from "an absent
-/// replica committed and I would be forking away from it".
+/// the shard resumes on what the sibling's committee still holds
+/// ([`a_restarted_committee_resumes_beside_a_live_sibling`]), so what is
+/// absent here is any counterpart holding what the committee dropped. The
+/// lock cannot be lowered instead: nothing in a shard's own state
+/// distinguishes "nothing was committed above me" from "an absent replica
+/// committed and I would be forking away from it". So the block travels
+/// with the record that locks on it, and the committee comes back able to
+/// extend its own certificate.
 #[test]
-#[ignore = "known gap: a lone shard whose every replica restarts together \
-            recovers a lock no proposal it can build satisfies"]
 fn a_committee_advances_after_all_of_it_restarts() {
     restart_and_advance(4);
 }
@@ -312,5 +330,83 @@ fn a_restarted_member_agrees_on_the_state_it_rebuilt() {
         root_at(&cluster, host),
         root_at(&cluster, peer),
         "a restarted replica's fold must be the one its committee agreed on",
+    );
+}
+
+/// A leg's reclaim survives its committee restarting between the leg's
+/// own finalization and the core's refusal.
+///
+/// The window this opens is the one the replay fold has to reach. The
+/// caller's shard runs the swap's withdraw as a leg: it pays, issues the
+/// crossing and certifies, and its own finalization decides nothing —
+/// the venue's does, later. A restart in between loses everything
+/// execution held in memory, so the entry that names what the reclaim
+/// would take back has to come back off the chain: a leg's own
+/// finalization retires nothing from the replay floor, and the fold
+/// reads to a leg entry's horizon rather than to a whole entry's
+/// deadline. A replay that stopped at either would come back to a
+/// refusal holding nothing for the transaction, no reclaim would be
+/// composed, and the caller's input would sit in a record cell until
+/// its grace sweeps it.
+///
+/// The whole committee restarts, not one member: a single replica would
+/// be carried by its peers, and what is under test is the entry rather
+/// than the vote.
+#[test]
+fn a_restarted_payer_still_reclaims_its_refused_leg() {
+    let mut cluster = SimCluster::with_grown_packages(
+        &venue_config(),
+        42,
+        &venue_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    );
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(&mut cluster, VENUE_SHARD, &mut taken);
+    let (caller_key, caller) = grind_onto(SWAPPER_SHARD, &mut taken);
+
+    // A floor no pool this size can pay, so the venue declines and the
+    // caller's leg is left holding a crossing nobody claims.
+    let refused = build_swap_tx(
+        &caller_key,
+        caller,
+        &venue.meta,
+        *XRD,
+        SWAP_INPUT,
+        SWAP_INPUT * 100,
+        validity_around(cluster.now()),
+    );
+    let price = declared_price(&cluster, &refused);
+    let funded = vault_balance(&cluster, SWAPPER_SHARD, caller);
+    let hash = refused.hash();
+    cluster.submit(Arc::new(refused));
+
+    // The leg has paid and certified: its own finalization is on the
+    // caller's chain, naming a transaction it does not decide.
+    assert!(
+        cluster.run_until(epochs(12), |c| {
+            vault_balance(c, SWAPPER_SHARD, caller) == funded - SWAP_INPUT - price
+                && c.chain_fate(SWAPPER_SHARD, hash).0.is_some()
+        }),
+        "the caller's leg must pay and commit before the restart",
+    );
+    assert!(
+        cluster.chain_fate(VENUE_SHARD, hash).1.is_none(),
+        "the venue must not have refused yet, or the restart lands after \
+         the evidence rather than before it",
+    );
+
+    for host in cluster.committee_hosts(SWAPPER_SHARD) {
+        cluster.restart_host(host, SWAPPER_SHARD);
+    }
+
+    // The refusal arrives to a restarted shard, and the reclaim it
+    // licenses is composed from the entry the replay rebuilt.
+    assert!(
+        cluster.run_until(epochs(24), |c| vault_balance(c, SWAPPER_SHARD, caller)
+            == funded - price),
+        "a restarted payer must still reclaim what its leg issued: holds {}, \
+         expected {}",
+        vault_balance(&cluster, SWAPPER_SHARD, caller),
+        funded - price,
     );
 }

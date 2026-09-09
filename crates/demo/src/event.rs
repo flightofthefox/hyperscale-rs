@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use hyperscale_simulation::{DeliveryDrain, DeliveryRecord};
 use hyperscale_types::{
-    BlockHeight, ExecutionOutcome, Finalization, MessageClass, Round, ShardId, TickId, TxHash,
-    TxOutcome,
+    BlockHeight, ExecutionOutcome, Finalization, MessageClass, Provisions, Round, ShardId, TickId,
+    TxHash, TxOutcome,
 };
 use serde::Serialize;
 
@@ -99,18 +99,19 @@ pub enum TraceKind {
         /// children a merge composed away.
         retired: Vec<ShardPath>,
     },
-    /// State committed on `from` that `to` executed against.
+    /// State committed on `from` that `to` took delivery of.
     ///
     /// Drawn as an arc from `(from, fromHeight)` — the block whose state was
     /// provisioned — to `(to, toHeight)`, the block where `to` committed the
-    /// settled outcome. Derived at the destination: `to` could not have
-    /// reached that outcome without first checking the provisions against
-    /// `from`'s QC-attested state root, so the arc stands for a proof that
-    /// checked out rather than a message that was sent.
+    /// bundle. Derived at the destination: a bundle reaches a block only
+    /// once the committee has checked its proof against `from`'s
+    /// QC-attested state root, so the arc stands for a proof that checked
+    /// out rather than a message that was sent.
     ///
-    /// One arc per direction per settlement. The reverse arc is reported by
-    /// `from` when it commits `to`'s certificate in a block of its own,
-    /// which is what makes a settlement round read as mutual on screen.
+    /// One arc per bundle, in the direction the state travelled. A transfer
+    /// draws one: the payer's shard settles it alone and the recipient's
+    /// commits the delivery, so the arc runs from payer to recipient and
+    /// nothing runs back.
     #[serde(rename_all = "camelCase")]
     ProvisionsVerified {
         from: ShardPath,
@@ -380,19 +381,19 @@ impl TraceEvent {
 
     pub(crate) fn provisions_verified(
         wt: u64,
-        from: &TickId,
+        bundle: &Provisions,
         to: ShardId,
         to_height: BlockHeight,
-        outcomes: &[TxOutcome],
+        delivered: Vec<TxHash>,
     ) -> Self {
         Self {
             wt,
             kind: TraceKind::ProvisionsVerified {
-                from: from.shard_id().into(),
-                from_height: from.block_height().inner(),
+                from: bundle.source_shard().into(),
+                from_height: bundle.block_height().inner(),
                 to: to.into(),
                 to_height: to_height.inner(),
-                txs: tx_labels(outcomes),
+                txs: delivered.into_iter().map(TxLabel::from).collect(),
             },
         }
     }

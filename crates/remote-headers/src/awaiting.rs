@@ -1,14 +1,15 @@
 //! Per-shard buffer for cross-shard artifacts awaiting their committee's epoch.
 //!
-//! When [`TopologySchedule::at`](crate::TopologySchedule::at) returns `None` for
-//! an artifact's weighted timestamp, this node's beacon hasn't committed that
-//! epoch yet and the signing committee can't be resolved. Coordinators park the
-//! artifact here, keyed by its source shard, and replay every buffered item on
-//! `BeaconBlockPersisted` once the beacon catches up.
+//! When [`TopologySchedule::at`](hyperscale_types::TopologySchedule::at)
+//! returns `None` for a header's weighted timestamp, this node's beacon
+//! hasn't committed that epoch yet and the signing committee can't be
+//! resolved. The coordinator parks the header here, keyed by its source
+//! shard, and replays every buffered item on `BeaconBlockPersisted` once
+//! the beacon catches up.
 
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::ShardId;
+use hyperscale_types::ShardId;
 
 /// Per-shard cap on artifacts buffered awaiting their committee's epoch.
 /// Drop-oldest past this bound; a node this far behind re-fetches the dropped
@@ -62,26 +63,6 @@ impl<V> AwaitingTopologyBuffer<V> {
             .flatten()
             .collect()
     }
-
-    /// Remove and return every value buffered under `shard`, in FIFO order.
-    pub fn drain_shard(&mut self, shard: ShardId) -> Vec<V> {
-        self.by_shard
-            .remove(&shard)
-            .map(Vec::from)
-            .unwrap_or_default()
-    }
-
-    /// Total buffered count across all shards.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.by_shard.values().map(VecDeque::len).sum()
-    }
-
-    /// Whether no values are buffered.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.by_shard.values().all(VecDeque::is_empty)
-    }
 }
 
 #[cfg(test)]
@@ -94,14 +75,11 @@ mod tests {
         buf.push(ShardId::leaf(1, 0), 1);
         buf.push(ShardId::leaf(1, 0), 2);
         buf.push(ShardId::leaf(1, 1), 3);
-        assert_eq!(buf.len(), 3);
-        assert!(!buf.is_empty());
 
         let mut drained = buf.drain();
         drained.sort_unstable();
         assert_eq!(drained, vec![1, 2, 3]);
-        assert_eq!(buf.len(), 0);
-        assert!(buf.is_empty());
+        assert!(buf.drain().is_empty(), "a drain empties the buffer");
     }
 
     #[test]
@@ -111,10 +89,10 @@ mod tests {
         for i in 0..MAX_AWAITING_TOPOLOGY_PER_SHARD + 5 {
             buf.push(shard, i);
         }
-        assert_eq!(buf.len(), MAX_AWAITING_TOPOLOGY_PER_SHARD);
 
         let mut drained = buf.drain();
         drained.sort_unstable();
+        assert_eq!(drained.len(), MAX_AWAITING_TOPOLOGY_PER_SHARD);
         // The first five pushes were evicted; the tail survives.
         assert_eq!(drained.first(), Some(&5));
         assert_eq!(drained.last(), Some(&(MAX_AWAITING_TOPOLOGY_PER_SHARD + 4)));
@@ -128,6 +106,6 @@ mod tests {
             buf.push(ShardId::leaf(1, 1), i);
         }
         // Each shard is capped on its own; the cap doesn't pool across shards.
-        assert_eq!(buf.len(), 2 * MAX_AWAITING_TOPOLOGY_PER_SHARD);
+        assert_eq!(buf.drain().len(), 2 * MAX_AWAITING_TOPOLOGY_PER_SHARD);
     }
 }

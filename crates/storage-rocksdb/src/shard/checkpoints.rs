@@ -12,38 +12,38 @@
 //! dot-prefixed temporary name and a rename, so a crash mid-create
 //! leaves only a `.tmp-*` directory, swept on the next creation.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, SubstateStore, Substates, WitnessSeed,
-    entry_from_leaf, filter_writes_to_prefix, merge_writes_from_receipts, package_of_cell,
-    sweepable_expiry,
+    AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, LeafRows, SubstateStore, Substates,
+    SweepRows, WitnessSeed, followed_block_writes, holds_state, is_record_cell, key_under_prefix,
+    prefix_low_key,
 };
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf,
+    Block, BlockHeight, ChainOrigin, ShardId, StateRoot, SubstateKey, SubstateLeaf,
+    shard_prefix_path,
 };
-use hyperscale_vm_types::{Address, CollectionId, SweepBucket};
+use hyperscale_vm_types::{Address, CollectionId};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{ColumnFamily, DB, Options, WriteBatch};
 use tracing::warn;
 
 use super::column_families::{
     ALL_COLUMN_FAMILIES, BeaconWitnessesCf, CfHandles, EntriesCf, ImportStagingCf, JmtNodesCf,
-    PackageArtifactsCf, StateCf, SubstateBytesCf, SweepIndexCf,
+    PackageArtifactsCf, StateCf, SubstateBytesCf,
 };
-use super::core::RocksDbShardStorage;
+use super::core::{RocksDbShardStorage, fold_sweep_rows};
 use super::entry_key::scan_entries;
 use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::jmt_stored::{StoredNode, StoredNodeKey, VersionedStoredNode};
 use super::metadata::{read_jmt_metadata, write_jmt_metadata};
 use crate::StorageError;
 use crate::typed_cf::{
-    ImportProgressEntry, TypedCf, batch_delete, batch_put, get, iter_all, meta_delete, meta_read,
-    meta_write, multi_get,
+    ImportProgressEntry, TypedCf, batch_delete, batch_put, get, iter_all, iter_from, meta_delete,
+    meta_read, meta_write,
 };
 
 /// Write one import batch's leaves and re-derive every index that hangs
@@ -58,52 +58,30 @@ fn index_imported_leaves(
     batch: &mut WriteBatch,
     cf: &CfHandles<'_>,
     leaves: &[SubstateLeaf],
-) -> BTreeMap<(SweepBucket, Address), u32> {
+) -> SweepRows {
     let state_cf = StateCf::handle(cf);
     let entries_cf = EntriesCf::handle(cf);
     let artifacts_cf = PackageArtifactsCf::handle(cf);
-    let mut sweep_rows: BTreeMap<(SweepBucket, Address), u32> = BTreeMap::new();
+    let mut sweep_rows = SweepRows::default();
     for leaf in leaves {
         batch_put::<StateCf>(batch, state_cf, &leaf.key, &leaf.value);
-        if let Some((entry_key, value)) = entry_from_leaf(leaf.key, &leaf.value) {
+        let LeafRows {
+            entry,
+            package,
+            sweep,
+        } = LeafRows::of(leaf.key, &leaf.value);
+        if let Some((entry_key, value)) = entry {
             batch_put::<EntriesCf>(batch, entries_cf, &entry_key, &value);
         }
         // The package index earns its rebuild for a sharper reason: an
         // imported store whose committee turns over is the only place a
         // foreign shard can still fetch this artifact from.
-        if let Some(package) = package_of_cell(leaf.key, &leaf.value) {
+        if let Some(package) = package {
             batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, &leaf.value);
         }
-        if let Some(expiry) = sweepable_expiry(leaf.key, &leaf.value) {
-            *sweep_rows
-                .entry((SweepBucket::of(expiry), leaf.key.owner))
-                .or_default() += 1;
-        }
+        sweep_rows.delta(leaf.key.owner, None, sweep);
     }
     sweep_rows
-}
-
-/// Add an import batch's sweepable-leaf counts to the sweep index.
-///
-/// Rows survive across batches — one owner's bucket can span several —
-/// so each fold reads what earlier batches left. Every batch is written
-/// before the next is built, so the read sees them.
-fn fold_sweep_rows(
-    db: &DB,
-    batch: &mut WriteBatch,
-    cf: &CfHandles<'_>,
-    rows: &BTreeMap<(SweepBucket, Address), u32>,
-) {
-    if rows.is_empty() {
-        return;
-    }
-    let sweep_cf = SweepIndexCf::handle(cf);
-    let keys: Vec<(SweepBucket, Address)> = rows.keys().copied().collect();
-    let held: Vec<Option<u32>> = multi_get::<SweepIndexCf>(db, sweep_cf, &keys);
-    for ((row, added), current) in rows.iter().zip(held) {
-        let count = current.unwrap_or(0).saturating_add(*added);
-        batch_put::<SweepIndexCf>(batch, sweep_cf, row, &count);
-    }
 }
 
 /// Queue the staging CF's full range and the progress record for
@@ -226,7 +204,7 @@ impl RocksDbShardStorage {
     /// poison the store for every later import attempt.
     fn check_finalize_preconditions(&self, height: BlockHeight) -> Result<(), String> {
         let (version, root) = self.read_jmt_metadata();
-        if version != 0 || root != StateRoot::ZERO {
+        if holds_state(BlockHeight::new(version), root) {
             return Err("snap-sync import requires an empty store".to_string());
         }
         if let Some(progress) = self.read_import_progress()
@@ -354,6 +332,7 @@ impl RocksDbShardStorage {
 /// oldest beyond that. Entries are
 /// discovered by scanning the ring directory, so the ring picks up
 /// where it left off after a restart.
+#[derive(Clone)]
 pub struct CheckpointRing {
     db: Arc<DB>,
     dir: PathBuf,
@@ -544,6 +523,15 @@ impl Substates for CheckpointStore {
 impl BoundaryStore for RocksDbShardStorage {
     type Boundary = CheckpointStore;
 
+    fn escrow_records(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)> {
+        let cf = self.cf();
+        let prefix = shard_prefix_path(shard);
+        iter_from::<StateCf>(&self.db, StateCf::handle(&cf), &prefix_low_key(&prefix))
+            .take_while(|(key, _)| key_under_prefix(&key.to_bytes(), &prefix))
+            .filter(|(key, value)| is_record_cell(*key, value))
+            .collect()
+    }
+
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
         self.checkpoints.create(height).map_err(|e| e.to_string())
     }
@@ -565,7 +553,7 @@ impl BoundaryStore for RocksDbShardStorage {
             .lock()
             .map_err(|_| "commit lock poisoned".to_string())?;
         let (version, root) = self.read_jmt_metadata();
-        if version != 0 || root != StateRoot::ZERO {
+        if holds_state(BlockHeight::new(version), root) {
             return Err("snap-sync staging requires an empty store".to_string());
         }
 
@@ -619,9 +607,10 @@ impl BoundaryStore for RocksDbShardStorage {
 
     fn follow_block_writes(
         &self,
-        height: BlockHeight,
-        receipts: &[StoredReceipt],
+        block: &Block,
+        creations: &[(SubstateKey, Vec<u8>)],
     ) -> Result<StateRoot, String> {
+        let height = block.height();
         let _commit_guard = self
             .commit_lock
             .lock()
@@ -639,19 +628,22 @@ impl BoundaryStore for RocksDbShardStorage {
         // of it. A follow that skips a height resolves its movements
         // against a baseline missing what the gap left, and fails against
         // the child roots rather than committing quietly.
-        let merged = merge_writes_from_receipts(receipts, &self.snapshot());
-        let filtered = filter_writes_to_prefix(&merged, &self.root_path);
+        let filtered =
+            followed_block_writes(self, &self.snapshot(), block, creations, &self.root_path);
         if filtered.is_empty() {
             return Ok(base_root);
         }
 
-        let mut batch = self.build_substate_write_batch(
+        let (mut batch, sweep_rows) = self.build_substate_write_batch(
             &filtered,
             height.inner(),
             /* write_history */ true,
             /* base_reads */ None,
             /* pending */ &[],
         );
+        // `commit_lock` is held across this whole follow and the batch is
+        // written below, so the fold's read is of the state it extends.
+        fold_sweep_rows(&self.db, &mut batch, &self.cf(), &sweep_rows);
         let parent_version =
             jmt_parent_height(BlockHeight::new(base_version), base_root).map(BlockHeight::inner);
         let (new_root, collected) =
@@ -698,12 +690,15 @@ fn parse_entry_name(name: &str) -> Option<BlockHeight> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use blake3::hash as blake3_hash;
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{
-        completed_import_progress, import_boundary_state, make_settled_writes,
+        commit_one, completed_import_progress, import_boundary_state,
         test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
-        test_boundary_unpinned_height_not_served,
+        test_boundary_unpinned_height_not_served, test_escrow_records_are_read_off_the_state,
+        test_import_gate_reads_the_trie,
     };
     use hyperscale_storage::{BOUNDARY_RETAIN, SubstateStore};
     use hyperscale_types::AddressClass;
@@ -717,11 +712,6 @@ mod tests {
 
     fn open_storage(dir: &Path) -> RocksDbShardStorage {
         RocksDbShardStorage::open(dir, NibblePath::empty()).unwrap()
-    }
-
-    fn commit_one(storage: &RocksDbShardStorage, seed: u8) {
-        let writes = make_settled_writes(seed, seed, vec![seed, seed, seed]);
-        storage.commit(&writes).unwrap();
     }
 
     #[test]
@@ -781,7 +771,7 @@ mod tests {
     fn retention_evicts_oldest() {
         let temp = TempDir::new().unwrap();
         let storage = open_storage(temp.path());
-        test_boundary_retention_evicts_oldest(&storage, |seed| commit_one(&storage, seed));
+        test_boundary_retention_evicts_oldest(&storage);
     }
 
     /// A configured `boundary_retain` widens the ring beyond the
@@ -865,7 +855,7 @@ mod tests {
     fn unpinned_height_is_not_served() {
         let temp = TempDir::new().unwrap();
         let storage = open_storage(temp.path());
-        test_boundary_unpinned_height_not_served(&storage, |seed| commit_one(&storage, seed));
+        test_boundary_unpinned_height_not_served(&storage);
     }
 
     /// Full serve → import round trip: leaves enumerated and resolved
@@ -876,7 +866,26 @@ mod tests {
         let storage = open_storage(temp.path());
         let fresh_dir = TempDir::new().unwrap();
         let fresh = open_storage(fresh_dir.path());
-        test_boundary_import_roundtrip(&storage, &fresh, |writes| storage.commit(writes).unwrap());
+        test_boundary_import_roundtrip(&storage, &fresh);
+    }
+
+    /// A store answers for the escrow records its state holds, which is
+    /// what a merge successor's adoption reads its obligations off.
+    #[test]
+    fn escrow_records_are_read_off_the_state() {
+        let temp = TempDir::new().unwrap();
+        let storage = open_storage(temp.path());
+        test_escrow_records_are_read_off_the_state(&storage);
+    }
+
+    #[test]
+    fn the_import_gate_reads_the_trie_not_the_chain() {
+        let replicated_dir = TempDir::new().unwrap();
+        let born_dir = TempDir::new().unwrap();
+        test_import_gate_reads_the_trie(
+            &open_storage(replicated_dir.path()),
+            &open_storage(born_dir.path()),
+        );
     }
 
     /// An import leaf whose top byte places it under one trie half.

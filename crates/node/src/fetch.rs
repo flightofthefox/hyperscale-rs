@@ -9,22 +9,28 @@
 //!   (`shard/{consensus,cross_shard,mempool}`, `beacon`); the `ProtocolEvent`
 //!   → in-flight-drain mapping lives outside the binding, in
 //!   `io_loop::drive_fetch_admission`.
+//! - [`ScopedAnswer`] is the contract for a binding whose request names one
+//!   scope and whose answer is checked against it; [`dispatch_scoped`] is
+//!   the one response boundary those bindings share.
 //! - [`partition_solicited`] is the shared response-boundary filter every
-//!   binding's admit handler runs.
+//!   bag-of-ids binding's admit handler runs.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
 use crossbeam::channel::Sender;
+use hyperscale_core::{FetchIds, ProtocolEvent};
 use hyperscale_metrics::{
-    record_fetch_abandoned, record_fetch_completed, record_fetch_retried, record_fetch_started,
+    record_fetch_abandoned, record_fetch_completed, record_fetch_response_refused,
+    record_fetch_retried, record_fetch_started,
 };
-use hyperscale_network::Network;
+use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
+use hyperscale_types::network::Request;
 use hyperscale_types::{MessageClass, ShardId, Stopwatch, ValidatorId};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
-use crate::shard::{HostEvent, ShardIo};
+use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, push_shard_input};
 
 /// Tunables for a [`Fetch`] instance.
 #[derive(Debug, Clone)]
@@ -86,6 +92,12 @@ pub enum FetchInput<Id> {
     /// so the two populations are observable separately.
     Abandoned {
         /// Ids whose fetch has been cancelled by the originating coordinator.
+        ids: Vec<Id>,
+    },
+    /// A chunk that never reached a peer: release the slots and leave
+    /// the retry to [`Self::Tick`].
+    Unroutable {
+        /// Ids in the chunk.
         ids: Vec<Id>,
     },
     /// Drive pending fetches: emit chunks up to per-tick and global caps.
@@ -172,7 +184,8 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 preferred,
                 class,
             } => self.handle_request(ids, shard, preferred, class),
-            FetchInput::Failed { ids } => self.handle_failed(&ids),
+            FetchInput::Failed { ids } => self.handle_failed(&ids, Respawn::Now),
+            FetchInput::Unroutable { ids } => self.handle_failed(&ids, Respawn::OnTick),
             FetchInput::Admitted { ids } => self.handle_drop(&ids, DropKind::Admitted),
             FetchInput::Abandoned { ids } => self.handle_drop(&ids, DropKind::Abandoned),
             FetchInput::Tick => self.spawn_pending_fetches(),
@@ -252,7 +265,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
         self.spawn_pending_fetches()
     }
 
-    fn handle_failed(&mut self, ids: &[Id]) -> Vec<FetchOutput<Id>> {
+    fn handle_failed(&mut self, ids: &[Id], respawn: Respawn) -> Vec<FetchOutput<Id>> {
         let mut released = 0usize;
         for id in ids {
             if let Some(entry) = self.pending.get_mut(id)
@@ -269,7 +282,10 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
             }
             trace!(count = released, "Id fetch chunk failed");
         }
-        self.spawn_pending_fetches()
+        match respawn {
+            Respawn::Now => self.spawn_pending_fetches(),
+            Respawn::OnTick => Vec::new(),
+        }
     }
 
     fn handle_drop(&mut self, ids: &[Id], kind: DropKind) -> Vec<FetchOutput<Id>> {
@@ -373,6 +389,11 @@ pub trait FetchBinding: 'static {
     /// to `true`; bag-of-hashes fetches leave it `false`.
     const PER_ID: bool = false;
 
+    /// The [`FetchIds`] arm that carries this binding's ids — how a
+    /// response boundary names the ids it failed or fulfilled, and the
+    /// inverse of the one dispatcher that routes a batch back here.
+    fn ids(ids: Vec<Self::Id>) -> FetchIds;
+
     /// Locate the `Fetch<Id>` instance for this binding inside `ShardIo` —
     /// each impl navigates to its own subsystem's state.
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id>;
@@ -397,6 +418,220 @@ pub trait FetchBinding: 'static {
         network: &N,
         sender: &Sender<HostEvent>,
     );
+}
+
+// ─── Scoped answers ────────────────────────────────────────────────────
+
+/// A binding whose request names one scope and asks about keys under it,
+/// and whose answer is checked against that scope before anything
+/// downstream sees it: a committed-transaction query against a
+/// predecessor's terminal, a state proof against an anchor's root, a
+/// witness run against a committed block. [`dispatch_scoped`] is the one
+/// response boundary these share; the impl is the pure part — how an id
+/// splits, what the request looks like, and what the answer has to lift
+/// to.
+pub trait ScopedAnswer: FetchBinding {
+    /// What one request is checked against. A chunk is grouped by
+    /// `(shard, preferred, class)`, which does not separate two scopes of
+    /// one shard, so the dispatcher splits a chunk by this before it
+    /// issues anything.
+    type Scope: Copy + Ord + std::fmt::Debug + Send + Sync + 'static;
+    /// What is asked under a scope — `()` when the scope is the whole
+    /// question.
+    type Key: Copy + std::fmt::Debug + Send + Sync + 'static;
+    /// The wire request one scope's keys ride in.
+    type Request: Request + Clone + 'static;
+
+    /// The id as its scope and key.
+    fn split(id: Self::Id) -> (Self::Scope, Self::Key);
+
+    /// The id a scope and key name.
+    fn join(scope: Self::Scope, key: Self::Key) -> Self::Id;
+
+    /// One request for `keys` under `scope`.
+    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request;
+
+    /// Check a peer's answer against the scope and turn it into the
+    /// event that carries it, or say why it is refused. The event is
+    /// what every replica reads; nothing unverified reaches it.
+    fn answer(
+        scope: Self::Scope,
+        keys: Vec<Self::Key>,
+        response: <Self::Request as Request>::Response,
+    ) -> Result<ProtocolEvent, Refusal>;
+}
+
+/// Why a scoped answer is refused at the response boundary. Either way
+/// the ids are released for retry against another peer and the response
+/// is rejected for peer scoring; an unusable one is also counted under
+/// its reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The peer does not hold the scope — a pruned height, a terminal it
+    /// never served.
+    NotHeld,
+    /// The peer answered, but with something that does not lift to the
+    /// scope. The label is the metric reason.
+    Unusable(&'static str),
+}
+
+/// What a refusal says about the peer that gave it.
+///
+/// Only one of the two is the peer's fault. A scope it does not hold is
+/// an honest answer about a height it has pruned or a terminal it never
+/// served, and every member of a committee asked below its own retention
+/// floor gives the same one — so scoring it would deprioritize a whole
+/// honest committee for answering correctly, and the requester would
+/// rotate away from the only peers there are. An answer that does not
+/// lift to the scope is the peer's fault and is scored.
+///
+/// `Accept` is not a reward: the transports act on `Reject` alone, so
+/// this leaves an honest refusal costing a round trip and nothing else.
+/// The ids release the same way either way.
+const fn scored(refusal: Refusal) -> ResponseVerdict {
+    match refusal {
+        Refusal::NotHeld => ResponseVerdict::Accept,
+        Refusal::Unusable(_) => ResponseVerdict::Reject,
+    }
+}
+
+/// Whether a transport error leaves the retry to the tick.
+///
+/// Only an error that never reached a peer does: the peer set is the
+/// reason, and re-dispatching into the same empty set inside the
+/// response callback would spin. Everything the transport already
+/// answered — a timeout, an exhausted retry budget, a peer-level error —
+/// has had per-peer and per-request backoff absorbed below this seam
+/// already, so it retries inline against a rotated peer.
+const fn defers_to_the_tick(error: &RequestError) -> bool {
+    matches!(
+        error,
+        RequestError::NoPeers | RequestError::PeerUnreachable(_)
+    )
+}
+
+/// Issue one request per scope in `ids` and route each answer through
+/// [`ScopedAnswer::answer`]. The ids are released before the event goes
+/// out, so the freed capacity is available if handling the delivery
+/// re-drives the fetch. A transport error releases the ids without
+/// rejecting the response — the network already recorded it — while an
+/// answer that is not an answer counts as a refusal.
+pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
+    ids: Vec<B::Id>,
+    local_shard: ShardId,
+    shard: ShardId,
+    preferred: Option<ValidatorId>,
+    class: Option<MessageClass>,
+    network: &N,
+    sender: &Sender<HostEvent>,
+) {
+    let mut by_scope: BTreeMap<B::Scope, Vec<B::Key>> = BTreeMap::new();
+    for id in ids {
+        let (scope, key) = B::split(id);
+        by_scope.entry(scope).or_default().push(key);
+    }
+    for (scope, keys) in by_scope {
+        let requested: Vec<B::Id> = keys.iter().map(|key| B::join(scope, *key)).collect();
+        let es = sender.clone();
+        network.request(
+            shard,
+            preferred,
+            B::request(scope, &keys),
+            class,
+            Box::new(move |result| {
+                let response = match result {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if matches!(error, RequestError::PeerError(_)) {
+                            record_fetch_response_refused(B::NAME, "unusable_answer");
+                        }
+                        let input = if defers_to_the_tick(&error) {
+                            ShardScopedInput::FetchUnroutable(B::ids(requested))
+                        } else {
+                            ShardScopedInput::FetchFailed(B::ids(requested))
+                        };
+                        push_shard_input(&es, local_shard, input);
+                        return ResponseVerdict::Accept;
+                    }
+                };
+                match B::answer(scope, keys, response) {
+                    Ok(event) => {
+                        push_shard_input(
+                            &es,
+                            local_shard,
+                            ShardScopedInput::FetchFulfilled(B::ids(requested)),
+                        );
+                        push_protocol_event(&es, local_shard, event);
+                        ResponseVerdict::Accept
+                    }
+                    Err(refusal) => {
+                        if let Refusal::Unusable(reason) = refusal {
+                            warn!(
+                                binding = B::NAME,
+                                scope = ?scope,
+                                reason,
+                                "Dropping fetch response: unusable answer"
+                            );
+                            record_fetch_response_refused(B::NAME, reason);
+                        }
+                        push_shard_input(
+                            &es,
+                            local_shard,
+                            ShardScopedInput::FetchFailed(B::ids(requested)),
+                        );
+                        scored(refusal)
+                    }
+                }
+            }),
+        );
+    }
+}
+
+/// Why a batch of ids leaves the in-flight set: the three id-carrying
+/// [`FetchInput`]s, so one dispatcher can route a [`FetchIds`] batch to
+/// its binding whichever way it is being released.
+#[derive(Debug, Clone, Copy)]
+pub enum Release {
+    /// The attempt failed or went unanswered; retry at once, since the
+    /// transport already spent a round trip on it.
+    Failed,
+    /// The request never reached a peer. Retry on the tick — see
+    /// [`Respawn`].
+    Unroutable,
+    /// The payload landed; the ids are done.
+    Admitted,
+    /// The consumer no longer wants them.
+    Abandoned,
+}
+
+impl Release {
+    /// The [`FetchInput`] releasing `ids` this way.
+    pub const fn input<Id>(self, ids: Vec<Id>) -> FetchInput<Id> {
+        match self {
+            Self::Failed => FetchInput::Failed { ids },
+            Self::Unroutable => FetchInput::Unroutable { ids },
+            Self::Admitted => FetchInput::Admitted { ids },
+            Self::Abandoned => FetchInput::Abandoned { ids },
+        }
+    }
+}
+
+/// When a released chunk goes out again.
+///
+/// A request the transport answered — a timeout, an exhausted rotation,
+/// a peer that held nothing, an answer this node could not use — has
+/// already cost a round trip and its peer budget, so the next attempt
+/// leaves at once. A request that never reached a peer has not: no
+/// committee resolves it, or none of its members is up, and it fails
+/// again as fast as it is asked. Re-sending that here spins between this
+/// thread and the transport for as long as the cause stands, which after
+/// a restart is until the beacon folds a topology.
+#[derive(Debug, Clone, Copy)]
+enum Respawn {
+    /// Send what the released slots make room for, now.
+    Now,
+    /// Leave it to the tick.
+    OnTick,
 }
 
 /// Result of partitioning a fetch response against the requested set.
@@ -475,6 +710,45 @@ mod tests {
         TxHash::from(Hash::from_bytes(&[n; 32]))
     }
 
+    /// Only an error that never reached a peer defers to the tick.
+    ///
+    /// The distinction is load-bearing in both directions. Deferring
+    /// what the transport already answered costs a whole tick of
+    /// latency on every timeout; retrying inline on an empty peer set
+    /// spins against nothing. The transport absorbs per-peer and
+    /// per-request backoff below this seam, so an answered error has
+    /// already waited.
+    #[test]
+    fn only_an_error_that_never_reached_a_peer_waits_for_the_tick() {
+        assert!(defers_to_the_tick(&RequestError::NoPeers));
+        assert!(defers_to_the_tick(&RequestError::PeerUnreachable(vid(3))));
+
+        assert!(!defers_to_the_tick(&RequestError::Timeout));
+        assert!(!defers_to_the_tick(&RequestError::Exhausted {
+            attempts: 4
+        }));
+        assert!(!defers_to_the_tick(&RequestError::PeerError(
+            "committee said no".into()
+        )));
+    }
+
+    /// A peer that does not hold the scope is not the peer at fault.
+    ///
+    /// Every member of a committee asked about a height below its own
+    /// retention floor answers the same way, so scoring it would
+    /// deprioritize the whole committee for being honest and send the
+    /// requester rotating away from the only peers that exist. An answer
+    /// that does not lift to the scope is a different matter and is
+    /// scored.
+    #[test]
+    fn only_an_unusable_answer_is_the_serving_peers_fault() {
+        assert_eq!(scored(Refusal::NotHeld), ResponseVerdict::Accept);
+        assert_eq!(
+            scored(Refusal::Unusable("short list")),
+            ResponseVerdict::Reject,
+        );
+    }
+
     fn vid(n: u64) -> ValidatorId {
         ValidatorId::new(n)
     }
@@ -506,6 +780,9 @@ mod tests {
         assert_eq!(p.in_flight_count(), 5);
     }
 
+    /// A chunk the transport answered goes out again at once: the round
+    /// trip is already spent, and the next attempt rotates to another
+    /// peer.
     #[test]
     fn failed_releases_chunk_and_redispatches() {
         let mut p = Fetch::<TxHash>::new("test", config());
@@ -519,10 +796,39 @@ mod tests {
         let FetchOutput::Send { ids, .. } = &out[0];
         let chunk_ids = ids.clone();
 
-        // handle(Failed) re-dispatches inline — no separate Tick needed.
         let retry_out = p.handle(FetchInput::Failed { ids: chunk_ids });
         assert_eq!(p.in_flight_count(), 2);
         assert_eq!(retry_out.len(), 1);
+    }
+
+    /// A chunk that never reached a peer waits for the tick. Re-sending
+    /// it here would meet the same wall in the same instant — an
+    /// unresolved committee answers as fast as it is asked — so the
+    /// slots are released, the ids stay owed, and the ticker carries it.
+    #[test]
+    fn an_unroutable_chunk_leaves_the_retry_to_the_tick() {
+        let mut p = Fetch::<TxHash>::new("test", config());
+        let out = p.handle(FetchInput::Request {
+            ids: vec![tx(1), tx(2)],
+            shard: SHARD,
+            preferred: Some(vid(1)),
+            class: None,
+        });
+        assert_eq!(out.len(), 1);
+        let FetchOutput::Send { ids, .. } = &out[0];
+        let chunk_ids = ids.clone();
+
+        assert!(
+            p.handle(FetchInput::Unroutable { ids: chunk_ids })
+                .is_empty(),
+            "an unroutable chunk re-sends nothing"
+        );
+        assert_eq!(p.in_flight_count(), 0, "and holds no slot");
+        assert!(p.has_pending(), "the ids are still owed");
+
+        let retried = p.handle(FetchInput::Tick);
+        assert_eq!(retried.len(), 1);
+        assert_eq!(p.in_flight_count(), 2);
     }
 
     #[test]

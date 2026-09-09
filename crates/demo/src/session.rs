@@ -11,8 +11,9 @@ use hyperscale_storage::ShardChainReader;
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, Ed25519PrivateKey, MAX_VALIDITY_RANGE, NetworkDefinition,
-    NetworkId, PrincipalAddr, ReshapeThresholds, ShardId, SharedCertificates, TimestampRange,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp,
+    NetworkId, PrincipalAddr, Provisions, ReshapeThresholds, ShardId, SharedCertificates,
+    TimestampRange, Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
+    Verifiable, WeightedTimestamp,
 };
 
 use crate::event::{HostRole, ObserverSeat, ShardPath, TraceEvent};
@@ -114,7 +115,8 @@ const fn status_rank(status: &TransactionStatus) -> u8 {
     match status {
         TransactionStatus::Pending => 0,
         TransactionStatus::Committed(_) => 1,
-        TransactionStatus::Completed(_) => 2,
+        TransactionStatus::LegFinalized => 2,
+        TransactionStatus::Completed(_) => 3,
     }
 }
 
@@ -172,54 +174,57 @@ fn resolve_status(answers: &[TransactionStatus]) -> Option<Reported> {
         .max_by_key(|status| status_rank(status))
         .map(|status| match status {
             TransactionStatus::Committed(height) => ("committed", Some(height.inner())),
+            TransactionStatus::LegFinalized => ("leg finalized", None),
             _ => ("pending", None),
         })
 }
 
-/// Derive the cross-shard events a block's finalizations attest to.
+/// Derive the settlement events a block attests to: the state it took
+/// delivery of and the finalizations it committed.
 ///
-/// A finalization reaches a block only once every participating shard's
-/// execution certificate is in hand and verified, so a certificate committed
-/// here stands for artifacts this committee checked: 2f+1 aggregated
-/// signatures per certificate, and — transitively, because the shard could
-/// not have executed otherwise — a merkle multiproof per provision against
-/// the source's QC-attested state root. That is what makes an arc drawn from
-/// one of these a claim about proofs rather than about messages.
+/// A bundle reaches a block only once this committee has checked its
+/// merkle multiproof against the source's QC-attested state root, and a
+/// finalization only once every certificate it carries is in hand and
+/// verified — 2f+1 aggregated signatures each. That is what makes an arc
+/// drawn from one of these a claim about proofs rather than about
+/// messages.
 ///
-/// Single-shard ticks land here too and produce no arcs of their own: they
-/// carry one certificate, from the committing shard itself.
+/// An empty bundle — a shard's commitment of a transaction it has nothing
+/// to serve for — moves no state and draws nothing. Single-shard ticks
+/// land here too and produce no arcs of their own: they carry one
+/// certificate, from the committing shard itself.
 fn settlement_events(
     events: &mut Vec<TraceEvent>,
     wt: u64,
     shard: ShardId,
     height: BlockHeight,
+    provisions: &[Arc<Verifiable<Provisions>>],
     certificates: &SharedCertificates,
 ) {
+    for bundle in provisions {
+        let bundle = bundle.as_unverified();
+        let delivered: Vec<TxHash> = bundle
+            .transactions()
+            .iter()
+            .filter(|entry| !entry.entries.is_empty())
+            .map(|entry| entry.tx_hash)
+            .collect();
+        if !delivered.is_empty() {
+            events.push(TraceEvent::provisions_verified(
+                wt, bundle, shard, height, delivered,
+            ));
+        }
+    }
     for tick in certificates.iter() {
         let tick = tick.as_unverified();
         for certificate in tick.execution_certificates() {
-            let id = certificate.tick_id();
             events.push(TraceEvent::execution_certified(
                 wt,
-                id,
+                certificate.tick_id(),
                 shard,
                 height,
                 certificate.tx_outcomes(),
             ));
-            // One edge, not two: the state this shard read and the
-            // certificate attesting what came of it both originate in the
-            // remote's block at `id.block_height()` and both land here. The
-            // opposite direction is reported by the remote, which commits
-            // this shard's certificate in a block of its own.
-            if id.shard_id() != shard {
-                events.push(TraceEvent::provisions_verified(
-                    wt,
-                    id,
-                    shard,
-                    height,
-                    certificate.tx_outcomes(),
-                ));
-            }
         }
         events.push(TraceEvent::tick_finalized(wt, shard, height, tick));
     }
@@ -799,11 +804,14 @@ impl Session {
                 if header.settled_txs_root().is_some() {
                     handoffs.entry(shard).or_insert_with(|| header.height());
                 }
+                // A stored block keeps only its bundles' hashes; the bodies
+                // are read back beside it.
                 settlement_events(
                     &mut events,
                     wt,
                     shard,
                     header.height(),
+                    &storage.provisions_at(header.height()),
                     block.certificates(),
                 );
                 watermarks.push((shard, BlockHeight::new(height)));

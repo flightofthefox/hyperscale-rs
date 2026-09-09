@@ -23,7 +23,7 @@ use hyperscale_vm_effects::{
     Declaration, DeclaredAccess, IssuanceGrant, Issued, ResourceKind, holdings_collection,
     instance_data_key, package_hash, resource_record_key,
 };
-use hyperscale_vm_kernel::{EnvInputs, KernelSession, Locality, MemoryStore, OverlayStore};
+use hyperscale_vm_kernel::{EnvInputs, KernelSession, MemoryStore, OverlayStore, OwnerSet};
 use hyperscale_vm_stdlib::{package_writes, staking};
 use hyperscale_vm_types::{Address, Effect, EffectSet, EffectTarget, Mode, Moves, Outcome, TxHash};
 
@@ -258,9 +258,10 @@ fn minted_allocations(accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
     // on: every credit here is the first thing its cell ever held.
     receipt
         .delta
-        .project(&Locality::All)
+        .project(&OwnerSet::whole())
         .expect("kernel-produced movements compose")
         .resolve(&mut |_| None)
+        .expect("an opening balance lands on nothing")
 }
 
 /// The packages the chain is born running, as the beacon registry holds

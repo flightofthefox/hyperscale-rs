@@ -468,6 +468,19 @@ impl MetadataEntry for JmtMetadataEntry {
     type Codec = JmtMetadataCodec;
 }
 
+/// The oldest version still inside the retention horizon.
+///
+/// Stored rather than derived, because four readers ask for it — a
+/// historical cell read, a historical range read, `snapshot_at`, and both
+/// garbage collectors — and what a reader may ask for has to be exactly
+/// what the collector has not deleted.
+pub struct RetentionFloorEntry;
+impl MetadataEntry for RetentionFloorEntry {
+    const KEY: &'static [u8] = b"jmt:retention_floor";
+    type Value = u64;
+    type Codec = HborCodec<u64>;
+}
+
 pub struct ChainOriginEntry;
 impl MetadataEntry for ChainOriginEntry {
     const KEY: &'static [u8] = b"chain:origin";

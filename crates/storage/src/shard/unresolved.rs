@@ -18,28 +18,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, EPOCH_DURATION, MAX_VALIDITY_RANGE, Provisions, RETENTION_HORIZON,
-    TERMINAL_EVIDENCE_EPOCHS, TxHash, Verifiable, Verified, WeightedTimestamp,
+    BlockHeight, CertifiedBlock, ChainOrigin, EPOCH_DURATION, Provisions, TERMINAL_EVIDENCE_EPOCHS,
+    TRANSACTION_EVIDENCE_HORIZON, TxHash, Verifiable, Verified, WeightedTimestamp,
 };
 
 use super::chain_reader::ShardChainReader;
-
-/// How far back a rebuild reads for a transaction its own deadline
-/// decides.
-///
-/// A transaction committed at time `T` states a validity end at most
-/// `MAX_VALIDITY_RANGE` beyond it, and its own clock stops deciding it a
-/// `RETENTION_HORIZON` past that. So this spans every entry whose fate is
-/// its deadline's to settle.
-///
-/// It does **not** span every entry the ledger holds. One a certificate of
-/// this shard's covers lives while some counterpart can still answer,
-/// which is the counterpart's clock rather than the transaction's: a
-/// counterpart may run for hours past the commit and only then depart, and
-/// the entry survives to that departure's terminal-evidence expiry. No span
-/// measured back from the tip reaches such a commit, which is why widening
-/// this is not the answer — [`RECORD_WINDOW`] is.
-const FOLD_WINDOW: Duration = MAX_VALIDITY_RANGE.saturating_add(RETENTION_HORIZON);
 
 /// How far back a rebuild reads for a transaction a committed boundary
 /// record decides.
@@ -85,20 +68,36 @@ const RECORD_WINDOW: Duration = Duration::from_secs(
 /// committed — the reverse would drop a release whose registration had
 /// not happened yet.
 ///
-/// Bounded by what the reader holds: a snap-synced replica has no blocks
-/// below its anchor and recovers only what committed above it, which is
-/// the same limit that applies to everything else it cannot see.
+/// Bounded below by `origin`, the height this chain begins at. A split
+/// child's `RocksDB` store is a hard-linked clone of its parent's and
+/// holds the parent's whole chain, so a walk measured in time alone
+/// reads the parent's blocks as this chain's and replays parts no peer
+/// seeded from the same clone ever held. Nothing under the origin is
+/// owed here in any case: a transaction whose validity window opened
+/// before the chain did cannot be admitted at all, which is the rule
+/// [`DedupWindow::from_reader`] stops at the same height for.
+///
+/// Bounded above that by what the reader holds: a snap-synced replica
+/// has no blocks below its anchor and recovers only what committed above
+/// it, which is the same limit that applies to everything else it cannot
+/// see.
+///
+/// [`DedupWindow::from_reader`]: crate::DedupWindow::from_reader
 #[must_use]
 pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
     reader: &R,
     committed_height: BlockHeight,
     committed_ts: WeightedTimestamp,
+    origin: ChainOrigin,
 ) -> Option<BlockHeight> {
-    let cutoff = committed_ts.minus(FOLD_WINDOW.max(RECORD_WINDOW));
+    let cutoff = committed_ts.minus(TRANSACTION_EVIDENCE_HORIZON.max(RECORD_WINDOW));
 
     // Walk back to the window's edge, then fold forward from there.
     let mut oldest = committed_height;
     while let Some(previous) = oldest.prev() {
+        if previous < origin.genesis_height {
+            break;
+        }
         match reader.get_block(previous) {
             Some(block) if block.block().header().parent_qc().weighted_timestamp() >= cutoff => {
                 oldest = previous;
@@ -111,7 +110,19 @@ pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
     // record is in it from the whole of the longer one. Tracked apart so
     // the extra reach a record needs does not resurrect a transaction the
     // deadline path retired.
-    let fold_cutoff = committed_ts.minus(FOLD_WINDOW);
+    //
+    // The shorter window is the transaction's own evidence horizon,
+    // which spans every entry whose fate is its own clock's to settle,
+    // leg entries included. It does not span every entry the ledger
+    // holds: one a certificate of this shard's covers lives while some
+    // counterpart can still answer, which is the counterpart's clock —
+    // it may run for hours past the commit and only then depart, and
+    // the entry survives to that departure's terminal-evidence expiry.
+    // `RECORD_WINDOW` is what reaches those. Which of the two is wider
+    // is not fixed — the claim window puts the transaction horizon a
+    // validity range past it — so the scan takes the greater of them
+    // and each cutoff is applied where it belongs.
+    let fold_cutoff = committed_ts.minus(TRANSACTION_EVIDENCE_HORIZON);
     let mut unresolved: BTreeMap<TxHash, BlockHeight> = BTreeMap::new();
     let mut undischarged: BTreeMap<TxHash, BlockHeight> = BTreeMap::new();
     let mut height = oldest;
@@ -123,13 +134,17 @@ pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
                     unresolved.insert(tx.hash(), height);
                 }
             }
-            for verdict in block.terminal_verdicts() {
+            for verdict in block.abandonment_records() {
                 for tx_hash in verdict.tx_hashes() {
                     undischarged.insert(tx_hash, height);
                 }
             }
+            // Only a deciding outcome retires an entry: a leg's own
+            // finalization names the leg and resolves nothing, since its
+            // entry lives on for the reclaim its core's refusal or its
+            // deliveries' lapse may license.
             for finalization in block.certificates().iter() {
-                for tx_hash in finalization.tx_hashes() {
+                for tx_hash in finalization.deciding_tx_hashes() {
                     unresolved.remove(&tx_hash);
                     undischarged.remove(&tx_hash);
                 }
@@ -155,6 +170,21 @@ pub struct ReplayWindow {
     /// tip, each with the provision bundles it carried reattached. Empty
     /// when nothing is owed an outcome.
     pub blocks: Vec<Verified<CertifiedBlock>>,
+    /// The lowest height the replay may *dispatch* a tick at: the first
+    /// one whose baseline — the settled state as of the height below it —
+    /// the store still answers for.
+    ///
+    /// The replay has two reaches because it has two jobs. Composition
+    /// runs over every block above [`unresolved_replay_floor`], which
+    /// runs back as far as an undischarged record, because which tick
+    /// holds a member is what every replica of the shard has to agree on
+    /// whatever its own store still reaches; execution runs over a
+    /// baseline, and a baseline is a historical read the store retires at
+    /// [`RETENTION_HORIZON`](hyperscale_types::RETENTION_HORIZON). Below
+    /// this a tick composes and never runs, which costs nothing: it was
+    /// taken by a fate the replay reads off the chain, and what it left
+    /// is seated from the receipts that committed it.
+    pub compose_from: BlockHeight,
     /// The parent-QC weighted timestamp of the block *below* the first
     /// one replayed — the clock execution resumes at, so the block above
     /// it stays on the exact carry path and classifies its ticks under
@@ -178,13 +208,21 @@ pub struct ReplayWindow {
 /// A hole anywhere in the range yields an empty window rather than a
 /// partial one: the folds above a missing block would sit on a baseline
 /// that block was supposed to have contributed to.
+///
+/// `retention_floor` is the oldest version the store answers a historical
+/// read at. A tick reads its baseline at the height below it, so a tick
+/// dispatches only from the first height above that floor and the ones
+/// below it compose without running.
 #[must_use]
 pub fn replay_window<R: ShardChainReader + ?Sized>(
     reader: &R,
     committed_height: BlockHeight,
     committed_ts: WeightedTimestamp,
+    retention_floor: BlockHeight,
+    origin: ChainOrigin,
 ) -> ReplayWindow {
-    let Some(floor) = unresolved_replay_floor(reader, committed_height, committed_ts) else {
+    let Some(floor) = unresolved_replay_floor(reader, committed_height, committed_ts, origin)
+    else {
         return ReplayWindow::default();
     };
     let anchor_wt = floor
@@ -204,7 +242,11 @@ pub fn replay_window<R: ShardChainReader + ?Sized>(
         }
         height = height.next();
     }
-    ReplayWindow { blocks, anchor_wt }
+    ReplayWindow {
+        blocks,
+        compose_from: floor.max(retention_floor.next()),
+        anchor_wt,
+    }
 }
 
 /// Put a stored block back in the shape a commit runs on, with whatever

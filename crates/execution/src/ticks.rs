@@ -288,7 +288,7 @@ impl TickRegistry {
     pub fn cross_shard_pending_count(&self) -> usize {
         let mut pending_txs: HashSet<TxHash> = HashSet::new();
         for tick in self.states.values() {
-            for h in tick.cross_shard_tx_hashes() {
+            for h in tick.awaiting_tx_hashes() {
                 pending_txs.insert(h);
             }
         }
@@ -428,7 +428,7 @@ mod tests {
     use proptest::collection::vec as prop_vec;
 
     use super::*;
-    use crate::tick_state::Admission;
+    use crate::tick_state::{Admission, Membership};
 
     fn shard() -> ShardId {
         ShardId::ROOT
@@ -446,7 +446,7 @@ mod tests {
         let mut state = TickState::new(tick_id, block_hash, ms(0));
         state.admit(
             test_transaction(tx_seed).hash(),
-            BTreeSet::from([shard()]),
+            Membership::whole(BTreeSet::from([shard()])),
             1,
             Admission::Executes,
         );

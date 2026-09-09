@@ -4,19 +4,21 @@ use std::sync::Arc;
 
 use hyperscale_crypto::{Signer, Verifier};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+use hyperscale_hbor::Hash32;
 use hyperscale_vm_types::{
-    Address, AddressClass, LocalKey, Mode, Moves, PrincipalAddr, SWEEP_BUCKET_BYTES, SchemeId,
-    SubstateKey, SweepBucket,
+    Address, AddressClass, LegRole, LegShape, LocalKey, Mode, Moves, PrincipalAddr,
+    SWEEP_BUCKET_BYTES, SchemeId, SubintentHash, SubstateKey, SweepBucket, ValueEdge,
 };
 
 use crate::crypto::Ed25519PrivateKey;
 use crate::{
     AbortCharge, AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
     BlockVoteMessage, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommitProof,
-    ConsensusPublicKey, ConsensusSignature, DeclaredKey, Derivation, DerivationError, Derived,
-    EnvelopeExt, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
-    NetworkDefinition, NetworkId, ProposerTimestamp, ProtocolStatics, QuorumCertificate, Round,
-    Routing, ShardForkProof, ShardId, SignerBitfield, SubintentSig, TickHalf, TickId,
+    ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, DeclaredKey, Derivation,
+    DerivationError, Derived, EnvelopeExt, ExecutionCertificate, ExecutionOutcome, Finalization,
+    GlobalReceiptHash, Hash, MerkleInclusionProof, NetworkDefinition, NetworkId, ProposerTimestamp,
+    ProtocolStatics, QuorumCertificate, Role, Round, Routing, ShardForkProof, ShardId,
+    SignerBitfield, StateRoot, StateWrites, StoredReceipt, SubintentSig, TickHalf, TickId,
     TimestampRange, TopologySnapshot, Transaction, TransactionBody, TransactionDecision,
     TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
     Verified, WeightedTimestamp, WitnessSources, compute_global_receipt_root, declared_work,
@@ -330,7 +332,8 @@ pub fn make_live_block(
         transactions: Arc::new(transactions),
         certificates: Arc::new(certificates),
         provisions: Arc::new(Vec::new()),
-        terminal_verdicts: Arc::new(Vec::new()),
+        abandonment_records: Arc::new(Vec::new()),
+        state_claims: Arc::new(Vec::new()),
         witness_sources: Arc::new(WitnessSources::empty()),
     }
 }
@@ -754,14 +757,16 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             transactions,
             certificates,
             provisions,
-            terminal_verdicts,
+            abandonment_records,
+            state_claims,
             witness_sources,
         } => Block::Live {
             header: restamp(header),
             transactions,
             certificates,
             provisions,
-            terminal_verdicts,
+            abandonment_records,
+            state_claims,
             witness_sources,
         },
         Block::Sealed {
@@ -769,14 +774,16 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             transactions,
             certificates,
             provision_hashes,
-            terminal_verdicts,
+            abandonment_records,
+            state_claims,
             witness_sources,
         } => Block::Sealed {
             header: restamp(header),
             transactions,
             certificates,
             provision_hashes,
-            terminal_verdicts,
+            abandonment_records,
+            state_claims,
             witness_sources,
         },
     }
@@ -796,15 +803,100 @@ pub fn make_finalization(
     tx_hash: TxHash,
     decision: TransactionDecision,
 ) -> Finalization {
-    let outcome = match decision {
+    finalization_of(
+        block_height,
+        vec![TxOutcome::new(tx_hash, outcome_of(decision))],
+    )
+}
+
+/// A finalization at `block_height` deciding `tx_hash` a success whose
+/// settlement awaits `counterparts`: what a member of a multi-shard core
+/// attests, and the one success the deadline does not bound.
+#[must_use]
+pub fn make_finalization_awaiting(
+    block_height: BlockHeight,
+    tx_hash: TxHash,
+    counterparts: impl IntoIterator<Item = ShardId>,
+) -> Finalization {
+    finalization_of(
+        block_height,
+        vec![
+            TxOutcome::new(tx_hash, outcome_of(TransactionDecision::Accept)).awaiting(counterparts),
+        ],
+    )
+}
+
+/// A finalization at `block_height` deciding `tx_hash` a success that is
+/// no execution of it — a reclaim's, an abandonment's — which settles
+/// past the deadline by construction and is not held to it.
+#[must_use]
+pub fn make_settling_finalization(block_height: BlockHeight, tx_hash: TxHash) -> Finalization {
+    finalization_of(
+        block_height,
+        vec![
+            TxOutcome::new(tx_hash, outcome_of(TransactionDecision::Accept))
+                .as_role(Role::Settling),
+        ],
+    )
+}
+
+/// The outcome a decision reads back as, for a fixture that states the
+/// decision and nothing else about the execution.
+const fn outcome_of(decision: TransactionDecision) -> ExecutionOutcome {
+    match decision {
         TransactionDecision::Accept => ExecutionOutcome::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
         },
         TransactionDecision::Reject => ExecutionOutcome::Failed,
         TransactionDecision::Aborted => ExecutionOutcome::Aborted,
-    };
+    }
+}
+
+/// A finalization at `block_height` deciding `tx_hash` a success, with
+/// the receipt stating what it left.
+///
+/// What the commit path applies to the base, and what a replay reads a
+/// settled tick's contribution off where it re-ran no tick to produce
+/// one.
+#[must_use]
+pub fn make_finalization_leaving(
+    block_height: BlockHeight,
+    tx_hash: TxHash,
+    writes: StateWrites,
+) -> Finalization {
+    let receipt = StoredReceipt::synced(
+        tx_hash,
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes,
+            beacon_witness_events: Vec::new(),
+            events: Vec::new(),
+        }),
+    );
+    let outcomes = vec![TxOutcome::new(
+        tx_hash,
+        outcome_of(TransactionDecision::Accept),
+    )];
     let tick_id = TickId::new(ShardId::ROOT, block_height);
-    let outcomes = vec![TxOutcome::new(tx_hash, outcome)];
+    let ec = ExecutionCertificate::new(
+        tick_id,
+        WeightedTimestamp::from_millis(block_height.inner() + 1),
+        compute_global_receipt_root(&outcomes),
+        outcomes,
+        AggregateSignature::new([0u8; 96]),
+        SignerBitfield::new(4),
+    );
+    Finalization::new(
+        tick_id,
+        TickHalf::Determined,
+        vec![Arc::new(ec)],
+        vec![receipt],
+    )
+}
+
+/// A single-certificate finalization at `block_height` over `outcomes`.
+fn finalization_of(block_height: BlockHeight, outcomes: Vec<TxOutcome>) -> Finalization {
+    let tick_id = TickId::new(ShardId::ROOT, block_height);
     let ec = ExecutionCertificate::new(
         tick_id,
         WeightedTimestamp::from_millis(block_height.inner() + 1),
@@ -819,6 +911,28 @@ pub fn make_finalization(
     Finalization::new(tick_id, TickHalf::Determined, vec![Arc::new(ec)], vec![])
 }
 
+/// A leg's finalization at `block_height`: `tx_hash` succeeded here and
+/// the outcome decides nothing, since the transaction's core decides it.
+#[must_use]
+pub fn make_leg_finalization(block_height: BlockHeight, tx_hash: TxHash) -> Finalization {
+    make_undecided_finalization(block_height, tx_hash, TransactionDecision::Accept)
+}
+
+/// A finalization at `block_height` whose outcome for `tx_hash` decides
+/// nothing whichever way it went: a leg's success, or a delivery's
+/// outcome either way.
+#[must_use]
+pub fn make_undecided_finalization(
+    block_height: BlockHeight,
+    tx_hash: TxHash,
+    decision: TransactionDecision,
+) -> Finalization {
+    finalization_of(
+        block_height,
+        vec![TxOutcome::new(tx_hash, outcome_of(decision)).as_role(Role::Delivery)],
+    )
+}
+
 /// The one synthetic cell the stub declares per owner. All of an
 /// owner's stubbed accesses collapse to this cell, so two stubbed
 /// transactions conflict exactly when they share an owner — the
@@ -828,7 +942,7 @@ const fn stub_cell(owner: Address) -> DeclaredKey {
 }
 
 /// A stub charge for a record fixture: a vault under `seed`'s own
-/// prefix, at a nominal floor.
+/// prefix, at a nominal price.
 ///
 /// The consensus fixtures that carry one are about what a record names
 /// and how it validates, never about what the burn comes to — so the
@@ -840,7 +954,7 @@ pub const fn stub_abort_charge(seed: u8) -> AbortCharge {
             owner: Address::new([seed; 31], AddressClass::Component),
             local: LocalKey([seed; 16]),
         },
-        floor: 13,
+        amount: 13,
     }
 }
 
@@ -896,12 +1010,6 @@ impl Derivation for StubVmStatics {
             .map(|bytes| Hash::from_hash_bytes(bytes))
             .collect();
         Ok(Derived {
-            // One per bound signature, which is what a real derivation
-            // counts: a subintent's signature and its nullifier come in
-            // a pair. Every fixture that binds none derives zero, so a
-            // test opts in by binding.
-            sweepable_writes: u32::try_from(vm.subintent_sigs.len())
-                .expect("a stub binds far fewer than u32 subintents"),
             // A stub derives no tree, so the envelope's own window is
             // the whole of it.
             effective_window: vm.validity_window(),
@@ -946,6 +1054,26 @@ impl Derivation for StubVmStatics {
                 vm.gas_limit,
                 vm.signature_work(),
             ),
+            footprint: (read_prefixes.len() + write_prefixes.len()) as u64,
+            // A stub derives no manifest, so it has no legs to divide;
+            // its payer is the one party its routing declares.
+            legs: Vec::new(),
+            owners: vec![vm.fee_payer.address()],
+            // One per bound signature, which is what a real derivation
+            // files: a subintent's signature and its nullifier come in a
+            // pair. Under the payer, since the stub cannot derive the
+            // signer's address from a key. Every fixture that binds none
+            // creates nothing, so a test opts in by binding.
+            nullifiers: (0..vm.subintent_sigs.len())
+                .map(|bound| {
+                    let mut local = [0xAF; 16];
+                    local[..8].copy_from_slice(&(bound as u64).to_le_bytes());
+                    SubstateKey {
+                        owner: vm.fee_payer.address(),
+                        local: LocalKey(local),
+                    }
+                })
+                .collect(),
         })
     }
 }
@@ -962,6 +1090,10 @@ impl ProtocolStatics for StubVmStatics {
             && SweepBucket::claimed_by(LocalKey(local)) == SweepBucket::of(expiry))
         .then_some(expiry)
     }
+
+    fn record_cell(&self, _owner: [u8; 32], _local: [u8; 16], value: &[u8]) -> bool {
+        value.first() == Some(&STUB_RECORD_MARKER)
+    }
 }
 
 /// The local-key first byte the stub judges a package cell by, in place
@@ -977,6 +1109,20 @@ pub const STUB_PACKAGE_MARKER: u8 = 0xAB;
 /// the half of the judgement a storage backend's index depends on, so a
 /// stub that skipped it would be testing nothing.
 pub const STUB_SWEEPABLE_MARKER: u8 = 0xCD;
+
+/// The value's first byte the stub judges an escrow record by.
+///
+/// No key rule stands beside it, which is the point: a record's key
+/// carries no bucket, so nothing about where it sits says what it is and
+/// the value is the whole of the judgement.
+pub const STUB_RECORD_MARKER: u8 = 0xEF;
+
+/// A stub escrow record's value, which [`StubVmStatics`] judges a record
+/// wherever it sits.
+#[must_use]
+pub fn stub_record_cell(body: u8) -> Vec<u8> {
+    vec![STUB_RECORD_MARKER, body]
+}
 
 /// A stub sweepable cell's value and the local key it must sit at for
 /// [`StubVmStatics`] to judge it sweepable.
@@ -1003,6 +1149,32 @@ pub fn install_stub_protocol_statics() {
     }
 }
 
+/// A manifest node's shape for the classifier: a leg at `target` in
+/// `role`, consuming `edges` as `(source node, output)`.
+///
+/// What a test hands [`Transaction::with_legs`] to give a stub
+/// transaction a shape the stub derivation cannot produce.
+#[must_use]
+pub fn leg_shape(target: Address, role: LegRole, edges: &[(u32, u32)]) -> LegShape {
+    LegShape {
+        target,
+        role,
+        edges: edges
+            .iter()
+            .map(|&(source, output)| ValueEdge {
+                source,
+                output,
+                non_fungible: false,
+            })
+            .collect(),
+        presents: Vec::new(),
+        declares: vec![target],
+        intent: SubintentHash(Hash32([7; 32])),
+        local: 0,
+        expiry_ms: 1_000,
+    }
+}
+
 /// A transaction the [`StubVmStatics`] derivation reports as creating
 /// `bound` sweepable cells — the fixture for anything gated on how many
 /// a block may create.
@@ -1015,8 +1187,14 @@ pub fn install_stub_protocol_statics() {
 ///
 /// Panics if the fixture signing key fails to construct.
 #[must_use]
-pub fn stub_transaction_binding(seed: u8, bound: usize, validity: TimestampRange) -> Transaction {
-    let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).expect("fixture key");
+pub fn stub_transaction_binding(seed: u32, bound: usize, validity: TimestampRange) -> Transaction {
+    // A four-byte seed: filling a creation cap sized in thousands of
+    // transactions takes more distinct payers than a byte names.
+    let mut key_bytes = [0x5Eu8; 32];
+    key_bytes[..4].copy_from_slice(&seed.to_le_bytes());
+    let key = Ed25519PrivateKey::from_bytes(&key_bytes).expect("fixture key");
+    let mut payer = [0x5Eu8; 31];
+    payer[..4].copy_from_slice(&seed.to_le_bytes());
     let vm = TransactionEnvelope {
         body: TransactionBody::Call(vec![0]),
         subintent_sigs: (0..bound)
@@ -1026,7 +1204,7 @@ pub fn stub_transaction_binding(seed: u8, bound: usize, validity: TimestampRange
                 signature: vec![0x22; 64],
             })
             .collect(),
-        fee_payer: test_principal(seed),
+        fee_payer: PrincipalAddr::new(payer),
         max_fee: 1_000,
         gas_limit: 1_000_000,
         validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
@@ -1134,6 +1312,88 @@ pub fn stub_transaction_running(
     tx.try_derived(&StubVmStatics)
         .expect("the fixture builds a tree the stub derivation routes");
     tx
+}
+
+/// A one-version state tree for `shard` holding `present`, and a proof
+/// over `asked` against it: the root the proof reconstructs, and the
+/// proof.
+///
+/// What a test hands a coordinator in place of a fetch: a key in
+/// `present` reads back present under the root, any other absent. The
+/// tree always holds one unrelated leaf besides, so a chain whose
+/// state is otherwise empty still has a root to prove against — a
+/// counterpart chain always holds something.
+///
+/// Rooted at `shard`'s prefix, as a shard's tree is, so a proof built
+/// here is checkable the way a served one is: every key it speaks for
+/// must be one `shard` owns.
+///
+/// # Panics
+///
+/// If `asked` names the unrelated leaf, whose presence would be an
+/// answer the caller did not ask for, or if any key falls outside
+/// `shard`'s prefix.
+#[must_use]
+pub fn state_and_proof(
+    shard: ShardId,
+    present: &[SubstateKey],
+    asked: &[SubstateKey],
+) -> (StateRoot, MerkleInclusionProof) {
+    use std::collections::BTreeMap;
+
+    use hyperscale_jmt::{
+        Blake3Hasher, Key as JmtKey, LeafValue, MemoryStore, NibblePath, NodeKey, Tree,
+    };
+
+    use crate::shard_prefix_path;
+    use crate::state_key::jmt_value_hash;
+
+    let root_path = shard_prefix_path(shard);
+    let under = |key: &SubstateKey| {
+        NibblePath::from_key_prefix(&key.to_bytes(), root_path.len()) == root_path
+    };
+    // The spare leaf sits under the same prefix, so it is a cell this
+    // shard could hold rather than one no proof of its could name.
+    let mut unrelated = test_key(0xEE);
+    let mut owner = unrelated.owner.to_bytes();
+    let shard_first = root_path.as_bytes().first().copied().unwrap_or(0);
+    let keep = u8::try_from(root_path.len().min(8)).unwrap_or(8);
+    if keep > 0 {
+        let mask = 0xFFu8 << (8 - keep);
+        owner[0] = (owner[0] & !mask) | (shard_first & mask);
+        unrelated = SubstateKey {
+            owner: Address::from_bytes(owner).expect("the class byte is untouched"),
+            local: unrelated.local,
+        };
+    }
+    assert!(
+        !asked.contains(&unrelated),
+        "the tree's unrelated leaf is not a key a test may ask about",
+    );
+    assert!(
+        present.iter().chain(asked).all(under),
+        "a fixture proof for a shard speaks only for keys that shard owns",
+    );
+    let mut store = MemoryStore::new();
+    let updates: BTreeMap<JmtKey, Option<LeafValue>> = present
+        .iter()
+        .chain(std::iter::once(&unrelated))
+        .map(|key| {
+            let value = key.to_bytes().to_vec();
+            (
+                key.to_bytes(),
+                Some(LeafValue::new(jmt_value_hash(&value), value.len() as u64)),
+            )
+        })
+        .collect();
+    let result = Tree::<Blake3Hasher, 1>::apply_updates_at(&store, None, 1, &root_path, &updates)
+        .expect("a fresh tree takes its first version");
+    let root = StateRoot::from_raw(Hash::from_hash_bytes(&result.root_hash));
+    store.apply(&result);
+    let jmt_keys: Vec<JmtKey> = asked.iter().map(SubstateKey::to_bytes).collect();
+    let proof = Tree::<Blake3Hasher, 1>::prove(&store, &NodeKey::new(1, root_path), &jmt_keys)
+        .expect("every key proves against a held version");
+    (root, MerkleInclusionProof::new(proof.encode()))
 }
 
 #[cfg(test)]

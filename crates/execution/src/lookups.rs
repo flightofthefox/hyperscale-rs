@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_types::{
-    ConsensusPublicKey, DeclaredKey, DeclaredRange, ExecutionCertificate, ShardId, ShardTrie,
-    SubstateKey, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, VoteCount,
+    ConsensusPublicKey, DeclaredKey, DeclaredRange, ExecutionCertificate, Finalization, ShardId,
+    ShardTrie, SubstateKey, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable,
+    VoteCount, committed_crossings,
 };
 
 /// Per-shard recipient lists for provision broadcasting.
@@ -170,12 +171,60 @@ pub fn provision_request(
     })
 }
 
-/// Build provision requests and shard recipients for cross-shard transactions.
+/// The crossing bundles a block's committed certificates promise: one
+/// request per accepted outcome that escrowed something, naming the
+/// record cells its execution wrote and the shards that claim them.
 ///
-/// Returns `None` if there are no cross-shard transactions needing provisions.
+/// Read off the certificate alone — every record cell rides its
+/// escrowed entry — so a validator holding the block and not the
+/// transactions builds the same requests, and in the same order the
+/// block's provision roots bucket them.
+#[must_use]
+pub fn crossing_requests(
+    certificates: &[Arc<Verifiable<Finalization>>],
+    local_shard: ShardId,
+) -> Vec<ProvisionsRequest> {
+    let mut requests: Vec<ProvisionsRequest> = Vec::new();
+    for finalization in certificates {
+        let finalization = finalization.as_unverified();
+        let promised: BTreeSet<TxHash> = committed_crossings(finalization, local_shard)
+            .map(|(_, tx_hash)| tx_hash)
+            .collect();
+        let Some(ec) = finalization
+            .execution_certificates()
+            .iter()
+            .find(|ec| ec.tick_id() == finalization.tick_id())
+        else {
+            continue;
+        };
+        for outcome in ec.tx_outcomes() {
+            if !promised.contains(&outcome.tx_hash()) {
+                continue;
+            }
+            requests.push(ProvisionsRequest {
+                tx_hash: outcome.tx_hash(),
+                targets: outcome
+                    .crossing_targets()
+                    .iter()
+                    .copied()
+                    .filter(|&target| target != local_shard)
+                    .collect(),
+                local_keys: outcome.escrowed().to_vec(),
+                local_ranges: Vec::new(),
+            });
+        }
+    }
+    requests
+}
+
+/// Build provision requests and shard recipients for cross-shard
+/// transactions and for the crossings the block's certificates commit.
+///
+/// Returns `None` if nothing in the block owes anyone a bundle.
 pub fn build_provision_requests(
     topology_snapshot: &TopologySnapshot,
     transactions: &[Arc<Verifiable<Transaction>>],
+    certificates: &[Arc<Verifiable<Finalization>>],
     me: ValidatorId,
     local_shard: ShardId,
 ) -> Option<(Vec<ProvisionsRequest>, ShardRecipients)> {
@@ -190,6 +239,8 @@ pub fn build_provision_requests(
             provision_requests.push(request);
         }
     }
+    // After the transactions, as the block's roots bucket them.
+    provision_requests.extend(crossing_requests(certificates, local_shard));
 
     if provision_requests.is_empty() {
         return None;
@@ -295,5 +346,61 @@ mod tests {
         let keys = committee_public_keys_for_shard(&topology_snapshot, ShardId::leaf(8, 99))
             .expect("empty committee is not corruption");
         assert!(keys.is_empty());
+    }
+
+    /// A crossing request names exactly what a committed outcome
+    /// escrowed — the record cells, toward the shards that claim them —
+    /// and a refused outcome yields none.
+    #[test]
+    fn crossing_requests_name_the_record_cells_the_outcome_escrowed() {
+        use hyperscale_types::{
+            AggregateSignature, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
+            GlobalReceiptHash, GlobalReceiptRoot, Hash, SignerBitfield, TickHalf, TickId,
+            TxOutcome, WeightedTimestamp,
+        };
+        use hyperscale_vm_types::{Address, AddressClass, LocalKey};
+
+        let local = ShardId::leaf(1, 0);
+        let target = ShardId::leaf(1, 1);
+        let record = SubstateKey {
+            owner: Address::new([0xC1; 31], AddressClass::Component),
+            local: LocalKey([1; 16]),
+        };
+        let accepted = TxHash::from(Hash::from_bytes(&[1; 32]));
+        let refused = TxHash::from(Hash::from_bytes(&[2; 32]));
+        let tick = TickId::new(local, BlockHeight::new(3));
+        let ec = ExecutionCertificate::new(
+            tick,
+            WeightedTimestamp::from_millis(3),
+            GlobalReceiptRoot::ZERO,
+            vec![
+                TxOutcome::new(
+                    accepted,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+                .escrowing([record])
+                .crossing_to([target]),
+                TxOutcome::new(refused, ExecutionOutcome::Failed)
+                    .escrowing([record])
+                    .crossing_to([target]),
+            ],
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        let finalization = Arc::new(Verifiable::from(Finalization::new(
+            tick,
+            TickHalf::Legs,
+            vec![Arc::new(ec)],
+            vec![],
+        )));
+
+        let requests = crossing_requests(std::slice::from_ref(&finalization), local);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].tx_hash, accepted);
+        assert_eq!(requests[0].targets, vec![target]);
+        assert_eq!(requests[0].local_keys, vec![record]);
+        assert!(requests[0].local_ranges.is_empty());
     }
 }

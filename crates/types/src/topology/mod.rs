@@ -1,7 +1,5 @@
 //! Topology and validator set.
 //!
-//! - [`awaiting`]: [`AwaitingTopologyBuffer`] parking artifacts whose committee
-//!   epoch the beacon hasn't reached.
 //! - [`genesis`]: [`genesis::GenesisValidators`], the validators a runner
 //!   projects its initial snapshot from at genesis.
 //! - [`schedule`]: per-epoch [`TopologySchedule`] resolving committees by
@@ -13,7 +11,6 @@
 //! - [`trie`]: the active shard partition as a binary [`trie::ShardTrie`].
 //! - [`validator`]: [`ValidatorInfo`] / [`ValidatorSet`].
 
-pub mod awaiting;
 pub mod genesis;
 pub mod network;
 pub mod schedule;

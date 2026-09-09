@@ -95,6 +95,13 @@ impl SimulationRunner {
     /// `storage`: a retained store (committed past genesis) resumes in place, a
     /// fresh store snap-syncs against the beacon-attested anchor through the
     /// [`ShardBootstrap`] sequencer, served from the shard's current committee.
+    ///
+    /// The routing question is whether there is a chain to resume, so it reads
+    /// the committed tip. That is not the question the import gate asks —
+    /// `hyperscale_storage::holds_state` reads the trie, and the two answer
+    /// differently for a store whose trie an adoption filled while its
+    /// coordinator sits at genesis. A seat that read the trie would resume a
+    /// chain holding no blocks.
     /// Every member shares the one store and one bootstrap, mirroring the
     /// production supervisor seating a whole committee group at once. A snap-sync
     /// whose attested anchor has gone stale leaves the group unseated; the
@@ -149,6 +156,13 @@ impl SimulationRunner {
             .iter()
             .map(|&validator| self.runtime_vnode_init(host, validator, shard, &recovered))
             .collect();
+        // A co-hosted pool extra has no host in the transport's layout until
+        // it is seated: bind it here, as the reshape seat does, or every
+        // notification addressed to it — headers, votes, ready-signal
+        // traffic — is dropped as unreachable and the seat never syncs.
+        for &validator in validators {
+            self.network.bind_validator(validator, host);
+        }
         self.hosts[host as usize].add_shard(inits, storage, self.event_txs[host as usize].clone());
         // Parity with the production supervisor's `unfollow_in_pool`: each
         // seated validator now drives its beacon from this shard, so retire any
@@ -239,6 +253,18 @@ impl SimulationRunner {
                     let storage = self
                         .retained_storages
                         .remove(&(host, shard))
+                        // The seat has two branches and between them they take a
+                        // store with a chain or a store with nothing. A store
+                        // that snap-synced and left before committing is
+                        // neither: it holds the import's state under no chain,
+                        // so resuming has no tip to resume from and importing
+                        // has nowhere to write. It is not the retained fast
+                        // path; it is an abandoned bootstrap, and the seat
+                        // starts again from an empty store against the anchor
+                        // that has since advanced.
+                        .filter(|storage| {
+                            storage.load_recovered_state().committed_height > BlockHeight::GENESIS
+                        })
                         .unwrap_or_else(|| SimShardStorage::new(shard_prefix_path(shard)));
                     self.seat_joined_group(host, shard, &placed, storage);
                 }

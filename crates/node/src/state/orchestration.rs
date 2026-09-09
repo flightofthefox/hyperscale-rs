@@ -13,7 +13,9 @@
 use std::sync::Arc;
 
 use hyperscale_core::Action;
-use hyperscale_types::{CertifiedBlock, CertifiedBlockHeader, Verified, derive_block_transactions};
+use hyperscale_types::{
+    Anchor, CertifiedBlock, CertifiedBlockHeader, Verified, derive_block_transactions,
+};
 
 use super::NodeStateMachine;
 
@@ -62,6 +64,15 @@ impl NodeStateMachine {
             self.beacon_coordinator.current_topology_snapshot(),
             certified,
         ));
+        // What the block's finalizations settle about the transactions
+        // they name is the execution ledger's reading — a name that
+        // decides nothing is a leg finalizing here, a deciding success
+        // on a leg entry is the reclaim — taken before the same block
+        // releases the entries below.
+        let resolutions = s
+            .execution_coordinator
+            .resolutions_of(certified.block().certificates());
+        actions.extend(s.mempool_coordinator.on_resolutions(&resolutions));
         // Committed bundles are engagement evidence: promote any parked
         // cross-shard transaction whose payer bundle just committed.
         // Covers the case where another proposer paired the bundle
@@ -117,6 +128,14 @@ impl NodeStateMachine {
             actions.extend(s.execution_coordinator.abort_pending_ticks());
         }
 
+        // Settlement order is judged over the execution fold, and only a
+        // commit moves it — a member settles when a block carries the
+        // half that settles it. Mirror the fold's answer into shard
+        // consensus, where the proposer's selection and the vote path
+        // both read it, so the two run one rule.
+        s.shard_coordinator
+            .set_owed_determined(s.execution_coordinator.owed_determined_ticks());
+
         s.shard_coordinator.queue_ready_proposal();
 
         // The fork-proof dedup fence clears once the attested recovery for
@@ -169,15 +188,19 @@ impl NodeStateMachine {
             return Vec::new();
         };
 
+        // The anchor lands first and in one place: the vote fence holds a
+        // block's state proofs to what this validator has commit-proven,
+        // and the certificate gate and the probe anchor read the same
+        // mirror, so nothing downstream may run before it is in.
+        s.shard_coordinator
+            .record_proven_anchor(Anchor::of(certified_header));
         let mut actions = s
             .provisions_coordinator
             .on_committed_remote_header(topology_schedule, certified_header);
-        actions.extend(s.execution_coordinator.on_committed_remote_header(
-            topology_schedule,
-            certified_header.shard_id(),
-            certified_header.header().height(),
-            certified_header.header().parent_qc().weighted_timestamp(),
-        ));
+        actions.extend(
+            s.execution_coordinator
+                .on_committed_remote_header(topology_schedule, certified_header.shard_id()),
+        );
         actions
     }
 }

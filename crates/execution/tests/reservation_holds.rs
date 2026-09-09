@@ -10,18 +10,20 @@
 //! every declared reservation was granted at its declared amount, and a
 //! receipt without writes granted none.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::ExecutedTx;
+use hyperscale_engine::legs::{Classified, Member, Runs, Side};
 use hyperscale_execution::action_handlers::accumulate_tick_output;
 use hyperscale_storage::TickOutput;
 use hyperscale_types::{
     Address, AddressClass, CollectionId, ConsensusReceipt, DeclaredKey, DeclaredRange, Derivation,
     DerivationError, Derived, EnvelopeExt, ExecutionMetadata, GlobalReceiptHash, Hash, LocalKey,
-    Mode, NetworkId, PrincipalAddr, Routing, SchemeId, StateWrites, SubstateKey, Transaction,
-    TransactionBody, TransactionEnvelope, TxHash, Verified, WeightedTimestamp, declared_work,
+    Mode, NetworkId, PrincipalAddr, Routing, SchemeId, ShardId, StateWrites, SubstateKey,
+    Transaction, TransactionBody, TransactionEnvelope, TxHash, Verified, WeightedTimestamp,
+    declared_work,
 };
 use hyperscale_vm_types::Moves;
 
@@ -76,7 +78,7 @@ impl Derivation for ReservingStatics {
         ];
         declared_modes.sort_unstable();
         Ok(Derived {
-            sweepable_writes: 0,
+            owners: Vec::new(),
             // This stub derives no tree; the envelope's window stands.
             effective_window: vm.validity_window(),
             routing: Routing {
@@ -93,6 +95,9 @@ impl Derivation for ReservingStatics {
             fee_vault_local: [0xEE; 16],
             auth_cell_local: [0xAE; 16],
             work: declared_work(4, vm.gas_limit, vm.signature_work()),
+            footprint: 4,
+            legs: Vec::new(),
+            nullifiers: Vec::new(),
             packages: Vec::new(),
         })
     }
@@ -121,13 +126,23 @@ fn reserving_transaction(seed: u8) -> Arc<Verified<Transaction>> {
     Arc::new(Verified::<Transaction>::from_persisted(tx))
 }
 
+/// A request for `tx` as a whole shape reaching a counterpart: a member
+/// whose verdict that counterpart can still discard, so its declared
+/// cells are held against it.
 fn request_for(tx: &Arc<Verified<Transaction>>) -> CrossShardExecutionRequest {
+    let (local, counterpart) = ShardId::ROOT.children();
     CrossShardExecutionRequest {
         tx_hash: tx.hash(),
-        transaction: Arc::clone(tx),
+        transaction: Some(Arc::clone(tx)),
         provisions: Vec::new(),
         clock: WeightedTimestamp::from_millis(1_000),
-        reaches_beyond: true,
+        runs: Runs::Shape(Member::of(
+            Classified::whole(),
+            local,
+            Side::Issuing,
+            BTreeSet::from([local, counterpart]),
+        )),
+        arrivals: Vec::new(),
     }
 }
 

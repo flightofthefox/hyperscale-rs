@@ -2,7 +2,7 @@
 //! derivation, the batch executor, and the movement fold, against a
 //! genesis-seeded snapshot.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key};
@@ -12,9 +12,12 @@ use hyperscale_effects_bridge::{
 use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
 };
+use hyperscale_engine::legs::{Classified, Licence, Member, PlanDefect, Runs, Side};
+use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PreviewGrants, PreviewInputs, PreviewOutcome,
-    PreviewReport, ResourceChange, TickBatchContext, TickEnvironment, XRD, genesis_writes,
+    PreviewReport, ResourceChange, TickBatchContext, TickEnvironment, TickTxInput, XRD,
+    genesis_writes,
 };
 use hyperscale_hbor::TypeShape;
 use hyperscale_storage::{
@@ -22,15 +25,16 @@ use hyperscale_storage::{
 };
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
-    BeaconWitnessEvent, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
-    Ed25519PrivateKey, EnvelopeExt, EpochWindows, Hash, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId,
-    PrincipalAddr, ProvisionalHolds, SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot,
-    StateWrites, SubstateKey, TimestampRange, Transaction, TransactionBody, TransactionEnvelope,
-    Verified, WeightedTimestamp, absorb_committed_cells,
+    BeaconWitnessEvent, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, Deadline,
+    DeclaredRange, Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt,
+    EventRoot, GlobalReceipt, Hash, MAX_SUBINTENT_VALIDITY_RANGE, NetworkId, PrincipalAddr,
+    ProvisionalHolds, SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites,
+    SubstateKey, TimestampRange, Transaction, TransactionBody, TransactionEnvelope, TxHash,
+    Verified, WeightedTimestamp, Window, absorb_committed_cells, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
-    AbiParam, Composed, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader, PackageHash,
-    PackageMetadata, ResourceKind, Totality, Value, issued_resource, package_hash,
+    AbiParam, Composed, CrossingCell, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader,
+    PackageHash, PackageMetadata, ResourceKind, Totality, Value, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder};
@@ -62,12 +66,9 @@ const HEADER: IntentHeader = IntentHeader {
 const ALICE_SEED: u8 = 41;
 const BOB_SEED: u8 = 42;
 
-/// The ceiling the plain transfer cases name, and — being under what a
-/// transfer costs — the fee they are charged exactly.
-///
-/// Small enough to stay legible in the balance assertions, which matters
-/// now that a withdrawal's own account is also the one paying: the payer
-/// is the signer, and the signer is whoever the withdrawing node names.
+/// The ceiling the plain transfer cases sign: above what a transfer
+/// prices, so admission would hold and the burn is the declared price
+/// rather than the clamp.
 const TRANSFER_FEE: u128 = 100;
 
 fn alice() -> PrincipalAddr {
@@ -98,7 +99,9 @@ impl MapDb {
     /// resolving what it moved against what this map holds, which is
     /// what settlement does.
     fn apply(&mut self, writes: &StateWrites) {
-        let writes = writes.resolve(&mut |key| self.0.get(&key).cloned());
+        let writes = writes
+            .resolve(&mut |key| self.0.get(&key).cloned())
+            .expect("the debit fits");
         for (key, change) in writes.cells() {
             match change {
                 Some(value) => {
@@ -168,6 +171,14 @@ impl SubstateStore for MapDb {
 }
 
 impl VersionedStore for MapDb {
+    fn retention_floor(&self) -> u64 {
+        0
+    }
+
+    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+        (height <= self.jmt_height()).then(|| self.snapshot_at(height))
+    }
+
     fn snapshot_at(&self, _height: BlockHeight) -> Self::Snapshot<'_> {
         Self(self.0.clone())
     }
@@ -311,6 +322,13 @@ fn world_accounts() -> Vec<(PrincipalAddr, u128)> {
         (fee_payer(31), 1_000),
         (fee_payer(32), 1_000),
     ]
+}
+
+/// What `tx` is charged, derived under the executor's own derivation:
+/// the figure a test pins a balance against.
+fn price_of(executor: &Executor, tx: &Transaction) -> u128 {
+    tx.price_under(executor.derivation().as_ref())
+        .expect("a test transaction derives")
 }
 
 fn execute(executor: &Executor, transactions: &[Arc<Verified<Transaction>>]) -> Vec<ExecutedTx> {
@@ -653,7 +671,9 @@ fn execute_batch_on(
 /// on. These tests start from `accounts` and settle one batch onto it.
 /// A receipt's writes as they settle onto the state they land on.
 fn settled_on(writes: &StateWrites, state: &impl Substates) -> SettledWrites {
-    writes.resolve(&mut |key| state.cell(key))
+    writes
+        .resolve(&mut |key| state.cell(key))
+        .expect("the debit fits")
 }
 
 fn settled(writes: &StateWrites, accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
@@ -666,12 +686,14 @@ fn settled(writes: &StateWrites, accounts: &[(PrincipalAddr, u128)]) -> SettledW
             .map(|(o, a)| (vault_key(*o, *XRD), a))
             .collect::<Vec<_>>()
     );
-    writes.resolve(&mut |key| {
-        accounts
-            .iter()
-            .find(|(owner, _)| vault_key(*owner, *XRD) == key)
-            .and_then(|(_, amount)| amount_cell(*amount).map(|cell| cell.to_vec()))
-    })
+    writes
+        .resolve(&mut |key| {
+            accounts
+                .iter()
+                .find(|(owner, _)| vault_key(*owner, *XRD) == key)
+                .and_then(|(_, amount)| amount_cell(*amount).map(|cell| cell.to_vec()))
+        })
+        .expect("the debit fits")
 }
 
 fn vault_cell(writes: &SettledWrites, owner: impl Into<Address>) -> Option<Vec<u8>> {
@@ -697,7 +719,7 @@ fn a_transfer_folds_to_identity_keyed_absolute_updates() {
         bob(),
         100,
     )));
-    let executed = execute(&executor, &[tx]);
+    let executed = execute(&executor, &[Arc::clone(&tx)]);
     assert_eq!(executed.len(), 1);
     let ConsensusReceipt::Succeeded {
         writes: database_updates,
@@ -708,12 +730,12 @@ fn a_transfer_folds_to_identity_keyed_absolute_updates() {
         panic!("transfer must succeed: {:?}", executed[0].consensus);
     };
     assert_ne!(receipt_hash.as_raw(), &Hash::ZERO);
-    // Withdraw settled 100 off the sender and the fee another 100 —
-    // the sender signs, so the sender pays. Deposit credited the
+    // Withdraw settled 100 off the sender and the declared price on
+    // top — the sender signs, so the sender pays. Deposit credited the
     // recipient. Absolute values, identity-keyed.
     assert_eq!(
         vault_cell(&settled(database_updates, &world_accounts()), alice()),
-        Some(encode_amount(1_000 - 100 - TRANSFER_FEE).to_vec())
+        Some(encode_amount(1_000 - 100 - price_of(&executor, &tx)).to_vec())
     );
     assert_eq!(
         vault_cell(&settled(database_updates, &world_accounts()), bob()),
@@ -730,7 +752,7 @@ fn an_uncovered_withdrawal_aborts_and_the_batch_carries_on() {
         alice(),
         500,
     )));
-    let floor = over.body().abort_floor();
+    let price = price_of(&executor, &over);
     let fine = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
         ALICE_SEED,
         alice(),
@@ -751,7 +773,7 @@ fn an_uncovered_withdrawal_aborts_and_the_batch_carries_on() {
     // receipt's writes merged in hash order, later receipts winning per
     // cell. Whichever side of the failure the transfer's hash lands on,
     // the committed end state carries both its movement and the
-    // failure's floor debit.
+    // failure's price debit.
     let mut store = MapDb::genesis(&[(alice(), 1_000), (bob(), 50)]);
     let mut ordered: Vec<&ExecutedTx> = executed.iter().collect();
     ordered.sort_by_key(|e| e.tx_hash);
@@ -765,18 +787,18 @@ fn an_uncovered_withdrawal_aborts_and_the_batch_carries_on() {
     }
     assert_eq!(
         store.cell(vault_key(alice(), *XRD)),
-        Some(encode_amount(1_000 - 25 - TRANSFER_FEE).to_vec())
+        Some(encode_amount(1_000 - 25 - price_of(&executor, &fine)).to_vec())
     );
     assert_eq!(
         store.cell(vault_key(bob(), *XRD)),
-        Some(encode_amount(75 - floor).to_vec()),
-        "the credit lands and the failure's floor stays charged"
+        Some(encode_amount(75 - price).to_vec()),
+        "the credit lands and the failure's price stays charged"
     );
 }
 
 /// A charged failure's debit survives a sibling folded after it.
 ///
-/// Each records what it moved on the vault — the failure its floor, the
+/// Each records what it moved on the vault — the failure its price, the
 /// credit its amount — so settling both leaves the vault holding the
 /// sum. Neither receipt has to know about the other, which is what a
 /// movement buys: an absolute would have had to carry the sibling's
@@ -790,7 +812,7 @@ fn a_failed_charge_survives_a_later_sibling_credit() {
         alice(),
         500,
     )));
-    let floor = failed.body().abort_floor();
+    let price = price_of(&executor, &failed);
     // Receipts fold and commit hash-ascending, and only a credit landing
     // after the failure can revert its debit — so pick a transfer amount
     // whose hash does.
@@ -818,13 +840,13 @@ fn a_failed_charge_survives_a_later_sibling_credit() {
         .fee_receipt
         .as_ref()
         .and_then(|receipt| receipt.writes())
-        .expect("a charged failure settles its floor");
+        .expect("a charged failure settles its price");
     db.apply(charge);
     db.apply(writes);
     assert_eq!(
         db.cell(vault_key(bob(), *XRD)),
-        Some(encode_amount(50 + amount - floor).to_vec()),
-        "a later sibling's credit must compose with the charged floor, not revert it"
+        Some(encode_amount(50 + amount - price).to_vec()),
+        "a later sibling's credit must compose with the charged price, not revert it"
     );
 }
 
@@ -851,10 +873,9 @@ fn serial_and_parallel_scheduling_produce_identical_receipts() {
     }
 }
 
-/// A completed transfer burns its attested actual — fuel, capped at the
-/// signed ceiling — from the payer's vault as part of the receipt's own
-/// writes, so the burn rides the attested `writes_root` and the
-/// sync-replayable work items.
+/// A completed transfer burns its declared price from the payer's vault
+/// as part of the receipt's own writes, so the burn rides the attested
+/// `writes_root` and the sync-replayable work items.
 /// An attempt that applies nothing still attests the declaration it made,
 /// and a completed one attests strictly more.
 ///
@@ -913,8 +934,8 @@ fn a_completed_transfer_burns_the_fee_ceiling_from_its_payer() {
     let payer = fee_payer(7);
     let accounts = [(payer, 1_000), (bob(), 50)];
     let executor = executor(ExecutionMode::Serial);
-    // A transfer's fuel far exceeds the tiny ceiling, so the burn is
-    // exactly `max_fee` — the cap working.
+    // A ceiling below the declared price is refused at admission; one
+    // that bypassed it burns the ceiling — the backstop clamp working.
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
         signed_transfer_with_fee(7, payer, bob(), 100, 10),
     ));
@@ -945,8 +966,8 @@ fn a_completed_transfer_burns_the_fee_ceiling_from_its_payer() {
 #[test]
 fn a_call_that_never_touches_its_payers_vault_still_pays() {
     let executor = executor(ExecutionMode::Serial);
-    // A draw's fuel far exceeds the tiny ceiling, so the burn is
-    // exactly `max_fee`.
+    // A ceiling below the declared price, bypassing admission, burns
+    // exactly the ceiling.
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
         signed_settle_with_fee(ALICE_SEED, 10, ROUND),
     ));
@@ -1052,17 +1073,17 @@ fn shared_payer_burns_accumulate_across_a_batch() {
 
 /// A missed edge bound is an infeasibility, not a defect: the sender
 /// declared what it would accept and the world moved between signing and
-/// execution, so nothing but the class floor leaves its vault.
+/// execution, and it settles the one declared price like every attempt.
 #[test]
-fn a_missed_edge_bound_charges_its_payer_the_floor() {
+fn a_missed_edge_bound_charges_its_payer_the_price() {
     let payer = fee_payer(23);
     let funded = 1_000;
     let accounts = [(payer, funded), (bob(), 50)];
     let executor = executor(ExecutionMode::Serial);
     // The withdrawal is covered and the guest is honest — it returns the
-    // 100 it reserved. What fails is the recipient's signed floor.
+    // 100 it reserved. What fails is the recipient's signed price.
     let tx = signed_transfer_under_bound(23, payer, bob(), 100, 150, 1_000);
-    let floor = tx.body().abort_floor();
+    let price = price_of(&executor, &tx);
     let executed = execute_on(
         &accounts,
         &executor,
@@ -1086,8 +1107,8 @@ fn a_missed_edge_bound_charges_its_payer_the_floor() {
     };
     assert_eq!(
         vault_cell(&settled(database_updates, &accounts), payer),
-        Some(encode_amount(funded - floor).to_vec()),
-        "the floor and nothing else"
+        Some(encode_amount(funded - price).to_vec()),
+        "the price and nothing else"
     );
     assert_eq!(
         vault_cell(&settled(database_updates, &accounts), bob()),
@@ -1206,6 +1227,627 @@ fn an_event_lands_only_on_its_emitters_home_shard() {
         hash_of(&recipient_side[0]),
         "under whole locality the hash covers the full fold, so it cannot differ by shard",
     );
+}
+
+/// A real transfer divides as the classifier says: the sender's shard
+/// runs the sign-in and the withdraw and issues one crossing from the
+/// withdraw's reserved vault; the recipient's shard runs the deposit
+/// against that crossing's attested value, and cannot plan without it.
+#[test]
+fn a_transfer_plans_one_leg_each_side_of_the_trie() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let divided = Classified::freeze(tx.legs(), tx.owners(), &trie);
+    assert!(divided.decomposed(), "a transfer decomposes");
+    assert_eq!(divided.core(), &BTreeSet::from([near_shard]));
+
+    let edges = divided.edges();
+    assert_eq!(edges.len(), 1, "one value edge crosses");
+    let edge = &edges[0];
+    assert_eq!(edge.from, near_shard);
+    assert_eq!(edge.to, BTreeSet::from([far_shard]));
+
+    let sender = divided
+        .plan(&[], near_shard, Side::Issuing)
+        .expect("the sender's legs take no arrival");
+    assert!(!sender.legs.is_whole());
+    assert!(
+        sender.legs.departure(edge.producer, edge.output).is_some(),
+        "the withdraw departs",
+    );
+    assert!(sender.judges.covers(alice()) && !sender.judges.covers(far()));
+
+    let arrived = EscrowedValue {
+        node: edge.producer,
+        output: edge.output,
+        resource: *XRD,
+        amount: 100,
+        record: edge.record.key(),
+    };
+    let recipient = divided
+        .plan(std::slice::from_ref(&arrived), far_shard, Side::Delivering)
+        .expect("the recipient's leg has its arrival");
+    assert!(recipient.legs.arrival(edge.producer, edge.output).is_some());
+    assert!(
+        recipient
+            .legs
+            .departure(edge.producer, edge.output)
+            .is_none()
+    );
+    assert!(recipient.judges.covers(far()) && !recipient.judges.covers(alice()));
+
+    assert!(matches!(
+        divided.plan(&[], far_shard, Side::Delivering),
+        Err(PlanDefect::MissingArrival { .. }),
+    ));
+}
+
+/// A transfer executed divided, end to end through the engine: the
+/// sender's shard runs the sign-in and the withdraw, escrows the value
+/// into the record cell the plan filed, and attests exactly that; the
+/// recipient's shard runs the deposit against the attested arrival and
+/// escrows nothing. Neither side runs the other's leg.
+#[test]
+fn a_transfer_executes_divided_on_both_shards() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let classified = Classified::freeze(tx.legs(), tx.owners(), &trie);
+    assert!(classified.decomposed());
+    let edge = classified.edges()[0].clone();
+
+    let run = |local_shard: ShardId, arrivals: &[EscrowedValue]| {
+        let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+        let ctx = TickBatchContext {
+            local_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            // A leg awaiting nobody but its own shard: nothing retracts
+            runs: Runs::Shape(Member::of(
+                classified.clone(),
+                local_shard,
+                classified.first_side_at(local_shard),
+                BTreeSet::from([near_shard, far_shard]),
+            )),
+            arrivals,
+        };
+        executor
+            .execute_tick_batch(&ctx, &snapshot_store, &[input])
+            .remove(0)
+    };
+
+    let sender = run(near_shard, &[]);
+    let ConsensusReceipt::Succeeded { writes, .. } = &sender.consensus else {
+        panic!("the sender's legs must succeed: {:?}", sender.metadata);
+    };
+    assert_eq!(
+        sender.escrowed,
+        vec![EscrowedValue {
+            node: edge.producer,
+            output: edge.output,
+            resource: *XRD,
+            amount: 100,
+            record: edge.record.key(),
+        }],
+        "the withdraw's value left into the record cell the plan filed",
+    );
+    assert!(
+        writes.cells.contains_key(&edge.record.key()),
+        "the record cell is among the sender's writes"
+    );
+    assert!(
+        !writes
+            .movements
+            .keys()
+            .any(|key| key.owner == far().address()),
+        "the sender ran no leg of the recipient's"
+    );
+
+    let recipient = run(far_shard, &sender.escrowed);
+    let ConsensusReceipt::Succeeded { writes, .. } = &recipient.consensus else {
+        panic!("the recipient's leg must succeed: {:?}", recipient.metadata);
+    };
+    assert!(recipient.escrowed.is_empty(), "a deposit hands nothing on");
+    assert!(
+        writes
+            .movements
+            .keys()
+            .any(|key| key.owner == far().address()),
+        "the deposit credited the recipient"
+    );
+    assert!(
+        !writes
+            .movements
+            .keys()
+            .any(|key| key.owner == alice().address()),
+        "the recipient ran no leg of the sender's"
+    );
+}
+
+/// A refused transfer's escrow comes back. The sender's shard runs the
+/// reclaim — no node, no nullifier, a declaration of its own over the
+/// record, the claim and the origin — and the vault is back at its
+/// pre-escrow balance exactly, read off the cell; the record goes with
+/// it, since the value it held is back where it left.
+#[test]
+fn a_reclaim_restores_the_senders_vault_exactly() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let near_shard = trie.shard_for_prefix(alice());
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let classified = Classified::freeze(tx.legs(), tx.owners(), &trie);
+    assert!(classified.decomposed());
+    let edge = classified.edges()[0].clone();
+
+    let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+    let run = |store: &MapDb, runs: Runs| {
+        let ctx = TickBatchContext {
+            local_shard: near_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            runs,
+            arrivals: &[],
+        };
+        executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
+    };
+
+    let sent = run(
+        &store,
+        Runs::Shape(Member::of(
+            classified.clone(),
+            near_shard,
+            Side::Issuing,
+            std::iter::once(near_shard)
+                .chain(edge.to.iter().copied())
+                .collect(),
+        )),
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &sent.consensus else {
+        panic!("the sender's legs must succeed: {:?}", sent.metadata);
+    };
+    store.apply(writes);
+    assert_eq!(
+        store.cell(vault_key(alice(), *XRD)),
+        Some(encode_amount(900).to_vec()),
+        "the escrow debited the vault"
+    );
+
+    let reclaimed = run(
+        &store,
+        Runs::Settle {
+            member: Member::whole(near_shard),
+            records: classified.records_issued(near_shard),
+            on: Licence::Unclaimed,
+            charged: true,
+        },
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &reclaimed.consensus else {
+        panic!("the reclaim must succeed: {:?}", reclaimed.metadata);
+    };
+    assert!(reclaimed.escrowed.is_empty(), "a reclaim issues nothing");
+    assert!(
+        reclaimed.fee_receipt.is_none(),
+        "the leg's own certificate settled the price; the reclaim owes none"
+    );
+    store.apply(writes);
+    assert_eq!(
+        store.cell(vault_key(alice(), *XRD)),
+        Some(encode_amount(1_000).to_vec()),
+        "and the reclaim restores it exactly"
+    );
+    assert!(
+        store.cell(edge.record.key()).is_none(),
+        "the record goes with the value it held"
+    );
+}
+
+/// Once the recipient's claim is on record, the sender's shard retires
+/// the record it held for it: no node, no fee, nothing moved, and the
+/// record deleted. A second retirement finds nothing and is refused
+/// before the kernel runs.
+#[test]
+fn a_retirement_deletes_the_record_and_moves_nothing() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let near_shard = trie.shard_for_prefix(alice());
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let classified = Classified::freeze(tx.legs(), tx.owners(), &trie);
+    let edge = classified.edges()[0].clone();
+
+    let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+    let run = |store: &MapDb, runs: Runs| {
+        let ctx = TickBatchContext {
+            local_shard: near_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            runs,
+            arrivals: &[],
+        };
+        executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
+    };
+
+    let sent = run(
+        &store,
+        Runs::Shape(Member::of(
+            classified.clone(),
+            near_shard,
+            Side::Issuing,
+            std::iter::once(near_shard)
+                .chain(edge.to.iter().copied())
+                .collect(),
+        )),
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &sent.consensus else {
+        panic!("the sender's legs must succeed: {:?}", sent.metadata);
+    };
+    store.apply(writes);
+    assert!(
+        store.cell(edge.record.key()).is_some(),
+        "the record is written"
+    );
+
+    let retired = run(
+        &store,
+        Runs::Settle {
+            member: Member::whole(near_shard),
+            records: classified.records_issued(near_shard),
+            on: Licence::Accepted,
+            charged: true,
+        },
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &retired.consensus else {
+        panic!("the retirement must succeed: {:?}", retired.metadata);
+    };
+    assert!(retired.escrowed.is_empty(), "a retirement issues nothing");
+    assert!(retired.fee_receipt.is_none(), "and charges nothing");
+    store.apply(writes);
+    assert!(
+        store.cell(edge.record.key()).is_none(),
+        "the record is gone"
+    );
+    assert_eq!(
+        store.cell(vault_key(alice(), *XRD)),
+        Some(encode_amount(900).to_vec()),
+        "and the value stays where the claim took it"
+    );
+
+    let again = run(
+        &store,
+        Runs::Settle {
+            member: Member::whole(near_shard),
+            records: classified.records_issued(near_shard),
+            on: Licence::Accepted,
+            charged: true,
+        },
+    );
+    assert!(
+        matches!(again.consensus, ConsensusReceipt::Failed),
+        "a second retirement finds no record and is refused: {:?}",
+        again.metadata
+    );
+}
+
+/// A record a shard inherited with a prefix decides itself, against the
+/// claim cell the record names: absent, the value goes back to the cell
+/// it left; present, the record is deleted and nothing moves.
+///
+/// The member runs with no body at all, which is the point — a merge
+/// successor's store arrives as a prefix of leaves and its ledger begins
+/// empty, so the leaf is the whole of what a reclaim has to work from.
+#[test]
+#[allow(clippy::too_many_lines)] // one member over one fixture, in its three states
+fn an_inherited_record_decides_itself_against_its_claim() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let near_shard = trie.shard_for_prefix(alice());
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let classified = Classified::freeze(tx.legs(), tx.owners(), &trie);
+    let edge = classified.edges()[0].clone();
+
+    // The sending half, which writes the record the successor inherits.
+    let issued = |store: &MapDb| {
+        let ctx = TickBatchContext {
+            local_shard: near_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            runs: Runs::Shape(Member::of(
+                classified.clone(),
+                near_shard,
+                Side::Issuing,
+                std::iter::once(near_shard)
+                    .chain(edge.to.iter().copied())
+                    .collect(),
+            )),
+            arrivals: &[],
+        };
+        executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
+    };
+
+    // The housekeeping half: no body, and a clock inside the window an
+    // absent claim answers in.
+    let settle = |store: &MapDb, at: u64| {
+        let ctx = TickBatchContext {
+            local_shard: near_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(at),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            tx_hash: TxHash::from(Hash::from_bytes(b"housekeeping")),
+            transaction: None,
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(at),
+            runs: Runs::Settle {
+                member: Member::whole(near_shard),
+                records: vec![edge.record.key()],
+                on: Licence::OwnLeaf,
+                charged: true,
+            },
+            arrivals: &[],
+        };
+        executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
+    };
+
+    let mut unclaimed = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+    let sent = issued(&unclaimed);
+    let ConsensusReceipt::Succeeded { writes, .. } = &sent.consensus else {
+        panic!("the sender's legs must succeed: {:?}", sent.metadata);
+    };
+    unclaimed.apply(writes);
+    let record = CrossingCell::from_bytes(
+        &Substates::cell(&unclaimed, edge.record.key()).expect("the record is written"),
+    )
+    .expect("a record decodes");
+    // The window opens where the consumer can no longer claim and closes
+    // where the claim cell it names is swept.
+    let inside = record.expiry_ms - 1;
+    assert!(
+        Window::Claim
+            .of(Deadline::from_expiry(record.expiry_ms))
+            .contains(&WeightedTimestamp::from_millis(inside))
+    );
+
+    // A store where the claim is present is the same store plus that one
+    // cell, so the two runs differ in nothing else.
+    let mut claimed = MapDb(unclaimed.0.clone());
+    claimed.0.insert(record.consumer_claim, vec![0xAA]);
+    let early_store = MapDb(unclaimed.0.clone());
+
+    let taken_back = settle(&unclaimed, inside);
+    let ConsensusReceipt::Succeeded { writes, .. } = &taken_back.consensus else {
+        panic!("the reclaim must succeed: {:?}", taken_back.metadata);
+    };
+    assert!(
+        taken_back.fee_receipt.is_none(),
+        "the chain that issued the crossing settled the price before it ended"
+    );
+    unclaimed.apply(writes);
+    assert_eq!(
+        Substates::cell(&unclaimed, vault_key(alice(), *XRD)),
+        Some(encode_amount(1_000).to_vec()),
+        "an unclaimed crossing returns to the cell it left"
+    );
+    assert!(
+        Substates::cell(&unclaimed, edge.record.key()).is_none(),
+        "and the record goes with it"
+    );
+
+    let retired = settle(&claimed, inside);
+    let ConsensusReceipt::Succeeded { writes, .. } = &retired.consensus else {
+        panic!("the retirement must succeed: {:?}", retired.metadata);
+    };
+    claimed.apply(writes);
+    assert!(
+        Substates::cell(&claimed, edge.record.key()).is_none(),
+        "a claimed crossing's record is deleted"
+    );
+    assert_eq!(
+        Substates::cell(&claimed, vault_key(alice(), *XRD)),
+        Some(encode_amount(900).to_vec()),
+        "and the value stays where the claim took it"
+    );
+
+    // Outside the window an absent claim says nothing, so the member is
+    // refused rather than crediting on a clock.
+    let early = settle(&early_store, 1_000);
+    assert!(
+        matches!(early.consensus, ConsensusReceipt::Failed),
+        "a record read before its window answers nothing: {:?}",
+        early.metadata
+    );
+}
+
+/// The reclaim of a leg that never ran finds no record to reclaim from,
+/// and is refused before the kernel runs. The refusal is the sender's
+/// terminal on this shard and the one receipt left to carry the price:
+/// it settles the charge apart, debiting exactly the declared price and
+/// nothing else. The same reclaim of a leg that ran owes nothing.
+#[test]
+fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let near_shard = trie.shard_for_prefix(alice());
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 1_000),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let price = tx.price();
+    assert!(price > 0, "a priced fixture, or the charge proves nothing");
+
+    let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+    let run = |store: &MapDb, charged: bool| {
+        let ctx = TickBatchContext {
+            local_shard: near_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            runs: Runs::Settle {
+                member: Member::whole(near_shard),
+                records: Classified::freeze(tx.legs(), tx.owners(), &trie)
+                    .records_issued(near_shard),
+                on: Licence::Unclaimed,
+                charged,
+            },
+            arrivals: &[],
+        };
+        executor.execute_tick_batch(&ctx, store, &[input]).remove(0)
+    };
+
+    let owed = run(&store, false);
+    assert!(
+        !matches!(owed.consensus, ConsensusReceipt::Succeeded { .. }),
+        "with no record to read, the reclaim is refused: {:?}",
+        owed.metadata
+    );
+    let charge = owed
+        .fee_receipt
+        .as_ref()
+        .and_then(ConsensusReceipt::writes)
+        .expect("the refusal settles the price apart");
+    store.apply(charge);
+    assert_eq!(
+        store.cell(vault_key(alice(), *XRD)),
+        Some(encode_amount(1_000 - price).to_vec()),
+        "exactly the declared price leaves the vault"
+    );
+
+    let paid = run(&store, true);
+    assert!(
+        !matches!(paid.consensus, ConsensusReceipt::Succeeded { .. }),
+        "the same refusal for a leg that ran"
+    );
+    assert!(
+        paid.fee_receipt.is_none(),
+        "owes nothing more: its own certificate settled the price"
+    );
+}
+
+/// A divided batch attests only what it ran. Each side's event root
+/// covers the events its own emitters produced — what its receipt
+/// stores — so the hash a shard signs is recomputable from exactly what
+/// it keeps. A participant running only its own legs could not assemble
+/// a union, and two attesting different unions under one signed root
+/// would contradict each other.
+#[test]
+fn a_divided_batch_hashes_only_its_own_emitters_events() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(
+        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    ));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let run = |local_shard: ShardId| {
+        let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
+        let ctx = TickBatchContext {
+            local_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+        };
+        let input = TickTxInput {
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            runs: Runs::Shape(Member::of(
+                Classified::whole(),
+                local_shard,
+                Side::Issuing,
+                BTreeSet::from([near_shard, far_shard]),
+            )),
+            arrivals: &[],
+        };
+        executor
+            .execute_tick_batch(&ctx, &snapshot_store, &[input])
+            .remove(0)
+    };
+    let (sender_side, recipient_side) = (run(near_shard), run(far_shard));
+
+    assert_eq!(events_of(&sender_side), vec![(alice().address(), 0)]);
+    assert_eq!(events_of(&recipient_side), vec![(far().address(), 1)]);
+    for side in [&sender_side, &recipient_side] {
+        let ConsensusReceipt::Succeeded {
+            receipt_hash,
+            writes,
+            events,
+            ..
+        } = &side.consensus
+        else {
+            panic!("the leg must succeed: {:?}", side.consensus);
+        };
+        let event_hashes: Vec<Hash> = events.iter().map(EventExt::hash).collect();
+        let recomputed = GlobalReceipt::new(
+            true,
+            EventRoot::from_raw(compute_merkle_root(&event_hashes)),
+            BeaconWitnessRoot::ZERO,
+            writes_root(writes),
+        )
+        .receipt_hash();
+        assert_eq!(
+            *receipt_hash, recomputed,
+            "the hash a divided member signs covers exactly what it stores",
+        );
+    }
 }
 
 /// A reservation is judged against committed balance less what
@@ -1763,7 +2405,10 @@ fn a_preview_reports_the_resource_changes_a_transfer_would_make() {
     let report = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
 
     assert_eq!(report.outcome, PreviewOutcome::Completed);
-    assert_eq!(report.fee, PREVIEW_CEILING, "a transfer's fuel exceeds it");
+    assert_eq!(
+        report.fee, PREVIEW_CEILING,
+        "a ceiling below the price is the burn"
+    );
     assert_eq!(report.changes.len(), 2, "two vaults move: {report:?}");
 
     let sender = change_for(&report, payer);
@@ -1857,32 +2502,32 @@ fn free_credit_reports_the_fee_without_charging_it() {
 }
 
 /// An uncovered withdrawal previews as the abort it would be, priced at
-/// the class floor: the sender lost a deterministic race rather than
-/// making a mistake, so nothing but the floor leaves its vault.
+/// the one declared price: the sender lost a deterministic race, and an
+/// attempt settles the price whatever refused it.
 #[test]
-fn a_preview_prices_an_abort_at_its_class_floor() {
+fn a_preview_prices_an_abort_at_the_declared_price() {
     let payer = fee_payer(7);
     let accounts = [(payer, 1_000), (bob(), 50)];
     let executor = executor(ExecutionMode::Serial);
-    let tx = signed_transfer_with_fee(7, payer, bob(), 5_000, PREVIEW_CEILING);
+    let tx = signed_transfer_with_fee(7, payer, bob(), 5_000, TRANSFER_FEE);
     let report = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
 
     let PreviewOutcome::Aborted { reason } = &report.outcome else {
         panic!("an uncovered withdrawal must abort: {:?}", report.outcome);
     };
     assert!(reason.contains("infeasible"), "reason = {reason}");
-    assert_eq!(report.fee, PREVIEW_CEILING / 10, "the abort floor");
+    assert_eq!(report.fee, price_of(&executor, &tx), "the declared price");
     assert_eq!(
         report.changes,
         vec![ResourceChange {
             key: vault_key(payer, *XRD),
             before: 1_000,
-            after: 1_000 - PREVIEW_CEILING / 10,
+            after: 1_000 - report.fee,
             credit: 0,
             debit: 0,
             settled: 0,
         }],
-        "an abort moves nothing but the floor"
+        "an abort moves nothing but the price"
     );
 }
 

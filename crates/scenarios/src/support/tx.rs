@@ -21,19 +21,21 @@ use hyperscale_transactions::{Client, DEFAULT_GAS_LIMIT, Terms};
 use hyperscale_types::{
     AccountSigner, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
     EnvelopeExt, Epoch, MAX_SUBINTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR,
-    MlDsa65PrivateKey, NetworkId, NetworkParams, PrincipalAddr, SchemeId, ShardId, ShardTrie,
-    StakePoolId, StakePoolSeat, TimestampRange, Transaction, TransactionBody, TransactionEnvelope,
-    ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
+    MlDsa65PrivateKey, NetworkId, NetworkParams, PrincipalAddr, ResourceAddr, SchemeId, ShardId,
+    ShardTrie, StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction,
+    TransactionBody, TransactionEnvelope, ValidatorId, WeightedTimestamp,
+    ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
     Composed, Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, IntentHeader,
-    ManifestGraph, ResourceKind, Totality, Value, issued_resource, package_hash,
+    ManifestGraph, ResourceKind, SlotId, Totality, Value, child_key, issued_resource, package_hash,
 };
-use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
+use hyperscale_vm_fixtures::{amm, amm_package_hash, lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::signing::{self, sign_subintent};
 use hyperscale_vm_manifest_builder::{
     EnvelopeBuilder, GraphBuilder, IntentBuilder, TypedBuilder, TypedError,
 };
+use hyperscale_vm_sdk::client::VaultField;
 use hyperscale_vm_stdlib::{STAKING_COMPONENT, account, account_artifact, instantiate, staking};
 use hyperscale_vm_types::Address;
 
@@ -86,18 +88,6 @@ const BALLAST_CELL_BYTES: u64 = 16;
 /// vote threshold fits between the flash-holding survivor and the
 /// splitter with fixed margins on both sides.
 const SPLITTER_BALLAST_LEAD: u64 = 24_000;
-
-/// Ballast accounts funded into the splitter, so it clears the voted-down
-/// threshold while the survivor — ballasted at [`STRADDLER_SURVIVOR_BULK`]
-/// — stays under it.
-///
-/// Derived so the ordering holds wherever the flash lands: the splitter
-/// clears the threshold on its ballast alone, and the survivor stays
-/// under it even holding the whole flash beside its own ballast.
-fn straddler_bulk() -> usize {
-    usize::try_from((stdlib_flash_bytes() + SPLITTER_BALLAST_LEAD) / BALLAST_CELL_BYTES)
-        .expect("ballast count fits usize")
-}
 
 /// Ballast accounts funded into the survivor: enough to clear the derived
 /// merge floor with margin, and short of the splitter's by enough that
@@ -280,36 +270,7 @@ pub struct SplitStraddlerSetup {
     /// Straddler transfers: `(payer key, payer account in survivor, recipient in
     /// splitter)`.
     pub straddlers: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
-    /// The leg whose payer sits in the *terminating* splitter, so the
-    /// reservation it engages is held by a shard that dies before the tick
-    /// can resolve: `(payer key, payer in the splitter's left child,
-    /// recipient in the survivor)`.
-    pub terminating: (Ed25519PrivateKey, PrincipalAddr, PrincipalAddr),
-    /// A recipient in the terminating payer's successor child, so the
-    /// post-terminal probe stays intra-shard.
-    pub successor_recipient: PrincipalAddr,
-    /// An unencumbered payer in the same shard as [`Self::terminating`]'s,
-    /// funded normally. Submitted beside the encumbered probe at the same
-    /// instant, it separates "this shard is refusing everything" from "this
-    /// shard is refusing this payer".
-    pub control: (Ed25519PrivateKey, PrincipalAddr),
 }
-
-/// The successor child the terminating payer's cells land in when the
-/// splitter splits.
-pub const STRADDLER_SUCCESSOR: ShardId = ShardId::leaf(2, 0);
-
-/// What the terminating payer holds at genesis.
-///
-/// Above one signed fee ceiling and below two, so a reservation surviving
-/// its shard's terminal would leave the payer unable to cover a second
-/// transaction — which is exactly the encumbrance the probe looks for.
-pub const TERMINATING_PAYER_FUNDING: u128 = MAX_FEE + MAX_FEE / 2;
-
-const _: () = assert!(
-    TERMINATING_PAYER_FUNDING > MAX_FEE && TERMINATING_PAYER_FUNDING < 2 * MAX_FEE,
-    "the terminating payer must cover exactly one fee ceiling: one transaction      admits, a second while the first is in flight cannot",
-);
 
 /// Push `count` ballast accounts routing to `shard` under a
 /// `num_shards`-wide trie onto `accounts`.
@@ -384,6 +345,118 @@ const CONTENTION_SENDER_BASE: u8 = 120;
 /// sender seed.
 const CONTENTION_RECIPIENT_BASE: u8 = 200;
 
+/// The byte skew alone: the splitter ballasted over the voted-down
+/// threshold and the survivor under it, for a scenario that brings its
+/// own cast to the pair.
+#[must_use]
+pub fn split_ballast_accounts() -> Vec<(PrincipalAddr, u128)> {
+    split_ballast_accounts_over(stdlib_flash_bytes())
+}
+
+/// Ballast on one quarter of a four-shard partition, leading a genesis
+/// flash of `flash` bytes by the splitter's margin: what puts that
+/// quarter alone over a threshold voted to [`split_bytes_over`].
+///
+/// # Panics
+///
+/// Panics if the ballast count does not fit `usize`.
+///
+/// [`split_bytes_over`]: crate::straddler::split_bytes_over
+#[must_use]
+pub fn quarter_ballast_over(shard: ShardId, flash: u64) -> Vec<(PrincipalAddr, u128)> {
+    let mut accounts = Vec::new();
+    let bulk = usize::try_from((flash + SPLITTER_BALLAST_LEAD) / BALLAST_CELL_BYTES)
+        .expect("ballast count fits usize");
+    ballast(shard, 4, bulk, &mut accounts);
+    accounts
+}
+
+/// [`split_ballast_accounts`] for a network whose genesis flash is
+/// `flash` bytes — the fixture packages beside the protocol's, on a
+/// network born running them.
+///
+/// # Panics
+///
+/// Panics if the ballast count does not fit `usize`.
+#[must_use]
+pub fn split_ballast_accounts_over(flash: u64) -> Vec<(PrincipalAddr, u128)> {
+    let mut accounts = Vec::new();
+    let bulk = usize::try_from((flash + SPLITTER_BALLAST_LEAD) / BALLAST_CELL_BYTES)
+        .expect("ballast count fits usize");
+    ballast(STRADDLER_SPLITTER, 2, bulk, &mut accounts);
+    ballast(
+        STRADDLER_SURVIVOR,
+        2,
+        STRADDLER_SURVIVOR_BULK,
+        &mut accounts,
+    );
+    accounts
+}
+
+/// The genesis flash of a network born running the fixture packages
+/// beside the protocol's: every artifact, written whole under the
+/// publisher's single prefix.
+#[must_use]
+pub fn fixture_flash_bytes() -> u64 {
+    GenesisPackages::with_fixtures()
+        .artifacts()
+        .iter()
+        .map(|artifact| artifact.len() as u64)
+        .sum()
+}
+
+/// The genesis funding and transfers for a train into a shard across its
+/// reshape.
+pub struct TrainSetup {
+    /// Genesis accounts: the byte skew plus every leg's payer and recipient.
+    pub accounts: Vec<(PrincipalAddr, u128)>,
+    /// One transfer per leg, a surviving shard's payer into the
+    /// terminating shard's recipient, each from its own payer so the
+    /// train never waits on a reservation.
+    pub legs: Vec<(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)>,
+}
+
+/// Build the split-train genesis funding and its `count` legs: survivor
+/// payers into splitter recipients over the split-straddler byte skew.
+#[must_use]
+pub fn split_train_setup(count: usize) -> TrainSetup {
+    let mut accounts = split_ballast_accounts();
+    let mut taken = Vec::new();
+    let legs = (0..count)
+        .map(|_| {
+            transfer_leg(
+                STRADDLER_SURVIVOR,
+                STRADDLER_SPLITTER,
+                2,
+                &mut taken,
+                &mut accounts,
+            )
+        })
+        .collect();
+    TrainSetup { accounts, legs }
+}
+
+/// Build the merge-train genesis funding and its `count` legs: survivor
+/// payers into merge-left recipients over the merge-straddler byte skew.
+#[must_use]
+pub fn merge_train_setup(count: usize) -> TrainSetup {
+    let mut accounts = Vec::new();
+    merge_survivor_ballast(&mut accounts);
+    let mut taken = Vec::new();
+    let legs = (0..count)
+        .map(|_| {
+            transfer_leg(
+                MERGE_STRADDLER_SURVIVOR,
+                MERGE_STRADDLER_LEFT,
+                4,
+                &mut taken,
+                &mut accounts,
+            )
+        })
+        .collect();
+    TrainSetup { accounts, legs }
+}
+
 /// Build the split-straddler genesis funding and straddler transfers.
 ///
 /// The splitter (`leaf(1, 0)`) is ballasted over the voted-down threshold,
@@ -394,14 +467,7 @@ const CONTENTION_RECIPIENT_BASE: u8 = 200;
 /// recipient.
 #[must_use]
 pub fn split_straddler_setup() -> SplitStraddlerSetup {
-    let mut accounts = Vec::new();
-    ballast(STRADDLER_SPLITTER, 2, straddler_bulk(), &mut accounts);
-    ballast(
-        STRADDLER_SURVIVOR,
-        2,
-        STRADDLER_SURVIVOR_BULK,
-        &mut accounts,
-    );
+    let mut accounts = split_ballast_accounts();
     let mut taken = Vec::new();
     let straddlers = (0..STRADDLER_COUNT)
         .map(|_| {
@@ -415,26 +481,66 @@ pub fn split_straddler_setup() -> SplitStraddlerSetup {
         })
         .collect();
 
-    // The terminating payer is ground into the splitter's *left child*, so
-    // the successor holding its cells after the split is known up front
-    // rather than derived from a trie the scenario would have to rebuild.
-    let (terminating_key, terminating_payer) =
-        account_routing_to_n(STRADDLER_SUCCESSOR, 4, &mut taken);
-    let (_, terminating_recipient) = account_routing_to(STRADDLER_SURVIVOR, &mut taken);
-    let (_, successor_recipient) = account_routing_to_n(STRADDLER_SUCCESSOR, 4, &mut taken);
-    let (control_key, control_payer) = account_routing_to_n(STRADDLER_SUCCESSOR, 4, &mut taken);
-    accounts.push((terminating_payer, TERMINATING_PAYER_FUNDING));
-    accounts.push((terminating_recipient, 10));
-    accounts.push((successor_recipient, 10));
-    accounts.push((control_payer, 10_000));
+    SplitStraddlerSetup {
+        accounts,
+        straddlers,
+    }
+}
+
+/// [`split_straddler_setup`] with the leg reversed: the payer in the
+/// splitting shard and the recipient in the survivor.
+///
+/// What the cut then carries is the crossing's *record* rather than its
+/// delivery — the issuer is what splits, so a successor inherits the
+/// record and has to decide it against the claim cell its leaf names.
+#[must_use]
+pub fn split_issuer_straddler_setup() -> SplitStraddlerSetup {
+    let mut accounts = split_ballast_accounts();
+    let mut taken = Vec::new();
+    let straddlers = (0..STRADDLER_COUNT)
+        .map(|_| {
+            transfer_leg(
+                STRADDLER_SPLITTER,
+                STRADDLER_SURVIVOR,
+                2,
+                &mut taken,
+                &mut accounts,
+            )
+        })
+        .collect();
 
     SplitStraddlerSetup {
         accounts,
         straddlers,
-        terminating: (terminating_key, terminating_payer, terminating_recipient),
-        successor_recipient,
-        control: (control_key, control_payer),
     }
+}
+
+/// [`merge_survivor_ballast`] on its own, for a scenario composing the
+/// merge topology's byte skew with funding of its own.
+#[must_use]
+pub fn merge_survivor_ballast_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let mut accounts = Vec::new();
+    merge_survivor_ballast(&mut accounts);
+    accounts
+}
+
+/// Lift the surviving quarters (`leaf(2, 2)` and `leaf(2, 3)`) above
+/// `merge_bytes`, so neither emits an unpairable merge against the other
+/// and churns the schedule, while the lighter pair stays under it.
+fn merge_survivor_ballast(accounts: &mut Vec<(PrincipalAddr, u128)>) {
+    let num_shards = 4;
+    ballast(
+        MERGE_STRADDLER_SURVIVOR,
+        num_shards,
+        MERGE_SURVIVOR_BULK,
+        accounts,
+    );
+    ballast(
+        ShardId::leaf(2, 3),
+        num_shards,
+        MERGE_SURVIVOR_BULK,
+        accounts,
+    );
 }
 
 /// Build the merge-straddler genesis funding and straddler transfers.
@@ -449,21 +555,7 @@ pub fn split_straddler_setup() -> SplitStraddlerSetup {
 pub fn merge_straddler_setup() -> MergeStraddlerSetup {
     let num_shards = 4;
     let mut accounts = Vec::new();
-
-    // Lift the surviving quarters above `merge_bytes` so neither emits an
-    // unpairable merge against the other and churns the schedule.
-    ballast(
-        MERGE_STRADDLER_SURVIVOR,
-        num_shards,
-        MERGE_SURVIVOR_BULK,
-        &mut accounts,
-    );
-    ballast(
-        ShardId::leaf(2, 3),
-        num_shards,
-        MERGE_SURVIVOR_BULK,
-        &mut accounts,
-    );
+    merge_survivor_ballast(&mut accounts);
 
     let mut taken = Vec::new();
     let straddlers = (0..MERGE_STRADDLER_COUNT)
@@ -1502,15 +1594,35 @@ pub fn world_pools() -> Vec<StakePoolSeat> {
 /// on the pool's.
 #[must_use]
 pub fn badge_buyer() -> (Ed25519PrivateKey, PrincipalAddr) {
+    off_genesis_pool_shard(0)
+}
+
+/// A delegator whose stake into the genesis pool crosses shards.
+///
+/// An account on the shard the genesis pool does not live on, so its
+/// withdrawal is an inbound leg and the pool — which takes the funds and
+/// hands back units — is a core elsewhere. The one shape among the
+/// scenario builders where the payer's shard waits on another's verdict.
+#[must_use]
+pub fn remote_delegator() -> (Ed25519PrivateKey, PrincipalAddr) {
+    off_genesis_pool_shard(1)
+}
+
+/// The `index`th account grinded onto the shard the genesis pool does
+/// not live on.
+fn off_genesis_pool_shard(index: usize) -> (Ed25519PrivateKey, PrincipalAddr) {
     let trie = ShardTrie::uniform_from_count(2);
     let pool_shard = trie.shard_for_prefix(pool_at(GENESIS_POOL_ID));
-    let buyer_shard = if pool_shard == ShardId::leaf(1, 0) {
+    let shard = if pool_shard == ShardId::leaf(1, 0) {
         ShardId::leaf(1, 1)
     } else {
         ShardId::leaf(1, 0)
     };
     let mut taken = Vec::new();
-    account_routing_to(buyer_shard, &mut taken)
+    (0..=index)
+        .map(|_| account_routing_to(shard, &mut taken))
+        .last()
+        .expect("at least one account is grinded")
 }
 
 /// Sell the genesis pool: withdraw its owner badge from the seller's
@@ -1647,6 +1759,201 @@ pub fn published_instance(artifact: &[u8], salt: u8, founder: PrincipalAddr) -> 
     }
 }
 
+/// The fee a scenario venue takes: thirty basis points, at the scale the
+/// pool's bounded fee type holds.
+const VENUE_FEE: u128 = 30 * (1_000_000_000_000_000_000 / 10_000);
+
+/// The metadata of a venue trading `pair` whose address routes to
+/// `shard`.
+///
+/// A venue's address derives from its package, its configuration and a
+/// salt, so a venue on one shard in particular asks for the salt that
+/// puts it there.
+///
+/// # Panics
+///
+/// If no salt in a byte lands the venue on `shard`, which would mean the
+/// derivation had stopped spreading addresses.
+#[must_use]
+pub fn venue_on(shard: ShardId, pair: (ResourceAddr, ResourceAddr)) -> InstanceMeta {
+    // The uniform trie the target leaf belongs to, so a venue grinds onto
+    // a shard of whatever depth the world has.
+    let trie = ShardTrie::uniform_from_count(1u64 << shard.depth());
+    for salt in 0..=u8::MAX {
+        let meta = InstanceMeta {
+            package: amm_package_hash(&ProtocolHasher),
+            config: vec![
+                Value::Address(pair.0.address()),
+                Value::Address(pair.1.address()),
+                Value::U128(VENUE_FEE),
+            ],
+            salt: Hash32([salt; 32]),
+        };
+        if trie.shard_for_prefix(meta.address(&ProtocolHasher).address()) == shard {
+            return meta;
+        }
+    }
+    panic!("no venue salt lands on {shard:?}");
+}
+
+/// Stock a venue: both sides withdrawn from one account, handed in
+/// together, and the claim they mint filed back.
+///
+/// One transaction because the curve prices a pair — a pool holding one
+/// side quotes against an empty reserve, which is the shape its own
+/// refusal exists to name.
+///
+/// # Panics
+///
+/// If the scenario world does not answer the call, which would be a
+/// defect in the world rather than in the call.
+#[must_use]
+pub fn build_add_liquidity_tx(
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    venue: &InstanceMeta,
+    pair: (ResourceAddr, ResourceAddr),
+    sides: (u128, u128),
+    validity: TimestampRange,
+) -> Transaction {
+    build_venue_tx(payer, venue, validity, &|pool, b| {
+        let x = account::withdraw(b, from, pair.0, sides.0)?;
+        let y = account::withdraw(b, from, pair.1, sides.1)?;
+        let claim = pool.add_liquidity(b, x, y)?;
+        account::deposit(b, from, claim)
+    })
+}
+
+/// A swap: withdraw one side, hand it to the venue, bank what comes
+/// back.
+///
+/// The shape the whole venue question is about: the withdraw is a leg
+/// on the caller's shard, the pricing is the core on the venue's, and
+/// the deposit is a delivery back — so the caller is the leg and the
+/// venue the core, as a stake into a remote pool is.
+///
+/// # Panics
+///
+/// If the scenario world does not answer the call, which would be a
+/// defect in the world rather than in the call.
+#[must_use]
+pub fn build_swap_tx(
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    venue: &InstanceMeta,
+    paying: ResourceAddr,
+    amount: u128,
+    min_out: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    build_venue_tx(payer, venue, validity, &|pool, b| {
+        let funds = account::withdraw(b, from, paying, amount)?;
+        let bought = pool.swap(b, funds, min_out)?;
+        account::deposit(b, from, bought)
+    })
+}
+
+/// A two-hop route: withdraw one side, price it at the first venue,
+/// price what comes back at the second, and bank the result.
+///
+/// `second_min_out` is the floor the second hop holds out for — zero to
+/// take whatever it is quoted, and more than the pool can pay to make
+/// the route refuse at its second venue, where a refusal has the most to
+/// take back.
+///
+/// The shape a multi-shard core takes. Both venues are core — a swap
+/// prices against reserves it also writes, so neither is reservation
+/// shaped nor total — and where they sit on different shards the core
+/// spans both and each awaits the other's certificate.
+///
+/// # Panics
+///
+/// If the scenario world does not answer either call.
+#[must_use]
+pub fn build_route_tx(
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    venues: (&InstanceMeta, &InstanceMeta),
+    paying: ResourceAddr,
+    amount: u128,
+    second_min_out: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    let metas = [venues.0.clone(), venues.1.clone()];
+    build_venues_tx(payer, &metas, validity, &|pools, b| {
+        let funds = account::withdraw(b, from, paying, amount)?;
+        let mid = pools[0].swap(b, funds, 0)?;
+        let out = pools[1].swap(b, mid, second_min_out)?;
+        account::deposit(b, from, out)
+    })
+}
+
+/// One call against a sealed venue, typed against the record the seal
+/// wrote.
+fn build_venue_tx(
+    payer: &Ed25519PrivateKey,
+    venue: &InstanceMeta,
+    validity: TimestampRange,
+    leg: &dyn Fn(&amm::Amm, &mut TypedBuilder<'_>) -> Result<(), TypedError>,
+) -> Transaction {
+    build_venues_tx(payer, std::slice::from_ref(venue), validity, &|pools, b| {
+        leg(&pools[0], b)
+    })
+}
+
+/// What a route does with the venues an envelope composed: one closure
+/// over all of them, so a hop can hand its output to the next.
+type VenueRoute<'a> = dyn Fn(&[amm::Amm], &mut TypedBuilder<'_>) -> Result<(), TypedError> + 'a;
+
+/// One call against every venue in `venues`, each typed against the
+/// record its own seal wrote.
+///
+/// The composer is handed all of them at once, which is what lets a
+/// route hand one venue's output to the next: a call types against the
+/// record the chain answers with, and a bucket only names a producer the
+/// same envelope declares.
+///
+/// # Panics
+///
+/// If the scenario world does not answer the call.
+fn build_venues_tx(
+    payer: &Ed25519PrivateKey,
+    venues: &[InstanceMeta],
+    validity: TimestampRange,
+    route: &VenueRoute<'_>,
+) -> Transaction {
+    let client = client();
+    let chain = client.records();
+    let composed = Composed::new(&chain, venues, &ProtocolHasher);
+    let pools: Vec<amm::Amm> = venues
+        .iter()
+        .map(|venue| amm::Amm::at(venue.address(&ProtocolHasher)))
+        .collect();
+    let (mut env, mut root) = EnvelopeBuilder::new(
+        &composed,
+        &ProtocolHasher,
+        account_address(&payer.public_key().0),
+        scenario_header(validity),
+    );
+    route(&pools, &mut root).expect("every venue call types against its signature");
+    env.seal(root)
+        .expect("the root declares nothing to discharge")
+        .none()
+        .expect("the root declares no socket");
+    let tree = env.build().expect("the intent declares no hole");
+
+    Transaction::new(client.sign_tree(
+        &tree,
+        Vec::new(),
+        payer,
+        Terms {
+            max_fee: MAX_FEE,
+            validity,
+            message: Vec::new(),
+        },
+    ))
+}
+
 /// Build the seal of an instance of a runtime-published package.
 ///
 /// Untyped, because the signature this types against lives in metadata
@@ -1759,6 +2066,19 @@ pub const SECOND_POOL_ID: StakePoolId = StakePoolId::new(7778);
 /// a founding validator. Nothing else about the pool changes — its stake
 /// and its membership are still genesis's.
 pub const GENESIS_POOL_ID: StakePoolId = StakePoolId::new(0);
+
+/// The cell a stake pool keeps its delegations in: the pool's declared
+/// vault of the resource it is configured to hold, under the pool's own
+/// address.
+#[must_use]
+pub fn pool_vault_cell(pool: ComponentAddr) -> SubstateKey {
+    child_key(
+        &ProtocolHasher,
+        pool.address(),
+        SlotId(staking::Pool::SLOT),
+        &[Value::Address(XRD.address()).canonical_bytes()],
+    )
+}
 
 /// Where genesis seats the pool with `id` — derived from the record, so
 /// a scenario names a pool the way genesis places it.
@@ -1929,7 +2249,7 @@ pub fn payment_request(signer: PrincipalAddr, amount: u128) -> IntentDecl {
 /// [`payment_request`] standing only for `window`.
 ///
 /// The nullifier a spend of it takes lives for that window plus
-/// [`NULLIFIER_GRACE_MS`](hyperscale_vm_types::NULLIFIER_GRACE_MS), so a
+/// [`ARTIFACT_GRACE_MS`](hyperscale_vm_types::ARTIFACT_GRACE_MS), so a
 /// request signed for a transaction-shaped window yields a nullifier a
 /// scenario's clock can outrun and watch the sweep retire.
 #[must_use]

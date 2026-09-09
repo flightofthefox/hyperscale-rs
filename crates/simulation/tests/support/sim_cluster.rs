@@ -14,10 +14,10 @@ use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_engine::{PreviewGrants, PreviewInputs, PreviewReport, TickEnvironment};
 use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
-use hyperscale_network::fault::{HostId, RuleHandle};
+use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
-use hyperscale_scenarios::query::{chain_fate, status_rank};
+use hyperscale_scenarios::query::{RanAs, chain_fate, chain_membership, status_rank};
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, vote_reshape_threshold,
@@ -32,8 +32,9 @@ use hyperscale_types::{
 };
 
 /// The clock slice `run_until` advances per poll, matching the runner's own
-/// internal predicate loop.
-const SLICE: Duration = Duration::from_secs(1);
+/// internal predicate loop — and so the resolution of anything a scenario
+/// reads off the clock between polls.
+pub const SLICE: Duration = Duration::from_secs(1);
 
 /// How many epochs the beacon tip may lag wall-clock before the harness
 /// fails the scenario at the park itself, instead of at whatever distant
@@ -104,6 +105,47 @@ impl SimCluster {
     /// [`Self::with_dedicated_pool_hosts`] with funded accounts — the
     /// straddler and halt-recovery scenarios, whose legs are transfers
     /// over a byte skew the genesis ballast shapes.
+    /// [`Self::with_accounts`] over a network born running `packages`,
+    /// with the config's reshape trigger armed from genesis — the shape a
+    /// scenario that reaches a fixture and drives its own split wants.
+    #[must_use]
+    pub fn with_packages(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+        packages: GenesisPackages,
+    ) -> Self {
+        Self::build_full(&BuildArgs {
+            config,
+            seed,
+            dedicated_pool_hosts: false,
+            accounts,
+            execution_mode: ExecutionMode::Serial,
+            packages,
+        })
+    }
+
+    /// [`Self::with_packages`] with every pool extra on its own host, so
+    /// the committees a split seats share no host — what a fault rule
+    /// keyed on committee hosts needs to cut one shard's traffic and no
+    /// other's.
+    #[must_use]
+    pub fn with_packages_on_dedicated_pool_hosts(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+        packages: GenesisPackages,
+    ) -> Self {
+        Self::build_full(&BuildArgs {
+            config,
+            seed,
+            dedicated_pool_hosts: true,
+            accounts,
+            execution_mode: ExecutionMode::Serial,
+            packages,
+        })
+    }
+
     #[must_use]
     pub fn with_accounts_and_dedicated_pool_hosts(
         config: &ScenarioConfig,
@@ -216,6 +258,30 @@ impl SimCluster {
         accounts: &[(PrincipalAddr, u128)],
         packages: GenesisPackages,
     ) -> Self {
+        Self::grown(config, seed, accounts, packages, false)
+    }
+
+    /// [`Self::with_grown_packages`] with every pool extra on its own
+    /// host, so the committees the grow seats share no host — what a
+    /// fault rule keyed on committee hosts needs to cut one shard's
+    /// traffic and no other's.
+    #[must_use]
+    pub fn with_grown_packages_on_dedicated_pool_hosts(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+        packages: GenesisPackages,
+    ) -> Self {
+        Self::grown(config, seed, accounts, packages, true)
+    }
+
+    fn grown(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+        packages: GenesisPackages,
+        dedicated_pool_hosts: bool,
+    ) -> Self {
         let grow_config = ScenarioConfig {
             split_bytes: 0,
             ..*config
@@ -223,7 +289,7 @@ impl SimCluster {
         let mut cluster = Self::build_full(&BuildArgs {
             config: &grow_config,
             seed,
-            dedicated_pool_hosts: false,
+            dedicated_pool_hosts,
             accounts,
             execution_mode: ExecutionMode::Serial,
             packages,
@@ -336,6 +402,30 @@ impl SimCluster {
     /// Panics if `host` does not serve `shard`, or if the rejoin does not
     /// take the retained-storage path — a snap-sync there would be a
     /// different test entirely.
+    /// Make `host` answer requests of `type_id` with what `rewrite`
+    /// returns, given the request's bytes and the answer it was about to
+    /// send.
+    ///
+    /// The byzantine seam, and sim-only for the same reason
+    /// [`Self::restart_host`] is: the portable surface is the
+    /// intersection of what both harnesses do, and a host that answers
+    /// wrongly is a transport the libp2p gate has no hook for. A drop
+    /// rule can only make a responder silent, which every fetch path has
+    /// a fallback for; what an evidence check is exercised by is a
+    /// well-formed answer that says the wrong thing.
+    pub fn rewrite_responses(
+        &mut self,
+        host: usize,
+        type_id: &'static str,
+        rewrite: Rewrite,
+    ) -> FaultHandle {
+        let handle =
+            self.runner
+                .network_mut()
+                .rewrite_responses(host_index(host), type_id, rewrite);
+        FaultHandle::new(move || handle.fired())
+    }
+
     pub fn restart_host(&mut self, host: usize, shard: ShardId) {
         let host = host_index(host);
         let validator = self
@@ -449,10 +539,16 @@ impl Cluster for SimCluster {
     }
 
     fn substate(&self, shard: ShardId, owner: Address, local: [u8; 16]) -> Option<Vec<u8>> {
+        // The furthest-along store among the live committee's hosts. A
+        // shard id can be hosted twice on one host across a reshape — a
+        // merged parent reclaims its predecessor's id, a recovered shard
+        // reseats members that hold the frozen store — and only the live
+        // one has committed past the cut.
         let store = self
             .live_committee_hosts(shard)
             .into_iter()
-            .find_map(|host| self.runner.hosts_shard(host, shard))?;
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .max_by_key(|store| store.jmt_height())?;
         let height = store.jmt_height();
         let key = SubstateKey {
             owner,
@@ -527,6 +623,17 @@ impl Cluster for SimCluster {
             .map(|header| header.header().work_in_flight())
     }
 
+    fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs> {
+        // Across every store of the shard, not the first: a member seated at
+        // runtime snap-synced to an anchor and holds no block below it, so
+        // its chain alone says nothing about what committed before it.
+        (0..self.runner.num_hosts())
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .map(|store| chain_membership(store, tx))
+            .find(|ran| !ran.is_empty())
+            .unwrap_or_default()
+    }
+
     fn chain_fate(
         &self,
         shard: ShardId,
@@ -535,12 +642,15 @@ impl Cluster for SimCluster {
         Option<BlockHeight>,
         Option<(BlockHeight, TransactionDecision)>,
     ) {
-        let Some(store) =
-            (0..self.runner.num_hosts()).find_map(|host| self.runner.hosts_shard(host, shard))
-        else {
-            return (None, None);
-        };
-        chain_fate(store, tx)
+        // Merged across every store of the shard, since a runtime seat's
+        // chain starts at its snap-sync anchor; the chains agree wherever
+        // they overlap.
+        (0..self.runner.num_hosts())
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .map(|store| chain_fate(store, tx))
+            .fold((None, None), |(committed, finalized), (c, f)| {
+                (committed.or(c), finalized.or(f))
+            })
     }
 }
 

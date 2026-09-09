@@ -8,16 +8,18 @@
 //! transaction ordering, `ticks` recomputation, cross-ancestor tx uniqueness)
 //! live in [`crate::validation`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
+use hyperscale_storage::committed_tx_cells;
 use hyperscale_types::{
-    BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertificateRoot,
-    CertifiedBlock, ChainOrigin, Finalization, LinkageError, LocalReceiptRoot, ProvisionTxRootsMap,
-    ProvisionsRoot, QuorumCertificate, ReshapeThresholds, RevealChain, ShardId, SplitChildRoots,
-    StateRoot, SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot, TransactionRoot,
-    TxHash, Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp, WorkInFlight,
+    AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
+    ChainOrigin, Demands, Finalization, LinkageError, LocalReceiptRoot, QuorumCertificate,
+    ReshapeThresholds, RevealChain, ScheduleLookup, ShardId, ShardTrie, SplitChildRoots, StateRoot,
+    SubstateKey, SweepFrontier, TerminalRoots, TopologySchedule, TopologySnapshot, TxHash,
+    UnsettledTx, Verifiable, VerificationKind, Verified, VerifiedBlockAssembleError,
+    WeightedTimestamp, WorkInFlight,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -25,32 +27,37 @@ use tracing::{debug, trace, warn};
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::chain_view::ChainView;
 use crate::pending::{PendingBlock, PendingBlocks};
+use crate::proposal::late_deliveries;
 
-/// Discriminant for the verification pipeline's per-root bookkeeping
-/// (in-flight set, verified set, parametric helpers). The corresponding
-/// `ProtocolEvent::*Verified` variants are the per-kind result events;
-/// the coordinator's per-kind public methods thread the matching kind
-/// here for the shared completion logic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VerificationKind {
-    /// State root computed by replaying the block's database updates against the JMT.
-    StateRoot,
-    /// Merkle root over the block's transactions plus per-tx validity-window check.
-    TransactionRoot,
-    /// Merkle root over included finalizations' receipt hashes.
-    CertificateRoot,
-    /// Merkle root over the block's local receipts.
-    LocalReceiptRoot,
-    /// Merkle root over the block's provision-batch hashes.
-    ProvisionRoot,
-    /// Per-target-shard provision-tx merkle roots map.
-    ProvisionTxRoots,
-    /// Merkle root over the per-shard beacon-witness accumulator after this
-    /// block's appended leaves.
-    BeaconWitnessRoot,
-    /// Payer-shard fee reservations against vault balances at the
-    /// committed frontier.
-    Reservations,
+/// The trie of `anchor`'s window, which a delivered body is classified
+/// against, or `None` where no retained window carries the anchor.
+///
+/// A stand-in trie would not be a neutral answer. Under one shard every
+/// prefix resolves to it, so no body classifies as delivering here, no
+/// delivery is ever read as lapsed, and the block passes the arm the
+/// abandonment fence rests on — a permissive answer to the question that
+/// keeps a crossing from being claimed after its issuer may have taken it
+/// back. A window this cannot read is one to wait for.
+pub fn anchor_trie(schedule: &TopologySchedule, anchor: WeightedTimestamp) -> Option<ShardTrie> {
+    match schedule.lookup(anchor) {
+        ScheduleLookup::Committee(snapshot) => Some(snapshot.shard_trie().clone()),
+        _ => None,
+    }
+}
+
+/// The committed cells `block` writes.
+///
+/// One per transaction it carries, under the block's own shard. Every
+/// reader of the block's root — the proposer's voters, a replica
+/// committing it on its certificate alone, a split child following it —
+/// derives the same set from the same two facts, and no window enters
+/// it.
+#[must_use]
+pub fn committed_cells_for(block: &Block) -> Vec<(SubstateKey, Vec<u8>)> {
+    committed_tx_cells(
+        block.header().shard_id(),
+        block.transactions().iter().map(|tx| tx.as_unverified()),
+    )
 }
 
 /// Lifecycle position for a verification entry. `InFlight` covers the
@@ -110,6 +117,9 @@ pub struct ReadyStateRootVerification {
     /// Hashes of the block's own transactions — its contribution to the
     /// committed-transaction window a terminating boundary header roots.
     pub block_tx_hashes: Vec<TxHash>,
+    /// The committed cells the block writes, derived under its window,
+    /// folded under the root being verified.
+    pub creations: Vec<(SubstateKey, Vec<u8>)>,
     /// Height of the block being verified.
     pub block_height: BlockHeight,
     /// The header's `split_child_roots` claim, verified beside the
@@ -201,55 +211,18 @@ pub enum AssemblyError {
     ParentQcMismatch,
 }
 
-/// A block awaiting the sub-results required to produce a
-/// [`Verified<CertifiedBlock>`]: a verified QC paired with the block, plus
-/// per-root verification outcomes for the block's internal commitments.
-///
-/// Each per-root slot is `Some(value)` either because the verification
-/// succeeded (carrying the typed verified value) or because the block
-/// carries no relevant content for that root (skip case, prefilled by
-/// [`VerificationPipeline::track_pending_assembly`] with
-/// `new_unchecked(header.x_root())` — the empty-input compute is
-/// trivially equal to the header's claim). A slot is `None` only while
-/// the verification is outstanding. The assembly is complete when every
-/// slot is `Some`; on completion the pipeline's per-root and per-QC
-/// setters return the linked block.
+/// A block awaiting what a [`Verified<CertifiedBlock>`] needs: its
+/// verified QC, and every check it demands answered. Which checks are
+/// outstanding is read off [`VerificationPipeline::outstanding`] at
+/// each completion rather than held here, so the assembly and the vote
+/// read one answer.
 #[derive(Debug)]
 pub struct PendingAssembly {
     /// Block whose commitments are being verified.
     pub block: Arc<Block>,
     /// Verified QC for [`Self::block`], populated when QC signature
     /// verification completes.
-    pub qc_result: Option<Verified<QuorumCertificate>>,
-    /// Transaction-root verification outcome.
-    pub tx_root_result: Option<Verified<TransactionRoot>>,
-    /// Certificate-root verification outcome.
-    pub certificate_root_result: Option<Verified<CertificateRoot>>,
-    /// Local-receipt-root verification outcome.
-    pub local_receipt_root_result: Option<Verified<LocalReceiptRoot>>,
-    /// Provisions-root verification outcome.
-    pub provision_root_result: Option<Verified<ProvisionsRoot>>,
-    /// Provision-tx-roots map verification outcome.
-    pub provision_tx_roots_result: Option<Verified<ProvisionTxRootsMap>>,
-    /// Beacon-witness-root verification outcome.
-    pub beacon_witness_root_result: Option<Verified<BeaconWitnessRoot>>,
-    /// State-root verification outcome.
-    pub state_root_result: Option<Verified<StateRoot>>,
-}
-
-impl PendingAssembly {
-    /// Every required sub-result is present.
-    #[must_use]
-    pub const fn is_complete(&self) -> bool {
-        self.qc_result.is_some()
-            && self.tx_root_result.is_some()
-            && self.certificate_root_result.is_some()
-            && self.local_receipt_root_result.is_some()
-            && self.provision_root_result.is_some()
-            && self.provision_tx_roots_result.is_some()
-            && self.beacon_witness_root_result.is_some()
-            && self.state_root_result.is_some()
-    }
+    pub qc: Option<Verified<QuorumCertificate>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -276,11 +249,6 @@ pub struct VerificationPipeline {
     verified_qcs: HashMap<BlockHash, Verified<QuorumCertificate>>,
 
     // === State root verification ===
-    /// State-root verification stage per block. Entries appear when the
-    /// verification is queued or completes; absence means "not tracked"
-    /// (either never started or failed).
-    state_roots: HashMap<BlockHash, RootStage>,
-
     /// Blocks waiting for their parent's tree nodes to become available (via
     /// commit or prior verification). Keyed by `parent_block_hash`.
     deferred_state_root_verifications: HashMap<BlockHash, Vec<PendingStateRootVerification>>,
@@ -326,12 +294,11 @@ pub struct VerificationPipeline {
     /// to re-enter `try_propose` with fresh transaction selection.
     proposal_unblocked: bool,
 
-    // === Per-root merkle verification ===
-    /// Verification stage per `(block_hash, kind)` (transaction,
-    /// certificate, local-receipt, provision, provision-tx, beacon-
-    /// witness). State-root rides [`Self::state_roots`] above because
-    /// its lifecycle includes deferred/ready queues for parent-tree
-    /// availability.
+    // === Per-check stage ===
+    /// Stage per `(block_hash, kind)` for every check a block demands.
+    /// Absence means "not dispatched" — never started, refused, or
+    /// deferred; [`Self::outstanding`] reads a block's demands against
+    /// this to say what is still owed.
     roots: HashMap<(BlockHash, VerificationKind), RootStage>,
 
     /// Beacon-witness verifications waiting for a missing/unassembled
@@ -386,7 +353,6 @@ impl VerificationPipeline {
         Self {
             pending_qc_verifications: HashMap::new(),
             verified_qcs: HashMap::new(),
-            state_roots: HashMap::new(),
             deferred_state_root_verifications: HashMap::new(),
             deferred_proposal: None,
             deferred_substate_ancestor: None,
@@ -407,9 +373,8 @@ impl VerificationPipeline {
     // Per-root merkle state (shared helpers)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Whether the given merkle root has been verified for `block_hash`.
-    /// State-root callers use [`Self::is_state_root_verified`] instead.
-    fn is_root_verified(&self, block_hash: BlockHash, kind: VerificationKind) -> bool {
+    /// Whether `kind` has been checked for `block_hash`.
+    pub(crate) fn is_root_verified(&self, block_hash: BlockHash, kind: VerificationKind) -> bool {
         matches!(
             self.roots.get(&(block_hash, kind)),
             Some(RootStage::Verified)
@@ -418,24 +383,11 @@ impl VerificationPipeline {
 
     /// Whether a merkle-root verification is currently in-flight for
     /// `(block_hash, kind)`.
-    fn is_root_in_flight(&self, block_hash: BlockHash, kind: VerificationKind) -> bool {
+    pub(crate) fn is_root_in_flight(&self, block_hash: BlockHash, kind: VerificationKind) -> bool {
         matches!(
             self.roots.get(&(block_hash, kind)),
             Some(RootStage::InFlight)
         )
-    }
-
-    /// Skip the verification when the block carries no relevant content,
-    /// has already been verified, or is already in-flight.
-    fn needs_root(
-        &self,
-        block_hash: BlockHash,
-        kind: VerificationKind,
-        has_relevant_content: bool,
-    ) -> bool {
-        has_relevant_content
-            && !self.is_root_verified(block_hash, kind)
-            && !self.is_root_in_flight(block_hash, kind)
     }
 
     /// Mark the root verification as in-flight so duplicate dispatch is
@@ -452,26 +404,52 @@ impl VerificationPipeline {
         self.roots.contains_key(&(block_hash, kind))
     }
 
-    /// Record a merkle-root verification result for one of the per-kind
-    /// merkle roots (transaction, certificate, local-receipt, provision,
-    /// provision-tx). Returns `valid` so the caller can short-circuit.
-    /// State-root results go through [`Self::on_state_root_verified`].
-    pub fn on_root_verified(
-        &mut self,
-        block_hash: BlockHash,
-        kind: VerificationKind,
-        valid: bool,
-    ) -> bool {
-        if valid {
-            self.roots.insert((block_hash, kind), RootStage::Verified);
-            debug!(?kind, ?block_hash, "Merkle root verified successfully");
-        } else {
-            self.roots.remove(&(block_hash, kind));
-            if kind == VerificationKind::BeaconWitnessRoot {
+    /// One check on `block_hash` answered in the block's favour.
+    ///
+    /// The state root's completion is also what makes the block's tree
+    /// readable, so it releases the children deferred on it, the
+    /// proposal parked on its tree, and the walk parked on its substate
+    /// delta. Any completion may be the last the assembly waits on.
+    pub fn checked(&mut self, block_hash: BlockHash, kind: VerificationKind) {
+        self.roots.insert((block_hash, kind), RootStage::Verified);
+        debug!(?kind, ?block_hash, "Block check passed");
+        if kind == VerificationKind::StateRoot {
+            self.release_deferred_children(block_hash);
+            self.try_unblock_proposal(block_hash);
+            self.release_substate_park(block_hash);
+        }
+        self.try_complete_assembly(block_hash);
+    }
+
+    /// One check on `block_hash` answered against it. The stage is
+    /// dropped, and so is whatever was parked on the block's success:
+    /// a refused beacon-witness root drops the children whose walk
+    /// deferred on it, a refused state root drops the verifications
+    /// deferred on its tree, since neither can ever unblock.
+    pub fn refused(&mut self, block_hash: BlockHash, kind: VerificationKind) {
+        self.roots.remove(&(block_hash, kind));
+        match kind {
+            VerificationKind::BeaconWitnessRoot => {
                 self.discard_deferred_beacon_witness_children(block_hash);
             }
+            VerificationKind::StateRoot => {
+                if let Some(orphans) = self.deferred_state_root_verifications.remove(&block_hash) {
+                    warn!(
+                        block_hash = ?block_hash,
+                        orphaned_count = orphans.len(),
+                        "Clearing deferred state root verifications — parent failed"
+                    );
+                }
+            }
+            _ => {}
         }
-        valid
+    }
+
+    /// One check on `block_hash` could not be answered here yet. The
+    /// in-flight mark clears, so the next re-drive of the vote
+    /// dispatches it again rather than reading it as still running.
+    pub fn deferred(&mut self, block_hash: BlockHash, kind: VerificationKind) {
+        self.roots.remove(&(block_hash, kind));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -528,171 +506,30 @@ impl VerificationPipeline {
     // Composite assembly
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Start tracking `block` as awaiting the sub-results required for
-    /// [`Verified<CertifiedBlock>`] assembly. The QC slot starts empty.
-    /// Per-root slots reflect the current pipeline state:
-    ///
-    /// - if the block carries no relevant content for a kind and the
-    ///   header's claimed root is the canonical empty value (`ZERO`, the
-    ///   empty-input compute), the slot is prefilled with
-    ///   `VerifiedXRoot::new_unchecked(header.x_root())`; a forged non-empty
-    ///   root over empty content fails the equality and leaves the slot
-    ///   outstanding, so it can't pass on the proposer's say-so;
-    /// - if the verification has already completed (its `(block_hash,
-    ///   kind)` entry in [`Self::roots`] is `RootStage::Verified`) the
-    ///   slot is prefilled with the same `new_unchecked` wrap of the
-    ///   header's claim — the verifier produced exactly that value on
-    ///   success and that map entry is the audit source;
-    /// - otherwise the slot starts `None` and lands via the matching
-    ///   `record_<kind>_root_result` setter.
+    /// Start tracking `block` as awaiting a [`Verified<CertifiedBlock>`]:
+    /// its QC, and every check it demands. A block already tracked keeps
+    /// the QC it has.
     pub fn track_pending_assembly(&mut self, block: Arc<Block>) {
-        let block_hash = block.hash();
-        let h = block.header();
-
-        let tx_done = (block.transaction_count() == 0
-            && h.transaction_root() == TransactionRoot::ZERO)
-            || self.is_root_verified(block_hash, VerificationKind::TransactionRoot);
-        let cert_done = (block.certificates().is_empty()
-            && h.certificate_root() == CertificateRoot::ZERO)
-            || self.is_root_verified(block_hash, VerificationKind::CertificateRoot);
-        let receipt_done = (block.certificates().is_empty()
-            && h.local_receipt_root() == LocalReceiptRoot::ZERO)
-            || self.is_root_verified(block_hash, VerificationKind::LocalReceiptRoot);
-        let provision_done = h.provision_root() == ProvisionsRoot::ZERO
-            || self.is_root_verified(block_hash, VerificationKind::ProvisionRoot);
-        let provision_tx_done = h.provision_tx_roots().is_empty()
-            || self.is_root_verified(block_hash, VerificationKind::ProvisionTxRoots);
-        let beacon_done = self.is_root_verified(block_hash, VerificationKind::BeaconWitnessRoot);
-        let state_done = self.is_state_root_verified(&block_hash);
-
-        let tx_root_result = tx_done
-            .then(|| Verified::<TransactionRoot>::from_pipeline_attestation(h.transaction_root()));
-        let certificate_root_result = cert_done
-            .then(|| Verified::<CertificateRoot>::from_pipeline_attestation(h.certificate_root()));
-        let local_receipt_root_result = receipt_done.then(|| {
-            Verified::<LocalReceiptRoot>::from_pipeline_attestation(h.local_receipt_root())
-        });
-        let provision_root_result = provision_done
-            .then(|| Verified::<ProvisionsRoot>::from_pipeline_attestation(h.provision_root()));
-        let provision_tx_roots_result = provision_tx_done.then(|| {
-            Verified::<ProvisionTxRootsMap>::from_pipeline_attestation(
-                h.provision_tx_roots().clone(),
-            )
-        });
-        let beacon_witness_root_result = beacon_done.then(|| {
-            Verified::<BeaconWitnessRoot>::from_pipeline_attestation(h.beacon_witness_root())
-        });
-        let state_root_result =
-            state_done.then(|| Verified::<StateRoot>::from_pipeline_attestation(h.state_root()));
-
-        self.pending_assemblies.insert(
-            block_hash,
-            PendingAssembly {
-                qc_result: None,
-                tx_root_result,
-                certificate_root_result,
-                local_receipt_root_result,
-                provision_root_result,
-                provision_tx_roots_result,
-                beacon_witness_root_result,
-                state_root_result,
-                block,
-            },
-        );
+        self.pending_assemblies
+            .entry(block.hash())
+            .or_insert(PendingAssembly { block, qc: None });
     }
 
     /// Populate the QC slot for `block_hash`'s pending assembly. When the
-    /// last outstanding slot lands as a result, the entry is removed and
-    /// a [`Verified<CertifiedBlock>`] is produced by feeding the verified
-    /// header + typed per-root witnesses into [`Verified::<Block>::assemble`]
-    /// then linking the resulting verified block with the QC via
-    /// [`Verified::<CertifiedBlock>::assemble`]. Returns `None` when no
-    /// assembly is tracked for `block_hash`, or when more sub-results are
-    /// still outstanding.
+    /// last outstanding check has already landed, the entry is removed
+    /// and a [`Verified<CertifiedBlock>`] is produced by feeding the
+    /// verified header and the demands witness into
+    /// [`Verified::<Block>::assemble`], then linking the verified block
+    /// with the QC via [`Verified::<CertifiedBlock>::assemble`]. Returns
+    /// `None` when no assembly is tracked for `block_hash`, or when a
+    /// check is still outstanding.
     pub fn record_qc_assembly(
         &mut self,
         block_hash: BlockHash,
         qc: Verified<QuorumCertificate>,
     ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
-        entry.qc_result = Some(qc);
-        self.try_complete_assembly(block_hash)
-    }
-
-    /// Populate the transaction-root slot.
-    pub fn record_transaction_root_result(
-        &mut self,
-        block_hash: BlockHash,
-        verified: Verified<TransactionRoot>,
-    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
-        let entry = self.pending_assemblies.get_mut(&block_hash)?;
-        entry.tx_root_result = Some(verified);
-        self.try_complete_assembly(block_hash)
-    }
-
-    /// Populate the certificate-root slot.
-    pub fn record_certificate_root_result(
-        &mut self,
-        block_hash: BlockHash,
-        verified: Verified<CertificateRoot>,
-    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
-        let entry = self.pending_assemblies.get_mut(&block_hash)?;
-        entry.certificate_root_result = Some(verified);
-        self.try_complete_assembly(block_hash)
-    }
-
-    /// Populate the local-receipt-root slot.
-    pub fn record_local_receipt_root_result(
-        &mut self,
-        block_hash: BlockHash,
-        verified: Verified<LocalReceiptRoot>,
-    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
-        let entry = self.pending_assemblies.get_mut(&block_hash)?;
-        entry.local_receipt_root_result = Some(verified);
-        self.try_complete_assembly(block_hash)
-    }
-
-    /// Populate the provisions-root slot.
-    pub fn record_provisions_root_result(
-        &mut self,
-        block_hash: BlockHash,
-        verified: Verified<ProvisionsRoot>,
-    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
-        let entry = self.pending_assemblies.get_mut(&block_hash)?;
-        entry.provision_root_result = Some(verified);
-        self.try_complete_assembly(block_hash)
-    }
-
-    /// Populate the provision-tx-roots slot.
-    pub fn record_provision_tx_roots_result(
-        &mut self,
-        block_hash: BlockHash,
-        verified: Verified<ProvisionTxRootsMap>,
-    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
-        let entry = self.pending_assemblies.get_mut(&block_hash)?;
-        entry.provision_tx_roots_result = Some(verified);
-        self.try_complete_assembly(block_hash)
-    }
-
-    /// Populate the beacon-witness-root slot.
-    pub fn record_beacon_witness_root_result(
-        &mut self,
-        block_hash: BlockHash,
-        verified: Verified<BeaconWitnessRoot>,
-    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
-        let entry = self.pending_assemblies.get_mut(&block_hash)?;
-        entry.beacon_witness_root_result = Some(verified);
-        self.try_complete_assembly(block_hash)
-    }
-
-    /// Populate the state-root slot.
-    pub fn record_state_root_result(
-        &mut self,
-        block_hash: BlockHash,
-        verified: Verified<StateRoot>,
-    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
-        let entry = self.pending_assemblies.get_mut(&block_hash)?;
-        entry.state_root_result = Some(verified);
+        entry.qc = Some(qc);
         self.try_complete_assembly(block_hash)
     }
 
@@ -700,32 +537,16 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
     ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
-        if !self.pending_assemblies.get(&block_hash)?.is_complete() {
+        let entry = self.pending_assemblies.get(&block_hash)?;
+        if entry.qc.is_none() || !self.outstanding(&entry.block).is_empty() {
             return None;
         }
         let entry = self.pending_assemblies.remove(&block_hash)?;
+        let demands = self.demands_of(&entry.block);
         let block = Arc::try_unwrap(entry.block).unwrap_or_else(|arc| (*arc).clone());
         let qc = entry
-            .qc_result
-            .expect("completion check just confirmed qc_result is Some");
-        let tx_root = entry
-            .tx_root_result
-            .expect("completion check just confirmed tx_root_result is Some");
-        let certificate_root = entry
-            .certificate_root_result
-            .expect("completion check just confirmed certificate_root_result is Some");
-        let local_receipt_root = entry
-            .local_receipt_root_result
-            .expect("completion check just confirmed local_receipt_root_result is Some");
-        let provision_root = entry
-            .provision_root_result
-            .expect("completion check just confirmed provision_root_result is Some");
-        let provision_tx_roots = entry
-            .provision_tx_roots_result
-            .expect("completion check just confirmed provision_tx_roots_result is Some");
-        let beacon_witness_root = entry
-            .beacon_witness_root_result
-            .expect("completion check just confirmed beacon_witness_root_result is Some");
+            .qc
+            .expect("completion check just confirmed the QC is held");
 
         let parent_qc_raw = block.header().parent_qc();
         let parent_qc_verified = if parent_qc_raw.is_genesis() {
@@ -751,12 +572,7 @@ impl VerificationPipeline {
         let verified_block = match Verified::<Block>::assemble(
             block,
             verified_header,
-            tx_root,
-            certificate_root,
-            local_receipt_root,
-            provision_root,
-            provision_tx_roots,
-            beacon_witness_root,
+            Verified::<Demands>::from_pipeline_attestation(demands),
         ) {
             Ok(v) => v,
             Err(e) => return Some(Err(AssemblyError::Block(e))),
@@ -820,10 +636,7 @@ impl VerificationPipeline {
     /// verification is running — the leader proposed, we received the block,
     /// the timeout should detect leader failure, not slow verification.
     pub fn has_verification_in_flight(&self) -> bool {
-        self.state_roots
-            .values()
-            .any(|stage| *stage == RootStage::InFlight)
-            || !self.deferred_state_root_verifications.is_empty()
+        !self.deferred_state_root_verifications.is_empty()
             || !self.deferred_beacon_witness_verifications.is_empty()
             || self.deferred_proposal.is_some()
             || self
@@ -844,124 +657,78 @@ impl VerificationPipeline {
     /// `PreparedCommit` from `VerifyStateRoot` already in the cache) and
     /// `CommitBlockByQcOnly` (slow path — compute inline at commit time).
     pub fn is_state_root_verified(&self, block_hash: &BlockHash) -> bool {
-        matches!(self.state_roots.get(block_hash), Some(RootStage::Verified))
+        self.is_root_verified(*block_hash, VerificationKind::StateRoot)
     }
 
-    /// Whether state-root verification is currently in-flight for `block_hash`.
-    fn is_state_root_in_flight(&self, block_hash: &BlockHash) -> bool {
-        matches!(self.state_roots.get(block_hash), Some(RootStage::InFlight))
+    /// Every check `block` demands: its own, plus the reservations the
+    /// coordinator derived for it, which are a fact of this shard's
+    /// payers rather than of the block and so are known only once
+    /// dispatched.
+    fn demands_of(&self, block: &Block) -> Demands {
+        let demands = block.demands();
+        if self.is_root_tracked(block.hash(), VerificationKind::Reservations) {
+            demands.with(VerificationKind::Reservations)
+        } else {
+            demands
+        }
     }
 
-    /// Check if all async verifications are complete for a block.
-    ///
-    /// Returns true if source attestation, state root, and transaction root
-    /// verifications are all done (or not needed).
-    pub fn is_block_verified(&self, block: &Block) -> bool {
+    /// The checks `block` demands that have not passed.
+    pub fn outstanding(&self, block: &Block) -> BTreeSet<VerificationKind> {
         let block_hash = block.hash();
-        let h = block.header();
+        self.demands_of(block)
+            .outstanding(|kind| self.is_root_verified(block_hash, kind))
+    }
 
-        let root_ok =
-            |kind, has_content: bool| !has_content || self.is_root_verified(block_hash, kind);
-
-        self.is_state_root_verified(&block_hash)
-            && root_ok(
-                VerificationKind::TransactionRoot,
-                block.transaction_count() > 0,
-            )
-            && root_ok(
-                VerificationKind::CertificateRoot,
-                !block.certificates().is_empty(),
-            )
-            && root_ok(
-                VerificationKind::LocalReceiptRoot,
-                !block.certificates().is_empty(),
-            )
-            && root_ok(
-                VerificationKind::ProvisionRoot,
-                h.provision_root() != ProvisionsRoot::ZERO,
-            )
-            && root_ok(
-                VerificationKind::ProvisionTxRoots,
-                !h.provision_tx_roots().is_empty(),
-            )
-            && root_ok(VerificationKind::BeaconWitnessRoot, true)
-            && root_ok(
-                VerificationKind::Reservations,
-                self.is_root_tracked(block_hash, VerificationKind::Reservations),
-            )
-            && self.verified_in_flight.contains(&block_hash)
+    /// Whether every check `block` demands has passed, and its drain
+    /// total was re-derived and matched.
+    pub fn is_block_verified(&self, block: &Block) -> bool {
+        self.outstanding(block).is_empty() && self.verified_in_flight.contains(&block.hash())
     }
 
     /// Log why a block's verification is incomplete. Called on view change
     /// to explain why the current block couldn't be voted on in time.
     pub fn log_incomplete_verification(&self, block: &Block) {
         let block_hash = block.hash();
-        let h = block.header();
-
-        let state_root_status = if self.is_state_root_verified(&block_hash) {
-            "verified"
-        } else if self.is_state_root_in_flight(&block_hash) {
-            "in_flight"
-        } else if self
-            .deferred_state_root_verifications
-            .values()
-            .any(|v| v.iter().any(|r| r.block_hash == block_hash))
-        {
-            "deferred(parent)"
-        } else {
-            "NOT_STARTED"
-        };
-
-        let root_status = |kind: VerificationKind, skip_label: &'static str, has_content: bool| {
-            if !has_content {
-                skip_label
-            } else if self.is_root_verified(block_hash, kind) {
+        let stage = |kind: VerificationKind| -> &'static str {
+            if self.is_root_verified(block_hash, kind) {
                 "verified"
             } else if self.is_root_in_flight(block_hash, kind) {
                 "in_flight"
             } else {
-                "NOT_STARTED"
+                match kind {
+                    VerificationKind::StateRoot
+                        if self
+                            .deferred_state_root_verifications
+                            .values()
+                            .any(|v| v.iter().any(|r| r.block_hash == block_hash)) =>
+                    {
+                        "deferred(parent)"
+                    }
+                    VerificationKind::BeaconWitnessRoot => match self
+                        .beacon_witness_defer(block_hash)
+                    {
+                        Some((_, BeaconWitnessDefer::WitnessAncestor)) => {
+                            "deferred(witness_ancestor)"
+                        }
+                        Some((_, BeaconWitnessDefer::SubstateCount)) => "deferred(substate_count)",
+                        Some((_, BeaconWitnessDefer::ParentRevealChain)) => {
+                            "deferred(parent_reveal_chain)"
+                        }
+                        None => "NOT_STARTED",
+                    },
+                    _ => "NOT_STARTED",
+                }
             }
         };
-
-        let tx_root_status = root_status(
-            VerificationKind::TransactionRoot,
-            "skipped(no_txs)",
-            block.transaction_count() > 0,
-        );
-        let certificate_root_status = root_status(
-            VerificationKind::CertificateRoot,
-            "skipped(no_certs)",
-            !block.certificates().is_empty(),
-        );
-        let local_receipt_root_status = root_status(
-            VerificationKind::LocalReceiptRoot,
-            "skipped(no_certs)",
-            !block.certificates().is_empty(),
-        );
-        let provision_root_status = root_status(
-            VerificationKind::ProvisionRoot,
-            "skipped(no_provisions)",
-            h.provision_root() != ProvisionsRoot::ZERO,
-        );
-        let provision_tx_root_status = root_status(
-            VerificationKind::ProvisionTxRoots,
-            "skipped(no_provision_targets)",
-            !h.provision_tx_roots().is_empty(),
-        );
-        let reservations_status = root_status(
-            VerificationKind::Reservations,
-            "skipped(no_local_payers)",
-            self.is_root_tracked(block_hash, VerificationKind::Reservations),
-        );
-        let beacon_witness_defer = self.beacon_witness_defer(block_hash);
-        let beacon_witness_root_status = match beacon_witness_defer {
-            Some((_, BeaconWitnessDefer::WitnessAncestor)) => "deferred(witness_ancestor)",
-            Some((_, BeaconWitnessDefer::SubstateCount)) => "deferred(substate_count)",
-            Some((_, BeaconWitnessDefer::ParentRevealChain)) => "deferred(parent_reveal_chain)",
-            None => root_status(VerificationKind::BeaconWitnessRoot, "skipped", true),
-        };
-
+        let checks: Vec<(VerificationKind, &'static str)> = self
+            .demands_of(block)
+            .iter()
+            .map(|kind| (kind, stage(kind)))
+            .collect();
+        let beacon_witness_blocker = self
+            .beacon_witness_defer(block_hash)
+            .map(|(blocker, _)| blocker);
         let in_flight_status = if self.verified_in_flight.contains(&block_hash) {
             "verified"
         } else {
@@ -974,15 +741,8 @@ impl VerificationPipeline {
             proposer = ?block.header().proposer(),
             certs = block.certificates().len(),
             txs = block.transaction_count(),
-            state_root = state_root_status,
-            tx_root = tx_root_status,
-            certificate_root = certificate_root_status,
-            local_receipt_root = local_receipt_root_status,
-            provision_root = provision_root_status,
-            provision_tx_root = provision_tx_root_status,
-            reservations = reservations_status,
-            beacon_witness_root = beacon_witness_root_status,
-            beacon_witness_blocker = ?beacon_witness_defer.map(|(blocker, _)| blocker),
+            ?checks,
+            ?beacon_witness_blocker,
             in_flight = in_flight_status,
             "View change — block verification was incomplete"
         );
@@ -998,16 +758,11 @@ impl VerificationPipeline {
     pub fn needs_state_root_verification(&self, block: &Block) -> bool {
         let block_hash = block.hash();
 
-        if self.state_roots.contains_key(&block_hash)
-            || self
+        !self.is_root_tracked(block_hash, VerificationKind::StateRoot)
+            && !self
                 .deferred_state_root_verifications
                 .values()
                 .any(|v| v.iter().any(|r| r.block_hash == block_hash))
-        {
-            return false;
-        }
-
-        true
     }
 
     /// Push a `PendingStateRootVerification` onto the ready queue and mark
@@ -1015,8 +770,10 @@ impl VerificationPipeline {
     /// in-flight marker tracks the same dispatch lifecycle as state-root —
     /// the unified `VerifyStateRoot` handler emits both events.
     fn enqueue_ready_state_root(&mut self, ready: PendingStateRootVerification) {
-        self.state_roots
-            .insert(ready.block_hash, RootStage::InFlight);
+        self.roots.insert(
+            (ready.block_hash, VerificationKind::StateRoot),
+            RootStage::InFlight,
+        );
         self.roots.insert(
             (ready.block_hash, VerificationKind::LocalReceiptRoot),
             RootStage::InFlight,
@@ -1062,31 +819,7 @@ impl VerificationPipeline {
         // the tree store or in the snapshot cache (from a prior verification).
         // Defer if: parent height exceeds committed JMT AND parent hasn't
         // been verified (no snapshot in the overlay).
-        let parent_tree_available = parent_block_height <= self.last_persisted_height
-            || self.is_state_root_verified(&parent_block_hash);
-
-        // A sync-admitted parent is QC-attested but never locally verified,
-        // and its tree materializes only at commit — which needs the
-        // successor QC this very verification gates. A tick-less child
-        // applies no updates, so it reads no tree version and its root is
-        // decided by the attested parent root alone; the parent commits
-        // first in height order, so nothing prepares over a version the
-        // tree never persisted. A child that does apply updates keeps
-        // deferring, because its prepared snapshot would chain to one.
-        //
-        // A terminating boundary block is the exception the emptiness test
-        // alone does not catch: it coasts its chain to the cut carrying no
-        // certificates, but its child-subtree and terminal root claims are
-        // answered from the tree, so it needs the version a bare tick-less
-        // block does not.
-        let reads_the_tree = split_child_roots_required || terminal_roots_required;
-        let parent_qc_attested = block.certificates().is_empty()
-            && !reads_the_tree
-            && self
-                .verified_certified_blocks
-                .contains_key(&parent_block_hash);
-
-        if parent_tree_available || parent_qc_attested {
+        if self.parent_tree_available(parent_block_height, parent_block_hash) {
             self.enqueue_ready_state_root(ready);
         } else {
             debug!(
@@ -1101,96 +834,22 @@ impl VerificationPipeline {
         }
     }
 
-    /// Record a state root verification result. Returns whether the verification passed.
+    /// Mark every check the proposer's own block demands as passed.
     ///
-    /// On success, unblocks any child blocks that were deferred waiting for
-    /// this parent's verification to complete.
-    pub fn on_state_root_verified(&mut self, block_hash: BlockHash, valid: bool) -> bool {
-        if valid {
-            self.state_roots.insert(block_hash, RootStage::Verified);
-            debug!(block_hash = ?block_hash, "State root verified successfully");
-
-            // Unblock children that were waiting for this parent.
-            if let Some(deferred) = self.deferred_state_root_verifications.remove(&block_hash) {
-                for ready in deferred {
-                    debug!(
-                        child = ?ready.block_hash,
-                        parent = ?block_hash,
-                        "Unblocking deferred state root verification"
-                    );
-                    self.enqueue_ready_state_root(ready);
-                }
-            }
-
-            // Unblock deferred proposal if it was waiting for this parent.
-            self.try_unblock_proposal(block_hash);
-            // A verified state root also supplies the block's substate byte
-            // delta, which a proposal's reshape predicate may be parked on.
-            self.release_substate_park(block_hash);
-        } else {
-            self.state_roots.remove(&block_hash);
-            warn!(block_hash = ?block_hash, "State root verification FAILED");
-
-            // Clear deferred children — they can never unblock since the
-            // parent failed. Without this, deferred entries are orphaned
-            // and block verification indefinitely.
-            if let Some(orphans) = self.deferred_state_root_verifications.remove(&block_hash) {
-                warn!(
-                    block_hash = ?block_hash,
-                    orphaned_count = orphans.len(),
-                    "Clearing deferred state root verifications — parent failed"
-                );
-            }
-        }
-
-        valid
-    }
-
-    /// Mark a block's state root as verified because the proposer built it.
-    ///
-    /// The proposer computed the state root during `BuildProposal`, so it is
-    /// inherently correct. This populates the overlay chain so that child
-    /// blocks can verify without waiting for the block to be committed.
-    fn mark_proposal_state_root_verified(&mut self, block_hash: BlockHash) {
-        self.state_roots.insert(block_hash, RootStage::Verified);
-
-        // Unblock children deferred on this parent.
-        if let Some(deferred) = self.deferred_state_root_verifications.remove(&block_hash) {
-            for ready in deferred {
-                debug!(
-                    child = ?ready.block_hash,
-                    parent = ?block_hash,
-                    "Unblocking deferred state root verification (proposer verified)"
-                );
-                self.enqueue_ready_state_root(ready);
-            }
-        }
-
-        // Unblock deferred proposal if it was waiting for this parent.
-        self.try_unblock_proposal(block_hash);
-    }
-
-    /// Mark all roots as verified for the proposer's own block.
-    ///
-    /// The proposer built the block, so all merkle roots — including the
-    /// beacon witness root it derived from its own accumulator — are
-    /// inherently correct. This marks every root kind, the state root,
-    /// and in-flight as verified so the verification pipeline is
-    /// complete. Without this, a view change would report these as
-    /// `NOT_STARTED` since the proposer path bypasses
+    /// The proposer built the block, so every root it claims — the
+    /// beacon witness root it derived from its own accumulator among
+    /// them — is inherently correct, and its state root is what
+    /// populates the overlay chain for child blocks to verify against
+    /// before it commits. Without this a view change would report the
+    /// checks as `NOT_STARTED`, since the proposer path bypasses
     /// `try_vote_on_block`.
-    pub fn mark_proposal_fully_verified(&mut self, block_hash: BlockHash) {
-        self.mark_proposal_state_root_verified(block_hash);
-        for kind in [
-            VerificationKind::TransactionRoot,
-            VerificationKind::CertificateRoot,
-            VerificationKind::LocalReceiptRoot,
-            VerificationKind::ProvisionRoot,
-            VerificationKind::ProvisionTxRoots,
-            VerificationKind::BeaconWitnessRoot,
-        ] {
+    pub fn mark_proposal_fully_verified(&mut self, block: &Block) {
+        let block_hash = block.hash();
+        for kind in block.demands().iter() {
             self.roots.insert((block_hash, kind), RootStage::Verified);
         }
+        self.release_deferred_children(block_hash);
+        self.try_unblock_proposal(block_hash);
         self.verified_in_flight.insert(block_hash);
     }
 
@@ -1209,6 +868,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         block: &Block,
+        late_deliveries: HashSet<TxHash>,
     ) -> Vec<Action> {
         debug!(
             ?block_hash,
@@ -1222,6 +882,7 @@ impl VerificationPipeline {
             expected_root: block.header().transaction_root(),
             transactions: block.transactions().clone(),
             validity_anchor: block.header().parent_qc().weighted_timestamp(),
+            late_deliveries,
         }]
     }
 
@@ -1283,6 +944,7 @@ impl VerificationPipeline {
             block_hash,
             expected: block.header().provision_tx_roots().clone(),
             transactions: block.transactions().clone(),
+            certificates: block.certificates().clone(),
             topology_snapshot: topology_snapshot.clone(),
         }]
     }
@@ -1318,6 +980,59 @@ impl VerificationPipeline {
         }]
     }
 
+    /// Initiate the check of a block's resolutions against the bodies
+    /// they name: the figures its abandonment records restate, and the
+    /// deliveries its finalizations carry against the lapse at the
+    /// block's anchor. Callers skip the dispatch when there is nothing to
+    /// check. The handler reads each named transaction off the store and
+    /// answers with a [`Resolutions`](hyperscale_types::Resolutions), which
+    /// the coordinator folds into the pipeline: exact verifies, wrong or
+    /// lapsed refuses, and unknown leaves the root in flight — the vote
+    /// deferred, the block pending.
+    pub fn initiate_resolutions_verification(
+        &mut self,
+        block_hash: BlockHash,
+        block: &Block,
+        schedule: &TopologySchedule,
+    ) -> Vec<Action> {
+        let anchor = block.header().parent_qc().weighted_timestamp();
+        // No window, no check: the mark is not taken and no action goes
+        // out, so the block stays pending and the next re-drive asks
+        // again — the same shape an unknown name takes.
+        let Some(trie) = anchor_trie(schedule, anchor) else {
+            warn!(
+                ?block_hash,
+                ?anchor,
+                "Deferring resolutions verification — no retained window carries the anchor"
+            );
+            return Vec::new();
+        };
+        let entries: Vec<UnsettledTx> = block
+            .abandonment_records()
+            .iter()
+            .flat_map(AbandonmentRecord::unsettled)
+            .cloned()
+            .collect();
+        let deliveries = block.undecided_names();
+        let successes = block.successes_decided_alone();
+        debug!(
+            ?block_hash,
+            names = entries.len(),
+            deliveries = deliveries.len(),
+            successes = successes.len(),
+            "Initiating resolutions verification"
+        );
+        self.mark_root_in_flight(block_hash, VerificationKind::Resolutions);
+        vec![Action::VerifyResolutions {
+            block_hash,
+            entries,
+            deliveries,
+            successes,
+            anchor,
+            trie,
+        }]
+    }
+
     /// Initiate beacon-witness root verification for a block, or defer
     /// it if the prospective-parent walk hits a missing/unassembled
     /// ancestor.
@@ -1328,7 +1043,7 @@ impl VerificationPipeline {
     /// `finalizations` from the block itself) so callers only thread
     /// the parts they own.
     /// The handler re-derives the leaf list and emits
-    /// `BeaconWitnessRootVerified { block_hash, valid }`.
+    /// `BlockCheckCompleted` for the beacon witness root.
     ///
     /// When [`prospective_parent_witness_leaves`] returns `Err`, the
     /// verification is parked on the blocking ancestor's hash and the
@@ -1847,7 +1562,7 @@ impl VerificationPipeline {
     /// so the beacon-witness initiator can resolve `parent_witness_leaves`
     /// by walking the pending chain — beacon-witness is the only root
     /// verifier whose inputs span the in-flight chain prefix.
-    #[allow(clippy::too_many_arguments)] // single dispatch over six per-root sub-verifications
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one dispatch over the per-root verifiers
     pub(crate) fn initiate_block_verifications(
         &mut self,
         topology_snapshot: &TopologySnapshot,
@@ -1870,102 +1585,107 @@ impl VerificationPipeline {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let h = block.header();
+        let anchor = h.parent_qc().weighted_timestamp();
+        let wanted: Vec<VerificationKind> = self
+            .outstanding(block)
+            .into_iter()
+            .filter(|&kind| !self.is_root_in_flight(block_hash, kind))
+            .collect();
 
-        if self.needs_state_root_verification(block) {
-            let parent_block_height = h.parent_qc().height();
-            let settled_txs_window_floor =
-                schedule.settled_window_floor(local_shard, h.parent_qc().weighted_timestamp());
-            self.initiate_state_root_verification(
-                block_hash,
-                block,
-                parent_block_height,
-                split_child_roots_required,
-                terminal_roots_required,
-                settled_txs_window_floor,
-            );
+        for kind in wanted {
+            match kind {
+                // The state root's own deferred queue is the second
+                // place it may already be waiting.
+                VerificationKind::StateRoot => {
+                    if self.needs_state_root_verification(block) {
+                        self.initiate_state_root_verification(
+                            block_hash,
+                            block,
+                            h.parent_qc().height(),
+                            split_child_roots_required,
+                            terminal_roots_required,
+                            schedule.settled_window_floor(local_shard, anchor),
+                        );
+                    }
+                }
+                VerificationKind::TransactionRoot => {
+                    let late = late_deliveries(block.transactions(), schedule, anchor, local_shard);
+                    actions.extend(
+                        self.initiate_transaction_root_verification(block_hash, block, late),
+                    );
+                }
+                VerificationKind::ProvisionRoot => {
+                    if let Some(pending) = pending_blocks.get(block_hash) {
+                        actions.extend(self.initiate_provision_root_verification(
+                            block_hash,
+                            block,
+                            pending.manifest(),
+                        ));
+                    }
+                }
+                VerificationKind::CertificateRoot => {
+                    actions.extend(self.initiate_certificate_root_verification(block_hash, block));
+                }
+                VerificationKind::ProvisionTxRoots => {
+                    actions.extend(self.initiate_provision_tx_root_verification(
+                        block_hash,
+                        block,
+                        topology_snapshot,
+                    ));
+                }
+                // The state root's replay checks the receipts first and
+                // answers for both; reservations are demanded only once
+                // dispatched below, so neither is ever dispatched here.
+                VerificationKind::LocalReceiptRoot | VerificationKind::Reservations => {}
+                VerificationKind::Resolutions => {
+                    actions.extend(
+                        self.initiate_resolutions_verification(block_hash, block, schedule),
+                    );
+                }
+                VerificationKind::BeaconWitnessRoot => {
+                    if !self.is_beacon_witness_deferred(block_hash) {
+                        actions.extend(self.initiate_beacon_witness_root_verification(
+                            block_hash,
+                            block,
+                            pending_blocks,
+                            accumulator,
+                            committed_hash,
+                            committed_reveal_chain,
+                            committed_block_anchor_wt,
+                            committed_committee_anchor_wt,
+                            local_shard,
+                            topology_snapshot,
+                            schedule,
+                            count_source,
+                        ));
+                    }
+                }
+            }
         }
 
-        if self.needs_root(
-            block_hash,
-            VerificationKind::TransactionRoot,
-            block.transaction_count() > 0,
-        ) {
-            actions.extend(self.initiate_transaction_root_verification(block_hash, block));
-        }
-
-        if self.needs_root(
-            block_hash,
-            VerificationKind::ProvisionRoot,
-            h.provision_root() != ProvisionsRoot::ZERO,
-        ) && let Some(pending) = pending_blocks.get(block_hash)
+        // Reservations are demanded by the coordinator's derivation
+        // rather than by the block, and only once: the first dispatch
+        // tracks the kind, and every later pass reads it as outstanding
+        // through the ordinary rule.
+        if !fee_demands.is_empty()
+            && !self.is_root_tracked(block_hash, VerificationKind::Reservations)
         {
-            actions.extend(self.initiate_provision_root_verification(
-                block_hash,
-                block,
-                pending.manifest(),
-            ));
-        }
-
-        if self.needs_root(
-            block_hash,
-            VerificationKind::CertificateRoot,
-            !block.certificates().is_empty(),
-        ) {
-            actions.extend(self.initiate_certificate_root_verification(block_hash, block));
-        }
-
-        if self.needs_root(
-            block_hash,
-            VerificationKind::ProvisionTxRoots,
-            !h.provision_tx_roots().is_empty(),
-        ) {
-            actions.extend(self.initiate_provision_tx_root_verification(
-                block_hash,
-                block,
-                topology_snapshot,
-            ));
-        }
-
-        if self.needs_root(
-            block_hash,
-            VerificationKind::Reservations,
-            !fee_demands.is_empty(),
-        ) {
             if fee_read_ready {
                 actions.extend(self.initiate_reservations_verification(
                     block_hash,
                     fee_demands,
                     fee_read_height,
-                    h.parent_qc().weighted_timestamp(),
+                    anchor,
                 ));
             } else {
                 // The anchor height isn't materialized locally yet — the
                 // ancestry proves its commit but the commit pipeline
-                // hasn't landed it. Mark the root in flight so the block
+                // hasn't landed it. Mark the check in flight so the block
                 // stays unvotable; the coordinator holds the demands and
                 // re-dispatches when the commit that materializes the
                 // anchor lands.
                 self.mark_root_in_flight(block_hash, VerificationKind::Reservations);
             }
-        }
-
-        if self.needs_root(block_hash, VerificationKind::BeaconWitnessRoot, true)
-            && !self.is_beacon_witness_deferred(block_hash)
-        {
-            actions.extend(self.initiate_beacon_witness_root_verification(
-                block_hash,
-                block,
-                pending_blocks,
-                accumulator,
-                committed_hash,
-                committed_reveal_chain,
-                committed_block_anchor_wt,
-                committed_committee_anchor_wt,
-                local_shard,
-                topology_snapshot,
-                schedule,
-                count_source,
-            ));
         }
 
         actions
@@ -2011,49 +1731,24 @@ impl VerificationPipeline {
         }
     }
 
-    /// Verify the block settles determined halves in order, and claims
-    /// the frontier that leaves.
-    ///
-    /// A receipt states an absolute computed from its tick's baseline and
-    /// settlement is last writer per cell, so an earlier tick's
-    /// determined half landing after a later one's reverts a write later
-    /// ticks have already read. Every replica would then agree on the
-    /// wrong state — there is no divergence to notice afterwards, which
-    /// is why the order has to be refused up front rather than detected.
-    ///
-    /// Two conditions, both read off the block: the determined halves it
-    /// carries rise strictly, starting above the parent's frontier, and
-    /// the claimed frontier is where they end. Legs halves are not
-    /// constrained — a leg's declared cells are claimed against every
-    /// later tick from the moment it executes, so it has nothing to
-    /// invert against, and it may settle arbitrarily late without
-    /// wedging the ticks above it.
+    /// Verify the block claims the settlement frontier its determined
+    /// halves leave: where the last of them settles, or the parent's
+    /// frontier where it carries none. That the halves rise strictly
+    /// above the parent's frontier is admission's rule, judged before
+    /// this.
     pub fn verify_settled_order(
         block_hash: BlockHash,
         block: &Block,
         parent_settled_frontier: BlockHeight,
     ) -> bool {
-        let mut frontier = parent_settled_frontier;
-        for fw in block.certificates().iter() {
-            let fw = fw.as_unverified();
-            if !fw.is_determined() {
-                continue;
-            }
-            let tick = fw.tick_id().block_height();
-            if tick <= frontier {
-                warn!(
-                    block_hash = ?block_hash,
-                    height = block.height().inner(),
-                    tick = tick.inner(),
-                    frontier = frontier.inner(),
-                    "Settlement order verification failed — a determined half at or below \
-                     the frontier it would settle under"
-                );
-                return false;
-            }
-            frontier = tick;
-        }
-
+        let frontier = block
+            .certificates()
+            .iter()
+            .map(|fw| fw.as_unverified())
+            .filter(|fw| fw.is_determined())
+            .map(|fw| fw.tick_id().block_height())
+            .max()
+            .unwrap_or(parent_settled_frontier);
         let proposed = block.header().settled_tick_frontier();
         if proposed == frontier {
             true
@@ -2143,21 +1838,19 @@ impl VerificationPipeline {
         pending: &PendingStateRootVerification,
         chain: &ChainView<'_>,
     ) -> Option<ReadyStateRootVerification> {
-        let block = chain
-            .get_pending(pending.block_hash)
-            .and_then(PendingBlock::block)
-            .or_else(|| {
-                debug!(
-                    block_hash = ?pending.block_hash,
-                    "Skipping state root verification — pending block no longer present"
-                );
-                None
-            })?;
+        let block = chain.get_block(pending.block_hash).or_else(|| {
+            debug!(
+                block_hash = ?pending.block_hash,
+                "Skipping state root verification — block no longer present"
+            );
+            None
+        })?;
         let parent_state_root = chain.parent_state_root(pending.parent_block_hash);
         let finalizations: Vec<Arc<Verifiable<Finalization>>> =
             block.certificates().iter().cloned().collect();
         let block_tx_hashes: Vec<TxHash> =
             block.transactions().iter().map(|tx| tx.hash()).collect();
+        let creations = committed_cells_for(block);
         Some(ReadyStateRootVerification {
             block_hash: pending.block_hash,
             parent_block_hash: pending.parent_block_hash,
@@ -2167,6 +1860,7 @@ impl VerificationPipeline {
             expected_local_receipt_root: pending.expected_local_receipt_root,
             finalizations,
             block_tx_hashes,
+            creations,
             block_height: pending.block_height,
             claimed_split_child_roots: pending.claimed_split_child_roots,
             split_child_roots_required: pending.split_child_roots_required,
@@ -2200,9 +1894,10 @@ impl VerificationPipeline {
         self.proposal_unblocked = true;
     }
 
-    /// Check if a parent's tree nodes are available (persisted or verified
-    /// or consensus-committed — all three place the parent's JMT snapshot
-    /// either on disk or in the `PendingChain` overlay).
+    /// Check if a parent's tree nodes are available: persisted, or
+    /// verified with its JMT snapshot in the `PendingChain` overlay.
+    /// Verification is the same act on a live block and a sync-admitted
+    /// one, so a verified parent always has a tree to build on.
     pub fn parent_tree_available(
         &self,
         parent_block_height: BlockHeight,
@@ -2210,6 +1905,25 @@ impl VerificationPipeline {
     ) -> bool {
         parent_block_height <= self.last_persisted_height
             || self.is_state_root_verified(&parent_block_hash)
+    }
+
+    /// Release the children deferred on `parent_block_hash` now that its
+    /// tree is in the overlay.
+    fn release_deferred_children(&mut self, parent_block_hash: BlockHash) {
+        let Some(deferred) = self
+            .deferred_state_root_verifications
+            .remove(&parent_block_hash)
+        else {
+            return;
+        };
+        for ready in deferred {
+            debug!(
+                child = ?ready.block_hash,
+                parent = ?parent_block_hash,
+                "Unblocking deferred state root verification"
+            );
+            self.enqueue_ready_state_root(ready);
+        }
     }
 
     /// Record that a proposal is deferred until the parent's tree nodes are
@@ -2337,24 +2051,14 @@ impl VerificationPipeline {
     /// verifications proceed as soon as the parent's tree is readable from
     /// the overlay, without waiting for `BlockPersisted`.
     pub fn on_block_committed(&mut self, block_hash: BlockHash) {
-        let was_verified = matches!(
-            self.state_roots.insert(block_hash, RootStage::Verified),
-            Some(RootStage::Verified)
-        );
-        if was_verified {
+        if self.is_state_root_verified(&block_hash) {
             return;
         }
-
-        if let Some(deferred) = self.deferred_state_root_verifications.remove(&block_hash) {
-            for ready in deferred {
-                debug!(
-                    child = ?ready.block_hash,
-                    parent = ?block_hash,
-                    "Unblocking deferred state root verification (parent committed)"
-                );
-                self.enqueue_ready_state_root(ready);
-            }
-        }
+        self.roots.insert(
+            (block_hash, VerificationKind::StateRoot),
+            RootStage::Verified,
+        );
+        self.release_deferred_children(block_hash);
 
         self.try_unblock_proposal(block_hash);
         // A sync-admitted block is never locally executed, so no delta can
@@ -2367,7 +2071,8 @@ impl VerificationPipeline {
     // Cleanup
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Remove verification state for blocks no longer in `pending_blocks`.
+    /// Remove verification state for blocks no longer in `pending_blocks`
+    /// or in the certified cache.
     ///
     /// Called by `ShardCoordinator::cleanup_old_state()` after it has cleaned up
     /// `pending_blocks`. We use the surviving `pending_blocks` set to determine
@@ -2375,24 +2080,33 @@ impl VerificationPipeline {
     ///
     /// Most verification state is keyed by block hash and cleaned up based on
     /// `pending_blocks` membership (if the block is gone, its verification state
-    /// is stale). The `verified_qcs` cache is the exception: it's keyed by the
-    /// QC's certified block hash (not the proposing block), so it uses
-    /// height-based retention with a 2-block buffer to support view-change
-    /// scenarios where multiple proposals share the same parent QC.
+    /// is stale). State-root state also lives for a sync-admitted block,
+    /// which is never pending: it is retained with the certified cache,
+    /// whose entries outlive their commit. The `verified_qcs` cache is the
+    /// other exception: it's keyed by the QC's certified block hash (not
+    /// the proposing block), so it uses height-based retention with a
+    /// 2-block buffer to support view-change scenarios where multiple
+    /// proposals share the same parent QC.
     pub fn cleanup(&mut self, pending_blocks: &PendingBlocks, committed_height: BlockHeight) {
         self.pending_qc_verifications
             .retain(|hash, _| pending_blocks.contains_key(*hash));
 
-        self.state_roots
-            .retain(|hash, _| pending_blocks.contains_key(*hash));
+        // The certified cache prunes first, so what it keeps is what a
+        // state-root entry may still serve.
+        self.verified_certified_blocks.retain(|hash, certified| {
+            pending_blocks.contains_key(*hash) || certified.block().height() > committed_height
+        });
+        let certified = &self.verified_certified_blocks;
+        let tracked =
+            |hash: BlockHash| pending_blocks.contains_key(hash) || certified.contains_key(&hash);
 
         self.ready_state_root_verifications
-            .retain(|r| pending_blocks.contains_key(r.block_hash));
+            .retain(|r| tracked(r.block_hash));
 
         // Clean up deferred verifications: remove entries whose child blocks
-        // are no longer pending, and remove parent keys with empty lists.
+        // are no longer tracked, and remove parent keys with empty lists.
         for entries in self.deferred_state_root_verifications.values_mut() {
-            entries.retain(|r| pending_blocks.contains_key(r.block_hash));
+            entries.retain(|r| tracked(r.block_hash));
         }
         self.deferred_state_root_verifications
             .retain(|_, entries| !entries.is_empty());
@@ -2405,8 +2119,15 @@ impl VerificationPipeline {
             self.deferred_proposal = None;
         }
 
-        self.roots
-            .retain(|(hash, _), _| pending_blocks.contains_key(*hash));
+        // A state-root stage also lives for a sync-admitted block, which
+        // is never pending: it is retained with the certified cache.
+        self.roots.retain(|(hash, kind), _| {
+            if *kind == VerificationKind::StateRoot {
+                tracked(*hash)
+            } else {
+                pending_blocks.contains_key(*hash)
+            }
+        });
 
         // Drop deferred beacon-witness entries whose child has been
         // pruned. Parent keys whose values empty out are removed too.
@@ -2434,9 +2155,6 @@ impl VerificationPipeline {
         // (consensus path) or still above the committed tip (sync path, which
         // caches the handle without a `pending_blocks` entry and needs it kept
         // until the round-contiguous two-chain commit drains it).
-        self.verified_certified_blocks.retain(|hash, certified| {
-            pending_blocks.contains_key(*hash) || certified.block().height() > committed_height
-        });
     }
 
     /// Number of pending QC verifications.
@@ -2460,8 +2178,11 @@ impl VerificationPipeline {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::test_utils::test_transaction;
-    use hyperscale_types::{AggregateSignature, WitnessSources};
+    use hyperscale_types::test_utils::{
+        TestCommittee, make_finalization, make_finalization_awaiting, make_leg_finalization,
+        make_settling_finalization, test_transaction,
+    };
+    use hyperscale_types::{AggregateSignature, TransactionDecision, Verifiable, WitnessSources};
 
     fn disabled_count_source() -> SubstateCountSource<'static> {
         static EMPTY: std::sync::OnceLock<HashMap<BlockHash, i64>> = std::sync::OnceLock::new();
@@ -2480,6 +2201,46 @@ mod tests {
 
     use super::*;
     use crate::pending::PendingBlock;
+
+    /// The deadline holds only an execution's success decided alone. A
+    /// member with a sibling to stay atomic with settles on the sibling's
+    /// clock, a refusal writes no claim to reclaim against, a member
+    /// settling what an execution left is past the deadline by
+    /// construction, and a leg's own success decides nothing — that one
+    /// is a delivery's question.
+    #[test]
+    fn only_an_executions_success_decided_alone_is_held_to_the_deadline() {
+        let alone = test_transaction(1).hash();
+        let with_sibling = test_transaction(2).hash();
+        let refused = test_transaction(3).hash();
+        let leg = test_transaction(4).hash();
+        let settled = test_transaction(5).hash();
+        let height = BlockHeight::new(3);
+        let certificates: Vec<Arc<Verifiable<Finalization>>> = vec![
+            Arc::new(make_finalization(height, alone, TransactionDecision::Accept).into()),
+            Arc::new(
+                make_finalization_awaiting(height, with_sibling, [ShardId::leaf(1, 1)]).into(),
+            ),
+            Arc::new(make_finalization(height, refused, TransactionDecision::Reject).into()),
+            Arc::new(make_leg_finalization(height, leg).into()),
+            Arc::new(make_settling_finalization(height, settled).into()),
+        ];
+        let block = Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                height,
+                ..Default::default()
+            }),
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(certificates),
+            provisions: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+
+        assert_eq!(block.successes_decided_alone(), vec![alone]);
+        assert_eq!(block.undecided_names(), vec![leg]);
+    }
 
     /// A single-entry schedule wrapping `snapshot` — the deferral tests
     /// never reach a per-ancestor committee resolution (the walk stops at
@@ -2530,7 +2291,8 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         }
     }
 
@@ -2574,43 +2336,9 @@ mod tests {
             certificates: Arc::new(certificates),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         }
-    }
-
-    /// The reproduced corruption, refused. Two ticks over one cell
-    /// settled in reverse across two blocks lose the later write; the
-    /// second block is the one carrying the lower tick, and its
-    /// determined half sits at or below the frontier its parent already
-    /// reached.
-    #[test]
-    fn a_determined_half_below_the_parent_frontier_is_refused() {
-        // The parent settled tick 2. This block offers tick 1.
-        let block = block_settling(&[1], &[], 2);
-        assert!(!VerificationPipeline::verify_settled_order(
-            block.hash(),
-            &block,
-            BlockHeight::new(2)
-        ));
-    }
-
-    /// Determined halves within one block must rise, or the receipts
-    /// apply in the order the block lists them and invert inside it.
-    #[test]
-    fn determined_halves_must_rise_within_a_block() {
-        let descending = block_settling(&[6, 4], &[], 6);
-        assert!(!VerificationPipeline::verify_settled_order(
-            descending.hash(),
-            &descending,
-            BlockHeight::new(3)
-        ));
-
-        let ascending = block_settling(&[4, 6], &[], 6);
-        assert!(VerificationPipeline::verify_settled_order(
-            ascending.hash(),
-            &ascending,
-            BlockHeight::new(3)
-        ));
     }
 
     /// The claimed frontier is where the determined halves end, and a
@@ -2872,6 +2600,68 @@ mod tests {
     }
 
     #[test]
+    fn a_synced_block_verifies_out_of_the_certified_cache() {
+        // A sync-admitted block is never pending: its verification is
+        // queued at admission and resolves its inputs off the certified
+        // cache, so its tree lands in the overlay like a live block's.
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let synced = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
+        let synced_hash = synced.hash();
+        let qc = QuorumCertificate::new(
+            synced_hash,
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::ZERO,
+        );
+        vp.insert_verified_certified_block(
+            synced_hash,
+            Arc::new(Verified::new_unchecked_for_test(
+                CertifiedBlock::new_unchecked(synced.clone(), qc),
+            )),
+        );
+        vp.initiate_state_root_verification(
+            synced_hash,
+            &synced,
+            BlockHeight::GENESIS,
+            false,
+            false,
+            None,
+        );
+
+        let pending = PendingBlocks::new();
+        let certified = vp.verified_certified_blocks().clone();
+        let chain = ChainView::new(
+            ShardId::ROOT,
+            ChainOrigin::ROOT,
+            BlockHeight::GENESIS,
+            BlockHash::ZERO,
+            StateRoot::ZERO,
+            None,
+            None,
+            &pending,
+            &certified,
+        );
+        let resolved: Vec<_> = vp
+            .take_ready_state_root_verifications()
+            .into_iter()
+            .filter_map(|pending| {
+                VerificationPipeline::resolve_ready_state_root_verification(&pending, &chain)
+            })
+            .collect();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].block_hash, synced_hash);
+
+        // Its completion is what makes a child's parent tree available.
+        assert!(!vp.parent_tree_available(BlockHeight::new(1), synced_hash));
+        vp.checked(synced_hash, VerificationKind::StateRoot);
+        assert!(vp.parent_tree_available(BlockHeight::new(1), synced_hash));
+    }
+
+    #[test]
     fn drain_skips_entries_whose_pending_block_is_gone() {
         // A sibling verification can call `remove_pending_block` between
         // queue-up and drain. Drain must skip the orphaned entry rather than
@@ -3028,8 +2818,6 @@ mod tests {
     /// emitted) and park itself on the missing ancestor's hash.
     #[test]
     fn beacon_witness_verification_defers_on_missing_ancestor() {
-        use hyperscale_types::test_utils::TestCommittee;
-
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
@@ -3071,8 +2859,6 @@ mod tests {
     /// otherwise resolved) is the caller's responsibility.
     #[test]
     fn deferred_beacon_witness_children_drain_by_parent_hash() {
-        use hyperscale_types::test_utils::TestCommittee;
-
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
@@ -3120,8 +2906,6 @@ mod tests {
     /// matching leaves through a parent whose own root was wrong.
     #[test]
     fn failed_beacon_witness_clears_dependent_children() {
-        use hyperscale_types::test_utils::TestCommittee;
-
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
@@ -3148,11 +2932,7 @@ mod tests {
         );
         assert!(vp.is_beacon_witness_deferred(child_hash));
 
-        vp.on_root_verified(
-            parent_block_hash,
-            VerificationKind::BeaconWitnessRoot,
-            false,
-        );
+        vp.refused(parent_block_hash, VerificationKind::BeaconWitnessRoot);
         assert!(!vp.is_beacon_witness_deferred(child_hash));
         assert!(
             vp.take_deferred_beacon_witness_children(parent_block_hash)
@@ -3184,17 +2964,15 @@ mod tests {
         )
     }
 
-    /// Completion fires only when every outstanding slot is `Some`.
-    /// For a genesis block the per-root content slots auto-skip (empty
-    /// txs / certs / provisions), so beacon-witness and state-root are
-    /// the two slots that must arrive via `record_*_root_result` before
-    /// QC completes the assembly.
+    /// Completion fires only when the QC is held and every check the
+    /// block demands has passed. A genesis block demands only the beacon
+    /// witness root and the state root, so those two must land through
+    /// `checked` before the QC completes the assembly.
     #[test]
-    fn record_assembly_waits_for_every_outstanding_slot() {
+    fn assembly_waits_for_every_outstanding_check() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let block = assembly_block();
         let block_hash = block.hash();
-        let header = block.header().clone();
         let verified_qc =
             Verified::<QuorumCertificate>::new_unchecked_for_test(assembly_qc_for(&block));
 
@@ -3206,35 +2984,27 @@ mod tests {
         assert_eq!(vp.pending_assembly_count(), 1);
 
         // Beacon-witness arrives — state root still outstanding.
-        let beacon_verified =
-            Verified::<BeaconWitnessRoot>::new_unchecked_for_test(header.beacon_witness_root());
-        assert!(
-            vp.record_beacon_witness_root_result(block_hash, beacon_verified)
-                .is_none()
-        );
+        vp.checked(block_hash, VerificationKind::BeaconWitnessRoot);
         assert_eq!(vp.pending_assembly_count(), 1);
+        assert!(vp.cached_verified_certified_block(block_hash).is_none());
 
-        // State root closes out the last slot; completion fires from the
-        // per-root setter (not from `record_qc_assembly`), proving either
-        // path can be the trigger.
+        // State root closes out the last check; completion fires from
+        // the check (not from `record_qc_assembly`), proving either path
+        // can be the trigger.
+        vp.checked(block_hash, VerificationKind::StateRoot);
         let linked = vp
-            .record_state_root_result(
-                block_hash,
-                Verified::<StateRoot>::new_unchecked_for_test(StateRoot::ZERO),
-            )
-            .expect("completion fires when every slot is Some")
-            .expect("linkage check passes for the matching qc.block_hash");
+            .cached_verified_certified_block(block_hash)
+            .expect("completion fires when every check has passed");
         assert_eq!(linked.qc().block_hash(), block_hash);
         assert_eq!(vp.pending_assembly_count(), 0);
     }
 
-    /// Per-root verifications that complete before `track_pending_assembly`
-    /// runs are reflected in the initial slot state — pre-existing
-    /// `RootStage::Verified` entries in `roots` / `state_roots` prefill
-    /// matching slots so the assembly doesn't deadlock waiting for events
-    /// that already fired.
+    /// Checks that complete before `track_pending_assembly` runs count
+    /// the same as ones that complete after: the stages are the one
+    /// record, so the assembly doesn't deadlock waiting for events that
+    /// already fired.
     #[test]
-    fn track_pending_assembly_prefills_already_verified_slots() {
+    fn assembly_reads_checks_that_passed_before_it_was_tracked() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let block = assembly_block();
         let block_hash = block.hash();
@@ -3242,31 +3012,28 @@ mod tests {
             Verified::<QuorumCertificate>::new_unchecked_for_test(assembly_qc_for(&block));
 
         // Beacon-witness + state root verify before the QC arrives.
-        vp.roots.insert(
-            (block_hash, VerificationKind::BeaconWitnessRoot),
-            RootStage::Verified,
-        );
-        vp.state_roots.insert(block_hash, RootStage::Verified);
+        vp.checked(block_hash, VerificationKind::BeaconWitnessRoot);
+        vp.checked(block_hash, VerificationKind::StateRoot);
 
         vp.track_pending_assembly(Arc::new(block));
 
-        // QC is the only outstanding slot — completion fires immediately.
+        // QC is the only outstanding piece — completion fires immediately.
         let linked = vp
             .record_qc_assembly(block_hash, verified_qc)
-            .expect("completion fires when every slot is Some")
+            .expect("completion fires when every check has passed")
             .expect("linkage check passes for the matching qc.block_hash");
         assert_eq!(linked.qc().block_hash(), block_hash);
         assert_eq!(vp.pending_assembly_count(), 0);
     }
 
-    /// A block with empty content but a forged non-`ZERO` root must not have
-    /// its per-root slot prefilled: the empty-content shortcut trusts the
-    /// claim only when it equals the canonical empty (`ZERO`) root, so a
-    /// forged root leaves the slot outstanding and can't pass assembly on the
-    /// proposer's say-so. A genuinely-empty sibling root is still prefilled.
+    /// A block with empty content but a forged non-`ZERO` root demands
+    /// the check over that root: the empty-content shortcut trusts the
+    /// claim only when it equals the canonical empty root, so a forged
+    /// root is verified over the empty section and refused rather than
+    /// passing on the proposer's say-so. A genuinely-empty sibling root
+    /// demands nothing.
     #[test]
-    fn track_pending_assembly_rejects_nonzero_root_on_empty_content() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+    fn a_forged_root_over_empty_content_is_demanded() {
         let forged_header = BlockHeader::new(BlockHeaderParts {
             height: BlockHeight::new(1),
             parent_block_hash: BlockHash::ZERO,
@@ -3282,19 +3049,12 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
-            terminal_verdicts: Arc::new(Vec::new()),
+            abandonment_records: Arc::new(Vec::new()),
+            state_claims: Arc::new(Vec::new()),
         };
-        let block_hash = block.hash();
-        vp.track_pending_assembly(Arc::new(block));
-
-        let entry = vp
-            .pending_assemblies
-            .get(&block_hash)
-            .expect("assembly tracked");
-        // The forged tx root is not trusted; its slot stays outstanding.
-        assert!(entry.tx_root_result.is_none());
-        // The genuinely-empty cert root (ZERO) is still prefilled.
-        assert!(entry.certificate_root_result.is_some());
+        let demands = block.demands();
+        assert!(demands.contains(VerificationKind::TransactionRoot));
+        assert!(!demands.contains(VerificationKind::CertificateRoot));
     }
 
     /// `record_qc_assembly` against a block hash with no tracked assembly
@@ -3307,19 +3067,6 @@ mod tests {
             Verified::<QuorumCertificate>::new_unchecked_for_test(assembly_qc_for(&block));
         assert!(vp.record_qc_assembly(block.hash(), verified_qc).is_none());
         assert_eq!(vp.pending_assembly_count(), 0);
-    }
-
-    /// `record_root_assembly` against an unknown block is a no-op too.
-    #[test]
-    fn record_root_assembly_returns_none_for_unknown_block() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
-        assert!(
-            vp.record_state_root_result(
-                bh(b"no-such-block"),
-                Verified::<StateRoot>::new_unchecked_for_test(StateRoot::ZERO),
-            )
-            .is_none()
-        );
     }
 
     // ─── substate-walk proposal park ────────────────────────────────────
@@ -3339,13 +3086,13 @@ mod tests {
             "parking alone must not latch a retry"
         );
 
-        vp.on_state_root_verified(bh(b"some-other-block"), true);
+        vp.checked(bh(b"some-other-block"), VerificationKind::StateRoot);
         assert!(
             !vp.take_ready_proposal(),
             "an unrelated state root leaves the park in place"
         );
 
-        vp.on_state_root_verified(ancestor, true);
+        vp.checked(ancestor, VerificationKind::StateRoot);
         assert!(
             vp.take_ready_proposal(),
             "the parked ancestor's delta must latch a retry"
